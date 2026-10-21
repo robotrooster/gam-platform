@@ -5,7 +5,7 @@ import { ArrowLeft, ChevronDown, ChevronRight, Download, Printer, ScrollText } f
 import {
   RENT_ROLL_STATUS_COLOR,
   type RentRollHistory, type RentRollHistoryRow, type RentRollMonthCount, type RentRollMonthStatus, type RentRollMovedOutOwing,
-  type RentRollResident, type RentRollStatusColor, type RentRollStayLine,
+  type RentRollResident, type RentRollStatusColor,
 } from '@gam/shared'
 import { api } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
@@ -19,6 +19,7 @@ import { movedOutMeta, movedOutWho, movedOutDetail } from '../components/payment
 import {
   useRentRollProperties, chosenProperty, PropertyPickList, householdName, householdNames, reportPath,
 } from '../components/rentroll/PropertyPick'
+import { StaysCard, staysMeta } from '../components/rentroll/StaysCard'
 import '../styles/rent-roll.css'
 import '../components/rentroll/rentroll.css'
 
@@ -120,11 +121,8 @@ export function movedOutOwesFor(m: Pick<RentRollMovedOutOwing, 'kind' | 'months'
   return m.months.map(x => `${shortMonth(x.month)} ${x.month.slice(0, 4)} ${money(x.owed)}`).join(' · ')
 }
 
-/** The Stays card's head: "6 stays" — how many stays the lines add up. */
-export function staysMeta(stays: readonly Pick<RentRollStayLine, 'stays'>[]): string {
-  const n = stays.reduce((t, s) => t + s.stays, 0)
-  return `${n} stay${n === 1 ? '' : 's'}`
-}
+/** The Stays card's head ("6 stays") lives with the card — both pages show it. */
+export { staysMeta }
 
 /** The rent roll as a spreadsheet: the rows as on screen, then the totals (when sent), then "Moved out, still owes", then the stays. */
 export function rentRollCsv(h: RentRollHistory): string {
@@ -237,8 +235,6 @@ export function RentRollPage() {
   const { pick: lit, range } = viewFromParams(params, today)
   const [movedOpen, setMovedOpen] = useState(false)
   // 10/13 (Nic): "expandable notes" — which stay lines are open.
-  const [staysOpen, setStaysOpen] = useState<Set<string>>(() => new Set())
-  const toggleStay = (key: string) => setStaysOpen(prev => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n })
 
   const history = useQuery(['rent-roll-history', propertyId, rangeKey(range)],
     () => api.get(historyPath(propertyId!, range)).then(r => r.data.data as RentRollHistory), {
@@ -255,14 +251,12 @@ export function RentRollPage() {
     next.set('property', id)
     setParams(next)
     setMovedOpen(false)
-    setStaysOpen(new Set())
   }
   const allProperties = () => {
     const next = new URLSearchParams(params)
     next.delete('property')
     setParams(next)
     setMovedOpen(false)
-    setStaysOpen(new Set())
   }
 
   // The custom boxes show the range on screen (All time: once its months are known).
@@ -471,34 +465,9 @@ export function RentRollPage() {
               )}
 
               {/* 10/13 (Nic): "dont put these stays in the spot put them below
-                  with expandable notes" — below the households, never in a space's row. */}
-              {(data.stays ?? []).length > 0 && (
-                <div className="card rrh-stays" style={dim} data-section="stays">
-                  <div className="rrh-stays-head">
-                    Stays
-                    <span className="rrh-folder-meta">{staysMeta(data.stays)}</span>
-                  </div>
-                  <ul className="rrh-stays-list">
-                    {data.stays.map(s => {
-                      const open = staysOpen.has(s.key)
-                      return (
-                        <li key={s.key} className="rrh-stay" data-line={s.key}>
-                          <button type="button" className="rrh-stay-head" aria-expanded={open} onClick={() => toggleStay(s.key)}>
-                            {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                            <span className="rrh-stay-label">{s.label}</span>
-                            {s.paid !== undefined && <span className="rrh-stay-paid">{money(s.paid)}</span>}
-                          </button>
-                          {open && (
-                            <ul className="rrh-stay-notes">
-                              {s.sites.map(x => <li key={x.space ?? ''}>{x.label}</li>)}
-                            </ul>
-                          )}
-                        </li>
-                      )
-                    })}
-                  </ul>
-                </div>
-              )}
+                  with expandable notes" — below the households, never in a space's
+                  row. The same card the Payments page shows under its sites. */}
+              <StaysCard key={propertyId ?? ''} stays={data.stays ?? []} style={dim} />
 
               {data.movedOutOwing.length > 0 && (
                 <div className="card rrh-folder">

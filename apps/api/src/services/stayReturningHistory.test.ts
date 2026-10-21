@@ -31,7 +31,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { randomUUID } from 'crypto'
 import { db, getClient } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, deleteBookingsForTest } from '../test/dbHelpers'
 import { stayNeeds, priorCompletedStay } from './stayTerms'
 import { returningResidentAllowance } from './onboardingWindow'
 
@@ -170,7 +170,7 @@ describe('a guest GAM has a completed stay for', () => {
       .toMatchObject({ screening: 'returning', returningHistory: { bookingId: byAccount } })
 
     // and the other way round: a bare address on the old row, priced by account
-    await db.query(`DELETE FROM unit_bookings WHERE id = $1`, [byAccount])
+    await deleteBookingsForTest(byAccount)
     const byEmail = await stay({ landlordId: w.landlordId, unitId: w.unitId, from: -60, to: -50, email: e })
     expect(await needs(w, { tenantId, from: 10, to: 35 }))
       .toMatchObject({ screening: 'returning', returningHistory: { bookingId: byEmail } })

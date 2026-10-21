@@ -78,6 +78,9 @@ import {
 import {
   payLinkLineNameForBill, billLineTaxRate, billTaxFitsItsCharge, billTaxDoesNotFitWords,
 } from './utilityPayLink'
+// 10/21 (Nic): what the stay itself still owes, by the reservation's own rule —
+// the same figure its ticket and its pay link ask for, never a second opinion.
+import { reservationDue } from './registerStay'
 import { voidUnowedCharges } from './chargeVoids'
 import { lockHousehold, moneyTakenOrMovingRowSql } from './moneyPredicates'
 
@@ -157,6 +160,22 @@ export interface CounterClosing {
   to: string | null
   /** Plain words for the row: "Stay — RV 27, Sep 3 to Oct 2". Never a raw enum. */
   what: string
+  /**
+   * 10/21 (Nic), the Checkout tab: who it is, for the list of people due out
+   * (the desk has not picked anybody yet there). Null when the booking carries
+   * no name.
+   */
+  who: string | null
+  /**
+   * 10/21 (Nic): "I want the determination of checking out to automatically
+   * know all of the things to bill for, not just targeted electric." What is
+   * STILL OWED on the stay itself — the reservation's own rule (registerStay
+   * reservationDue), the same figure its ticket and its pay link ask for — so
+   * the desk settling somebody up is told about it rather than finding out
+   * after they have driven off. 0 when nothing is owed; null on a lease, whose
+   * rent is its household's invoice and is never a register line.
+   */
+  owed: number | null
   /**
    * The payer behind it, structurally:
    *   'lease'              — a lease, billed per its meter setup.
@@ -356,6 +375,83 @@ export async function releaseStaleCounterAsks(
   return r.rows.length
 }
 
+/**
+ * ONE STAY, AS A CLOSING. Built in one place because the Checkout tab reaches
+ * the same stays two ways — the person the desk picked, and the list of people
+ * due out — and the two must never describe a stay differently.
+ */
+async function stayClosing(q: Q, s: {
+  id: string; unit_id: string; space_label: unknown; check_in: unknown; check_out: unknown
+  agreement_id: unknown; guest?: unknown
+}): Promise<CounterClosing> {
+  const label = String(s.space_label ?? '')
+  const span = [dayWords(s.check_in), dayWords(s.check_out)].filter(Boolean).join(' to ')
+  const due = await reservationDue(q as Pick<PoolClient, 'query'>, s.id)
+  return {
+    kind: 'stay', id: s.id, unitId: s.unit_id, spaceLabel: label,
+    from: isoDay(s.check_in), to: isoDay(s.check_out),
+    what: `Stay — ${label || 'their site'}${span ? `, ${span}` : ''}`,
+    who: (typeof s.guest === 'string' && s.guest.trim()) || null,
+    // A cancelled or no-show stay is closed: it asks for nothing (`closed`),
+    // and reading its owed as money due would invent a bill at the counter.
+    owed: due && !due.closed ? Math.max(0, Math.round(due.owed * 100) / 100) : 0,
+    // Whether an agreement can bill this site, not whether one was ever made
+    // for the booking — see STAY_PAYS_ITS_OWN. No night count here: the nights
+    // are counted on every save of the reservation, in the one place that is
+    // allowed to count them.
+    payer: s.agreement_id ? 'service_agreement' : 'in_the_rate',
+    meters: await metersOnUnit(q, s.unit_id),
+  }
+}
+
+/** The columns stayClosing reads, on a unit_bookings alias `b`. */
+const STAY_CLOSING_COLUMNS = `b.id, b.unit_id, b.status, b.stay_terms,
+              to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
+              to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+              COALESCE(NULLIF(TRIM(b.guest_name), ''),
+                       NULLIF(TRIM(CONCAT_WS(' ', gu.first_name, gu.last_name)), '')) AS guest,
+              ${SPACE_LABEL} AS space_label,
+              ${STAY_PAYS_ITS_OWN} AS agreement_id`
+
+/** The joins STAY_CLOSING_COLUMNS needs beside `units un`. */
+const STAY_CLOSING_JOINS = `LEFT JOIN tenants gt ON gt.id = b.tenant_id
+         LEFT JOIN users gu ON gu.id = gt.user_id`
+
+/**
+ * 10/21 (Nic) — WHO IS DUE OUT, for the Checkout tab's own list.
+ *
+ *   "when somebody's checking out, the point of sale should communicate with
+ *    the unit and any submeters applicable to that unit."
+ *
+ * The desk opening Checkout has usually not typed anything yet: the person is
+ * standing there because their time is up. So the tab opens on the stays whose
+ * last day has come or gone and whose guest is still checked in — the
+ * schedule's own answer, not a status anybody typed — and picking one reaches
+ * the SAME closing the person search reaches (stayClosing). A guest who is not
+ * on this list is found by name, as always.
+ *
+ * `today` is the property's day ('YYYY-MM-DD').
+ */
+export async function counterDueOut(
+  q: Q, args: { landlordId: string; propertyId: string; today: string },
+): Promise<CounterClosing[]> {
+  const rows = (await q.query<any>(
+    `SELECT ${STAY_CLOSING_COLUMNS}
+       FROM unit_bookings b
+       JOIN units un ON un.id = b.unit_id
+       ${STAY_CLOSING_JOINS}
+      WHERE un.property_id = $1 AND b.landlord_id = $2
+        AND b.status = 'checked_in'
+        AND b.check_out <= $3::date
+        AND b.stay_terms IS DISTINCT FROM 'lease'
+        AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id AND l.status IN ('pending', 'active'))
+      ORDER BY b.check_out, space_label
+      LIMIT 40`, [args.propertyId, args.landlordId, args.today])).rows
+  const out: CounterClosing[] = []
+  for (const r of rows) out.push(await stayClosing(q, r))
+  return out
+}
+
 export async function counterClosings(
   q: Q, args: { landlordId: string; propertyId: string; email?: string | null; phone?: string | null },
 ): Promise<CounterLookup> {
@@ -374,13 +470,10 @@ export async function counterClosings(
     const onEmail = by === 'email'
 
     const stays = (await q.query<any>(
-      `SELECT b.id, b.unit_id, b.status, b.stay_terms,
-              to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
-              to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
-              ${SPACE_LABEL} AS space_label,
-              ${STAY_PAYS_ITS_OWN} AS agreement_id
+      `SELECT ${STAY_CLOSING_COLUMNS}
          FROM unit_bookings b
          JOIN units un ON un.id = b.unit_id
+         ${STAY_CLOSING_JOINS}
         WHERE un.property_id = $1 AND b.landlord_id = $2
           AND b.status IN ('confirmed', 'checked_in', 'checked_out')
           AND b.stay_terms IS DISTINCT FROM 'lease'
@@ -419,21 +512,7 @@ export async function counterClosings(
     if (!stays.length && !leases.length) continue
 
     const closings: CounterClosing[] = []
-    for (const s of stays) {
-      const label = String(s.space_label ?? '')
-      const span = [dayWords(s.check_in), dayWords(s.check_out)].filter(Boolean).join(' to ')
-      closings.push({
-        kind: 'stay', id: s.id, unitId: s.unit_id, spaceLabel: label,
-        from: isoDay(s.check_in), to: isoDay(s.check_out),
-        what: `Stay — ${label || 'their site'}${span ? `, ${span}` : ''}`,
-        // Whether an agreement can bill this site, not whether one was ever
-        // made for the booking — see STAY_PAYS_ITS_OWN. No night count here:
-        // the nights are counted on every save of the reservation, in the one
-        // place that is allowed to count them.
-        payer: s.agreement_id ? 'service_agreement' : 'in_the_rate',
-        meters: await metersOnUnit(q, s.unit_id),
-      })
-    }
+    for (const s of stays) closings.push(await stayClosing(q, s))
     for (const l of leases) {
       const label = String(l.space_label ?? '')
       const span = [dayWords(l.start_date), dayWords(l.end_date) ?? 'open'].filter(Boolean).join(' to ')
@@ -441,6 +520,10 @@ export async function counterClosings(
         kind: 'lease', id: l.id, unitId: l.unit_id, spaceLabel: label,
         from: isoDay(l.start_date), to: isoDay(l.end_date),
         what: `Lease — ${label || 'their space'}${span ? `, ${span}` : ''}`,
+        who: null,
+        // A lease's rent is its household's invoice, settled on the Payments
+        // page — never a line on a register ticket (10/21).
+        owed: null,
         payer: 'lease',
         meters: await metersOnUnit(q, l.unit_id),
       })
@@ -466,26 +549,16 @@ export async function counterClosingById(
   const GONE = 'That stay or lease is not at this property any more — open the customer up again and pick it from the list.'
   if (args.kind === 'stay') {
     const b = (await q.query<any>(
-      `SELECT b.id, b.unit_id,
-              to_char(b.check_in, 'YYYY-MM-DD') AS check_in,
-              to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
-              ${SPACE_LABEL} AS space_label,
-              ${STAY_PAYS_ITS_OWN} AS agreement_id
-         FROM unit_bookings b JOIN units un ON un.id = b.unit_id
+      `SELECT ${STAY_CLOSING_COLUMNS}
+         FROM unit_bookings b
+         JOIN units un ON un.id = b.unit_id
+         ${STAY_CLOSING_JOINS}
         WHERE b.id = $1 AND b.landlord_id = $2 AND un.property_id = $3
           AND b.status IN ('confirmed', 'checked_in', 'checked_out')
           AND b.stay_terms IS DISTINCT FROM 'lease'`,
       [args.id, args.landlordId, args.propertyId])).rows[0]
     if (!b) throw new AppError(404, GONE)
-    const label = String(b.space_label ?? '')
-    const span = [dayWords(b.check_in), dayWords(b.check_out)].filter(Boolean).join(' to ')
-    return {
-      kind: 'stay', id: b.id, unitId: b.unit_id, spaceLabel: label,
-      from: isoDay(b.check_in), to: isoDay(b.check_out),
-      what: `Stay — ${label || 'their site'}${span ? `, ${span}` : ''}`,
-      payer: b.agreement_id ? 'service_agreement' : 'in_the_rate',
-      meters: await metersOnUnit(q, b.unit_id),
-    }
+    return await stayClosing(q, b)
   }
   const l = (await q.query<any>(
     `SELECT l.id, l.unit_id,
@@ -503,6 +576,8 @@ export async function counterClosingById(
     kind: 'lease', id: l.id, unitId: l.unit_id, spaceLabel: label,
     from: isoDay(l.start_date), to: isoDay(l.end_date),
     what: `Lease — ${label || 'their space'}${span ? `, ${span}` : ''}`,
+    who: null,
+    owed: null,
     payer: 'lease',
     meters: await metersOnUnit(q, l.unit_id),
   }

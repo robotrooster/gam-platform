@@ -34,7 +34,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from 'react-query'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
-import type { OpenMonthRoll, OpenMonthRow, RentRollProperty, RentRollPayment, RentRollCharge, OpenMonthOtherMoney, OpenMonthSalePart, OpenMonthTotals } from '@gam/shared'
+import type { OpenMonthRoll, OpenMonthRow, RentRollProperty, RentRollPayment, RentRollCharge, OpenMonthOtherMoney, OpenMonthSalePart, OpenMonthTotals, RentRollStayLine } from '@gam/shared'
 
 const server = vi.hoisted(() => ({
   properties: [] as any[],
@@ -1084,6 +1084,71 @@ describe('the register\'s and pay links\' money that is no bill and no stay', ()
       await click(folder.querySelector('button.pay-other-head'))
       expect(folder.querySelectorAll('li.pay-other-line')).toHaveLength(3)
     } finally { delete (window as any).matchMedia }
+  })
+})
+
+// 10/21 (Nic): "maybe at the bottom is where we have stays, like underneath
+// the sites, but above the register sales and pay links. Have it be stays where
+// it's tracking, you know, this is how many individual nights we sold, this is
+// how many weeks we sold, or combination thereof … We don't want it to be in
+// the rent roll, making it longer."
+describe('10/21 (Nic): the stays under the sites', () => {
+  // Counts, no money: this page's stay money is the "Stays" total on its head
+  // (what came IN this month), never on a line — see OpenMonthRoll.stays.
+  const nights: RentRollStayLine = {
+    key: 'night:pos', unit: 'night', via: 'pos', quantity: 22, label: '22 nights paid for via POS', stays: 4,
+    sites: [{ space: 'RV 15', quantity: 4, stays: 1, label: '4 nights in RV 15' },
+            { space: 'RV 18', quantity: 18, stays: 3, label: '18 nights in RV 18' }],
+  }
+  const weeks: RentRollStayLine = {
+    key: 'week:booking_site', unit: 'week', via: 'booking_site', quantity: 1, label: '1 week paid for via the booking site',
+    stays: 1, sites: [{ space: 'RV 10', quantity: 1, stays: 1, label: '1 week in RV 10' }],
+  }
+  const otherLine: OpenMonthOtherMoney = {
+    id: 'sale1', saleId: 'sale1', kind: 'sale', day: '2026-10-01', amount: 23.92, methodLabel: 'Cash',
+    forLabel: 'Propane · at the register', who: null,
+  }
+
+  it('a card under the sites and above the register sales and pay links: a line per kind, how many stays, opening to its notes per site', async () => {
+    server.rolls['p-oak'] = roll([russ, vacant('RV 10', 'u10')], { stays: [nights, weeks], otherMoney: [otherLine] })
+    await render()
+    await loaded()
+    // Under the sites, above the register's money — in that order on the page.
+    const order = [...host.querySelectorAll('table.pay-table, [data-section]')]
+      .map(e => e.getAttribute('data-section') ?? 'sites')
+    expect(order).toEqual(['sites', 'stays', 'other-money'])
+    const card = host.querySelector('[data-section="stays"]')!
+    expect(card.querySelector('.rrh-stays-head')!.textContent).toBe('Stays5 stays')
+    expect([...card.querySelectorAll('li.rrh-stay')].map(li => li.querySelector('.rrh-stay-label')!.textContent))
+      .toEqual(['22 nights paid for via POS', '1 week paid for via the booking site'])
+    // No money on a line here — the month's stay money is the head's total.
+    expect(card.querySelectorAll('.rrh-stay-paid')).toHaveLength(0)
+    // The notes per site open under their line.
+    const head = card.querySelector('li[data-line="night:pos"] button')!
+    expect(head.getAttribute('aria-expanded')).toBe('false')
+    await click(head)
+    expect(head.getAttribute('aria-expanded')).toBe('true')
+    expect([...card.querySelectorAll('li[data-line="night:pos"] .rrh-stay-notes li')].map(li => li.textContent))
+      .toEqual(['4 nights in RV 15', '18 nights in RV 18'])
+    // Never a row up in the sites: the guests are not spaces.
+    expect(host.querySelectorAll('tr.pay-row')).toHaveLength(2)
+    expect(host.querySelector('table.pay-table')!.textContent).not.toContain('nights')
+  })
+
+  it('a line that does carry money (the Rent Roll page\'s, one card for both) shows it beside the label', async () => {
+    server.rolls['p-oak'] = roll([russ], { stays: [{ ...nights, paid: 1540 }] })
+    await render()
+    await loaded()
+    const card = host.querySelector('[data-section="stays"]')!
+    expect(card.querySelector('.rrh-stay-label')!.textContent).toBe('22 nights paid for via POS')
+    expect(card.querySelector('.rrh-stay-paid')!.textContent).toBe('$1,540.00')
+  })
+
+  it('no stays this month, no card', async () => {
+    server.rolls['p-oak'] = roll([russ], { stays: [] })
+    await render()
+    await loaded()
+    expect(host.querySelector('[data-section="stays"]')).toBeNull()
   })
 })
 

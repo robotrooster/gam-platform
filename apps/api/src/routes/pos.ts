@@ -34,7 +34,7 @@ import {
   type UtilitySettlementRecorded,
 } from '../services/utilityPayLink'
 import {
-  counterPersonContact, counterClosings, counterClosingById, quoteCounterReads, recordCounterReads,
+  counterPersonContact, counterClosings, counterClosingById, counterDueOut, quoteCounterReads, recordCounterReads,
   counterBillIdsInCart, NOBODY_AT_THIS_PROPERTY, counterBillsOnCart, settleCounterBills, releaseCounterBills,
   type CounterBillsOnCart, type CounterSettlement,
 } from '../services/registerFinalUtility'
@@ -1977,6 +1977,28 @@ posRouter.get('/stays/current', requirePerm('pos.ring_sale'), async (req: any, r
 //
 // Three doors, in the order the desk uses them, and only the third one writes.
 // services/registerFinalUtility carries every word of the reasoning.
+
+/**
+ * 10/21 (Nic), THE CHECKOUT TAB'S OWN LIST — who is due out at this property:
+ * the stays whose last day has come or gone whose guest is still checked in.
+ *
+ * The desk opening Checkout has usually typed nothing, because the person is
+ * standing there for the one reason. Picking one of these reaches the same
+ * closing the person search reaches, with the same meters and the same figure
+ * (services/registerFinalUtility counterDueOut) — it is a faster door to the
+ * same room, not a second set of rules. Anybody not on it is found by name.
+ */
+posRouter.get('/checkout/due-out', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const propertyId = await assertPropertyIsLandlords(posLandlordId(req), req.query.propertyId)
+    await assertPropertyInScope(req.user, propertyId)
+    const p = await queryOne<{ timezone: string | null }>(`SELECT timezone FROM properties WHERE id = $1`, [propertyId])
+    const closings = await counterDueOut(db, {
+      landlordId: posLandlordId(req), propertyId, today: todayIn(p?.timezone ?? null),
+    })
+    res.json({ success: true, data: { closings } })
+  } catch (e) { next(e) }
+})
 
 /** Who the desk has in front of them, and what of theirs can be closed out. */
 posRouter.get('/final-utility/customer', requirePerm('pos.ring_sale'), async (req: any, res, next) => {

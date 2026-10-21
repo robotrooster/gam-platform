@@ -14,6 +14,7 @@ import { money, toCents, monthTitle, serverStatus, serverMessage, dayWord, CREDI
 import { RecordPaymentWindow, PostPaymentForm } from '../components/RecordPaymentWindow'
 import { OpenMonthDetail, StayDetail, SpaceDetail } from '../components/payments/OpenMonthDetail'
 import { OtherMoneyFolder } from '../components/payments/OtherMoney'
+import { StaysCard } from '../components/rentroll/StaysCard'
 import { MovedOutFolder } from '../components/payments/MovedOut'
 import { RecordPaymentPicker } from '../components/payments/RecordPaymentPicker'
 import {
@@ -660,6 +661,14 @@ export function PaymentsPage() {
           </table>
         )}
       </div>
+      {/* 10/21 (Nic): "maybe at the bottom is where we have stays, like
+          underneath the sites, but above the register sales and pay links.
+          Have it be stays where it's tracking … this is how many individual
+          nights we sold, this is how many weeks we sold, or combination
+          thereof … We don't want it to be in the rent roll, making it
+          longer" — so no stay is a row up in the sites: a guest checked in is
+          their site's row, and every other stay is counted here. */}
+      <StaysCard stays={roll.stays ?? []} />
       {/* 10/13 (Nic): "show ALL money coming in" — what is no bill and no stay. */}
       <OtherMoneyFolder lines={roll.otherMoney ?? []} month={roll.month} totals={t} />
       {/* 10/14 (Nic): "show in the moved-out section of Payments" — guests checked out

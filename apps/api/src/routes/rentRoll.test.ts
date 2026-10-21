@@ -595,13 +595,16 @@ async function siteDepositOn(p: { landlordId: string }, bookingId: string, towar
 describe('10/13 (Nic): the stays on the Payments page — "show all money coming in"', () => {
   // "The people that paid short-term stays like Space RV 10 and 11 at Mountain
   // View, those should have details of the money that was paid."
-  it('each stay paid this month is a row with the money and its details; never in the bills\' Invoiced, Paid or Owed', async () => {
+  it('the guest checked in is their site\'s row with the money and its details; every other stay is counted below, never a second row at the site', async () => {
     const p = await park()
     const lena = await household(p, 'RV 1', 'Lena Lease')
     await rent(p, lena, THIS, 495, 1)
     // RV 10: checked in, paid at the desk through a pay link, in cash (Mountain View's RV 10 and 11).
+    // Sold as one whole month, whatever the month's length, so it counts in months.
+    const monthNights = Math.round(
+      (Date.parse(`${addMonths(THIS, 1)}-01T00:00:00Z`) - Date.parse(`${THIS}-01T00:00:00Z`)) / 86_400_000)
     const rv10 = await space(p, 'RV 10')
-    const rhea = await stayAt(p, rv10, { guest: 'Rhea Register', checkIn: `${THIS}-01`, nights: 31, status: 'checked_in', leaseType: 'month_to_month' })
+    const rhea = await stayAt(p, rv10, { guest: 'Rhea Register', checkIn: `${THIS}-01`, nights: monthNights, status: 'checked_in', leaseType: 'month_to_month' })
     const rheaPaid = await registerSale(p, rhea, { method: 'cash', toward: 589, day: `${THIS}-01`, payLink: true })
     // RV 11: a guest who came and left this month — the booking site's deposit, then the balance link by card online.
     const rv11 = await space(p, 'RV 11')
@@ -634,15 +637,20 @@ describe('10/13 (Nic): the stays on the Payments page — "show all money coming
     const res = await openMonth(owner(p), p.propertyId)
     expect(res.status, JSON.stringify(res.body)).toBe(200)
     const d = res.body.data
+    // 10/21 (Nic): "we don't want it to be in the rent roll, making it longer"
+    // — one row per site. The guest checked in is the site's row; the guest who
+    // came and left is NOT a second row at RV 11 (before 10/21 both showed,
+    // which is how RV 10 and RV 11 at Mountain View read twice).
     expect(d.rows.map((r: any) => [r.space, r.key, r.status, r.statusLabel, r.occupant ?? r.residents[0]?.name, r.paid])).toEqual([
       ['RV 1', `lease:${lena.leaseId}`, 'paid', 'Paid', 'Lena Lease', 495],
       ['RV 10', `stay:${rhea}`, 'stay', 'Checked in', 'Rhea Register', 589],
-      ['RV 11', `stay:${otto}`, 'stay', 'Checked out', 'Otto Online', 120],
       ['RV 11', `vacant:${rv11}`, 'vacant', 'Vacant', undefined, 0],
       ['RV 12', `vacant:${rv12}`, 'vacant', 'Vacant', undefined, 0],
       ['RV 13', `stay:${vic}`, 'stay', 'Checked in', 'Vic Voided', 0],
       ['RV 14', `vacant:${rv14}`, 'vacant', 'Vacant', undefined, 0],
     ])
+    expect(d.rows.filter((r: any) => r.space === 'RV 11')).toHaveLength(1)
+    expect(JSON.stringify(d.rows)).not.toContain('Otto Online')
     const row = (key: string) => d.rows.find((r: any) => r.key === key)
     const dates = (from: string, nights: number) => {
       const M = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -657,21 +665,31 @@ describe('10/13 (Nic): the stays on the Payments page — "show all money coming
     })
     expect(row(`stay:${rhea}`).payments).toEqual([{
       paymentId: rheaPaid, paidOn: `${THIS}-01`, amount: 589, credit: 0, methodLabel: 'Cash', status: 'settled', statusLabel: 'Settled',
-      reference: null, forLabel: `Stay ${dates(`${THIS}-01`, 31)} · pay link`,
+      reference: null, forLabel: `Stay ${dates(`${THIS}-01`, monthNights)} · pay link`,
     }])
-    expect(row(`stay:${otto}`).methods).toEqual(['Card · online'])
-    expect(row(`stay:${otto}`).payments.map((x: any) => [x.paymentId, x.amount, x.methodLabel, x.forLabel])).toEqual([
-      [ottoDeposit, 40, 'Card · online', `Booking deposit · stay ${dates(`${THIS}-01`, 2)} · booking site`],
-      [ottoBalance, 80, 'Card · online', `Stay balance · stay ${dates(`${THIS}-01`, 2)} · pay link`],
-    ])
     expect(row(`stay:${vic}`)).toMatchObject({ paid: 0, methods: [], payments: [] })
     expect(JSON.stringify(d.rows)).not.toContain('Olga Other')
     expect(JSON.stringify(d.rows)).not.toContain('Lee Leased')
-    // The stays' money is its own total — the bills still add up without it.
+    // 10/21 (Nic): "have it be stays where it's tracking … this is how many
+    // individual nights we sold, this is how many weeks we sold" — below the
+    // sites: the month stay rung at the register, the 2 nights booked online
+    // (deposit then balance link), each with its site. The voided sale paid
+    // nothing, last month's stay is last month's, and the stay that became a
+    // lease is that lease's.
+    // Counts, never money: the month's stay money is the total below, what
+    // came IN this month — a line's money would be what this month's nights
+    // earned, which is a different figure (see OpenMonthRoll.stays).
+    expect(d.stays.map((x: any) => [x.key, x.label, x.quantity, x.stays, x.paid, x.sites.map((y: any) => y.label)])).toEqual([
+      ['night:booking_site', '2 nights paid for via the booking site', 2, 1, undefined, ['2 nights in RV 11']],
+      ['month:pos', '1 month paid for via POS', 1, 1, undefined, ['1 month in RV 10']],
+    ])
+    expect(ottoDeposit && ottoBalance).toBeTruthy()
+    // The stays' money is its own total — the bills still add up without it —
+    // and it counts every stay's money, row or no row (Otto's $120 included).
     expect(d.totals).toMatchObject({ invoiced: 495, paid: 495, owed: 0, stays: 709, staysRefunded: 0 })
   })
 
-  it('money an early check-out gave back this month shows on the stay\'s row', async () => {
+  it('money an early check-out gave back this month is in the month\'s stays, net of what went back', async () => {
     const p = await park()
     const rv20 = await space(p, 'RV 20')
     const early = await stayAt(p, rv20, { guest: 'Ella Early', checkIn: `${THIS}-01`, nights: 7, status: 'checked_out', leaseType: 'weekly' })
@@ -687,10 +705,16 @@ describe('10/13 (Nic): the stays on the Payments page — "show all money coming
        VALUES ($1,$2,$3,1,'cash',$4,100,100,'Cash · register','handed_back',$5::timestamptz) RETURNING id`,
       [decision, early, p.landlordId, sp, `${THIS}-01 15:00:00-07`])).rows[0].id
     const d = (await openMonth(owner(p), p.propertyId)).body.data
-    const row = d.rows.find((r: any) => r.key === `stay:${early}`)
-    expect(row).toMatchObject({ paid: 300, statusLabel: 'Checked out' })
-    expect(row.stay).toMatchObject({ refunded: 100, refunds: [{ refundId: refund, refundedOn: `${THIS}-01`, amount: 100, label: 'Cash · register' }] })
+    // 10/21 (Nic): the guest has left, so RV 20 is on the page once — as the
+    // site, vacant. The money is below: $300 in, $100 back.
+    expect(d.rows.map((r: any) => [r.space, r.key, r.statusLabel])).toEqual([['RV 20', `vacant:${rv20}`, 'Vacant']])
+    expect(refund).toBeTruthy()
     expect(d.totals).toMatchObject({ stays: 300, staysRefunded: 100 })
+    // The week it was sold for, and what was kept for it — the $100 handed
+    // back comes off (10/14, Nic: refunds are subtracted). Her booking still
+    // reads the whole week, so it counts as the week; the "booked 7, stayed 3,
+    // refunded 4 → 3 nights" rule is on a booking whose check-out moved in.
+    expect(d.stays.map((x: any) => [x.label, x.quantity, x.paid])).toEqual([['1 week paid for via POS', 1, undefined]])
   })
 
   // 10/13 (Nic): "a 'Delinquent' tag beside the name" — past grace with money
@@ -901,18 +925,18 @@ describe('10/13 (Nic): "the payments page ... should show all money coming in" �
        VALUES ($1,$2,100,'cash',$3,$4::timestamptz)`, [eveSale, p.landlordId, part, `${THIS}-01 15:00:00-07`])
 
     const d = (await openMonth(owner(p), p.propertyId)).body.data
-    const stay = (id: string) => d.rows.find((r: any) => r.key === `stay:${id}`)
-    expect(stay(ella)).toMatchObject({ paid: 300 })
-    expect(stay(ella).stay).toMatchObject({
-      refunded: 100, refunds: [{ refundId: ellaBack, refundedOn: `${THIS}-01`, amount: 100, label: 'Cash · refund at the register' }],
-    })
-    expect(stay(mo)).toMatchObject({ paid: 200 })
-    expect(stay(mo).stay).toMatchObject({
-      refunded: 30, refunds: [{ refundId: moBack, refundedOn: `${THIS}-01`, amount: 30, label: 'Check · refund at the register' }],
-    })
-    expect(stay(lou)).toMatchObject({ paid: 0, payments: [] })
-    expect(stay(lou).stay).toMatchObject({ refunded: 60, refunds: [{ refundId: louBack, amount: 60 }] })
-    expect(stay(eve).stay).toMatchObject({ refunded: 100, refunds: [{ refundId: part, amount: 100, label: 'Cash · register' }] })
+    // 10/21 (Nic): every one of these guests has left, so none is a row — the
+    // sites are the rows, and the stays are counted below them.
+    expect(d.rows.map((r: any) => r.statusLabel)).toEqual(['Vacant', 'Vacant', 'Vacant', 'Vacant'])
+    // What the property kept on each, refunds off: $200 of Ella's $300, $170
+    // of Mo's $200 (only $30 of her $80 refund came off the stay — the other
+    // $50 was the propane), $200 of Eve's $300. Lou's week was last month's,
+    // so it is last month's line; the $60 handed back this month is in this
+    // month's refunds all the same.
+    expect(d.stays.map((x: any) => [x.label, x.stays, x.paid, x.sites.map((y: any) => y.label)])).toEqual([
+      ['3 weeks paid for via POS', 3, undefined, ['1 week in RV 20', '1 week in RV 21', '1 week in RV 23']],
+    ])
+    expect([ellaBack, moBack, louBack, part].every(x => !!x)).toBe(true)
     expect(d.otherMoney.map((x: any) => [x.saleId, x.kind, x.amount, x.methodLabel])).toEqual([
       [moSale, 'sale', 50, 'Cash'], [moSale, 'refund', 50, 'Check'],
     ])
@@ -1681,7 +1705,7 @@ describe('10/13 (Nic), round 3: "Stay rows SHOW what\'s still owed"', () => {
     return id
   }
 
-  it('a stay row says what is still owed on it; what is owed now — billed, or from arrival day — is its Owed, at the top, money this month or not', async () => {
+  it('the checked-in guest\'s row says what is still owed on their stay, at the top; a guest not here is no row at the site, their owed in the month\'s sum', async () => {
     const p = await park()
     const lena = await household(p, 'RV 1', 'Lena Lease')
     await rent(p, lena, THIS, 495, 1)
@@ -1734,25 +1758,30 @@ describe('10/13 (Nic), round 3: "Stay rows SHOW what\'s still owed"', () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200)
     const d = res.body.data
     const row = (key: string) => d.rows.find((r: any) => r.key === key)
-    // Owing now first — the stays owing now, in space order — then every other row in its spot.
-    expect(d.rows.slice(0, 2).map((r: any) => [r.key, r.space, r.status, r.occupant, r.paid, r.owed, r.invoiced])).toEqual([
-      [`stay:${bea}`, 'RV 30', 'stay', 'Bea Balance', 0, 360, 0],
+    // Owing now first — the guest here who still owes — then every other row
+    // in its spot.
+    expect(d.rows.slice(0, 1).map((r: any) => [r.key, r.space, r.status, r.occupant, r.paid, r.owed, r.invoiced])).toEqual([
       [`stay:${hal}`, 'RV 36', 'stay', 'Hal Here', 0, 200, 0],
     ])
-    expect(row(`stay:${bea}`).stay).toMatchObject({ owed: 360, balanceBilledOn: `${THIS}-01`, statusLabel: 'Confirmed' })
     expect(row(`stay:${hal}`).stay).toMatchObject({ owed: 200, balanceBilledOn: null, statusLabel: 'Checked in' })
-    // Dee: the rest of her stay is shown on the stay, owed from her arrival — nothing owed now, so in its spot.
-    expect(row(`stay:${dee}`)).toMatchObject({ paid: 50, owed: 0, stay: { owed: 150, balanceBilledOn: null, checkIn: `${addMonths(THIS, 1)}-03` } })
-    const keys = d.rows.map((r: any) => r.key)
-    expect(keys.indexOf(`stay:${dee}`)).toBeGreaterThan(keys.indexOf(`stay:${paul}`))
+    // 10/21 (Nic): a guest nobody has checked in is not a row at a site they
+    // are not in — Bea's billed balance and Dee's deposit are counted below
+    // the sites and in the month's stay sums, never beside RV 30 or RV 33.
+    expect(row(`stay:${bea}`)).toBeUndefined()
+    expect(row(`stay:${dee}`)).toBeUndefined()
+    expect(d.rows.filter((r: any) => r.space === 'RV 30' || r.space === 'RV 33').map((r: any) => r.statusLabel))
+      .toEqual(['Vacant', 'Vacant'])
     expect(row(`stay:${paul}`)).toMatchObject({ paid: 300, owed: 0, stay: { owed: 0, balanceBilledOn: null } })
     expect(row(`stay:${cy}`)).toBeUndefined()
     expect(row(`stay:${kit}`)).toBeUndefined()
     expect(row(`stay:${olaf}`)).toBeUndefined()
     // A stay is never a delinquent household, and the desk never takes its money.
-    expect(row(`stay:${bea}`)).toMatchObject({ delinquent: false, recordWith: null })
-    // The stays' Owed is its own sum; the bills still add up without it.
-    expect(d.totals).toMatchObject({ invoiced: 495, paid: 495, owed: 0, stays: 350, staysOwed: 560 })
+    expect(row(`stay:${hal}`)).toMatchObject({ delinquent: false, recordWith: null })
+    // The stays' Owed is its own sum — Bea's $360 billed and Hal's $200, not
+    // Dee's $150 (not owed until she arrives) and not Olaf's $360 (he checked
+    // out owing: his is the "Moved out, still owes" folder's, counted once).
+    // The bills still add up without any of it.
+    expect(d.totals).toMatchObject({ invoiced: 495, paid: 495, owed: 0, stays: 350, staysOwed: 560, movedOutOwed: 360 })
   })
 })
 
@@ -2455,7 +2484,8 @@ describe('10/14 (Nic): "A checked-out guest still owing, nothing paid this month
     await db.query(`UPDATE unit_bookings SET total_amount = 480, deposit_amount = 120, deposit_paid_at = $2::timestamptz WHERE id = $1`,
       [kit, `${LAST}-01 12:00:00-07`])
     await balanceLinkOf(p, kit, 360, `${LAST}-01`, 'cancelled')
-    // RV 33: checked out owing, but paid toward this month — its row says what is owed.
+    // RV 33: checked out owing, having paid toward this month — 10/21 (Nic):
+    // she is the folder's too now, never a row at the site she has left.
     const pia = await stayAt(p, await space(p, 'RV 33'), { guest: 'Pia Part', checkIn: `${THIS}-01`, nights: 2, status: 'checked_out' })
     await registerSale(p, pia, { method: 'cash', toward: 50, day: `${THIS}-01` })
     await db.query(`UPDATE unit_bookings SET total_amount = 120, deposit_amount = 50, deposit_paid_at = $2::timestamptz WHERE id = $1`,
@@ -2470,19 +2500,27 @@ describe('10/14 (Nic): "A checked-out guest still owing, nothing paid this month
     const d = (await openMonth(owner(p), p.propertyId)).body.data
     expect(d.movedOutOwing.map((m: any) => [m.key, m.kind, m.space, m.guest, m.residents.map((r: any) => r.name), m.owed, m.months])).toEqual([
       [`lease:${mo.leaseId}`, 'household', 'RV 5', null, ['Moe Moved'], 495, [{ month: LAST, owed: 495 }]],
+      [`stay:${pia}`, 'stay', 'RV 33', 'Pia Part', [], 70, []],
       [`stay:${olaf}`, 'stay', 'RV 35', 'Olaf Over', [], 360, []],
     ])
-    expect(d.movedOutOwing[1]).toMatchObject({ leftOn: (await db.query<{ d: string }>(
+    expect(d.movedOutOwing[2]).toMatchObject({ leftOn: (await db.query<{ d: string }>(
       `SELECT to_char(check_out, 'YYYY-MM-DD') AS d FROM unit_bookings WHERE id = $1`, [olaf])).rows[0].d })
-    // Never a row as well; the one paid toward this month is its row.
+    // Never a row as well — 10/21 (Nic): not even the one who paid toward this
+    // month, whose $50 is in the month's stays below the sites instead.
     const keys = d.rows.map((r: any) => r.key)
     expect(keys).not.toContain(`stay:${olaf}`)
     expect(keys).not.toContain(`lease:${mo.leaseId}`)
-    expect(keys).toContain(`stay:${pia}`)
-    expect(d.totals).toMatchObject({ invoiced: 495, paid: 495, owed: 0, owedEarlier: 0, movedOutOwed: 855 })
-    // Staff without the sums still see who is in it.
+    expect(keys).not.toContain(`stay:${pia}`)
+    expect(d.stays.map((x: any) => [x.label, x.paid, x.sites.map((y: any) => y.label)]))
+      .toEqual([['2 nights paid for via POS', undefined, ['2 nights in RV 33']]])
+    expect(d.totals).toMatchObject({ invoiced: 495, paid: 495, owed: 0, owedEarlier: 0, stays: 50, movedOutOwed: 925 })
+    // Staff without the sums still see who is in it, and the stays' counts
+    // without the money (decisions #25).
     const staff = (await openMonth(await teamToken(p, 'onsite_manager', { 'payments.view_all': true }), p.propertyId)).body.data
-    expect(staff.movedOutOwing).toHaveLength(2)
+    expect(staff.movedOutOwing).toHaveLength(3)
+    expect(staff.stays.map((x: any) => [x.label, x.paid])).toEqual([['2 nights paid for via POS', undefined]])
+    // The same lines the owner gets — there is no money on them for anybody.
+    expect(staff.stays).toEqual(d.stays)
     expect(staff.totals).toBeUndefined()
   })
 

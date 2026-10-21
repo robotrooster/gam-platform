@@ -82,16 +82,22 @@
  *       here (this month or earlier) first, then the rest, each in space order
  *       (compareSpaces), so a row drops into its space when paid. recordWith
  *       opens the desk window (POST /payments/:id/record-manual — the one way
- *       to log a payment). 10/13 (Nic): "show ALL money coming in" — a stay
- *       guest's row for the money toward a stay this month, and `otherMoney`:
- *       every register sale and pay link this month that is no household's
- *       bill and no stay's (and what went back on one at the register). 10/13
- *       (Nic), round 3: "Stay rows SHOW what's still owed" — a stay row opened
- *       says what is still owed on the stay (registerStay reservationDue), and
- *       its Owed is what of that is owed now: its balance billed on its pay
- *       link, or the rest from arrival day (S649); a stay whose billed balance
- *       is still unpaid is a row even with no money this month, while its
- *       guest is still coming or here; "Pay links /
+ *       to log a payment). 10/13 (Nic): "show ALL money coming in" —
+ *       `otherMoney`: every register sale and pay link this month that is no
+ *       household's bill and no stay's (and what went back on one at the
+ *       register). 10/21 (Nic): "we don't want it to be in the rent roll,
+ *       making it longer … if you turn 6 or 7 people through a spot in a
+ *       month, it's going to just add them all to the rent roll" — so a stay
+ *       is NEVER a row beside its site. The guest CHECKED IN on a space no
+ *       lease holds IS that space's row: its money, the methods, and (round
+ *       3: "Stay rows SHOW what's still owed") what is still owed on the stay
+ *       — its Owed is what of that is owed now (balance billed on its pay
+ *       link, or the rest from arrival day, S649). Every other stay — checked
+ *       out, or still to arrive — is counted in `stays` below the sites (the
+ *       aggregate the Rent Roll page shows: nights, weeks and months sold,
+ *       rentRollStays), its money in the month's `stays` total, and a guest
+ *       who checked out still owing in "Moved out, still owes". So the page is
+ *       one row per site, however many guests turned through it. "Pay links /
  *       register sales that name a space go ON that space's row" — a sale
  *       whose items or label name one of the property's spaces is on that
  *       space's row (OpenMonthRow.otherMoney); only money with no space stays
@@ -1228,12 +1234,24 @@ export async function buildOpenMonth(opts: {
   const blocked = new Map(spaces.map(s => [s.unit_id, s.payment_block === true]))
 
   const scope = { landlordIds, propertyIds, from: month, through: month, asOf, byLease: true }
-  const [months, lines, ledger, earlier, anchors, { register, stays }] = await Promise.all([
+  const [months, lines, ledger, earlier, anchors, stayLines, { register, stays }] = await Promise.all([
     householdMonths(scope),
     householdLines(scope),
     listPaymentsByMonth({ landlordIds, propertyIds, month, withTotals: false }),
     householdMonths({ ...scope, from: ALL_TIME_FROM, through: addMonths(month, -1) }),
     mayRecord ? deskAnchors(landlordIds, property.id) : Promise.resolve(new Map<string, string>()),
+    // 10/21 (Nic): the month's stays under the sites — "this is how many
+    // individual nights we sold, this is how many weeks we sold, or
+    // combination thereof". COUNTS ONLY, no money, on purpose: the open
+    // month's stay MONEY is what came in this month (totals.stays, beside the
+    // bills' sums), while a stay line's money is what this month's NIGHTS
+    // earned (10/14: "each month counts only its own nights") — two true
+    // figures that answer different questions and differ whenever a month
+    // stay's nights cross into the next month. One of them on the page, and
+    // the money one is the header's, so nothing on this page has to be
+    // reconciled against anything else on it. The Rent Roll page, whose range
+    // totals ARE by nights, shows the money on its lines.
+    rentRollStays({ landlordIds, property, from: month, to: month, withMoney: false }),
     // 10/13 (Nic): "show ALL money coming in" — the register's and the pay
     // links' money first (a refund there can be a stay's), then the stays.
     registerMoney(landlordIds, property, month)
@@ -1256,26 +1274,37 @@ export async function buildOpenMonth(opts: {
     stay?: { booking: StayBooking; payments: RentRollPayment[]; refunds: OpenMonthStay['refunds']; owed: number; due: number }
   }
   const rows = new Map<string, Building>()
-  // 10/13 (Nic): a stay guest's row. The guest checked in on a space no lease
-  // holds IS that space's row (the space is not empty, and the money is
-  // theirs); a stay paid this month whose guest has left, or has yet to
-  // arrive, is a row at its space beside whatever is there now — and so
-  // (round 3: "Stay rows SHOW what's still owed") is one still owing on it.
+  // 10/21 (Nic): "if you turn 6 or 7 people through a spot in a month, it's
+  // going to just add them all to the rent roll. I don't like that idea at all
+  // … maybe at the bottom is where we have stays, like underneath the sites" —
+  // so a stay is never a row beside its site, and the page is one row per
+  // site. The guest CHECKED IN on a space no lease holds IS that space's row
+  // (the space is not empty, the money is theirs, and round 3's "Stay rows
+  // SHOW what's still owed" still reads). Every other stay — checked out, or
+  // still to arrive — is counted below the sites instead (roll.stays), its
+  // money in the month's stays total, and a guest who checked out still owing
+  // in "Moved out, still owes" (checkedOutStillOwing). Before 10/21 each of
+  // those was a row at its site BESIDE whatever was there now, so a site whose
+  // guest had left showed twice: the guest's row and the site's own.
   const stayRowAt = new Set<string>()
   for (const booking of stays.bookings) {
-    const key = `stay:${booking.id}`
-    const pays = stays.payments.get(booking.id) ?? []
-    const backs = stays.refunds.get(booking.id) ?? []
-    const owedOnStay = stays.owed.get(booking.id) ?? 0
+    if (booking.status !== 'checked_in') continue
     const here = spaces.find(s => s.unit_id === booking.unit_id)
-    // Checked in on a space a lease holds: the lease's household is the row.
-    if (booking.status === 'checked_in' && here?.lease_id && !pays.length && !backs.length && cents(owedOnStay) <= 0) continue
-    if (booking.status === 'checked_in' && here && !here.lease_id && here.stay_id === booking.id) stayRowAt.add(here.unit_id)
+    // Checked in on a space a lease holds, or not the guest the space reads as
+    // here: the lease's household (or the space) is the row, and the stay is
+    // counted below the sites like any other.
+    if (!here || here.lease_id || here.stay_id !== booking.id) continue
+    const key = `stay:${booking.id}`
+    stayRowAt.add(here.unit_id)
     rows.set(key, {
       key, unitId: booking.unit_id, space: booking.unit_number, leaseId: null, householdId: null,
       spaceOnly: false, inUse: null, stayTenantId: booking.tenant_id,
       movedOut: false, evictionMode: blocked.get(booking.unit_id) === true,
-      earlierOnly: false, charges: [], stay: { booking, payments: pays, refunds: backs, owed: owedOnStay, due: stays.due.get(booking.id) ?? 0 },
+      earlierOnly: false, charges: [],
+      stay: {
+        booking, payments: stays.payments.get(booking.id) ?? [], refunds: stays.refunds.get(booking.id) ?? [],
+        owed: stays.owed.get(booking.id) ?? 0, due: stays.due.get(booking.id) ?? 0,
+      },
     })
   }
   for (const s of spaces) {
@@ -1432,13 +1461,25 @@ export async function buildOpenMonth(opts: {
     ...zeroTotals(), owedEarlier: 0, stays: 0, staysRefunded: 0, staysOwed: 0,
     otherIn: 0, otherRefunded: 0, folderIn: 0, folderRefunded: 0,
   }
+  // 10/21 (Nic): the month's stay money is the PROPERTY's, not the rows' — a
+  // stay with no row of its own (its guest checked out, or still to arrive) is
+  // money that came in all the same, counted here once and shown below the
+  // sites (roll.stays). What is still owed on a stay whose guest checked out is
+  // the "Moved out, still owes" folder's (movedOutOwing), so it is never in
+  // both sums.
+  for (const b of stays.bookings) {
+    const paidOn = (stays.payments.get(b.id) ?? []).reduce((t, p) => t + cents(p.amount), 0)
+    const backOn = (stays.refunds.get(b.id) ?? []).reduce((t, r) => t + cents(r.amount), 0)
+    totals.stays = dollars(cents(totals.stays) + paidOn)
+    totals.staysRefunded = dollars(cents(totals.staysRefunded) + backOn)
+    if (b.status === 'checked_out') continue
+    const owedOn = Math.max(0, cents(stays.owed.get(b.id) ?? 0))
+    const dueOn = Math.min(owedOn, Math.max(0, cents(stays.due.get(b.id) ?? 0)))
+    totals.staysOwed = dollars(cents(totals.staysOwed) + dueOn)
+  }
   for (const b of rows.values()) {
     if (b.stay) {
-      const row: OpenMonthRow = { ...stayRow(b, b.stay), ...registerOf(b.key) }
-      totals.stays = dollars(cents(totals.stays) + cents(row.paid))
-      totals.staysRefunded = dollars(cents(totals.staysRefunded) + cents(row.stay!.refunded))
-      totals.staysOwed = dollars(cents(totals.staysOwed) + cents(row.owed))
-      out.push(row)
+      out.push({ ...stayRow(b, b.stay), ...registerOf(b.key) })
       continue
     }
     const m = b.month
@@ -1523,13 +1564,21 @@ export async function buildOpenMonth(opts: {
       months: earlier.filter(m => householdKey(m.lease_id, m.household_id) === h.key && cents(m.owed) > 0)
         .sort((a, z) => a.month.localeCompare(z.month)).map(m => ({ month: m.month, owed: m.owed })),
     })),
-    ...(await checkedOutStillOwing(landlordIds, property, new Set(stays.bookings.map(b => b.id)))),
+    // 10/21 (Nic): a checked-out stay is no longer a row of its own, so every
+    // guest who left still owing is this folder's — whether they paid this
+    // month or not.
+    ...(await checkedOutStillOwing(landlordIds, property)),
   ].filter(m => cents(m.owed) > 0)
     .sort((a, z) => compareSpaces(a.space, z.space) || (a.leftOn ?? '').localeCompare(z.leftOn ?? '') || a.key.localeCompare(z.key))
   totals.movedOutOwed = dollars(movedOutOwing.reduce((t, m) => t + cents(m.owed), 0))
   const roll: OpenMonthRoll = {
     propertyId: property.id, propertyName: property.name, month,
     rows: showWorkTrade ? out : out.map(withoutWorkTrade), otherMoney: folder, movedOutOwing,
+    // 10/21 (Nic): "have it be stays where it's tracking … this is how many
+    // individual nights we sold, this is how many weeks we sold, or
+    // combination thereof" — the month's stays under the sites, the same
+    // aggregate the Rent Roll page shows (rentRollStays).
+    stays: stayLines,
   }
   if (opts.withTotals && showWorkTrade) roll.totals = totals
   return roll
@@ -1574,13 +1623,13 @@ export function withoutWorkTrade(row: OpenMonthRow): OpenMonthRow {
  * show in the moved-out section of Payments." Every stay at the property whose
  * guest checked out with money still owed on it — by the register's own rule
  * (registerStay reservationDue: its price less what was paid toward it; a stay
- * its lease bills is that lease's) — that is not a stay row this month (`rows`:
- * the stays the month shows — one paid toward this month is a row, its Owed
- * already said). A stay whose balance link was canceled is not owed here, as
- * on its row (stayMoney).
+ * its lease bills is that lease's). 10/21 (Nic): a checked-out stay is no
+ * longer a row of its own, so every one of them is here — whether money came
+ * in on it this month or not (that money is in the month's stays). A stay
+ * whose balance link was canceled is not owed here, as on its row (stayMoney).
  */
 async function checkedOutStillOwing(
-  landlordIds: string[], property: RentRollPropertyRef, rows: ReadonlySet<string>,
+  landlordIds: string[], property: RentRollPropertyRef,
 ): Promise<OpenMonthMovedOut[]> {
   const left = await query<{ id: string; unit_number: string; check_in: string; check_out: string; guest: string | null }>(`
     SELECT b.id, u.unit_number, to_char(b.check_in, 'YYYY-MM-DD') AS check_in, to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
@@ -1596,7 +1645,6 @@ async function checkedOutStillOwing(
      ORDER BY b.check_out, b.id`, [property.id, landlordIds])
   const out: OpenMonthMovedOut[] = []
   for (const b of left) {
-    if (rows.has(b.id)) continue
     const r = await reservationDue(db, b.id)
     const owed = r && !r.closed ? dollars(cents(r.owed)) : 0
     if (cents(owed) <= 0) continue
@@ -2137,7 +2185,7 @@ export async function buildRentRollHistory(opts: {
   // — the Payments page's rule (checkedOutStillOwing), whatever the range. A
   // stay is no bill: nothing of it is in the range totals (its money paid is
   // the stays' lines below).
-  for (const m of await checkedOutStillOwing(landlordIds, property, new Set())) {
+  for (const m of await checkedOutStillOwing(landlordIds, property)) {
     movedOutOwing.push({
       key: m.key, kind: 'stay', leaseId: null, householdId: null, residents: [], guest: m.guest, stayDates: m.stayDates,
       checkedOut: m.leftOn, spaces: m.space ? [m.space] : [], owed: m.owed, months: [], leaseEnded: null, inRange: zeroTotals(),

@@ -117,6 +117,21 @@ export function leaseHeldSpaceInMonthSql(l: string, month: string, monthEnd: str
  * `b` is the unit_bookings alias.
  */
 export function feeCountedStaySql(b: string, month: string): string {
+  return `(${b}.lease_type IN ('nightly', 'weekly') AND ${stayNotBilledByItsLeaseSql(b, month)})`
+}
+
+/**
+ * Of feeCountedStaySql, the part about the LEASE — whether a lease drafted from
+ * this stay was billed for `month`, in which case the stay's nights are not
+ * billed as well.
+ *
+ * On its own because the nights count (below) reads the stay's KIND off the
+ * night's own record — written down the night it happened and frozen there, so
+ * that editing a reservation's kind afterwards cannot un-count a night — while
+ * this part is still read live from the lease. A lease is nobody's way of
+ * hiding nights: it costs the landlord a whole space for the month.
+ */
+export function stayNotBilledByItsLeaseSql(b: string, month: string): string {
   const m = `(${month})::date`
   const monthEnd = `(${m} + INTERVAL '1 month' - INTERVAL '1 day')`
   const tz = `COALESCE(fs_p.timezone, 'America/Phoenix')`
@@ -132,14 +147,13 @@ export function feeCountedStaySql(b: string, month: string): string {
   // or Saturday that ends the month) was billed for nobody's month yet, so
   // that month's nights still carry the space — otherwise it is billed by
   // nobody. `month` is the month whose nights are being counted.
-  return `(${b}.lease_type IN ('nightly', 'weekly')
-       AND NOT EXISTS (
+  return `NOT EXISTS (
              SELECT 1 FROM leases fs
                JOIN units fs_u ON fs_u.id = fs.unit_id
                JOIN properties fs_p ON fs_p.id = fs_u.property_id
               WHERE fs.source_booking_id = ${b}.id
                 AND ${leaseHeldSpaceInMonthSql('fs', m, monthEnd, tz)}
-                AND GREATEST(COALESCE(fs.signed_at, ${startsAt}), ${startsAt}) < ${lastTopUpOfMonthSql(m)}))`
+                AND GREATEST(COALESCE(fs.signed_at, ${startsAt}), ${startsAt}) < ${lastTopUpOfMonthSql(m)})`
 }
 
 /**
@@ -415,42 +429,86 @@ export async function billableUnitsForProperty(
   const utilityServiceUnitCount = sp.utility_service
 
   // ── Short-stay nights ────────────────────────────────────────────────
-  // SUM of nights in the billing month across all nightly and weekly
-  // bookings on this property. Every night counts; nightly/weekly bookings on
-  // units that ALSO had a lease this month still contribute their nights (no
-  // exclusion). 10/5 (Nic): month stays are NOT here — they are spaces, up
-  // front, above (feeCountedStaySql).
+  //
+  // Every night in the billing month that a nightly or weekly reservation held
+  // a site at this property. Nightly/weekly reservations on a site that ALSO
+  // had a lease that month still contribute their nights (no exclusion). 10/5
+  // (Nic): month stays are NOT here — they are spaces, up front, above
+  // (feeCountedMonthStaySql).
+  //
+  // 10/21 (Nic) — THE NIGHTS COME FROM WHAT WAS WRITTEN DOWN THAT NIGHT.
+  //
+  //   "say I had 10 or 12 people go in the month, and then the landlord goes to
+  //    delete all of those out of the schedule before the close of the month…
+  //    the landlord could be cheating us out of the subscription fee by
+  //    deleting the history. We need a way to have that no matter what changes
+  //    they try to do."
+  //
+  // Each night is written down the morning after it happened and can never be
+  // moved or removed (services/occupancyNights, and the triggers in the
+  // 10/23 migration). This used to read the reservations' own dates at the
+  // moment the bill was cut, and editing the dates of a stay that already
+  // happened is deliberately allowed (S548) — so re-dating a month's stays on
+  // the 30th lowered the bill, and nothing could tell that from an honest early
+  // check-out.
+  //
+  // `live` is the fallback for a night NO record covers: the hours since the
+  // last run, and a reservation typed in (or imported) after its nights had
+  // already passed. So a late run loses nothing, while a night already written
+  // down cannot be taken away. It is capped at last night in the park's own
+  // time zone — a night that has not ended is not an occupied night.
+  //
+  // The KIND (nightly/weekly) and the SITE TYPE come off the night's own record
+  // where there is one: both are editable, and both decide whether the night is
+  // counted at all.
   const ssRes = await client.query<{ nights: number | null }>(`
-    SELECT COALESCE(SUM(
-        GREATEST(
-          LEAST(b.check_out, $2::date + INTERVAL '1 month')::date
-            - GREATEST(b.check_in, $2::date)::date,
-          0
-        )
-      ), 0)::int AS nights
-      FROM unit_bookings b
-      JOIN units u ON u.id = b.unit_id
-     WHERE u.property_id = $1
-       AND u.unit_type = ANY($3::text[])
-       AND ${feeCountedStaySql('b', '$2::date')}
-       -- S652 (Nic): "If somebody cancels that stay prior to the date of the
-       -- reservation, then those nights don't get counted for the aggregate...
-       -- if the reservation was never cancelled, we have no way to know" — so
-       -- a stay cancelled ON or AFTER arrival is a stay. The site was held, it
-       -- could not be sold to anybody else, and the schedule carried it the
-       -- whole way, which is the thing GAM is paid for. Nights billed in
-       -- arrears against a status anybody could flip on the 30th was a free
-       -- month for the asking.
-       --
-       -- NO-SHOW IS NOT A BILLING STATE. Nic: "I don't want to have a no-show
-       -- thing. If they just don't show up, that's not really GAM's problem."
-       -- A NULL cancelled_at is read GENEROUSLY — as cancelled in time. It
-       -- cannot occur (a trigger stamps every cancellation, and the existing
-       -- rows were backfilled), and if it somehow did, billing a landlord for a
-       -- stay that never happened is a worse failure than missing $2.
-       AND ${feeCountedNightsStatusSql('b')}
-       AND b.check_in  <  $2::date + INTERVAL '1 month'
-       AND b.check_out >  $2::date
+    WITH written AS (
+      SELECT s.booking_id, s.night, s.lease_type, s.unit_type
+        FROM unit_occupancy_nights s
+       WHERE s.property_id = $1
+         AND s.night >= $2::date
+         AND s.night <  ($2::date + INTERVAL '1 month')::date
+    ), live AS (
+      SELECT b.id AS booking_id, d::date AS night, b.lease_type, u.unit_type
+        FROM unit_bookings b
+        JOIN units u ON u.id = b.unit_id
+        JOIN properties p ON p.id = u.property_id
+        CROSS JOIN LATERAL generate_series(
+          GREATEST(b.check_in, $2::date),
+          LEAST(
+            b.check_out - 1,
+            ($2::date + INTERVAL '1 month' - INTERVAL '1 day')::date,
+            ((NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date - 1)),
+          INTERVAL '1 day') d
+       WHERE u.property_id = $1
+         -- S652 (Nic): "If somebody cancels that stay prior to the date of the
+         -- reservation, then those nights don't get counted for the aggregate...
+         -- if the reservation was never cancelled, we have no way to know" — so
+         -- a stay cancelled ON or AFTER arrival is a stay. The site was held, it
+         -- could not be sold to anybody else, and the schedule carried it the
+         -- whole way, which is the thing GAM is paid for.
+         --
+         -- NO-SHOW IS NOT A BILLING STATE. Nic: "I don't want to have a no-show
+         -- thing. If they just don't show up, that's not really GAM's problem."
+         -- A NULL cancelled_at is read GENEROUSLY — as cancelled in time. It
+         -- cannot occur (a trigger stamps every cancellation, and the existing
+         -- rows were backfilled), and if it somehow did, billing a landlord for
+         -- a stay that never happened is a worse failure than missing $2.
+         AND ${feeCountedNightsStatusSql('b')}
+         AND NOT EXISTS (
+               SELECT 1 FROM written w
+                WHERE w.booking_id = b.id AND w.night = d::date)
+    ), nights AS (
+      SELECT * FROM written
+      UNION ALL
+      SELECT * FROM live
+    )
+    SELECT COUNT(*)::int AS nights
+      FROM nights n
+      JOIN unit_bookings nb ON nb.id = n.booking_id
+     WHERE n.lease_type IN ('nightly', 'weekly')
+       AND n.unit_type = ANY($3::text[])
+       AND ${stayNotBilledByItsLeaseSql('nb', '$2::date')}
     -- S650: nights are billed IN ARREARS — you cannot count them before the
     -- month is over — so this query reads the month just ended while the
     -- lease side above bills the month starting.

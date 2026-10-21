@@ -574,12 +574,20 @@ export interface OpenMonthRoll {
   month: string
   /**
    * Every space, one row per household (lease), a Vacant row for an empty
-   * space and an occupied row for a space in use with nobody on a lease; a
-   * stay guest's row for a stay checked in, paid toward this month, or — its
-   * guest still coming or here — owing on its billed balance; and any
-   * household here still owing on an earlier lease. Ordered: rows still owing
-   * (owed + owedEarlier > 0) first, then the rest; each group in space order
-   * (compareSpaces).
+   * space and an occupied row for a space in use with nobody on a lease; and
+   * any household here still owing on an earlier lease. Ordered: rows still
+   * owing (owed + owedEarlier > 0) first, then the rest; each group in space
+   * order (compareSpaces).
+   *
+   * 10/21 (Nic): "we don't want it to be in the rent roll, making it longer …
+   * if you turn 6 or 7 people through a spot in a month, it's going to just
+   * add them all to the rent roll" — a stay is never a row beside its site.
+   * The guest CHECKED IN on a space no lease holds IS that space's row (its
+   * money, and what is still owed on the stay); every other stay — checked
+   * out, or still to arrive — is counted in `stays` below the sites, with its
+   * money in `totals.stays`, and a guest who checked out still owing is in
+   * `movedOutOwing`. So this list is one row per site, whoever turned through
+   * it.
    */
   rows: OpenMonthRow[]
   /**
@@ -598,6 +606,28 @@ export interface OpenMonthRoll {
    * server.
    */
   movedOutOwing?: OpenMonthMovedOut[]
+  /**
+   * 10/21 (Nic): "maybe at the bottom is where we have stays, like underneath
+   * the sites, but above the register sales and pay links. Have it be stays
+   * where it's tracking … this is how many individual nights we sold, this is
+   * how many weeks we sold, or combination thereof" — the month's stays as an
+   * aggregate by line item, the same shape the Rent Roll page shows
+   * (RentRollHistory.stays, rentRollStays): nights, weeks and months sold,
+   * each with its notes per site.
+   *
+   * COUNTS ONLY — no `paid` on these lines, whoever is looking. The open
+   * month's stay money is `totals.stays`: what came IN this month. A stay
+   * line's money would be what this month's NIGHTS earned (10/14: "each month
+   * counts only its own nights"), which is a different true figure — a month
+   * stay paid in September for nights that run into November is in neither
+   * month whole. Both on one page would have to be reconciled against each
+   * other, so the counts are here and the money is in the totals. The Rent
+   * Roll page, whose range totals are themselves by nights, carries the money
+   * on its lines.
+   *
+   * [] when none; absent from an older server.
+   */
+  stays?: RentRollStayLine[]
   totals?: OpenMonthTotals
 }
 

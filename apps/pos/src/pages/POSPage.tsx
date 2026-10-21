@@ -413,7 +413,7 @@ const nonNeg = { min: 0, onKeyDown: blockNeg, onPaste: blockNegPaste }
 export function POSPage() {
   const qc = useQueryClient()
   const [payLinkOpen, setPayLinkOpen] = useState(false)
-  const [tab, setTab] = useUrlTab('tab', 'register', ['register','history','customers','paylinks','items','categories','taxes','discounts','vendors','orders','inventory','readers'] as const)
+  const [tab, setTab] = useUrlTab('tab', 'register', ['register','checkout','history','customers','paylinks','items','categories','taxes','discounts','vendors','orders','inventory','readers'] as const)
 
   const [cart, setCart] = useState<CartItem[]>([])
   // S651: the site + dates + guest for a stay in the cart. Held here rather
@@ -1696,6 +1696,12 @@ export function POSPage() {
   const canVoid = canSeeTab('pos.void')
   const TABS = [
     { key:'register',  label:'Register',   perm:'pos.tab.register' },
+    // 10/21 (Nic): "maybe there's another one that says checkout" — beside the
+    // register, because checking somebody out is a sequence of its own and
+    // crowding it into the register would make the register mean two things.
+    // Anyone who can ring a sale can check somebody out; its money lands on
+    // the register ticket either way.
+    { key:'checkout',  label:'Checkout',   perm:'pos.tab.register' },
     { key:'history',   label:'History',    perm:'pos.tab.history' },
     // S654 (Nic): "an overall customers tab… see my whole customer history."
     { key:'customers', label:'Customers',  perm:'pos.tab.history' },
@@ -1954,6 +1960,29 @@ export function POSPage() {
         <div style={{padding:'48px 24px',textAlign:'center',color:'var(--text-3)',border:'1px dashed var(--border-1)',borderRadius:12}}>
           Select a property above — POS is per-property: its register, sales history, items, and tax rates all live at one location.
         </div>
+      )}
+
+      {/* 10/21 (Nic) — CHECKING SOMEBODY OUT. Its own tab, its output on the
+          register's ticket: "I want the determination of checking out to
+          automatically know all of the things to bill for, not just targeted
+          electric." */}
+      {tab==='checkout' && !!registerProperty && (
+        <CheckoutTab propertyId={registerProperty}
+          onToTicket={(lines, notes, picked)=>{
+            if (lines.length) setCart(c => [...c.filter(i => !lines.some(l => l.utilityBillId === i.utilityBillId)), ...lines])
+            // Why there is nothing to collect, said out loud — one line per
+            // meter that did not go on the ticket.
+            for (const n of notes) toastOnce(n)
+            if (!lines.length && !notes.length) toastOnce('The read was recorded. There is nothing to collect for it.')
+            if (!lines.length) return
+            // The person carries over only when picking them made a record to
+            // carry (somebody from another company comes back sealed, with no
+            // record, and a chip with no record behind it would block a charge
+            // account at the till).
+            if (picked && (picked.tenantId || picked.customerId) && !person) setPerson(picked)
+            setTab('register')
+            toastOnce('On the ticket — take the money at the register.')
+          }} />
       )}
 
       {tab==='register' && (
@@ -3300,19 +3329,49 @@ const CLOSING_MATCH_LABEL: Record<string, string> = {
 }
 
 /**
- * 10/20 (Nic) — THE CLOSING READ, TAKEN AT THE COUNTER.
+ * WHAT ONE CLOSING IS, FOR THE DESK TO CONFIRM — a stay or a lease, never a
+ * space. Two rigs means two of these and the desk confirms which.
  *
- *   "desk picks the customer and gam should know the site from the reservation.
- *    no reason for the front counter to pick a space too"
- *
- * The desk has already picked the customer. GAM finds what of theirs can be
- * closed out — their own stays and their own leases at this park, matched on
- * their email address and then their phone number, never on a name — and the
- * desk confirms WHICH one. Two rigs, the desk confirms which. It is never a
- * list of spaces.
- *
- * Then a box for every submeter that site has, usually one and sometimes two,
- * and they go on the one ticket as one set of lines.
+ * 10/21 (Nic), with the stay's own money on it: "I want the determination of
+ * checking out to automatically know all of the things to bill for, not just
+ * targeted electric." A stay that still owes says so and says where it is
+ * taken, because a closing read does not collect it and somebody settling up
+ * is the last moment anyone can.
+ */
+function ClosingPickList({ closings, pickedId, onPick, busy }: {
+  closings: any[]
+  pickedId: string | null
+  onPick: (c: any) => void
+  busy?: boolean
+}) {
+  return (
+    <div style={{display:'grid',gap:6,marginBottom:14}}>
+      {closings.map((c: any) => {
+        const owes = typeof c.owed === 'number' && c.owed > 0.005
+        return (
+          <button key={c.id} type="button" disabled={busy} onClick={()=>onPick(c)}
+                  style={{textAlign:'left',padding:'8px 10px',borderRadius:6,cursor:'pointer',
+                          background: c.id===pickedId ? 'var(--gold-bg)' : 'var(--bg-3)',
+                          border:`1px solid ${c.id===pickedId ? 'var(--gold)' : 'var(--border-1)'}`,
+                          color: c.id===pickedId ? 'var(--gold)' : 'var(--text-1)', fontSize:'.82rem', fontWeight:600}}>
+            {c.who ? `${c.who} · ${c.what}` : c.what}
+            <div style={{fontSize:'.68rem',color:'var(--text-3)',fontWeight:500,marginTop:2}}>
+              {c.meters.length
+                ? `${c.meters.length} meter${c.meters.length===1?'':'s'} on this space`
+                : 'No submeter on this space — nothing to read'}
+              {owes ? ` · still owes ${fmt(c.owed)} on the stay` : ''}
+            </div>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+/**
+ * 10/20 (Nic) — THE CLOSING READ ITSELF: a box for every submeter the site has,
+ * usually one and sometimes two, and they go on the one ticket as one set of
+ * lines.
  *
  * ── WHY TWO BUTTONS ─────────────────────────────────────────────────────────
  *
@@ -3328,35 +3387,28 @@ const CLOSING_MATCH_LABEL: Record<string, string> = {
  * they already paid, a guest who left early at a park that kept their money, a
  * figure the landlord has to look at first — the screen says so in a sentence
  * and the ticket stays as it was.
+ *
+ * One form, used by the register's window and by the Checkout tab (10/21), so
+ * the two can never ask for a reading differently.
  */
-function ClosingReadModal({ propertyId, tenantId, posCustomerId, onCancel, onDone }: {
-  propertyId: string; tenantId: string | null; posCustomerId: string | null
-  onCancel: () => void
+function ClosingReadForm({ propertyId, closing, onDone }: {
+  propertyId: string
+  closing: any
   onDone: (lines: CartItem[], notes: string[]) => void
 }) {
-  const [pickedId, setPickedId] = useState<string | null>(null)
   const [values, setValues] = useState<Record<string, string>>({})
   const [checked, setChecked] = useState<any[] | null>(null)
+  // A different closing is a different set of meters: nothing typed carries over.
+  useEffect(() => { setValues({}); setChecked(null) }, [closing?.kind, closing?.id])
 
-  const who = useQuery<any>(
-    ['pos-final-utility', propertyId, tenantId, posCustomerId],
-    () => apiGet(`/pos/final-utility/customer?propertyId=${propertyId}`
-      + (tenantId ? `&tenantId=${tenantId}` : '') + (posCustomerId ? `&posCustomerId=${posCustomerId}` : '')),
-    { enabled: !!propertyId && !!(tenantId || posCustomerId), retry: false, staleTime: 0, refetchOnMount: 'always' },
-  )
-  const closings: any[] = who.data?.closings ?? []
-  const picked = closings.find((c: any) => c.id === pickedId) ?? null
   // Only the meters a figure was typed for. A site with two meters where only
   // the electric was read sends the electric.
-  const typed = (picked?.meters ?? [])
+  const typed = (closing?.meters ?? [])
     .filter((m: any) => String(values[m.meterId] ?? '').trim() !== '')
     .map((m: any) => ({ meterId: m.meterId, value: Number(values[m.meterId]) }))
   const typedOk = typed.length > 0 && typed.every((r: any) => Number.isInteger(r.value) && r.value >= 0)
 
-  const body = () => ({
-    propertyId, closing: { kind: picked.kind, id: picked.id },
-    reads: typed,
-  })
+  const body = () => ({ propertyId, closing: { kind: closing.kind, id: closing.id }, reads: typed })
 
   const checkMut = useMutation(() => apiPost<any>('/pos/final-utility/quote', body()), {
     onSuccess: (r: any) => setChecked(r?.data?.reads ?? []),
@@ -3372,6 +3424,7 @@ function ClosingReadModal({ propertyId, tenantId, posCustomerId, onCancel, onDon
         // counter's to retype and the sale takes no discount.
         fixed: true, utilityBill: true,
       }))
+      setValues({}); setChecked(null)
       onDone(lines, r?.data?.notes ?? [])
     },
     onError: (e: any) => toastOnce(errorMessage(e, 'That read could not be recorded — check the connection and press Put it on the ticket again.'), { error: true }),
@@ -3380,6 +3433,112 @@ function ClosingReadModal({ propertyId, tenantId, posCustomerId, onCancel, onDon
   // A figure retyped is a figure not yet checked.
   const setValue = (meterId: string, v: string) => { setChecked(null); setValues(s => ({ ...s, [meterId]: v })) }
   const busy = checkMut.isLoading || confirmMut.isLoading
+
+  if (!closing?.meters?.length) {
+    return (
+      <div style={{fontSize:'.82rem',color:'var(--text-2)',lineHeight:1.55,marginBottom:12}}>
+        That space has no submeter of its own, so there is no closing read to take and no final utility bill to raise.
+      </div>
+    )
+  }
+  return (<>
+    {/* D4 (Nic): every submeter the site has gets a box — they go on the
+        one ticket as one set of lines. */}
+    <div style={{display:'grid',gap:10,marginBottom:12}}>
+      {closing.meters.map((m: any) => {
+        const line = (checked ?? []).find((q: any) => q.meterId === m.meterId)
+        return (
+          <div key={m.meterId} style={{display:'grid',gap:4}}>
+            <div style={{fontSize:'.74rem',color:'var(--text-3)'}}>
+              {m.label}{m.digits ? ` · ${m.digits} digits` : ''}
+              {m.noBaseline ? ' · never read before' : ''}
+            </div>
+            <input className="form-input" type="number" inputMode="numeric" value={values[m.meterId] ?? ''}
+                   placeholder={`Read off the face of ${m.label}`} disabled={busy}
+                   onChange={e=>setValue(m.meterId, e.target.value)} {...nonNeg} />
+            {line && (
+              <div style={{fontSize:'.78rem',lineHeight:1.5,fontWeight:600,
+                           color: line.block ? 'var(--amber)' : 'var(--gold)'}}>
+                {line.note}
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+
+    {/* The desk reads the total out to the person paying it. */}
+    {checked && checked.some((q: any) => !q.block) && (
+      <div style={{display:'flex',justifyContent:'space-between',fontWeight:700,fontSize:'.95rem',
+                   borderTop:'1px solid var(--border-1)',paddingTop:8,marginBottom:12}}>
+        <span>Going on the ticket</span>
+        <span style={{color:'var(--gold)'}}>
+          {fmt(checked.filter((q: any) => !q.block).reduce((s: number, q: any) => s + (Number(q.amount) || 0), 0))}
+        </span>
+      </div>
+    )}
+
+    {!checked || !typedOk ? (
+      <button type="button" className="btn btn-primary" style={{width:'100%'}} disabled={!typedOk || busy}
+              onClick={()=>checkMut.mutate()}>
+        {checkMut.isLoading ? 'Checking…' : 'Check the read'}
+      </button>
+    ) : (
+      <button type="button" className="btn btn-primary" style={{width:'100%'}} disabled={busy}
+              onClick={()=>confirmMut.mutate()}>
+        {confirmMut.isLoading ? 'Recording…' : 'Put it on the ticket'}
+      </button>
+    )}
+    <div style={{fontSize:'.68rem',color:'var(--text-3)',marginTop:8,lineHeight:1.5}}>
+      Nothing is recorded until you press Put it on the ticket, and nothing is emailed — the ticket is the bill.
+    </div>
+  </>)
+}
+
+/** What a stay still owes, and where it is taken — never by a closing read (10/21). */
+function StayStillOwes({ closing }: { closing: any }) {
+  if (!(typeof closing?.owed === 'number' && closing.owed > 0.005)) return null
+  return (
+    <div style={{fontSize:'.8rem',lineHeight:1.55,color:'var(--amber)',fontWeight:600,
+                 background:'var(--bg-3)',border:'1px solid var(--border-1)',borderRadius:6,padding:'8px 10px',marginBottom:12}}>
+      This stay still owes {fmt(closing.owed)}.
+      <div style={{fontWeight:500,color:'var(--text-2)',marginTop:2}}>
+        A closing read does not collect it — open their ticket or their pay link from the open list and charge that,
+        on this ticket or its own.
+      </div>
+    </div>
+  )
+}
+
+/**
+ * 10/20 (Nic) — THE CLOSING READ, TAKEN AT THE COUNTER.
+ *
+ *   "desk picks the customer and gam should know the site from the reservation.
+ *    no reason for the front counter to pick a space too"
+ *
+ * The desk has already picked the customer on the ticket. GAM finds what of
+ * theirs can be closed out — their own stays and their own leases at this park,
+ * matched on their email address and then their phone number, never on a name —
+ * and the desk confirms WHICH one. It is never a list of spaces.
+ *
+ * The Checkout tab (10/21) is the same thing with its own front door; this
+ * window stays for the clerk who is already mid-sale.
+ */
+function ClosingReadModal({ propertyId, tenantId, posCustomerId, onCancel, onDone }: {
+  propertyId: string; tenantId: string | null; posCustomerId: string | null
+  onCancel: () => void
+  onDone: (lines: CartItem[], notes: string[]) => void
+}) {
+  const [pickedId, setPickedId] = useState<string | null>(null)
+
+  const who = useQuery<any>(
+    ['pos-final-utility', propertyId, tenantId, posCustomerId],
+    () => apiGet(`/pos/final-utility/customer?propertyId=${propertyId}`
+      + (tenantId ? `&tenantId=${tenantId}` : '') + (posCustomerId ? `&posCustomerId=${posCustomerId}` : '')),
+    { enabled: !!propertyId && !!(tenantId || posCustomerId), retry: false, staleTime: 0, refetchOnMount: 'always' },
+  )
+  const closings: any[] = who.data?.closings ?? []
+  const picked = closings.find((c: any) => c.id === pickedId) ?? null
 
   return (
     <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.6)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:2000,padding:16}}>
@@ -3405,93 +3564,145 @@ function ClosingReadModal({ propertyId, tenantId, posCustomerId, onCancel, onDon
               ? 'Confirm this is what they are closing out.'
               : 'Which one are they closing out?'}
           </div>
-          <div style={{display:'grid',gap:6,marginBottom:14}}>
-            {closings.map((c: any) => (
-              <button key={c.id} type="button" disabled={busy}
-                      onClick={()=>{ setPickedId(c.id); setValues({}); setChecked(null) }}
-                      style={{textAlign:'left',padding:'8px 10px',borderRadius:6,cursor:'pointer',
-                              background: c.id===pickedId ? 'var(--gold-bg)' : 'var(--bg-3)',
-                              border:`1px solid ${c.id===pickedId ? 'var(--gold)' : 'var(--border-1)'}`,
-                              color: c.id===pickedId ? 'var(--gold)' : 'var(--text-1)', fontSize:'.82rem', fontWeight:600}}>
-                {c.what}
-                <div style={{fontSize:'.68rem',color:'var(--text-3)',fontWeight:500,marginTop:2}}>
-                  {c.meters.length
-                    ? `${c.meters.length} meter${c.meters.length===1?'':'s'} on this space`
-                    : 'No submeter on this space — nothing to read'}
-                </div>
-              </button>
-            ))}
-          </div>
-
-          {picked && !picked.meters.length && (
-            <div style={{fontSize:'.82rem',color:'var(--text-2)',lineHeight:1.55,marginBottom:12}}>
-              That space has no submeter of its own, so there is no closing read to take and no final utility bill to raise.
-            </div>
-          )}
-
-          {picked && picked.meters.length > 0 && (<>
-            {/* D4 (Nic): every submeter the site has gets a box — they go on the
-                one ticket as one set of lines. */}
-            <div style={{display:'grid',gap:10,marginBottom:12}}>
-              {picked.meters.map((m: any) => {
-                const line = (checked ?? []).find((q: any) => q.meterId === m.meterId)
-                return (
-                  <div key={m.meterId} style={{display:'grid',gap:4}}>
-                    <div style={{fontSize:'.74rem',color:'var(--text-3)'}}>
-                      {m.label}{m.digits ? ` · ${m.digits} digits` : ''}
-                      {m.noBaseline ? ' · never read before' : ''}
-                    </div>
-                    <input className="form-input" type="number" inputMode="numeric" value={values[m.meterId] ?? ''}
-                           placeholder={`Read off the face of ${m.label}`} disabled={busy}
-                           onChange={e=>setValue(m.meterId, e.target.value)} {...nonNeg} />
-                    {line && (
-                      <div style={{fontSize:'.78rem',lineHeight:1.5,fontWeight:600,
-                                   color: line.block ? 'var(--amber)' : 'var(--gold)'}}>
-                        {line.note}
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
-            </div>
-
-            {/* The desk reads the total out to the person paying it. */}
-            {checked && checked.some((q: any) => !q.block) && (
-              <div style={{display:'flex',justifyContent:'space-between',fontWeight:700,fontSize:'.95rem',
-                           borderTop:'1px solid var(--border-1)',paddingTop:8,marginBottom:12}}>
-                <span>Going on the ticket</span>
-                <span style={{color:'var(--gold)'}}>
-                  {fmt(checked.filter((q: any) => !q.block).reduce((s: number, q: any) => s + (Number(q.amount) || 0), 0))}
-                </span>
-              </div>
-            )}
-
-            <div style={{display:'flex',gap:8}}>
-              {!checked || !typedOk ? (
-                <button type="button" className="btn btn-primary" style={{flex:1}} disabled={!typedOk || busy}
-                        onClick={()=>checkMut.mutate()}>
-                  {checkMut.isLoading ? 'Checking…' : 'Check the read'}
-                </button>
-              ) : (
-                <button type="button" className="btn btn-primary" style={{flex:1}} disabled={busy}
-                        onClick={()=>confirmMut.mutate()}>
-                  {confirmMut.isLoading ? 'Recording…' : 'Put it on the ticket'}
-                </button>
-              )}
-              <button type="button" className="btn btn-ghost" disabled={busy} onClick={onCancel}>Close</button>
-            </div>
-            <div style={{fontSize:'.68rem',color:'var(--text-3)',marginTop:8,lineHeight:1.5}}>
-              Nothing is recorded until you press Put it on the ticket, and nothing is emailed — the ticket is the bill.
-            </div>
+          <ClosingPickList closings={closings} pickedId={pickedId} onPick={(c)=>setPickedId(c.id)} />
+          {picked && (<>
+            <StayStillOwes closing={picked} />
+            <ClosingReadForm propertyId={propertyId} closing={picked} onDone={onDone} />
           </>)}
         </>)}
 
-        {(!closings.length || (picked && !picked.meters.length) || !picked) && !who.isLoading && (
-          <div style={{display:'flex',gap:8,marginTop:12}}>
-            <button type="button" className="btn btn-ghost" style={{flex:1}} onClick={onCancel}>Close</button>
-          </div>
-        )}
+        <div style={{display:'flex',gap:8,marginTop:12}}>
+          <button type="button" className="btn btn-ghost" style={{flex:1}} onClick={onCancel}>Close</button>
+        </div>
       </div>
+    </div>
+  )
+}
+
+/**
+ * 10/21 (Nic) — THE CHECKOUT TAB.
+ *
+ *   "on the point of sale, how we have the tabs at the top for register,
+ *    history, customers, maybe there's another one that says checkout… when
+ *    somebody's checking out, the point of sale should communicate with the
+ *    unit and any submeters applicable to that unit… I want the determination
+ *    of checking out to automatically know all of the things to bill for, not
+ *    just targeted electric."
+ *
+ * Checking somebody out is a SEQUENCE, not a thing in a cart — who is leaving,
+ * what of theirs is ending, every meter on it read, the money on the ticket —
+ * so it gets its own tab beside Register and History rather than another button
+ * on the register, where it would be one option among forty and the register
+ * would stop meaning one thing. Its output still lands on the REGISTER TICKET,
+ * so taking the money is the ordinary thing the desk does every day.
+ *
+ * The tab opens on who is due out (the schedule's own answer — last day come
+ * and gone, still checked in), because the desk has usually typed nothing: the
+ * person is standing there for that one reason. Anybody not on that list is
+ * found by name, the same typed flow as everywhere else. Either way GAM finds
+ * the site from the reservation; the counter never picks a space.
+ *
+ * WHAT IT KNOWS TO BILL FOR: every submeter the site has, not the electric
+ * alone (the unit answers with its own meters), and what the stay itself still
+ * owes — said out loud, with where it is taken, because a closing read does not
+ * collect it and this is the last moment anybody can.
+ */
+function CheckoutTab({ propertyId, onToTicket }: {
+  propertyId: string
+  /** The lines the reads raised, the sentences for what was not billed, and who it was for. */
+  onToTicket: (lines: CartItem[], notes: string[], person: PickedPerson | null) => void
+}) {
+  const [person, setPerson] = useState<PickedPerson | null>(null)
+  const [picked, setPicked] = useState<any | null>(null)
+  const tenantId = person?.kind === 'resident' ? (person.tenantId ?? '') : ''
+  const posCustomerId = person?.kind === 'customer' ? (person.customerId ?? '') : ''
+
+  const due = useQuery<any>(
+    ['pos-checkout-due-out', propertyId],
+    () => apiGet(`/pos/checkout/due-out?propertyId=${propertyId}`),
+    { enabled: !!propertyId, retry: false, staleTime: 0, refetchOnMount: 'always' },
+  )
+  const dueOut: any[] = due.data?.closings ?? []
+
+  const who = useQuery<any>(
+    ['pos-final-utility', propertyId, tenantId, posCustomerId],
+    () => apiGet(`/pos/final-utility/customer?propertyId=${propertyId}`
+      + (tenantId ? `&tenantId=${tenantId}` : '') + (posCustomerId ? `&posCustomerId=${posCustomerId}` : '')),
+    { enabled: !!propertyId && !!(tenantId || posCustomerId), retry: false, staleTime: 0, refetchOnMount: 'always' },
+  )
+  const theirs: any[] = who.data?.closings ?? []
+
+  return (
+    <div style={{display:'grid',gap:14,maxWidth:620}}>
+      <div className="card">
+        <div className="card-header"><span className="card-title">Who is leaving</span></div>
+        <div style={{fontSize:'.78rem',color:'var(--text-2)',lineHeight:1.55,marginBottom:10}}>
+          Pick them and GAM finds their site from their own reservation, reads every meter on it, and puts the power
+          on the ticket with whatever else they are buying.
+        </div>
+
+        {/* The schedule's own answer: last day come and gone, still here. */}
+        <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:6}}>Due out</div>
+        {due.isLoading ? (
+          <div style={{fontSize:'.8rem',color:'var(--text-3)',marginBottom:12}}>Reading the schedule…</div>
+        ) : due.isError ? (
+          <div style={{fontSize:'.8rem',color:'var(--red)',lineHeight:1.5,marginBottom:12}}>
+            {errorMessage(due.error, 'The schedule could not be read — check the connection and open the tab again.')}
+          </div>
+        ) : !dueOut.length ? (
+          <div style={{fontSize:'.8rem',color:'var(--text-2)',lineHeight:1.5,marginBottom:12}}>
+            Nobody is past their last day right now. Type a name below for anybody leaving early.
+          </div>
+        ) : (
+          <ClosingPickList closings={dueOut} pickedId={picked?.id ?? null}
+                           onPick={(c)=>{ setPicked(c); setPerson(null) }} />
+        )}
+
+        <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:6}}>Somebody else</div>
+        <POSCustomerPicker propertyId={propertyId} value={person} sealedPicks
+                           placeholder="Type a name, email or phone"
+                           onChange={(p)=>{ setPerson(p); setPicked(null) }} />
+      </div>
+
+      {/* What of theirs is ending — their own stays and leases here, never spaces. */}
+      {!!(tenantId || posCustomerId) && (
+        <div className="card">
+          <div className="card-header"><span className="card-title">What they are closing out</span></div>
+          {who.isLoading ? (
+            <div style={{fontSize:'.8rem',color:'var(--text-3)'}}>Looking them up…</div>
+          ) : who.isError ? (
+            <div style={{fontSize:'.8rem',color:'var(--red)',lineHeight:1.5}}>
+              {errorMessage(who.error, 'They could not be looked up — check the connection and pick them again.')}
+            </div>
+          ) : !theirs.length ? (
+            <div style={{fontSize:'.8rem',color:'var(--text-2)',lineHeight:1.55}}>{who.data?.note}</div>
+          ) : (<>
+            {who.data?.matchedBy && (
+              <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:8}}>
+                {CLOSING_MATCH_LABEL[who.data.matchedBy] ?? 'Matched on their own record'}
+              </div>
+            )}
+            <div style={{fontSize:'.78rem',color:'var(--text-2)',marginBottom:8,lineHeight:1.5}}>
+              {theirs.length === 1 ? 'Confirm this is what they are closing out.' : 'Which one are they closing out?'}
+            </div>
+            <ClosingPickList closings={theirs} pickedId={picked?.id ?? null} onPick={(c)=>setPicked(c)} />
+          </>)}
+        </div>
+      )}
+
+      {picked && (
+        <div className="card">
+          <div className="card-header">
+            <span className="card-title">Closing read · {picked.spaceLabel || 'their site'}</span>
+          </div>
+          <div style={{fontSize:'.78rem',color:'var(--text-2)',lineHeight:1.5,marginBottom:10}}>
+            {picked.who ? `${picked.who} · ${picked.what}` : picked.what}
+          </div>
+          <StayStillOwes closing={picked} />
+          <ClosingReadForm propertyId={propertyId} closing={picked}
+                           onDone={(lines, notes)=>{ setPicked(null); onToTicket(lines, notes, person) }} />
+        </div>
+      )}
     </div>
   )
 }

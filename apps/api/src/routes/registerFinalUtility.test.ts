@@ -113,6 +113,11 @@ async function stay(p: Park, o: {
   email: string; phone?: string | null; nights: number
   checkIn?: string; checkOut?: string; bookedCheckOut?: string | null
   withAgreement?: boolean
+  /** Default 'checked_out' — the guest at the counter on their way out. */
+  status?: string
+  /** The reservation's own price, so what it still owes is a real figure. */
+  total?: number
+  unitId?: string
 }) {
   const c = await db.connect()
   try {
@@ -121,11 +126,11 @@ async function stay(p: Park, o: {
     const leaseType = o.nights >= 28 ? 'month_to_month' : o.nights >= 7 ? 'weekly' : 'nightly'
     const b = await c.query<{ id: string }>(
       `INSERT INTO unit_bookings (unit_id, landlord_id, check_in, check_out, booked_check_out,
-                                  status, lease_type, stay_terms, guest_name, guest_email, guest_phone)
-       VALUES ($1,$2,$3::date,$4::date,$5::date,'checked_out',$6,'stay','Andres Razo',$7,$8)
+                                  status, lease_type, stay_terms, guest_name, guest_email, guest_phone, total_amount)
+       VALUES ($1,$2,$3::date,$4::date,$5::date,$9,$6,'stay','Andres Razo',$7,$8,$10)
        RETURNING id`,
-      [p.unitId, p.landlordId, checkIn, checkOut, o.bookedCheckOut ?? checkOut,
-       leaseType, o.email, o.phone ?? null])
+      [o.unitId ?? p.unitId, p.landlordId, checkIn, checkOut, o.bookedCheckOut ?? checkOut,
+       leaseType, o.email, o.phone ?? null, o.status ?? 'checked_out', o.total ?? null])
     let agreementId: string | null = null
     let tenantId: string | null = null
     if (o.withAgreement) {
@@ -901,5 +906,116 @@ describe('a pole is read once', () => {
     ] })
     expect(q.status, JSON.stringify(q.body)).toBe(400)
     expect(q.body.error).toBe(r.body.error)
+  })
+})
+
+
+/**
+ * 10/21 (Nic) — THE CHECKOUT TAB'S OWN DOOR.
+ *
+ *   "on the point of sale, how we have the tabs at the top for register,
+ *    history, customers, maybe there's another one that says checkout… when
+ *    somebody's checking out, the point of sale should communicate with the
+ *    unit and any submeters applicable to that unit… I want the determination
+ *    of checking out to automatically know all of the things to bill for, not
+ *    just targeted electric."
+ *
+ * The tab opens on who is due out — the schedule's own answer, not a status
+ * anybody typed — and picking one of them reaches the SAME closing the person
+ * search reaches, with the same meters and the same figures.
+ */
+describe('10/21 (Nic): who is due out, and what checking them out knows to bill for', () => {
+  const dueOut = (p: Park) => request(buildApp())
+    .get(`/api/pos/checkout/due-out?propertyId=${p.propertyId}`)
+    .set('Authorization', `Bearer ${p.token}`)
+
+  it('lists the guest whose last day has come or gone and who is still here, with every meter on their site and what their stay still owes', async () => {
+    const p = await park()
+    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    // Still here, their week up yesterday, $300 stay with nothing paid on it.
+    const here = await stay(p, { email, nights: 8, checkIn: day(-8), checkOut: day(-1), status: 'checked_in', total: 300 })
+
+    const r = await dueOut(p)
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    expect(r.body.data.closings.map((c: any) => [c.kind, c.id, c.spaceLabel, c.who, c.owed, c.meters.length]))
+      .toEqual([['stay', here.bookingId, 'RV 27', 'Andres Razo', 300, 1]])
+    // The site's own meter, named as the landlord named it — the unit answers,
+    // the counter never picks a space.
+    expect(r.body.data.closings[0].meters[0]).toMatchObject({ meterId: p.meterId, utilityType: 'electric' })
+  })
+
+  it('is the schedule, not a list of everyone: not a guest still running, not one already checked out, not a lease-backed stay, not another park\'s', async () => {
+    const p = await park()
+    const mine = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const here = await stay(p, { email: mine, nights: 8, checkIn: day(-8), checkOut: day(-1), status: 'checked_in', total: 300 })
+    // Still running: their last day is tomorrow.
+    await stay(p, { email: `later-${mine}`, nights: 3, checkIn: day(-2), checkOut: day(1), status: 'checked_in' })
+    // Already checked out: settled up and gone, and found by name if need be.
+    await stay(p, { email: `gone-${mine}`, nights: 3, checkIn: day(-9), checkOut: day(-6), status: 'checked_out' })
+    // A stay its lease bills is the lease's, never a stay to close out here.
+    const c = await db.connect()
+    try {
+      const other = await seedUnit(c, { propertyId: p.propertyId, landlordId: p.landlordId, unitType: 'rv_spot', rentAmount: 589 })
+      const leased = await stay(p, { email: `leased-${mine}`, nights: 40, checkIn: day(-40), checkOut: day(-1), status: 'checked_in', unitId: other })
+      const leaseId = await seedLease(c, { unitId: other, landlordId: p.landlordId, rentAmount: 589, status: 'active' })
+      await c.query(`UPDATE leases SET source_booking_id = $2 WHERE id = $1`, [leaseId, leased.bookingId])
+    } finally { c.release() }
+
+    const r = await dueOut(p)
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    expect(r.body.data.closings.map((x: any) => x.id)).toEqual([here.bookingId])
+
+    // Another company's register cannot read this park's departures at all —
+    // refused on the property, before a single booking is read (the same guard
+    // every other door at this register uses).
+    const q = await park()
+    const theirs = await request(buildApp())
+      .get(`/api/pos/checkout/due-out?propertyId=${p.propertyId}`)
+      .set('Authorization', `Bearer ${q.token}`)
+    expect(theirs.status).toBe(400)
+    expect(JSON.stringify(theirs.body)).not.toContain(here.bookingId)
+  })
+
+  it('a closing reached from the list reads and bills exactly as one reached by name', async () => {
+    const p = await park()
+    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const s = await stay(p, { email, nights: 35, checkIn: day(-35), checkOut: day(-1), status: 'checked_in', withAgreement: true })
+    const g = await guestRecord(p, { email })
+
+    const listed = (await dueOut(p)).body.data.closings[0]
+    const byName = (await lookUp(p, { posCustomerId: g.posCustomerId })).body.data.closings
+      .find((c: any) => c.id === s.bookingId)
+    expect(listed).toEqual(byName)
+
+    // And the read taken off it goes on the ticket the ordinary way.
+    const r = await putOnTicket(p, { closing: { kind: listed.kind, id: listed.id }, reads: [{ meterId: p.meterId, value: 48387 }] })
+    expect(r.status, JSON.stringify(r.body)).toBe(201)
+    expect(r.body.data.lines).toHaveLength(1)
+    expect(await bills(p.meterId)).toHaveLength(1)
+    // Nothing emailed, nothing on an invoice — the ticket is the bill.
+    expect(emailMock).not.toHaveBeenCalled()
+    expect(await invoices(p.landlordId)).toHaveLength(0)
+  })
+
+  it('a lease says nothing is owed on it here — rent is its household\'s invoice, never a register line', async () => {
+    const p = await park()
+    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const who = await resident(p, { email })
+    const r = await lookUp(p, { tenantId: who.tenantId })
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    const lease = r.body.data.closings.find((c: any) => c.kind === 'lease')
+    expect(lease).toMatchObject({ owed: null, who: null })
+  })
+
+  it('a cancelled stay asks for nothing — a closed reservation never becomes a figure at the counter', async () => {
+    const p = await park()
+    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const s = await stay(p, { email, nights: 4, checkIn: day(-4), checkOut: day(-1), total: 300 })
+    await db.query(`UPDATE unit_bookings SET status = 'cancelled', cancelled_at = NOW() WHERE id = $1`, [s.bookingId])
+    const g = await guestRecord(p, { email })
+    const r = await lookUp(p, { posCustomerId: g.posCustomerId })
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    // Cancelled is not one of the statuses a closing is read from at all.
+    expect(r.body.data.closings.filter((c: any) => c.kind === 'stay')).toHaveLength(0)
   })
 })

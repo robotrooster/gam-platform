@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Zciwpjex1scNg6O06mYhNwiplyAUpUF48GVfewwvCHbTic5aSCep2nW4tgWXBan
+\restrict QSudJBwA9nKFgv0HztykPkAt78gPAvzu6NgnlxpZSCEYKcVli6azZ3a64Qab1Fm
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -347,6 +347,21 @@ BEGIN
      AND p.voided_at IS NULL AND NEW.amount < 0;
   RETURN NULL;
 END $$;
+
+
+--
+-- Name: booking_block_delete(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.booking_block_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  RAISE EXCEPTION
+    'unit_bookings row % cannot be deleted — a reservation is cancelled, never erased, and the nights it held are what GAM bills (10/21)',
+    OLD.id;
+END;
+$$;
 
 
 --
@@ -2584,6 +2599,165 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: fold_old_task_list_into_property_lists(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fold_old_task_list_into_property_lists() RETURNS TABLE(folded integer, left_alone integer)
+    LANGUAGE plpgsql
+    SET search_path TO 'public', 'pg_catalog'
+    AS $$
+DECLARE
+    item        record;
+    parks       uuid[];
+    park        uuid;
+    owner_user  uuid;
+    line        text;
+    repeats     text;
+    when_said   text;
+    new_line_id uuid;
+    n_folded    integer := 0;
+    n_left      integer := 0;
+BEGIN
+    FOR item IN
+        SELECT d.id, d.landlord_id, d.title, d.description, d.due_date,
+               d.recurrence, d.assigned_to, d.created_at
+          FROM daily_tasks d
+         -- A done item has nothing left to do, so there is nothing to put on a
+         -- checklist; its record stays here, ticked, with who finished it.
+         WHERE d.completed = FALSE
+           AND d.folded_into_property_task_id IS NULL
+         ORDER BY d.created_at, d.id
+    LOOP
+        park := NULL;
+
+        -- 1. The person it was given to, when they work exactly one of this
+        --    company's parks. A worker set to all_properties points at every
+        --    park, which points at none of them.
+        IF item.assigned_to IS NOT NULL THEN
+            SELECT array_agg(DISTINCT s.property_id) INTO parks
+              FROM (
+                SELECT user_id, landlord_id, unnest(property_ids) AS property_id
+                  FROM maintenance_worker_scopes WHERE all_properties = FALSE
+                UNION ALL
+                SELECT user_id, landlord_id, unnest(property_ids) AS property_id
+                  FROM onsite_manager_scopes WHERE all_properties = FALSE
+                UNION ALL
+                SELECT user_id, landlord_id, unnest(property_ids) AS property_id
+                  FROM property_manager_scopes WHERE all_properties = FALSE
+              ) s
+              JOIN properties p ON p.id = s.property_id AND p.landlord_id = item.landlord_id
+             WHERE s.user_id = item.assigned_to
+               AND s.landlord_id = item.landlord_id;
+            IF parks IS NOT NULL AND array_length(parks, 1) = 1 THEN
+                park := parks[1];
+            END IF;
+        END IF;
+
+        -- 2. The company itself, when it owns one park. Then the line can only
+        --    be about that park.
+        IF park IS NULL THEN
+            SELECT array_agg(p.id) INTO parks
+              FROM properties p WHERE p.landlord_id = item.landlord_id;
+            IF parks IS NOT NULL AND array_length(parks, 1) = 1 THEN
+                park := parks[1];
+            END IF;
+        END IF;
+
+        IF park IS NULL THEN
+            UPDATE daily_tasks
+               SET fold_note = 'Left on the old list: nothing on this item names a property, and the '
+                               'company it belongs to has more than one. Putting somebody''s job on the '
+                               'wrong park is worse than leaving it here, so it was not guessed at.'
+             WHERE id = item.id;
+            n_left := n_left + 1;
+            CONTINUE;
+        END IF;
+
+        -- The line, in the words that were typed. Title and detail read as one
+        -- sentence because the park's list has no title/detail split: the whole
+        -- thing is the task.
+        line := btrim(coalesce(item.title, ''));
+        IF coalesce(btrim(item.description), '') <> '' THEN
+            line := CASE WHEN line = '' THEN btrim(item.description)
+                         ELSE line || ' — ' || btrim(item.description) END;
+        END IF;
+        IF line = '' THEN
+            -- The old POST had no title validator, so a wordless row is
+            -- possible. There is nothing to put on a checklist.
+            UPDATE daily_tasks
+               SET fold_note = 'Left on the old list: the item has no words on it, so there is nothing '
+                               'to put on a park''s list.'
+             WHERE id = item.id;
+            n_left := n_left + 1;
+            CONTINUE;
+        END IF;
+
+        -- The due date and the repeat, said the way a landlord would say them.
+        -- Never a raw enum: 'weekly' is not a thing anybody says out loud.
+        repeats := CASE item.recurrence
+                     WHEN 'none'    THEN NULL
+                     WHEN 'daily'   THEN 'every day'
+                     WHEN 'weekly'  THEN 'every week'
+                     WHEN 'monthly' THEN 'every month'
+                     ELSE replace(item.recurrence, '_', ' ')
+                   END;
+        when_said := NULL;
+        IF item.due_date IS NOT NULL AND repeats IS NOT NULL THEN
+            when_said := 'was due ' || to_char(item.due_date, 'FMMon FMDD, YYYY')
+                         || ' and set to repeat ' || repeats;
+        ELSIF item.due_date IS NOT NULL THEN
+            when_said := 'was due ' || to_char(item.due_date, 'FMMon FMDD, YYYY');
+        ELSIF repeats IS NOT NULL THEN
+            when_said := 'was set to repeat ' || repeats;
+        END IF;
+        IF when_said IS NOT NULL THEN
+            line := line || ' (' || when_said || ')';
+        END IF;
+
+        -- Whose line it is. The old list was the landlord's own list, so the
+        -- folded line is theirs; the person it used to be assigned to is NOT
+        -- carried over, because the park's list belongs to the park and not to
+        -- anybody (20261022150000: "whoever is there does the next line"). Their
+        -- name is still on the row here.
+        SELECT l.user_id INTO owner_user FROM landlords l WHERE l.id = item.landlord_id;
+        IF owner_user IS NULL THEN
+            UPDATE daily_tasks
+               SET fold_note = 'Left on the old list: the company that owns it has no owner account to '
+                               'put the line under.'
+             WHERE id = item.id;
+            n_left := n_left + 1;
+            CONTINUE;
+        END IF;
+
+        -- created_at is carried over, not restamped: these lines were asked for
+        -- before today's, and the park's list reads in the order things were
+        -- asked for.
+        INSERT INTO property_task_list_items (property_id, body, added_by_user_id, created_at)
+        VALUES (park, line, owner_user, item.created_at)
+        RETURNING id INTO new_line_id;
+
+        -- updated_at is deliberately left alone: a pointer to where the line
+        -- went is not the landlord editing their task.
+        UPDATE daily_tasks
+           SET folded_into_property_task_id = new_line_id,
+               fold_note = NULL
+         WHERE id = item.id;
+        n_folded := n_folded + 1;
+    END LOOP;
+
+    RETURN QUERY SELECT n_folded, n_left;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION fold_old_task_list_into_property_lists(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.fold_old_task_list_into_property_lists() IS '10/20 (Nic): moves every still-open item from the retired landlord-wide Tasks list (daily_tasks) onto the park task list it belongs to, and leaves a note on the ones no park could be worked out for. Idempotent — run it again after the old tab stops being offered to catch anything added in between.';
 
 
 --
@@ -6790,6 +6964,44 @@ $_$;
 
 
 --
+-- Name: occupancy_night_block_delete(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.occupancy_night_block_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  RAISE EXCEPTION
+    'unit_occupancy_nights row % is the record that site % was occupied on % — a night that happened cannot be deleted',
+    OLD.id, OLD.unit_id, OLD.night;
+END;
+$$;
+
+
+--
+-- Name: occupancy_night_freeze(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.occupancy_night_freeze() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.night       IS DISTINCT FROM OLD.night
+  OR NEW.unit_id     IS DISTINCT FROM OLD.unit_id
+  OR NEW.booking_id  IS DISTINCT FROM OLD.booking_id
+  OR NEW.property_id IS DISTINCT FROM OLD.property_id
+  OR NEW.lease_type  IS DISTINCT FROM OLD.lease_type
+  OR NEW.unit_type   IS DISTINCT FROM OLD.unit_type THEN
+    RAISE EXCEPTION
+      'unit_occupancy_nights row % is what the schedule said that night — site, night, reservation and kind are frozen',
+      OLD.id;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: occupy_unit_on_active_lease(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -7201,6 +7413,28 @@ BEGIN
   RAISE EXCEPTION 'Platform ownership cannot be changed here — it takes a migration.'
     USING ERRCODE = 'raise_exception';
 END;
+$$;
+
+
+--
+-- Name: register_book_companies(uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.register_book_companies(company uuid, caller_user uuid) RETURNS SETOF uuid
+    LANGUAGE sql STABLE
+    AS $$
+  SELECT l.id FROM landlords l
+   WHERE caller_user IS NOT NULL
+     AND l.user_id = (SELECT o.user_id FROM landlords o WHERE o.id = company)
+     AND (
+          -- 1. the account behind this company is the caller's own
+          l.user_id = caller_user
+          -- 2. a co-owner reaches the companies they co-own, and no siblings
+       OR EXISTS (SELECT 1 FROM landlord_members cm
+                   WHERE cm.landlord_id = l.id AND cm.user_id = caller_user)
+     )
+  UNION
+  SELECT company
 $$;
 
 
@@ -11193,8 +11427,24 @@ CREATE TABLE public.daily_tasks (
     completed_by uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    folded_into_property_task_id uuid,
+    fold_note text,
     CONSTRAINT daily_tasks_recurrence_check CHECK ((recurrence = ANY (ARRAY['none'::text, 'daily'::text, 'weekly'::text, 'monthly'::text])))
 );
+
+
+--
+-- Name: COLUMN daily_tasks.folded_into_property_task_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.daily_tasks.folded_into_property_task_id IS '10/20 (Nic): the line on a property task list this item became when the old landlord-wide Tasks tab was retired. The row here is kept as it was — GAM never erases — and this says where to look for the live copy. NULL means it was never folded: it was already done, or nothing on it said which park it belonged to (see fold_note).';
+
+
+--
+-- Name: COLUMN daily_tasks.fold_note; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.daily_tasks.fold_note IS 'Why this item was left on the old list instead of being folded onto a property, in plain words. Nic 10/20: an item that points nowhere is said out loud, not guessed at.';
 
 
 --
@@ -17882,6 +18132,54 @@ CREATE TABLE public.property_site_photos (
 
 
 --
+-- Name: property_task_list_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_task_list_items (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    body text NOT NULL,
+    added_by_user_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    done_at timestamp with time zone,
+    done_by_user_id uuid,
+    hidden_at timestamp with time zone,
+    hidden_by_user_id uuid,
+    CONSTRAINT property_task_list_items_body_not_blank CHECK ((btrim(body) <> ''::text)),
+    CONSTRAINT property_task_list_items_done_together CHECK (((done_at IS NULL) = (done_by_user_id IS NULL))),
+    CONSTRAINT property_task_list_items_hidden_together CHECK (((hidden_at IS NULL) = (hidden_by_user_id IS NULL)))
+);
+
+
+--
+-- Name: TABLE property_task_list_items; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.property_task_list_items IS '10/20 (Blu, via Nic): a plain checklist on one property. The landlord adds lines, the maintenance person ticks them off. Deliberately OUTSIDE maintenance: no status, no priority, no assignment, no duration, and nothing that reports on maintenance reads it — Nic: "it''s not counting how long it takes to get closed after it''s been open".';
+
+
+--
+-- Name: COLUMN property_task_list_items.body; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.property_task_list_items.body IS 'The task in the landlord''s own words, e.g. "fix these meters". The whole task — there is no title.';
+
+
+--
+-- Name: COLUMN property_task_list_items.done_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.property_task_list_items.done_at IS 'When it was ticked. Kept, never counted: no report measures the gap between created_at and this.';
+
+
+--
+-- Name: COLUMN property_task_list_items.hidden_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.property_task_list_items.hidden_at IS 'The landlord took the line off the list. GAM never erases, so the row, its tick and its author stay.';
+
+
+--
 -- Name: property_transfer_approvals; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -20878,6 +21176,48 @@ CREATE TABLE public.unit_number_history (
 
 
 --
+-- Name: unit_occupancy_nights; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_occupancy_nights (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    booking_id uuid NOT NULL,
+    night date NOT NULL,
+    lease_type text NOT NULL,
+    unit_type text NOT NULL,
+    status_at_stamp text NOT NULL,
+    stay_terms text,
+    stamped_at timestamp with time zone DEFAULT now() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE unit_occupancy_nights; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.unit_occupancy_nights IS '10/21 (Nic): one row per site per night, stamped the morning after and never rewritten — the nights GAM bills in arrears, so re-dating or deleting a reservation later cannot lower the count. services/occupancyNights.';
+
+
+--
+-- Name: COLUMN unit_occupancy_nights.lease_type; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_occupancy_nights.lease_type IS 'The reservation''s kind AS AT THE NIGHT. The count reads this, not the live row (editing it later must not un-count a night).';
+
+
+--
+-- Name: COLUMN unit_occupancy_nights.unit_type; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_occupancy_nights.unit_type IS 'The site''s type AS AT THE NIGHT, for the same reason — only some types aggregate nights (NIGHTS_AGGREGATION_UNIT_TYPES).';
+
+
+--
 -- Name: unit_out_of_order; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -21470,6 +21810,8 @@ CREATE TABLE public.utility_meter_readings (
     reason_note text,
     bill_amount numeric(12,2),
     photo_url text,
+    move_out_lease_id uuid,
+    move_out_space_move boolean DEFAULT false NOT NULL,
     CONSTRAINT utility_meter_readings_reason_check CHECK ((reason = ANY (ARRAY['monthly_cycle'::text, 'stay_turnover'::text, 'move_out_final'::text, 'meter_replaced'::text, 'baseline'::text, 'billed_off_platform'::text, 'other'::text])))
 );
 
@@ -21486,6 +21828,20 @@ COMMENT ON COLUMN public.utility_meter_readings.reason IS 'S605: monthly_cycle =
 --
 
 COMMENT ON COLUMN public.utility_meter_readings.bill_amount IS 'S607: RUBS master only — the utility provider''s total dollar charge for this cycle (A.R.S. § 33-2107(C)(1) "actual expense of obtaining the utility, including the taxes and fees"). With reading_value (total gallons) it gives the blended rate the whole line bills at. NULL on submeters, and on a master means the dollar bill was not entered.';
+
+
+--
+-- Name: COLUMN utility_meter_readings.move_out_lease_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_meter_readings.move_out_lease_id IS 'The household a HELD move-out read closes out, stamped when the read is held for the landlord''s double-check so resolving it bills the same household the desk named.';
+
+
+--
+-- Name: COLUMN utility_meter_readings.move_out_space_move; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_meter_readings.move_out_space_move IS 'TRUE when a HELD move-out read is a space move''s closing read: the resident is staying, so resolving it bills their old space with no final invoice and no "your last days" email.';
 
 
 --
@@ -21651,7 +22007,7 @@ COMMENT ON VIEW public.utility_owner_use_absorptions IS '10/20: the old name for
 
 CREATE TABLE public.utility_pay_link_settlements (
     id uuid DEFAULT public.gen_random_uuid() NOT NULL,
-    pay_link_id uuid NOT NULL,
+    pay_link_id uuid,
     landlord_id uuid NOT NULL,
     property_id uuid NOT NULL,
     utility_bill_id uuid,
@@ -21672,9 +22028,13 @@ CREATE TABLE public.utility_pay_link_settlements (
     notes text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    raised_at_counter boolean DEFAULT false NOT NULL,
+    meter_reading_id uuid,
     CONSTRAINT upls_amount_check CHECK ((charge_amount >= (0)::numeric)),
     CONSTRAINT upls_cancelled_is_stamped CHECK (((cancelled_at IS NOT NULL) = (status = 'cancelled'::text))),
+    CONSTRAINT upls_counter_row_names_its_bill CHECK (((NOT raised_at_counter) OR (utility_bill_id IS NOT NULL))),
     CONSTRAINT upls_no_bill_means_a_sale CHECK (((utility_bill_id IS NOT NULL) OR (status = ANY (ARRAY['settled'::text, 'refunded'::text])))),
+    CONSTRAINT upls_one_door CHECK (((pay_link_id IS NOT NULL) <> raised_at_counter)),
     CONSTRAINT upls_refunded_is_stamped CHECK (((refunded_at IS NOT NULL) = (status = 'refunded'::text))),
     CONSTRAINT upls_sale_shape CHECK (((pos_transaction_id IS NOT NULL) = (status = ANY (ARRAY['settled'::text, 'refunded'::text])))),
     CONSTRAINT upls_settled_is_stamped CHECK (((settled_at IS NOT NULL) = (status = ANY (ARRAY['settled'::text, 'refunded'::text])))),
@@ -21689,6 +22049,13 @@ CREATE TABLE public.utility_pay_link_settlements (
 --
 
 COMMENT ON TABLE public.utility_pay_link_settlements IS '10/20 (Nic): the one book for utility money collected on a PAY LINK — "a paylink''s utility line settles the bill and counts as recovery". One row per utility line on a link: with utility_bill_id, the bill that line closes out (the bill stays the record of what was billed back, so this row adds no second figure); without one, a line rung up by hand for somebody''s power that no bill was ever cut for — which is the only kind that is itself a figure, and is what happened to Andres Razo''s $163.17 of August and September electric. Which utility comes from the bill or from pos_items.recovers_utility, never from an item name.';
+
+
+--
+-- Name: COLUMN utility_pay_link_settlements.pay_link_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_pay_link_settlements.pay_link_id IS 'The emailed link this utility line went out on, or NULL when the line was raised at the register with the payer standing there (raised_at_counter). Those are the only two doors, and upls_one_door holds a row to one of them.';
 
 
 --
@@ -21710,6 +22077,20 @@ COMMENT ON COLUMN public.utility_pay_link_settlements.status IS 'open (a link is
 --
 
 COMMENT ON COLUMN public.utility_pay_link_settlements.payment_id IS 'The charge row on the payer''s invoice that this collection took care of. The charge is VOIDED when the link is paid (services/chargeVoids — "a charge nobody owes is voided, never deleted"), because the money came in through the register sale and the charge accruing the same income twice would double the revenue in the books. Kept here after the void so the bill''s story stays readable.';
+
+
+--
+-- Name: COLUMN utility_pay_link_settlements.raised_at_counter; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_pay_link_settlements.raised_at_counter IS '10/20 (Nic): TRUE when the desk took the closing read and put the bill on the ticket — "I don''t want it to generate a bill". Such a row is on no invoice and nothing was emailed for it while it is open; paying the ticket settles it, and cancelling it hands the bill back to the ordinary route.';
+
+
+--
+-- Name: COLUMN utility_pay_link_settlements.meter_reading_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_pay_link_settlements.meter_reading_id IS 'The closing read this bill was raised from, when it was raised at a counter. The read always stands, whether or not the bill is ever collected.';
 
 
 --
@@ -25267,6 +25648,14 @@ ALTER TABLE ONLY public.property_site_photos
 
 
 --
+-- Name: property_task_list_items property_task_list_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_task_list_items
+    ADD CONSTRAINT property_task_list_items_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: property_transfer_approvals property_transfer_approvals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -26112,6 +26501,14 @@ ALTER TABLE ONLY public.unit_inspections
 
 ALTER TABLE ONLY public.unit_number_history
     ADD CONSTRAINT unit_number_history_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: unit_occupancy_nights unit_occupancy_nights_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_occupancy_nights
+    ADD CONSTRAINT unit_occupancy_nights_pkey PRIMARY KEY (id);
 
 
 --
@@ -30936,6 +31333,20 @@ CREATE INDEX idx_unit_number_history_unit ON public.unit_number_history USING bt
 
 
 --
+-- Name: idx_unit_occupancy_nights_property_night; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_occupancy_nights_property_night ON public.unit_occupancy_nights USING btree (property_id, night);
+
+
+--
+-- Name: idx_unit_occupancy_nights_unit_night; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_occupancy_nights_unit_night ON public.unit_occupancy_nights USING btree (unit_id, night);
+
+
+--
 -- Name: idx_unit_out_of_order_open; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -32273,6 +32684,13 @@ CREATE INDEX property_site_imports_property_id_idx ON public.property_site_impor
 
 
 --
+-- Name: property_task_list_items_property_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX property_task_list_items_property_idx ON public.property_task_list_items USING btree (property_id, created_at);
+
+
+--
 -- Name: reserve_fund_state_singleton; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -32511,6 +32929,13 @@ CREATE INDEX unit_bookings_unpaid_hold_idx ON public.unit_bookings USING btree (
 
 
 --
+-- Name: unit_occupancy_nights_once; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX unit_occupancy_nights_once ON public.unit_occupancy_nights USING btree (booking_id, night);
+
+
+--
 -- Name: units_property_building_number_uniq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -32550,6 +32975,13 @@ CREATE UNIQUE INDEX upls_one_row_per_sale_line ON public.utility_pay_link_settle
 --
 
 CREATE UNIQUE INDEX upls_one_settlement_per_bill ON public.utility_pay_link_settlements USING btree (utility_bill_id) WHERE ((status = 'settled'::text) AND (utility_bill_id IS NOT NULL));
+
+
+--
+-- Name: upls_open_at_counter; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX upls_open_at_counter ON public.utility_pay_link_settlements USING btree (property_id, created_at) WHERE ((status = 'open'::text) AND raised_at_counter);
 
 
 --
@@ -34380,6 +34812,13 @@ CREATE TRIGGER audit_unit_inspections AFTER DELETE OR UPDATE ON public.unit_insp
 
 
 --
+-- Name: unit_occupancy_nights audit_unit_occupancy_nights; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_unit_occupancy_nights AFTER DELETE OR UPDATE ON public.unit_occupancy_nights FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
 -- Name: units audit_units; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -35899,6 +36338,13 @@ CREATE TRIGGER trg_background_checks_updated_at BEFORE UPDATE ON public.backgrou
 
 
 --
+-- Name: unit_bookings trg_booking_block_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_booking_block_delete BEFORE DELETE ON public.unit_bookings FOR EACH ROW EXECUTE FUNCTION public.booking_block_delete();
+
+
+--
 -- Name: business_recurring_invoice_schedules trg_brisched_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -36204,6 +36650,20 @@ CREATE TRIGGER trg_normalize_user_name BEFORE INSERT OR UPDATE OF first_name, la
 --
 
 CREATE TRIGGER trg_notification_preferences_updated_at BEFORE UPDATE ON public.notification_preferences FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: unit_occupancy_nights trg_occupancy_night_block_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_occupancy_night_block_delete BEFORE DELETE ON public.unit_occupancy_nights FOR EACH ROW EXECUTE FUNCTION public.occupancy_night_block_delete();
+
+
+--
+-- Name: unit_occupancy_nights trg_occupancy_night_freeze; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_occupancy_night_freeze BEFORE UPDATE ON public.unit_occupancy_nights FOR EACH ROW EXECUTE FUNCTION public.occupancy_night_freeze();
 
 
 --
@@ -38848,6 +39308,14 @@ ALTER TABLE ONLY public.daily_tasks
 
 ALTER TABLE ONLY public.daily_tasks
     ADD CONSTRAINT daily_tasks_completed_by_fkey FOREIGN KEY (completed_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: daily_tasks daily_tasks_folded_into_property_task_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.daily_tasks
+    ADD CONSTRAINT daily_tasks_folded_into_property_task_id_fkey FOREIGN KEY (folded_into_property_task_id) REFERENCES public.property_task_list_items(id);
 
 
 --
@@ -43067,6 +43535,38 @@ ALTER TABLE ONLY public.property_site_photos
 
 
 --
+-- Name: property_task_list_items property_task_list_items_added_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_task_list_items
+    ADD CONSTRAINT property_task_list_items_added_by_user_id_fkey FOREIGN KEY (added_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: property_task_list_items property_task_list_items_done_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_task_list_items
+    ADD CONSTRAINT property_task_list_items_done_by_user_id_fkey FOREIGN KEY (done_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: property_task_list_items property_task_list_items_hidden_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_task_list_items
+    ADD CONSTRAINT property_task_list_items_hidden_by_user_id_fkey FOREIGN KEY (hidden_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: property_task_list_items property_task_list_items_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_task_list_items
+    ADD CONSTRAINT property_task_list_items_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id);
+
+
+--
 -- Name: property_transfer_approvals property_transfer_approvals_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -44883,6 +45383,38 @@ ALTER TABLE ONLY public.unit_number_history
 
 
 --
+-- Name: unit_occupancy_nights unit_occupancy_nights_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_occupancy_nights
+    ADD CONSTRAINT unit_occupancy_nights_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE CASCADE;
+
+
+--
+-- Name: unit_occupancy_nights unit_occupancy_nights_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_occupancy_nights
+    ADD CONSTRAINT unit_occupancy_nights_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: unit_occupancy_nights unit_occupancy_nights_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_occupancy_nights
+    ADD CONSTRAINT unit_occupancy_nights_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: unit_occupancy_nights unit_occupancy_nights_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_occupancy_nights
+    ADD CONSTRAINT unit_occupancy_nights_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
+
+
+--
 -- Name: unit_out_of_order unit_out_of_order_cleared_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -45187,6 +45719,14 @@ ALTER TABLE ONLY public.utility_meter_readings
 
 
 --
+-- Name: utility_meter_readings utility_meter_readings_move_out_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_meter_readings
+    ADD CONSTRAINT utility_meter_readings_move_out_lease_id_fkey FOREIGN KEY (move_out_lease_id) REFERENCES public.leases(id);
+
+
+--
 -- Name: utility_meter_units utility_meter_units_meter_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -45240,6 +45780,14 @@ ALTER TABLE ONLY public.utility_pay_link_settlements
 
 ALTER TABLE ONLY public.utility_pay_link_settlements
     ADD CONSTRAINT utility_pay_link_settlements_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES public.utility_meters(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: utility_pay_link_settlements utility_pay_link_settlements_meter_reading_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_pay_link_settlements
+    ADD CONSTRAINT utility_pay_link_settlements_meter_reading_id_fkey FOREIGN KEY (meter_reading_id) REFERENCES public.utility_meter_readings(id);
 
 
 --
@@ -45631,5 +46179,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Zciwpjex1scNg6O06mYhNwiplyAUpUF48GVfewwvCHbTic5aSCep2nW4tgWXBan
+\unrestrict QSudJBwA9nKFgv0HztykPkAt78gPAvzu6NgnlxpZSCEYKcVli6azZ3a64Qab1Fm
 

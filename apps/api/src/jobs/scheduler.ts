@@ -3351,6 +3351,29 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // ── 10/21 (Nic): WHO WAS IN THE SPOT LAST NIGHT, WRITTEN DOWN ──────────
+  //
+  //   "say I had 10 or 12 people go in the month, and then the landlord goes to
+  //    delete all of those out of the schedule before the close of the month…
+  //    the landlord could be cheating us out of the subscription fee by
+  //    deleting the history. We need a way to have that no matter what changes
+  //    they try to do."
+  //
+  // Hourly, at twenty past, because a park's midnight is its own: the parks run
+  // in four time zones today and will run in more, so an hourly pass writes
+  // last night down within the hour of each park's own midnight — in particular
+  // before the accrual reads the month at 1:30 am Phoenix on the 1st. It writes
+  // nothing on almost every run, because the night it would write is already
+  // written (services/occupancyNights).
+  cron.schedule('20 * * * *', async () => {
+    try {
+      const { stampOccupancyNightsHourly } = await import('../services/occupancyNights')
+      await stampOccupancyNightsHourly()
+    } catch (e) {
+      logger.error({ err: e }, '[occupancy-nights] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S600: no-double-bill onboarding grace — daily cap sweep. Runs 1:15am Phoenix,
   // just BEFORE the monthly platform-fee accrual (1:30am on the 1st), so a landlord
   // whose grace cap month has arrived is flipped to billing in time for that month's

@@ -198,6 +198,34 @@ export async function cleanupAllSchema(): Promise<void> {
   }
 }
 
+/**
+ * 10/21 — REMOVE A RESERVATION IN A TEST, PAST THE DELETE REFUSAL.
+ *
+ * Production cannot delete one at all: `trg_booking_block_delete` refuses it,
+ * because the nights a reservation held are what GAM bills in arrears and
+ * erasing the history was how a landlord could lower the bill (Nic, 10/21). A
+ * handful of tests need a reservation to be simply ABSENT — they are testing
+ * what a lookup does when there is no row — so they set the replica role for
+ * the one statement, the way cleanupAllSchema sets it for the whole wipe.
+ *
+ * Nothing outside a test may use this. There is no application path.
+ */
+export async function deleteBookingsForTest(bookingId?: string): Promise<void> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    await client.query(`SELECT set_config('session_replication_role', 'replica', true)`)
+    if (bookingId) await client.query(`DELETE FROM unit_bookings WHERE id = $1`, [bookingId])
+    else await client.query(`DELETE FROM unit_bookings`)
+    await client.query('COMMIT')
+  } catch (e) {
+    try { await client.query('ROLLBACK') } catch { /* ignore */ }
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
 export async function withRollback<T>(
   fn: (client: PoolClient) => Promise<T>
 ): Promise<T> {
