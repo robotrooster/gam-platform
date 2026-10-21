@@ -67,7 +67,10 @@ describe('action parity — what a person can do, the agent should be able to do
     // nine (routes/booksLoansAssets.ts, each named in actionGap DELIBERATE)
     // and the Contractors list took two away (contractors are vendors now),
     // beside the ledger's other phases.
-    expect(reachable).toBeLessThan(500)
+    // 10/20: 501 after the utility pay link, the reservation importer and the
+    // duplicate-person screens — six mutating routes, every one of them named
+    // in actionGap DELIBERATE because a person pressing them is the feature.
+    expect(reachable).toBeLessThan(530)
   })
 
   it('nothing from another portal has crept into a landlord or tenant agent', async () => {

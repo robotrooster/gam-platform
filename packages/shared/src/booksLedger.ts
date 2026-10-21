@@ -1006,6 +1006,18 @@ export const LEDGER_EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   tenant_one_off_charges: 'a charge before it is billed; once billed it is a payments row (payment_id)',
   propane_fills: 'billed as payments rows',
   propane_fill_installments: 'billed as payments rows',
+  // 10/20 (Nic, "call it a wash"): four records ABOUT money, none of which is
+  // money moving. The whole point of the wash is that nothing is charged — a
+  // posting source here would invent a transaction out of a decision not to
+  // bill one, which is the opposite of what these rows exist to prove.
+  utility_absorbed_charges:
+    'utility billed to NOBODY — the provable record that a charge was held back rather than passed through; nothing moved, so nothing posts',
+  utility_wash_holds:
+    'a final utility stub parked while the desk answers the money question; it posts later as a utility_bills row or becomes an absorbed row, and never itself',
+  early_departure_washes:
+    "the unused money a departing guest's stay left with the landlord; it already posted when they paid it (stay_payments), so this is the record of what was kept, never a second movement",
+  utility_pay_link_settlements:
+    'HOW a utility bill was collected; the bill and the register sale are what post (utility_bills, pos_transactions)',
   common_area_reservations: 'its fee is billed as a payments row (fee_payment_id)',
   common_areas: CONFIGURATION,
   suspended_utility_charges: 'a utility charge held back; once released it is billed as a payments row',

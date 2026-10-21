@@ -168,6 +168,28 @@ const DELIBERATE = new Map(Object.entries({
   // the lines on screen, never from a spoken figure.
   'posPayLinks PATCH /:id':
     'changes the lines and total of an unpaid link. Done from the outstanding list with every line on screen; a misheard number is a real charge.',
+  // ── 10/20: a utility bill sent as a link ─────────────────────────────────
+  'posPayLinks POST /utility-bills':
+    'emails a person a card page for their utility bills — most often the final bill of somebody who has already left. Same reason as every other pay link: it is a real charge sent to a real address, and the bills are picked from a list on screen beside who they belong to. The figures come off the bills, so there is nothing for a spoken number to get wrong; who it goes to is the part that would be.',
+  // ── 10/20 (Nic): the confirmation and the old schedule coming in ─────────
+  //
+  // These three are not withheld because they are risky to get wrong. They are
+  // withheld because a PERSON pressing them is the whole feature. Nic:
+  // "the imports should not send anybody anything", and the confirmation exists
+  // as a deliberate act precisely so a 150-row season file cannot become 150
+  // emails. An agent that could press them would be the auto-send the design
+  // forbids, however carefully it asked first.
+  'bookings POST /:id/confirmation':
+    'emails a guest their reservation with a deposit offer. Deliberately a human act: the whole reason it is a separate button is that bringing the old schedule in must never email anybody, and Nic reads the wording before the first one goes out.',
+  'bookings POST /import/validate':
+    'reads an export from another park-management system and shows what it would do. Takes a file, which an agent does not hold, and its answer is a screen a person reads row by row before committing.',
+  'bookings POST /import/commit':
+    'puts a whole season of reservations on the board, taking sites in file order. Reviewed row by row on screen first; a batch nobody read is a board nobody can trust, and the guests in it were promised their sites somewhere else.',
+  // ── 10/20 (Nic): the same person twice ───────────────────────────────────
+  'duplicatePeople POST /:id/same-person':
+    "folds two records into one person, moving an email address and repointing their reservations. Nic: \"always have the landlord check that the customer is the same.\" The two people are shown side by side with what each actually has; a wrong answer joins two real people's histories.",
+  'duplicatePeople POST /:id/not-duplicate':
+    'answers that two records are different people, and the pair is never raised again. The same landlord call as the merge, in the other direction — a dismissal nobody made would hide a real duplicate for good.',
   // ── S652: posting a check that arrived before its bill ────────────────────
   'payments POST /post-payment':
     'writes down cash, a check or a money order handed over at the office and banks what is beyond the open balance as paid ahead. Done at the desk with the check in hand — the amount, the check number and the date come off the paper, and a misheard figure is money the books say arrived and did not. The agent records a payment against an open charge (record_cash_payment); money ahead of any bill is the desk\'s to post.',

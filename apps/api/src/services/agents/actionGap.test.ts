@@ -29,8 +29,12 @@ describe('action parity — the gap stays closed', () => {
     // reached the old ceiling: 450 counted. Raised to that real count plus
     // room for one build's worth of routes — raise it again, on purpose, when
     // a build passes it, never to hide a bulk addition.
+    // 10/20: 463 counted, after the utility pay link, the reservation importer
+    // and the duplicate-person screens. Raised on purpose, with each of those
+    // six named in DELIBERATE — the ceiling is here to catch a bulk addition
+    // nobody decided about, not to be nudged past one build at a time.
     expect(gap.all.length).toBeGreaterThan(250)
-    expect(gap.all.length).toBeLessThan(460)
+    expect(gap.all.length).toBeLessThan(475)
   })
 
   it('every endpoint is either reachable or deliberately not — nothing is merely forgotten', () => {
