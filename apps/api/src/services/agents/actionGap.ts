@@ -50,6 +50,16 @@ const DELIBERATE = new Map(Object.entries({
   // are back on; the tick is not worth revisiting.
   'propertyTaskList POST /:propertyId':
     'adds a line to a property\'s task list. Nic 10/20, relaying Blu: "it\'s stuff assigned by the landlord himself, not necessarily requests coming from the tenant, or work orders or whatever" — a list the assistant composes is a list nobody decided, which is the whole thing this list is meant to be.',
+  // 10/21: and the two ways back from a stray click. Both are the OWNER
+  // correcting their own screen — "I clicked on it and it highlighted and I
+  // couldn't unclick it… I tried to X out of it and it deleted it from the
+  // list". An assistant un-ticking a line erases a worker's record of having
+  // done the work, which is the done rule read backwards; an assistant putting
+  // a line back puts a job in front of somebody that the owner took away.
+  'propertyTaskList POST /:propertyId/items/:itemId/undone':
+    'un-ticks a task. The tick carries the name of whoever said they did the work, so clearing it is as much a person\'s act as pressing it was — see the done rule above.',
+  'propertyTaskList POST /:propertyId/items/:itemId/unhide':
+    'puts a line the owner took off the park\'s list back on it. The owner\'s own correction; an assistant doing it hands the maintenance person a job the owner had decided against.',
   'propertyTaskList POST /:propertyId/items/:itemId/done':
     'ticks a task off as done, and the row keeps who ticked it for good. That name is somebody saying they were there and did the work; an assistant pressing it records work nobody did. Same reason an agent never signs.',
   'propertyTaskList POST /:propertyId/items/:itemId/hide':
