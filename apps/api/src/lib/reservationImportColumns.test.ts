@@ -55,6 +55,54 @@ describe('column names', () => {
     expect(row.total_amount).toBeUndefined()
   })
 
+  // 10/21 — Campground Master's own export: "First Night" and "LAST NIGHT".
+  it('reads "Last Night" as the last night slept, so check-out is the morning after', () => {
+    const [row] = applyReservationMapping([{
+      'Site Name': '12', 'Last Name': 'Sutherland', 'First Names': 'Val',
+      'First Night': '10/17/2026', 'Last Night': '10/23/2026',
+    }])
+    expect(row.check_in).toBe('10/17/2026')
+    // Seven nights, the 17th through the 23rd — not six.
+    expect(row.check_out).toBe('2026-10-24')
+    // 10/21: Campground Master's own headers, read whole — "First Names" is
+    // plural in their export and used to fall straight into the unread pile,
+    // so every guest in the file came in as a surname with no first name.
+    expect(row.first_name).toBe('Val')
+    expect(row.last_name).toBe('Sutherland')
+    expect(guestNameFrom(row)).toBe('Val Sutherland')
+    expect(row.unit_number).toBe('12')
+  })
+
+  it('reads the rest of Campground Master\'s own headers: a numbered phone column and a confirmation number with a period in it', () => {
+    const [row] = applyReservationMapping([{
+      'Last Name': 'Abel', 'First Names': 'Vesta', 'Phone 1': '(520) 406-9840',
+      'Phone 2': '', 'Email': 'vestaalegria@gmail.com', 'Confirm. #': 'R000001234',
+    }])
+    expect(row.phone).toBe('(520) 406-9840')
+    expect(row.external_ref).toBe('R000001234')
+    expect(row.email).toBe('vestaalegria@gmail.com')
+  })
+
+  it('a customer whose only number is in the second column keeps it', () => {
+    const [row] = applyReservationMapping([{ 'Last Name': 'Abel', 'Phone 1': '', 'Phone 2': '520-555-0133' }])
+    expect(row.phone).toBe('520-555-0133')
+  })
+
+  it('a month stay read off "Last Night" stays a month — one night short would change what kind of stay it is', () => {
+    const [row] = applyReservationMapping([{ Guest: 'Victor Cardoza', Site: '11',
+      'First Night': '10/4/2026', 'Last Night': '11/3/2026' }])
+    expect(row.check_out).toBe('2026-11-04')
+  })
+
+  it('a column that names the DAY THEY LEAVE is left exactly as it is', () => {
+    expect(applyReservationMapping([{ Guest: 'Dale', Arrive: '3/6/27', Depart: '3/13/27' }])[0].check_out).toBe('3/13/27')
+    expect(applyReservationMapping([{ Guest: 'Dale', 'Check In': '3/6/27', 'Check Out': '3/13/27' }])[0].check_out).toBe('3/13/27')
+    // "Thru" and "through" are deliberately NOT moved: half the park systems
+    // mean the departure day by them and the other half the last night, and
+    // guessing on an ambiguous label is worse than reading it as written.
+    expect(applyReservationMapping([{ Guest: 'Dale', From: '3/6/27', Thru: '3/13/27' }])[0].check_out).toBe('3/13/27')
+  })
+
   it('takes the first recognized column when an export has two for one thing', () => {
     const [row] = applyReservationMapping([{ Site: 'RV 14', 'Assigned Site': 'RV 03' }])
     expect(row.unit_number).toBe('RV 14')

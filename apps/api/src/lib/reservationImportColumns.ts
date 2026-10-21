@@ -53,8 +53,14 @@ const ALIASES: Record<ReservationCanonicalHeader, readonly string[]> = {
     'tenant name', 'primary guest', 'reservation name', 'party', 'party name',
     'registered to', 'reserved for', 'last, first',
   ],
-  first_name: ['first_name', 'first name', 'firstname', 'first', 'given name'],
-  last_name:  ['last_name', 'last name', 'lastname', 'last', 'surname', 'family name'],
+  // 10/21: 'first names' PLURAL is Campground Master's own header — it holds
+  // "John & Colleen" — and without it every row in Nic's file imported as a
+  // surname with no first name.
+  first_name: [
+    'first_name', 'first name', 'first names', 'first name(s)', 'firstname',
+    'first', 'given name', 'given names',
+  ],
+  last_name:  ['last_name', 'last name', 'last names', 'lastname', 'last', 'surname', 'family name'],
   email: [
     'email', 'e-mail', 'email address', 'e-mail address', 'guest email',
     'customer email', 'emails', 'primary email', 'contact email',
@@ -63,6 +69,13 @@ const ALIASES: Record<ReservationCanonicalHeader, readonly string[]> = {
     'phone', 'phone number', 'phone #', 'telephone', 'mobile', 'mobile phone',
     'cell', 'cell phone', 'cellular', 'primary phone', 'guest phone',
     'contact phone', 'home phone', 'phone numbers',
+    // 10/21: Campground Master numbers its phone columns. They are listed in
+    // order, and the first column with something in it wins (see
+    // applyReservationMapping), so a customer with only a second number keeps
+    // it instead of coming in with none.
+    'phone 1', 'phone1', 'phone #1', 'phone # 1',
+    'phone 2', 'phone2', 'phone #2', 'phone # 2',
+    'phone 3', 'phone3', 'phone #3', 'phone # 3',
   ],
   property_name: [
     'property_name', 'property', 'property name', 'park', 'park name', 'resort',
@@ -85,7 +98,9 @@ const ALIASES: Record<ReservationCanonicalHeader, readonly string[]> = {
     'check_out', 'check out', 'check-out', 'checkout', 'check out date',
     'check-out date', 'departure', 'depart', 'departure date', 'departing',
     'date out', 'out', 'end', 'end date', 'to', 'to date', 'thru', 'through',
-    'last night',
+    // 10/21: INCLUSIVE — see INCLUSIVE_CHECK_OUT below. Campground Master
+    // writes "Last Night", the last night slept; check-out is the morning after.
+    'last night', 'last night of stay', 'final night', 'last nite',
   ],
   nights: [
     'nights', '# nights', '#nights', 'no of nights', 'number of nights',
@@ -111,6 +126,10 @@ const ALIASES: Record<ReservationCanonicalHeader, readonly string[]> = {
     'confirmation no', 'confirmation number', 'confirmation code', 'booking #',
     'booking no', 'booking number', 'booking id', 'id', 'ref', 'reference',
     'reference #',
+    // 10/21: Campground Master's own, with the period. This is what lets a row
+    // be matched back to the old system and a re-run know it has seen it.
+    'confirm. #', 'confirm #', 'confirm. no', 'confirm no', 'conf #', 'conf. #',
+    'confirmation', 'confirm', 'confirmation code #',
   ],
   notes: [
     'notes', 'note', 'comment', 'comments', 'memo', 'remarks', 'special requests',
@@ -153,23 +172,59 @@ export function reservationColumnsAccepted(): { field: ReservationCanonicalHeade
  * strike, so a column we did not understand is still in the row somebody can
  * look at afterwards.
  */
+/**
+ * 10/21 — COLUMNS THAT NAME THE LAST NIGHT, NOT THE DAY THEY LEAVE.
+ *
+ * Campground Master's export is "First Night" and "LAST NIGHT". The last night
+ * is the last one slept on the site; the guest leaves the MORNING AFTER, and
+ * check-out in GAM is the day they go (a stay Oct 17 → Oct 24 is seven nights,
+ * 17th through 23rd). Read straight across, every reservation in Nic's season
+ * would come in a night short — and a 30-night month would read as 29, which
+ * also flips the kind of stay it is (leaseTypeForNights), what rate has to
+ * exist for it, and what the arrival ticket asks for.
+ *
+ * So a check-out that came out of one of THESE columns is moved on a day.
+ * Only labels that unambiguously name a NIGHT are in here: "thru" and
+ * "through" are left alone, because half the park systems in the world mean
+ * the departure day by them and the other half mean the last night, and
+ * guessing on an ambiguous label is worse than reading it as written.
+ */
+const INCLUSIVE_CHECK_OUT = new Set(['last night', 'last night of stay', 'final night', 'last nite'])
+
 export function applyReservationMapping(records: Record<string, any>[]): Record<string, any>[] {
   return records.map(rec => {
     const out: Record<string, any> = {}
     const extra: Record<string, any> = {}
+    let checkOutWasInclusive = false
     for (const [key, val] of Object.entries(rec)) {
       const canonical = ALIAS_TO_CANONICAL.get(norm(key))
       if (canonical) {
         // First recognized column wins: an export with both "Site" and
         // "Assigned Site" keeps the one that came first in the file.
-        if (out[canonical] === undefined || out[canonical] === '') out[canonical] = val
+        if (out[canonical] === undefined || out[canonical] === '') {
+          out[canonical] = val
+          if (canonical === 'check_out') checkOutWasInclusive = INCLUSIVE_CHECK_OUT.has(norm(key))
+        }
       } else if (!NOISE_SET.has(norm(key))) {
         extra[key] = val
       }
     }
+    // The day after the last night is the day they leave. Done here, on the
+    // mapped value, so the preview and the commit can never disagree about it.
+    if (checkOutWasInclusive) {
+      const night = parseStayDate(out.check_out)
+      if (night) out.check_out = addDay(night)
+    }
     if (Object.keys(extra).length > 0) out._extra = extra
     return out
   })
+}
+
+/** One day on from 'YYYY-MM-DD'. */
+function addDay(ymd: string): string {
+  const at = new Date(`${ymd}T00:00:00Z`)
+  at.setUTCDate(at.getUTCDate() + 1)
+  return at.toISOString().slice(0, 10)
 }
 
 // ── DATES ────────────────────────────────────────────────────────────────────
