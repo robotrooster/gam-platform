@@ -126,6 +126,14 @@ const tick = (token: string, propertyId: string, itemId: string) =>
 const hide = (token: string, propertyId: string, itemId: string) =>
   app().post(`/api/property-task-list/${propertyId}/items/${itemId}/hide`)
     .set('Authorization', `Bearer ${token}`).send({})
+const untick = (token: string, propertyId: string, itemId: string) =>
+  app().post(`/api/property-task-list/${propertyId}/items/${itemId}/undone`)
+    .set('Authorization', `Bearer ${token}`).send({})
+const unhide = (token: string, propertyId: string, itemId: string) =>
+  app().post(`/api/property-task-list/${propertyId}/items/${itemId}/unhide`)
+    .set('Authorization', `Bearer ${token}`).send({})
+const listWithRemoved = (token: string, propertyId: string) =>
+  app().get(`/api/property-task-list/${propertyId}?withHidden=1`).set('Authorization', `Bearer ${token}`)
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -432,5 +440,116 @@ describe('it sits outside maintenance, and that is the point', () => {
       'added_by_user_id', 'body', 'created_at', 'done_at', 'done_by_user_id',
       'hidden_at', 'hidden_by_user_id', 'id', 'property_id',
     ])
+  })
+})
+
+
+/**
+ * 10/21 (Nic), after a stray click on Mountain View's list:
+ *
+ *   "I clicked on it and it highlighted and I couldn't unclick it. And then I
+ *    tried to X out of it and it deleted it from the list, not completed it. So
+ *    whatever was there, I didn't get a chance to read it. Please revert that."
+ *
+ * Nothing had been erased — the row sat there with hidden_at stamped on it — but
+ * nothing on screen could bring it back, which from where he stood is the same
+ * as gone. Both one-way doors now have a way back, and both are the OWNER's:
+ * the one-way tick is what stops a second tap on a worker's phone rewriting the
+ * name of whoever did the work.
+ */
+describe('10/21 (Nic): nothing on this list is one-way for the owner', () => {
+  it('un-ticks a line the owner ticked by accident, and clears the ticker with it', async () => {
+    const park = await seedPark()
+    const { body: added } = await add(park.token, park.propertyId, 'Fix the meters on row C')
+    const id = added.data.id
+    await tick(park.token, park.propertyId, id)
+    expect((await list(park.token, park.propertyId)).body.data[0].doneAt).toBeTruthy()
+
+    const r = await untick(park.token, park.propertyId, id)
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    const back = (await list(park.token, park.propertyId)).body.data[0]
+    // Not done, and by nobody — a line that is not done was not done by anyone.
+    expect(back.doneAt).toBeNull()
+    expect(back.doneByUserId).toBeNull()
+    expect(back.doneByName).toBeNull()
+    expect(back.body).toBe('Fix the meters on row C')
+  })
+
+  it('puts back a line the X took off the list, with its words intact', async () => {
+    const park = await seedPark()
+    const { body: added } = await add(park.token, park.propertyId,
+      'Final electric read — RV 44, take it the day they leave')
+    const id = added.data.id
+    await hide(park.token, park.propertyId, id)
+    // Gone from the list, as before …
+    expect((await list(park.token, park.propertyId)).body.data).toHaveLength(0)
+    // … but readable by the owner, which is what was missing.
+    const removed = (await listWithRemoved(park.token, park.propertyId)).body.data
+    expect(removed).toHaveLength(1)
+    expect(removed[0].hiddenAt).toBeTruthy()
+    expect(removed[0].body).toContain('Final electric read')
+
+    const r = await unhide(park.token, park.propertyId, id)
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    const live = (await list(park.token, park.propertyId)).body.data
+    expect(live).toHaveLength(1)
+    expect(live[0].hiddenAt).toBeNull()
+    expect(live[0].body).toContain('Final electric read')
+  })
+
+  it('putting a line back says nothing about whether the work was done', async () => {
+    const park = await seedPark()
+    const { body: added } = await add(park.token, park.propertyId, 'Re-gravel site 12')
+    const id = added.data.id
+    await tick(park.token, park.propertyId, id)
+    const whoTicked = (await list(park.token, park.propertyId)).body.data[0].doneByUserId
+    await hide(park.token, park.propertyId, id)
+    await unhide(park.token, park.propertyId, id)
+    const back = (await list(park.token, park.propertyId)).body.data[0]
+    expect(back.doneAt).toBeTruthy()
+    expect(back.doneByUserId).toBe(whoTicked)
+  })
+
+  it('the worker can tick but can neither un-tick, put back, nor see what was taken off', async () => {
+    const park = await seedPark()
+    const worker = await seedWorker(park.landlordId, { propertyIds: [park.propertyId] })
+    const { body: a } = await add(park.token, park.propertyId, 'Swap the bulb at the gate')
+    const { body: b } = await add(park.token, park.propertyId, 'Check the pump')
+    await tick(worker.token, park.propertyId, a.data.id)
+    await hide(park.token, park.propertyId, b.data.id)
+
+    expect((await untick(worker.token, park.propertyId, a.data.id)).status).toBe(403)
+    expect((await unhide(worker.token, park.propertyId, b.data.id)).status).toBe(403)
+    // The worker's tick stands, with their name on it.
+    const theirs = (await list(worker.token, park.propertyId)).body.data
+    expect(theirs).toHaveLength(1)
+    expect(theirs[0].doneByUserId).toBe(worker.userId)
+    // And asking for the removed pile gets them nothing — it is not a job list.
+    const asked = (await listWithRemoved(worker.token, park.propertyId)).body.data
+    expect(asked.map((x: any) => x.body)).toEqual(['Swap the bulb at the gate'])
+  })
+
+  it('un-ticking an open line and putting back a line already on the list change nothing', async () => {
+    const park = await seedPark()
+    const { body: added } = await add(park.token, park.propertyId, 'Tighten the gate latch')
+    const id = added.data.id
+    expect((await untick(park.token, park.propertyId, id)).status).toBe(200)
+    expect((await unhide(park.token, park.propertyId, id)).status).toBe(200)
+    const live = (await list(park.token, park.propertyId)).body.data
+    expect(live).toHaveLength(1)
+    expect(live[0].doneAt).toBeNull()
+    expect(live[0].hiddenAt).toBeNull()
+  })
+
+  it('another landlord\'s line is not un-tickable or restorable by naming a park you do have', async () => {
+    const mine = await seedPark()
+    const theirs = await seedPark('Oak Park Motel and RV')
+    const { body: hers } = await add(theirs.token, theirs.propertyId, 'Their job')
+    await tick(theirs.token, theirs.propertyId, hers.data.id)
+    // The item id is a body-supplied reference: naming my own park with their
+    // item must not reach it.
+    expect((await untick(mine.token, mine.propertyId, hers.data.id)).status).toBe(404)
+    expect((await unhide(mine.token, mine.propertyId, hers.data.id)).status).toBe(404)
+    expect((await list(theirs.token, theirs.propertyId)).body.data[0].doneAt).toBeTruthy()
   })
 })

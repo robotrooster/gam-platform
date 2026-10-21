@@ -189,3 +189,76 @@ describe('a ticked line is kept, with who did it', () => {
     expect(text()).toContain('1 to do')
   })
 })
+
+/**
+ * 10/21 (Nic), after a stray click on Mountain View's own list:
+ *
+ *   "I clicked on it and it highlighted and I couldn't unclick it. And then I
+ *    tried to X out of it and it deleted it from the list, not completed it. So
+ *    whatever was there, I didn't get a chance to read it."
+ *
+ * The data was never gone — the row sat there with hidden_at stamped on it —
+ * but no button on this screen could bring either one back, and a screen with
+ * no way back is the same as gone to the person standing at it.
+ */
+describe('10/21: neither the tick nor the X is one-way for the owner', () => {
+  it('a ticked line un-ticks from the same circle', async () => {
+    server.items = [{
+      id: 'i1', body: 'Fix the meters on row C', addedByUserId: 'u1',
+      doneAt: '2026-10-21T20:20:00.000Z', doneByUserId: 'u1', doneByName: 'Nic Rhoades',
+    }]
+    await show()
+    const circle = [...host.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Un-tick it')!
+    expect(circle).toBeTruthy()
+    expect((circle as HTMLButtonElement).disabled).toBe(false)
+    await act(async () => { circle.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await settle()
+    expect(server.posts.map(p => p.url)).toEqual(['/property-task-list/p1/items/i1/undone'])
+  })
+
+  it('a line taken off the list is readable under its own heading, with a way back', async () => {
+    server.items = [
+      { id: 'i1', body: 'Swap the laundry bulb', addedByUserId: 'u1',
+        doneAt: null, doneByUserId: null, doneByName: null, hiddenAt: null },
+      { id: 'i2', body: 'Final electric read — RV 44, take it the day they leave', addedByUserId: 'u1',
+        doneAt: null, doneByUserId: null, doneByName: null, hiddenAt: '2026-10-21T20:20:00.000Z' },
+    ]
+    await show()
+    // Not among the jobs, and not counted as one to do …
+    expect(text()).toContain('1 to do')
+    expect(text()).toContain('Taken off the list (1)')
+    // … and one click reads it again.
+    const fold = [...host.querySelectorAll('button')].find(b => (b.textContent ?? '').includes('Taken off the list'))!
+    await act(async () => { fold.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await settle()
+    expect(text()).toContain('Final electric read — RV 44')
+
+    const back = [...host.querySelectorAll('button')].find(b => (b.textContent ?? '').includes('Put it back'))!
+    await act(async () => { back.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await settle()
+    expect(server.posts.map(p => p.url)).toEqual(['/property-task-list/p1/items/i2/unhide'])
+  })
+
+  it('the X says it is not the same as done, and where the line goes', async () => {
+    server.items = [{
+      id: 'i1', body: 'Fix the meters on row C', addedByUserId: 'u1',
+      doneAt: null, doneByUserId: null, doneByName: null, hiddenAt: null,
+    }]
+    await show()
+    const x = [...host.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Take it off the list')!
+    expect(x.getAttribute('title')).toContain('not the same as done')
+    expect(x.getAttribute('title')).toContain('put it back')
+  })
+
+  it('the maintenance person gets no un-tick, no X and no removed pile', async () => {
+    perms.isOwner = false
+    server.items = [
+      { id: 'i1', body: 'Fix the meters on row C', addedByUserId: 'u1',
+        doneAt: '2026-10-21T20:20:00.000Z', doneByUserId: 'w1', doneByName: 'Dale Pruitt', hiddenAt: null },
+    ]
+    await show()
+    const labels = [...host.querySelectorAll('button')].map(b => b.getAttribute('aria-label'))
+    expect(labels).toEqual(['Done'])
+    expect(text()).not.toContain('Taken off the list')
+  })
+})

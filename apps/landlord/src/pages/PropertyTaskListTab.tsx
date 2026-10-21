@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
-import { CheckCircle2, Circle, ClipboardList, X } from 'lucide-react'
+import { CheckCircle2, Circle, ClipboardList, RotateCcw, X } from 'lucide-react'
 import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 
@@ -32,12 +32,15 @@ export function PropertyTaskListTab({ propertyId }: { propertyId: string }) {
   const qc = useQueryClient()
   const { isOwner } = usePerms()
   const [draft, setDraft] = useState('')
+  const [showRemoved, setShowRemoved] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const boxRef = useRef<HTMLInputElement>(null)
 
-  const key = ['property-task-list', propertyId]
+  // The owner reads the lines they took off the list too, so nothing can go
+  // out of reach with one click (10/21). A worker's read never asks for them.
+  const key = ['property-task-list', propertyId, isOwner ? 'with-removed' : 'open']
   const { data: items = [], isLoading } = useQuery<any[]>(
-    key, () => apiGet(`/property-task-list/${propertyId}`))
+    key, () => apiGet(`/property-task-list/${propertyId}${isOwner ? '?withHidden=1' : ''}`))
 
   // Every write refreshes the same list and clears the last error. The worker's
   // cross-property screen reads its own query, so it is invalidated too.
@@ -64,8 +67,20 @@ export function PropertyTaskListTab({ propertyId }: { propertyId: string }) {
     (id: string) => apiPost(`/property-task-list/${propertyId}/items/${id}/done`, {}),
     { onSuccess: after, onError: fail })
 
+  // 10/21 (Nic): "I clicked on it and it highlighted and I couldn't unclick
+  // it." The owner's way back from a stray tick.
+  const untickMut = useMutation(
+    (id: string) => apiPost(`/property-task-list/${propertyId}/items/${id}/undone`, {}),
+    { onSuccess: after, onError: fail })
+
   const hideMut = useMutation(
     (id: string) => apiPost(`/property-task-list/${propertyId}/items/${id}/hide`, {}),
+    { onSuccess: after, onError: fail })
+
+  // 10/21 (Nic): "I tried to X out of it and it deleted it from the list, not
+  // completed it. So whatever was there, I didn't get a chance to read it."
+  const unhideMut = useMutation(
+    (id: string) => apiPost(`/property-task-list/${propertyId}/items/${id}/unhide`, {}),
     { onSuccess: after, onError: fail })
 
   const submit = () => {
@@ -74,8 +89,10 @@ export function PropertyTaskListTab({ propertyId }: { propertyId: string }) {
     addMut.mutate(body)
   }
 
-  const open = items.filter(i => !i.doneAt)
-  const done = items.filter(i => i.doneAt)
+  const live = items.filter(i => !i.hiddenAt)
+  const open = live.filter(i => !i.doneAt)
+  const done = live.filter(i => i.doneAt)
+  const removed = items.filter(i => i.hiddenAt)
 
   return (
     <div className="card" style={{ marginTop: 20 }}>
@@ -90,7 +107,8 @@ export function PropertyTaskListTab({ propertyId }: { propertyId: string }) {
       <p style={{ fontSize: '.78rem', color: 'var(--text-3)', margin: '0 0 16px', maxWidth: 620 }}>
         Jobs around the property for whoever is working here — fix the meters, re-gravel a site,
         swap a bulb. Not repair requests: nothing here is timed, counted or reported on, and
-        residents never see it. A ticked line stays on the list with who did it.
+        residents never see it. A ticked line stays on the list with who did it, and
+        {isOwner ? ' nothing you tick or take off is lost — both have a way back.' : ' nothing is ever deleted.'}
       </p>
 
       {isOwner && (
@@ -145,22 +163,46 @@ export function PropertyTaskListTab({ propertyId }: { propertyId: string }) {
           )}
           {done.map(i => (
             <TaskRow key={i.id} item={i} isOwner={isOwner}
-              onTick={() => {}}
+              onTick={() => untickMut.mutate(i.id)}
               onHide={() => hideMut.mutate(i.id)}
-              busy={hideMut.isLoading} />
+              busy={untickMut.isLoading || hideMut.isLoading} />
           ))}
+          {/* 10/21 (Nic): what a stray X took off the list, and the way back.
+              The owner only — a line somebody removed is not a job. */}
+          {isOwner && removed.length > 0 && (<>
+            <button type="button" onClick={() => setShowRemoved(v => !v)}
+              style={{
+                background: 'none', border: 'none', padding: 0, margin: '16px 0 4px',
+                color: 'var(--text-3)', fontSize: '.72rem', cursor: 'pointer', textAlign: 'left',
+              }}>
+              {showRemoved ? '▾' : '▸'} Taken off the list ({removed.length})
+            </button>
+            {showRemoved && removed.map(i => (
+              <TaskRow key={i.id} item={i} isOwner={isOwner} removed
+                onTick={() => {}}
+                onHide={() => unhideMut.mutate(i.id)}
+                busy={unhideMut.isLoading} />
+            ))}
+          </>)}
         </div>
       )}
     </div>
   )
 }
 
-/** One line. Ticked lines read dimmed, with who did it and when. */
+/**
+ * One line. Ticked lines read dimmed, with who did it and when.
+ *
+ * 10/21 (Nic): nothing here is one-way for the owner. The circle un-ticks a
+ * ticked line, and a line that was taken off the list shows with "Put it back"
+ * in place of the X.
+ */
 function TaskRow(
-  { item, isOwner, onTick, onHide, busy }:
-  { item: any; isOwner: boolean; onTick: () => void; onHide: () => void; busy: boolean },
+  { item, isOwner, onTick, onHide, busy, removed }:
+  { item: any; isOwner: boolean; onTick: () => void; onHide: () => void; busy: boolean; removed?: boolean },
 ) {
   const isDone = !!item.doneAt
+  const canUntick = isOwner && isDone && !removed
   return (
     <div style={{
       display: 'flex', alignItems: 'flex-start', gap: 10, padding: '8px 4px',
@@ -168,13 +210,14 @@ function TaskRow(
     }}>
       <button
         onClick={onTick}
-        disabled={isDone || busy}
-        title={isDone ? 'Done' : 'Mark it done'}
-        aria-label={isDone ? 'Done' : 'Mark it done'}
+        disabled={removed || busy || (isDone && !canUntick)}
+        title={removed ? 'Taken off the list' : isDone ? (canUntick ? 'Un-tick it' : 'Done') : 'Mark it done'}
+        aria-label={removed ? 'Taken off the list' : isDone ? (canUntick ? 'Un-tick it' : 'Done') : 'Mark it done'}
         style={{
           background: 'none', border: 'none', padding: 0, marginTop: 1,
-          cursor: isDone ? 'default' : 'pointer',
+          cursor: removed || (isDone && !canUntick) ? 'default' : 'pointer',
           color: isDone ? 'var(--gold)' : 'var(--text-3)', lineHeight: 0,
+          opacity: removed ? 0.5 : 1,
         }}>
         {isDone ? <CheckCircle2 size={18} /> : <Circle size={18} />}
       </button>
@@ -196,17 +239,29 @@ function TaskRow(
           </div>
         )}
       </div>
-      {isOwner && (
+      {isOwner && (removed ? (
         <button
           className="btn btn-ghost btn-sm"
           onClick={onHide}
           disabled={busy}
-          title="Take it off the list"
+          title="Put it back on the list"
+          style={{ padding: '2px 8px', fontSize: '.72rem', whiteSpace: 'nowrap' }}>
+          <RotateCcw size={12} style={{ marginRight: 4, verticalAlign: '-2px' }} />Put it back
+        </button>
+      ) : (
+        <button
+          className="btn btn-ghost btn-sm"
+          onClick={onHide}
+          disabled={busy}
+          // 10/21: it used to say "Take it off the list" and Nic pressed it
+          // meaning "done". The words now say which of the two it is, and
+          // where the line goes — nothing here deletes anything.
+          title="Take it off the list (not the same as done — it moves to “Taken off the list”, where you can put it back)"
           aria-label="Take it off the list"
           style={{ lineHeight: 0, padding: '4px 6px' }}>
           <X size={14} />
         </button>
-      )}
+      ))}
     </div>
   )
 }

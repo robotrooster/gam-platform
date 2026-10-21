@@ -47,6 +47,8 @@ import {
   tickPropertyTask,
   hidePropertyTask,
   getPropertyTask,
+  untickPropertyTask,
+  unhidePropertyTask,
 } from '../services/propertyTaskList'
 
 export const propertyTaskListRouter = Router()
@@ -100,11 +102,20 @@ propertyTaskListRouter.get('/', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-/** GET /api/property-task-list/:propertyId — this park's list, open lines first. */
+/**
+ * GET /api/property-task-list/:propertyId — this park's list, open lines first.
+ *
+ * `?withHidden=1` adds the lines that were taken off the list, flagged, so they
+ * can be read and put back — 10/21, after a stray X took one off and nothing on
+ * screen could bring it back. The OWNER's only: a line somebody removed is not
+ * a job, and a worker's screen must not grow a pile of them.
+ */
 propertyTaskListRouter.get('/:propertyId', async (req, res, next) => {
   try {
     await reachProperty(req, req.params.propertyId)
-    res.json({ success: true, data: await listPropertyTasks(req.params.propertyId) })
+    const asked = req.query.withHidden === '1' || req.query.withHidden === 'true'
+    const withHidden = asked && OWNER_ROLES.has(req.user?.role ?? '')
+    res.json({ success: true, data: await listPropertyTasks(req.params.propertyId, { withHidden }) })
   } catch (e) { next(e) }
 })
 
@@ -139,6 +150,41 @@ propertyTaskListRouter.post('/:propertyId/items/:itemId/done', async (req, res, 
   try {
     await reachProperty(req, req.params.propertyId)
     const item = await tickPropertyTask(req.params.propertyId, req.params.itemId, req.user!.userId)
+    if (!item) throw new AppError(404, 'That task is not on this property\'s list')
+    res.json({ success: true, data: item })
+  } catch (e) { next(e) }
+})
+
+/**
+ * POST /api/property-task-list/:propertyId/items/:itemId/undone — un-tick it.
+ *
+ * 10/21 (Nic): "I clicked on it and it highlighted and I couldn't unclick it."
+ * The owner's, like adding and removing — never the worker's, because the
+ * one-way tick is what stops a second tap on a phone rewriting the name of
+ * whoever did the work. Un-ticking an open line changes nothing and answers 200.
+ */
+propertyTaskListRouter.post('/:propertyId/items/:itemId/undone', async (req, res, next) => {
+  try {
+    await reachProperty(req, req.params.propertyId)
+    assertOwner(req)
+    const item = await untickPropertyTask(req.params.propertyId, req.params.itemId)
+    if (!item) throw new AppError(404, 'That task is not on this property\'s list')
+    res.json({ success: true, data: item })
+  } catch (e) { next(e) }
+})
+
+/**
+ * POST /api/property-task-list/:propertyId/items/:itemId/unhide — put it back.
+ *
+ * 10/21 (Nic): "I tried to X out of it and it deleted it from the list, not
+ * completed it… Please revert that." The row was never erased; there was just
+ * no way back on screen. This is it, and it leaves the tick as it was.
+ */
+propertyTaskListRouter.post('/:propertyId/items/:itemId/unhide', async (req, res, next) => {
+  try {
+    await reachProperty(req, req.params.propertyId)
+    assertOwner(req)
+    const item = await unhidePropertyTask(req.params.propertyId, req.params.itemId)
     if (!item) throw new AppError(404, 'That task is not on this property\'s list')
     res.json({ success: true, data: item })
   } catch (e) { next(e) }

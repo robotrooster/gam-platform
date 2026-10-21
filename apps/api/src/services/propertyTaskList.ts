@@ -49,6 +49,8 @@ export interface PropertyTaskListItem {
   done_at: string | null
   done_by_user_id: string | null
   done_by_name: string | null
+  /** 10/21: set when the landlord took it off the list. The row never leaves. */
+  hidden_at: string | null
 }
 
 /** A row plus the property it is on — what the worker's cross-property read needs. */
@@ -62,7 +64,8 @@ const PERSON = (alias: string) =>
 const COLUMNS = `
          i.id, i.property_id, i.body, i.created_at,
          i.added_by_user_id, ${PERSON('a')} AS added_by_name,
-         i.done_at, i.done_by_user_id, ${PERSON('d')} AS done_by_name`
+         i.done_at, i.done_by_user_id, ${PERSON('d')} AS done_by_name,
+         i.hidden_at`
 
 const FROM = `
     FROM property_task_list_items i
@@ -77,11 +80,19 @@ const ORDER = `ORDER BY (i.done_at IS NOT NULL), i.created_at, i.id`
  * One park's list. Hidden lines are left out of the read and left in the table
  * — the landlord took them off the list, which is not the same as them never
  * having been there.
+ *
+ * 10/21 (Nic, after losing one to a stray click): `withHidden` returns them as
+ * well, flagged, so the owner can read what they took off and put it back. The
+ * worker's read never asks for it — a line somebody removed is not a job.
  */
-export async function listPropertyTasks(propertyId: string): Promise<PropertyTaskListItem[]> {
+export async function listPropertyTasks(
+  propertyId: string,
+  opts: { withHidden?: boolean } = {},
+): Promise<PropertyTaskListItem[]> {
   return query<PropertyTaskListItem>(
-    `SELECT ${COLUMNS} ${FROM} WHERE i.property_id = $1 AND i.hidden_at IS NULL ${ORDER}`,
-    [propertyId],
+    `SELECT ${COLUMNS} ${FROM}
+      WHERE i.property_id = $1 AND ($2::boolean OR i.hidden_at IS NULL) ${ORDER}`,
+    [propertyId, opts.withHidden === true],
   )
 }
 
@@ -150,6 +161,58 @@ export async function tickPropertyTask(
         SET done_at = NOW(), done_by_user_id = $3
       WHERE id = $1 AND property_id = $2 AND hidden_at IS NULL AND done_at IS NULL`,
     [itemId, propertyId, userId],
+  )
+  return getPropertyTask(propertyId, itemId)
+}
+
+/**
+ * 10/21 (Nic) — UN-TICK IT.
+ *
+ *   "I clicked on it and it highlighted and I couldn't unclick it."
+ *
+ * Ticking was deliberately one-way so that a second tap from a worker's phone
+ * could not rewrite the name of whoever actually did the work. That reasoning
+ * holds for the WORKER and was wrong for the LANDLORD, who had no way back from
+ * a stray click on their own list. So the owner — and only the owner, the same
+ * hand that may add and remove — can put a line back to not-done. The tick and
+ * the ticker's name are cleared together, because a line that is not done was
+ * not done by anybody.
+ */
+export async function untickPropertyTask(
+  propertyId: string,
+  itemId: string,
+): Promise<PropertyTaskListItem | null> {
+  await query(
+    `UPDATE property_task_list_items
+        SET done_at = NULL, done_by_user_id = NULL
+      WHERE id = $1 AND property_id = $2 AND hidden_at IS NULL AND done_at IS NOT NULL`,
+    [itemId, propertyId],
+  )
+  return getPropertyTask(propertyId, itemId)
+}
+
+/**
+ * 10/21 (Nic) — PUT IT BACK ON THE LIST.
+ *
+ *   "I tried to X out of it and it deleted it from the list, not completed it.
+ *    So whatever was there, I didn't get a chance to read it. Please revert
+ *    that."
+ *
+ * Nothing was ever erased — the row sat there with hidden_at stamped on it —
+ * but nothing on screen could bring it back, which from where he was standing
+ * is the same as gone. This is the way back. Its tick, if it had one, is left
+ * exactly as it was: putting a line back on the list says nothing about whether
+ * the work was done.
+ */
+export async function unhidePropertyTask(
+  propertyId: string,
+  itemId: string,
+): Promise<PropertyTaskListItem | null> {
+  await query(
+    `UPDATE property_task_list_items
+        SET hidden_at = NULL, hidden_by_user_id = NULL
+      WHERE id = $1 AND property_id = $2 AND hidden_at IS NOT NULL`,
+    [itemId, propertyId],
   )
   return getPropertyTask(propertyId, itemId)
 }
