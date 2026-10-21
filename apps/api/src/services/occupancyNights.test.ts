@@ -260,6 +260,41 @@ describe('what the record does NOT change about the money', () => {
     expect(await written()).toEqual([day(-9), day(-8), day(-7), day(-6)])
   })
 
+  // 10/21 (Nic): "What happens if we don't adjust his move-out day until he
+  // moves out? Say it stops counting on the 22nd according to the reservation,
+  // and he doesn't move out till the 26th, and then we change the schedule as
+  // of the 26th. Will it backtrack and count those other days, or will it not?
+  // Because it would be really tedious for somebody who doesn't know exactly
+  // when they're leaving to have the front desk person update the schedule
+  // daily."
+  it('IT BACKTRACKS: a departure corrected days later fills in the nights nobody had written down yet', async () => {
+    // Booked to leave six days ago; stayed on and nobody touched the schedule.
+    const booking = await stay(w.siteId, day(-10), day(-6))
+    await stampOccupancyNights(db, { propertyId: w.propertyId, from: day(-10) })
+    // Four nights written: the 10th through the 7th day ago. Nothing after the
+    // check-out the schedule still claims.
+    expect(await written()).toEqual([day(-10), day(-9), day(-8), day(-7)])
+
+    // The desk catches up today and sets the day they actually left.
+    await db.query(`UPDATE unit_bookings SET check_out = $2::date, status = 'checked_out' WHERE id = $1`, [booking, day(-1)])
+    await stampOccupancyNights(db, { propertyId: w.propertyId, from: day(-10) })
+    // The nights in between are now written, in one pass, with no daily
+    // babysitting: nothing is lost by the correction being late.
+    expect(await written()).toEqual([day(-10), day(-9), day(-8), day(-7), day(-6), day(-5), day(-4), day(-3), day(-2)])
+  })
+
+  it('and the bill counts a late correction even before the next run reaches it', async () => {
+    const lastMonth = monthOf(day(-40))
+    const checkIn = `${lastMonth.slice(0, 8)}05`
+    const booking = await stay(w.siteId, checkIn, `${lastMonth.slice(0, 8)}09`)
+    await stampOccupancyNights(db, { propertyId: w.propertyId, from: checkIn })
+    expect(await nightsBilledFor(lastMonth)).toBe(4)
+    // They stayed four nights longer than the schedule said, corrected after
+    // the fact. No run has happened since.
+    await db.query(`UPDATE unit_bookings SET check_out = $2::date WHERE id = $1`, [booking, `${lastMonth.slice(0, 8)}13`])
+    expect(await nightsBilledFor(lastMonth)).toBe(8)
+  })
+
   it('extending adds the nights as they happen', async () => {
     const booking = await stay(w.siteId, day(-4), day(-2))
     await stampOccupancyNights(db, { propertyId: w.propertyId, from: day(-4) })
