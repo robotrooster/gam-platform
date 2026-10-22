@@ -56,7 +56,11 @@ describe('the flag another landlord sees', () => {
     expect(flag.count).toBe(1)
     expect(flag.words).toBe(LEFT_OWING_WORDS)
 
-    // The three things he said they must never see.
+    // The three things he said they must never see. The key set is asserted
+    // first so the digit checks below can never start reading a random id: a
+    // fourth field fails this line deterministically instead of failing the
+    // ones under it one deploy in six.
+    expect(Object.keys(flag).sort()).toEqual(['count', 'flagged', 'words'])
     const everything = JSON.stringify(flag)
     expect(everything).not.toContain('1430')
     expect(everything).not.toContain('2024')
@@ -100,6 +104,7 @@ describe('the flag another landlord sees', () => {
       [w.owed.landlordId, w.propertyId, userId, randomUUID()])
     const flag = await leftOwingFlagFor(userId, [w.asking.landlordId])
     expect(flag.count).toBe(2)
+    expect(Object.keys(flag).sort()).toEqual(['count', 'flagged', 'words'])
     expect(JSON.stringify(flag)).not.toMatch(/99|2023/)
   })
 })
@@ -135,11 +140,17 @@ describe('the first door — where and when, free', () => {
       userId, askingLandlordIds: [w.asking.landlordId], byUserId: w.asking.userId })
     expect(seen.when).toBe('August of 2024')
     expect(seen.where).toBe('Las Vegas, NV')
-    // Not the day, not the amount, not the park, not the landlord.
-    const everything = JSON.stringify(seen)
-    expect(everything).not.toContain('14')
-    expect(everything).not.toContain('1430')
-    expect(everything).not.toContain(w.owed.landlordId)
+    // THE SHAPE IS THE GUARANTEE: three fields and no more, so a fourth cannot
+    // be added later carrying the amount or the park without this failing.
+    expect(Object.keys(seen).sort()).toEqual(['owingId', 'when', 'where'])
+    // Not the day, not the amount, not the park, not the landlord — read off
+    // the two fields that carry WORDS. (Not off the whole row stringified: that
+    // drags in a random id, and this failed on a deploy the day it was written,
+    // on a uuid that happened to have "14" inside it.)
+    const words = `${seen.when} ${seen.where}`
+    expect(words).not.toContain('14')
+    expect(words).not.toContain('1430')
+    expect(words).not.toContain(w.owed.landlordId)
   })
 
   it('is written down, and pressing it twice takes on nothing', async () => {
