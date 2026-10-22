@@ -80,16 +80,30 @@ const IV_LENGTH = 16
 // S561 landlord-billed model (Checkr call 7/27):
 //   SCREENING_CHECKR_COST_USD = GAM's actual cost per report from Checkr.
 //     Checkr Tenant "Essential" ($34.99: financials + rental history +
-//     background + credit score) + Identity-Protection add-on ($2.95: live
-//     ID scan / biometric liveness, always-on) = $37.94. Checkr Tenant prices
+//     background + credit score) + Identity Intelligence add-on ($3.95: live
+//     ID scan / biometric liveness, always-on) = $38.94. Checkr Tenant prices
 //     this FLAT (unlike the employment product's variable county pass-throughs),
 //     so a module constant is correct; if Checkr ever bills a variable/taxed
 //     amount, swap this for the invoiced actual (see accrual note in /submit).
+//
+//   10/21 (Nic, reading Checkr's own pricing page and his September receipts):
+//     the ID scan is $3.95, not the $2.95 this constant was built on, so the
+//     number here was a dollar light. The receipts also proved the add-on had
+//     never actually been ordered — five applicants paid for a live ID scan
+//     that never ran (see backgroundProvider.initiate). Both halves are fixed:
+//     the add-on is now ordered, and the cost it is priced from is the real one.
+//
+//     The add-on is NOT something this order body controls — Checkr carries it
+//     as a per-PROPERTY toggle ("Identity Intelligence") in their dashboard, and
+//     a property only appears there the first time an order names it. So every
+//     new park has to have the toggle turned on by hand the first time it shows
+//     up, or its first applicant screens without the scan they paid for. The
+//     `checkr_id_scan_missing` alarm is what catches that.
 //   SCREENING_GAM_MARGIN_USD = GAM's flat margin per report ($5).
-//   Landlord is charged cost + margin ($42.94), netted from disbursement — NOT
+//   Landlord is charged cost + margin ($43.94), netted from disbursement — NOT
 //   charged to the applicant, and NOT run through card processing (the landlord
 //   never makes a payment; it's a receivable, per gam-checkr-billing-model).
-const SCREENING_CHECKR_COST_USD = parseFloat(process.env.SCREENING_CHECKR_COST_USD || '37.94')
+const SCREENING_CHECKR_COST_USD = parseFloat(process.env.SCREENING_CHECKR_COST_USD || '38.94')
 const SCREENING_GAM_MARGIN_USD = parseFloat(process.env.SCREENING_GAM_MARGIN_USD || '5')
 
 // S564/S565: renter-pool applicants pay for their OWN portable screen — one
@@ -836,19 +850,29 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     // again. The response waits for the booking, so no cancel can come first.
     await (async () => {
       const priced = await screeningIntakeFee(state)
-      await recordScreeningEarnings(prepaid
-        ? {
-            backgroundCheckId: check!.id,
-            gamMarginUsd: priced.gamFee,
-            processingChargedUsd: 0,
-            totalChargedUsd: Number(prepaid.amount),
-          }
-        : {
-            backgroundCheckId: check!.id,
-            gamMarginUsd: priced.gamFee,
-            processingChargedUsd: priced.processing,
-            totalChargedUsd: amountChargedUsd ?? priced.total,
-          })
+      // 10/21 (Nic): a check is ONE price now (stayTerms, screeningFee.amount)
+      // and a screening line never takes a card fee on top, so there is no
+      // separate processing charge on a screening to book any more. What GAM
+      // keeps is simply everything that is not Checkr's invoice: the $5 margin
+      // plus the processing that is already inside the price. On a card that
+      // covers Stripe's cut; where nobody swiped a card — cash at the counter,
+      // or a landlord eating it out of a payout — it is GAM's, which is the
+      // "little extra markup on our end" that keeps the price the same for
+      // everybody.
+      //
+      // Figured on what was actually COLLECTED, not on today's list price: a
+      // prepayment taken at the counter weeks ago was collected at whatever a
+      // check cost that day, and Checkr's invoice is the same either way. GAM
+      // keeps the remainder, whatever it happens to be.
+      const gamKeepsOf = (collected: number) =>
+        Math.round(Math.max(0, collected - priced.screening) * 100) / 100
+      const collected = prepaid ? Number(prepaid.amount) : (amountChargedUsd ?? priced.total)
+      await recordScreeningEarnings({
+        backgroundCheckId: check!.id,
+        gamMarginUsd: gamKeepsOf(collected),
+        processingChargedUsd: 0,
+        totalChargedUsd: collected,
+      })
     })().catch(err => logger.error({ err, checkId: check?.id }, '[background] could not book the screening earnings'))
 
     // Risk score (intake-fraud only — disposable email, SSN patterns, IP velocity, prior denials)
@@ -1064,6 +1088,96 @@ backgroundRouter.patch('/notifications/:id/read', requireAuth, async (req, res, 
 })
 
 // ── LANDLORD: LIST + DETAIL ──────────────────────────────────
+// ── BACKGROUND CHECKS PAID FOR AND WAITING ON THE GUEST ──────────────────────
+//
+// 10/21 (Nic): "if it goes to a typoed folder or bounces, how would the tenant
+// sign in to complete the check if they can't sign in with a typoed email?
+// Because they would need the two-factor authentication anyway, right? And then
+// nothing shows the desk it's waiting. Yeah, we need a way to resend it."
+//
+// He is right, and the hole was worse than a missing button. A check paid for
+// at the counter is found again BY THE EMAIL THE STAY WAS SOLD TO. Every GAM
+// account is created with email 2FA on and login needs a verified address, so
+// a guest whose address was mistyped cannot sign in to the inbox the code goes
+// to — and if they sign up with their REAL address instead, the paid check does
+// not match them and they are asked to pay a second time. Their money was
+// simply stuck, and the only trace was a line in a log file.
+//
+// So this is two things, not one: somewhere the desk can SEE what is paid and
+// waiting, and a resend that can CORRECT the address before it sends. Fixing
+// the address moves the check to the new one, which is the whole point — the
+// old one was never reachable.
+backgroundRouter.get('/waiting', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
+  try {
+    const scope = landlordScopeIds((req as any).user)
+    if (!scope.length) return res.json({ success: true, data: [] })
+    const propertyId = typeof req.query.propertyId === 'string' && UUID_RE.test(req.query.propertyId)
+      ? req.query.propertyId : null
+    const rows = await query<any>(`
+      SELECT sp.id, sp.amount::float AS amount, sp.source, sp.created_at,
+             sp.email, sp.booking_id, sp.landlord_id,
+             COALESCE(sp.property_id, bu.property_id) AS property_id,
+             COALESCE(p.name, bp.name) AS property_name,
+             b.guest_name, b.guest_email,
+             to_char(b.check_in, 'YYYY-MM-DD')  AS check_in,
+             to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+             bu.unit_number,
+             tu.email AS tenant_email,
+             -- Who the link would reach right now, by the same rule that sends
+             -- it (services/stayTerms emailPrepaidScreeningLink).
+             COALESCE(sp.email, tu.email, b.guest_email) AS sends_to
+        FROM screening_prepayments sp
+        LEFT JOIN tenants t        ON t.id  = sp.tenant_id
+        LEFT JOIN users tu         ON tu.id = t.user_id
+        LEFT JOIN unit_bookings b  ON b.id  = sp.booking_id
+        LEFT JOIN units bu         ON bu.id = b.unit_id
+        LEFT JOIN properties bp    ON bp.id = bu.property_id
+        LEFT JOIN properties p     ON p.id  = sp.property_id
+       WHERE sp.status = 'unused'
+         AND sp.landlord_id = ANY($1::uuid[])
+         AND ($2::uuid IS NULL OR COALESCE(sp.property_id, bu.property_id) = $2)
+       ORDER BY sp.created_at`, [scope, propertyId])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+backgroundRouter.post('/waiting/:id/resend', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
+  try {
+    if (!UUID_RE.test(req.params.id)) throw new AppError(404, 'That paid background check is not on this account any more.')
+    const scope = landlordScopeIds((req as any).user)
+    const sp = scope.length ? await queryOne<{ id: string; status: string; email: string | null }>(
+      `SELECT id, status, email FROM screening_prepayments
+        WHERE id = $1 AND landlord_id = ANY($2::uuid[])`, [req.params.id, scope]) : null
+    if (!sp) throw new AppError(404, 'That paid background check is not on this account any more.')
+    if (sp.status !== 'unused') {
+      throw new AppError(409, sp.status === 'used'
+        ? 'They have already done this background check — there is nothing left to send.'
+        : 'That background check was taken back, so there is no link to send.')
+    }
+
+    // Correcting the address is the point of the button, not a side effect:
+    // the old one is why nobody could reach them.
+    const raw = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
+    if (raw) {
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(raw)) {
+        throw new AppError(400, 'That does not look like an email address — check it and press Send again.')
+      }
+      if (raw !== (sp.email || '').toLowerCase()) {
+        await query(`UPDATE screening_prepayments SET email = $2 WHERE id = $1`, [sp.id, raw])
+        logger.info({ prepaymentId: sp.id, from: sp.email, to: raw, by: (req as any).user.userId },
+          '[background] the email on a paid background check was corrected before resending')
+      }
+    }
+
+    const { emailPrepaidScreeningLink } = await import('../services/stayTerms')
+    const { sentTo } = await emailPrepaidScreeningLink(sp.id)
+    if (!sentTo) {
+      throw new AppError(400, 'There is no email address on this background check to send the link to — type theirs in and press Send again.')
+    }
+    res.json({ success: true, data: { sentTo } })
+  } catch (e) { next(e) }
+})
+
 backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
   try {
     const checks = await query<any>(`

@@ -311,7 +311,12 @@ describe('a repeat is carried in the line\'s own words, never dropped', () => {
       .map(r => r.column_name).sort()
     expect(cols).toEqual([
       'added_by_user_id', 'body', 'created_at', 'done_at', 'done_by_user_id',
-      'hidden_at', 'hidden_by_user_id', 'id', 'property_id',
+      'hidden_at', 'hidden_by_user_id', 'id',
+      // 10/21: which of the park's two lists — the owner's jobs, or things to
+      // buy. A kind is not a due date and not a recurrence: the absences this
+      // guard is about are still absent.
+      'kind',
+      'property_id',
     ])
   })
 })

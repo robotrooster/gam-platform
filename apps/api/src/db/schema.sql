@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict QSudJBwA9nKFgv0HztykPkAt78gPAvzu6NgnlxpZSCEYKcVli6azZ3a64Qab1Fm
+\restrict VdwWhwyv3xiV8OsJic5p5c3h5vzXsn820qUtbUMeZCbrjZLRDdmAe9cnFLFfqLk
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -16697,8 +16697,15 @@ CREATE TABLE public.pos_customers (
     created_from text DEFAULT 'manual'::text NOT NULL,
     tenant_id uuid,
     elsewhere_ref text,
-    CONSTRAINT pos_customers_created_from_check CHECK ((created_from = ANY (ARRAY['manual'::text, 'card_reader'::text])))
+    CONSTRAINT pos_customers_created_from_check CHECK ((created_from = ANY (ARRAY['manual'::text, 'card_reader'::text, 'import'::text])))
 );
+
+
+--
+-- Name: COLUMN pos_customers.created_from; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_customers.created_from IS 'How the record came to exist: typed at the counter, taken off a card reader, or carried over from the system the park used before GAM (10/21).';
 
 
 --
@@ -18145,9 +18152,11 @@ CREATE TABLE public.property_task_list_items (
     done_by_user_id uuid,
     hidden_at timestamp with time zone,
     hidden_by_user_id uuid,
+    kind text DEFAULT 'job'::text NOT NULL,
     CONSTRAINT property_task_list_items_body_not_blank CHECK ((btrim(body) <> ''::text)),
     CONSTRAINT property_task_list_items_done_together CHECK (((done_at IS NULL) = (done_by_user_id IS NULL))),
-    CONSTRAINT property_task_list_items_hidden_together CHECK (((hidden_at IS NULL) = (hidden_by_user_id IS NULL)))
+    CONSTRAINT property_task_list_items_hidden_together CHECK (((hidden_at IS NULL) = (hidden_by_user_id IS NULL))),
+    CONSTRAINT property_task_list_items_kind_check CHECK ((kind = ANY (ARRAY['job'::text, 'supply'::text])))
 );
 
 
@@ -18177,6 +18186,13 @@ COMMENT ON COLUMN public.property_task_list_items.done_at IS 'When it was ticked
 --
 
 COMMENT ON COLUMN public.property_task_list_items.hidden_at IS 'The landlord took the line off the list. GAM never erases, so the row, its tick and its author stay.';
+
+
+--
+-- Name: COLUMN property_task_list_items.kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.property_task_list_items.kind IS '10/21 (Nic): ''job'' — the owner''s task list, which only the owner writes and anybody working the park ticks. ''supply'' — things to buy, which anybody working the park writes and only the owner ticks bought. Single source: PROPERTY_LIST_KINDS in packages/shared.';
 
 
 --
@@ -21486,6 +21502,28 @@ CREATE TABLE public.user_totp_recovery_codes (
     used_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
+
+
+--
+-- Name: user_ui_layout; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_ui_layout (
+    user_id uuid NOT NULL,
+    surface text NOT NULL,
+    layout jsonb DEFAULT '[]'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT user_ui_layout_is_a_list CHECK ((jsonb_typeof(layout) = 'array'::text)),
+    CONSTRAINT user_ui_layout_surface_known CHECK ((surface = ANY (ARRAY['landlord_nav'::text, 'landlord_dashboard'::text])))
+);
+
+
+--
+-- Name: TABLE user_ui_layout; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.user_ui_layout IS 'One person''s arrangement of one of their own screens (10/21, Nic: the draggable nav and the dashboard widgets). Never permissions — what somebody may SEE is still decided by visibleNavItemsFor and the API.';
 
 
 --
@@ -26568,6 +26606,14 @@ ALTER TABLE ONLY public.user_totp_recovery_codes
 
 
 --
+-- Name: user_ui_layout user_ui_layout_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_ui_layout
+    ADD CONSTRAINT user_ui_layout_pkey PRIMARY KEY (user_id, surface);
+
+
+--
 -- Name: users users_email_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -30483,6 +30529,13 @@ CREATE INDEX idx_property_allocation_rules_bank_account ON public.property_alloc
 --
 
 CREATE INDEX idx_property_fee_schedules_property ON public.property_fee_schedules USING btree (property_id);
+
+
+--
+-- Name: idx_property_task_list_items_property_kind; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_property_task_list_items_property_kind ON public.property_task_list_items USING btree (property_id, kind, created_at);
 
 
 --
@@ -45575,6 +45628,14 @@ ALTER TABLE ONLY public.user_totp_recovery_codes
 
 
 --
+-- Name: user_ui_layout user_ui_layout_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_ui_layout
+    ADD CONSTRAINT user_ui_layout_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
 -- Name: users users_default_management_payout_bank_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -46179,5 +46240,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict QSudJBwA9nKFgv0HztykPkAt78gPAvzu6NgnlxpZSCEYKcVli6azZ3a64Qab1Fm
+\unrestrict VdwWhwyv3xiV8OsJic5p5c3h5vzXsn820qUtbUMeZCbrjZLRDdmAe9cnFLFfqLk
 

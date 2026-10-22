@@ -135,8 +135,8 @@ describe('screening tax gate (screeningIntakeFee)', () => {
     await seedTaxRow('TX', true, 6.25)
     await setStateRegistration('TX', true)
     const fee = await screeningIntakeFee('TX')
-    // screening $37.94 × 6.25% = 2.37125 → 2.37 (gamFee margin NOT in base)
-    expect(fee.tax).toBe(2.37)
+    // screening $38.94 × 6.25% = 2.43375 → 2.43 (gamFee margin NOT in base)
+    expect(fee.tax).toBe(2.43)
     expect(fee.total).toBeGreaterThan(fee.screening + fee.gamFee + fee.processing)
   })
 
@@ -158,8 +158,8 @@ describe('screening tax gate (screeningIntakeFee)', () => {
     await seedTaxRow('TX', true, 10, 'screening_plus_gamfee')
     await setStateRegistration('TX', true)
     const fee = await screeningIntakeFee('TX')
-    // (37.94 + 5) × 10% = 4.294 → 4.29
-    expect(fee.tax).toBe(4.29)
+    // (38.94 + 5) × 10% = 4.394 → 4.39
+    expect(fee.tax).toBe(4.39)
   })
 })
 

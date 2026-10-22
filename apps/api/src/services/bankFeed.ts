@@ -256,7 +256,35 @@ export async function finalizeConnection(landlordId: string, sessionId: string):
                   gam_debit_authorized_at = COALESCE(gam_debit_authorized_at, NOW()), gam_debit_revoked_at = NULL, updated_at = NOW()
             WHERE id = $1`, [landlordId, pm.paymentMethodId, pm.last4, pm.bankName])
       }
-    } catch (e) { logger.warn({ err: e, landlordId, connectionId: conn.id }, '[bank-feed] link made, debit method not minted') }
+      if (!pm) throw new Error('Stripe returned no debit payment method for this link')
+    } catch (e) {
+      // 10/21 — AND SAY SO, BECAUSE THIS IS HOW THE TWO SILENT ONES HAPPENED.
+      //
+      // Mountain View and TruBlu are both linked for payouts with NO debit
+      // method and no authorization — a state this one-step flow is not
+      // supposed to be able to produce. Nic, told about it: "I'm not worried
+      // about True Blue and Mountain View for the debit… I'm not ever gonna
+      // bother fixing these two properties," on the premise that every OTHER
+      // landlord authorizes both in the one step with no way to opt out of half
+      // of it. That premise is true (above) — but only when the mint succeeds,
+      // and a warn in a log file is nobody's idea of being told. Same lesson as
+      // the Checkr ID scan the same evening: a thing that fails quietly is a
+      // thing that is invisible for weeks.
+      logger.warn({ err: e, landlordId, connectionId: conn.id }, '[bank-feed] link made, debit method not minted')
+      try {
+        const { createAdminNotification } = await import('./adminNotifications')
+        await createAdminNotification({
+          severity: 'critical', category: 'gam_debit_not_minted', emailSuperAdmins: true,
+          title: 'Bank linked for payouts but GAM cannot debit it',
+          body: 'A landlord linked a bank — which authorizes payouts AND debits in one step — but the debit '
+            + 'payment method could not be created, so GAM has no way to collect its own fee from this entity. '
+            + 'It will be netted out of rent while rent flows through GAM, and there is nothing to net against '
+            + 'in a month that comes in as cash at the counter. Mountain View and TruBlu are already in this '
+            + `state. Landlord ${landlordId}, link ${conn.id}.`,
+          context: { landlord_id: landlordId, bank_connection_id: conn.id },
+        })
+      } catch { /* the link matters more than the notice */ }
+    }
   }
   return out
 }

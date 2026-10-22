@@ -40,6 +40,37 @@ export function MaintenancePortalPage() {
       apiPost(`/property-task-list/${propertyId}/items/${id}/done`, {}),
     { onSuccess: () => qc.invalidateQueries('my-property-tasks') })
 
+  // 10/21 (Nic) — THE SHOPPING LIST, FROM THE PERSON WHO KNOWS WHAT RAN OUT.
+  //
+  //   "we also need a way for maybe maintenance people or work trade people to
+  //    put in sort of a collected shopping cart pool of, hey, we need to buy
+  //    some new paint brushes and new trash bags... that way he doesn't have
+  //    text messages from like 5 or 6 different people."
+  //
+  // The maintenance person is the whole point of the supply list and was the
+  // one person with nowhere to add to it: the owner has it on the property
+  // page and a work-trade resident has it in their portal, and this screen —
+  // the one somebody standing in a park with an empty box is actually looking
+  // at — only showed jobs.
+  //
+  // The write rule here is the opposite of the jobs list above, and the server
+  // is what enforces it (routes/propertyTaskList assertMayAdd / assertMayTick):
+  // anybody working the park ADDS a line, and only the owner ticks it bought.
+  // So there is an add box and no tick button, which is the right way round.
+  const { data: supplyLines = [] } = useQuery<any[]>('my-property-supplies',
+    () => apiGet('/property-task-list?kind=supply'))
+  // The parks this person may write a line for — asked for by name, not
+  // guessed from the lines already on the lists. A quiet park with nothing on
+  // either list still has to be somewhere you can write the first thing down.
+  const { data: myParks = [] } = useQuery<any[]>('my-property-list-parks',
+    () => apiGet('/property-task-list/my-parks'))
+  const [supplyFor, setSupplyFor] = useState<string | null>(null)
+  const [supplyText, setSupplyText] = useState('')
+  const addSupplyMut = useMutation(
+    ({ propertyId, body }: { propertyId: string; body: string }) =>
+      apiPost(`/property-task-list/${propertyId}`, { body, kind: 'supply' }),
+    { onSuccess: () => { setSupplyText(''); qc.invalidateQueries('my-property-supplies') } })
+
   const myShift = (shiftData as any)?.myShift
   const activeStaff = (shiftData as any)?.active || []
   const lowStock = (parts as any[]).filter(p => p.quantity <= p.minQuantity)
@@ -62,7 +93,8 @@ export function MaintenancePortalPage() {
     // doesn't need to be its own tab, that's kind of ridiculous" — so the old
     // one is gone, its open lines are on the parks they belong to, and the
     // qualifier can go with it.
-    { id:'propertytasks', label:'Tasks', icon:ClipboardList, badge: (propertyTasks as any[]).length || undefined, quiet: true },
+    { id:'propertytasks', label:'Tasks', icon:ClipboardList,
+      badge: ((propertyTasks as any[]).length + (supplyLines as any[]).length) || undefined, quiet: true },
     { id:'parts',      label:'Parts',        icon:Package,      badge: lowStock.length || undefined },
     { id:'purchases',  label:'Purchases',    icon:ShoppingCart, badge: pendingPurchases.length || undefined },
     { id:'scheduled',  label:'Scheduled',    icon:Calendar,     badge: overdueScheduled.length || undefined },
@@ -213,6 +245,58 @@ export function MaintenancePortalPage() {
                 ))}
               </div>
             )}
+          </div>
+
+          {/* 10/21 (Nic): the shopping list, beside the jobs and not inside
+              them — "a collected shopping cart pool... so he doesn't have text
+              messages from like 5 or 6 different people." Add what ran out;
+              the owner ticks it off when it is bought. */}
+          <div className="card" style={{ padding:0, marginTop:16 }}>
+            <div style={{ padding:'12px 16px', borderBottom:'1px solid var(--border-0)' }}>
+              <div style={{ fontWeight:700, fontSize:'.9rem' }}>Supplies to buy</div>
+              <div style={{ fontSize:'.76rem', color:'var(--text-3)', marginTop:2 }}>
+                Anything the park needs. It all lands on one list so the owner buys it in one go.
+              </div>
+            </div>
+            {myParks.length === 0 ? (
+              <div style={{ padding:'16px', fontSize:'.8rem', color:'var(--text-3)' }}>
+                You are not on a park yet, so there is no list to add to.
+              </div>
+            ) : myParks.map(park => (
+              <div key={park.propertyId}>
+                <div style={{ padding:'10px 16px', fontSize:'.72rem', fontWeight:600,
+                              color:'var(--text-3)', borderBottom:'1px solid var(--border-0)' }}>
+                  {park.propertyName}
+                </div>
+                {(supplyLines as any[]).filter(l => l.propertyId === park.propertyId).map((l:any) => (
+                  <div key={l.id} style={{ display:'flex', gap:12, padding:'10px 16px',
+                                           borderBottom:'1px solid var(--border-0)', fontSize:'.85rem' }}>
+                    <ShoppingCart size={16} style={{ color:'var(--text-3)', flexShrink:0, marginTop:2 }}/>
+                    <div style={{ flex:1, minWidth:0, wordBreak:'break-word' }}>{l.body}</div>
+                    {l.mine && <span style={{ fontSize:'.7rem', color:'var(--text-3)' }}>yours</span>}
+                  </div>
+                ))}
+                <div style={{ display:'flex', gap:8, padding:'10px 16px', borderBottom:'1px solid var(--border-0)' }}>
+                  <input
+                    className="form-input"
+                    placeholder="Paint brushes, trash bags…"
+                    value={supplyFor === park.propertyId ? supplyText : ''}
+                    onFocus={()=>setSupplyFor(park.propertyId)}
+                    onChange={e=>{ setSupplyFor(park.propertyId); setSupplyText(e.target.value) }}
+                    onKeyDown={e=>{
+                      if (e.key === 'Enter' && supplyText.trim() && !addSupplyMut.isLoading) {
+                        addSupplyMut.mutate({ propertyId: park.propertyId, body: supplyText.trim() })
+                      }
+                    }}
+                    style={{ flex:1, minWidth:0, fontSize:'.85rem' }} />
+                  <button className="btn btn-primary btn-sm"
+                    disabled={supplyFor !== park.propertyId || !supplyText.trim() || addSupplyMut.isLoading}
+                    onClick={()=>addSupplyMut.mutate({ propertyId: park.propertyId, body: supplyText.trim() })}>
+                    Add
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       )}

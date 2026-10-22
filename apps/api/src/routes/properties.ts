@@ -14,6 +14,7 @@ import { openOnboardingWindow, getOnboardingWindow, closeOnboardingWindow, scree
 import { draftLeaseFromApplication } from '../services/applicationLeaseDraft'
 import { loadSubtype, setSubtypeUnits } from '../services/unitSubtype'
 import { AppError } from '../middleware/errorHandler'
+import { portalLink } from '../lib/portalUrls'
 import { landlordScopeIds, isEntityMember, resolveLandlordTarget, landlordIdForProperty, ownsLandlord } from '../lib/landlordScope'
 import { MAINTENANCE_CATEGORIES,
   FEE_PAYER_VALUES,
@@ -582,6 +583,12 @@ propertiesRouter.post('/applications/:id/onboard', requirePerm('tenants.create')
 // never expires — so a code on a laminated sign at the office does not
 // silently go dead. Revoking access means clearing the slug, the same
 // switch that takes the booking site down.
+/** The one URL the apply QR encodes — printed, shown on a screen, or sent. */
+function applyLinkUrl(prop: { id: string; landlord_id: string }): string {
+  const qs = new URLSearchParams({ landlordId: prop.landlord_id, propertyId: prop.id })
+  return portalLink('tenant', `background-check?${qs.toString()}`)
+}
+
 propertiesRouter.get('/:id/apply-link', requirePerm('units.edit', 'units.view_status'), async (req, res, next) => {
   try {
     const prop = await queryOne<{ id: string; name: string; landlord_id: string; booking_slug: string | null }>(
@@ -607,14 +614,55 @@ propertiesRouter.get('/:id/apply-link', requirePerm('units.edit', 'units.view_st
     // So the code encodes the screening page itself, with the property and
     // landlord carried in the query string. The applicant scans and is in the
     // flow; the binding rides along without them entering anything for it.
-    const tenantApp = process.env.TENANT_APP_URL || 'http://localhost:3002'
-    const url = `${tenantApp}/background-check`
-      + `?landlordId=${prop.landlord_id}&propertyId=${prop.id}`
+    // 10/21: through portalUrls like every other link GAM sends. This one is
+    // PRINTED and stuck on a front desk, so a missing variable would be a
+    // localhost QR on a counter with nobody able to tell from looking at it.
+    const url = applyLinkUrl(prop)
     const QRCode = (await import('qrcode')).default
     const qrDataUrl = await QRCode.toDataURL(url, { margin: 1, width: 320 })
     res.json({ success: true, data: { url, qrDataUrl, propertyName: prop.name } })
   } catch (e) { next(e) }
 })
+
+// POST /:id/apply-link/send — the same link, emailed.
+//
+// 10/21 (Nic): "Somebody pays for a background check in person. The only way to
+// get there is to book 22 nights or more... they have to pay not only for the
+// check, but the whole 22 nights just to do the check. And then what happens if
+// the landlord denies them?... for people that just legitimately want to move
+// in, they need to be able to just do the background check first and see if
+// they're going to be approved."
+//
+// The QR on the desk already does this for anyone standing in front of it —
+// they scan, they pay GAM themselves, nobody fronts anything. This is the same
+// link for the person who rang instead of walked in. It is deliberately NOT a
+// second link: both come out of applyLinkUrl, so what is sent and what is
+// printed can never drift apart.
+propertiesRouter.post('/:id/apply-link/send', requirePerm('units.edit', 'units.view_status'), async (req, res, next) => {
+  try {
+    const prop = await queryOne<{ id: string; name: string; landlord_id: string; booking_slug: string | null; state: string | null }>(
+      `SELECT id, name, landlord_id, booking_slug, state FROM properties WHERE id = $1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (!prop.booking_slug) {
+      throw new AppError(409, `${prop.name} has no booking address yet, so there is no application link to send. `
+        + 'Set one under the property\'s booking settings, then press Send again.')
+    }
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new AppError(400, 'That does not look like an email address — check it and press Send again.')
+    }
+    const { screeningIntakeFee } = await import('./background')
+    const { emailStartScreening } = await import('../services/email')
+    const fee = await screeningIntakeFee(prop.state ?? null)
+    await emailStartScreening(email, {
+      name: typeof req.body?.name === 'string' ? req.body.name.trim() : null,
+      propertyName: prop.name, url: applyLinkUrl(prop), price: fee.total,
+    }, { landlordId: prop.landlord_id })
+    res.json({ success: true, data: { sentTo: email, price: fee.total } })
+  } catch (e) { next(e) }
+})
+
 
 propertiesRouter.get('/:id', async (req, res, next) => {
   try {

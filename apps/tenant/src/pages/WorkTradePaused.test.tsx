@@ -23,6 +23,8 @@ const server = vi.hoisted(() => ({
   /** Every URL the screen asked for, so a paused screen can be shown to ask for nothing. */
   gets: [] as string[],
   runs: [] as any[],
+  /** 10/21: what the park's task / supply list answers. */
+  lists: [] as any[],
 }))
 
 vi.mock('../lib/api', () => ({
@@ -31,6 +33,8 @@ vi.mock('../lib/api', () => ({
     if (url === '/tenants/work-trade') return server.agreement
     if (url.startsWith('/utility/reading-runs')) return server.runs
     if (url === '/work-trade/jobs') return { mine: [], available: [], toCheck: [] }
+    // 10/21: the park's two lists, which a work-trade resident reads from here.
+    if (url.startsWith('/property-task-list/')) return server.lists
     if (url.endsWith('/standing')) return {
       currentMonthHours: 20, carriedHours: 0, catchUpHours: 20, bankedHours: 0, carriedValue: null,
       paused: true, hoursCounted: true, hoursNotCounted: false,
@@ -60,6 +64,7 @@ let root: Root
 beforeEach(() => {
   server.gets = []
   server.runs = []
+  server.lists = []
   server.agreement = {
     id: 'a1', status: 'paused', tracksHours: true, pausedSpaceOccupied: true, hoursCounted: true,
     unitNumber: 'RV 50', propertyName: 'Mountain View RV Ranch', propertyId: 'p1',
@@ -144,5 +149,59 @@ describe('the Meter Readings page while the trade is paused', () => {
     server.agreement = { ...server.agreement, status: 'active', fieldPermissions: [] }
     await show(MeterReadingsPage)
     await until(() => text().includes('not part of your work trade'), 'the not-your-job reason')
+  })
+})
+
+/**
+ * 10/21 (Nic) — "we need work trade people to be able to see this task list in
+ * the system. And then we also need a way for maybe maintenance people or work
+ * trade people to put in sort of a collected shopping cart pool."
+ *
+ * It goes on THIS page rather than a nav item of its own, because this page
+ * already exists only while the agreement is live — which is exactly who should
+ * be looking at the park's jobs — and it is the page they open to check their
+ * hours. The panel is the owner's own (shared-ui), with the owner's controls
+ * off: they tick a job and they ask for supplies, and the task list stays the
+ * owner's to write.
+ */
+describe('10/21: the park\'s task list and supply list, in the work trader\'s portal', () => {
+  it('asks for both lists on the park named by their agreement', async () => {
+    await show(WorkTradePage)
+    await until(() => text().includes('Task list'), 'the task list')
+    expect(server.gets).toContain('/property-task-list/p1?kind=job')
+    expect(server.gets).toContain('/property-task-list/p1?kind=supply')
+    // Not the owner's read: a resident never asks for what was taken off the list.
+    expect(server.gets.every(u => !u.includes('withHidden'))).toBe(true)
+  })
+
+  it('reads the jobs and can tick one off, but has no box to write the task list', async () => {
+    server.lists = [{
+      id: 'i1', kind: 'job', body: 'Take pictures of MH 14 and get it listed',
+      addedByUserId: 'u1', addedByName: 'Nic Rhoades', mine: false,
+      doneAt: null, doneByUserId: null, doneByName: null, hiddenAt: null,
+    }]
+    await show(WorkTradePage)
+    await until(() => text().includes('Take pictures of MH 14'), 'the job')
+    // The tick is there …
+    expect(buttons().some(b => b.getAttribute('aria-label') === 'Mark it done')).toBe(true)
+    // … and so is the supply box, because anybody working the park may ask.
+    expect(text()).toContain('Things to buy for this property')
+    // The task list's own words say what does NOT belong on it.
+    expect(text()).toContain('a closing read is taken at the counter')
+  })
+
+  it('shows a paused work trader the lists too — they are back on site before anybody un-pauses them', async () => {
+    expect(server.agreement.status).toBe('paused')
+    await show(WorkTradePage)
+    await until(() => text().includes('Task list'), 'the task list while paused')
+    expect(text()).toContain('Supply list')
+  })
+
+  it('a resident with no agreement sees no lists at all, because the page itself is not theirs', async () => {
+    server.agreement = null
+    await show(WorkTradePage)
+    await until(() => text().includes('no work trade agreement'), 'the empty state')
+    expect(text()).not.toContain('Task list')
+    expect(server.gets.every(u => !u.startsWith('/property-task-list/'))).toBe(true)
   })
 })

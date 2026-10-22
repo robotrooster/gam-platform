@@ -741,8 +741,23 @@ export async function stayNeeds(args: {
       // calculation background checks are sold at, never a copy of it.
       const { screeningIntakeFee } = await import('../routes/background')
       const fee = await screeningIntakeFee(prop?.state ?? null)
+      // 10/21 (Nic): ONE price for a background check, whoever pays it and
+      // however it is collected — `fee.total`, processing included.
+      //
+      //   "if the landlord is paying for it, we are still going to make the
+      //    price the same... That's just a little extra markup on our end. It
+      //    keeps the price consistent. That way it's not a landlord paying for
+      //    it for some people and getting a little bit of a break and making
+      //    other people pay for it themselves."
+      //
+      // This line used to stop before processing, so a check cost $43.94 at a
+      // counter taking cash and $46.03 on an applicant's own card — the same
+      // check, two prices, decided by how the money happened to arrive. Now it
+      // is the full price everywhere, and a screening line never takes a card
+      // fee on top of it (cardFeeSplit's `feeExempt`). Where no card is
+      // presented, the processing inside the price is GAM's.
       screeningFee = {
-        amount: Math.round((fee.screening + fee.gamFee + fee.tax) * 100) / 100,
+        amount: fee.total,
         screening: fee.screening, gamFee: fee.gamFee, tax: fee.tax, intakeTotal: fee.total,
       }
       // 10/6 (Nic): the third choice. One count per person per property per

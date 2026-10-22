@@ -226,16 +226,21 @@ describe('stayNeeds — the one function every door calls', () => {
     expect(r).toMatchObject({ nights: 21, screening: 'not_needed', leaseChoice: 'not_asked', screeningFee: null })
   })
 
-  it('22 nights with nothing on file: the intake price, before its own card processing', async () => {
+  // 10/21 (Nic): the whole intake price, card processing included — a check is
+  // one price however it is collected. It used to stop before processing, so
+  // the same check cost less at a counter taking cash than on an applicant's
+  // own card. The breakdown is still carried beside it for the books.
+  it('22 nights with nothing on file: the whole intake price, processing included', async () => {
     const w = await world()
     const r = await stayNeeds({ landlordId: w.landlordId, propertyId: w.propertyId, email: email('fee'), checkIn: await day(0), checkOut: await day(22) })
     const intake = await screeningIntakeFee('AZ')
     expect(r.screening).toBe('fee_due')
     expect(r.leaseChoice).toBe('not_asked')
     expect(r.screeningFee).toEqual({
-      amount: Math.round((intake.screening + intake.gamFee + intake.tax) * 100) / 100,
+      amount: intake.total,
       screening: intake.screening, gamFee: intake.gamFee, tax: intake.tax, intakeTotal: intake.total,
     })
+    expect(r.screeningFee!.amount).toBe(46.03)
   })
 
   it('30+ nights asks lease or stay; the answer given wins; a check on file means no fee', async () => {

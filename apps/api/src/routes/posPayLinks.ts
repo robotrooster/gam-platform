@@ -70,8 +70,8 @@ const round2 = (n: number) => Math.round(n * 100) / 100
  * What a link charges by card. GAM's fee is always taken; the property's
  * setting when the link was made decides whether it's added on top (S648).
  */
-export function payLinkCharge(total: number, payer: CardFeePayer = 'customer'): { fee: number; charged: number; held: number; customerFee: number } {
-  const split = cardFeeSplit(total, payer)
+export function payLinkCharge(total: number, payer: CardFeePayer = 'customer', feeExempt = 0): { fee: number; charged: number; held: number; customerFee: number } {
+  const split = cardFeeSplit(total, payer, feeExempt)
   return { ...split, customerFee: payer === 'customer' ? split.fee : 0 }
 }
 
@@ -700,6 +700,18 @@ export function linkBookingLines(link: any, stay: LinkStay | null): { name: stri
  * the guest when the link is paid (recordLinkScreening).
  */
 export const isScreeningLine = (l: any): boolean => !l?.id && l?.screening === true
+
+/**
+ * 10/21 (Nic): what the background-check lines on a cart come to — the part of
+ * a total that never takes a card fee on top, because the price of a check
+ * already has its processing inside it (cardFeeSplit's `feeExempt`). One price
+ * for a check, every way it is sold.
+ */
+export function screeningLineTotal(items: any): number {
+  const list = Array.isArray(items) ? items : Array.isArray(items?.items) ? items.items : []
+  return round2(list.filter(isScreeningLine)
+    .reduce((sum: number, l: any) => sum + (Number(l.price) || 0) * (Number(l.qty) || 1), 0))
+}
 
 /**
  * The link's background-check line (its name and fee), or null. `bookingId`:
@@ -1588,7 +1600,7 @@ async function writePayLink(req: any, body: z.infer<typeof createSchema>, prop: 
   } finally { client.release() }
   if (returningAfterCommit) await returningAfterCommit()
 
-  const { customerFee, charged } = payLinkCharge(Number(link.total), payerOf(link))
+  const { customerFee, charged } = payLinkCharge(Number(link.total), payerOf(link), screeningLineTotal(link))
   if (link.kind === 'one_time') {
     const { emailPayLink } = await import('../services/email')
     await emailPayLink({
@@ -1681,7 +1693,7 @@ export async function createBookingDepositLink(opts: {
 
   // No expiry on the LINK either. A deposit link that dies on its own leaves a
   // held site and a guest holding a dead URL, and somebody has to notice.
-  const { customerFee } = payLinkCharge(Number(link.total), payerOf(link))
+  const { customerFee } = payLinkCharge(Number(link.total), payerOf(link), screeningLineTotal(link))
   const { emailPayLink } = await import('../services/email')
   const emailed = await emailPayLink({
     to: link.customer_email, name: link.customer_name, propertyName: propName,
@@ -1793,7 +1805,7 @@ export async function createScreeningFeeLink(opts: {
   } finally { client.release() }
 
   // No expiry: check-in waits on the check, so the link stays good until it is paid or closed.
-  const { customerFee } = payLinkCharge(Number(link.total), payerOf(link))
+  const { customerFee } = payLinkCharge(Number(link.total), payerOf(link), screeningLineTotal(link))
   const { emailPayLink } = await import('../services/email')
   const emailed = await emailPayLink({
     to: link.customer_email, name: link.customer_name, propertyName: propName,
@@ -1849,7 +1861,7 @@ export async function createStayBalanceLink(opts: {
     await client.query('ROLLBACK').catch(() => {})
     throw e
   } finally { client.release() }
-  const { customerFee } = payLinkCharge(Number(link.total), payerOf(link))
+  const { customerFee } = payLinkCharge(Number(link.total), payerOf(link), screeningLineTotal(link))
   const { emailPayLink } = await import('../services/email')
   await emailPayLink({
     to: link.customer_email, name: link.customer_name, propertyName: propName,
@@ -1955,7 +1967,7 @@ export async function createUtilityBillPayLink(req: any, body: {
     throw e
   } finally { client.release() }
 
-  const { customerFee } = payLinkCharge(Number(link.total), payerOf(link))
+  const { customerFee } = payLinkCharge(Number(link.total), payerOf(link), screeningLineTotal(link))
   const { emailPayLink } = await import('../services/email')
   const emailed = await emailPayLink({
     to: link.customer_email, name: link.customer_name, propertyName: prop.name,
@@ -2086,7 +2098,7 @@ posPayLinksRouter.get('/', requirePerm('pos.ring_sale'), async (req, res, next) 
           }
         }
       }
-      data.push({ ...r, ...shown, note, holds_stay: holdsStay, url: payLinkUrl(r.token), ...payLinkCharge(Number(shown.total), payerOf(r)) })
+      data.push({ ...r, ...shown, note, holds_stay: holdsStay, url: payLinkUrl(r.token), ...payLinkCharge(Number(shown.total), payerOf(r), screeningLineTotal(r)) })
     }
     res.json({ success: true, data })
   } catch (e) { next(e) }
@@ -2225,7 +2237,7 @@ posPayLinksRouter.patch('/:id', requirePerm('pos.ring_sale'), async (req: any, r
       await client.query('ROLLBACK').catch(() => {})
       throw e
     } finally { client.release() }
-    const { customerFee, charged } = payLinkCharge(Number(updated.total), payerOf(updated))
+    const { customerFee, charged } = payLinkCharge(Number(updated.total), payerOf(updated), screeningLineTotal(updated))
     res.json({ success: true, data: { ...updated, url: payLinkUrl(updated.token), card_fee: customerFee, charged } })
   } catch (e) { next(e) }
 })
@@ -2456,7 +2468,7 @@ posPayLinksRouter.post('/:id/resend', requirePerm('pos.ring_sale'), async (req, 
       }
     }
     const { emailPayLink } = await import('../services/email')
-    const { customerFee } = payLinkCharge(total, payerOf(link))
+    const { customerFee } = payLinkCharge(total, payerOf(link), screeningLineTotal(link))
     await emailPayLink({
       to: link.customer_email, name: link.customer_name, propertyName: prop.name,
       label: link.label, amount: total, cardFee: customerFee, url: payLinkUrl(link.token),
@@ -2469,6 +2481,35 @@ posPayLinksRouter.post('/:id/resend', requirePerm('pos.ring_sale'), async (req, 
     // A link sent with no expiry (a deposit, a background check) keeps none — only a 14-day link gets 14 more days.
     await query(`UPDATE pos_pay_links SET expires_at = CASE WHEN expires_at IS NULL THEN NULL ELSE NOW() + INTERVAL '14 days' END, updated_at = NOW() WHERE id = $1`, [link.id])
     res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// GET /api/pos/pay-links/:id/qr.svg — the same code as VECTOR art.
+//
+// 10/21 (Nic): "I can make nice signs engraved on wood and maybe use a laser
+// engraver to actually like do the QR code the right way, so it looks nice and
+// professional."
+//
+// A laser cutter wants paths, not pixels — a PNG has to be traced first and the
+// trace rounds the corners of the modules, which is exactly how a code stops
+// scanning. This is the one the engraver should get. Highest error correction,
+// because an engraved code lives outdoors on wood and will pick up dirt, sun
+// and a scratch or two, and H lets it keep working through about a third of
+// itself being unreadable.
+posPayLinksRouter.get('/:id/qr.svg', requirePerm('pos.ring_sale'), async (req, res, next) => {
+  try {
+    const link = /^[0-9a-f-]{36}$/i.test(String(req.params.id))
+      ? await queryOne<any>(`SELECT * FROM pos_pay_links WHERE id = $1`, [req.params.id]) : null
+    if (!link) throw new AppError(404, LINK_GONE)
+    await propertyFor(req, link.property_id)
+    const svg = await QRCode.toString(payLinkUrl(link.token), {
+      type: 'svg', margin: 2, errorCorrectionLevel: 'H', width: 600,
+    })
+    const name = String(link.label || 'qr-code').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'qr-code'
+    res.setHeader('Content-Type', 'image/svg+xml')
+    res.setHeader('Content-Disposition', `attachment; filename="${name}.svg"`)
+    res.setHeader('Cache-Control', 'private, max-age=300')
+    res.send(svg)
   } catch (e) { next(e) }
 })
 
@@ -2704,7 +2745,7 @@ publicPayRouter.get('/pay/:token', async (req, res, next) => {
             `<h1>This link needs updating</h1><p>Nothing was charged. Please contact ${escapeHtml(link.property_name)} for an up-to-date link.</p>`))
         }
       }
-      const { customerFee } = payLinkCharge(Number(link.total), payerOf(link))
+      const { customerFee } = payLinkCharge(Number(link.total), payerOf(link), screeningLineTotal(link))
       const heldWords = await linkHeldWords(link).catch(() => null)
       const session = await openLinkCardPage(link, customerFee, heldWords)
       const saved = await queryOne<{ id: string }>(
@@ -2844,7 +2885,7 @@ export async function finalizePayLink(session: {
     if (!link) { await client.query('ROLLBACK'); return { recorded: false, reason: 'link gone' } }
     const dup = await client.query(`SELECT 1 FROM pos_transactions WHERE stripe_payment_intent_id = $1`, [session.payment_intent])
     if (dup.rows.length) { await client.query('ROLLBACK'); return { recorded: false, reason: 'already recorded' } }
-    const { fee, charged, held, customerFee } = payLinkCharge(Number(link.total), payerOf(link))
+    const { fee, charged, held, customerFee } = payLinkCharge(Number(link.total), payerOf(link), screeningLineTotal(link))
     const payer = session.custom_fields?.find(f => f.key === 'name')?.text?.value ?? session.customer_details?.name ?? link.customer_name ?? null
     const paid = round2((Number(session.amount_total) || 0) / 100)
     const holdAndTell = async (reason: HeldReason, note: string, tell: (heldId: string) => Promise<void>, why: string) => {

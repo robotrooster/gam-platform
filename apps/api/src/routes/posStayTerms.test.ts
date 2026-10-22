@@ -55,7 +55,7 @@ import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import { camelCaseKeys } from '../lib/caseConversion'
 import { errorHandler } from '../middleware/errorHandler'
 import { posRouter } from './pos'
-import { posPayLinksRouter, finalizePayLink, payLinkCharge, createScreeningFeeLink, createBookingDepositLink } from './posPayLinks'
+import { posPayLinksRouter, finalizePayLink, payLinkCharge, screeningLineTotal, createScreeningFeeLink, createBookingDepositLink } from './posPayLinks'
 import { stayNeeds } from '../services/stayTerms'
 import { reservationDue, SCREENING_LINE_NAME } from '../services/registerStay'
 import { incomeEvents } from '../services/incomeBasis'
@@ -242,8 +242,13 @@ describe('Add a month at the register (R6)', () => {
 describe('a stay sent on a pay link', () => {
   const sendLink = (f: F, body: any) => request(app()).post('/api/pos/pay-links').set(auth(f))
     .send({ propertyId: f.propertyId, kind: 'one_time', customer: { name: 'Dale Carter', email: 'dale@t.dev' }, ...body })
+  // 10/21 (Nic): Stripe is charged what the server asked for, and a background
+  // check line takes no card fee on top of it — so the simulated payment has to
+  // leave the check out of the fee the same way the server does, or finalize
+  // reads it as the wrong amount.
   const paidOnline = (link: any, pi: string) => finalizePayLink({
-    id: link.last_checkout_session_id ?? 'cs_any', amount_total: Math.round(payLinkCharge(Number(link.total)).charged * 100), payment_intent: pi,
+    id: link.last_checkout_session_id ?? 'cs_any',
+    amount_total: Math.round(payLinkCharge(Number(link.total), 'customer', screeningLineTotal(link)).charged * 100), payment_intent: pi,
     metadata: { gam_pay_link_id: link.id, gam_landlord_id: link.landlord_id ?? link.landlordId },
     customer_details: { name: 'Dale Carter', email: 'dale@t.dev' },
   })
@@ -470,7 +475,8 @@ describe('links the schedule sends for the background check (A2)', () => {
        RETURNING id`, [f.sites[0], f.landlordId]))[0].id
   }
   const paidOnline = (link: any, pi: string) => finalizePayLink({
-    id: 'cs_any', amount_total: Math.round(payLinkCharge(Number(link.total)).charged * 100), payment_intent: pi,
+    id: 'cs_any',
+    amount_total: Math.round(payLinkCharge(Number(link.total), 'customer', screeningLineTotal(link)).charged * 100), payment_intent: pi,
     metadata: { gam_pay_link_id: link.id, gam_landlord_id: link.landlord_id }, customer_details: { name: 'Dale Carter', email: 'dale@t.dev' },
   })
 

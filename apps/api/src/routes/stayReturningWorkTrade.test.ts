@@ -186,10 +186,9 @@ const tradeOf = async (bookingId: string) => (await db.query(
   `SELECT id, status, unit_id, tenant_id, booking_id, to_char(start_date, 'YYYY-MM-DD') AS start_date,
           to_char(end_date, 'YYYY-MM-DD') AS end_date, covered_charges, trusted, tracks_hours, monthly_hours_target
      FROM work_trade_agreements WHERE booking_id = $1`, [bookingId])).rows[0]
-const feeFor = async (state: string | null) => {
-  const i = await screeningIntakeFee(state)
-  return Math.round((i.screening + i.gamFee + i.tax) * 100) / 100
-}
+// 10/21 (Nic): one price for a background check — the whole intake price, its
+// card processing already inside it, whoever pays and however it is collected.
+const feeFor = async (state: string | null) => (await screeningIntakeFee(state)).total
 const day = async (offset: number): Promise<string> =>
   (await db.query<{ d: string }>(`SELECT (CURRENT_DATE + $1::int)::text AS d`, [offset])).rows[0].d
 

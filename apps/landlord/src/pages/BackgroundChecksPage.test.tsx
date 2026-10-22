@@ -244,8 +244,17 @@ describe('a filter can only narrow, never widen', () => {
     await render()
     await choose(selectWith('Choose a company')!, OP)
     await choose(selectWith('Choose a company')!, MV)
-    expect(server.gets.filter(u => u.startsWith('/background'))).toEqual(['/background'])
-    expect(server.gets.every(u => !u.includes('landlordId=') && !u.includes('propertyId='))).toBe(true)
+    // The SCREENING LIST itself is fetched once, account-wide, and every filter
+    // narrows it here in the page — that is the rule this guards, because a
+    // filter that goes to the server is a filter that can come back with MORE.
+    expect(server.gets.filter(u => u === '/background' || u.startsWith('/background?'))).toEqual(['/background'])
+    // No company ever goes to the server for it either.
+    expect(server.gets.every(u => !u.includes('landlordId='))).toBe(true)
+    // 10/21 (Nic): checks that are PAID FOR and waiting are a separate, small
+    // list (routes/background /waiting) and it is scoped server-side to the
+    // account — narrowing it by park is a filter it is free to send, because
+    // the endpoint only ever answers with this account's own.
+    expect(server.gets.filter(u => u.startsWith('/background/waiting'))).toEqual(['/background/waiting'])
   })
 
   it('offers no company or park the account was not already sent screenings for', async () => {

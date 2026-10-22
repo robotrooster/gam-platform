@@ -402,6 +402,12 @@ describe('it sits outside maintenance, and that is the point', () => {
       // here to prevent, and it is still not maintenance.
       'apps/api/src/db/migrations/20261022182000_one_task_list_not_two.sql',
       'apps/api/src/routes/oneTaskList.test.ts',
+      // 10/21 (Nic): the supply list — "anybody can contribute to a list of
+      // things to purchase" — lives in this same table under a kind, because
+      // the two lists are the same four columns and a second parallel table
+      // for them is the duplication he killed the night before. It adds a
+      // column; it still reports on nothing.
+      'apps/api/src/db/migrations/20261023120000_a_supply_list_beside_the_task_list.sql',
     ])
     const repo = join(__dirname, '..', '..', '..', '..')
     const hits: string[] = []
@@ -438,7 +444,12 @@ describe('it sits outside maintenance, and that is the point', () => {
       .map(r => r.column_name).sort()
     expect(cols).toEqual([
       'added_by_user_id', 'body', 'created_at', 'done_at', 'done_by_user_id',
-      'hidden_at', 'hidden_by_user_id', 'id', 'property_id',
+      'hidden_at', 'hidden_by_user_id', 'id',
+      // 10/21: which of the park's two lists this line is on — jobs, or things
+      // to buy. Still no status, no priority, no assignee, no due date and no
+      // recurrence: the absences are the feature.
+      'kind',
+      'property_id',
     ])
   })
 })
@@ -551,5 +562,284 @@ describe('10/21 (Nic): nothing on this list is one-way for the owner', () => {
     expect((await untick(mine.token, mine.propertyId, hers.data.id)).status).toBe(404)
     expect((await unhide(mine.token, mine.propertyId, hers.data.id)).status).toBe(404)
     expect((await list(theirs.token, theirs.propertyId)).body.data[0].doneAt).toBeTruthy()
+  })
+})
+
+/**
+ * 10/21 (Nic) — THE SUPPLY LIST, AND WORK-TRADE PEOPLE SEEING ANY OF THIS.
+ *
+ *   "We also need a way for maybe maintenance people or work trade people to
+ *    put in sort of a collected shopping cart pool of, hey, we need to buy some
+ *    new paint brushes and new trash bags. Like, anybody can contribute to a
+ *    list of things to purchase. The owner can consult that list when either
+ *    ordering online or running to the store. But that way he doesn't have text
+ *    messages from like 5 or 6 different people."
+ *
+ *   "And we need work trade people to be able to see this task list in the
+ *    system."
+ *
+ * Two rules, and the first is INVERTED between the lists, which is the only
+ * reason they are not one list:
+ *
+ *   job     the owner writes; anybody working the park ticks.
+ *   supply  anybody working the park writes; only the owner ticks it bought.
+ *
+ * The second rule is about WHO COUNTS AS WORKING THE PARK. A work-trade
+ * resident is a TENANT — not staff — so until now they got a flat 404 on the
+ * list of the jobs they are there to do. Their claim is their own agreement.
+ */
+describe('10/21 (Nic): the supply list, and who may write which list', () => {
+  const addKind = (token: string, propertyId: string, body: string, kind: string) =>
+    app().post(`/api/property-task-list/${propertyId}`)
+      .set('Authorization', `Bearer ${token}`).send({ body, kind })
+  const listKind = (token: string, propertyId: string, kind: string) =>
+    app().get(`/api/property-task-list/${propertyId}?kind=${kind}`).set('Authorization', `Bearer ${token}`)
+  const mineKind = (token: string, kind: string) =>
+    app().get(`/api/property-task-list?kind=${kind}`).set('Authorization', `Bearer ${token}`)
+
+  /** A resident who works off their rent at this park, which is a TENANT. */
+  async function seedWorkTradeResident(
+    landlordId: string, propertyId: string, unitId: string,
+    opts: { status?: string; endDate?: string | null } = {},
+  ) {
+    const userId = randomUUID()
+    await db.query(
+      `INSERT INTO users (id, email, password_hash, first_name, last_name, role)
+       VALUES ($1, $2, 'x', 'Susan', 'Geisman', 'tenant')`, [userId, `wt-${userId}@t.dev`])
+    const { rows: [t] } = await db.query<{ id: string }>(
+      `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [userId])
+    await db.query(
+      `INSERT INTO work_trade_agreements
+         (unit_id, tenant_id, landlord_id, duties, start_date, end_date, status, monthly_hours_target, covered_charges)
+       VALUES ($1,$2,$3,'Around the park','2026-09-01',$5::date,$4,80,'{rent}')`,
+      [unitId, t.id, landlordId, opts.status ?? 'active', opts.endDate ?? null])
+    return {
+      userId,
+      token: jwt.sign({ userId, role: 'tenant', email: `wt-${userId}@t.dev`, profileId: t.id, permissions: {} },
+                      process.env.JWT_SECRET!, { expiresIn: '1h' }),
+    }
+  }
+
+  it('anybody working the park adds to the supply list; only the owner adds to the task list', async () => {
+    const park = await seedPark()
+    const worker = await seedWorker(park.landlordId, { propertyIds: [park.propertyId] })
+
+    // The thing Nic asked for: the maintenance person's own request.
+    const asked = await addKind(worker.token, park.propertyId, 'Trash bags — the 55 gallon ones', 'supply')
+    expect(asked.status, JSON.stringify(asked.body)).toBe(200)
+    // And the thing that must not change: the task list stays the owner's.
+    expect((await addKind(worker.token, park.propertyId, 'Repaint the office', 'job')).status).toBe(403)
+    expect((await addKind(park.token, park.propertyId, 'Repaint the office', 'job')).status).toBe(200)
+  })
+
+  it('only the owner marks a supply line bought — he is the one at the till', async () => {
+    const park = await seedPark()
+    const worker = await seedWorker(park.landlordId, { propertyIds: [park.propertyId] })
+    const { body: added } = await addKind(worker.token, park.propertyId, 'Paint brushes', 'supply')
+
+    const theirs = await tick(worker.token, park.propertyId, added.data.id)
+    expect(theirs.status).toBe(403)
+    expect(theirs.body.error).toMatch(/owner/i)
+    expect((await tick(park.token, park.propertyId, added.data.id)).status).toBe(200)
+    const bought = (await listKind(park.token, park.propertyId, 'supply')).body.data[0]
+    expect(bought.doneAt).toBeTruthy()
+  })
+
+  it('whoever asked for a thing may take their own request back, but not somebody else\'s and not once it is bought', async () => {
+    const park = await seedPark()
+    const dale = await seedWorker(park.landlordId, { propertyIds: [park.propertyId] })
+    const sam = await seedWorker(park.landlordId, { propertyIds: [park.propertyId] })
+    const { body: a } = await addKind(dale.token, park.propertyId, 'Trash bags', 'supply')
+    const { body: b } = await addKind(sam.token, park.propertyId, 'A doorknob for 14', 'supply')
+
+    // Somebody else's request is not theirs to cancel.
+    expect((await hide(dale.token, park.propertyId, b.data.id)).status).toBe(403)
+    // Their own, while unbought, is.
+    expect((await hide(dale.token, park.propertyId, a.data.id)).status).toBe(200)
+    // Once the owner has bought it, the money is spent and it is his line.
+    await tick(park.token, park.propertyId, b.data.id)
+    expect((await hide(sam.token, park.propertyId, b.data.id)).status).toBe(403)
+  })
+
+  it('the two lists never bleed into each other', async () => {
+    const park = await seedPark()
+    await addKind(park.token, park.propertyId, 'Take pictures of MH 14 and get it listed', 'job')
+    await addKind(park.token, park.propertyId, 'Trash bags', 'supply')
+    expect((await listKind(park.token, park.propertyId, 'job')).body.data.map((x: any) => x.body))
+      .toEqual(['Take pictures of MH 14 and get it listed'])
+    expect((await listKind(park.token, park.propertyId, 'supply')).body.data.map((x: any) => x.body))
+      .toEqual(['Trash bags'])
+    // And no kind named at all is the task list, so every caller written before
+    // the supply list existed still reads what it always read.
+    expect((await list(park.token, park.propertyId)).body.data.map((x: any) => x.body))
+      .toEqual(['Take pictures of MH 14 and get it listed'])
+  })
+
+  it('the shopping view puts every park of one company together, each line naming its park', async () => {
+    const park = await seedPark('Spanishfork')
+    // A second park on the SAME company: one order, one set of books.
+    const c = await db.connect()
+    let second: string
+    try {
+      second = await seedProperty(c, { landlordId: park.landlordId, ownerUserId: park.userId, managedByUserId: park.userId })
+      await c.query(`UPDATE properties SET name = 'Springville' WHERE id = $1`, [second])
+      await c.query(`UPDATE landlords SET business_name = 'R&N property' WHERE id = $1`, [park.landlordId])
+    } finally { c.release() }
+    await addKind(park.token, park.propertyId, 'A doorknob for the front', 'supply')
+    await addKind(park.token, second, 'A new window', 'supply')
+    await addKind(park.token, park.propertyId, 'Repaint the office', 'job')
+
+    const run = (await mineKind(park.token, 'supply')).body.data
+    expect(run.map((x: any) => [x.entityName, x.propertyName, x.body])).toEqual([
+      ['R&N property', 'Spanishfork', 'A doorknob for the front'],
+      ['R&N property', 'Springville', 'A new window'],
+    ])
+    // The jobs are not on the shopping run.
+    expect(JSON.stringify(run)).not.toContain('Repaint the office')
+  })
+})
+
+describe('10/21 (Nic): "we need work trade people to be able to see this task list"', () => {
+  const addKind = (token: string, propertyId: string, body: string, kind: string) =>
+    app().post(`/api/property-task-list/${propertyId}`)
+      .set('Authorization', `Bearer ${token}`).send({ body, kind })
+
+  async function resident(
+    landlordId: string, propertyId: string, unitId: string,
+    opts: { trade?: boolean; status?: string; endDate?: string | null } = {},
+  ) {
+    const userId = randomUUID()
+    await db.query(
+      `INSERT INTO users (id, email, password_hash, first_name, last_name, role)
+       VALUES ($1, $2, 'x', 'Susan', 'Geisman', 'tenant')`, [userId, `res-${userId}@t.dev`])
+    const { rows: [t] } = await db.query<{ id: string }>(
+      `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [userId])
+    if (opts.trade !== false) {
+      await db.query(
+        `INSERT INTO work_trade_agreements
+           (unit_id, tenant_id, landlord_id, duties, start_date, end_date, status, monthly_hours_target, covered_charges)
+         VALUES ($1,$2,$3,'Around the park','2026-09-01',$5::date,$4,80,'{rent}')`,
+        [unitId, t.id, landlordId, opts.status ?? 'active', opts.endDate ?? null])
+    }
+    return {
+      userId,
+      token: jwt.sign({ userId, role: 'tenant', email: `res-${userId}@t.dev`, profileId: t.id, permissions: {} },
+                      process.env.JWT_SECRET!, { expiresIn: '1h' }),
+    }
+  }
+
+  it('reads the park\'s list and ticks a line off, on the strength of their own agreement', async () => {
+    const park = await seedPark()
+    const susan = await resident(park.landlordId, park.propertyId, park.unitId)
+    const { body: job } = await add(park.token, park.propertyId, 'Take pictures of MH 14 and get it listed')
+
+    const read = await list(susan.token, park.propertyId)
+    expect(read.status, JSON.stringify(read.body)).toBe(200)
+    expect(read.body.data.map((x: any) => x.body)).toEqual(['Take pictures of MH 14 and get it listed'])
+
+    const ticked = await tick(susan.token, park.propertyId, job.data.id)
+    expect(ticked.status, JSON.stringify(ticked.body)).toBe(200)
+    expect((await list(park.token, park.propertyId)).body.data[0].doneByUserId).toBe(susan.userId)
+  })
+
+  it('and can ask for supplies, which is the other half of what Nic asked for', async () => {
+    const park = await seedPark()
+    const susan = await resident(park.landlordId, park.propertyId, park.unitId)
+    const asked = await addKind(susan.token, park.propertyId, 'A new hose for the wash bay', 'supply')
+    expect(asked.status, JSON.stringify(asked.body)).toBe(200)
+    // Still not the task list: that is the owner's.
+    expect((await addKind(susan.token, park.propertyId, 'Repaint the office', 'job')).status).toBe(403)
+  })
+
+  it('a PAUSED agreement still reads it — a snowbird back a week early is not locked out', async () => {
+    const park = await seedPark()
+    const kent = await resident(park.landlordId, park.propertyId, park.unitId, { status: 'paused' })
+    await add(park.token, park.propertyId, 'Walk the fence line')
+    expect((await list(kent.token, park.propertyId)).status).toBe(200)
+  })
+
+  it('a resident with NO work trade sees nothing — "get apartment 4 listed" is not a renter\'s business', async () => {
+    const park = await seedPark()
+    const renter = await resident(park.landlordId, park.propertyId, park.unitId, { trade: false })
+    await add(park.token, park.propertyId, 'Take pictures of MH 14')
+    const r = await list(renter.token, park.propertyId)
+    // 404, not 403: a renter learns nothing about what exists here.
+    expect(r.status).toBe(404)
+    expect(JSON.stringify(r.body)).not.toContain('MH 14')
+  })
+
+  it('an ENDED agreement is nothing — their hours were billed when it ended', async () => {
+    const park = await seedPark()
+    const gone = await resident(park.landlordId, park.propertyId, park.unitId, { status: 'ended' })
+    await add(park.token, park.propertyId, 'Clear the laundry room')
+    expect((await list(gone.token, park.propertyId)).status).toBe(404)
+  })
+
+  it('a work-trade resident at ANOTHER park gets nothing here', async () => {
+    const mine = await seedPark('Mountain View RV Park')
+    const theirs = await seedPark('Oak Park Motel and RV')
+    const elsewhere = await resident(theirs.landlordId, theirs.propertyId, theirs.unitId)
+    await add(mine.token, mine.propertyId, 'Take pictures of MH 14')
+    expect((await list(elsewhere.token, mine.propertyId)).status).toBe(404)
+  })
+
+  it('and they cannot write the task list, un-tick, remove or see what was removed', async () => {
+    const park = await seedPark()
+    const susan = await resident(park.landlordId, park.propertyId, park.unitId)
+    const { body: job } = await add(park.token, park.propertyId, 'Walk the fence line')
+    await tick(susan.token, park.propertyId, job.data.id)
+    expect((await add(susan.token, park.propertyId, 'A list of my own')).status).toBe(403)
+    expect((await untick(susan.token, park.propertyId, job.data.id)).status).toBe(403)
+    expect((await hide(susan.token, park.propertyId, job.data.id)).status).toBe(403)
+    expect((await listWithRemoved(susan.token, park.propertyId)).body.data.every((x: any) => !x.hiddenAt)).toBe(true)
+  })
+})
+
+/**
+ * 10/21 (Nic) — A LIST YOU CANNOT START IS NOT A LIST.
+ *
+ *   "we also need a way for maybe maintenance people or work trade people to
+ *    put in sort of a collected shopping cart pool of, hey, we need to buy some
+ *    new paint brushes and new trash bags... that way he doesn't have text
+ *    messages from like 5 or 6 different people."
+ *
+ * The maintenance person's screen could only ever show parks that ALREADY had
+ * a line on them, so the first thing that ran out at a quiet park could never
+ * be written down — the park was not on screen to write it against.
+ */
+describe('the parks a person may write a line for', () => {
+  const myParks = (token: string) =>
+    app().get('/api/property-task-list/my-parks').set('Authorization', `Bearer ${token}`)
+
+  it('names a park with nothing on either list yet', async () => {
+    const park = await seedPark()
+    const res = await myParks(park.token)
+    expect(res.status).toBe(200)
+    expect(res.body.data.map((p: any) => p.propertyId)).toContain(park.propertyId)
+  })
+
+  it('names only this account\'s parks', async () => {
+    const mine_ = await seedPark('Mine')
+    const theirs = await seedPark('Theirs')
+    const ids = (await myParks(mine_.token)).body.data.map((p: any) => p.propertyId)
+    expect(ids).toContain(mine_.propertyId)
+    expect(ids).not.toContain(theirs.propertyId)
+  })
+
+  it('a worker sees the parks they are ON, and no others', async () => {
+    const park = await seedPark('Theirs')
+    const other = await seedPark('Not theirs')
+    const worker = await seedWorker(park.landlordId, { propertyIds: [park.propertyId] })
+    const ids = (await myParks(worker.token)).body.data.map((p: any) => p.propertyId)
+    expect(ids).toEqual([park.propertyId])
+    expect(ids).not.toContain(other.propertyId)
+  })
+
+  it('is not read as a property id — "my-parks" is its own route', async () => {
+    const park = await seedPark()
+    const res = await myParks(park.token)
+    // The /:propertyId route would have refused this as a bad id.
+    expect(res.status).toBe(200)
+    expect(Array.isArray(res.body.data)).toBe(true)
   })
 })

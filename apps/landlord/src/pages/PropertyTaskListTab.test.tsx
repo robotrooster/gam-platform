@@ -22,9 +22,10 @@ import { QueryClient, QueryClientProvider } from 'react-query'
 const server = vi.hoisted(() => ({
   items: [] as any[],
   posts: [] as { url: string; body: any }[],
+  gets: [] as string[],
 }))
 vi.mock('../lib/api', () => ({
-  apiGet: async () => server.items,
+  apiGet: async (url: string) => { server.gets.push(url); return server.items },
   apiPost: async (url: string, body: any) => {
     server.posts.push({ url, body })
     // The API answers with the saved line; the component refetches anyway.
@@ -49,6 +50,7 @@ let root: Root
 beforeEach(() => {
   server.items = []
   server.posts = []
+  server.gets = []
   perms.isOwner = true
   host = document.createElement('div')
   document.body.appendChild(host)
@@ -66,12 +68,12 @@ const buttonSaying = (label: string) =>
 
 const settle = async () => { await act(async () => { await Promise.resolve(); await Promise.resolve() }) }
 
-async function show() {
+async function show(kind?: 'job' | 'supply') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   await act(async () => {
     root.render(
       <QueryClientProvider client={qc}>
-        <PropertyTaskListTab propertyId="p1" />
+        <PropertyTaskListTab propertyId="p1" kind={kind} />
       </QueryClientProvider>,
     )
   })
@@ -103,7 +105,7 @@ describe('the landlord types the list', () => {
     await typeAndEnter('Fix the meters on row C')
 
     expect(server.posts).toHaveLength(1)
-    expect(server.posts[0].body).toEqual({ body: 'Fix the meters on row C' })
+    expect(server.posts[0].body).toEqual({ body: 'Fix the meters on row C', kind: 'job' })
     expect(text()).toContain('Fix the meters on row C')
     // Empty and still focused — the next line can just be typed.
     expect(box()!.value).toBe('')
@@ -129,10 +131,26 @@ describe('the landlord types the list', () => {
     expect(server.posts).toHaveLength(0)
   })
 
-  it('says what the list is for, and that it is not a repair queue', async () => {
+  // 10/21 (Nic): the words ARE the feature. This screen used to prompt "Fix the
+  // meters on row C" and describe itself as "fix the meters, re-gravel a site,
+  // swap a bulb" — all three of which he then ruled out: "meter reads should not
+  // ever be here, along with changing a broken meter, fixing gravel, whatever…
+  // It's an owner that says, hey, I want you to take some pictures of this
+  // apartment, get it listed as available." A screen that asks for the wrong
+  // thing gets the wrong thing.
+  it('asks for the work Nic actually wants here, and says what belongs elsewhere', async () => {
     await show()
-    // The landlord should not have to guess why this is not Maintenance.
-    expect(text()).toContain('Not repair requests')
+    expect(text()).toContain('take pictures of a vacant one and get it listed')
+    // Both of the places the wrong thing would otherwise land, named.
+    expect(text()).toContain('a maintenance request')
+    expect(text()).toContain('a closing read is taken at the counter')
+    expect(text()).toContain('Nothing here is timed, counted or reported on')
+    // And it no longer invites any of the three he ruled out.
+    expect(text()).not.toContain('re-gravel')
+    expect(text()).not.toContain('swap a bulb')
+    expect(text()).not.toContain('fix the meters')
+    const box = host.querySelector('input') as HTMLInputElement
+    expect(box.placeholder).toBe('Take pictures of MH 14 and get it listed')
     expect(text()).toContain('Press enter to add it and keep typing.')
   })
 })
@@ -260,5 +278,116 @@ describe('10/21: neither the tick nor the X is one-way for the owner', () => {
     const labels = [...host.querySelectorAll('button')].map(b => b.getAttribute('aria-label'))
     expect(labels).toEqual(['Done'])
     expect(text()).not.toContain('Taken off the list')
+  })
+})
+
+/**
+ * 10/21 (Nic) — THE SUPPLY LIST, WHICH IS THE TASK LIST WITH THE RULES THE
+ * OTHER WAY ROUND.
+ *
+ *   "We also need a way for maybe maintenance people or work trade people to
+ *    put in sort of a collected shopping cart pool of, hey, we need to buy some
+ *    new paint brushes and new trash bags. Like, anybody can contribute to a
+ *    list of things to purchase. The owner can consult that list when either
+ *    ordering online or running to the store. But that way he doesn't have text
+ *    messages from like 5 or 6 different people saying we need this and we need
+ *    this, and, you know, consolidate the list all in one spot."
+ *
+ * So: anybody working the park WRITES, and only the owner ticks it bought.
+ * Inverted from the task list, on the same screen, which is why the rules are
+ * tested rather than trusted to whoever reads the component next.
+ */
+describe('10/21: the supply list — anybody adds, the owner buys', () => {
+  const supply = (over: any = {}) => ({
+    id: 'i1', body: 'Trash bags — the 55 gallon ones', kind: 'supply',
+    addedByUserId: 'w1', addedByName: 'Dale Pruitt', mine: false,
+    doneAt: null, doneByUserId: null, doneByName: null, hiddenAt: null, ...over,
+  })
+
+  it('asks for things to buy, in Nic\'s words, and says where a line lives', async () => {
+    perms.isOwner = true
+    await show('supply')
+    expect(text()).toContain('Things to buy for this property')
+    expect(text()).toContain('paint brushes, trash bags')
+    expect(text()).toContain('one list stands in for six text messages')
+    const box = host.querySelector('input') as HTMLInputElement
+    expect(box.placeholder).toBe('Trash bags — the 55 gallon ones')
+  })
+
+  it('the maintenance person CAN add a line here, which they cannot on the task list', async () => {
+    perms.isOwner = false
+    await show('supply')
+    const box = host.querySelector('input') as HTMLInputElement
+    expect(box).toBeTruthy()
+    await typeAndEnter('Two gallons of flat white')
+    expect(server.posts).toHaveLength(1)
+    expect(server.posts[0].body).toEqual({ body: 'Two gallons of flat white', kind: 'supply' })
+  })
+
+  it('but only the owner marks it bought', async () => {
+    perms.isOwner = false
+    server.items = [supply()]
+    await show('supply')
+    const circle = [...host.querySelectorAll('button')]
+      .find(b => b.getAttribute('aria-label') === 'Only the owner marks this one') as HTMLButtonElement
+    expect(circle).toBeTruthy()
+    expect(circle.disabled).toBe(true)
+
+    perms.isOwner = true
+    await show('supply')
+    const ownerCircle = [...host.querySelectorAll('button')]
+      .find(b => b.getAttribute('aria-label') === 'Mark it bought') as HTMLButtonElement
+    expect(ownerCircle.disabled).toBe(false)
+    await act(async () => { ownerCircle.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await settle()
+    expect(server.posts.map(p => p.url)).toEqual(['/property-task-list/p1/items/i1/done'])
+  })
+
+  it('a bought line reads "Bought by", not "Done by"', async () => {
+    perms.isOwner = true
+    server.items = [supply({ doneAt: '2026-10-21T20:00:00.000Z', doneByUserId: 'u1', doneByName: 'Nic Rhoades' })]
+    await show('supply')
+    expect(text()).toContain('Bought by Nic Rhoades')
+    expect(text()).toContain('Bought')
+    expect(text()).not.toContain('Done by')
+  })
+
+  const hasX = () => [...host.querySelectorAll('button')]
+    .some(b => b.getAttribute('aria-label') === 'Take it off the list')
+
+  it('whoever asked for it can take their own request back while it is unbought', async () => {
+    perms.isOwner = false
+    server.items = [supply({ mine: true })]
+    await show('supply')
+    expect(hasX()).toBe(true)
+  })
+
+  it('but not somebody else\'s request — that is not theirs to cancel', async () => {
+    perms.isOwner = false
+    server.items = [supply({ mine: false })]
+    await show('supply')
+    expect(hasX()).toBe(false)
+  })
+
+  it('nor their own once it has been bought — the owner spent the money', async () => {
+    perms.isOwner = false
+    server.items = [supply({ mine: true, doneAt: '2026-10-21T20:00:00.000Z', doneByName: 'Nic Rhoades' })]
+    await show('supply')
+    expect(hasX()).toBe(false)
+  })
+
+  it('says who asked for each thing, which is the point of pooling them', async () => {
+    perms.isOwner = true
+    server.items = [supply(), supply({ id: 'i2', body: 'Paint brushes', addedByName: 'Bill Geisman' })]
+    await show('supply')
+    expect(text()).toContain('Asked for by Dale Pruitt')
+    expect(text()).toContain('Asked for by Bill Geisman')
+  })
+
+  it('reads the park\'s supply list, not its task list', async () => {
+    perms.isOwner = true
+    await show('supply')
+    expect(server.gets.some(u => u.includes('kind=supply'))).toBe(true)
+    expect(server.gets.some(u => u.includes('kind=job'))).toBe(false)
   })
 })

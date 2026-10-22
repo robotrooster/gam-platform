@@ -3191,6 +3191,35 @@ export function isSiteLayoutMismatch(required: string | null | undefined, actual
 // service; a reservation can require an amperage; staff are WARNED (not blocked)
 // on a mismatched move/edit (same posture as site layout — Nic 2026-06-27).
 // 'none' = not an RV site / unspecified. 'both' on the UNIT satisfies either.
+/**
+ * 10/21 (Nic) — THE TWO LISTS A PROPERTY KEEPS, AND WHO MAY WRITE WHICH.
+ *
+ *   'job'     the owner's task list. "It's stuff assigned by the landlord
+ *             himself" — he writes the lines, anybody working the park ticks
+ *             one off. Never meter reads (checkout takes those) and never
+ *             repairs (those are maintenance requests): "None of that stuff
+ *             should be here. It's an owner that says, hey, I want you to take
+ *             some pictures of this apartment, get it listed as available."
+ *
+ *   'supply'  things to buy. "Anybody can contribute to a list of things to
+ *             purchase. The owner can consult that list when either ordering
+ *             online or running to the store. But that way he doesn't have text
+ *             messages from like 5 or 6 different people." So the write rule is
+ *             INVERTED: anybody working the park adds a line, and only the
+ *             owner ticks it bought, because he is the one at the till.
+ *
+ * One table, one screen pattern, two lists (migration 20261023120000). A line
+ * always belongs to a PROPERTY — that is where the thing is needed and where it
+ * is delivered — while the owner's shopping view groups by ENTITY, because an
+ * order and its bookkeeping are the company's.
+ */
+export const PROPERTY_LIST_KINDS = ['job', 'supply'] as const
+export type PropertyListKind = typeof PROPERTY_LIST_KINDS[number]
+export const PROPERTY_LIST_KIND_LABEL: Record<PropertyListKind, string> = {
+  job:    'Task list',
+  supply: 'Supply list',
+}
+
 export const RV_AMP_SERVICES = ['none', '30', '50', 'both'] as const
 export type RvAmpService = typeof RV_AMP_SERVICES[number]
 export const RV_AMP_SERVICE_LABEL: Record<RvAmpService, string> = {
@@ -5631,9 +5660,24 @@ export const CARD_FEE_PAYER_LABEL: Record<CardFeePayer, string> = {
  * A card charge for `amount` (the price): what GAM's fee is, what the customer
  * is charged, and what GAM holds for the landlord afterwards. The fee is the
  * same either way — only who pays it moves.
+ *
+ * 10/21 (Nic): `feeExempt` is the part of `amount` that must NOT take a card
+ * fee on top, because its processing is already inside the price it is sold
+ * at. Today that is exactly one thing — a background check.
+ *
+ *   "a background check is a fixed thing, and so it should be one price...
+ *    That way it's not a landlord paying for it for some people and getting a
+ *    little bit of a break and making other people pay for it themselves."
+ *
+ * A screening is $46.03 to whoever buys it: the applicant on their own card,
+ * the guest on a pay link, the office taking cash, the landlord eating it out
+ * of a payout. Adding a fee on top of a price that already contains one would
+ * have made a third price out of the same check, which is the thing he was
+ * killing.
  */
-export function cardFeeSplit(amount: number, payer: CardFeePayer): { fee: number; charged: number; held: number } {
-  const fee = processingFeeFor({ amount, paymentMethod: 'card' })
+export function cardFeeSplit(amount: number, payer: CardFeePayer, feeExempt = 0): { fee: number; charged: number; held: number } {
+  const base = round2(Math.max(0, amount - Math.max(0, feeExempt)))
+  const fee = base > 0 ? processingFeeFor({ amount: base, paymentMethod: 'card' }) : 0
   const charged = payer === 'customer' ? round2(amount + fee) : round2(amount)
   return { fee, charged, held: round2(charged - fee) }
 }

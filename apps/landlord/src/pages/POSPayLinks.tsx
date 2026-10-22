@@ -164,6 +164,27 @@ function printQr(label: string, price: number, linkId: string, feeOnTop: boolean
   }).catch(() => toastOnce('Could not load the QR code — check the connection and press Print sign again.', { error: true }))
 }
 
+/**
+ * 10/21 (Nic): "I can make nice signs engraved on wood and maybe use a laser
+ * engraver to actually like do the QR code the right way, so it looks nice and
+ * professional."
+ *
+ * SVG is the one an engraver wants — paths, not pixels. A PNG has to be traced
+ * first, and tracing rounds the corners of the modules, which is how an
+ * engraved code ends up not scanning. The PNG is here too for anything that
+ * only takes an image.
+ */
+function downloadQr(linkId: string, label: string, kind: 'svg' | 'png') {
+  api.get(`/pos/pay-links/${linkId}/qr.${kind}`, { responseType: 'blob' }).then(r => {
+    const url = URL.createObjectURL(r.data as Blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${String(label || 'qr-code').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'qr-code'}.${kind}`
+    document.body.appendChild(a); a.click(); a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }).catch(() => toastOnce(`Could not download the ${kind.toUpperCase()} — check the connection and press it again.`, { error: true }))
+}
+
 const HELD_REASON_LABEL: Record<string, string> = {
   paid_twice: 'Paid twice',
   wrong_amount: 'Paid an old amount of the link',
@@ -271,12 +292,28 @@ export function PayLinksTab({ propertyId }: { propertyId: string }) {
       onError: (e: any) => { refresh(); toastOnce(errorMessage(e, 'Could not send it — check the connection and press Send again.'), { error: true }) } })
   const [qrLabel, setQrLabel] = useState('')
   const [qrPrice, setQrPrice] = useState('')
+  // 10/21 (Nic): "I would also like it to be set up where QR codes can be
+  // generated from point of sale items." A code typed by hand is a second
+  // price for a thing the register already sells — change the item and the
+  // sign on the wall is quietly wrong. Picking the item instead means the
+  // code carries the catalog's own price, tax and category, and a sale
+  // through it reads as that item everywhere a sale of it is counted.
+  const [qrItemId, setQrItemId] = useState('')
+  const { data: qrItems = [] } = useQuery<any[]>(['pos-items-for-qr', propertyId],
+    () => apiGet(`/pos/items?propertyId=${propertyId}`), { enabled: !!propertyId })
+  const sellable = (qrItems as any[]).filter(i => i.isActive !== false && !i.stayUnit)
+  const pickedItem = sellable.find(i => i.id === qrItemId) || null
+  const qrReady = !!propertyId && (pickedItem ? true : (!!qrLabel.trim() && Number(qrPrice) > 0))
   const makeQr = useMutation(
     () => apiPost('/pos/pay-links', {
-      propertyId, kind: 'standing', label: qrLabel.trim(),
-      items: [{ id: null, name: qrLabel.trim(), qty: 1, price: Number(qrPrice), tax: 0, cat: 'misc' }],
+      propertyId, kind: 'standing',
+      label: (pickedItem ? String(pickedItem.name) : qrLabel.trim()),
+      items: [pickedItem
+        ? { id: pickedItem.id, name: pickedItem.name, qty: 1,
+            price: Number(pickedItem.sellPrice), tax: Number(pickedItem.taxRate) || 0, cat: pickedItem.category || undefined }
+        : { id: null, name: qrLabel.trim(), qty: 1, price: Number(qrPrice), tax: 0, cat: 'misc' }],
     }),
-    { onSuccess: () => { setQrLabel(''); setQrPrice(''); refresh() },
+    { onSuccess: () => { setQrLabel(''); setQrPrice(''); setQrItemId(''); refresh() },
       onError: (e: any) => toastOnce(errorMessage(e, 'Could not create the QR code — check the connection and press Create QR code again.'), { error: true }) })
 
   const standing = (links as any[]).filter(l => l.kind === 'standing' && l.status === 'open')
@@ -351,22 +388,43 @@ export function PayLinksTab({ propertyId }: { propertyId: string }) {
           Each payment is recorded as its own sale. The card fee is added on top unless this property absorbs it
           (the property&apos;s Card fees setting when the code is made).
         </div>
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 }}>
-          <input id="qr-label" className="form-input" placeholder="What it's for (e.g. Dump station)" value={qrLabel}
-            onChange={e => setQrLabel(e.target.value)} style={{ flex: '1 1 220px' }} />
-          <input id="qr-price" className="form-input" inputMode="decimal" placeholder="Price" value={qrPrice}
-            onChange={e => setQrPrice(e.target.value.replace(/[^\d.]/g, ''))} style={{ width: 110 }} />
-          <button className="btn btn-primary" disabled={!qrLabel.trim() || !(Number(qrPrice) > 0) || makeQr.isLoading}
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+          <select className="form-input" value={qrItemId} onChange={e => setQrItemId(e.target.value)} style={{ flex: '1 1 260px' }}>
+            <option value="">Pick a register item…</option>
+            {sellable.map((i: any) => (
+              <option key={i.id} value={i.id}>{i.name} — {fmt(Number(i.sellPrice))}</option>
+            ))}
+          </select>
+          <button className="btn btn-primary" disabled={!qrReady || makeQr.isLoading}
             onClick={() => makeQr.mutate()}>Create QR code</button>
         </div>
+        {!pickedItem && (
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16, alignItems: 'center' }}>
+            <span style={{ fontSize: '.76rem', color: 'var(--text-3)' }}>or a one-off:</span>
+            <input id="qr-label" className="form-input" placeholder="What it's for (e.g. Dump station)" value={qrLabel}
+              onChange={e => setQrLabel(e.target.value)} style={{ flex: '1 1 220px' }} />
+            <input id="qr-price" className="form-input" inputMode="decimal" placeholder="Price" value={qrPrice}
+              onChange={e => setQrPrice(e.target.value.replace(/[^\d.]/g, ''))} style={{ width: 110 }} />
+          </div>
+        )}
+        {pickedItem && (
+          <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 16 }}>
+            The code will charge {fmt(Number(pickedItem.sellPrice))} and record each scan as a sale of
+            {' '}<strong>{pickedItem.name}</strong>, so it counts in that item&apos;s sales and stock like any other.
+          </div>
+        )}
         <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
           {standing.map((l: any) => (
             <div key={l.id} style={{ border: '1px solid var(--border-0)', borderRadius: 12, padding: 12, display: 'grid', gap: 8, justifyItems: 'center' }}>
               <QrImage linkId={l.id} />
               <div style={{ fontWeight: 600 }}>{l.label}</div>
               <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{fmt(Number(l.total))}{l.customerFee > 0 ? <> + {fmt(l.customerFee)} card fee</> : null} · paid {l.timesPaid}×</div>
-              <div style={{ display: 'flex', gap: 6 }}>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'center' }}>
                 <button className="btn btn-primary btn-sm" onClick={() => printQr(l.label, Number(l.total), l.id, l.customerFee > 0)}>Print sign</button>
+                {/* 10/21 (Nic): for the laser engraver — vector, so the modules
+                    keep their corners and the code still scans off wood. */}
+                <button className="btn btn-ghost btn-sm" onClick={() => downloadQr(l.id, l.label, 'svg')}>SVG</button>
+                <button className="btn btn-ghost btn-sm" onClick={() => downloadQr(l.id, l.label, 'png')}>PNG</button>
                 <button className="btn btn-ghost btn-sm" disabled={cancel.isLoading} onClick={() => cancel.mutate(l.id)}>Retire</button>
               </div>
             </div>

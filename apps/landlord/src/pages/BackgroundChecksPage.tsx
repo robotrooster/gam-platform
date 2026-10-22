@@ -5,6 +5,10 @@ import { humanize } from '@gam/shared'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
 import { EntityPicker, useEntities } from '../components/EntityPicker'
 import { toast } from '../components/dialogs'
+import { ScreeningsWaitingPanel } from '../../../../packages/shared-ui/ScreeningsWaitingPanel'
+
+/** Shared with the front desk's own Checks tab in the POS — one list, both screens. */
+const screeningsApi = { get: apiGet, post: apiPost }
 
 // S527 W-6: the real applicant list is GET /background (not /background-checks).
 // S561: rows are now clickable → a review modal with Approve / Deny. On Deny,
@@ -107,6 +111,12 @@ export function BackgroundChecksPage() {
       </div>
       <EntityPicker value={companyId} onChange={setCompanyId} label="Company"
         note="Choose one to see only its applicants." />
+      {/* 10/21 (Nic): checks somebody has already PAID for and not done. They
+          are not applicants yet — no report, nothing to decide — so they are
+          not in either list below, and until now they were in no list at all.
+          The address is editable because a mistyped one is both why the link
+          never arrived and why they cannot sign in to sort it out themselves. */}
+      <ScreeningsWaitingPanel propertyId={propertyId || null} api={screeningsApi} />
       <div className="filter-bar" style={{display:'flex',gap:6,alignItems:'center',marginBottom:12,flexWrap:'wrap'}}>
         <button type="button" className={`btn btn-sm ${tab === 'attention' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab('attention')}>
           Needs attention ({attention.length})

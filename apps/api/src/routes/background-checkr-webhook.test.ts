@@ -319,3 +319,117 @@ describe('S640 events we do not act on are acknowledged, not retried', () => {
     expect(res.status).toBe(401)
   })
 })
+
+/**
+ * 10/21 (Nic) — A PRODUCT WE ORDERED AND DID NOT GET IS A LOUD PROBLEM.
+ *
+ *   "I'm pretty sure that we didn't code it right for the identity
+ *    verification add-on package. So whatever we need to change in our settings
+ *    to add that onto the invoices is what we need to do."
+ *
+ * He was right. Every order asks Checkr for the live ID scan
+ * (identity_verification, $3.95), and the price every applicant pays is built
+ * on it — but the summary only ever recorded products that came BACK. An add-on
+ * Checkr silently dropped left no key, no status and no trace, the report read
+ * as fully resolved, and five real screenings went out with no identity check
+ * and nobody able to tell. Checkr never refused it either, so the 422 path that
+ * would have shouted never fired: the absence of a refusal is not evidence a
+ * product ran.
+ */
+describe('10/21: the ID scan either ran or GAM says so out loud', () => {
+  it('a report without the ID scan is flagged on the summary and the admins are told', async () => {
+    const f = await seed({ status: 'processing' })
+    const reportId = 'rp_test_' + randomUUID().replace(/-/g, '')
+    // Exactly the five products production came back with, and no sixth.
+    stubReportFetch({
+      id: reportId,
+      order_id: f.providerRef,
+      criminal_history: { status: 'clear' },
+      credit_report: { status: 'clear' },
+      eviction_history: { status: 'clear' },
+      global_watchlist: { status: 'clear' },
+      sex_offender_registry: { status: 'clear' },
+    })
+    const rawBody = JSON.stringify(tenantEvent('report.completed', { id: reportId, order_id: f.providerRef }))
+    const res = await request(buildApp())
+      .post('/api/background/webhook/checkr')
+      .set('Tenant-Signature', tenantSignature(rawBody, SECRET))
+      .set('Content-Type', 'application/json')
+      .send(rawBody)
+    expect(res.status).toBe(200)
+
+    const { rows: [row] } = await db.query<any>(
+      `SELECT status, report_summary FROM background_checks WHERE id=$1`, [f.checkId])
+    // The five that DID run are resolved — an applicant at the counter does not
+    // wait on GAM's billing problem — but the scan is not claimed.
+    expect(row.status).toBe('complete')
+    expect(row.report_summary.all_products_resolved).toBe(true)
+    expect(row.report_summary.id_scan_ran).toBe(false)
+    expect(row.report_summary.products.identity_verification).toBeUndefined()
+
+    // And somebody is told, loudly, because this is money the applicant paid.
+    const { rows: notices } = await db.query<any>(
+      `SELECT severity, title, body FROM admin_notifications WHERE category = 'checkr_id_scan_missing'`)
+    expect(notices).toHaveLength(1)
+    expect(notices[0].severity).toBe('critical')
+    expect(notices[0].title).toMatch(/no ID scan/i)
+    // 10/21: the notice has to name the actual fix. Checkr keeps the ID scan as
+    // a per-PROPERTY switch, and a property only appears in their dashboard the
+    // first time an order names it — so every new park needs this done once, and
+    // whoever reads this alarm at 9pm should not have to go find that out.
+    expect(notices[0].body).toMatch(/Checkr dashboard/)
+    expect(notices[0].body).toMatch(/Identity Intelligence/)
+    expect(notices[0].body).toMatch(/Properties/)
+    expect(notices[0].body).toMatch(/\$3\.95/)
+  })
+
+  it('a report WITH the ID scan says so, and raises nothing', async () => {
+    const f = await seed({ status: 'processing' })
+    const reportId = 'rp_test_' + randomUUID().replace(/-/g, '')
+    stubReportFetch({
+      id: reportId,
+      order_id: f.providerRef,
+      criminal_history: { status: 'clear' },
+      credit_report: { status: 'clear' },
+      identity_verification: { status: 'clear' },
+    })
+    const rawBody = JSON.stringify(tenantEvent('report.completed', { id: reportId, order_id: f.providerRef }))
+    await request(buildApp())
+      .post('/api/background/webhook/checkr')
+      .set('Tenant-Signature', tenantSignature(rawBody, SECRET))
+      .set('Content-Type', 'application/json')
+      .send(rawBody)
+
+    const { rows: [row] } = await db.query<any>(
+      `SELECT report_summary FROM background_checks WHERE id=$1`, [f.checkId])
+    expect(row.report_summary.id_scan_ran).toBe(true)
+    expect(row.report_summary.products.identity_verification).toBe('clear')
+    const { rows: notices } = await db.query<any>(
+      `SELECT 1 FROM admin_notifications WHERE category = 'checkr_id_scan_missing'`)
+    expect(notices).toHaveLength(0)
+  })
+
+  it('an ID scan still running holds the report back, as any unresolved product does', async () => {
+    const f = await seed({ status: 'processing' })
+    const reportId = 'rp_test_' + randomUUID().replace(/-/g, '')
+    stubReportFetch({
+      id: reportId,
+      order_id: f.providerRef,
+      criminal_history: { status: 'clear' },
+      identity_verification: { status: 'pending' },
+    })
+    const rawBody = JSON.stringify(tenantEvent('report.completed', { id: reportId, order_id: f.providerRef }))
+    await request(buildApp())
+      .post('/api/background/webhook/checkr')
+      .set('Tenant-Signature', tenantSignature(rawBody, SECRET))
+      .set('Content-Type', 'application/json')
+      .send(rawBody)
+
+    const { rows: [row] } = await db.query<any>(
+      `SELECT report_summary FROM background_checks WHERE id=$1`, [f.checkId])
+    // It RAN, so nothing is flagged missing — it simply has not finished.
+    expect(row.report_summary.id_scan_ran).toBe(true)
+    expect(row.report_summary.all_products_resolved).toBe(false)
+    expect(row.report_summary.result).toBe('pending')
+  })
+})

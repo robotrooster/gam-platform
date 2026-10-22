@@ -8,7 +8,13 @@ import { TEAM_INVITATION_TTL_HOURS } from '@gam/shared'
 import { longCalendarDate } from '@gam/shared'
 import { query } from '../db'
 import { logger } from '../lib/logger'
-import { portalLink } from '../lib/portalUrls'
+// 10/21 (Nic): these six emails each defaulted their button to a localhost
+// address, and every caller passed `undefined`, so every one of them shipped a
+// dead link. Nine had already gone out — five "your application is approved"
+// emails to real applicants among them. portalUrls exists because this happened
+// once before ("Lisa's email link is trying to go to localhost"); these were
+// missed. A default is evaluated at call time, so these read the real host.
+import { portalLink, portalUrl as portalUrlFor } from '../lib/portalUrls'
 import { replyAddressesFor, type ReplyTo } from './replyRouting'
 import { buildDemoBookingIcs } from './demoCalendar'
 // S651: read before every send — see the comment at the send decision below.
@@ -402,7 +408,7 @@ function h(text: string) {
 
 // ── BACKGROUND CHECK EMAILS ───────────────────────────────────
 
-export async function emailNewBackgroundCheck(landlordEmail: string, landlordName: string, tenantName: string, propertyName: string, unitNumber: string, riskLevel: string, portalUrl = 'http://localhost:3001/background', ctx?: { landlordId?: string; backgroundCheckId?: string }) {
+export async function emailNewBackgroundCheck(landlordEmail: string, landlordName: string, tenantName: string, propertyName: string, unitNumber: string, riskLevel: string, portalUrl = portalLink('landlord', 'background'), ctx?: { landlordId?: string; backgroundCheckId?: string }) {
   const riskColor = riskLevel === 'low' ? '#22c55e' : riskLevel === 'medium' ? '#f59e0b' : '#ef4444'
   await send(landlordEmail, `New background check submitted — ${tenantName}`,
     base(h('New Application Received') +
@@ -676,7 +682,7 @@ export async function emailBookingConfirmation(args: {
 // 10/5 (Nic): a stay of more than three weeks needs a background check before
 // check-in, and its fee is taken with the stay's payment — `prepaid` says so,
 // so the guest is never asked to pay for it again.
-export async function emailBackgroundCheckScreeningRequest(guestEmail: string, guestName: string | null, propertyName: string, portalUrl = 'http://localhost:3002/background', ctx?: { landlordId?: string; replyTo?: ReplyTo; prepaid?: boolean }) {
+export async function emailBackgroundCheckScreeningRequest(guestEmail: string, guestName: string | null, propertyName: string, portalUrl = portalLink('tenant', 'background'), ctx?: { landlordId?: string; replyTo?: ReplyTo; prepaid?: boolean }) {
   await send(guestEmail, `${propertyName} — background check for your stay`,
     base(h('One more step before check-in') +
       p(`Hi ${guestName || 'there'},`) +
@@ -691,7 +697,7 @@ export async function emailBackgroundCheckScreeningRequest(guestEmail: string, g
   )
 }
 
-export async function emailBackgroundDecision(tenantEmail: string, tenantName: string, decision: 'approved' | 'denied', propertyName: string, unitNumber: string, notes?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; backgroundCheckId?: string; replyTo?: ReplyTo }) {
+export async function emailBackgroundDecision(tenantEmail: string, tenantName: string, decision: 'approved' | 'denied', propertyName: string, unitNumber: string, notes?: string, portalUrl = portalUrlFor('tenant'), ctx?: { landlordId?: string; backgroundCheckId?: string; replyTo?: ReplyTo }) {
   const approved = decision === 'approved'
   await send(tenantEmail,
     approved ? 'Your application has been approved! 🎉' : 'Update on your rental application',
@@ -718,7 +724,7 @@ export async function emailBackgroundDecision(tenantEmail: string, tenantName: s
 
 // ── POOL EMAILS ───────────────────────────────────────────────
 
-export async function emailPoolMatchInterest(tenantEmail: string, tenantName: string, landlordName: string, propertyName: string, unitNumber: string, message: string|null, monthlyRent: number | null = null, portalUrl = 'http://localhost:3002/notifications', ctx?: { landlordId?: string; matchRequestId?: string; replyTo?: ReplyTo }) {
+export async function emailPoolMatchInterest(tenantEmail: string, tenantName: string, landlordName: string, propertyName: string, unitNumber: string, message: string|null, monthlyRent: number | null = null, portalUrl = portalLink('tenant', 'notifications'), ctx?: { landlordId?: string; matchRequestId?: string; replyTo?: ReplyTo }) {
   await send(tenantEmail, `A landlord is interested in you — ${propertyName}`,
     base(
       h('You Have a Match!') +
@@ -738,7 +744,7 @@ export async function emailPoolMatchInterest(tenantEmail: string, tenantName: st
   )
 }
 
-export async function emailPoolTenantInterested(landlordEmail: string, landlordName: string, portalUrl = 'http://localhost:3001/pool', ctx?: { landlordId?: string; matchRequestId?: string }) {
+export async function emailPoolTenantInterested(landlordEmail: string, landlordName: string, portalUrl = portalLink('landlord', 'pool'), ctx?: { landlordId?: string; matchRequestId?: string }) {
   await send(landlordEmail, 'A tenant confirmed interest — unlock their full report',
     base(
       h('Tenant Is Interested!') +
@@ -809,7 +815,7 @@ export async function emailSigningRequest(to: string, signerName: string, docume
   )
 }
 
-export async function emailSigningCompleted(to: string, signerName: string, documentTitle: string, unitLabel: string, pdfUrl?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; documentId?: string; replyTo?: ReplyTo }, pdfBytes?: Buffer) {
+export async function emailSigningCompleted(to: string, signerName: string, documentTitle: string, unitLabel: string, pdfUrl?: string, portalUrl = portalUrlFor('tenant'), ctx?: { landlordId?: string; documentId?: string; replyTo?: ReplyTo }, pdfBytes?: Buffer) {
   // S637: no leading emoji in a transactional subject — it is a spam signal
   // and this one goes out at the moment a lease becomes legally binding.
   await send(to, `Document fully signed: ${documentTitle}`,
@@ -1621,8 +1627,7 @@ export async function sendSubleaseInvite({
   startDate: string; endDate: string | null
   ctx?: { masterLeaseId?: string; sublessorTenantId?: string; replyTo?: ReplyTo }
 }) {
-  const appUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
-  const acceptUrl = `${appUrl}/sublease-invite/${token}`
+  const acceptUrl = portalLink('tenant', `sublease-invite/${token}`)
   const range = endDate
     ? `${new Date(startDate).toLocaleDateString()} – ${new Date(endDate).toLocaleDateString()}`
     : `Starting ${new Date(startDate).toLocaleDateString()} (open-ended)`
@@ -1675,8 +1680,7 @@ export async function sendPosCustomerOnboarding({
   token:         string
   ctx?: { landlordId?: string; posCustomerId?: string; replyTo?: ReplyTo }
 }) {
-  const appUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
-  const acceptUrl = `${appUrl}/pos-customer-onboard/${token}`
+  const acceptUrl = portalLink('tenant', `pos-customer-onboard/${token}`)
   await send(customerEmail, `${merchantName} invited you to open a FlexCharge tab`,
     base(
       h('Open a FlexCharge tab') +
@@ -3443,6 +3447,40 @@ export async function emailInvoiceReady(
 // had no card on file, and when it was re-placed five days later the only email
 // he had ever received from GAM was a sign-in code. He could not have finished
 // if he wanted to.
+/**
+ * 10/21 (Nic) — START A BACKGROUND CHECK, WITH NOTHING BOOKED.
+ *
+ *   "for people that just legitimately want to move in, they need to be able to
+ *    just do the background check first and see if they're going to be
+ *    approved."
+ *
+ * Handed out at the desk, or texted to somebody who rang. They pay GAM for it
+ * themselves on their own phone, so nobody at the park is holding their money
+ * and no landlord is fronting it for a person who may never move in.
+ */
+export async function emailStartScreening(
+  to: string,
+  args: { name?: string | null; propertyName?: string | null; url: string; price: number },
+  ctx?: { landlordId?: string; replyTo?: ReplyTo },
+): Promise<string | null> {
+  const where = args.propertyName ? `<strong style="color:#eef1f8">${args.propertyName}</strong>` : 'the property'
+  return await send(to, `Start your background check${args.propertyName ? ` — ${args.propertyName}` : ''}`,
+    base(
+      h('Start your background check') +
+      p(`Hi ${args.name || 'there'},`) +
+      p(`Here is the link to run your background check for ${where}. You do not have to book anything first — `
+        + `run the check, and you will know where you stand before you commit to a thing.`) +
+      p(`It costs <strong style="color:#eef1f8">$${args.price.toFixed(2)}</strong>, which you pay on this page. `
+        + `Our screening partner Checkr asks for your Social Security number and your consent on their own secure form — we never see or store it.`) +
+      btn('Start my background check', args.url) +
+      `<div style="margin-top:14px;font-size:.78rem;color:#7a8aaa">
+         If the button does not work, paste this into your browser:<br/>
+         <span style="color:#b8c4d8;word-break:break-all">${args.url}</span>
+       </div>`
+    ),
+    { category: 'screening_start_link', landlordId: ctx?.landlordId ?? null, replyTo: ctx?.replyTo })
+}
+
 export async function emailScreeningApplyLink(
   to: string,
   args: {

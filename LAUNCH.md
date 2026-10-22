@@ -16,6 +16,111 @@ products don't render, crons no-op.
 
 ---
 
+## 0. RAISED AND NOT BUILT — the standing list (opened 2026-10-21)
+
+Nic, 10/21: *"I feel like there's a lot of stuff that I brought up that got
+skipped, and unless I remember it again, it just doesn't get built."*
+
+He is right, and this doc is why: it was last touched **2026-09-21** while a
+month of asks went past it. Everything below lives here now instead of in
+anybody's memory. **Rule: an ask goes on this list the day it is made, and comes
+off only when it ships or he says no.** A thing he says no to stays, marked no,
+so it stops being re-proposed at him.
+
+### Screens / feel — raised, never built
+- ~~**Draggable left navigation**~~ — BUILT 10/21. Drag anything anywhere, saved
+  per person on the server so it follows them between machines. Section headers
+  come off once it is their own order; "Reset menu order" puts them back. The
+  order can only reorder what their permissions already show.
+- ~~**Rearrangeable dashboard widgets**~~ — BUILT 10/21. All ten cards drag. Once
+  arranged they go to half-width each (Nic, 10/21: thirds *"was a bad idea...
+  that table's got some important stuff"*), which is the only width that leaves
+  no holes in any order. "Reset to the default view" sits at the top with the
+  banners, and only once something has been dragged.
+- **The "expensive" pass** — the look-and-feel uplift, as a deliberate piece of
+  work rather than a side effect of other builds.
+- **GAM logo** — still a word mark.
+
+### Features raised, specified, not built
+- **"Left owing" flag across landlords** (10/20–21, spec'd in full; the reveal
+  is TWO doors, 10/21 — step 1 is the date and place and costs nothing, step 2
+  is the total and buys the debt; a refusal to settle is itself a flag). Another
+  landlord sees *high risk · owes other people money · needs to settle up* and
+  NOTHING else — no amount, no landlord, no date. The reveal is a Pandora's box:
+  clicking it means the clicking landlord ASSUMES the debt, GAM collects from
+  them and pays the landlord who was owed. That consequence is the control.
+  Source of the data: the Square archived invoices, imported onto "moved out,
+  still owes".
+  **Held for Nic's eyes on purpose (10/21), not skipped.** He said to keep
+  building overnight and deploy, and everything else in that batch shipped. This
+  one did not, for two reasons worth stating: its output is shown to OTHER
+  landlords about a named person, and its second door creates a real debt
+  between two landlords that GAM then collects. Neither is a thing to put in
+  front of third parties, unreviewed, while he is asleep. It is the first thing
+  to build with him awake.
+- ~~**The maintenance person's one screen**~~ — it already existed (the
+  Maintenance portal's Tasks tab reads `GET /api/property-task-list` and groups
+  by park). What was missing, and was BUILT 10/21: the SUPPLY list on that same
+  screen. The maintenance person is the whole reason the supply list exists and
+  was the one person with nowhere to add to it. Plus
+  `GET /api/property-task-list/my-parks`, so a quiet park with nothing on
+  either list is still somewhere the first line can be written.
+- **Square import** — customers, and the archived invoices onto "moved out,
+  still owes". Waiting on the files. The importer it needs was BUILT 10/21
+  (`apps/api/src/scripts/importCampgroundMasterCustomers.ts`) and dry-run
+  against Mountain View's Campground Master file: **762 people, 7 placeholder
+  rows left behind, 27 pairs that might be one person printed for him to judge
+  — nothing merged.** NOT YET APPLIED: the point of the script is that somebody
+  who knows these people looks at those pairs first.
+- **Booking-site customization** — Wix-style drag/drop, photos, FAQ, a guided
+  walkthrough for a landlord setting up their own `{slug}.gam.biz`.
+- **Native apps** — landlord and tenant, wanted before the PM deal.
+- **"What do PM companies use that we don't have"** — a competitive audit he
+  asked for and nobody has run.
+- **PM portal demo login / walkthrough**.
+
+### Known defects and loose ends
+- ~~**Checkr charges $34.99; the code defaults to $37.94.**~~ FIXED 10/21, and
+  it was two faults, not one. The September receipts showed one line, Essential,
+  $34.99 — no ID scan, because the code that asks for it landed four hours after
+  the last of the five orders went out. So five applicants paid for a scan that
+  was never ordered. The add-on is now requested AND switched on per property in
+  Checkr; the price is the real one ($38.94 cost → $46.03); and the $14.75 the
+  books had set aside for Checkr but GAM actually kept was moved to GAM's own
+  income on his instruction (no refunds: *"We're just going to correct it going
+  forward to actually order the scan."*).
+- **Card reader order $331.73** — tax and shipping split unknown; needs his
+  Stripe order page.
+- **Mountain View and TruBlu have no fee-debit bank path** — GAM cannot collect
+  its own fee from either entity yet.
+- **A work-trade document raised from a resident's page is not linked to its
+  work-trade agreement record.**
+- **Evening UTC-today flakes** — ~24 test files and ~20 source sites use
+  `new Date().toISOString().slice(0,10)`, which is tomorrow after 5pm Phoenix.
+- **The repo is PUBLIC** (`robotrooster/gam-platform`) and the dev password in
+  14 tracked files is the production DB password. Tolerable only while Postgres
+  listens on localhost. Ben makes it private before the GCP migration.
+
+### Decided NO — do not re-propose
+- **Ray Artiaga's late fees** (10/21). No due-date exception ("That's not how we
+  run the property"), no property-wide late-fee cap, and no catch-up
+  arrangement. He wants FlexPay for this when it launches.
+- **Work-trade agreements drafted ahead of him** for the Nielsens, Susan
+  Geisman or Brandon Valdez — "not on my priority list" (10/21).
+- **Marking anybody deceased or alive** on a customer record — "That's not our
+  determination to make. We just have a record of people that were here when
+  they were here." (10/21)
+
+### His, not Claude's
+- Leases: the Nielsens (RV 71 year-round + work trade, hibernated while away),
+  Susan Geisman (MH 26, work trade, out June 2027, the home comes to the park),
+  Rick Moran (a lease when they arrive — no site assigned, 30 amp), Ray Artiaga
+  (full-time, pays late).
+- Brandon Valdez: answered 10/21 — he was never on MH 17; MH 17 is a wreck that
+  may be torn down. His work trade is MH 10, ending 2028-03-31.
+
+---
+
 ## 1. Oak Park launch — CHECKLIST CLEARED
 
 Original scope: tenants log in + pay rent. Every item verified against the live

@@ -35,11 +35,12 @@
  */
 import { Router } from 'express'
 import { z } from 'zod'
+import { PROPERTY_LIST_KINDS, type PropertyListKind } from '@gam/shared'
 import { requireAuth, assertPropertyInScope, getScopedPropertyIds } from '../middleware/auth'
 import { canAccessLandlordResource } from '../middleware/scope'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
-import { queryOne } from '../db'
+import { query, queryOne } from '../db'
 import {
   listPropertyTasks,
   listOpenTasksForScope,
@@ -49,6 +50,7 @@ import {
   getPropertyTask,
   untickPropertyTask,
   unhidePropertyTask,
+  worksHereOnTrade,
 } from '../services/propertyTaskList'
 
 export const propertyTaskListRouter = Router()
@@ -61,7 +63,40 @@ const addSchema = z.object({
   // One line, the way it would be said out loud. Capped so a paste of a whole
   // document cannot become a checklist item nobody can read on a phone.
   body: z.string().trim().min(1, 'Type the task first').max(500),
+  // 10/21: which of the park's two lists. Absent means the task list, so every
+  // caller written before the supply list keeps working.
+  kind: z.enum(PROPERTY_LIST_KINDS).optional(),
 })
+
+/** Which list a request is about: ?kind=supply, else the task list. */
+function kindOf(req: any): PropertyListKind {
+  return req.query?.kind === 'supply' ? 'supply' : 'job'
+}
+
+/**
+ * 10/21 (Nic) — WHO MAY WRITE WHICH LIST, WHICH IS INVERTED BETWEEN THEM.
+ *
+ *   job     "It's stuff assigned by the landlord himself" — the owner writes a
+ *           line, anybody working the park ticks it off.
+ *   supply  "Anybody can contribute to a list of things to purchase. The owner
+ *           can consult that list when either ordering online or running to the
+ *           store" — so anybody working the park writes, and the OWNER ticks it
+ *           bought, because he is the one at the till.
+ *
+ * Everyone who gets this far has already passed reachProperty, which is what
+ * "working the park" means: the owner, their staff scoped to it, or a resident
+ * with a live work-trade agreement on it.
+ */
+function assertMayAdd(req: any, kind: PropertyListKind) {
+  if (kind === 'job') assertOwner(req)
+}
+function assertMayTick(req: any, kind: PropertyListKind) {
+  if (kind === 'supply') {
+    if (!OWNER_ROLES.has(req.user?.role ?? '')) {
+      throw new AppError(403, 'Only the owner marks a supply line bought — they are the one buying it')
+    }
+  }
+}
 
 /**
  * Can this caller touch this park's list at all, and does the park exist?
@@ -74,6 +109,18 @@ async function reachProperty(req: any, propertyId: string) {
   const p = await queryOne<{ id: string; landlord_id: string; name: string }>(
     `SELECT id, landlord_id, name FROM properties WHERE id = $1`, [propertyId])
   if (!p) throw new AppError(404, 'Property not found')
+  // 10/21 (Nic): "we need work trade people to be able to see this task list in
+  // the system." A work-trade resident is a TENANT, so neither the
+  // landlord-resource check below nor the staff scope tables let them past —
+  // they were getting a flat 404 on the list of the jobs they are there to do.
+  // Their claim is their own agreement on a unit at this park, and nothing
+  // else: a resident without one still sees nothing.
+  if (req.user?.role === 'tenant') {
+    if (!(await worksHereOnTrade(req.user.userId, propertyId))) {
+      throw new AppError(404, 'Property not found')
+    }
+    return p
+  }
   if (!canAccessLandlordResource(req.user, p.landlord_id)) throw new AppError(404, 'Property not found')
   await assertPropertyInScope(req.user, propertyId)
   return p
@@ -98,7 +145,46 @@ propertyTaskListRouter.get('/', async (req, res, next) => {
     // answer for a role that has no landlord at all.
     const landlordIds = PLATFORM_ROLES.has(req.user!.role) ? null : landlordScopeIds(req.user!)
     const propertyIds = await getScopedPropertyIds(req.user)
-    res.json({ success: true, data: await listOpenTasksForScope(landlordIds, propertyIds) })
+    // 10/21: ?kind=supply is the owner's shopping view — every park's open
+    // supply lines at once, each carrying its property and its company, so one
+    // order covers one company's houses and never two companies' at a time.
+    res.json({
+      success: true,
+      data: await listOpenTasksForScope(landlordIds, propertyIds, kindOf(req), req.user!.userId),
+    })
+  } catch (e) { next(e) }
+})
+
+/**
+ * GET /api/property-task-list/my-parks — the parks this person may write a
+ * line for, whether or not either list has anything on it yet.
+ *
+ * 10/21 (Nic): the maintenance person is the whole reason the supply list
+ * exists — "a collected shopping cart pool... so he doesn't have text messages
+ * from like 5 or 6 different people" — and their screen could only ever show
+ * parks that ALREADY had a line on them. Which means the first thing that ran
+ * out at a quiet park could never be written down, because the park was not on
+ * the screen to write it against. A list you cannot start is not a list.
+ *
+ * Read-only, and it widens nothing: the same scope the cross-park list uses,
+ * so it names exactly the parks whose lines this person can already see.
+ *
+ * DECLARED BEFORE /:propertyId, or Express reads "my-parks" as a property id.
+ */
+propertyTaskListRouter.get('/my-parks', async (req, res, next) => {
+  try {
+    const landlordIds = PLATFORM_ROLES.has(req.user!.role) ? null : landlordScopeIds(req.user!)
+    const propertyIds = await getScopedPropertyIds(req.user)
+    if (landlordIds && landlordIds.length === 0) return res.json({ success: true, data: [] })
+    if (propertyIds && propertyIds.length === 0) return res.json({ success: true, data: [] })
+    const rows = await query<{ property_id: string; property_name: string }>(
+      `SELECT p.id AS property_id, p.name AS property_name
+         FROM properties p
+        WHERE ($1::uuid[] IS NULL OR p.landlord_id = ANY($1))
+          AND ($2::uuid[] IS NULL OR p.id = ANY($2))
+        ORDER BY p.name`,
+      [landlordIds, propertyIds])
+    res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
 
@@ -115,7 +201,12 @@ propertyTaskListRouter.get('/:propertyId', async (req, res, next) => {
     await reachProperty(req, req.params.propertyId)
     const asked = req.query.withHidden === '1' || req.query.withHidden === 'true'
     const withHidden = asked && OWNER_ROLES.has(req.user?.role ?? '')
-    res.json({ success: true, data: await listPropertyTasks(req.params.propertyId, { withHidden }) })
+    res.json({
+      success: true,
+      data: await listPropertyTasks(req.params.propertyId, {
+        withHidden, kind: kindOf(req), viewerUserId: req.user!.userId,
+      }),
+    })
   } catch (e) { next(e) }
 })
 
@@ -129,12 +220,13 @@ propertyTaskListRouter.get('/:propertyId', async (req, res, next) => {
 propertyTaskListRouter.post('/:propertyId', async (req, res, next) => {
   try {
     await reachProperty(req, req.params.propertyId)
-    assertOwner(req)
     const parsed = addSchema.safeParse(req.body)
     if (!parsed.success) {
       throw new AppError(400, parsed.error.issues[0]?.message || 'Type the task first')
     }
-    const item = await addPropertyTask(req.params.propertyId, parsed.data.body, req.user!.userId)
+    const kind = parsed.data.kind ?? 'job'
+    assertMayAdd(req, kind)
+    const item = await addPropertyTask(req.params.propertyId, parsed.data.body, req.user!.userId, kind)
     res.json({ success: true, data: item })
   } catch (e) { next(e) }
 })
@@ -149,6 +241,11 @@ propertyTaskListRouter.post('/:propertyId', async (req, res, next) => {
 propertyTaskListRouter.post('/:propertyId/items/:itemId/done', async (req, res, next) => {
   try {
     await reachProperty(req, req.params.propertyId)
+    // The line decides who may tick it: a job is the worker's press, a supply
+    // line is the owner saying they bought it.
+    const existing = await getPropertyTask(req.params.propertyId, req.params.itemId)
+    if (!existing) throw new AppError(404, 'That task is not on this property\'s list')
+    assertMayTick(req, existing.kind)
     const item = await tickPropertyTask(req.params.propertyId, req.params.itemId, req.user!.userId)
     if (!item) throw new AppError(404, 'That task is not on this property\'s list')
     res.json({ success: true, data: item })
@@ -200,9 +297,17 @@ propertyTaskListRouter.post('/:propertyId/items/:itemId/unhide', async (req, res
 propertyTaskListRouter.post('/:propertyId/items/:itemId/hide', async (req, res, next) => {
   try {
     await reachProperty(req, req.params.propertyId)
-    assertOwner(req)
     const existing = await getPropertyTask(req.params.propertyId, req.params.itemId)
     if (!existing) throw new AppError(404, 'That task is not on this property\'s list')
+    // 10/21: a job line is the owner's to remove, as it always was. A SUPPLY
+    // line is a request somebody made, so they may also take their OWN back
+    // while it is still unbought — "we need trash bags" typed twice should not
+    // need the owner to tidy up. Somebody else's request is never theirs to
+    // cancel.
+    const ownRequest = existing.kind === 'supply'
+      && existing.added_by_user_id === req.user!.userId
+      && !existing.done_at
+    if (!ownRequest) assertOwner(req)
     await hidePropertyTask(req.params.propertyId, req.params.itemId, req.user!.userId)
     res.json({ success: true, data: { id: existing.id, hidden: true } })
   } catch (e) { next(e) }

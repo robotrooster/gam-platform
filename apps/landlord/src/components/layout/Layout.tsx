@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useUiLayout, applyOrder, moved } from '../../lib/useUiLayout'
 import { NotificationBell } from '../NotificationBell'
 import { ChatWidget } from '../ChatWidget'
 import { apiGet } from '../../lib/api'
@@ -649,6 +650,24 @@ export function Layout() {
     if (to) return <Navigate to={to} replace />
   }
 
+  // 10/21 (Nic): "people being able to drag the left navigation bar into an
+  // order of their choosing." Saved per person on the server, so it follows
+  // them from the office machine to the tablet at the counter.
+  //
+  // The order only ever REORDERS what visibleNavItemsFor already decided this
+  // person may see (applyOrder starts from that list), so nobody can drag
+  // themselves a page they do not have, and a page added next month shows up at
+  // the end instead of vanishing.
+  //
+  // Section headers only make sense while the order is the one that put items
+  // under them. Once somebody arranges their own, the headers come off — a
+  // "Financials" label above whatever happened to land there would be a lie —
+  // and Reset puts both back.
+  const navLayout = useUiLayout('landlord_nav')
+  const [dragFrom, setDragFrom] = useState<number | null>(null)
+  const [dragOver, setDragOver] = useState<number | null>(null)
+  const orderedItems = applyOrder(visibleItems, navLayout.order, i => i.to)
+
   // Track section headers without side effects
   const renderedSections = new Set<string>()
 
@@ -662,15 +681,34 @@ export function Layout() {
         </div>
 
         <nav className="sidebar-nav">
-          {visibleItems.map(item => {
+          {orderedItems.map((item, index) => {
             const Icon = item.icon
-            const showSection = !!item.section && !renderedSections.has(item.section)
+            // Once it is their own order, the section labels no longer describe it.
+            const showSection = !navLayout.customized && !!item.section && !renderedSections.has(item.section)
             if (showSection) renderedSections.add(item.section!)
             // Hub items (Financials/Screening/Bookkeeping) are active for any of
             // their child routes, not just the landing path a plain NavLink would match.
             const hubActive = !!item.hub && HUB_CHILD_PATHS[item.hub].has(layoutLocation.pathname)
+            const isOver = dragOver === index && dragFrom !== null && dragFrom !== index
             return (
-              <div key={item.to}>
+              <div key={item.to}
+                draggable
+                onDragStart={e => { setDragFrom(index); e.dataTransfer.effectAllowed = 'move' }}
+                onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOver(index) }}
+                onDragLeave={() => setDragOver(o => (o === index ? null : o))}
+                onDrop={e => {
+                  e.preventDefault()
+                  if (dragFrom !== null && dragFrom !== index) {
+                    navLayout.save(moved(orderedItems, dragFrom, index).map(i => i.to))
+                  }
+                  setDragFrom(null); setDragOver(null)
+                }}
+                onDragEnd={() => { setDragFrom(null); setDragOver(null) }}
+                style={{
+                  opacity: dragFrom === index ? 0.4 : 1,
+                  borderTop: isOver && index < (dragFrom ?? 0) ? '2px solid var(--gold)' : '2px solid transparent',
+                  borderBottom: isOver && index > (dragFrom ?? 0) ? '2px solid var(--gold)' : '2px solid transparent',
+                }}>
                 {showSection && (
                   <div className="nav-section-label" style={{ marginTop: item.section === 'Overview' ? 0 : 8 }}>
                     {item.section}
@@ -683,6 +721,13 @@ export function Layout() {
               </div>
             )
           })}
+          {navLayout.customized && (
+            <button type="button" onClick={navLayout.reset}
+              style={{ background: 'none', border: 'none', color: 'var(--text-3)', fontSize: '.7rem',
+                       padding: '6px 12px', cursor: 'pointer', textAlign: 'left', width: '100%' }}>
+              Reset menu order
+            </button>
+          )}
           {!LAUNCH_HIDDEN.has('/flex-charge') && (
             <NavLink to="/flex-charge" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
               💳 FlexCharge

@@ -735,6 +735,66 @@ async function screeningAlreadyPaid(bookingId: string): Promise<boolean> {
   return !!(await queryOne(`SELECT 1 FROM screening_prepayments WHERE booking_id = $1 AND status <> 'void'`, [bookingId]))
 }
 
+// ── A BACKGROUND CHECK ON ITS OWN, WITH NO STAY UNDER IT ─────────────────────
+//
+// 10/21 (Nic): "Somebody pays for a background check in person. The only way to
+// get there is to book 22 nights or more. What happens? They have to pay not
+// only for the check, but the whole 22 nights just to do the check. And then
+// what happens if the landlord denies them? Maybe we need a way for them to
+// just pay directly for the background check right then and there... for people
+// that just legitimately want to move in, they need to be able to just do the
+// background check first and see if they're going to be approved."
+//
+// He is describing somebody who has not agreed to anything yet. Until now the
+// counter had no way to sell them a check: the only screening line the register
+// could carry was one a 22-night stay had put there, so the applicant had to
+// buy the stay to buy the check — and if the landlord then said no, they had
+// paid for three weeks they could not use.
+//
+// It is priced by the one function that sells screenings and NEVER by the cart,
+// for the same reason every other screening line is: the price of a check is
+// not a thing a register may type.
+export interface CounterScreening { name: string; email: string; price: number }
+
+async function counterScreeningOf(
+  landlordId: string, propertyId: string | null, raw: unknown, press: string,
+): Promise<CounterScreening | null> {
+  if (!raw || typeof raw !== 'object') return null
+  const name  = String((raw as any).name  ?? '').trim()
+  const email = String((raw as any).email ?? '').trim().toLowerCase()
+  if (!name && !email) return null
+  if (!name) {
+    throw new AppError(400, `A background check needs the person's name — type it above ${press}, then press ${press} again.`)
+  }
+  // The address is not a nicety. Their link goes to it, and it is the address
+  // they will sign in with — GAM makes every account with email 2FA on, so one
+  // typed wrong means they can neither read the link nor sign in to sort it out
+  // (routes/background, the waiting list, exists because of exactly that).
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw new AppError(400, `A background check needs the person's email — their link goes to it and they sign in with it. `
+      + `Type it above ${press}, then press ${press} again.`)
+  }
+  const prop = propertyId
+    ? await queryOne<{ state: string | null }>(
+        `SELECT state FROM properties WHERE id = $1 AND landlord_id = $2`, [propertyId, landlordId])
+    : null
+  const { screeningIntakeFee } = await import('./background')
+  const fee = await screeningIntakeFee(prop?.state ?? null)
+  return { name, email, price: fee.total }
+}
+
+/** Its cart line, in the shape every screening line has (so the card fee leaves it alone). */
+function counterScreeningLine(sc: CounterScreening): Record<string, unknown> {
+  return { id: null, name: SCREENING_LINE_NAME, qty: 1, price: sc.price, tax: 0,
+           screening: true, screeningFor: { name: sc.name, email: sc.email } }
+}
+
+/** One check per sale: a cart that already carries one is not given a second. */
+function cartAlreadyHasAScreening(items: any[], stayPlan: { screeningFee?: number } | null): boolean {
+  if ((stayPlan?.screeningFee ?? 0) > 0) return true
+  return (items || []).some((i: any) => isScreeningLine(i) || i?.[SCREENING_LINE] === true)
+}
+
 /**
  * 10/2 (front desk foolproof): a cart line whose price or tax is below zero
  * (or not a number) is refused in the clerk's words, with the button to press —
@@ -1504,14 +1564,14 @@ async function priceLinkCart(link: any, items: any[], discountAmount: unknown, p
  * card is about to be charged — a stay with no site and dates is refused first.
  */
 async function cartAsCharged(landlordId: string, propertyId: string | null, items: any[], openTicketId: unknown, discountAmount: unknown, press: string,
-                             payLinkId?: unknown, opts: { stay?: unknown; needSite?: boolean } = {}): Promise<{ items: any[]; reservation: { ticketId: string; due: ReservationDue } | null; link: LinkReservation | null
-                                                                                                             stayPlan: CounterStayPlan | null }> {
+                             payLinkId?: unknown, opts: { stay?: unknown; needSite?: boolean; screening?: unknown } = {}): Promise<{ items: any[]; reservation: { ticketId: string; due: ReservationDue } | null; link: LinkReservation | null
+                                                                                                             stayPlan: CounterStayPlan | null; screening: CounterScreening | null }> {
   const linkNamed = namedLinkOf(items, payLinkId)
   if (linkNamed && namedTicketOf(items, openTicketId)) throw new AppError(400, ONE_TICKET_OR_LINK)
   if (linkNamed) {
     const link = await openLinkAt(landlordId, propertyId, linkNamed)
     const r = await priceLinkCart(link, items, discountAmount, press)
-    return { items: r.items, reservation: null, link: r.res, stayPlan: null }
+    return { items: r.items, reservation: null, link: r.res, stayPlan: null, screening: null }
   }
   const t = await reservationTicketOf(landlordId, items, openTicketId, propertyId)
   if (!t) {
@@ -1521,10 +1581,19 @@ async function cartAsCharged(landlordId: string, propertyId: string | null, item
     if (opts.needSite && c.stayLines.some((l) => !(l.lineTotal > 0))) {
       throw new AppError(400, `A stay needs a site and an arrival date before it can be charged — press Pick a site and dates, then press ${press} again.`)
     }
-    return { items: c.items, reservation: null, link: null, stayPlan: c.plan }
+    // 10/21 (Nic): a check sold on its own, to somebody with no stay. Only on
+    // a plain counter cart — a reservation ticket's check belongs to its stay,
+    // and a pay link was priced when it was sent.
+    const sc = await counterScreeningOf(landlordId, propertyId, opts.screening, press)
+    if (sc && cartAlreadyHasAScreening(c.items, c.plan)) {
+      throw new AppError(409, 'This sale already has a background check on it — one check, one person. '
+        + 'Take the stay off the cart to sell a check on its own, or ring the stay, which carries its check already.')
+    }
+    return { items: sc ? [...c.items, counterScreeningLine(sc)] : c.items,
+             reservation: null, link: null, stayPlan: c.plan, screening: sc }
   }
   const r = await priceReservationCart(landlordId, t.bookingId, items, discountAmount, press)
-  return { items: r.items, reservation: { ticketId: t.ticketId, due: r.due }, link: null, stayPlan: null }
+  return { items: r.items, reservation: { ticketId: t.ticketId, due: r.due }, link: null, stayPlan: null, screening: null }
 }
 
 /**
@@ -1646,7 +1715,20 @@ async function serverCartTotals(landlordId: string, items: any[], paymentMethod:
     const prop = propertyId ? await queryOne<{ register_card_fee_payer: CardFeePayer }>(
       `SELECT register_card_fee_payer FROM properties WHERE id = $1 AND landlord_id = $2`,
       [propertyId, landlordId]) : null
-    const split = cardFeeSplit(base.total, prop?.register_card_fee_payer ?? 'customer')
+    // 10/21 (Nic): one price for a background check. Its line already carries
+    // its processing, so it is left out of what the card fee is figured on —
+    // the rest of the ticket still follows the property's fee choice.
+    //
+    // BOTH shapes of that line count. A check that came from a ticket or a pay
+    // link carries `screening: true` (it survived JSON); one the register
+    // priced a moment ago carries the SCREENING_LINE symbol instead, which
+    // isScreeningLine cannot see. Reading only the first shape left the stay's
+    // own check paying a card fee on this path while the screen showed none —
+    // the register would have quoted one figure and charged another.
+    const screeningOnCart = round2((items || []).reduce((n: number, it: any) =>
+      n + ((isScreeningLine(it) || it?.[SCREENING_LINE] === true)
+            ? (Number(it.price) || 0) * (Number(it.qty) || 1) : 0), 0))
+    const split = cardFeeSplit(base.total, prop?.register_card_fee_payer ?? 'customer', screeningOnCart)
     cardFee = split.fee
     surcharge = round2(split.charged - base.total)
   } else if (paymentMethod === 'charge') {
@@ -1710,6 +1792,8 @@ posRouter.post('/cart-quote', requirePerm('pos.ring_sale'), async (req, res, nex
     await assertPropertyInScope(req.user, propertyId)
     await assertPropertyIsLandlords(posLandlordId(req), propertyId)
     const items = lowerLineIds(req.body.items)
+    // 10/21 (Nic): the quote for a check sold on its own has no other line in
+    // it — an empty array is the whole cart, and only a missing one is wrong.
     if (!Array.isArray(items)) throw new AppError(400, 'The cart is empty — add what they are buying, then press Charge again.')
     assertCartNumbers(items, 'Charge')
     assertNonNeg([surcharge, 'Surcharge'], [discountAmount, 'Discount'])
@@ -1721,13 +1805,16 @@ posRouter.post('/cart-quote', requirePerm('pos.ring_sale'), async (req, res, nex
     // priced.
     assertStayLineMatches(items, req.body.stay, 'Charge')
     const priced = await cartAsCharged(posLandlordId(req), propertyId, items, req.body.openTicketId, discountAmount, 'Charge', req.body.payLinkId,
-      { stay: req.body.stay })
+      { stay: req.body.stay, screening: req.body.screening })
     const totals = await serverCartTotals(posLandlordId(req), priced.items, paymentMethod, discountAmount, surcharge, propertyId)
     const line = priced.link ? priced.items.find((i: any) => i[RESERVATION_LINE]) : null
     res.json({ success: true, data: { ...totals,
       ...(line ? { reservationLine: { name: line.name, price: line.price, nights: line.nights ?? null } } : {}),
       // 10/5: what a stay rung here needs (the same answer the stay picker gets).
-      ...(priced.stayPlan ? { stay: stayPlanOut(priced.stayPlan) } : {}) } })
+      ...(priced.stayPlan ? { stay: stayPlanOut(priced.stayPlan) } : {}),
+      // 10/21: a check sold on its own — the server's price for it, so the
+      // screen never has to work it out.
+      ...(priced.screening ? { screening: priced.screening } : {}) } })
   } catch (e) { next(e) }
 })
 
@@ -2541,7 +2628,13 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         discountAmount = linkDiscountFor(payLink, items)
       }
     }
-    if (!Array.isArray(items) || items.length === 0) {
+    // 10/21 (Nic): a background check sold on its own IS the sale — the cart
+    // beside it is empty on purpose, because the applicant is buying nothing
+    // else. The server writes that line, never the register, so an empty cart
+    // with a person named for a check is a real sale and not a mistake.
+    const sellingACheckAlone = !!(req.body?.screening && typeof req.body.screening === 'object'
+      && (String((req.body.screening as any).name ?? '').trim() || String((req.body.screening as any).email ?? '').trim()))
+    if (!Array.isArray(items) || (items.length === 0 && !sellingACheckAlone)) {
       throw new AppError(400, 'The cart is empty — add what they are buying, then press Charge again.')
     }
     // 10/2 (review): every item id as the database writes it (lowercase) —
@@ -2843,6 +2936,8 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // 10/5 (Nic): the stay rung here — priced whole (R5), a month added (R6),
     // what it needs (R1/R2/R8) — read once and written as it was priced.
     let stayPlan: CounterStayPlan | null = null
+    /** 10/21 (Nic): a check rung on its own, with nobody's stay under it. */
+    let counterScreening: CounterScreening | null = null
     let pricedItems: any[]
     if (ticketBookingId) {
       const r = await priceReservationCart(posLandlordId(req), ticketBookingId, items, discountAmount, 'Charge')
@@ -2876,6 +2971,20 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         throw new AppError(400, 'Nothing in this cart is a stay any more — press Clear, then ring the sale again.')
       }
       pricedItems = counter.items
+      // 10/21 (Nic): a background check sold on its own, to somebody with no
+      // stay — priced by the same function the quote used, never by the cart.
+      counterScreening = await counterScreeningOf(posLandlordId(req), propertyId, req.body?.screening, 'Charge')
+      if (counterScreening) {
+        if (payLink) {
+          throw new AppError(409, 'A pay link is charged exactly as it was sent — ring a background check as its own sale instead.')
+        }
+        if (cartAlreadyHasAScreening(pricedItems, stayPlan)) {
+          throw new AppError(409, 'This sale already has a background check on it — one check, one person. '
+            + 'Take the stay off the cart to sell a check on its own, or ring the stay, which carries its check already.')
+        }
+        if (paymentMethod === 'charge') throw new AppError(400, CHARGE_ACCOUNT_NO_SCREENING)
+        pricedItems = [...pricedItems, counterScreeningLine(counterScreening)]
+      }
       // 10/3: a pay link's reservation, as one line at what it charges.
       if (linkResLine) pricedItems = [linkResLine, ...pricedItems]
     }
@@ -2970,7 +3079,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // landlord's to give back (and is logged).
     const screeningCollector = screeningCollectedBy(paymentMethod)
     const screeningAmount = (stayPlan?.screeningFee ?? 0) > 0 ? stayPlan!.screeningFee
-      : ticketScreening?.price ?? linkScreening?.price ?? 0
+      : counterScreening?.price ?? ticketScreening?.price ?? linkScreening?.price ?? 0
     const screeningBooking = ticketScreening?.bookingId ?? linkScreening?.bookingId ?? stayPlan?.ext?.bookingId ?? null
     const gamKeeps = screeningAmount > 0 && screeningCollector === 'gam'
       && !(screeningBooking && await screeningAlreadyPaid(screeningBooking)) ? round2(screeningAmount) : 0
@@ -3405,6 +3514,22 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           const r = await attestReturningGuest(client, { bookingId: stayBooking.bookingId, propertyId, byUserId: req.user!.userId, chainBookingIds: stayPlan.needs.chain.bookingIds })
           returningAfterCommit = r.afterCommit
         }
+      }
+      // 10/21 (Nic): a check sold on its own. No booking, no site, no stay —
+      // just a person who wants to know whether they will be approved before
+      // they commit to anything. Recorded as a paid screening waiting for them,
+      // and the link goes out the moment the sale commits. The prepayment is
+      // found again BY THE PERSON (routes/background unusedScreeningPrepayment
+      // matches on the email or their tenant record), so it does not need a
+      // stay to attach to — and if they do book later, the same paid check is
+      // what that stay finds.
+      if (counterScreening) {
+        const rec = await recordScreeningPrepayment(client, {
+          landlordId: posLandlordId(req), propertyId, bookingId: null,
+          email: counterScreening.email, amount: counterScreening.price,
+          source: 'register', sourceId: tx.id, collectedBy: screeningCollector,
+        })
+        screeningAfterCommit = rec.afterCommit
       }
       // 10/5 (Nic, M2): a reservation ticket's background check — sold from
       // the schedule, settled here — is recorded as the guest's prepaid check.

@@ -11,6 +11,10 @@ import {
 } from '../lib/terminal'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiPut, apiDel } from '../lib/api'
+import { ScreeningsWaitingPanel } from '../../../../packages/shared-ui/ScreeningsWaitingPanel'
+
+/** The panel is shared with the landlord's own screening page — one list, both screens. */
+const screeningsApi = { get: apiGet, post: apiPost }
 import { humanize, processingFeeFor, rvSiteFactsLabel, SUPPORTED_CARD_READER, READER_ORDER_STATUS_LABEL, STAY_TERMS, STAY_TERMS_LABEL, RETURNING_GUEST_LABEL, type StayTerms } from '@gam/shared'
 import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
 import { appConfirm, appPrompt } from '../components/dialogs'
@@ -413,7 +417,7 @@ const nonNeg = { min: 0, onKeyDown: blockNeg, onPaste: blockNegPaste }
 export function POSPage() {
   const qc = useQueryClient()
   const [payLinkOpen, setPayLinkOpen] = useState(false)
-  const [tab, setTab] = useUrlTab('tab', 'register', ['register','checkout','history','customers','paylinks','items','categories','taxes','discounts','vendors','orders','inventory','readers'] as const)
+  const [tab, setTab] = useUrlTab('tab', 'register', ['register','checkout','checks','history','customers','paylinks','items','categories','taxes','discounts','vendors','orders','inventory','readers'] as const)
 
   const [cart, setCart] = useState<CartItem[]>([])
   // S651: the site + dates + guest for a stay in the cart. Held here rather
@@ -421,6 +425,9 @@ export function POSPage() {
   // checkout can refuse to run without them.
   const [stay, setStay] = useState<any | null>(null)
   const [stayModal, setStayModal] = useState(false)
+  // 10/21 (Nic): a background check rung on its own — who it is for and what
+  // the SERVER said it costs. Never priced here.
+  const [counterCheck, setCounterCheck] = useState<{ name: string; email: string; price: number } | null>(null)
   // The stay line in the cart, if there is one. Only ONE kind of stay can be
   // sold at a time — two different lengths on one sale have no single set of
   // dates, and the server refuses it too.
@@ -644,7 +651,7 @@ export function POSPage() {
     // bill — the power was used, so nothing is written off: it is owed the
     // ordinary way, on their invoice or as an emailed link. The read stands.
     releaseRaisedBills()
-    setCart([]); setPerson(null); setAppliedDiscount(null); setStay(null); setCashGiven('')
+    setCart([]); setPerson(null); setAppliedDiscount(null); setStay(null); setCashGiven(''); setCounterCheck(null)
     setOpenTicketId(null); setTicketSnapshot(null); setPayLinkId(null); setClosingRead(false)
   }
 
@@ -1150,7 +1157,13 @@ export function POSPage() {
   // 10/5 (Nic, R8): the background check's fee the server quoted for the stay
   // in the cart — its own line, which the server adds and the register cannot
   // take off. Shown here so the cart says what Charge takes.
-  const screeningDue = stayLine && stayPriced(stayLine) ? Number(stayLine.screeningFee) || 0 : 0
+  // 10/21 (Nic): a background check rung on its own, for somebody with no stay
+  // — "for people that just legitimately want to move in, they need to be able
+  // to just do the background check first and see if they're going to be
+  // approved." Its price is the server's (cart-quote answers with it); nothing
+  // here works it out.
+  const counterCheckDue = counterCheck ? Number(counterCheck.price) || 0 : 0
+  const screeningDue = (stayLine && stayPriced(stayLine) ? Number(stayLine.screeningFee) || 0 : 0) + counterCheckDue
   const subtotal = cart.reduce((s,i) => s+lineAmount(i), 0) + screeningDue
   // 10/3 (review, decisions #9): a stay is charged at the schedule's price —
   // a sale with a stay (or a reservation) in it takes no discount, and the
@@ -1189,8 +1202,14 @@ export function POSPage() {
   // whether the customer pays it on top or the landlord absorbs it. The server
   // decides the real figure (cart-quote / transactions); this shows it first.
   const absorbsCardFee = (allProperties as any[]).find(p => p.id === registerProperty)?.registerCardFeePayer === 'landlord'
+  // 10/21 (Nic): one price for a background check. Its line already carries its
+  // own processing, so the card fee here is figured on the rest of the ticket —
+  // the same base the server uses (serverCartTotals), or the screen would quote
+  // a fee the Charge never takes. A cart with a check in it takes no discount,
+  // so the whole fee is still in discountedSubtotal.
+  const cardFeeBase = Math.max(0, discountedSubtotal + taxAmount - screeningDue)
   const surcharge = method==='charge' ? discountedSubtotal*0.01
-    : (method==='card'||method==='card_on_file') && !absorbsCardFee ? processingFeeFor({ amount: discountedSubtotal + taxAmount, paymentMethod: 'card' })
+    : (method==='card'||method==='card_on_file') && !absorbsCardFee ? processingFeeFor({ amount: cardFeeBase, paymentMethod: 'card' })
     : 0
   const total = discountedSubtotal + taxAmount + surcharge
   // 10/3 (decisions #16): "Cash given" left blank is exact cash — received is
@@ -1347,6 +1366,9 @@ export function POSPage() {
       // dates from the item and its quantity; this is the part only the
       // cashier knows. (A stay taken back out leaves nothing behind.)
       stay: stayInCart ? (stay || null) : null,
+      // 10/21 (Nic): a check sold on its own. The server prices it and writes
+      // the line — this is only the person it is for.
+      screening: counterCheck ? { name: counterCheck.name, email: counterCheck.email } : null,
     }),
     { onSuccess: async (res:any) => {
       // 10/3 (Nic, decisions #16): the change stays on screen until the cashier
@@ -1377,7 +1399,7 @@ export function POSPage() {
         })
       }
       setClientSessionId(null)
-      abandonPendingIntent(); setCart([]); setCashGiven(''); setPerson(null); setAppliedDiscount(null); setStay(null)
+      abandonPendingIntent(); setCart([]); setCashGiven(''); setPerson(null); setAppliedDiscount(null); setStay(null); setCounterCheck(null)
       setOpenTicketId(null); setTicketSnapshot(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets')
       qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-items')
       // 10/3 (review): a stay sold here took its site — the next picker reads what is free again.
@@ -1702,6 +1724,12 @@ export function POSPage() {
     // Anyone who can ring a sale can check somebody out; its money lands on
     // the register ticket either way.
     { key:'checkout',  label:'Checkout',   perm:'pos.tab.register' },
+    // 10/21 (Nic): "nothing shows the desk it's waiting. Yeah, we need a way to
+    // resend it." The desk took the money for these checks, and the desk is who
+    // the guest rings when the link never came — so the list of who has paid and
+    // not done it belongs here, with the address editable, because a mistyped
+    // one is why the link never came AND why they cannot sign in to fix it.
+    { key:'checks',    label:'Checks',     perm:'pos.tab.register' },
     { key:'history',   label:'History',    perm:'pos.tab.history' },
     // S654 (Nic): "an overall customers tab… see my whole customer history."
     { key:'customers', label:'Customers',  perm:'pos.tab.history' },
@@ -1966,6 +1994,13 @@ export function POSPage() {
           register's ticket: "I want the determination of checking out to
           automatically know all of the things to bill for, not just targeted
           electric." */}
+      {tab==='checks' && (
+        <div style={{maxWidth:760}}>
+          <StartACheck propertyId={registerProperty}
+            onToSale={(c)=>{ setCounterCheck(c); setTab('register') }} />
+          <ScreeningsWaitingPanel propertyId={registerProperty} api={screeningsApi} />
+        </div>
+      )}
       {tab==='checkout' && !!registerProperty && (
         <CheckoutTab propertyId={registerProperty}
           onToTicket={(lines, notes, picked)=>{
@@ -2107,8 +2142,15 @@ export function POSPage() {
                     check on file carries the check's fee — the server adds it
                     to the sale, and nobody can take it off. */}
                 {screeningDue>0 && (<div style={{display:'flex',alignItems:'center',gap:6,padding:'7px 0',borderBottom:'1px solid var(--border-1)'}}>
-                  <div style={{flex:1,minWidth:0,fontSize:'.8rem',fontWeight:500}}>{stay?.screeningLineName || 'Background check'}</div>
-                  <div style={{fontSize:'.68rem',color:'var(--text-3)',textAlign:'right',maxWidth:110,lineHeight:1.3}}>required · cannot be taken off</div>
+                  <div style={{flex:1,minWidth:0,fontSize:'.8rem',fontWeight:500}}>
+                    {counterCheck ? `Background check — ${counterCheck.name}` : (stay?.screeningLineName || 'Background check')}
+                  </div>
+                  {counterCheck
+                    ? <button type="button" onClick={()=>setCounterCheck(null)}
+                        style={{border:'none',background:'none',color:'var(--text-3)',fontSize:'.68rem',cursor:'pointer',textDecoration:'underline'}}>
+                        take off
+                      </button>
+                    : <div style={{fontSize:'.68rem',color:'var(--text-3)',textAlign:'right',maxWidth:110,lineHeight:1.3}}>required · cannot be taken off</div>}
                   <div style={{fontSize:'.82rem',fontWeight:600,minWidth:44,textAlign:'right'}}>{fmt(screeningDue)}</div>
                 </div>)}
               </div>
@@ -4047,6 +4089,101 @@ function GetReaderCard({ propertyId, property }: { propertyId: string; property:
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * 10/21 (Nic) — START A BACKGROUND CHECK FOR SOMEBODY WITH NO STAY.
+ *
+ *   "Somebody pays for a background check in person. The only way to get there
+ *    is to book 22 nights or more. What happens? They have to pay not only for
+ *    the check, but the whole 22 nights just to do the check. And then what
+ *    happens if the landlord denies them?... for people that just legitimately
+ *    want to move in, they need to be able to just do the background check
+ *    first and see if they're going to be approved."
+ *
+ * Two ways out of the same box, because he asked for both:
+ *
+ *   SEND THEM THE LINK — the park's own application link, the same one the QR
+ *   on the desk already encodes. They pay GAM on their own phone, so nobody at
+ *   the counter is holding their money and no landlord fronts anything for a
+ *   person who may never move in. Best for almost everyone.
+ *
+ *   TAKE IT AT THE COUNTER — puts the check on the register ticket for anyone
+ *   who cannot or will not use a phone. Paid in cash, GAM takes its fee out of
+ *   the landlord's next payout, so the landlord is briefly fronting it.
+ *
+ * The price is the server's either way. The email is not optional on either
+ * path: the link goes to it, and it is the address they sign in with.
+ */
+function StartACheck({ propertyId, onToSale }: {
+  propertyId: string | null
+  onToSale: (c: { name: string; email: string; price: number }) => void
+}) {
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+  const ready = !!propertyId && !!name.trim() && emailOk && !busy
+
+  const run = async (what: 'send' | 'counter') => {
+    if (!ready) return
+    setBusy(true); setErr(null); setNote(null)
+    try {
+      if (what === 'send') {
+        const r: any = await apiPost(`/properties/${propertyId}/apply-link/send`,
+          { email: email.trim(), name: name.trim() })
+        setNote(`Sent to ${r?.data?.sentTo ?? email.trim()}. They pay for it on the page.`)
+        setName(''); setEmail('')
+      } else {
+        // The server prices it; the register never does.
+        const q: any = await apiPost('/pos/cart-quote',
+          { propertyId, items: [], paymentMethod: 'cash', screening: { name: name.trim(), email: email.trim() } })
+        const priced = q?.data?.screening
+        if (!priced) throw new Error('The register could not price that check just now — try again in a moment.')
+        onToSale({ name: priced.name, email: priced.email, price: Number(q.data.total) })
+      }
+    } catch (e: any) {
+      setErr(e?.message || 'That did not go through — try again in a moment.')
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div style={{border:'1px solid var(--border)',borderRadius:10,padding:14,marginBottom:16}}>
+      <h3 style={{margin:'0 0 4px',fontSize:'.9rem'}}>Start a background check</h3>
+      <p style={{margin:'0 0 12px',fontSize:'.76rem',color:'var(--text-3)'}}>
+        For somebody who wants to know where they stand before they book anything. They do not
+        have to take a site first.
+      </p>
+      <div style={{display:'flex',gap:8,flexWrap:'wrap',marginBottom:10}}>
+        <input value={name} onChange={e=>{setName(e.target.value);setNote(null);setErr(null)}} placeholder="Their name"
+          style={{flex:'1 1 180px',minWidth:0,padding:'7px 10px',borderRadius:8,border:'1px solid var(--border)',
+                  background:'var(--bg-2)',color:'var(--text-1)',fontSize:'.82rem'}} />
+        <input value={email} onChange={e=>{setEmail(e.target.value);setNote(null);setErr(null)}} placeholder="Their email"
+          style={{flex:'1 1 220px',minWidth:0,padding:'7px 10px',borderRadius:8,border:'1px solid var(--border)',
+                  background:'var(--bg-2)',color:'var(--text-1)',fontSize:'.82rem'}} />
+      </div>
+      <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
+        <button type="button" disabled={!ready} onClick={()=>run('send')}
+          style={{padding:'7px 14px',borderRadius:8,border:'none',background:ready?'var(--gold)':'var(--bg-3)',
+                  color:ready?'#1a1a1a':'var(--text-3)',fontWeight:700,fontSize:'.8rem',cursor:ready?'pointer':'default'}}>
+          Send them the link
+        </button>
+        <button type="button" disabled={!ready} onClick={()=>run('counter')}
+          style={{padding:'7px 14px',borderRadius:8,border:'1px solid var(--border)',background:'transparent',
+                  color:'var(--text-1)',fontWeight:600,fontSize:'.8rem',cursor:ready?'pointer':'default'}}>
+          Take it at the counter
+        </button>
+        <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>
+          They pay on their own phone, or on this ticket.
+        </span>
+      </div>
+      {!propertyId && <div style={{marginTop:8,fontSize:'.74rem',color:'var(--amber)'}}>Pick which property this register is at first.</div>}
+      {note && <div style={{marginTop:8,fontSize:'.76rem',color:'var(--green)'}}>{note}</div>}
+      {err && <div style={{marginTop:8,fontSize:'.76rem',color:'var(--red)'}}>{err}</div>}
     </div>
   )
 }

@@ -104,6 +104,7 @@ import { maintenancePortalRouter } from './routes/maintenance-portal'
 import { esignRouter }        from './routes/esign'
 import { signingPackagesRouter } from './routes/signingPackages'
 import { backgroundRouter }   from './routes/background'
+import { uiLayoutRouter }     from './routes/uiLayout'
 // S651: the renter's own view of the pool — places near THEM, no company involved.
 import { renterPoolRouter }   from './routes/renterPool'
 import { emergencyContactsRouter } from './routes/emergencyContacts'
@@ -468,6 +469,7 @@ app.use('/api/tenant-credits', tenantCreditsRouter)
 app.use('/api/property-tax',   propertyTaxRouter)
 app.use('/api/real-estate-law', realEstateLawRouter)
   app.use('/api/background',    backgroundRouter)
+  app.use('/api/ui-layout',     uiLayoutRouter)
   // S640: the front desk's emergency contact list.
   app.use('/api/emergency-contacts', emergencyContactsRouter)
 app.use('/api/fitness',        fitnessRouter)

@@ -837,11 +837,18 @@ export async function confirmBookingDeposit(
     if (b && paid) {
       const deposit = Number(b.deposit_amount ?? 0)
       const charged = chargedCents / 100
-      // GAM's fee is on the whole charge (the stay's part + any check), and
-      // comes out whoever paid it: on top (charged = base + fee) or absorbed
-      // (charged = base).
+      // GAM's fee comes out whoever paid it: on top (charged = base + fee) or
+      // absorbed (charged = base).
+      //
+      // 10/21 (Nic): it is figured on the STAY's part alone. A background check
+      // is one price with its own processing already inside it, so its line
+      // takes no fee on top (dueNowFor / cardFeeSplit's feeExempt) — and this
+      // is the same base the checkout actually charged. Figuring it on the
+      // whole charge, as it did, took the check's share of the fee out of the
+      // landlord's money: a $900 month with a $46.03 check held $898.39.
       const base = round2(deposit + screening)
-      const cardFee = processingFeeFor({ amount: base, paymentMethod: 'card' })
+      const feeBase = round2(Math.max(0, deposit))
+      const cardFee = feeBase > 0 ? processingFeeFor({ amount: feeBase, paymentMethod: 'card' }) : 0
       const baseCents = Math.round(base * 100)
       if (chargedCents !== baseCents && chargedCents !== baseCents + Math.round(cardFee * 100)) {
         logger.error({ bookingId, deposit, screening, cardFee, got: chargedCents }, '[propertyBooking] deposit amount mismatch — holding what was charged, less the card fee')

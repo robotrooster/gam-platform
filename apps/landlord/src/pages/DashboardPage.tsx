@@ -3,6 +3,7 @@ import { useQuery } from 'react-query'
 import { humanize , DISBURSEMENT_TRIGGER_LABEL } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
+import { useDashboardCards } from '../lib/useDashboardCards'
 import { AlertTriangle, CheckCircle, Activity, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, HeartHandshake, UserPlus, LogOut } from 'lucide-react'
 import { fmtWhole } from '../lib/format'
 import { PropertySelect } from '../components/ListControls'
@@ -219,6 +220,11 @@ export function DashboardPage() {
         .toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
     : null
 
+  // 10/21 (Nic): "rearranging the dashboard widgets." ABOVE the loading
+  // branch — a hook after an early return is a hook that sometimes does not
+  // run, and React counts them.
+  const dash = useDashboardCards()
+
   if (isLoading) return (
     <div>
       <div className="page-header">
@@ -230,6 +236,21 @@ export function DashboardPage() {
 
   return (
     <div>
+      {/* 10/21 (Nic): "a reset button down to default view at the bottom of the
+          page. Or maybe it only appears at the top next to the notification
+          banner when they've redragged."
+          Up here with the banners, and only once somebody HAS redragged —
+          a way back is only worth a line on the screen to the person who needs
+          one, and the way back is what they will be looking for at the top. */}
+      {dash.customized && (
+        <div style={{ display:'flex', justifyContent:'flex-end', marginBottom: 8 }}>
+          <button type="button" onClick={dash.reset}
+            style={{ background:'none', border:'1px solid var(--border)', borderRadius: 8,
+                     color:'var(--text-3)', fontSize:'.72rem', padding:'4px 10px', cursor:'pointer' }}>
+            Reset to the default view
+          </button>
+        </div>
+      )}
       {/* Alerts */}
       {/* ── S637: THE CONNECT BANNER IS GONE ────────────────────────────
           S605 put a banner here reading "Tenants can't pay rent yet". It was
@@ -357,7 +378,7 @@ export function DashboardPage() {
             10/13 (Nic): "Dashboard 'Expected Monthly Rent' card opens
             PAYMENTS" — this month's rent roll (it opened the Rent Roll's
             history before). */}
-        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/payments')}>
+        <div className="kpi-card" {...dash.bind('expected-rent', 'span 4')} onClick={()=>navigate('/payments')}>
           <div className="kpi-label">Expected Monthly Rent</div>
           <div className="kpi-value gold">{fmtWhole(stats?.monthlyRentVolume || 0)}</div>
           {/* S641 (Nic): the "$2,869 traded for work on 6" clause is gone — he
@@ -370,7 +391,7 @@ export function DashboardPage() {
             payable across {payableUnits} of {occupiedUnits} occupied unit{occupiedUnits === 1 ? '' : 's'}
           </div>
         </div>
-        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/reports')}>
+        <div className="kpi-card" {...dash.bind('money-this-month', 'span 4')} onClick={()=>navigate('/reports')}>
           {/* 10/18 (Nic): the label says what the card covers. Three figures in
               a row read as a subtraction, and these do not subtract: Received is
               money on the day it arrived, Charged is this month's bills, Owed is
@@ -394,7 +415,7 @@ export function DashboardPage() {
         </div>
         {/* S527 W-3: outstanding → the who-owes-what list, not Reports.
             10/13 (Nic): that list is Payments now (Outstanding Balances removed). */}
-        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/payments')}>
+        <div className="kpi-card" {...dash.bind('outstanding', 'span 4')} onClick={()=>navigate('/payments')}>
           <div className="kpi-label">Outstanding</div>
           <div className="kpi-value" style={{color:(stats?.outstanding||0)>0?'var(--amber)':'var(--text-0)'}}>{fmtWhole(stats?.outstanding || 0)}</div>
           {/* S650 (Nic): no small print about work-trade balances here.
@@ -411,7 +432,7 @@ export function DashboardPage() {
           <div className="kpi-sub">every open charge, every month</div>
         </div>
         {/* Row 2 (span 3): portfolio + operations */}
-        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units')}>
+        <div className="kpi-card" {...dash.bind('occupancy-rate', 'span 3')} onClick={()=>navigate('/units')}>
           <div className="kpi-label">Occupancy Rate</div>
           <div className="kpi-value">{stats?.occupancyRate ?? 0}%</div>
           <div className="kpi-sub">{stats?.activeUnits || 0} of {stats?.totalUnits || 0} units active</div>
@@ -426,24 +447,24 @@ export function DashboardPage() {
             has somebody living in it and owing rent; excluding it here and
             including it there put two different denominators on one screen.
             Occupied is occupied — the same rule the utility billing follows. */}
-        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units?status=occupied')}>
+        <div className="kpi-card" {...dash.bind('occupied-units', 'span 3')} onClick={()=>navigate('/units?status=occupied')}>
           <div className="kpi-label">Occupied Units</div>
           <div className="kpi-value green">{occupiedUnits}</div>
           <div className="kpi-sub">{stats?.vacantUnits || 0} vacant</div>
         </div>
         {/* S527 W-5: land pre-filtered to the expiring window. */}
-        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/leases?expiring=60')}>
+        <div className="kpi-card" {...dash.bind('leases-expiring', 'span 3')} onClick={()=>navigate('/leases?expiring=60')}>
           <div className="kpi-label">Leases Expiring</div>
           <div className="kpi-value" style={{fontSize:'1.4rem',color:(stats?.leasesExpiring30d||0)>0?'var(--amber)':'var(--text-0)'}}>{stats?.leasesExpiring30d || 0} in 30d</div>
           <div className="kpi-sub">{stats?.leasesExpiring60d || 0} within 60 days</div>
         </div>
-        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/maintenance')}>
+        <div className="kpi-card" {...dash.bind('maintenance', 'span 3')} onClick={()=>navigate('/maintenance')}>
           <div className="kpi-label">Maintenance</div>
           <div className="kpi-value" style={{fontSize:'1.4rem'}}>{(stats as any)?.maintenance?.openRequests||0} open</div>
           <div className="kpi-sub">{(stats as any)?.maintenance?.inProgress||0} in progress · {(stats as any)?.maintenance?.completed30d||0} done this month</div>
         </div>
         {/* Row 3 (span 6): applications + next payout */}
-        <div className="kpi-card" style={{gridColumn:'span 6',cursor:'pointer'}} onClick={()=>navigate('/background')}>
+        <div className="kpi-card" {...dash.bind('applications', 'span 6')} onClick={()=>navigate('/background')}>
           <div className="kpi-label">Applications</div>
           <div className="kpi-value" style={{fontSize:'1.4rem',color:(stats as any)?.bgPending>0?'var(--amber)':'var(--green)'}}>{(stats as any)?.bgPending||0}</div>
           <div className="kpi-sub">{(stats as any)?.bgPending>0?'pending review':'no pending applications'}</div>
@@ -452,7 +473,7 @@ export function DashboardPage() {
             see no way to see the history." Every other KPI here navigates; this
             one didn't, so the payout history was only reachable by knowing to
             look under Financials. */}
-        <div className="kpi-card" style={{gridColumn:'span 6',cursor:'pointer'}} onClick={()=>navigate('/disbursements')}>
+        <div className="kpi-card" {...dash.bind('disbursements', 'span 6')} onClick={()=>navigate('/disbursements')}>
           {/* S640 (Nic): "It's still showing a next disbursement of zero
               dollars. The landlord's expecting money to be handled and moved.
               They wanna know what's about to hit their bank."
@@ -486,7 +507,7 @@ export function DashboardPage() {
             free. The Referral Earnings and Net Platform Cost cards went with
             it; this one widens to fill the row rather than leaving a gap where
             an offer used to be. */}
-        <div className="kpi-card" style={{gridColumn:'span 12',cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
+        <div className="kpi-card" {...dash.bind('platform-fee', 'span 12')} onClick={()=>setShowFeeModal(true)}>
           <div className="kpi-label">Platform Fee / Mo</div>
           <div className="kpi-value">{fmtWhole(platformFee)}</div>
           <div className="kpi-sub">{platformFeeUnits} occupied × $2/unit · $10/property min</div>

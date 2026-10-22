@@ -211,7 +211,9 @@ export function depositForStay(
 export interface DueNow { stay: number; screening: number; cardFee: number; total: number }
 export function dueNowFor(stay: number, screening: number, payer: CardFeePayer): DueNow {
   const base = round2(stay + screening)
-  const split = cardFeeSplit(base, payer)
+  // 10/21 (Nic): the check is one price with its processing already in it, so
+  // the card fee is figured on the stay's part only.
+  const split = cardFeeSplit(base, payer, screening)
   return { stay: round2(stay), screening: round2(screening), cardFee: round2(split.charged - base), total: split.charged }
 }
 

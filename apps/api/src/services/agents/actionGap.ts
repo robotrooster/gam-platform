@@ -266,6 +266,17 @@ const DELIBERATE = new Map(Object.entries({
   'admin PATCH /reader-orders/:id': 'GAM\'s own desk',
   // 10/12 (Nic): GAM's actual cost of a reader (base, tax, shipping), typed from the shop receipt.
   'admin POST /reader-orders/:id/cost': 'GAM\'s own desk — what a card reader cost GAM, typed by GAM from the shop receipt; no landlord or tenant has anything to do with it',
+  // 10/21 (Nic): the link to run a background check at a park, emailed.
+  'properties POST /:id/apply-link/send':
+    'sends the park\'s own application link to an address spoken out loud. Nothing is charged and nothing is '
+    + 'committed to — the applicant pays GAM themselves on the page — but an address misheard on a call sends a '
+    + 'landlord\'s application link to a stranger, and the person who should type it is the one reading it off '
+    + 'a screen or a form. The QR on the desk is the version that needs no typing at all.',
+  // 10/21 (Nic): where somebody dragged their own nav items and dashboard widgets.
+  'uiLayout PUT /:surface':
+    'moves things around on somebody else\'s screen. It is theirs, it is done by dragging, and the only '
+    + 'way to know it came out right is to be looking at it — there is nothing here for an assistant to do '
+    + 'that the person is not already doing with their hand on the mouse.',
   'properties PATCH /:id/meter-photo-config': 'a landlord setting about their own crew\'s walk — not an agent\'s call',
   'utility POST /reading-runs/:id/meters/:meterId/photo': 'a camera on a phone at the meter — nothing an agent can do',
   'properties PATCH /:id/maintenance-config':
@@ -300,6 +311,10 @@ const DELIBERATE = new Map(Object.entries({
     'the required applicant notice is the landlord\'s to send, same directive',
   'background POST /payment-intent': 'Stripe payment entry, which belongs to Stripe\'s own elements',
   'background POST /pool/match/:matchId/payment-intent': 'Stripe payment entry, which belongs to Stripe\'s own elements',
+  'background POST /waiting/:id/resend':
+    'the point of the button is CORRECTING a mistyped email address before it sends again, and an '
+    + 'address heard in a conversation is exactly the thing not to take dictation on — whoever fixes it '
+    + 'should be looking at the list, reading the one that bounced, and typing the right one',
   'background POST /upload-id': 'an identity document is uploaded by the person, not the agent',
   'background POST /submit': 'the applicant enters their own SSN and identity details',
   'scopes POST /:roleType/invite': 'permissions and access are a hard stop in every profile',

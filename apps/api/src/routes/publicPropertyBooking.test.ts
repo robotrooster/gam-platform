@@ -290,10 +290,11 @@ describe('GET availability — 10/5 long stays', () => {
     await db.query(`UPDATE properties SET rent_due_mode = 'fixed_day', rent_due_day = 1 WHERE id = $1`, [s.propertyId])
     return s
   }
+  // 10/21 (Nic): one price for a background check — the whole intake price,
+  // its card processing already inside it.
   async function checkFee(): Promise<number> {
     const { screeningIntakeFee } = await import('./background')
-    const f = await screeningIntakeFee(null)
-    return round2(f.screening + f.gamFee + f.tax)
+    return (await screeningIntakeFee(null)).total
   }
   const quote = async (from: number, to: number) => (await request(buildApp())
     .get(`/api/public/property/sunny-rv-park/availability?checkIn=${plusDays(from)}&checkOut=${plusDays(to)}`)).body.data
@@ -314,7 +315,12 @@ describe('GET availability — 10/5 long stays', () => {
     expect(t.screeningFee).toBe(fee)
     expect(t.longStay).toBeNull()
     expect(t.dueNow.screening).toBe(fee)
-    expect(t.dueNow.total).toBe(round2(t.dueNow.stay + fee + processingFeeFor({ amount: t.dueNow.stay + fee, paymentMethod: 'card' })))
+    // 10/21 (Nic): the card fee is figured on the STAY alone. The check's own
+    // processing is already inside its price, and charging a fee on top of it
+    // would have made a guest on a fee-passing park pay more for the same check
+    // than one who paid for it themselves.
+    expect(t.dueNow.cardFee).toBe(processingFeeFor({ amount: t.dueNow.stay, paymentMethod: 'card' }))
+    expect(t.dueNow.total).toBe(round2(t.dueNow.stay + fee + processingFeeFor({ amount: t.dueNow.stay, paymentMethod: 'card' })))
   })
 
   it('30+ nights: both answers priced — lease deposit or the first month — with the R2 words', async () => {

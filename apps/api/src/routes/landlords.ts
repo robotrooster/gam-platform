@@ -1566,6 +1566,46 @@ landlordsRouter.delete('/me/deposit-interest-overrides/:state/:year',
 // Returns actionable signals for the dashboard to-do card.
 // Three categories: lease issues, ACH issues, high-$ maintenance.
 //
+// ── 10/21 (Nic): ONLY WHAT THE LANDLORD CAN ACTUALLY DO ────────────────────
+//
+//   "we should eliminate things that are not something a landlord can achieve
+//    or take off of the to-do list. Like right now, I'm showing 56 ACH issues.
+//    For tenants that don't have ACH set up yet. Either they're not going to,
+//    or they don't have a bank account, that's not something a landlord can do.
+//    And it looks like I need to do 57 things right now. Things that are in the
+//    landlord's control are the only things that should be there."
+//
+// And the line between this list and the Front Desk page, in his words:
+//
+//   "the front desk page is the front desk getting a hold of a tenant for
+//    something the tenant needs to do. And the to-do list is something the
+//    landlord needs to do... like sign their end of the lease. Once the
+//    landlord signs their end of the lease, it goes on the front desk page for
+//    the whoever to sign so that they can see that."
+//
+// So the test for a row here is: CAN THE LANDLORD FINISH IT ALONE, TODAY?
+// Sign the lease, draft the lease, approve the repair, link the bank, resend
+// the expired invite, record the homes — yes. Anything whose next move belongs
+// to a tenant is the Front Desk's call list, not this.
+//
+// Three rows failed that test and are gone (10/21). Each was already on the
+// Front Desk where somebody could ring the person, except the ACH one, which
+// Nic says does not belong there either — "ACH is not something they're going
+// to necessarily do, so it doesn't need to go there":
+//
+//   tenant_ach          a tenant has not verified their bank. The landlord
+//                       cannot verify it for them, and some never will. This
+//                       alone was 56 of the 57 rows on his dashboard.
+//   recent_failure      a rent pull bounced. The only move is to ring the
+//                       tenant, and they are already on the Front Desk under
+//                       "Owes — overdue" because the money is still owed.
+//   awaiting_co_tenants waiting on a housemate to accept. Its own subtitle
+//                       said "Nothing for you to do" — the Front Desk's
+//                       "Waiting on household" is where that line belongs.
+//
+// Before adding a row here, ask whose move it is. If the answer is the
+// tenant's, it goes on the Front Desk.
+//
 // S131: stays requireLandlord — this is the OWNER's personalized
 // dashboard. Team workers have their own dashboards under their
 // portal.
@@ -1924,80 +1964,11 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
     }
 
     // 2. Active units with unverified tenant ACH.
-    // S183: same self-managed filter as lease issues — tenant onboarding
-    // / ACH verification is a day-to-day manager concern, not an
-    // owner-financial-control concern.
-    const unverifiedTenants = await query<any>(`
-      SELECT
-        u.id AS unit_id,
-        u.unit_number,
-        p.name AS property_name,
-        tu.first_name AS tenant_first,
-        tu.last_name AS tenant_last
-      FROM units u
-      JOIN properties p ON p.id = u.property_id
-      JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
-      JOIN tenants t ON t.id = vuo.primary_tenant_id
-      JOIN users tu ON tu.id = t.user_id
-      WHERE u.landlord_id = ANY($1)
-        AND u.status = 'active'
-        AND p.pm_company_id IS NULL
-        AND p.managed_by_user_id = $2
-        AND (t.ach_verified = false OR t.ach_verified IS NULL)
-      ORDER BY u.unit_number
-    `, [scopeIds, userId])
-
-    for (const t of unverifiedTenants) {
-      const tenantName = [t.tenant_first, t.tenant_last].filter(Boolean).join(' ') || 'Tenant'
-      ach.push({
-        id: 'tenant-ach-' + t.unit_id,
-        type: 'tenant_ach',
-        title: tenantName + ' — ACH not verified (Unit ' + t.unit_number + ')',
-        subtitle: 'Tenant has not completed bank verification. Rent pulls will fail.',
-        href: '/units/' + t.unit_id,
-      })
-    }
-
-    // 3. Recent failed rent pulls (last 30 days).
-    // S183: same self-managed filter — rent collection / NSF chases are
-    // day-to-day manager work. JOIN through properties to apply the
-    // delegation filter.
-    const failed = await query<any>(`
-      SELECT DISTINCT ON (p.unit_id)
-        p.id AS payment_id,
-        p.unit_id,
-        p.status,
-        p.return_reason,
-        p.due_date,
-        u.unit_number,
-        tu.first_name AS tenant_first,
-        tu.last_name AS tenant_last
-      FROM payments p
-      JOIN units u ON u.id = p.unit_id
-      JOIN properties pr ON pr.id = u.property_id
-      LEFT JOIN tenants t ON t.id = p.tenant_id
-      LEFT JOIN users tu ON tu.id = t.user_id
-      WHERE p.landlord_id = ANY($1)
-        AND pr.pm_company_id IS NULL
-        AND pr.managed_by_user_id = $2
-        AND p.type = 'rent'
-        AND p.status IN ('failed', 'returned')
-        AND p.due_date >= CURRENT_DATE - INTERVAL '30 days'
-      ORDER BY p.unit_id, p.due_date DESC
-    `, [scopeIds, userId])
-
-    for (const f of failed) {
-      const tenantName = [f.tenant_first, f.tenant_last].filter(Boolean).join(' ') || 'Tenant'
-      const statusLabel = f.status === 'returned' ? 'Returned' : 'Failed'
-      ach.push({
-        id: 'payment-' + f.payment_id,
-        type: 'recent_failure',
-        title: statusLabel + ' rent pull — Unit ' + f.unit_number,
-        subtitle: tenantName + (f.return_reason ? ' · ' + f.return_reason : '')
-          + ' · Due ' + new Date(f.due_date).toLocaleDateString(),
-        href: '/units/' + f.unit_id,
-      })
-    }
+    // 10/21 (Nic): the tenant-ACH rows and the bounced-rent-pull rows used to
+    // be built here. Both were somebody else's move — see the rule at the top
+    // of this route. A tenant who has not verified their bank is not something
+    // a landlord can finish, and a bounced pull is a phone call, which is the
+    // Front Desk's job and already on it under "Owes — overdue".
 
     // ── MAINTENANCE (awaiting approval) ───────────────────
     const maintRows = await query<any>(`
@@ -2149,20 +2120,13 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
           // One row per unit, not per person who's already accepted.
           if (waitingUnits.has(it.unit_id)) continue
           waitingUnits.add(it.unit_id)
-          const accepted = roster.filter(r => r.accepted_at)
-          const names = (rows: any[]) => rows
-            .map(r => [r.first_name, r.last_name].filter(Boolean).join(' ') || 'Tenant')
-            .join(', ')
-          onboarding.push({
-            id: 'intent-waiting-' + it.unit_id,
-            type: 'awaiting_co_tenants',
-            title: 'Waiting on ' + outstanding.length + ' of ' + roster.length +
-                   ' to accept' + where,
-            subtitle: names(accepted) + ' accepted. The lease drafts on its own once ' +
-                      names(outstanding) + ' accepts too — everyone on this unit signs one lease. ' +
-                      'Nothing for you to do unless you want to resend the invite.',
-            href: '/tenant-onboarding/pending',
-          })
+          // 10/21 (Nic): this row used to say, in its own subtitle, "Nothing
+          // for you to do unless you want to resend the invite" — which is the
+          // definition of a row that does not belong on a list of what the
+          // landlord has to do. The lease drafts itself the moment the last
+          // housemate accepts. Whoever is chasing them reads the Front Desk's
+          // "Waiting on household". The unit is still claimed above so no other
+          // row is raised for it.
           continue
         }
         onboarding.push({

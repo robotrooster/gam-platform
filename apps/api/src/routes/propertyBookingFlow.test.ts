@@ -400,11 +400,17 @@ describe('10/5 long stays on the booking site', () => {
     await db.query(`UPDATE units SET monthly_rate = 900 WHERE id = $1`, [s.unitId])
     return s
   }
-  /** The background check's fixed line: the applicant intake price before processing. */
+  /**
+   * The background check's fixed line: the whole intake price.
+   *
+   * 10/21 (Nic): one price for a check — its card processing is already inside
+   * it, and a screening line never takes a fee on top. It used to stop before
+   * processing, so the same check cost less at a counter than on an
+   * applicant's own card.
+   */
   async function checkFee(): Promise<number> {
     const { screeningIntakeFee } = await import('./background')
-    const f = await screeningIntakeFee(null)
-    return round2(f.screening + f.gamFee + f.tax)
+    return (await screeningIntakeFee(null)).total
   }
   const monthOut = (ymd: string) => DateTime.fromISO(ymd).plus({ months: 1 }).toISODate()!
   const sessionOf = async (id: string) =>
@@ -433,7 +439,10 @@ describe('10/5 long stays on the booking site', () => {
          FROM unit_bookings WHERE id = $1`, [res.body.data.bookingId])).rows[0]
     expect(b).toEqual({ check_out: out, stay_terms: 'stay', screening_required: true,
                         deposit_amount: '900.00', total_amount: '900.00', lease_type: 'month_to_month' })
-    const card = processingFeeFor({ amount: 900 + fee, paymentMethod: 'card' })
+    // 10/21 (Nic): the card fee is on the STAY only — a background check is one
+    // price with its own processing already inside it, so its line takes no fee
+    // on top of it.
+    const card = processingFeeFor({ amount: 900, paymentMethod: 'card' })
     expect(res.body.data).toMatchObject({
       checkOut: out, stayTerms: 'stay', depositAmount: 900, screeningFee: fee, cardFee: card,
       dueNow: round2(900 + fee + card), heldWords: stayHeldWords(out),

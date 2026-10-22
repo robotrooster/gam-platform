@@ -498,7 +498,7 @@ async function depositOfferFor(
     // named here too, so a guest who rings the office is told the same total
     // the link would have charged.
     const screening = typeof fee === 'number' && fee > 0 ? fee : 0
-    const charge = cardFeeSplit(round2(figures.deposit + screening), b.booking_card_fee_payer)
+    const charge = cardFeeSplit(round2(figures.deposit + screening), b.booking_card_fee_payer, screening)
     return {
       deposit: figures.deposit, screening,
       cardFee: b.booking_card_fee_payer === 'customer' ? round2(charge.fee) : 0,

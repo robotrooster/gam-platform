@@ -2607,7 +2607,13 @@ export async function loadPlatformBalanceBook(): Promise<PlatformBalanceBook> {
   for (const r of checks) {
     const charged = cents(num(r.charged))
     const margin = cents(r.margin != null ? num(r.margin) : PLATFORM_FEES.BG_CHECK_NET)
-    const fee = cents(r.fee != null ? num(r.fee) : screeningFeeInside(num(r.charged)))
+    // 10/21 (Nic): only a screening that really was charged a card fee on top
+    // has one (the banking_spread row's customer_fee_charged). Since a check
+    // became one price with its processing inside it, nothing is added on top
+    // any more — and guessing a fee here would hand Checkr money GAM keeps.
+    // The five checks taken before that still carry their row, so what they
+    // held does not move.
+    const fee = cents(r.fee != null ? num(r.fee) : 0)
     const kept = Math.min(charged, margin + fee)
     screeningKeptC += kept
     screeningMarginC += Math.min(kept, margin)

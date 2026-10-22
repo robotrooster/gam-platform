@@ -312,9 +312,33 @@ class CheckrProvider implements BackgroundProvider {
     // SSN is deliberately NEVER sent — the applicant supplies it on Checkr's
     // hosted consent form, so screening PII stays off GAM servers.
     // 10/5 (Nic): "Order the ID scan." The price applicants pay has always
-    // been built on Checkr's $2.95 live ID scan (identity_verification — an
-    // add-on; Essential does not bundle it), but no order ever asked for it, so
-    // every applicant paid for a check that never ran. Every order asks now.
+    // been built on Checkr's live ID scan (identity_verification — an add-on;
+    // Essential does not bundle it), but no order ever asked for it, so every
+    // applicant paid for a check that never ran. Every order asks now.
+    //
+    // 10/21, with the September receipts in hand: both of them show one line,
+    // "Essential Tenant Screening package", $34.99, no add-on — because the
+    // field below landed four hours AFTER the last of those five orders went
+    // out. None of them ever asked. `add_on_products` is the documented way to
+    // order it on the Tenant API, so it is the right request and it stays.
+    //
+    // Checkr ALSO carries the ID scan as a per-property switch in their
+    // dashboard ("Identity Intelligence"), which Nic turned on for Mountain
+    // View the same day. Both levers are on now, deliberately. Which of the two
+    // actually does the work is something only a real order can tell us, and
+    // the next report settles it: `id_scan_ran` below is checked against the
+    // report, never inferred from this request.
+    //
+    // The switch is per PROPERTY, and a property only exists in Checkr once an
+    // order names it — so a brand-new park arrives with whatever the account
+    // default is. If the field alone turns out not to be enough, every new park
+    // needs the switch turned on by hand, and `checkr_id_scan_missing` is the
+    // only thing standing between that and an applicant paying for a scan
+    // nobody ran.
+    //
+    // The receipts also proved `package` here beats the dashboard: the property
+    // was set to Complete and we were billed Essential, because this body names
+    // the package outright. That is deliberate (S564) — leave it that way.
     const body: { order: Record<string, unknown> } = {
       order: {
         package: pkg,
@@ -578,6 +602,57 @@ class CheckrProvider implements BackgroundProvider {
     const matchedFirst = typeof cand.first_name === 'string' ? cand.first_name.trim() : ''
     const matchedLast  = typeof cand.last_name  === 'string' ? cand.last_name.trim()  : ''
 
+    // ── 10/21 (Nic) — A PRODUCT WE ORDERED AND DID NOT GET IS A LOUD PROBLEM ──
+    //
+    //   "I'm pretty sure that we didn't code it right for the identity
+    //    verification add-on package. So whatever we need to change in our
+    //    settings to add that onto the invoices is what we need to do."
+    //
+    // He was right, and this loop is why nobody could tell. The price every
+    // applicant pays is built on the live ID scan, but the loop above only
+    // records a product that is PRESENT: a product that never ran leaves no
+    // key, no status and no trace, `allTerminal` stays true, and the report
+    // reads as fully resolved. Five real screenings went out that way — the
+    // five reports in production carry criminal_history, credit_report,
+    // eviction_history, global_watchlist and sex_offender_registry, and no
+    // identity_verification at all — so five applicants paid for a scan that
+    // never ran and nothing anywhere said so.
+    //
+    // 10/21, with the September receipts and the Checkr dashboard in hand, the
+    // rest of the story: the code that asks for the add-on landed 10/5 at
+    // 14:03 and the last of those five orders went out 10/5 at 09:53, so not
+    // one of them ever carried the request. The 422 path in initiate() never
+    // fired because nothing was ever asked.
+    //
+    // Which is exactly why this check belongs here. Whether the add-on is
+    // refused, ignored, never requested, or simply switched off for a park
+    // nobody has touched yet, the only honest evidence that the scan ran is
+    // the product coming back on the report. Never infer it from the request.
+    //
+    // It does not hold the report back. The five products that DID run are
+    // resolved, and an applicant standing at the counter should not wait on
+    // GAM's billing problem. It says so out loud instead: on the summary, so no
+    // landlord is ever told an identity check happened when it did not, and to
+    // the admins, so the add-on gets turned on.
+    const idScanRan = CHECKR_ID_SCAN_ADD_ON in products
+    if (!idScanRan) {
+      try {
+        const { createAdminNotification } = await import('./adminNotifications')
+        await createAdminNotification({
+          severity: 'critical', category: 'checkr_id_scan_missing', emailSuperAdmins: true,
+          title: 'Checkr returned a report with no ID scan — the add-on is not being applied',
+          body: 'The price the applicant pays includes the live ID scan (identity_verification, $3.95). This '
+            + 'report came back WITHOUT that product, and Checkr raised no error — so the scan did not run and '
+            + 'somebody paid for it anyway. Checkr keeps this as a per-PROPERTY switch: open the Checkr '
+            + 'dashboard, go to Properties, pick this property, and turn Identity Intelligence on. A property '
+            + 'appears there the first time an order names it, so a park screening its first applicant will '
+            + 'always need this done once. '
+            + `Report ${report.id ?? reportRef}, order ${report.order_id ?? '(unknown)'}.`,
+          context: { report_id: report.id ?? reportRef, order_id: report.order_id ?? null },
+        })
+      } catch { /* the report matters more than the notice */ }
+    }
+
     return {
       provider:   'checkr',
       report_id:  report.id ?? reportRef,
@@ -589,6 +664,9 @@ class CheckrProvider implements BackgroundProvider {
       // per-product map, and so the landlord page can say "still running"
       // instead of rendering a verdict that is not one yet.
       all_products_resolved: allTerminal,
+      // 10/21: whether the live ID scan this order asked for actually ran. A
+      // reader must never have to work that out from the absence of a key.
+      id_scan_ran: idScanRan,
       products,
       details,
       fetched_at: new Date().toISOString(),

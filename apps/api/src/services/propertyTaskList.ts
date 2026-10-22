@@ -38,6 +38,7 @@
  * actually did the work.
  */
 import { query, queryOne } from '../db'
+import type { PropertyListKind } from '@gam/shared'
 
 export interface PropertyTaskListItem {
   id: string
@@ -51,21 +52,40 @@ export interface PropertyTaskListItem {
   done_by_name: string | null
   /** 10/21: set when the landlord took it off the list. The row never leaves. */
   hidden_at: string | null
+  /** 'job' — the owner's task list. 'supply' — things to buy (10/21). */
+  kind: PropertyListKind
+  /**
+   * 10/21: this line is the CALLER's own. A supply line is a request, so
+   * whoever made it may take their own back while it is unbought — and the
+   * screen should not have to know who is looking to work that out. The server
+   * knows; it says so here.
+   */
+  mine?: boolean
 }
 
-/** A row plus the property it is on — what the worker's cross-property read needs. */
+/**
+ * A row plus the property it is on — what the worker's cross-property read
+ * needs — and, for the owner's shopping view, the COMPANY that would buy it
+ * (10/21: one order, one set of books, per entity).
+ */
 export interface PropertyTaskListItemWithProperty extends PropertyTaskListItem {
   property_name: string
+  landlord_id?: string
+  entity_name?: string | null
 }
 
 const PERSON = (alias: string) =>
   `NULLIF(btrim(COALESCE(${alias}.first_name, '') || ' ' || COALESCE(${alias}.last_name, '')), '')`
 
+/** What the company is called — its own name, else the person behind it. */
+const ENTITY = `COALESCE(NULLIF(btrim(el.business_name), ''), ${PERSON('eu')})`
+
 const COLUMNS = `
          i.id, i.property_id, i.body, i.created_at,
          i.added_by_user_id, ${PERSON('a')} AS added_by_name,
          i.done_at, i.done_by_user_id, ${PERSON('d')} AS done_by_name,
-         i.hidden_at`
+         i.hidden_at, i.kind,
+         (i.added_by_user_id = $VIEWER) AS mine`
 
 const FROM = `
     FROM property_task_list_items i
@@ -87,12 +107,13 @@ const ORDER = `ORDER BY (i.done_at IS NOT NULL), i.created_at, i.id`
  */
 export async function listPropertyTasks(
   propertyId: string,
-  opts: { withHidden?: boolean } = {},
+  opts: { withHidden?: boolean; kind?: PropertyListKind; viewerUserId?: string | null } = {},
 ): Promise<PropertyTaskListItem[]> {
   return query<PropertyTaskListItem>(
-    `SELECT ${COLUMNS} ${FROM}
-      WHERE i.property_id = $1 AND ($2::boolean OR i.hidden_at IS NULL) ${ORDER}`,
-    [propertyId, opts.withHidden === true],
+    `SELECT ${COLUMNS.replace('$VIEWER', '$4')} ${FROM}
+      WHERE i.property_id = $1 AND ($2::boolean OR i.hidden_at IS NULL)
+        AND i.kind = $3 ${ORDER}`,
+    [propertyId, opts.withHidden === true, opts.kind ?? 'job', opts.viewerUserId ?? null],
   )
 }
 
@@ -112,17 +133,29 @@ export async function listPropertyTasks(
 export async function listOpenTasksForScope(
   landlordIds: string[] | null,
   propertyIds: string[] | null,
+  kind: PropertyListKind = 'job',
+  viewerUserId: string | null = null,
 ): Promise<PropertyTaskListItemWithProperty[]> {
   return query<PropertyTaskListItemWithProperty>(
-    `SELECT ${COLUMNS}, p.name AS property_name
+    `SELECT ${COLUMNS.replace('$VIEWER', '$4')}, p.name AS property_name,
+            p.landlord_id, ${ENTITY} AS entity_name
        ${FROM}
        JOIN properties p ON p.id = i.property_id
+       LEFT JOIN landlords el ON el.id = p.landlord_id
+       LEFT JOIN users eu ON eu.id = el.user_id
       WHERE i.hidden_at IS NULL
         AND i.done_at IS NULL
+        AND i.kind = $3
         AND ($1::uuid[] IS NULL OR p.landlord_id = ANY($1))
         AND ($2::uuid[] IS NULL OR i.property_id = ANY($2))
-      ORDER BY p.name, i.created_at, i.id`,
-    [landlordIds, propertyIds],
+      -- 10/21 (Nic): the shopping view groups by COMPANY, because an order and
+      -- its bookkeeping are the company's — "if I'm buying a doorknob for this
+      -- single family house and a new window for this other single family
+      -- house, if it's at the same LLC, it's going to be under the same
+      -- bookkeeping." The property is still on every line: that is the delivery
+      -- address and the house the doorknob is for.
+      ORDER BY entity_name NULLS LAST, p.landlord_id, p.name, i.created_at, i.id`,
+    [landlordIds, propertyIds, kind, viewerUserId],
   )
 }
 
@@ -131,13 +164,46 @@ export async function addPropertyTask(
   propertyId: string,
   body: string,
   addedByUserId: string,
+  kind: PropertyListKind = 'job',
 ): Promise<PropertyTaskListItem> {
   const { id } = (await queryOne<{ id: string }>(
-    `INSERT INTO property_task_list_items (property_id, body, added_by_user_id)
-     VALUES ($1, $2, $3) RETURNING id`,
-    [propertyId, body, addedByUserId],
+    `INSERT INTO property_task_list_items (property_id, body, added_by_user_id, kind)
+     VALUES ($1, $2, $3, $4) RETURNING id`,
+    [propertyId, body, addedByUserId, kind],
   ))!
   return (await getPropertyTask(propertyId, id))!
+}
+
+/**
+ * 10/21 (Nic) — "we need work trade people to be able to see this task list in
+ * the system."
+ *
+ * A work-trade resident is a TENANT, not staff, so neither the landlord-resource
+ * check nor the worker scope tables admit them — they were getting a flat 404.
+ * Their claim is their own agreement: a live one on a unit at THIS property.
+ *
+ * Live includes PAUSED, the same rule that decides whether they get the Work
+ * Trade page at all (routes/tenants work-trade, 10/19: Nic chose to show a
+ * paused agreement). A snowbird whose hours are paused while they are away must
+ * not be locked out of the list the day they drive back in. An ENDED agreement
+ * is nothing: their hours were billed when it ended.
+ *
+ * A resident with no work-trade agreement sees nothing, which is the point —
+ * "get apartment 4 listed" is not a renter's business.
+ */
+export async function worksHereOnTrade(userId: string, propertyId: string): Promise<boolean> {
+  const row = await queryOne<{ ok: boolean }>(
+    `SELECT TRUE AS ok
+       FROM work_trade_agreements w
+       JOIN units u ON u.id = w.unit_id
+       JOIN tenants t ON t.id = w.tenant_id
+      WHERE u.property_id = $2 AND t.user_id = $1
+        AND w.status IN ('active', 'paused')
+        AND (w.end_date IS NULL OR w.end_date >= CURRENT_DATE)
+      LIMIT 1`,
+    [userId, propertyId],
+  )
+  return row?.ok === true
 }
 
 /**
@@ -243,7 +309,7 @@ export async function getPropertyTask(
   itemId: string,
 ): Promise<PropertyTaskListItem | null> {
   return (await queryOne<PropertyTaskListItem>(
-    `SELECT ${COLUMNS} ${FROM} WHERE i.id = $1 AND i.property_id = $2`,
+    `SELECT ${COLUMNS.replace('$VIEWER', 'NULL')} ${FROM} WHERE i.id = $1 AND i.property_id = $2`,
     [itemId, propertyId],
   )) ?? null
 }

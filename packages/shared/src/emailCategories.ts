@@ -118,6 +118,11 @@ export const EMAIL_CATEGORY_RULES: Readonly<Record<string, EmailCategoryRule>> =
     'They asked for the link on the page they were looking at.' },
   screening_apply_link: { label: 'Your application link', always:
     'They asked GAM to email them the link.' },
+  // 10/21 (Nic): the park's own application link, handed to somebody who wants
+  // to run a background check before they commit to anything — the same link
+  // the printed QR on the desk encodes.
+  screening_start_link: { label: 'Start your background check', always:
+    'The desk sent them this link because they asked for it, standing there or on the phone. Declining it would mean somebody asked GAM for a link and GAM quietly did not send it.' },
   background_screening_request: { label: 'Background check needed', always:
     'It is the screening they have to complete to go on; declining the email would only strand them.' },
   background_decision: { label: 'Your application decision', always:

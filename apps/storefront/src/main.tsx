@@ -353,7 +353,13 @@ interface TypeAvail {
   longStay: LongStay | null
   altStay: { checkOut: string; nights: number } | null
 }
-/** "Due now: $60.00 deposit + $42.94 background check + $4.19 card fee" */
+/**
+ * "Due now: $60.00 deposit + $46.03 background check + $2.65 card fee"
+ *
+ * 10/21 (Nic): the check is one price wherever it is sold, its processing
+ * already inside it, so the card fee shown here is the one on the stay alone
+ * (propertyBookingQuote dueNowFor).
+ */
 function dueNowWords(d: DueNow, stayWord: string): string {
   return [
     `Due now: ${money(d.stay)} ${stayWord}`,

@@ -93,13 +93,13 @@ const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100
 /**
  * What the check costs this applicant, asked of the one function that sells
  * them (routes/background screeningIntakeFee) rather than written down here —
- * GAM's cost per report is being corrected in another pass and this test is
- * about WHERE the fee lands, not what it is.
+ * this test is about WHERE the fee lands, not what it is.
+ *
+ * 10/21 (Nic): that is the whole intake price now, processing included, and a
+ * screening line never takes a card fee on top of it. One price for a check
+ * however it is paid for.
  */
-const checkFee = async (state = 'AZ') => {
-  const f = await screeningIntakeFee(state)
-  return round2(f.screening + f.gamFee + f.tax)
-}
+const checkFee = async (state = 'AZ') => (await screeningIntakeFee(state)).total
 
 /** Nic's own rates: $49 a night, $269 a week, $589 a month, 6.60% lodging tax. */
 async function seed() {

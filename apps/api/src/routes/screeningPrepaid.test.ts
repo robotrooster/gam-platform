@@ -202,7 +202,11 @@ describe('POST /background/submit with a prepaid check (R8)', () => {
     const margin = await waitFor(async () => (await db.query<any>(
       `SELECT amount::text AS amount FROM platform_revenue_ledger
         WHERE type = 'screening_margin' AND reference_id = $1`, [checkId])).rows[0])
-    expect(margin?.amount).toBe('5.00')
+    // 10/21 (Nic): one price for a check, and GAM keeps whatever is left after
+    // Checkr's invoice — here $42.94 was collected at the counter before the
+    // price was corrected, so $42.94 - $38.94 = $4.00. Nothing is figured from
+    // today's list price: the money that came in is the money that came in.
+    expect(margin?.amount).toBe('4.00')
     // No card spread of its own — the stay's payment charged the card fee once.
     const spread = await db.query(
       `SELECT 1 FROM platform_revenue_ledger WHERE type = 'banking_spread' AND reference_id = $1`, [checkId])

@@ -61,6 +61,13 @@ const TABS = [
   // Maintenance would read as a kind of work order, which is the one thing it
   // is not.
   { key: 'tasks', label: 'Task List' },
+  // 10/21 (Nic): "we also need a way for maybe maintenance people or work trade
+  // people to put in sort of a collected shopping cart pool of, hey, we need to
+  // buy some new paint brushes and new trash bags… that way he doesn't have text
+  // messages from like 5 or 6 different people." Beside the task list and not
+  // inside it, because the write rule is the opposite one: anybody working the
+  // park adds a line here, and only the owner ticks it bought.
+  { key: 'supplies', label: 'Supplies' },
   { key: 'ownership', label: 'Ownership' },
 ] as const
 type TabKey = typeof TABS[number]['key']
@@ -187,6 +194,7 @@ export function PropertyDetailPage() {
       {/* 10/20 (Blu, via Nic): jobs around the park for whoever is working
           here. Deliberately not a work-order queue — see PropertyTaskListTab. */}
       {tab === 'tasks' && <PropertyTaskListTab propertyId={id!} />}
+      {tab === 'supplies' && <PropertyTaskListTab propertyId={id!} kind="supply" />}
       {/* S605 (Nic): selling the property, gated on every owner confirming. */}
       {tab === 'ownership' && <PropertyOwnershipTab propertyId={id!} propertyName={property.name} />}
 

@@ -2,6 +2,7 @@ import { useQuery } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { toast } from '../components/dialogs'
 import { WorkTradePanel } from '../../../../packages/shared-ui/WorkTradePanel'
+import { PropertyListPanel } from '../../../../packages/shared-ui/PropertyListPanel'
 
 /**
  * S652 (Nic): "this is the same window that I want the tenants to see... The
@@ -18,6 +19,7 @@ import { WorkTradePanel } from '../../../../packages/shared-ui/WorkTradePanel'
  * agreement stays gone — its hours were billed when it ended.
  */
 const panelApi = { get: apiGet, post: apiPost, patch: apiPatch }
+const listApi = { get: apiGet, post: apiPost }
 
 export function WorkTradePage() {
   const { data: agreement, isLoading } = useQuery<any>('work-trade-nav', () => apiGet('/tenants/work-trade'))
@@ -32,6 +34,24 @@ export function WorkTradePage() {
       <div className="ph"><div className="pt">Work Trade</div></div>
       <WorkTradePanel agreementId={agreement.id} side="tenant" api={panelApi}
         notify={(m, kind) => kind === 'error' ? toast.error(m) : toast(m)} />
+
+      {/* 10/21 (Nic): "we need work trade people to be able to see this task
+          list in the system… And we also need a way for maybe maintenance
+          people or work trade people to put in sort of a collected shopping
+          cart pool."
+
+          Here rather than a nav item of its own: this page already exists only
+          while the agreement is live, which is exactly who should see the
+          park's jobs, and it is the page they open to look at their hours. The
+          same panel the owner reads on the property page (shared-ui), with the
+          owner's controls off — they tick a job off and they ask for supplies;
+          they never write the task list, which is the owner's. */}
+      {agreement.propertyId && (
+        <div style={{ display: 'grid', gap: 14, marginTop: 14 }}>
+          <PropertyListPanel propertyId={agreement.propertyId} kind="job" isOwner={false} api={listApi} />
+          <PropertyListPanel propertyId={agreement.propertyId} kind="supply" isOwner={false} api={listApi} />
+        </div>
+      )}
     </div>
   )
 }
