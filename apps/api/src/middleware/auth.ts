@@ -383,15 +383,40 @@ export async function assertPropertyInScope(
   }
   const table = WORKER_SCOPE_TABLE[user.role]
   if (!table) throw new AppError(403, 'Not authorized for property-scoped actions')
-  const rows = await query<{ property_ids: string[]; all_properties: boolean }>(
-    `SELECT property_ids, all_properties FROM ${table} WHERE user_id = $1 LIMIT 1`,
-    [user.userId],
-  )
-  const row = rows[0]
-  if (!row) throw new AppError(403, 'No property scope assigned')
-  if (row.all_properties) return
   if (!propertyId) throw new AppError(400, 'A property must be selected for this action')
-  if (!row.property_ids.includes(propertyId)) throw new AppError(403, 'You are not assigned to this property')
+  // 10/22 — THE PROPERTY NAMES THE COMPANY, AND THE COMPANY NAMES THE SCOPE.
+  //
+  // This read was `WHERE user_id = $1 LIMIT 1`, which could only ever be right
+  // while a person worked for exactly one company. The scope tables are keyed
+  // (user_id, landlord_id) and always were, so a manager working for two owners
+  // had two rows and got whichever one came back first: one owner's properties
+  // answered and the other silently did not — or, if the first row happened to
+  // say all_properties, it answered for a company that had granted nothing.
+  //
+  // It is the same rule the rest of the platform follows since S654 ("the
+  // property or the row names the company; none is the default"): find the
+  // scope row belonging to the company that owns THIS property. No row for that
+  // company means no access to it, whatever they hold elsewhere.
+  const rows = await query<{ property_ids: string[]; all_properties: boolean }>(
+    `SELECT s.property_ids, s.all_properties
+       FROM ${table} s
+       JOIN properties p ON p.landlord_id = s.landlord_id
+      WHERE s.user_id = $1 AND p.id = $2::uuid`,
+    [user.userId, propertyId],
+  )
+  if (!rows.length) {
+    // Told apart so the words are true: somebody with no scope at all is a
+    // setup problem, somebody scoped elsewhere is a permission answer.
+    const any = await query<{ one: number }>(
+      `SELECT 1 AS one FROM ${table} WHERE user_id = $1 LIMIT 1`, [user.userId])
+    throw new AppError(403, any.length
+      ? 'You are not assigned to this property'
+      : 'No property scope assigned')
+  }
+  // Several rows can only mean several companies own the same property, which
+  // cannot happen — but if it ever did, any grant that reaches it is enough.
+  if (rows.some(r => r.all_properties || r.property_ids.includes(propertyId))) return
+  throw new AppError(403, 'You are not assigned to this property')
 }
 
 // Read-side companion to assertPropertyInScope: which properties may this
@@ -411,14 +436,41 @@ export async function getScopedPropertyIds(
   if (user.role === 'bookkeeper') return bookkeeperPropertyIdsOf(user)
   const table = WORKER_SCOPE_TABLE[user.role]
   if (!table) return null
+  // 10/22 — EVERY COMPANY THEY WORK FOR, NOT THE FIRST ONE.
+  //
+  // `LIMIT 1` here was the read-side half of the same fault: a manager working
+  // for two owners listed one owner's properties and the other's were invisible
+  // to every list in the portal.
+  //
+  // `null` KEEPS ITS MEANING, which is not "no filter" but "NOT NARROWED" —
+  // this person holds whole companies, so every page that distinguishes a
+  // company-wide document from a per-property one (the Books P&L, the cash
+  // flow, the owner statements) still hands them the company's own. Returning a
+  // list instead refused a manager with every property of the only company they
+  // work for, which the Books audience-isolation suite caught at once.
+  //
+  // Narrowed anywhere, and the answer is the explicit union: a person who
+  // manages every property for one owner and fixes two sites for another is
+  // narrowed, and must never see past either grant. An all_properties row
+  // expands to ITS OWN company's properties — never to every property on the
+  // platform, which is what a bare `null` would have meant for them.
   const rows = await query<{ property_ids: string[] | null; all_properties: boolean }>(
-    `SELECT property_ids, all_properties FROM ${table} WHERE user_id = $1 LIMIT 1`,
+    `SELECT property_ids, all_properties FROM ${table} WHERE user_id = $1`,
     [user.userId],
   )
-  const row = rows[0]
-  if (!row) return []
-  if (row.all_properties) return null
-  return row.property_ids || []
+  if (!rows.length) return []
+  if (rows.every(r => r.all_properties)) return null
+  const spread = await query<{ pid: string }>(
+    `SELECT DISTINCT pid FROM (
+       SELECT unnest(s.property_ids) AS pid FROM ${table} s WHERE s.user_id = $1
+       UNION
+       SELECT p.id FROM ${table} s
+         JOIN properties p ON p.landlord_id = s.landlord_id
+        WHERE s.user_id = $1 AND s.all_properties
+     ) q WHERE pid IS NOT NULL`,
+    [user.userId],
+  )
+  return spread.map(r => r.pid)
 }
 
 /**

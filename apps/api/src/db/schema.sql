@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict HCX61dskYYQDWFAaz1Nch5OwpIkIrqH0mrcxITG3AOEzE5eLtxNXdWOtjjIpEww
+\restrict FzaGdb2y6iaTA1B8hWtA0Ig5x3LzcFIdrkwDfqy1KXwhLCwohLkCKKAmTS6nYGs
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -13469,8 +13469,24 @@ CREATE TABLE public.landlord_members (
     added_by_user_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT landlord_members_role_check CHECK ((role = 'owner'::text))
+    via_pm_company_id uuid,
+    CONSTRAINT landlord_members_owner_is_direct CHECK (((role = 'manager'::text) OR (via_pm_company_id IS NULL))),
+    CONSTRAINT landlord_members_role_check CHECK ((role = ANY (ARRAY['owner'::text, 'manager'::text])))
 );
+
+
+--
+-- Name: COLUMN landlord_members.role; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_members.role IS '10/22: owner = the account owns this company; manager = the account manages its properties for the owner, inside a scope and permissions the owner granted (services/managedCompanies).';
+
+
+--
+-- Name: COLUMN landlord_members.via_pm_company_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_members.via_pm_company_id IS 'The management company this access came through, when it came through one. NULL = the owner added this person directly (in-house staff).';
 
 
 --
@@ -29318,6 +29334,13 @@ CREATE INDEX idx_landlord_member_inv_token ON public.landlord_member_invitations
 
 
 --
+-- Name: idx_landlord_members_via_pm_company; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_landlord_members_via_pm_company ON public.landlord_members USING btree (via_pm_company_id) WHERE (via_pm_company_id IS NOT NULL);
+
+
+--
 -- Name: idx_landlord_other_income_bank_txn; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -40875,6 +40898,14 @@ ALTER TABLE ONLY public.landlord_members
 
 
 --
+-- Name: landlord_members landlord_members_via_pm_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_members
+    ADD CONSTRAINT landlord_members_via_pm_company_id_fkey FOREIGN KEY (via_pm_company_id) REFERENCES public.pm_companies(id) ON DELETE CASCADE;
+
+
+--
 -- Name: landlord_merchant_rules landlord_merchant_rules_category_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -46519,5 +46550,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict HCX61dskYYQDWFAaz1Nch5OwpIkIrqH0mrcxITG3AOEzE5eLtxNXdWOtjjIpEww
+\unrestrict FzaGdb2y6iaTA1B8hWtA0Ig5x3LzcFIdrkwDfqy1KXwhLCwohLkCKKAmTS6nYGs
 
