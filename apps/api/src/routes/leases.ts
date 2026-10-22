@@ -16,6 +16,7 @@ import { todayIn, monthStartOf } from '../lib/timezone'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
 import { replyToProperty } from '../services/replyRouting'
+import { repriceDeparture, adjustUnpaidDepartureBill } from '../services/departureReprice'
 
 export const leasesRouter = Router()
 leasesRouter.use(requireAuth)
@@ -116,6 +117,70 @@ async function appendLeaseAddendums(leaseId: string, mainBytes: Uint8Array): Pro
  * (same package group), each with who has signed and who has not, and the file
  * to open — the executed copy once complete, the drafted copy until then.
  */
+// ── 10/22 (Nic): the money when somebody leaves part way through a month ───
+//
+//   "if they used more than half the month, we're not going to prorate them. We
+//    would just either wash the electric or other utilities. And if they are
+//    leaving before half the paid for time, then we could prorate a refund back
+//    to their payment method on file."
+//
+// WHAT COMES BACK IS A QUOTE AND NOTHING ELSE. No money moves, no bill changes,
+// nothing is written — the desk reads the figure, and the day it is worked out
+// for is the day THEY name:
+//
+//   "those guys actually ended up leaving about 2 days ago... in case somebody
+//    leaves on a Sunday when the office is closed and we don't check them out
+//    till Monday. Or they're going to be checking out on Sunday and we settle
+//    them up on Saturday."
+//
+// Left out: `leftOn` defaults to the leaving day already on the lease.
+leasesRouter.get('/:id/departure-money', async (req: any, res, next) => {
+  try {
+    const lease = await queryOne<{ id: string; landlord_id: string }>(
+      'SELECT id, landlord_id FROM leases WHERE id = $1', [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canAccessLandlordResource(req.user!, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    const leftOn = typeof req.query.leftOn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.leftOn)
+      ? req.query.leftOn : null
+    res.json({ success: true, data: await repriceDeparture(
+      { leaseId: lease.id, landlordId: lease.landlord_id, leftOn }) })
+  } catch (e) { next(e) }
+})
+
+// THE ADJUSTMENT — for the one case where no money has to move: they never paid
+// the month they left in, so the bill is re-priced to the days they used and
+// the late fees that came of waiting on it are voided.
+//
+//   "We want to adjust the bill so that there's no late fees but also get them
+//    prorated."
+//
+// It refuses, in plain words, anything else: a month that was actually paid
+// (that is a refund or a wash), a departure past the halfway point, or a month
+// carrying more than one unpaid rent charge.
+//
+// Takes the same permission the rest of a departure's money takes at the desk.
+leasesRouter.post('/:id/departure-money/adjust', requirePerm('pos.refund', 'take_payment'), async (req: any, res, next) => {
+  try {
+    const lease = await queryOne<{ id: string; landlord_id: string; property_id: string | null }>(
+      `SELECT l.id, l.landlord_id, u.property_id
+         FROM leases l LEFT JOIN units u ON u.id = l.unit_id WHERE l.id = $1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canAccessLandlordResource(req.user!, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/22: the permission has to be the one THIS property's company granted,
+    // not one carried in from another company somebody also works for.
+    await assertPropertyInScope(req.user, lease.property_id, { perm: ['pos.refund', 'take_payment'] })
+    const body = z.object({
+      leftOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullish(),
+    }).parse(req.body ?? {})
+    const out = await adjustUnpaidDepartureBill({
+      leaseId: lease.id, landlordId: lease.landlord_id,
+      leftOn: body.leftOn ?? null, byUserId: req.user!.userId,
+    })
+    if (!out.applied) throw new AppError(409, out.why)
+    res.json({ success: true, data: out })
+  } catch (e) { next(e) }
+})
+
 leasesRouter.get('/:id/documents', async (req, res, next) => {
   try {
     const lease = await queryOne<{ id: string; landlord_id: string }>(

@@ -4634,14 +4634,37 @@ function LeaseLeaveDateModal({ lease, onClose, onSaved }: {
 
   const tooEarly = !!(date && start && date < start)
 
+  /* 10/22 (Nic) — WHAT THE MONEY DOES, SHOWN BEFORE ANYTHING IS SAVED.
+     "if they used more than half the month, we're not going to prorate them. We
+     would just either wash the electric or other utilities. And if they are
+     leaving before half the paid for time, then we could prorate a refund back
+     to their payment method on file."
+     Worked out for the day TYPED IN THIS BOX, not for today — which is the
+     whole point of being able to set a day that has already passed. */
+  const { data: money } = useQuery<any>(
+    ['departure-money', lease.id, date],
+    () => apiGet(`/leases/${lease.id}/departure-money?leftOn=${date}`),
+    { enabled: !!date && !tooEarly })
+
+  const adjust = useMutation(
+    () => apiPost(`/leases/${lease.id}/departure-money/adjust`, { leftOn: date }),
+    { onSuccess: onSaved, onError: (e: any) => setErr(e?.message || 'That did not save — try again.') })
+
+  const fmt = (n: number) => '$' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  /* Three shapes, and each says what will happen rather than naming a rule:
+     an unpaid month that can be re-priced here, a paid month with money to go
+     back, and the wash. */
+  const canAdjust = money?.which === 'prorate' && money?.unpaid > 0 && money?.paid === 0
+  const owesThemMoney = money?.which === 'prorate' && money?.refundDue > 0
+
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" style={{maxWidth:460}} onClick={e=>e.stopPropagation()}>
         <div className="modal-title">Last day · {who}</div>
         <div style={{fontSize:'.82rem',color:'var(--text-3)',marginBottom:14}}>
           The last day they are on site {lease.unitNumber ? `${lease.unitNumber}` : 'this site'}.
-          It opens for reservations the day after. Nothing is checked out and no money
-          is settled — do that on the register when they actually go.
+          It opens for reservations the day after. A day that has already passed is fine —
+          somebody who drove out on Sunday is settled as Sunday.
         </div>
         <input type="date" className="form-input" value={date}
           min={start || undefined}
@@ -4651,8 +4674,39 @@ function LeaseLeaveDateModal({ lease, onClose, onSaved }: {
             That is before they moved in{start ? ` on ${start}` : ''}.
           </div>
         )}
+        {money && money.which !== 'nothing' && !tooEarly && (
+          <div style={{marginTop:14,padding:'10px 12px',borderRadius:8,background:'var(--surface-2)',
+                       fontSize:'.8rem',lineHeight:1.5,color:'var(--text-2)'}}>
+            <div style={{color:'var(--text-1)',fontWeight:600,marginBottom:4}}>
+              {money.nightsUsed} of {money.daysInPeriod} nights used
+            </div>
+            {money.which === 'wash' ? (
+              <div>{money.why}</div>
+            ) : (
+              <>
+                <div>
+                  Their {money.nightsUsed} nights come to {fmt(money.worth)}
+                  {money.lodgingTax > 0 && <> plus {fmt(money.lodgingTax)} lodging tax — {fmt(money.repricedTotal)}</>}
+                  {money.plan && <> ({money.plan})</>}.
+                </div>
+                {owesThemMoney && (
+                  <div style={{marginTop:6,color:'var(--gold)'}}>
+                    {fmt(money.paid)} was paid, so {fmt(money.refundDue)} goes back to them.
+                    Send it from their Payments page.
+                  </div>
+                )}
+                {canAdjust && (
+                  <div style={{marginTop:6}}>
+                    Their bill of {fmt(money.unpaid)} becomes {fmt(money.repricedTotal)},
+                    and the late fees on it come off.
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
         {err && <div style={{color:'var(--red)',fontSize:'.78rem',marginTop:8}}>{err}</div>}
-        <div style={{display:'flex',gap:8,justifyContent:'flex-end',marginTop:18}}>
+        <div style={{display:'flex',gap:8,justifyContent:'flex-end',marginTop:18,flexWrap:'wrap'}}>
           <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
           {existing && (
             <button className="btn btn-ghost btn-sm" disabled={save.isLoading}
@@ -4665,6 +4719,12 @@ function LeaseLeaveDateModal({ lease, onClose, onSaved }: {
             onClick={()=>save.mutate(date)}>
             {save.isLoading ? 'Saving…' : 'Save'}
           </button>
+          {canAdjust && (
+            <button className="btn btn-primary btn-sm" disabled={adjust.isLoading || save.isLoading}
+              onClick={()=>{ save.mutate(date); adjust.mutate() }}>
+              {adjust.isLoading ? 'Adjusting…' : `Save and adjust the bill to ${fmt(money.repricedTotal)}`}
+            </button>
+          )}
         </div>
       </div>
     </div>

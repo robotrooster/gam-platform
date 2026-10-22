@@ -57,7 +57,12 @@ import type { PoolClient } from 'pg'
 // The ONE ladder: the same function, rates and proration answer the register
 // quotes a stay with and the wash prices nights stayed with.
 import { priceNightsStayedBetween, stayPlanWords, type StayRates } from '@gam/shared'
-import { query } from '../db'
+import { query, getClient } from '../db'
+// The ONE way a charge that is still owed stops being owed: voided under its
+// own lock, with a reason, and refused for any charge a record points at
+// (services/chargeVoids). services/lateFeeDelete is NOT this — it is the
+// onboarding waiver, and only takes a late fee that was already credited.
+import { voidUnowedCharges } from './chargeVoids'
 import { departureRuleSql } from './departureRules'
 
 
@@ -371,5 +376,164 @@ export async function repriceDeparture(
     which, why, period, daysInPeriod, nightsUsed, leftOn,
     worth, lodgingTax, repricedTotal, basis, plan,
     paid, unpaid, refundDue, billBecomes,
+  }
+}
+
+/** The note left on a bill the departure re-priced, so the history reads. */
+export const DEPARTURE_ADJUSTED_NOTE =
+  'Re-priced when they left part way through the month (departure adjustment)'
+
+export interface UnpaidDepartureAdjustment {
+  applied: boolean
+  why: string
+  /** What the month was billed at, and what it becomes. */
+  rentWas: number
+  rentNow: number
+  /** Late fees taken off, and how many rows that was. */
+  lateFeesOff: number
+  lateFeeRows: number
+  /** The re-priced figure the bill was set to, tax included where tax applies. */
+  repricedTotal: number
+  lodgingTax: number
+  nightsUsed: number
+  daysInPeriod: number
+}
+
+const NOTHING = (why: string): UnpaidDepartureAdjustment => ({
+  applied: false, why, rentWas: 0, rentNow: 0, lateFeesOff: 0, lateFeeRows: 0,
+  repricedTotal: 0, lodgingTax: 0, nightsUsed: 0, daysInPeriod: 0,
+})
+
+/**
+ * 10/22 (Nic) — THEY NEVER PAID THE MONTH THEY LEFT IN, SO THE BILL CHANGES
+ * INSTEAD OF MONEY GOING BACK.
+ *
+ *   "somebody doesn't pay on the first of the month, because they think they're
+ *    going to be leaving in a week. You know, or shortly after the grace period
+ *    ends. So they don't pay. It racks up late fees. They go to check out on
+ *    the seventh... let's say they check out on the ninth. We want to adjust the
+ *    bill so that there's no late fees but also get them prorated."
+ *
+ * Two things happen, and the second is the one that needs saying out loud:
+ *
+ *   THE RENT IS RE-PRICED to what they actually used — the register's ladder in
+ *   a first month, monthly ÷ days in that month for a resident, by the one rule
+ *   above. Lodging tax rides inside the figure where a short stay owes it.
+ *
+ *   THE LATE FEES COME OFF. They were charged for waiting on a month the person
+ *   was never going to use, and Nic's answer is that they should not be there.
+ *   They come off through the SAME path a landlord's own "Delete this late fee"
+ *   uses (services/lateFeeDelete), so the fee is kept in the audit log, its own
+ *   credit is released, and the bill's late mark is re-rated — rather than a
+ *   second way to remove a late fee that does four fewer things.
+ *
+ * REFUSED, in plain words, when:
+ *   - any of that month's rent actually arrived. Money in hand is the wash's
+ *     question or a refund's, not an adjustment's.
+ *   - they used half the month or more. "if they used more than half the month,
+ *     we're not going to prorate them."
+ *   - the month carries more than one unpaid rent row. One bill is the normal
+ *     shape; several is somebody's hand-correction, and quietly rewriting the
+ *     first of them is how a figure nobody can explain gets into the books.
+ */
+export async function adjustUnpaidDepartureBill(args: {
+  leaseId: string
+  landlordId: string
+  leftOn?: string | null
+  byUserId: string | null
+  client?: PoolClient
+}): Promise<UnpaidDepartureAdjustment> {
+  const own = !args.client
+  const client = args.client ?? await getClient()
+  try {
+    if (own) await client.query('BEGIN')
+    const fork = await repriceDeparture(
+      { leaseId: args.leaseId, landlordId: args.landlordId, leftOn: args.leftOn }, client)
+    if (!fork) {
+      if (own) await client.query('COMMIT')
+      return NOTHING('That lease is not on this landlord\'s books, or there is no day they left.')
+    }
+    const shape = { repricedTotal: fork.repricedTotal, lodgingTax: fork.lodgingTax,
+                    nightsUsed: fork.nightsUsed, daysInPeriod: fork.daysInPeriod }
+    const no = (why: string) => ({ ...NOTHING(why), ...shape })
+
+    if (fork.paid > 0) {
+      if (own) await client.query('COMMIT')
+      return no(`They paid ${money(fork.paid)} toward that month, so this is not a bill to adjust — `
+        + 'it is a refund or a wash. Settle it on the check-out screen.')
+    }
+    if (fork.which !== 'prorate') {
+      if (own) await client.query('COMMIT')
+      return no(fork.why)
+    }
+    if (!(fork.unpaid > 0)) {
+      if (own) await client.query('COMMIT')
+      return no('Nothing is billed for that month, so there is nothing to adjust.')
+    }
+
+    const rent = (await client.query<{ id: string; amount: string; invoice_id: string | null }>(
+      `SELECT id, amount, invoice_id FROM payments
+        WHERE lease_id = $1 AND landlord_id = $2 AND type = 'rent'
+          AND status IN ('pending', 'failed')
+          AND due_date >= $3::date AND due_date <= $4::date
+        ORDER BY due_date, id
+        FOR UPDATE`,
+      [args.leaseId, args.landlordId, fork.period.start, fork.period.end])).rows
+    if (rent.length !== 1) {
+      if (own) await client.query('COMMIT')
+      return no(`That month has ${rent.length} unpaid rent charges on it, not one, so nothing was changed — `
+        + 'put the month right on the Payments page first, then adjust it here.')
+    }
+    const row = rent[0]
+    const was = num(row.amount)
+
+    await client.query(
+      `UPDATE payments
+          SET amount = $2,
+              notes = TRIM(COALESCE(notes || ' · ', '') || $3)
+        WHERE id = $1`,
+      [row.id, fork.repricedTotal.toFixed(2), DEPARTURE_ADJUSTED_NOTE])
+
+    // THE LATE FEES THAT CAME OF WAITING ON THIS BILL.
+    //
+    // Voided, not deleted: GAM never erases, the row keeps its reason, and the
+    // change journal holds what it said before. A fee some other record points
+    // at (a receipt application, a bank match) is left alone by
+    // voidUnowedCharges and reported as held, rather than torn out from under
+    // whatever points at it.
+    let lateFeesOff = 0, lateFeeRows = 0, lateFeesHeld = 0
+    if (row.invoice_id) {
+      const fees = (await client.query<{ id: string }>(
+        `SELECT id FROM payments
+          WHERE invoice_id = $1 AND type = 'late_fee' AND status IN ('pending', 'failed')`,
+        [row.invoice_id])).rows
+      if (fees.length) {
+        const out = await voidUnowedCharges(
+          ((sql: string, params?: any[]) => client.query(sql, params as any)) as any,
+          fees.map(f => f.id),
+          'Left part way through the month they never paid for; the late fees were waiting on a month they did not use.')
+        lateFeeRows = out.voided.length
+        lateFeesOff = round2(out.voided.reduce((n, v) => n + v.amount, 0))
+        lateFeesHeld = out.held.length
+      }
+    }
+
+    if (own) await client.query('COMMIT')
+    return {
+      applied: true, ...shape,
+      rentWas: was, rentNow: fork.repricedTotal, lateFeesOff, lateFeeRows,
+      why: `${fork.why}`
+        + (lateFeeRows > 0
+            ? ` ${money(lateFeesOff)} of late fees came off — they were waiting on a month they did not use.`
+            : '')
+        + (lateFeesHeld > 0
+            ? ` ${lateFeesHeld} late fee${lateFeesHeld === 1 ? '' : 's'} stayed: money is recorded against ${lateFeesHeld === 1 ? 'it' : 'them'}.`
+            : ''),
+    }
+  } catch (e) {
+    if (own) await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    if (own) client.release()
   }
 }

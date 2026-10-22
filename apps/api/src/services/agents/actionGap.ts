@@ -93,6 +93,16 @@ const DELIBERATE = new Map(Object.entries({
   // what is about to change, by a person who can be asked "are you sure".
   'properties PATCH /:id/departure-rules':
     'sets whether a property gives money back when someone leaves early and whether it prorates a mid-month move (Nic 10/18: "these should all be property level settings"). A standing policy answer about the landlord\'s own money, given once on the property\'s page — never an assistant\'s call in the middle of a conversation.',
+  // 10/22: the departure adjustment. It re-prices a month to the days somebody
+  // actually used and voids the late fees that came of waiting on it — and the
+  // whole figure hangs off ONE fact the desk establishes, the day they drove
+  // out ("those guys actually ended up leaving about 2 days ago... somebody
+  // leaves on a Sunday when the office is closed and we don't check them out
+  // till Monday"). An assistant cannot know that day; it is told it. The quote
+  // (GET /:id/departure-money) is open to anybody who can read the lease, so an
+  // assistant can say what it would come to — it just does not press it.
+  'leases POST /:id/departure-money/adjust':
+    'adjusts a departing resident\'s unpaid month down to the days they used and voids the late fees it carried. The figure turns on the day they left, which the desk establishes and nobody can infer; pressed on a screen showing the old bill, the new one and the fees coming off, by a person who can be asked "are you sure" (#38 Q6).',
   'tenantCredits POST /:id/undo':
     'takes back a credit whole: every bill it settled goes back to owed, so the late-fee run charges the days since each due date and the resident\'s payment history is re-scored. The owner\'s or a property manager\'s press, with the bills it reopens on screen; an assistant makes no money decision (#38 Q6).',
   // ── 10/4: move-out money, check-outs, and a card waiting on its bank ───────
