@@ -1,94 +1,118 @@
 /**
- * 10/21 (Nic) — "I'm wondering if we have a collision on size."
+ * 10/22 (Nic) — FIXED PLACES, MOVING CARDS.
  *
- *   "if I put something that takes up half the width of the screen and then
- *    something else that takes up like a third, there's going to be a little
- *    leftover space at the end. Can it only do like will it allow a card that
- *    is too big to go next to it and mess up the view?"
+ *   "I'm wondering if we should have those sizes of slots locked. And if I drag
+ *    something from a one size slot to another size, it's moved to that view.
+ *    Like there are places to fill with items that the size of the place is
+ *    locked, as opposed to making everything half and half after you move just
+ *    one single item."
  *
- * Two different worries in there, and they have different answers.
- *
- * OVERLAP cannot happen. A CSS grid places each card in the next space that
- * fits and never stacks one on another, so there is nothing to test for.
- *
- * HOLES absolutely could. The ten cards ship as thirds, halves and one full
- * width, sized so the DEFAULT rows add to twelve exactly — and any other order
- * breaks that, because a half will not fit in a third of leftover room. It
- * drops to the next row and leaves the gap he is describing.
- *
- * So a dragged layout makes every card the same width. This is the proof: over
- * every shape of arrangement, the rows stay full.
+ * The first attempt (10/21) let the cards carry their own widths and made them
+ * all half-width the moment anything moved — the only way to avoid gaps, and it
+ * flattened a page that had a deliberate shape. Fixed places solve it properly:
+ * the rows always add up because the places never change.
  */
 import { describe, it, expect } from 'vitest'
-import { DASHBOARD_CARDS } from './useDashboardCards'
+import { DASHBOARD_SLOTS, DASHBOARD_CARDS, arrange, swap } from './useDashboardCards'
 
-/** The widths the cards ship at, in the order they ship. */
-const SHIPPED_SPANS = [4, 4, 4, 3, 3, 3, 3, 6, 6, 12]
 const COLUMNS = 12
-const UNIFORM = 6   // half the row — what every card becomes once somebody arranges their own
+const spanOf = (s: { span: string }) => Number(s.span.replace('span ', ''))
 
-/** Empty cells left in COMPLETED rows — the last row's remainder is just the end of the list. */
-function holesBetween(spans: number[]): number[] {
-  const holes: number[] = []
-  let used = 0
-  for (const s of spans) {
-    if (used + s > COLUMNS) { holes.push(COLUMNS - used); used = 0 }
-    used += s
-  }
-  return holes.filter(Boolean)
-}
+describe('the shape of the page', () => {
+  it('has a place for every card and a card for every place', () => {
+    expect(DASHBOARD_SLOTS).toHaveLength(DASHBOARD_CARDS.length)
+  })
 
-/** Every arrangement of n things is too many to walk; this samples the shapes. */
-function shuffles<T>(items: T[], howMany: number): T[][] {
-  const out: T[][] = []
-  let seed = 7
-  const rand = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648
-  for (let i = 0; i < howMany; i++) {
-    const a = items.slice()
-    for (let j = a.length - 1; j > 0; j--) {
-      const k = Math.floor(rand() * (j + 1))
-      ;[a[j], a[k]] = [a[k], a[j]]
+  it('every row adds up to a full twelve — which is why nothing can leave a gap', () => {
+    let row = 0
+    const rows: number[] = []
+    for (const slot of DASHBOARD_SLOTS) {
+      const span = spanOf(slot)
+      expect(span).toBeGreaterThan(0)
+      expect(span).toBeLessThanOrEqual(COLUMNS)
+      if (row + span > COLUMNS) { rows.push(row); row = 0 }
+      row += span
     }
-    out.push(a)
-  }
-  return out
-}
-
-describe('cards cannot leave a hole once somebody arranges their own', () => {
-  it('the shipped widths are exact — this is why the default layout is left alone', () => {
-    expect(SHIPPED_SPANS).toHaveLength(DASHBOARD_CARDS.length)
-    expect(holesBetween(SHIPPED_SPANS)).toEqual([])
+    rows.push(row)
+    // Nic's pyramid: three across, then four, then two, then full width, then
+    // the band for the big panels.
+    expect(rows).toEqual([12, 12, 12, 12, 12, 12])
   })
 
-  it('and why they CANNOT be kept: reordering them leaves a hole almost every time', () => {
-    const bad = shuffles(SHIPPED_SPANS, 2000).filter(o => holesBetween(o).length > 0)
-    expect(bad.length).toBeGreaterThan(1500)
-    // Not a sliver, either — most of a row can end up empty.
-    const worst = Math.max(...shuffles(SHIPPED_SPANS, 2000).flatMap(o => holesBetween(o)), 0)
-    expect(worst).toBeGreaterThanOrEqual(6)
+  it('keeps the three big panels at half a row or wider — they hold tables and charts', () => {
+    const panels = DASHBOARD_SLOTS.filter(s => s.band === 'panel')
+    expect(panels).toHaveLength(3)
+    for (const p of panels) expect(spanOf(p)).toBeGreaterThanOrEqual(COLUMNS / 2)
   })
 
-  it('one width for every card leaves no hole, in ANY order', () => {
-    const uniform = DASHBOARD_CARDS.map(() => UNIFORM)
-    for (const order of shuffles(uniform, 500)) {
-      expect(holesBetween(order)).toEqual([])
-    }
-  })
-
-  it('a half divides the row exactly, so the rows are always full', () => {
-    expect(COLUMNS % UNIFORM).toBe(0)
-    expect(COLUMNS / UNIFORM).toBe(2)
-  })
-
-  // 10/21 (Nic): "resizing some of these cards to I think 1/3 was a bad idea...
-  // that table's got some important stuff." A card has to hold more than a
-  // label and a figure, so half the row is the floor.
-  it('is never narrower than half a row', () => {
-    expect(UNIFORM).toBeGreaterThanOrEqual(COLUMNS / 2)
-  })
-
-  it('every card has a key, and no two share one', () => {
+  it('names every card once', () => {
     expect(new Set(DASHBOARD_CARDS).size).toBe(DASHBOARD_CARDS.length)
-    expect(DASHBOARD_CARDS.every(k => /^[a-z][a-z-]*$/.test(k))).toBe(true)
+  })
+})
+
+describe('a saved arrangement', () => {
+  it('with nothing saved, the page is exactly as it ships', () => {
+    expect(arrange([])).toEqual([...DASHBOARD_CARDS])
+  })
+
+  it('always fills every place, however odd the save is', () => {
+    for (const saved of [[], ['todo'], ['nope'], ['todo', 'todo', 'todo'], [...DASHBOARD_CARDS].reverse()]) {
+      const out = arrange(saved)
+      expect(out).toHaveLength(DASHBOARD_SLOTS.length)
+      expect(new Set(out).size).toBe(DASHBOARD_SLOTS.length)
+    }
+  })
+
+  it('a card that no longer exists is dropped, and one added since takes the first free place', () => {
+    const out = arrange(['retired-card', 'todo'])
+    expect(out).not.toContain('retired-card')
+    expect(out[0]).toBe('todo')
+    expect(out).toHaveLength(DASHBOARD_SLOTS.length)
+  })
+})
+
+describe('dropping a card', () => {
+  it('SWAPS the two and moves nothing else — the rest of the page stays put', () => {
+    const before = arrange([])
+    const after = swap(before, 'todo', 'expected-rent')
+    expect(after[0]).toBe('todo')
+    expect(after[before.indexOf('todo')]).toBe('expected-rent')
+    // Every other card is exactly where it was.
+    for (let i = 0; i < before.length; i++) {
+      if (i === 0 || i === before.indexOf('todo')) continue
+      expect(after[i]).toBe(before[i])
+    }
+  })
+
+  it('a card dropped on itself, or on something not on the board, changes nothing', () => {
+    const before = arrange([])
+    expect(swap(before, 'todo', 'todo')).toBe(before)
+    expect(swap(before, 'todo', 'not-a-card')).toBe(before)
+  })
+
+  it('a card takes the width of the place it lands in — that is the whole idea', () => {
+    const before = arrange([])
+    // The to-do list ships in the full-width place at the bottom.
+    expect(spanOf(DASHBOARD_SLOTS[before.indexOf('todo')])).toBe(12)
+    const after = swap(before, 'todo', 'occupancy-rate')
+    // Dragged onto a quarter-row place, it becomes a quarter-row card...
+    expect(spanOf(DASHBOARD_SLOTS[after.indexOf('todo')])).toBe(3)
+    // ...and the card it displaced takes the full width it left behind.
+    expect(spanOf(DASHBOARD_SLOTS[after.indexOf('occupancy-rate')])).toBe(12)
+  })
+
+  it('no arrangement can ever leave a gap, because the places never move', () => {
+    const shuffled = [...DASHBOARD_CARDS].reverse()
+    const out = arrange(shuffled)
+    // Whatever sits where, the row widths are the same twelve every time.
+    expect(out).toHaveLength(DASHBOARD_SLOTS.length)
+    let row = 0, rows: number[] = []
+    for (const slot of DASHBOARD_SLOTS) {
+      const span = spanOf(slot)
+      if (row + span > COLUMNS) { rows.push(row); row = 0 }
+      row += span
+    }
+    rows.push(row)
+    expect(rows.every(r => r === COLUMNS)).toBe(true)
   })
 })

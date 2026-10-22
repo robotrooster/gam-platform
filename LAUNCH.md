@@ -32,11 +32,17 @@ so it stops being re-proposed at him.
   per person on the server so it follows them between machines. Section headers
   come off once it is their own order; "Reset menu order" puts them back. The
   order can only reorder what their permissions already show.
-- ~~**Rearrangeable dashboard widgets**~~ — BUILT 10/21. All ten cards drag. Once
-  arranged they go to half-width each (Nic, 10/21: thirds *"was a bad idea...
-  that table's got some important stuff"*), which is the only width that leaves
-  no holes in any order. "Reset to the default view" sits at the top with the
-  banners, and only once something has been dragged.
+- ~~**Rearrangeable dashboard widgets**~~ — BUILT 10/21, REBUILT 10/22 on Nic's
+  better idea. The first cut let each card carry its own width and made them all
+  half-width once anything moved, which was the only way to avoid gaps and
+  flattened a page that had a deliberate shape. Now the PLACES are fixed —
+  his pyramid, three across then four then two then full width, plus a band
+  underneath for the three big panels — and a card takes the size of the place
+  it lands in. Dropping SWAPS two cards and moves nothing else. All thirteen
+  drag, including Property Health, Recent Disbursements and the to-do list
+  (10/22: *"it should be able to be anything on the page"*). Rows always add up,
+  so no arrangement can leave a gap. "Reset to the default view" sits at the top
+  with the banners, once something has been dragged.
 - **The "expensive" pass** — the look-and-feel uplift, as a deliberate piece of
   work rather than a side effect of other builds.
 - **GAM logo** — still a word mark.

@@ -41,12 +41,22 @@ export const LEFT_OWING_WORDS =
  * Does this person have money outstanding anywhere, and is the landlord asking
  * somebody OTHER than the one owed?
  *
- * MATCHED ON A VERIFIED GAM ACCOUNT AND NOTHING ELSE (Claude's call 10/21, for
- * Nic to counter). Two people share a name. A false flag tells a landlord, in
- * the moment they are deciding whether to house somebody, that this person is
- * high risk and owes money — and there is no undoing that. A missed flag costs
- * a landlord money; a false one costs somebody a home. So: `users.id`, or
- * nothing.
+ * HOW SOMEBODY IS RECOGNISED — Nic overruled this on 10/22. Claude had built
+ * it to match a verified GAM account and nothing else; Nic: "It's a flag only
+ * matches a verified GAM account. That's not right."
+ *
+ * The rule is TWO CONTACT POINTS AGREEING — name + email, or name + phone:
+ * "I know people can change their email and phone number and stuff, but most of
+ * the time they don't change both." Partial and nickname names count, both
+ * ways: Nick/Nicholas, Richard/Dick, William/Bob — "a square invoice, a lot of
+ * people might treat as informal, even though it's... rent." And where it is
+ * genuinely unsure, it is neither matched nor dropped: it goes to a GAM admin
+ * to research. Three outcomes, never a silent guess in either direction.
+ *
+ * NOT YET BUILT — the account match below is the narrow first cut and is a
+ * SUBSET of the rule above, so it under-matches rather than over-matches while
+ * the contact-point matcher and the admin queue are built. It never flags
+ * somebody the real rule would not.
  *
  * The landlord who is OWED is excluded on purpose. They already have the whole
  * story in their own "moved out, still owes" folder, with every figure in it.

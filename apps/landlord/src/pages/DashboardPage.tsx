@@ -4,7 +4,7 @@ import { humanize , DISBURSEMENT_TRIGGER_LABEL } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
 import { useDashboardCards } from '../lib/useDashboardCards'
-import { AlertTriangle, CheckCircle, Activity, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, HeartHandshake, UserPlus, LogOut } from 'lucide-react'
+import { AlertTriangle, CheckCircle, Activity, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, HeartHandshake, UserPlus, LogOut, Home } from 'lucide-react'
 import { fmtWhole } from '../lib/format'
 import { PropertySelect } from '../components/ListControls'
 // 10/12 (Nic): no "Money received" / "Money billed" switch — the income card
@@ -367,9 +367,18 @@ export function DashboardPage() {
       {/* KPI Grid — 12-col so we can run 3 / 4 / 3 cards per row (spans 4 / 3 / 4). */}
       {/* While a new property loads, the last figures stay up dimmed
           rather than reading as the new choice's numbers. */}
-      {!loadFailed && (
-      <div className="kpi-grid dash-kpis" style={{gridTemplateColumns:"repeat(12, 1fr)", opacity: isPreviousData ? 0.55 : 1, transition: 'opacity .15s'}}
+      {/* 10/22 (Nic): ONE grid for the whole page, because "it should be able
+          to be anything on the page. I could drag my to-do list to the top as
+          well if I wanted." A card can only trade places with another card in
+          the same grid, so the big panels below had to come inside it.
+          The figures stay behind their own guard (a fragment, which adds no
+          element, so its cards remain direct children of the grid) — a failed
+          load still leaves the panels and the to-do list on screen, as before.
+          `alignItems: start` keeps a short card from stretching to the height
+          of a tall panel that landed in its row. */}
+      <div className="kpi-grid dash-kpis" style={{gridTemplateColumns:"repeat(12, 1fr)", alignItems: 'start', opacity: isPreviousData ? 0.55 : 1, transition: 'opacity .15s'}}
            aria-busy={isPreviousData || undefined}>
+      {!loadFailed && (<>
         {/* Row 1 (span 4): rent money trio */}
         {/* 10/12 (Nic): the rent the active LEASES bill (never a unit's listed
             rent; a space marked occupied with no active lease adds nothing),
@@ -378,7 +387,7 @@ export function DashboardPage() {
             10/13 (Nic): "Dashboard 'Expected Monthly Rent' card opens
             PAYMENTS" — this month's rent roll (it opened the Rent Roll's
             history before). */}
-        <div className="kpi-card" {...dash.bind('expected-rent', 'span 4')} onClick={()=>navigate('/payments')}>
+        <div className="kpi-card" {...dash.bind('expected-rent')} onClick={()=>navigate('/payments')}>
           <div className="kpi-label">Expected Monthly Rent</div>
           <div className="kpi-value gold">{fmtWhole(stats?.monthlyRentVolume || 0)}</div>
           {/* S641 (Nic): the "$2,869 traded for work on 6" clause is gone — he
@@ -391,7 +400,7 @@ export function DashboardPage() {
             payable across {payableUnits} of {occupiedUnits} occupied unit{occupiedUnits === 1 ? '' : 's'}
           </div>
         </div>
-        <div className="kpi-card" {...dash.bind('money-this-month', 'span 4')} onClick={()=>navigate('/reports')}>
+        <div className="kpi-card" {...dash.bind('money-this-month')} onClick={()=>navigate('/reports')}>
           {/* 10/18 (Nic): the label says what the card covers. Three figures in
               a row read as a subtraction, and these do not subtract: Received is
               money on the day it arrived, Charged is this month's bills, Owed is
@@ -415,7 +424,7 @@ export function DashboardPage() {
         </div>
         {/* S527 W-3: outstanding → the who-owes-what list, not Reports.
             10/13 (Nic): that list is Payments now (Outstanding Balances removed). */}
-        <div className="kpi-card" {...dash.bind('outstanding', 'span 4')} onClick={()=>navigate('/payments')}>
+        <div className="kpi-card" {...dash.bind('outstanding')} onClick={()=>navigate('/payments')}>
           <div className="kpi-label">Outstanding</div>
           <div className="kpi-value" style={{color:(stats?.outstanding||0)>0?'var(--amber)':'var(--text-0)'}}>{fmtWhole(stats?.outstanding || 0)}</div>
           {/* S650 (Nic): no small print about work-trade balances here.
@@ -432,7 +441,7 @@ export function DashboardPage() {
           <div className="kpi-sub">every open charge, every month</div>
         </div>
         {/* Row 2 (span 3): portfolio + operations */}
-        <div className="kpi-card" {...dash.bind('occupancy-rate', 'span 3')} onClick={()=>navigate('/units')}>
+        <div className="kpi-card" {...dash.bind('occupancy-rate')} onClick={()=>navigate('/units')}>
           <div className="kpi-label">Occupancy Rate</div>
           <div className="kpi-value">{stats?.occupancyRate ?? 0}%</div>
           <div className="kpi-sub">{stats?.activeUnits || 0} of {stats?.totalUnits || 0} units active</div>
@@ -447,24 +456,24 @@ export function DashboardPage() {
             has somebody living in it and owing rent; excluding it here and
             including it there put two different denominators on one screen.
             Occupied is occupied — the same rule the utility billing follows. */}
-        <div className="kpi-card" {...dash.bind('occupied-units', 'span 3')} onClick={()=>navigate('/units?status=occupied')}>
+        <div className="kpi-card" {...dash.bind('occupied-units')} onClick={()=>navigate('/units?status=occupied')}>
           <div className="kpi-label">Occupied Units</div>
           <div className="kpi-value green">{occupiedUnits}</div>
           <div className="kpi-sub">{stats?.vacantUnits || 0} vacant</div>
         </div>
         {/* S527 W-5: land pre-filtered to the expiring window. */}
-        <div className="kpi-card" {...dash.bind('leases-expiring', 'span 3')} onClick={()=>navigate('/leases?expiring=60')}>
+        <div className="kpi-card" {...dash.bind('leases-expiring')} onClick={()=>navigate('/leases?expiring=60')}>
           <div className="kpi-label">Leases Expiring</div>
           <div className="kpi-value" style={{fontSize:'1.4rem',color:(stats?.leasesExpiring30d||0)>0?'var(--amber)':'var(--text-0)'}}>{stats?.leasesExpiring30d || 0} in 30d</div>
           <div className="kpi-sub">{stats?.leasesExpiring60d || 0} within 60 days</div>
         </div>
-        <div className="kpi-card" {...dash.bind('maintenance', 'span 3')} onClick={()=>navigate('/maintenance')}>
+        <div className="kpi-card" {...dash.bind('maintenance')} onClick={()=>navigate('/maintenance')}>
           <div className="kpi-label">Maintenance</div>
           <div className="kpi-value" style={{fontSize:'1.4rem'}}>{(stats as any)?.maintenance?.openRequests||0} open</div>
           <div className="kpi-sub">{(stats as any)?.maintenance?.inProgress||0} in progress · {(stats as any)?.maintenance?.completed30d||0} done this month</div>
         </div>
         {/* Row 3 (span 6): applications + next payout */}
-        <div className="kpi-card" {...dash.bind('applications', 'span 6')} onClick={()=>navigate('/background')}>
+        <div className="kpi-card" {...dash.bind('applications')} onClick={()=>navigate('/background')}>
           <div className="kpi-label">Applications</div>
           <div className="kpi-value" style={{fontSize:'1.4rem',color:(stats as any)?.bgPending>0?'var(--amber)':'var(--green)'}}>{(stats as any)?.bgPending||0}</div>
           <div className="kpi-sub">{(stats as any)?.bgPending>0?'pending review':'no pending applications'}</div>
@@ -473,7 +482,7 @@ export function DashboardPage() {
             see no way to see the history." Every other KPI here navigates; this
             one didn't, so the payout history was only reachable by knowing to
             look under Financials. */}
-        <div className="kpi-card" {...dash.bind('disbursements', 'span 6')} onClick={()=>navigate('/disbursements')}>
+        <div className="kpi-card" {...dash.bind('disbursements')} onClick={()=>navigate('/disbursements')}>
           {/* S640 (Nic): "It's still showing a next disbursement of zero
               dollars. The landlord's expecting money to be handled and moved.
               They wanna know what's about to hit their bank."
@@ -507,30 +516,28 @@ export function DashboardPage() {
             free. The Referral Earnings and Net Platform Cost cards went with
             it; this one widens to fill the row rather than leaving a gap where
             an offer used to be. */}
-        <div className="kpi-card" {...dash.bind('platform-fee', 'span 12')} onClick={()=>setShowFeeModal(true)}>
+        <div className="kpi-card" {...dash.bind('platform-fee')} onClick={()=>setShowFeeModal(true)}>
           <div className="kpi-label">Platform Fee / Mo</div>
           <div className="kpi-value">{fmtWhole(platformFee)}</div>
           <div className="kpi-sub">{platformFeeUnits} occupied × $2/unit · $10/property min</div>
         </div>
-      </div>
-      )}
+      </>)}
 
-      {/* S159: PM cut MTD vs net to owner — only renders when there's
-            an active PM linkage with measurable cut this month. */}
-      <PmCutThisMonthCard />
-
-      <div className="grid-2" style={{gap:20}}>
         {/* Property health — an animated ECG whose 6 beats are the last 6
             months of rent collected (taller beat = stronger month). */}
-        {!loadFailed && <PropertyHealthMonitor
-          months={trendData}
-          health={stats?.rentHealth}
-          thisMonth={stats?.propertyHealth}
-          stale={isPreviousData}
-        />}
+        {!loadFailed && (
+          <div {...dash.bind('property-health')}>
+            <PropertyHealthMonitor
+              months={trendData}
+              health={stats?.rentHealth}
+              thisMonth={stats?.propertyHealth}
+              stale={isPreviousData}
+            />
+          </div>
+        )}
 
         {/* Recent disbursements */}
-        <div className="card">
+        <div className="card" {...dash.bind('recent-disbursements')}>
           <div className="card-header">
             <span className="card-title">Recent Disbursements</span>
             {/* S605: an icon is not a way out. Give the panel a real link to the
@@ -568,10 +575,15 @@ export function DashboardPage() {
             <div style={{color:'var(--text-3)',fontSize:'.82rem',padding:'16px 0'}}>No disbursements yet.</div>
           )}
         </div>
+
+        {/* To-Do List — a place on the board like everything else now. */}
+        <div {...dash.bind('todo')}><TodoCard /></div>
       </div>
 
-      {/* To-Do List */}
-      <TodoCard />
+      {/* S159: PM cut MTD vs net to owner — only renders when there's
+            an active PM linkage with measurable cut this month. Not one of the
+            draggable places: it appears and disappears on its own. */}
+      <PmCutThisMonthCard />
 
       {showFeeModal && (
         <div className="modal-overlay" onClick={()=>setShowFeeModal(false)}>
@@ -661,6 +673,18 @@ function TodoCard() {
     { key: 'ach', label: 'ACH Issues', icon: CreditCard, color: 'var(--amber)', items: todos?.ach || [] },
     { key: 'maintenance', label: 'High-$ Maintenance', icon: Wrench, color: 'var(--blue)', items: todos?.maintenance || [] },
     { key: 'workTrade', label: 'Work Trade', icon: HeartHandshake, color: 'var(--gold)', items: todos?.workTrade || [] },
+    // 10/22 (Nic): "it says one item needs attention, but there's nothing
+    // populating in the list."
+    //
+    // The server has always sent NINE kinds of to-do and counted all nine into
+    // the total; this list rendered eight. So a park owing its home inventory
+    // was counted and had nowhere to appear — a number with nothing under it.
+    // It hid for as long as it did because it was one row among fifty-seven;
+    // taking the fifty-six ACH rows off left it standing on its own.
+    //
+    // The guard below (dashboardTodoSections.test) now fails if the server ever
+    // counts a kind this list does not render.
+    { key: 'homeInventory', label: 'Record the homes', icon: Home, color: 'var(--blue)', items: todos?.homeInventory || [] },
   ]
 
   return (

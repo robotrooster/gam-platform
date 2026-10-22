@@ -1,24 +1,60 @@
 import { useState } from 'react'
-import { useUiLayout, applyOrder, moved } from './useUiLayout'
+import { useUiLayout } from './useUiLayout'
 
 /**
- * 10/21 (Nic) — "rearranging the dashboard widgets."
+ * 10/22 (Nic) — THE SLOTS ARE FIXED; THE CARDS MOVE BETWEEN THEM.
  *
- * The dashboard's cards are hand-written grid items, each one a different
- * shape with its own figures and its own click. Turning them into a list of
- * components to sort would have meant rewriting the whole page — and a page
- * about money is not one to rewrite for a drag handle.
+ *   "I'm wondering if we have a collision on size... if I put something that
+ *    takes up half the width of the screen and then something else that takes
+ *    up like a third, there's going to be a little leftover space at the end."
  *
- * So nothing about the cards moves. CSS grid already lets an item say where it
- * goes with `order`, so each card keeps its own markup exactly and gains two
- * things: a number saying where it sits, and the handlers to drag it. The page
- * reads the same whether somebody has arranged it or not.
+ *   "I'm wondering if we should have those sizes of slots locked. And if I drag
+ *    something from a one size slot to another size, it's moved to that view.
+ *    Like there are places to fill with items that the size of the place is
+ *    locked, as opposed to making everything half and half after you move just
+ *    one single item."
  *
- * The keys below are the cards in the order they ship. A card added later just
- * joins the end of this list; somebody's saved arrangement does not need to
- * know about it (applyOrder leaves unknown-to-it cards where they were), and a
- * card retired later disappears from both without stranding anything.
+ * His idea, and it is better than what shipped 10/21. That first attempt made
+ * every card half-width the moment anything moved, which was the only way to
+ * guarantee no gaps when the cards themselves carried their widths — and it
+ * flattened a dashboard that had a deliberate shape.
+ *
+ * Fixed slots solve it properly. The page is a pyramid of THIRTEEN places —
+ * three across, then four, then two, then one full width, then a band
+ * underneath for the three big panels. A card takes the size of the place it
+ * lands in. The places never change, so the rows always add up and there is
+ * nothing to collide with.
+ *
+ * DROPPING SWAPS, it does not insert. With places of different sizes, sliding
+ * everything along would resize every card between here and there — you move
+ * one thing and the whole page rearranges. Swapping changes exactly two.
  */
+export interface DashboardSlot {
+  /** The grid span this place occupies. Never changes. */
+  span: string
+  /** Roughly how tall what sits here is expected to be, for the empty-row feel. */
+  band: 'kpi' | 'panel'
+}
+
+/**
+ * The shape of the page, in reading order. Row 1 is the money trio across the
+ * top; row 2 the four small counts; row 3 the two halves; row 4 the full-width
+ * platform fee; then the big band for the panels that hold tables and charts.
+ */
+export const DASHBOARD_SLOTS: DashboardSlot[] = [
+  { span: 'span 4',  band: 'kpi' }, { span: 'span 4',  band: 'kpi' }, { span: 'span 4', band: 'kpi' },
+  { span: 'span 3',  band: 'kpi' }, { span: 'span 3',  band: 'kpi' },
+  { span: 'span 3',  band: 'kpi' }, { span: 'span 3',  band: 'kpi' },
+  { span: 'span 6',  band: 'kpi' }, { span: 'span 6',  band: 'kpi' },
+  { span: 'span 12', band: 'kpi' },
+  // 10/22 (Nic): "it's not letting me drag the property health card or the
+  // recent disbursements card... it should be able to be anything on the page.
+  // I could drag my to-do list to the top as well if I wanted."
+  { span: 'span 6',  band: 'panel' }, { span: 'span 6', band: 'panel' },
+  { span: 'span 12', band: 'panel' },
+]
+
+/** Which card sits in which place when nobody has moved anything. */
 export const DASHBOARD_CARDS = [
   'expected-rent',
   'money-this-month',
@@ -30,81 +66,96 @@ export const DASHBOARD_CARDS = [
   'applications',
   'disbursements',
   'platform-fee',
+  'property-health',
+  'recent-disbursements',
+  'todo',
 ] as const
 
 export type DashboardCardKey = typeof DASHBOARD_CARDS[number]
 
+/**
+ * The saved arrangement, made safe: anything the save does not know about keeps
+ * its own place, anything it names that no longer exists is dropped, and the
+ * result is always exactly as long as there are places.
+ *
+ * So a card added next month appears in the first free place instead of
+ * vanishing, and a card retired last month does not leave a hole.
+ */
+export function arrange(saved: string[], all: readonly string[] = DASHBOARD_CARDS): string[] {
+  const known = new Set(all)
+  const seen = new Set<string>()
+  const placed: string[] = []
+  for (const k of saved) {
+    // Each card holds exactly one place. A save naming the same card twice
+    // (a half-written write, an old shape) would otherwise eat a place and
+    // leave the board a card short.
+    if (known.has(k) && !seen.has(k)) { seen.add(k); placed.push(k) }
+  }
+  return [...placed, ...all.filter(k => !seen.has(k))].slice(0, all.length)
+}
+
+/** Swap two cards between their places. Nothing else on the page moves. */
+export function swap(order: string[], a: string, b: string): string[] {
+  const i = order.indexOf(a)
+  const j = order.indexOf(b)
+  if (i < 0 || j < 0 || i === j) return order
+  const next = order.slice()
+  next[i] = b
+  next[j] = a
+  return next
+}
+
 export function useDashboardCards() {
   const layout = useUiLayout('landlord_dashboard')
-  const [from, setFrom] = useState<DashboardCardKey | null>(null)
-  const [over, setOver] = useState<DashboardCardKey | null>(null)
+  const [from, setFrom] = useState<string | null>(null)
+  const [over, setOver] = useState<string | null>(null)
+  // 10/22 (Nic): "if I click and hold, I want it to show that they can edit."
+  // Shown on the press, before any movement.
+  const [pressed, setPressed] = useState<string | null>(null)
 
-  const arranged = applyOrder([...DASHBOARD_CARDS], layout.order, k => k) as DashboardCardKey[]
-  const rankOf = (key: DashboardCardKey) => {
-    const i = arranged.indexOf(key)
-    return i < 0 ? DASHBOARD_CARDS.length : i
+  const order = arrange(layout.order)
+  const slotOf = (key: string) => {
+    const i = order.indexOf(key)
+    return i < 0 ? DASHBOARD_SLOTS.length - 1 : i
   }
 
   /**
-   * Everything a card needs, spread onto its existing div.
-   *
-   * 10/21 (Nic): "I'm wondering if we have a collision on size... if I put
-   * something that takes up half the width of the screen and then something
-   * else that takes up like a third, there's going to be a little leftover
-   * space at the end."
-   *
-   * He was right, and it was worse than it sounds. The ten cards ship as
-   * thirds, halves and one full-width, and those widths were chosen so the
-   * DEFAULT rows add up to twelve exactly. Any other order breaks that: a
-   * half cannot squeeze into a third of leftover room, so it drops to the next
-   * row and leaves a hole. Simulated over thousands of arrangements, a dragged
-   * order leaves a hole in about nine of every ten, and the worst leaves three
-   * quarters of a row empty. (They can never OVERLAP — a grid will not stack
-   * two cards on each other — so the damage was only ever ugly, not broken.)
-   *
-   * Letting the grid backfill (`grid-auto-flow: dense`) was no good either: it
-   * still left holes in nine of ten, and it fills them by pulling a later card
-   * forward, so a card lands somewhere other than where it was dropped. A
-   * dashboard that moves things you did not move is worse than a gap.
-   *
-   * So: arrange it yourself and every card becomes the same width. Half the
-   * row, two to a row, no holes between them ever, and the order on screen is
-   * exactly the order dragged. Until somebody drags anything, the designed
-   * layout is untouched.
-   *
-   * 10/21 (Nic), on the first try at this, which made them thirds:
-   *
-   *   "resizing some of these cards to I think 1/3 was a bad idea. We should
-   *    do it to 1/2. Because like the property health bar, if I drag that to
-   *    the very top and it shrinks to a 1/3, it's going to compress a lot of
-   *    that information and that table's got some important stuff."
-   *
-   * A half divides the twelve-column row exactly, the same as a third did, so
-   * it costs nothing in tidiness and leaves room for a card that is more than
-   * a label and a figure.
+   * Everything a card needs, spread onto its own element. The card no longer
+   * says how wide it is — the place it is sitting in does.
    */
-  const bind = (key: DashboardCardKey, gridColumn: string) => ({
-    draggable: true,
-    onDragStart: (e: React.DragEvent) => { setFrom(key); e.dataTransfer.effectAllowed = 'move' },
-    onDragOver: (e: React.DragEvent) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setOver(key) },
-    onDragLeave: () => setOver(o => (o === key ? null : o)),
-    onDrop: (e: React.DragEvent) => {
-      e.preventDefault()
-      e.stopPropagation()   // a card's own click must not fire from a drop
-      if (from && from !== key) {
-        layout.save(moved(arranged, arranged.indexOf(from), arranged.indexOf(key)))
-      }
-      setFrom(null); setOver(null)
-    },
-    onDragEnd: () => { setFrom(null); setOver(null) },
-    style: {
-      gridColumn: layout.customized ? 'span 6' : gridColumn,
-      cursor: 'pointer',
-      order: rankOf(key),
-      opacity: from === key ? 0.4 : undefined,
-      outline: over === key && from && from !== key ? '2px solid var(--gold)' : undefined,
-    } as React.CSSProperties,
-  })
+  const bind = (key: DashboardCardKey) => {
+    const slot = slotOf(key)
+    const place = DASHBOARD_SLOTS[slot] ?? DASHBOARD_SLOTS[DASHBOARD_SLOTS.length - 1]
+    const isTarget = over === key && !!from && from !== key
+    return {
+      draggable: true,
+      onMouseDown: () => setPressed(key),
+      onMouseUp: () => setPressed(null),
+      onMouseLeave: () => setPressed(p => (p === key ? null : p)),
+      onDragStart: (e: React.DragEvent) => { setFrom(key); e.dataTransfer.effectAllowed = 'move' },
+      onDragOver: (e: React.DragEvent) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setOver(key) },
+      onDragLeave: () => setOver(o => (o === key ? null : o)),
+      onDrop: (e: React.DragEvent) => {
+        e.preventDefault()
+        e.stopPropagation()   // a card's own click must not fire from a drop
+        if (from && from !== key) layout.save(swap(order, from, key))
+        setFrom(null); setOver(null); setPressed(null)
+      },
+      onDragEnd: () => { setFrom(null); setOver(null); setPressed(null) },
+      style: {
+        gridColumn: place.span,
+        order: slot,
+        cursor: from === key ? 'grabbing' : 'grab',
+        // The place lights up before you let go, so the size it will become is
+        // visible while the card is still in the air.
+        outline: isTarget ? '2px solid var(--gold)' : undefined,
+        outlineOffset: isTarget ? 2 : undefined,
+        opacity: from === key ? 0.4 : undefined,
+        transform: pressed === key && !from ? 'scale(0.99)' : undefined,
+        transition: 'transform .08s',
+      } as React.CSSProperties,
+    }
+  }
 
   return { bind, customized: layout.customized, reset: layout.reset, ready: layout.ready }
 }

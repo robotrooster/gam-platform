@@ -666,6 +666,18 @@ export function Layout() {
   const navLayout = useUiLayout('landlord_nav')
   const [dragFrom, setDragFrom] = useState<number | null>(null)
   const [dragOver, setDragOver] = useState<number | null>(null)
+  // 10/22 (Nic): "the mouse doesn't make any distinction. Like, if I click and
+  // hold, I have to move a whole space before the line shows up. Like, nobody's
+  // gonna know that they can drag and drop."
+  //
+  // Three separate signals, because they answer three different moments:
+  //   CAN I? — the hand cursor on hover, before anything is pressed.
+  //   AM I HOLDING IT? — `pressed`, set on mouse-down and showing instantly,
+  //     with no movement needed. This is the one that was missing entirely.
+  //   WHERE WILL IT LAND? — the gold line, as before.
+  // Matched to the Master Schedule's reservation drag (SchedulePage: grab
+  // cursor, the dragged bar dimmed, the target gold), because he named it.
+  const [pressed, setPressed] = useState<number | null>(null)
   const orderedItems = applyOrder(visibleItems, navLayout.order, i => i.to)
 
   // Track section headers without side effects
@@ -693,6 +705,9 @@ export function Layout() {
             return (
               <div key={item.to}
                 draggable
+                onMouseDown={() => setPressed(index)}
+                onMouseUp={() => setPressed(null)}
+                onMouseLeave={() => setPressed(p => (p === index ? null : p))}
                 onDragStart={e => { setDragFrom(index); e.dataTransfer.effectAllowed = 'move' }}
                 onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOver(index) }}
                 onDragLeave={() => setDragOver(o => (o === index ? null : o))}
@@ -701,10 +716,19 @@ export function Layout() {
                   if (dragFrom !== null && dragFrom !== index) {
                     navLayout.save(moved(orderedItems, dragFrom, index).map(i => i.to))
                   }
-                  setDragFrom(null); setDragOver(null)
+                  setDragFrom(null); setDragOver(null); setPressed(null)
                 }}
-                onDragEnd={() => { setDragFrom(null); setDragOver(null) }}
+                onDragEnd={() => { setDragFrom(null); setDragOver(null); setPressed(null) }}
                 style={{
+                  // Held, but not yet moved — the signal that was missing.
+                  // It has to show on the press itself, not after a whole row
+                  // of travel, or the only way to discover dragging is to have
+                  // already done it.
+                  cursor: dragFrom === index ? 'grabbing' : 'grab',
+                  background: pressed === index && dragFrom === null ? 'var(--bg-3)' : undefined,
+                  borderRadius: pressed === index && dragFrom === null ? 8 : undefined,
+                  transform: pressed === index && dragFrom === null ? 'scale(0.98)' : undefined,
+                  transition: 'transform .08s, background .08s',
                   opacity: dragFrom === index ? 0.4 : 1,
                   borderTop: isOver && index < (dragFrom ?? 0) ? '2px solid var(--gold)' : '2px solid transparent',
                   borderBottom: isOver && index > (dragFrom ?? 0) ? '2px solid var(--gold)' : '2px solid transparent',
