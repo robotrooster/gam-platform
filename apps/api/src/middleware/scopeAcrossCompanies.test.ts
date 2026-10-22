@@ -55,11 +55,13 @@ async function person(): Promise<string> {
 }
 
 /** A grant from one company: named properties, or the whole company. */
-async function grant(userId: string, landlordId: string, o: { properties?: string[]; all?: boolean }) {
+async function grant(userId: string, landlordId: string, o: {
+  properties?: string[]; all?: boolean; permissions?: Record<string, boolean>
+}) {
   await db.query(
-    `INSERT INTO property_manager_scopes (user_id, landlord_id, property_ids, all_properties)
-     VALUES ($1, $2, $3::uuid[], $4)`,
-    [userId, landlordId, o.properties ?? [], o.all === true])
+    `INSERT INTO property_manager_scopes (user_id, landlord_id, property_ids, all_properties, permissions)
+     VALUES ($1, $2, $3::uuid[], $4, $5::jsonb)`,
+    [userId, landlordId, o.properties ?? [], o.all === true, JSON.stringify(o.permissions ?? {})])
 }
 
 const asManager = (userId: string, landlordId: string): AuthPayload => ({
@@ -187,5 +189,56 @@ describe('an owner is untouched by any of this', () => {
     const owner = { userId: one.ownerUserId, email: 'o@t.dev', role: 'landlord' } as AuthPayload
     await expect(assertPropertyInScope(owner, one.propertyA)).resolves.toBeUndefined()
     expect(await getScopedPropertyIds(owner)).toBeNull()
+  })
+})
+
+describe('a permission is granted by a company, not held by a person', () => {
+  it("one owner's permission does not pass at the other owner's park", async () => {
+    // The hole folding the portal in would have opened: a worker's pass carries
+    // ONE flat permission set, so "issue refunds" granted at park A would have
+    // passed the check at park B, which granted nothing of the kind.
+    const one = await company()
+    const two = await company()
+    const blu = await person()
+    await grant(blu, one.landlordId, { properties: [one.propertyA], permissions: { 'pos.refund': true } })
+    await grant(blu, two.landlordId, { properties: [two.propertyA], permissions: { 'take_payment': true } })
+    const user = asManager(blu, one.landlordId)
+
+    // Owner one gave refunds, owner two did not.
+    await expect(assertPropertyInScope(user, one.propertyA, { perm: 'pos.refund' })).resolves.toBeUndefined()
+    await expect(assertPropertyInScope(user, two.propertyA, { perm: 'pos.refund' }))
+      .rejects.toThrow(/Insufficient permissions for this property/)
+    // And the other way round.
+    await expect(assertPropertyInScope(user, two.propertyA, { perm: 'take_payment' })).resolves.toBeUndefined()
+    await expect(assertPropertyInScope(user, one.propertyA, { perm: 'take_payment' })).rejects.toThrow(/Insufficient/)
+  })
+
+  it('any one of several named permissions is enough, as elsewhere in GAM', async () => {
+    const one = await company()
+    const blu = await person()
+    await grant(blu, one.landlordId, { all: true, permissions: { 'pos.ring_sale': true } })
+    await expect(assertPropertyInScope(asManager(blu, one.landlordId), one.propertyA,
+      { perm: ['take_payment', 'pos.ring_sale'] })).resolves.toBeUndefined()
+  })
+
+  it('naming no permission asks only about the property, exactly as before', async () => {
+    const one = await company()
+    const blu = await person()
+    await grant(blu, one.landlordId, { properties: [one.propertyA] })
+    await expect(assertPropertyInScope(asManager(blu, one.landlordId), one.propertyA)).resolves.toBeUndefined()
+  })
+
+  it('the property is still checked first — a permission cannot buy access', async () => {
+    const one = await company()
+    const blu = await person()
+    await grant(blu, one.landlordId, { properties: [one.propertyA], permissions: { 'pos.refund': true } })
+    await expect(assertPropertyInScope(asManager(blu, one.landlordId), one.propertyB, { perm: 'pos.refund' }))
+      .rejects.toThrow(/not assigned to this property/)
+  })
+
+  it('an owner is never asked for a permission', async () => {
+    const one = await company()
+    const owner = { userId: one.ownerUserId, email: 'o@t.dev', role: 'landlord' } as AuthPayload
+    await expect(assertPropertyInScope(owner, one.propertyA, { perm: 'pos.refund' })).resolves.toBeUndefined()
   })
 })

@@ -369,6 +369,25 @@ const WORKER_SCOPE_TABLE: Record<string, string> = {
 export async function assertPropertyInScope(
   user: AuthPayload | undefined,
   propertyId: string | null | undefined,
+  /**
+   * 10/22 — A PERMISSION IS GRANTED BY A COMPANY, NOT HELD BY A PERSON.
+   *
+   * Name the permission this action needs and it is checked against the set
+   * THIS PROPERTY'S COMPANY granted, read from that company's own scope row.
+   *
+   * It matters as soon as one person works for two owners, which is the whole
+   * point of folding the management portal in (PM_FOLD_PLAN.md). A worker's
+   * token carries one flat permission set, so "issue refunds" granted at park A
+   * would otherwise pass the check at park B, which granted nothing of the
+   * kind — property access would refuse the data while the permission sailed
+   * through. Read fresh here rather than baked into the pass, so an owner
+   * taking a permission away takes effect on the next request and not the next
+   * login.
+   *
+   * requirePerm still admits the route on what the pass carries. This is the
+   * narrower question asked where the property is already known.
+   */
+  opts: { perm?: string | string[] } = {},
 ): Promise<void> {
   if (!user) throw new AppError(401, 'Unauthenticated')
   if (OWNER_ROLES.includes(user.role)) return
@@ -397,8 +416,8 @@ export async function assertPropertyInScope(
   // property or the row names the company; none is the default"): find the
   // scope row belonging to the company that owns THIS property. No row for that
   // company means no access to it, whatever they hold elsewhere.
-  const rows = await query<{ property_ids: string[]; all_properties: boolean }>(
-    `SELECT s.property_ids, s.all_properties
+  const rows = await query<{ property_ids: string[]; all_properties: boolean; permissions: Record<string, unknown> | null }>(
+    `SELECT s.property_ids, s.all_properties, s.permissions
        FROM ${table} s
        JOIN properties p ON p.landlord_id = s.landlord_id
       WHERE s.user_id = $1 AND p.id = $2::uuid`,
@@ -415,8 +434,14 @@ export async function assertPropertyInScope(
   }
   // Several rows can only mean several companies own the same property, which
   // cannot happen — but if it ever did, any grant that reaches it is enough.
-  if (rows.some(r => r.all_properties || r.property_ids.includes(propertyId))) return
-  throw new AppError(403, 'You are not assigned to this property')
+  const reaching = rows.filter(r => r.all_properties || r.property_ids.includes(propertyId))
+  if (!reaching.length) throw new AppError(403, 'You are not assigned to this property')
+
+  const needs = opts.perm == null ? [] : (Array.isArray(opts.perm) ? opts.perm : [opts.perm])
+  if (!needs.length) return
+  // Granted by THIS property's company, or not granted here at all.
+  const granted = reaching.some(r => needs.some(k => (r.permissions ?? {})[k] === true))
+  if (!granted) throw new AppError(403, 'Insufficient permissions for this property')
 }
 
 // Read-side companion to assertPropertyInScope: which properties may this
