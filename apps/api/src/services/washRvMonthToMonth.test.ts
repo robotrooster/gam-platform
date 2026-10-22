@@ -376,3 +376,70 @@ describe('what the nights they used are worth', () => {
     expect(later).toMatchObject({ which: 'wash', nightsUsed: 24 })
   })
 })
+
+describe('who owes short-term lodging tax, and who never does', () => {
+  /** A site with register rates and a real lodging-tax rate on the park. */
+  async function taxedPark() {
+    const p = await park()
+    await db.query(
+      `UPDATE units SET nightly_rate = 49, weekly_rate = 269, monthly_rate = 589 WHERE id = $1`, [p.unitId])
+    await db.query(`UPDATE properties SET short_term_tax_rate = 6.6 WHERE id = $1`, [p.propertyId])
+    return p
+  }
+
+  it('their only month, nine nights: a week plus two, tax on top', async () => {
+    const p = await taxedPark()
+    const leaseId = await leaseThatEnded(p, { startedOn: '2026-10-01', endedOn: '2026-10-10' })
+    await rentPaid(p, leaseId, '2026-10-01')
+    const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
+    expect(fork).toMatchObject({ basis: 'stay_rates', plan: '1 week + 2 nights', lodgingTax: 24.22 })
+  })
+
+  it('RENT BILLED FOR AN EARLIER MONTH makes them a resident — no tax', async () => {
+    // 10/22 (Nic): "if they've been here more than a month... the proration
+    // doesn't mean we add the short-term tax."
+    const p = await taxedPark()
+    const leaseId = await leaseThatEnded(p, { startedOn: '2026-10-01', endedOn: '2026-10-10' })
+    await rentPaid(p, leaseId, '2026-09-01')          // they were here in September
+    await rentPaid(p, leaseId, '2026-10-01')
+    const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
+    expect(fork!.basis).toBe('monthly_prorated')
+    expect(fork!.lodgingTax).toBe(0)
+  })
+
+  it('AN IMPORTED LEASE is a resident — the onboarding gray area he named', async () => {
+    // The park comes onto GAM in October and brings a resident of three years
+    // with it. The lease starts this month; the person did not.
+    const p = await taxedPark()
+    const leaseId = await leaseThatEnded(p, { startedOn: '2026-10-01', endedOn: '2026-10-10' })
+    await db.query(`UPDATE leases SET lease_source = 'imported' WHERE id = $1`, [leaseId])
+    await rentPaid(p, leaseId, '2026-10-01')
+    const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
+    expect(fork!.basis).toBe('monthly_prorated')
+    expect(fork!.lodgingTax).toBe(0)
+  })
+
+  it('A RENEWAL is a resident — it replaced an earlier lease', async () => {
+    const p = await taxedPark()
+    const before = await leaseThatEnded(p, { startedOn: '2026-04-01', endedOn: '2026-09-30' })
+    const leaseId = await leaseThatEnded(p, { startedOn: '2026-10-01', endedOn: '2026-10-10' })
+    await db.query(`UPDATE leases SET supersedes_lease_id = $2 WHERE id = $1`, [leaseId, before])
+    await rentPaid(p, leaseId, '2026-10-01')
+    const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
+    expect(fork!.basis).toBe('monthly_prorated')
+    expect(fork!.lodgingTax).toBe(0)
+  })
+
+  it('and the shape of his own two — a lease signed the month the park joined GAM', async () => {
+    // RV 20 and RV 41: leases e-signed 2026-09-07 and 2026-09-09 for people who
+    // had been on those sites much longer. September is before October, so they
+    // read as residents and owe no short-term tax.
+    const p = await taxedPark()
+    const leaseId = await leaseThatEnded(p, { startedOn: '2026-09-09', endedOn: '2026-10-20' })
+    await rentPaid(p, leaseId, '2026-10-01')
+    const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
+    expect(fork).toMatchObject({ which: 'wash', basis: 'monthly_prorated', lodgingTax: 0 })
+    const kept = await moneyKeptForDeparture({ leaseId }, p.landlordId)
+    expect(kept).toMatchObject({ amountKept: 228, lodgingTaxOwed: 0, amountKeptNet: 228 })
+  })
+})

@@ -188,6 +188,7 @@ export interface DepartureReprice {
 interface LeaseFacts {
   lease_type: string; unit_type: string; rent: string; due_day: number | null
   start_date: string; left_on: string | null
+  lease_source: string | null; has_predecessor: boolean; source_booking_id: string | null
   refunds: boolean; prorates: boolean
   nightly: string | null; weekly: string | null; monthly: string | null
   tax_pct: string | null
@@ -212,6 +213,8 @@ export async function repriceDeparture(
     `SELECT l.lease_type, u.unit_type, l.rent_amount AS rent,
             COALESCE(l.rent_due_day, p.rent_due_day) AS due_day,
             to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
+            l.lease_source, l.source_booking_id,
+            (l.supersedes_lease_id IS NOT NULL) AS has_predecessor,
             to_char(NULLIF(LEAST(COALESCE(l.end_date, 'infinity'::date),
                                  COALESCE(timezone(p.timezone, l.terminated_at)::date, 'infinity'::date)),
                            'infinity'::date), 'YYYY-MM-DD') AS left_on,
@@ -253,12 +256,48 @@ export async function repriceDeparture(
   const paid = num(m?.paid)
   const unpaid = num(m?.unpaid)
 
+  // ── HAVE THEY BEEN HERE LONGER THAN THIS MONTH? ──────────────────────────
+  //
+  // 10/22 (Nic), on the two RV residents he was checking out: "These guys don't
+  // have lodging tax, though. They've been here for multiple months, right? So
+  // there needs to be a distinction. It's going to be always a gray area on
+  // like an onboarding type of month, but if they've been here more than a
+  // month and the proration doesn't mean we add the short-term tax. We need
+  // that distinction in there."
+  //
+  // THE LEASE'S START DATE IS NOT THE ANSWER, and his own two leases are why:
+  // both were e-signed in September for people who had been on those sites far
+  // longer, because that is when the park came onto GAM. A landlord who
+  // onboards in October and imports a resident of three years has a lease that
+  // starts this month. Pricing that person as a nine-night tourist would put a
+  // short-term lodging tax on somebody who owes none.
+  //
+  // So anything that shows they were here before this month makes them a
+  // resident, and the doubt goes that way on purpose — GAM never charges
+  // short-term tax to somebody who may not owe it:
+  //   • the lease started before this month;
+  //   • it came in from the old system (imported at onboarding);
+  //   • it replaced an earlier lease (a renewal);
+  //   • rent was billed for an earlier month;
+  //   • the stay behind it checked in before this month.
+  const been = (await q.query<{ earlier_rent: boolean; earlier_stay: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM payments pr
+                     WHERE pr.lease_id = $1 AND pr.type = 'rent' AND pr.due_date < $2::date) AS earlier_rent,
+            EXISTS (SELECT 1 FROM unit_bookings b
+                     WHERE b.id = $3::uuid AND b.check_in < $2::date) AS earlier_stay`,
+    [args.leaseId, month.start, l.source_booking_id])).rows[0]
+  const beenHereLonger = l.start_date < month.start
+    || l.lease_source === 'imported'
+    || l.has_predecessor === true
+    || been?.earlier_rent === true
+    || been?.earlier_stay === true
+
   // ── What the nights they used are worth ──────────────────────────────────
   //
   // THEIR FIRST MONTH, so they were never a resident: the register's ladder,
   // tax and all. "if that's the only month they've been there, they get charged
   // the weekly rate."
-  const firstMonth = l.start_date >= month.start
+  const firstMonth = !beenHereLonger
   let worth = 0, lodgingTax = 0, plan: string | null = null
   let basis: RepriceBasis = 'monthly_prorated'
 
