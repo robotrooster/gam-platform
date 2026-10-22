@@ -49,6 +49,7 @@ import {
 } from '../services/paymentsByMonth'
 import { createPaidAhead, runWholeBillCheckAfterCommit } from '../services/creditUse'
 import { handlePaymentReversal } from '../services/paymentReversal'
+import { expectNoFigures } from '../test/noLeaks'
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret'
 
@@ -891,7 +892,7 @@ describe('work trade', () => {
     await db.query(`UPDATE payments SET work_trade_suspended_at = NOW() WHERE id = ANY($1::uuid[])`, [ids])
     const data = (await ledger(ownerToken(p), '2026-09')).body.data
     expect(data.work_trade).toEqual([{ tenant_id: t, name: 'Walt Trade', unit_number: 'RV 9', property_name: expect.any(String), label: 'Work trade — covered' }])
-    expect(JSON.stringify(data.work_trade)).not.toMatch(/589|619/)
+    expectNoFigures(data.work_trade, [589, 619])
     expect(data.payments).toEqual([])
   })
 
@@ -910,7 +911,7 @@ describe('work trade', () => {
         WHERE id = (SELECT invoice_id FROM payments WHERE id = $1)`, [ids[0]])
     const data = (await ledger(ownerToken(p), '2026-08')).body.data
     expect(data.work_trade).toEqual([expect.objectContaining({ tenant_id: t, label: 'Work trade — covered' })])
-    expect(JSON.stringify(data)).not.toMatch(/619|589/)
+    expectNoFigures(data, [619, 589])
     expect(data.payments).toEqual([])
     expect(data.months).toContain('2026-08')
   })

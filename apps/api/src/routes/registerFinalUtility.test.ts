@@ -40,6 +40,7 @@ import { posRouter } from './pos'
 import { posPayLinksRouter } from './posPayLinks'
 import { utilityRouter } from './utility'
 import { errorHandler } from '../middleware/errorHandler'
+import { expectNoFigures } from '../test/noLeaks'
 
 function buildApp() {
   const app = express()
@@ -288,7 +289,7 @@ describe('D5 — typing the number writes nothing; confirming writes the reading
     expect(line.note).toMatch(/387 kWh/)
     expect(line.note).toMatch(/\$87\.77/)
     // Blind entry still holds: the quote never says what the meter read before.
-    expect(JSON.stringify(q.body)).not.toMatch(/48000/)
+    expectNoFigures(q.body, [48000])
 
     // NOTHING WAS WRITTEN. No reading beyond the one that was already there, no
     // bill, no absorbed row.
@@ -814,7 +815,8 @@ describe('the closing\'s own space is what a read may be taken on', () => {
     expect(q.body.error).toMatch(/not on the space being closed out/i)
     // Blind entry: the refusal is the same one a meter at another park gets, so
     // nothing typed here tells the two apart.
-    expect(JSON.stringify(q.body)).not.toMatch(/RV 05|pedestal|210|226/)
+    expect(JSON.stringify(q.body)).not.toMatch(/RV 05|pedestal/)
+    expectNoFigures(q.body, [210, 226])
 
     // AND CONFIRMING IT WRITES NOTHING.
     const r = await putOnTicket(p, { closing: { kind: 'stay', id: s.bookingId },

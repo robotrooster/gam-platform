@@ -246,8 +246,13 @@ export async function deleteLateFee(
   paymentId: string,
   o: {
     deletedBy: string | null
-    /** Where the landlord chose it: the Record payment / Post a payment box, or the history line. */
-    via: 'record_payment' | 'post_payment' | 'history_line'
+    /**
+     * Where the landlord chose it: the Record payment / Post a payment box, the
+     * history line, or (10/22) the departure adjustment — somebody who never
+     * paid the month they were leaving in, where the late fees came of waiting
+     * on a month they were not going to use.
+     */
+    via: 'record_payment' | 'post_payment' | 'history_line' | 'departure_adjustment'
     /** The box: the day the deposit being recorded was made (the fee is unpaid and was never owed). */
     neverOwedSince?: string | null
   },

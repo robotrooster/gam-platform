@@ -18,6 +18,7 @@ import { utilityServiceAgreementsRouter } from './utilityServiceAgreements'
 import { generateLateFeesForTimezone } from '../jobs/lateFees'
 import { errorHandler } from '../middleware/errorHandler'
 import { camelCaseKeys } from '../lib/caseConversion'
+import { expectNoFigures } from '../test/noLeaks'
 
 const { emailUtilityServiceInviteMock } = vi.hoisted(() => ({
   emailUtilityServiceInviteMock: vi.fn(async (..._a: any[]) => undefined),
@@ -581,7 +582,8 @@ describe('S654: POST /api/utility/service-agreements and password links', () => 
               payer: { firstName: 'Made', lastName: 'Up', email: 'z.elsewhere@test.dev', phone: '+10000000000' } })
     expect(res.status).toBe(409)
     expect(res.body.error).toMatch(ALREADY_ON_GAM)
-    expect(JSON.stringify(res.body)).not.toMatch(/Zelda|Secretname|6025559999|alreadyOnPlatform/)
+    expect(JSON.stringify(res.body)).not.toMatch(/Zelda|Secretname|alreadyOnPlatform/)
+    expectNoFigures(res.body, ['6025559999'])
     expect(await counts()).toEqual(was)
     expect(await notesFor(z.userId)).toEqual([])
 
@@ -590,7 +592,8 @@ describe('S654: POST /api/utility/service-agreements and password links', () => 
       .set('Authorization', `Bearer ${b.token}`)
     expect(list.status).toBe(200)
     expect(list.body.data).toEqual([])
-    expect(JSON.stringify(list.body)).not.toMatch(/Zelda|Secretname|6025559999/)
+    expect(JSON.stringify(list.body)).not.toMatch(/Zelda|Secretname/)
+    expectNoFigures(list.body, ['6025559999'])
   })
 
   it('a resident with their own password, even one tied to no company: refused, nothing created', async () => {

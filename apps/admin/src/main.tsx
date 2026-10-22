@@ -24,7 +24,7 @@ import {
   LayoutDashboard, Rocket, Building2, Users, Zap, ClipboardList, DoorOpen,
   CreditCard, ArrowDownToLine, Plug, Activity, Map as MapIcon, FileText,
   Scale, SlidersHorizontal, Lightbulb, Landmark, Mail, Send,
-  Target, TrendingUp, Bot, Lock, LogOut, Sun, Moon, ShieldCheck, Trophy,
+  Target, TrendingUp, Bot, Lock, LogOut, Sun, Moon, ShieldCheck, Trophy, UserSearch,
 } from 'lucide-react'
 import axios from 'axios'
 import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
@@ -368,6 +368,10 @@ function Layout(){
           {isSuperAdmin&&<NavLink to="/screenings" className={({isActive})=>`ni${isActive?' active':''}`}><ShieldCheck size={15}/> Screenings</NavLink>}
           {isSuperAdmin&&<NavLink to="/flexpay-requests" className={({isActive})=>`ni${isActive?' active':''}`}><Zap size={15}/> FlexPay Requests</NavLink>}
           {isSuperAdmin&&<NavLink to="/property-reviews" className={({isActive})=>`ni${isActive?' active':''}`}><ClipboardList size={15}/> Property Reviews</NavLink>}
+          {/* 10/22 (Nic): "when there's a not sure call, we can leave it to the
+              admin to kind of do some research on." Nobody is flagged while a
+              row sits here, so an empty list is the normal state. */}
+          {isSuperAdmin&&<NavLink to="/left-owing-reviews" className={({isActive})=>`ni${isActive?' active':''}`}><UserSearch size={15}/> Left-Owing Matches<LeftOwingReviewBadge/></NavLink>}
           {isSuperAdmin&&<NavLink to="/feature-requests" className={({isActive})=>`ni${isActive?' active':''}`}><Lightbulb size={15}/> Feature Requests</NavLink>}
           <NavLink to="/units" className={({isActive})=>`ni${isActive?' active':''}`}><DoorOpen size={15}/> Units</NavLink>
           <div className="nl" style={{marginTop:8}}>Finance</div>
@@ -4908,6 +4912,7 @@ function App(){
           <Route path="screenings"    element={<SuperAdminGuard><Screenings/></SuperAdminGuard>}/>
           <Route path="flexpay-requests" element={<SuperAdminGuard><FlexPayRequests/></SuperAdminGuard>}/>
           <Route path="property-reviews" element={<SuperAdminGuard><PropertyReviews/></SuperAdminGuard>}/>
+          <Route path="left-owing-reviews" element={<SuperAdminGuard><LeftOwingReviews/></SuperAdminGuard>}/>
           <Route path="feature-requests" element={<SuperAdminGuard><FeatureRequests/></SuperAdminGuard>}/>
           <Route path="team"          element={<SuperAdminGuard><Team/></SuperAdminGuard>}/>
           <Route path="units"         element={<Units/>}/>
@@ -5714,6 +5719,112 @@ const SCHEDULE_LABEL: Record<string, string> = {
   ssi_day_1: '1st of month', ssdi_day_3: '3rd of month',
   ssdi_wed_2: '2nd Wednesday', ssdi_wed_3: '3rd Wednesday',
   ssdi_wed_4: '4th Wednesday', fixed_day: 'Fixed day',
+}
+
+/**
+ * 10/22 (Nic) — THE CLOSE CALLS ON A DEBT SOMEBODY WALKED AWAY FROM.
+ *
+ *   "Maybe when there's a not sure call, we can leave it to the admin to kind
+ *    of do some research on."
+ *
+ * A contact point agreed — the email or the phone — and the name only half did:
+ * an initial, a brother at the same number, a surname that changed. The matcher
+ * refuses to guess either way, so until somebody here decides, NO landlord sees
+ * a flag and no door opens.
+ *
+ * Everything about the debt is on the row, because that is what research takes.
+ * The rule that keeps the amount and the landlord back is a rule about other
+ * LANDLORDS, not about this desk.
+ */
+interface LeftOwingReviewRow {
+  id: string; owingId: string
+  debtName: string | null; personName: string | null
+  personEmail: string | null; personPhone: string | null
+  matchedOn: 'email' | 'phone' | 'account'
+  nameAgreement: 'same' | 'unsure' | 'different'
+  why: string; amount: number; owedTo: string | null
+  leftOn: string | null; where: string | null; source: string; raisedAt: string
+}
+
+function LeftOwingReviewBadge() {
+  const { data: rows = [] } = useQuery<LeftOwingReviewRow[]>(
+    'left-owing-reviews', () => get<LeftOwingReviewRow[]>('/admin/left-owing-reviews'))
+  if (!rows.length) return null
+  return <span className="badge b-amber" style={{ marginLeft: 'auto' }}>{rows.length}</span>
+}
+
+function LeftOwingReviews() {
+  const qc = useQueryClient()
+  const [note, setNote] = React.useState<Record<string, string>>({})
+  const [err, setErr] = React.useState<string | null>(null)
+  const { data: rows = [], isLoading } = useQuery<LeftOwingReviewRow[]>(
+    'left-owing-reviews', () => get<LeftOwingReviewRow[]>('/admin/left-owing-reviews'))
+
+  const decide = useMutation(
+    (p: { id: string; samePerson: boolean; note?: string }) =>
+      post(`/admin/left-owing-reviews/${p.id}/decide`, { samePerson: p.samePerson, note: p.note || undefined }),
+    { onSuccess: () => { qc.invalidateQueries('left-owing-reviews'); setErr(null) },
+      onError: (e: any) => setErr(e?.response?.data?.error || 'That did not save — try again') },
+  )
+
+  const money = (n: number) => '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  const WHICH: Record<string, string> = { email: 'Same email address', phone: 'Same phone number', account: 'Same account' }
+  const CLOSE: Record<string, string> = {
+    unsure: 'The names are close', different: 'The names do not match', same: 'The names match',
+  }
+
+  return (
+    <div>
+      <div className="ph">
+        <div>
+          <h1 className="pt">Left-Owing Matches</h1>
+          <p className="ps">
+            {rows.length === 0
+              ? 'Nothing waiting. A flag only needs a person when a contact point matches and the name does not quite.'
+              : `${rows.length} waiting — no landlord sees a flag for these until you decide`}
+          </p>
+        </div>
+      </div>
+      {err && <div className="alert a-red" style={{ marginBottom: 12 }}>{err}</div>}
+      {isLoading && <div className="muted">Loading…</div>}
+      {rows.map(r => (
+        <div key={r.id} className="card" style={{ marginBottom: 12 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 24, alignItems: 'flex-start' }}>
+            <div style={{ flex: 1, minWidth: 260 }}>
+              <div className="kpi-l">On the old invoice</div>
+              <div style={{ fontSize: '1.05rem', fontWeight: 600 }}>{r.debtName || '— no name —'}</div>
+              <div className="kpi-s">
+                {money(r.amount)} · left {r.leftOn || 'date unknown'}{r.where ? ` · ${r.where}` : ''}
+              </div>
+              <div className="kpi-s">Owed to {r.owedTo || 'a landlord on GAM'} · {r.source}</div>
+            </div>
+            <div style={{ flex: 1, minWidth: 260 }}>
+              <div className="kpi-l">The person being checked</div>
+              <div style={{ fontSize: '1.05rem', fontWeight: 600 }}>{r.personName || '— no name —'}</div>
+              <div className="kpi-s">{r.personEmail || 'no email'} · {r.personPhone || 'no phone'}</div>
+              <div className="kpi-s">
+                <span className="badge b-amber">{WHICH[r.matchedOn]}</span>{' '}
+                <span className="badge b-muted">{CLOSE[r.nameAgreement]}</span>
+              </div>
+            </div>
+          </div>
+          <p className="ps" style={{ marginTop: 10 }}>{r.why}</p>
+          <input className="in" style={{ marginTop: 8 }} placeholder="What you found (optional, kept with the decision)"
+            value={note[r.id] ?? ''} onChange={e => setNote({ ...note, [r.id]: e.target.value })}/>
+          <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+            <button className="btn btn-primary btn-sm" disabled={decide.isLoading}
+              onClick={() => decide.mutate({ id: r.id, samePerson: true, note: note[r.id] })}>
+              Same person — every landlord sees the flag
+            </button>
+            <button className="btn btn-ghost btn-sm" disabled={decide.isLoading}
+              onClick={() => decide.mutate({ id: r.id, samePerson: false, note: note[r.id] })}>
+              Somebody else — never show it
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
 }
 
 function FlexPayRequests() {

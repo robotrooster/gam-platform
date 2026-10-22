@@ -189,7 +189,17 @@ describe('the health block\'s figures tie, and say which money they count', () =
     expect(b.scopeNote).toContain('every open charge of every month')
     // S650: the fact that work trade is out, never what it is worth.
     expect(b.workTradeNote).toContain('not counted here')
-    expect(JSON.stringify(b)).not.toContain('3478')
+    // 10/22 (Nic) — asked of the VALUES, not of the stringified object: a
+    // search through a blob for bare digits is the assertion that went red on a
+    // deploy and green an hour earlier (apps/api/src/test/noLeaks.ts).
+    // What is held back is the WORTH of the hours, so the note carries no
+    // figure at all and no field of the card is that number.
+    expect(b.workTradeNote).not.toMatch(/[0-9]/)
+    expect(b.figures.map(f => f.amount)).not.toContain(3478)
+    for (const text of [b.tieText, b.rateText, b.scopeNote, b.workTradeNote]) {
+      expect(text ?? '').not.toContain('3,478')
+      expect(text ?? '').not.toContain('3478')
+    }
     expect(rentHealthFigures({ ...MV, workTradeHeld: 0 })!.workTradeNote).toBeNull()
   })
 

@@ -38,6 +38,7 @@ import {
 } from '../test/dbHelpers'
 import { reportsRouter } from './reports'
 import { errorHandler } from '../middleware/errorHandler'
+import { expectNoFigures } from '../test/noLeaks'
 
 function buildApp() {
   const app = express()
@@ -1669,7 +1670,7 @@ describe('10/12: Charged, Received and Owed side by side on every report', () =>
       const refused = await pm(path)
       expect(refused.status).toBe(403)
       expect(refused.body.error ?? refused.body.message).toMatch(/covers the whole company/)
-      expect(JSON.stringify(refused.body)).not.toMatch(/700/)
+      expectNoFigures(refused.body, [700])
       expect((await get(f, path)).status).toBe(200)
     }
 

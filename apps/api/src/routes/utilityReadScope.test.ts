@@ -28,6 +28,7 @@ import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedUtilityMeter } from '../test/dbHelpers'
 import { utilityRouter } from './utility'
 import { errorHandler } from '../middleware/errorHandler'
+import { expectNoFiguresInText } from '../test/noLeaks'
 
 function buildApp() {
   const app = express()
@@ -124,7 +125,7 @@ describe('the readings spreadsheet is the owner\'s, at the owner\'s own park', (
       { 'utility.read_meters': true, 'units.view_status': true }, [w.mountain])
     const r = await get(desk, url(w.mountain))
     expect(r.status).toBe(403)
-    expect(r.text).not.toContain('4211')
+    expectNoFiguresInText(r.text, [4211])
   })
 
   it('a manager put on Mountain View cannot download Oak Park', async () => {
@@ -134,7 +135,7 @@ describe('the readings spreadsheet is the owner\'s, at the owner\'s own park', (
     expect(theirs.status, theirs.text).toBe(200)
     const other = await get(pm, url(w.oak))
     expect(other.status).toBe(403)
-    expect(other.text).not.toContain('9357')
+    expectNoFiguresInText(other.text, [9357])
   })
 })
 
@@ -166,7 +167,7 @@ describe('the rest of the utility reads that take a propertyId', () => {
     expect((await get(pm, `/api/utility/reading-history?propertyId=${w.mountain}`)).status).toBe(200)
     const other = await get(pm, `/api/utility/reading-history?propertyId=${w.oak}`)
     expect(other.status).toBe(403)
-    expect(other.text).not.toContain('9357')
+    expectNoFiguresInText(other.text, [9357])
   })
 
   // Prices and taxes: the desk legitimately needs these to ring up a fill, at

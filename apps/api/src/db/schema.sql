@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict E324rWGqNFyBmMAtB8QBkqin9wS7guxt0sEnKmaC577apTbJmlGlep9kZIbdOSz
+\restrict HCX61dskYYQDWFAaz1Nch5OwpIkIrqH0mrcxITG3AOEzE5eLtxNXdWOtjjIpEww
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -20380,8 +20380,9 @@ CREATE TABLE public.tenant_left_owing (
     settled_reason text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    phone text,
     CONSTRAINT tenant_left_owing_amount_check CHECK ((amount > (0)::numeric)),
-    CONSTRAINT tenant_left_owing_source_kind_check CHECK ((source_kind = ANY (ARRAY['lease'::text, 'stay'::text])))
+    CONSTRAINT tenant_left_owing_source_kind_check CHECK ((source_kind = ANY (ARRAY['lease'::text, 'stay'::text, 'import'::text])))
 );
 
 
@@ -20390,6 +20391,48 @@ CREATE TABLE public.tenant_left_owing (
 --
 
 COMMENT ON TABLE public.tenant_left_owing IS 'A debt somebody walked away from, kept so a DIFFERENT landlord can be told it exists without being told what it is (10/20-21, Nic). Matched to an applicant only through a verified GAM account — never a name.';
+
+
+--
+-- Name: COLUMN tenant_left_owing.phone; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_left_owing.phone IS 'The phone on the invoice this debt came from — one of the two contact points a person is recognised by (services/nameMatch).';
+
+
+--
+-- Name: tenant_left_owing_match_reviews; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_left_owing_match_reviews (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    owing_id uuid NOT NULL,
+    user_id uuid,
+    person_name text,
+    person_email text,
+    person_phone text,
+    person_key text NOT NULL,
+    matched_on text NOT NULL,
+    name_agreement text NOT NULL,
+    why text NOT NULL,
+    status text DEFAULT 'open'::text NOT NULL,
+    decided_by uuid,
+    decided_at timestamp with time zone,
+    decided_note text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT left_owing_review_decided_shape CHECK (((status = 'open'::text) = (decided_at IS NULL))),
+    CONSTRAINT tenant_left_owing_match_reviews_matched_on_check CHECK ((matched_on = ANY (ARRAY['email'::text, 'phone'::text, 'account'::text]))),
+    CONSTRAINT tenant_left_owing_match_reviews_name_agreement_check CHECK ((name_agreement = ANY (ARRAY['same'::text, 'unsure'::text, 'different'::text]))),
+    CONSTRAINT tenant_left_owing_match_reviews_status_check CHECK ((status = ANY (ARRAY['open'::text, 'same_person'::text, 'not_the_same_person'::text])))
+);
+
+
+--
+-- Name: TABLE tenant_left_owing_match_reviews; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.tenant_left_owing_match_reviews IS '10/22 (Nic): "when there is a not sure call, we can leave it to the admin to do some research on". A contact point agreed but the name only half did; nobody is flagged until a person at GAM decides.';
 
 
 --
@@ -24811,6 +24854,14 @@ ALTER TABLE ONLY public.ledger_source_errors
 
 
 --
+-- Name: tenant_left_owing_match_reviews left_owing_review_one_per_pair; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing_match_reviews
+    ADD CONSTRAINT left_owing_review_one_per_pair UNIQUE (owing_id, person_key);
+
+
+--
 -- Name: liability_insurance_policies liability_insurance_policies_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -26408,6 +26459,14 @@ ALTER TABLE ONLY public.tenant_declared_deposits
 
 ALTER TABLE ONLY public.tenant_identifications
     ADD CONSTRAINT tenant_identifications_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tenant_left_owing_match_reviews tenant_left_owing_match_reviews_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing_match_reviews
+    ADD CONSTRAINT tenant_left_owing_match_reviews_pkey PRIMARY KEY (id);
 
 
 --
@@ -29609,6 +29668,20 @@ CREATE INDEX idx_leases_unit ON public.leases USING btree (unit_id);
 
 
 --
+-- Name: idx_left_owing_review_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_left_owing_review_open ON public.tenant_left_owing_match_reviews USING btree (created_at) WHERE (status = 'open'::text);
+
+
+--
+-- Name: idx_left_owing_review_person; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_left_owing_review_person ON public.tenant_left_owing_match_reviews USING btree (person_key) WHERE (status = 'same_person'::text);
+
+
+--
 -- Name: idx_liability_insurance_lease; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -31142,6 +31215,13 @@ CREATE INDEX idx_tenant_identifications_tenant ON public.tenant_identifications 
 
 
 --
+-- Name: idx_tenant_left_owing_email; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_left_owing_email ON public.tenant_left_owing USING btree (lower(btrim(email))) WHERE ((settled_at IS NULL) AND (email IS NOT NULL));
+
+
+--
 -- Name: idx_tenant_left_owing_landlord; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -31153,6 +31233,13 @@ CREATE INDEX idx_tenant_left_owing_landlord ON public.tenant_left_owing USING bt
 --
 
 CREATE INDEX idx_tenant_left_owing_person ON public.tenant_left_owing USING btree (user_id) WHERE ((settled_at IS NULL) AND (user_id IS NOT NULL));
+
+
+--
+-- Name: idx_tenant_left_owing_phone; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_left_owing_phone ON public.tenant_left_owing USING btree ("right"(regexp_replace(phone, '[^0-9]'::text, ''::text, 'g'::text), 10)) WHERE ((settled_at IS NULL) AND (phone IS NOT NULL));
 
 
 --
@@ -34891,6 +34978,13 @@ CREATE TRIGGER audit_tenant_identifications AFTER DELETE OR UPDATE ON public.ten
 --
 
 CREATE TRIGGER audit_tenant_left_owing AFTER DELETE OR UPDATE ON public.tenant_left_owing FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: tenant_left_owing_match_reviews audit_tenant_left_owing_match_reviews; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_tenant_left_owing_match_reviews AFTER DELETE OR UPDATE ON public.tenant_left_owing_match_reviews FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -44917,6 +45011,30 @@ ALTER TABLE ONLY public.tenant_left_owing
 
 
 --
+-- Name: tenant_left_owing_match_reviews tenant_left_owing_match_reviews_decided_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing_match_reviews
+    ADD CONSTRAINT tenant_left_owing_match_reviews_decided_by_fkey FOREIGN KEY (decided_by) REFERENCES public.users(id);
+
+
+--
+-- Name: tenant_left_owing_match_reviews tenant_left_owing_match_reviews_owing_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing_match_reviews
+    ADD CONSTRAINT tenant_left_owing_match_reviews_owing_id_fkey FOREIGN KEY (owing_id) REFERENCES public.tenant_left_owing(id);
+
+
+--
+-- Name: tenant_left_owing_match_reviews tenant_left_owing_match_reviews_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing_match_reviews
+    ADD CONSTRAINT tenant_left_owing_match_reviews_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+
+--
 -- Name: tenant_left_owing tenant_left_owing_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -46401,5 +46519,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict E324rWGqNFyBmMAtB8QBkqin9wS7guxt0sEnKmaC577apTbJmlGlep9kZIbdOSz
+\unrestrict HCX61dskYYQDWFAaz1Nch5OwpIkIrqH0mrcxITG3AOEzE5eLtxNXdWOtjjIpEww
 

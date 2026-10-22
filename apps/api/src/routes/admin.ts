@@ -27,6 +27,7 @@ import { getNexusDashboard, recomputeNexusTally, setStateRegistration, setStateM
 import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 import { graceDaysSql } from '../services/lateness'
 import { REVENUE_SLICE_TYPE_SQL } from '../services/revenueSlices'
+import { openMatchReviews, decideMatchReview } from '../services/leftOwing'
 
 export const adminRouter = Router()
 adminRouter.use(requireAuth)
@@ -938,6 +939,57 @@ adminRouter.get('/nacha/monitoring', requireSuperAdmin, async (_req, res, next) 
 // Read model: GAM own-revenue by customer state vs each state's economic-nexus
 // registration threshold + current registration status. MONITORING ONLY — the
 // register action flips tax collection, but the dashboard itself charges nothing.
+// ── 10/22 (Nic): the close calls on a debt somebody walked away from ────────
+//
+//   "Maybe when there's a not sure call, we can leave it to the admin to kind
+//    of do some research on."
+//
+// A contact point agreed and the name only half did — an initial, a brother at
+// the same phone number, a surname that changed with a marriage. Until somebody
+// here decides, NO landlord sees a flag and no door opens. Both halves of that
+// are deliberate: a flag is somebody's reputation, and a miss is a landlord
+// taking on a person who owes money elsewhere.
+//
+// A GAM admin sees the whole debt — amount, dates, who was owed — because that
+// is what research takes. The rule that holds all of it back is a rule about
+// other LANDLORDS.
+adminRouter.get('/left-owing-reviews', requireAdmin, async (req, res, next) => {
+  try {
+    const limit = Math.min(Math.max(1, Number(req.query.limit) || 200), 500)
+    res.json({ success: true, data: await openMatchReviews(limit) })
+  } catch (e) { next(e) }
+})
+
+// The answer. It decides ONE thing — is this the same human being — and moves
+// no money: the amount is frozen at import and cannot change inside GAM
+// (10/22). 'same person' makes the debt count for every landlord who asks from
+// then on; 'somebody else' puts it away for good. Deciding twice is refused
+// rather than overwritten, and both answers are audited.
+adminRouter.post('/left-owing-reviews/:id/decide', requireAdmin, async (req, res, next) => {
+  try {
+    const body = z.object({
+      samePerson: z.boolean(),
+      note: z.string().max(1000).nullish(),
+    }).parse(req.body)
+    const said = await decideMatchReview({
+      reviewId: req.params.id,
+      samePerson: body.samePerson,
+      byUserId: req.user!.userId,
+      note: body.note ?? null,
+    })
+    if (!said.decided) throw new AppError(409, said.why)
+    await logAdminAction({
+      adminUserId: req.user!.userId,
+      actionType: 'left_owing_match_decided',
+      targetType: 'tenant_left_owing_match_review',
+      targetId: req.params.id,
+      metadata: { samePerson: body.samePerson },
+      ipAddress: req.ip ?? null,
+    })
+    res.json({ success: true, data: said })
+  } catch (e) { next(e) }
+})
+
 adminRouter.get('/nexus/dashboard', requireSuperAdmin, async (_req, res, next) => {
   try {
     const data = await getNexusDashboard()

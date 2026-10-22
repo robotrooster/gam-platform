@@ -45,6 +45,7 @@ import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant } from '../test/dbHelpers'
 import { posPayLinksRouter, publicPayRouter, finalizePayLink, payLinkCharge } from './posPayLinks'
 import { errorHandler } from '../middleware/errorHandler'
+import { expectNoFigures } from '../test/noLeaks'
 
 function buildApp() {
   const app = express()
@@ -424,7 +425,7 @@ describe('the pay-link search is the register\'s search', () => {
     // masked — never digits of their phone.
     expect(res.body.data[0]).toMatchObject({ kind: 'elsewhere', name: 'Zed Elsewhere', email: null, phone: null, customerId: null, tenantId: null,
                                              hint: 'z•••@elsewhere.com' })
-    expect(JSON.stringify(res.body)).not.toContain('0199')
+    expectNoFigures(res.body, ['0199'])
     for (const leak of ['zed@elsewhere.com', '602-555-0199', '6025550199', other.landlordId, other.propertyId]) {
       expect(JSON.stringify(res.body)).not.toContain(leak)
     }

@@ -11,6 +11,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { db } from '../db'
 import { cleanupAllSchema, seedTenant, seedLease } from '../test/dbHelpers'
 import { ledgerCompany, inTx, type LedgerCompany } from '../test/ledgerFixtures'
+import { expectNoFigures } from '../test/noLeaks'
 import {
   vendor1099List, vendorYearTotals, vendorOwed, listVendors, getOrCreateContractorVendorForTenant,
   matchLoanPaymentForBankLine, findLoanMatchesForBankLine, unmatchLoanBankLine, loanFigures, LOAN_COLUMNS,
@@ -87,7 +88,7 @@ describe('the 1099 list: a contractor\'s payments added up per calendar year', (
     const [row] = await listVendors(db, owner(co), { year: 2026 })
     expect(row).toMatchObject({ id: jose, paid_this_year: 400, owed: 600, tax_id_last4: '6789', has_tax_id: true })
     expect(row).not.toHaveProperty('tax_id')
-    expect(JSON.stringify(row)).not.toContain('3456789')
+    expectNoFigures(row, ['3456789'])
   })
 })
 

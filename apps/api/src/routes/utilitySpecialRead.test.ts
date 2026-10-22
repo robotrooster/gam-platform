@@ -21,6 +21,7 @@ import { utilityRouter } from './utility'
 import { errorHandler } from '../middleware/errorHandler'
 import { unitPendingReads, getReadsDue } from '../services/utilityReadingRuns'
 import { generateBillsForMeter } from '../services/utilityBilling'
+import { expectNoFigures } from '../test/noLeaks'
 
 function buildApp() {
   const app = express()
@@ -92,11 +93,6 @@ const billedTo = async (meter: string) =>
  * Every leaf value in an answer, as text — for asking "is the reading itself in
  * here anywhere", without a substring scan over ids that happen to contain it.
  */
-function leakedValues(v: unknown, out: string[] = []): string[] {
-  if (v && typeof v === 'object') Object.values(v as Record<string, unknown>).forEach(x => leakedValues(x, out))
-  else if (v != null) out.push(String(v))
-  return out
-}
 
 describe('a move-out read names whose move-out it is', () => {
   it('the to-do sends the leaving household: that household is billed, not one that left earlier', async () => {
@@ -119,12 +115,10 @@ describe('a move-out read names whose move-out it is', () => {
   it('the response stays blind: no reading values come back', async () => {
     const f = await seed()
     const r = await readOut(f, { leaseId: f.mover })
-    // 10/17: this read `JSON.stringify(r.body)` for the text "1100" or "1000",
-    // the same substring-in-an-id trap the meter-list check below was fixed for
-    // on 10/15 — an id like …a1000f… is not a leaked reading. Exact, per field.
-    const values = leakedValues(r.body)
-    expect(values).not.toContain('1100')
-    expect(values).not.toContain('1000')
+    // 10/17: this read `JSON.stringify(r.body)` for the text "1100" or "1000" —
+    // an id like …a1000f… is not a leaked reading. 10/22 (Nic): the rule for
+    // that lives in ONE place now, test/noLeaks, instead of a copy per file.
+    expectNoFigures(r.body, [1100, 1000])
   })
 })
 
@@ -201,7 +195,7 @@ describe('a meter reader reads blind', () => {
     // id like …a777f… trips once the test database holds other rows — the
     // full suite failed on that, not on a leak. The check is now exact: no
     // field anywhere in the answer IS the reading.
-    expect(leakedValues(r.body.data)).not.toContain('777')
+    expectNoFigures(r.body.data, [777])
   })
 
   it('staff who can see units keep the prices but still never the reading value', async () => {
@@ -281,9 +275,7 @@ describe('a dropped digit at a pull-out', () => {
     // Not which way the number was off, and never a figure: say "below the last
     // read" and the clerk has learned the last read is higher.
     expect(r.body.data.billingNote).not.toMatch(/below|under|low|high|above/i)
-    const values = leakedValues(r.body)
-    expect(values).not.toContain('4800')
-    expect(values).not.toContain('48000')
+    expectNoFigures(r.body, [4800, 48000])
   })
 
   it('leaves the closing-read to-do open — the walk still has to happen', async () => {

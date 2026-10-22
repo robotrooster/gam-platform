@@ -30,6 +30,7 @@ import { registerProductionLedgerProjectors, unregisterProductionLedgerProjector
 import { markLedgerLive } from '../test/ledgerReportFixtures'
 import { createLandlordExpense } from '../services/landlordExpenses'
 import { categorizeTransaction } from '../services/bankFeed'
+import { expectNoFigures } from '../test/noLeaks'
 
 function buildApp() {
   const app = express()
@@ -102,7 +103,7 @@ describe('the whole-company books are refused to a team member assigned to some 
     const bs = await request(app).get('/api/books/reports/balance-sheet?asOf=2026-10-31').set(bearer(some))
     expect(bs.status).toBe(403)
     expect(bs.body.error).toMatch(/covers the whole company.*Ask the owner/)
-    expect(JSON.stringify(bs.body)).not.toMatch(/1300|900/)
+    expectNoFigures(bs.body, [1300, 900])
     const all = await manager(w, 'all')
     expect((await request(app).get('/api/books/reports/balance-sheet?asOf=2026-10-31').set(bearer(all))).status).toBe(200)
 

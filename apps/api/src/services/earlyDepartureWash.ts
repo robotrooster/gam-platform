@@ -86,6 +86,8 @@ import { logger } from '../lib/logger'
 // read so this works whether or not migration 20261020120000 has reached the
 // database yet. services/departureRules is the one place that knows.
 import { departureRuleSql } from './departureRules'
+// 10/22: which way the money goes when somebody leaves part way through a month.
+import { repriceDeparture } from './departureReprice'
 // 10/22: "did the landlord actually take this month's rent?" — the same money
 // list every "collected" figure reads (RENT_RECEIVED_STATUSES, S642), asked of
 // one rent period. A wash can only keep money that arrived.
@@ -141,80 +143,14 @@ const num = (v: unknown): number => (v == null ? 0 : round2(Number(v)))
 // a tourist. February and July give different day rates on the same rent, which
 // is correct — it is their month being divided, not an average one.
 
-/** The paid period containing `onDay`, for rent due on `dueDay` of the month. */
-export function rentPeriodAround(onDay: string, dueDay: number): { start: string; end: string } {
-  // Out of range falls back to the 1st rather than clamping — the same rule
-  // the rest of the system uses for a rent due day (renewalSuccessor), and
-  // clamping 31 to the 28th would quietly invent a period nobody agreed to.
-  const n = Math.floor(Number(dueDay))
-  const d = Number.isFinite(n) && n >= 1 && n <= 28 ? n : 1
-  const [y, m, day] = onDay.split('-').map(Number)
-  // The period starts on the due day of this month, unless they are standing
-  // before it — then it started on the due day of last month.
-  const startY = day >= d ? y : (m === 1 ? y - 1 : y)
-  const startM = day >= d ? m : (m === 1 ? 12 : m - 1)
-  const iso = (yy: number, mm: number, dd: number) =>
-    `${yy}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`
-  const start = iso(startY, startM, d)
-  // Ends the day before the next due day.
-  const nextY = startM === 12 ? startY + 1 : startY
-  const nextM = startM === 12 ? 1 : startM + 1
-  const endDate = new Date(Date.UTC(nextY, nextM - 1, d))
-  endDate.setUTCDate(endDate.getUTCDate() - 1)
-  return { start, end: endDate.toISOString().slice(0, 10) }
-}
+// THE ARITHMETIC MOVED, THE RULE DID NOT. 10/22: services/departureReprice is
+// the home of what a part month is worth and which way the money goes, and it
+// needs this same period maths — so it owns it and this file reads it from
+// there. Re-exported because the proration suite and the register both import
+// them from here.
+export { rentPeriodAround, proratedUnusedRent, type ProratedUnused } from './departureReprice'
+import { rentPeriodAround, proratedUnusedRent } from './departureReprice'
 
-export interface ProratedUnused {
-  /** Days the paid period covers — the real length of THEIR month. */
-  daysInPeriod: number
-  /** Days after the one they left on. The day they leave counts as used. */
-  daysUnused: number
-  /** Monthly rent divided by the days in that period. */
-  perDay: number
-  /** What a pro-rated refund would have handed back. */
-  wouldRefund: number
-}
-
-/**
- * What a pro-rated refund would have returned — the figure the wash keeps
- * instead of paying out.
- *
- * THE DAY THEY LEAVE IS NOT CHARGED. 10/22 (Nic), correcting the first cut,
- * which counted it as used:
- *
- *   "RVs usually bill by the night, just like hotel rooms. So you're still
- *    there in the morning of the next day, but you're checking out early so the
- *    room can be prepped for the next night's stay. So think of it like that.
- *    We're not charging them for the leaving day. They're paid by the night."
- *
- * So a site is sold by the NIGHT, and the night of the day you leave is a night
- * you did not have — it is sold to whoever comes next. Leave on the 20th and
- * the nights of the 20th through the 31st are all unused. Leave on the 1st of
- * the next month and you used every night of the one you paid for, which is
- * his "if they leave right at the end of the time they paid for, we still
- * bill."
- */
-export function proratedUnusedRent(args: {
-  monthlyRent: number
-  period: { start: string; end: string }
-  leftOn: string
-}): ProratedUnused {
-  const days = (from: string, to: string) =>
-    Math.round((Date.parse(to + 'T12:00:00Z') - Date.parse(from + 'T12:00:00Z')) / 86400000)
-  const daysInPeriod = Math.max(1, days(args.period.start, args.period.end) + 1)
-  const perDay = args.monthlyRent / daysInPeriod
-  // +1 because the night of the leaving day is itself unused — they are gone
-  // that morning and the site can be sold again that night. Clamped: a
-  // move-out dated after the period refunds nothing, and one dated before it
-  // never refunds more than the period itself.
-  const unused = Math.max(0, Math.min(daysInPeriod, days(args.leftOn, args.period.end) + 1))
-  return {
-    daysInPeriod,
-    daysUnused: unused,
-    perDay: round2(perDay),
-    wouldRefund: round2(perDay * unused),
-  }
-}
 const nullNum = (v: unknown): number | null => (v == null ? null : Number(v))
 
 /** "$1,234.56", for the plain sentences this module hands back. */
@@ -589,11 +525,15 @@ export async function moneyKeptForDeparture(
         refundAmount: 0,
         departedOn: m2m.departedOn,
         paidThrough: m2m.paidThrough,
-        // Rent, not a short stay — re-pricing it owes no lodging tax. A
-        // six-month resident pro-rated for the days they did not use never
-        // becomes a short-term guest.
-        lodgingTaxOwed: 0,
-        amountKeptNet: m2m.amountKept,
+        // A RESIDENT'S prorate owes the state nothing — rent is not a short
+        // stay, and a six-month resident re-priced for the days they did not
+        // use never becomes a short-term guest. A FIRST month is the other
+        // shape: it is priced on the register's ladder, and 10/22 (Nic) "the
+        // tax also needs to be added into it... this property is still
+        // responsible to local government for lodging tax." The fork knows
+        // which of the two this is, so neither rule is written here.
+        lodgingTaxOwed: m2m.lodgingTaxOwed,
+        amountKeptNet: round2(Math.max(0, m2m.amountKept - m2m.lodgingTaxOwed)),
         source: 'the unused part of the month they had paid for (monthly rent ÷ days in that month)',
       }
     }
@@ -718,19 +658,11 @@ export interface WashStatus {
  */
 export async function rvMonthToMonthWash(
   leaseId: string, landlordId: string, q: Q = poolQ,
-): Promise<{ amountKept: number; departedOn: string; paidThrough: string; why: string } | null> {
-  const l = (await q.query<{
-    lease_type: string; unit_type: string; rent: string; due_day: number | null
-    left_on: string | null
-  }>(
-    `SELECT l.lease_type, u.unit_type, l.rent_amount AS rent,
-            COALESCE(l.rent_due_day, p.rent_due_day) AS due_day,
-            to_char(NULLIF(LEAST(COALESCE(l.end_date, 'infinity'::date),
-                                 COALESCE(timezone(p.timezone, l.terminated_at)::date, 'infinity'::date)),
-                           'infinity'::date), 'YYYY-MM-DD') AS left_on
+): Promise<{ amountKept: number; departedOn: string; paidThrough: string; why: string; lodgingTaxOwed: number } | null> {
+  const l = (await q.query<{ lease_type: string; unit_type: string }>(
+    `SELECT l.lease_type, u.unit_type
        FROM leases l
        JOIN units u ON u.id = l.unit_id
-       JOIN properties p ON p.id = u.property_id
       WHERE l.id = $1 AND l.landlord_id = $2`,
     [leaseId, landlordId])).rows[0]
   if (!l) return null
@@ -741,61 +673,42 @@ export async function rvMonthToMonthWash(
   if (l.lease_type !== 'month_to_month') return null
   // 10/22 (Nic): "just for rvs."
   if (l.unit_type !== 'rv_spot') return null
-  if (!l.left_on) return null
 
-  if (!(num(l.rent) > 0)) return null
-  const month = rentPeriodAround(l.left_on, Number(l.due_day) || 1)
-
-  // THE MONEY HAS TO HAVE ARRIVED. The wash keeps what a pro-rated refund would
-  // have handed back, so there has to be something in hand to hand back. A
-  // tenant who stopped paying and drove off on the 20th kept nothing — they OWE
-  // for the days they used, and this module's own rule covers that case already:
-  // "The wash is about money KEPT, not money never collected; forgiving a debt
-  // is a write-off, not a wash."
+  // ONE MODULE ANSWERS WHICH WAY THE MONEY GOES, and what the nights they used
+  // are worth: services/departureReprice. It knows the halfway rule (10/22:
+  // "if they used more than half the month, we're not going to prorate them...
+  // if they are leaving before half the paid for time, then we could prorate a
+  // refund"), the first-month ladder, the resident's monthly ÷ days, and the
+  // lodging tax a re-priced short stay owes.
   //
-  // So it is read off the rent rows for THIS period rather than off the lease's
-  // rent figure. That also answers the ordinary end: somebody paid through
-  // October and left the morning of November 1st has no November rent, so there
-  // is no November to pro-rate and the final power bills normally — which is
-  // Nic's "if they leave right at the end of the time they paid for, we still
-  // bill."
-  //
-  // And the figure pro-rated is the money ITSELF, not the contract amount: a
-  // first month billed part-way through is the only amount they ever paid, and
-  // dividing a part month by a whole month's days would hand back less than
-  // their own money was worth per day.
-  const paid = (await q.query<{ taken: string; first_due: string | null }>(
-    `SELECT COALESCE(SUM(p.amount), 0) AS taken,
-            to_char(MIN(p.due_date), 'YYYY-MM-DD') AS first_due
-       FROM payments p
-      WHERE p.lease_id = $1 AND p.landlord_id = $2 AND p.type = 'rent'
-        AND ${rentReceivedStatusSql('p')}
-        AND p.due_date >= $3::date AND p.due_date <= $4::date`,
-    [leaseId, landlordId, month.start, month.end])).rows[0]
-  const taken = num(paid?.taken)
-  if (!(taken > 0)) return null
+  // This was spelled out twice for one afternoon and the two spellings had
+  // already drifted: one read the paid period from the rent row's due date and
+  // the other from the lease's start, which on a part first month is a
+  // different number of days to divide by. One of them is gone.
+  const fork = await repriceDeparture({ leaseId, landlordId }, q)
+  if (!fork || fork.which !== 'wash') return null
 
-  // Their money covers from the day it was billed for — which is the period's
-  // own start in every ordinary month, and the move-in day in a first part
-  // month — through the end of the period.
-  const period = { start: (paid!.first_due && paid!.first_due > month.start) ? paid!.first_due : month.start, end: month.end }
-  const pro = proratedUnusedRent({ monthlyRent: taken, period, leftOn: l.left_on })
-  if (!(pro.wouldRefund > 0)) return null
-  // A JUDGMENT CALL, named as one, the way this module names its other.
-  // Nic described a mid-month departure: "they paid for a month, they leave in
-  // the middle of the month, and we just call it a wash on the last electric."
-  // Somebody who used NONE of the nights they paid for is not that — a pro-rated
-  // refund would give the whole month back, and keeping all of it on nobody's
-  // signature is not a call this module should make quietly. It goes to the desk
-  // as an ordinary refund question and the power bills.
-  if (pro.daysUnused >= pro.daysInPeriod) return null
+  // THE MONEY HAS TO HAVE ARRIVED. A tenant who stopped paying and drove off
+  // kept nothing — they OWE for the days they used, and this module's own rule
+  // covers that already: "The wash is about money KEPT, not money never
+  // collected; forgiving a debt is a write-off, not a wash."
+  if (!(fork.paid > 0)) return null
+
+  // What the till is up: what they paid, less what the nights they used were
+  // worth. The lodging tax those nights owe is reported BESIDE it, not taken
+  // off here — the recovery report prices it when it reads the row, and taking
+  // it off twice read "$0.00 kept" on a departure Nic had worked by hand.
+  const amountKept = round2(fork.paid - fork.worth)
+  if (!(amountKept > 0)) return null
 
   return {
-    amountKept: pro.wouldRefund,
-    departedOn: l.left_on,
-    paidThrough: period.end,
-    why: `They left ${pro.daysUnused} day${pro.daysUnused === 1 ? '' : 's'} before the month they paid for ran out, `
-      + `so ${money(pro.wouldRefund)} stayed with the landlord instead of being pro-rated back.`,
+    amountKept,
+    departedOn: fork.leftOn,
+    paidThrough: fork.period.end,
+    lodgingTaxOwed: fork.lodgingTax,
+    why: `They left ${fork.daysInPeriod - fork.nightsUsed} day${fork.daysInPeriod - fork.nightsUsed === 1 ? '' : 's'} `
+      + `before the month they paid for ran out, so ${money(amountKept)} stayed with the landlord `
+      + 'instead of being pro-rated back.',
   }
 }
 

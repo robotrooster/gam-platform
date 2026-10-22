@@ -89,6 +89,7 @@ import { camelCaseKeys } from '../lib/caseConversion'
 import { errorHandler } from '../middleware/errorHandler'
 import { posRouter } from './pos'
 import { posPayLinksRouter, publicPayRouter, finalizePayLink, payLinkCharge } from './posPayLinks'
+import { expectNoFigures } from '../test/noLeaks'
 
 function app() {
   const a = express()
@@ -748,7 +749,10 @@ describe('10/2 (review) a quote is for the register\'s own property', () => {
     const theirs = await quote({ propertyId: other })
     expect(theirs.status).toBe(400)
     expect(theirs.body.error).toBe('That ticket is for another property — nothing was charged. Switch the register to that property, then press Charge again.')
-    for (const r of [none, notTheirs, theirs]) expect(JSON.stringify(r.body)).not.toMatch(/RV 01|280|May 1/)
+    for (const r of [none, notTheirs, theirs]) {
+      expect(JSON.stringify(r.body)).not.toMatch(/RV 01|May 1/)
+      expectNoFigures(r.body, [280])
+    }
   })
 })
 

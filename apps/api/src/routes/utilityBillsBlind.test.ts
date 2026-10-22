@@ -31,6 +31,7 @@ import {
 } from '../test/dbHelpers'
 import { utilityRouter } from './utility'
 import { errorHandler } from '../middleware/errorHandler'
+import { expectNoFigures, expectNoFiguresInText } from '../test/noLeaks'
 
 function buildApp() {
   const app = express()
@@ -114,11 +115,6 @@ const bills = (token: string) =>
   request(buildApp()).get('/api/utility/bills').set('Authorization', `Bearer ${token}`)
 
 /** Every leaf value in an answer, as text — so a uuid containing "1100" is not read as a leaked figure. */
-function leakedValues(v: unknown, out: string[] = []): string[] {
-  if (v && typeof v === 'object') Object.values(v as Record<string, unknown>).forEach(x => leakedValues(x, out))
-  else if (v != null) out.push(String(v))
-  return out
-}
 
 describe('GET /bills — the gate, the park, and the odometer', () => {
   it('the front desk that walks the meters cannot list bills at all', async () => {
@@ -126,8 +122,7 @@ describe('GET /bills — the gate, the park, and the odometer', () => {
     const r = await bills(f.readerToken)
     expect(r.status).toBe(403)
     // And nothing came back with it: not the figure, not the other park.
-    expect(leakedValues(r.body)).not.toContain('1100')
-    expect(leakedValues(r.body)).not.toContain('2200')
+    expectNoFigures(r.body, [1100, 2200])
   })
 
   it('a staffer who may see bills gets their own park only, never another park in the company', async () => {
@@ -147,8 +142,7 @@ describe('GET /bills — the gate, the park, and the odometer', () => {
     expect(row.usage_amount).toBeUndefined()
     // The window a charge covers still reads — only the numbers are gone.
     expect(row.reading_end_date).toBeTruthy()
-    expect(leakedValues(row)).not.toContain('1100')
-    expect(leakedValues(row)).not.toContain('100')
+    expectNoFigures(row, [1100, 100])
   })
 
   it('the owner still sees every park and the readings each bill ran between', async () => {
@@ -180,7 +174,7 @@ describe('the readings spreadsheet is not handed to someone who walks blind', ()
     const f = await seed()
     const r = await exportCsv(f.deskToken, f.mountainView.propertyId)
     expect(r.status).toBe(403)
-    expect(r.text).not.toContain('1100')
+    expectNoFiguresInText(r.text, [1100])
   })
 
   it('the owner still downloads it', async () => {
@@ -195,7 +189,7 @@ describe('the readings spreadsheet is not handed to someone who walks blind', ()
     expect((await exportCsv(f.parkMgrToken, f.mountainView.propertyId)).status).toBe(200)
     const other = await exportCsv(f.parkMgrToken, f.oakPark.propertyId)
     expect(other.status).toBe(403)
-    expect(other.text).not.toContain('2200')
+    expectNoFiguresInText(other.text, [2200])
   })
 })
 
@@ -210,7 +204,7 @@ describe('a park id in the query string is not a key to another park', () => {
       .get(`/api/utility/reading-history?propertyId=${f.oakPark.propertyId}`)
       .set('Authorization', `Bearer ${f.parkMgrToken}`)
     expect(theirs.status).toBe(403)
-    expect(leakedValues(theirs.body)).not.toContain('2200')
+    expectNoFigures(theirs.body, [2200])
   })
 
   it('the recovery report: same answer, and the owner still reads both', async () => {

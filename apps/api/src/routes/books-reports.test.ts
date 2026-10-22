@@ -46,6 +46,7 @@ import {
 
 import { booksRouter } from './books'
 import { errorHandler } from '../middleware/errorHandler'
+import { expectNoFigures } from '../test/noLeaks'
 
 function buildApp() {
   const app = express()
@@ -856,7 +857,7 @@ describe('S655: Books and a team member assigned to some properties (gam-audienc
       const refused = await pm(path)
       expect(refused.status).toBe(403)
       expect(refused.body.error).toMatch(/covers the whole company.*Ask the owner/)
-      expect(JSON.stringify(refused.body)).not.toMatch(/700|1000/)
+      expectNoFigures(refused.body, [700, 1000])
     }
     // The rent roll: park 2's unit and money only — no park-1 unit, tenant or email.
     const roll = (await pm('/api/books/rent-roll')).body.data

@@ -33,6 +33,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedUtilityMeter } from '../test/dbHelpers'
 import { washVerdict, moneyKeptForDeparture, settleFinalStubForDeparture, washPairing } from './earlyDepartureWash'
+import { repriceDeparture } from './departureReprice'
 
 /** Their real shape: $589 a month, rent due the 1st, October. */
 const RENT = 589
@@ -69,7 +70,7 @@ async function rentPaid(p: Awaited<ReturnType<typeof park>>, leaseId: string, du
 
 /** A lease that ended on the day they drove out. */
 async function leaseThatEnded(p: Awaited<ReturnType<typeof park>>, o: {
-  leaseType?: 'month_to_month' | 'fixed_term'; endedOn?: string | null
+  leaseType?: 'month_to_month' | 'fixed_term'; endedOn?: string | null; startedOn?: string
 } = {}) {
   const c = await getClient()
   let leaseId: string
@@ -77,7 +78,8 @@ async function leaseThatEnded(p: Awaited<ReturnType<typeof park>>, o: {
     await c.query('BEGIN')
     leaseId = await seedLease(c, {
       unitId: p.unitId, landlordId: p.landlordId, rentAmount: RENT,
-      leaseType: o.leaseType ?? 'month_to_month', status: 'terminated', startDate: '2026-04-01',
+      leaseType: o.leaseType ?? 'month_to_month', status: 'terminated',
+      startDate: o.startedOn ?? '2026-04-01',
     })
     await c.query('COMMIT')
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
@@ -180,16 +182,22 @@ describe('who the wash does NOT reach', () => {
     expect((await washVerdict({ leaseId }, p.landlordId)).verdict).toBe('bill')
   })
 
-  it('a part first month is pro-rated over the days that money covered', async () => {
-    // Moved in on the 10th, billed $380 for the 22 nights of October left, then
-    // gone on the 20th: $380 ÷ 22 nights is $17.27, and the 20th through the
-    // 31st — twelve nights — went unused.
+  it('leaving in the FIRST half is a pro-rate, not a wash — 10/22', async () => {
+    // Nic, 10/22: "if they are leaving before half the paid for time, then we
+    // could prorate a refund back to their payment method on file." Somebody
+    // who paid for October and drove out on the 4th kept nothing; keeping $530
+    // of it and eating a $40 electric bill is not a wash.
     const p = await park()
-    const leaseId = await leaseThatEnded(p)
-    await rentPaid(p, leaseId, '2026-10-10', 380)
-    const v = await washVerdict({ leaseId }, p.landlordId)
-    expect(v.verdict).toBe('wash')
-    expect(v.amountKept).toBe(207.27)
+    const leaseId = await leaseThatEnded(p, { endedOn: '2026-10-04' })
+    await rentPaid(p, leaseId, '2026-10-01')
+    expect((await washVerdict({ leaseId }, p.landlordId)).verdict).toBe('bill')
+
+    const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
+    expect(fork).toMatchObject({ which: 'prorate', nightsUsed: 3, daysInPeriod: 31 })
+    // $589 ÷ 31 is $19.00 a night; three nights used, so $532.00 goes back.
+    expect(fork!.worth).toBe(57)
+    expect(fork!.refundDue).toBe(532)
+    expect(fork!.lodgingTax).toBe(0)
   })
 
   it('a lease still running has nobody who left, so there is nothing to wash', async () => {
@@ -284,5 +292,87 @@ describe('the register checks one out and the wash lands, both halves', () => {
     const abs = (await db.query<{ n: string }>(
       `SELECT COUNT(*)::text AS n FROM utility_absorbed_charges WHERE landlord_id = $1`, [p.landlordId])).rows[0]
     expect(Number(abs.n)).toBe(0)
+  })
+})
+
+describe('what the nights they used are worth', () => {
+  it("a resident's part first month is divided by the days that money covered", async () => {
+    // Moved in on the 10th, billed $380 for the 22 nights of October left, gone
+    // on the 20th: ten nights used of twenty-two, so fewer than half, and
+    // $380 ÷ 22 = $17.27 a night.
+    const p = await park()
+    const leaseId = await leaseThatEnded(p, { startedOn: '2026-10-10' })
+    await rentPaid(p, leaseId, '2026-10-10', 380)
+    const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
+    expect(fork).toMatchObject({ which: 'prorate', nightsUsed: 10, daysInPeriod: 22 })
+    // No rates on the site, so the ladder cannot price it and the money they
+    // paid divided by the days it covered is the answer.
+    expect(fork!.basis).toBe('monthly_prorated')
+    expect(fork!.refundDue).toBe(207.27)
+  })
+
+  it('a FIRST month on a site with register rates is a week plus nights, tax in', async () => {
+    // 10/22 (Nic): "It's a week plus 2 days on short-term pricing. And the tax
+    // also needs to be added into it... this property is still responsible to
+    // local government for lodging tax."
+    const p = await park()
+    await db.query(
+      `UPDATE units SET nightly_rate = 49, weekly_rate = 269, monthly_rate = 589 WHERE id = $1`, [p.unitId])
+    await db.query(`UPDATE properties SET short_term_tax_rate = 6.6 WHERE id = $1`, [p.propertyId])
+    // Moved in the 1st, paid the month, gone on the 10th: nine nights.
+    const leaseId = await leaseThatEnded(p, { startedOn: '2026-10-01', endedOn: '2026-10-10' })
+    await rentPaid(p, leaseId, '2026-10-01')
+
+    const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
+    expect(fork).toMatchObject({ which: 'prorate', basis: 'stay_rates', nightsUsed: 9 })
+    expect(fork!.plan).toBe('1 week + 2 nights')
+    // A week ($269) plus two nights ($98) is $367, and the lodging tax those
+    // nine nights owe at 6.6% is $24.22.
+    expect(fork!.worth).toBe(367)
+    expect(fork!.lodgingTax).toBe(24.22)
+    expect(fork!.repricedTotal).toBe(391.22)
+    // The refund is what they paid less that whole total — the tax comes out of
+    // the re-pricing, not out of the property's pocket.
+    expect(fork!.refundDue).toBe(197.78)
+  })
+
+  it('and a long resident is never re-priced as a tourist', async () => {
+    const p = await park()
+    await db.query(
+      `UPDATE units SET nightly_rate = 49, weekly_rate = 269, monthly_rate = 589 WHERE id = $1`, [p.unitId])
+    await db.query(`UPDATE properties SET short_term_tax_rate = 6.6 WHERE id = $1`, [p.propertyId])
+    // Six months in, gone on the 10th: nine nights used, but at $19.00 a night.
+    const leaseId = await leaseThatEnded(p, { startedOn: '2026-04-01', endedOn: '2026-10-10' })
+    await rentPaid(p, leaseId, '2026-10-01')
+    const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
+    expect(fork!.basis).toBe('monthly_prorated')
+    expect(fork!.worth).toBe(171)        // 9 × $19.00
+    expect(fork!.lodgingTax).toBe(0)     // rent is not a short stay
+    expect(fork!.refundDue).toBe(418)
+  })
+
+  it('a property that gives nothing back washes instead, however early they left', async () => {
+    const p = await park()
+    await db.query(
+      `UPDATE properties SET early_departure_refunds = FALSE WHERE id = $1`, [p.propertyId])
+    const leaseId = await leaseThatEnded(p, { endedOn: '2026-10-04' })
+    await rentPaid(p, leaseId, '2026-10-01')
+    const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
+    expect(fork!.which).toBe('wash')
+    expect((await washVerdict({ leaseId }, p.landlordId)).verdict).toBe('wash')
+  })
+
+  it('the leaving day is read as given, not as today — a Sunday settled on Monday', async () => {
+    // 10/22 (Nic): "those guys actually ended up leaving about 2 days ago...
+    // somebody leaves on a Sunday when the office is closed and we don't check
+    // them out till Monday."
+    const p = await park()
+    const leaseId = await leaseThatEnded(p, { endedOn: null })
+    await rentPaid(p, leaseId, '2026-10-01')
+    const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId, leftOn: '2026-10-20' })
+    expect(fork).toMatchObject({ which: 'wash', leftOn: '2026-10-20', nightsUsed: 19 })
+    // And a day in the future reads the same way.
+    const later = await repriceDeparture({ leaseId, landlordId: p.landlordId, leftOn: '2026-10-25' })
+    expect(later).toMatchObject({ which: 'wash', nightsUsed: 24 })
   })
 })
