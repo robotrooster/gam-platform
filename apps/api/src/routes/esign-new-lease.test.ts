@@ -158,14 +158,28 @@ async function addHousehold(park: Awaited<ReturnType<typeof seedPark>>, opts: {
 
 const api = () => request(buildApp())
 
-/** Draft through the real route, send, and have the landlord sign at `startIso` / `rent`. */
-async function newLeaseSignedByLandlord(park: Awaited<ReturnType<typeof seedPark>>, h: Household, startIso: string, rent = '1050.00') {
+/**
+ * Draft through the real route, send, and have the landlord sign at `startIso` /
+ * `rent`.
+ *
+ * `mayRefuseAtSend` is for the one test about a stretch that is already billed.
+ * The start is typed at SIGNING, but SENDING checks the successor's DEFAULT
+ * start — so whether the refusal lands at send or at sign depends on where the
+ * billed invoice falls relative to that default, which moves with the calendar.
+ * (10/22: it moved. plusDays(40) was November 30 and became December 1, which
+ * is a rent due day, so the refusal that used to land at sign landed at send
+ * and the suite failed on a date rather than on a change — it failed on the
+ * previous night's green code too.) What the product guarantees is that it is
+ * refused and the signature does not land, not which of the two doors says so.
+ */
+async function newLeaseSignedByLandlord(park: Awaited<ReturnType<typeof seedPark>>, h: Household, startIso: string, rent = '1050.00', mayRefuseAtSend = false) {
   const drafted = await api().post('/api/esign/documents/renewal')
     .set('Authorization', `Bearer ${h.landlordToken}`).send({ leaseId: h.leaseId, templateId: park.templateId })
   expect(drafted.status).toBe(201)
   const docId = drafted.body.data.id
   const sent = await api().post(`/api/esign/documents/${docId}/send`).set('Authorization', `Bearer ${h.landlordToken}`).send({})
-  expect(sent.status).toBe(200)
+  if (mayRefuseAtSend && sent.status === 409) return { docId, sent, signed: sent }
+  expect(sent.status, JSON.stringify(sent.body)).toBe(200)
   const fields = (await db.query<{ id: string; lease_column: string }>(
     `SELECT id, lease_column FROM lease_document_fields WHERE document_id=$1 AND signer_role='landlord'`, [docId])).rows
   const fid = (col: string) => fields.find(f => f.lease_column === col)!.id
@@ -174,7 +188,7 @@ async function newLeaseSignedByLandlord(park: Awaited<ReturnType<typeof seedPark
       { fieldId: fid('start_date'), value: isoToDocumentDate(startIso) },
       { fieldId: fid('rent_amount'), value: rent },
     ] })
-  return { docId, signed }
+  return { docId, sent, signed }
 }
 
 /** The landlord signs an already-drafted new lease, typing `startIso` / `rent`. */
@@ -283,7 +297,10 @@ describe('a month-to-month household can be sent a new lease', () => {
     await db.query(
       `INSERT INTO invoices (landlord_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
        VALUES ($1,$2,$3,'INV-BILLED',$4,1000,1000,'pending')`, [h.landlordId, h.leaseId, h.unitId, start])
-    const { signed, docId } = await newLeaseSignedByLandlord(park, h, start)
+    // Refused — at send or at sign, whichever reaches the billed stretch first
+    // (see newLeaseSignedByLandlord). Both say the same thing and neither lets
+    // the signature land, which is the rule that matters.
+    const { signed, docId } = await newLeaseSignedByLandlord(park, h, start, '1050.00', true)
     expect(signed.status).toBe(409)
     expect(signed.body.error).toMatch(/already billed .* or later, so that stretch is not billed twice/)
     // The landlord's signature did not land; they can fix the box and sign.

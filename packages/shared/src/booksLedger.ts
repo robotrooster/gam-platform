@@ -956,6 +956,14 @@ export const LEDGER_EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   screening_fee_accruals: "GAM's screening earnings",
   screening_prepayments: "GAM's screening earnings",
   background_checks: "GAM's screening money; the applicant's fee never reaches a landlord's book",
+  // 10/22 (Nic): a debt somebody walked away from at a DIFFERENT landlord,
+  // frozen at the moment it was imported. Writing the row moves no money and
+  // belongs on nobody's ledger — it is a fact about the past, carried so a
+  // later landlord can be warned. If it is ever settled, THAT moves money and
+  // posts on its own (the split is 50% to the landlord owed, 20% GAM, 10% to
+  // the landlord who fronted it, 20% written off), which is a posting about
+  // today, not this record of what happened years ago.
+  tenant_left_owing: 'a frozen record of a debt left at another landlord; no money moves when it is written',
   commission_accruals: "GAM's sales commissions",
   pos_reader_order_costs: "GAM's own cost of a card reader (Nic A1b); the landlord's book carries the price charged (pos_reader_orders, landlord_gam_charges, design H4)",
   platform_fee_accruals: "GAM's fee worked out; what the landlord owes posts through landlord_gam_charges (design H1)",

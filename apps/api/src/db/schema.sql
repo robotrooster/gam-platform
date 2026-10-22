@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 65DYt7w1RtGj1v0rhg7IxFcRy7JLJS1zCljKZcopuAFjMpz2XrIQr2S9tLtQYrJ
+\restrict E324rWGqNFyBmMAtB8QBkqin9wS7guxt0sEnKmaC577apTbJmlGlep9kZIbdOSz
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -34887,6 +34887,20 @@ CREATE TRIGGER audit_tenant_identifications AFTER DELETE OR UPDATE ON public.ten
 
 
 --
+-- Name: tenant_left_owing audit_tenant_left_owing; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_tenant_left_owing AFTER DELETE OR UPDATE ON public.tenant_left_owing FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: tenant_left_owing_reveals audit_tenant_left_owing_reveals; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_tenant_left_owing_reveals AFTER DELETE OR UPDATE ON public.tenant_left_owing_reveals FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
 -- Name: tenant_one_off_charges audit_tenant_one_off_charges; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -46387,5 +46401,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 65DYt7w1RtGj1v0rhg7IxFcRy7JLJS1zCljKZcopuAFjMpz2XrIQr2S9tLtQYrJ
+\unrestrict E324rWGqNFyBmMAtB8QBkqin9wS7guxt0sEnKmaC577apTbJmlGlep9kZIbdOSz
 

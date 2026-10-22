@@ -982,6 +982,9 @@ export function SchedulePage() {
   // 10/4 (decisions #38): the Check out window — opened from a stay, or from
   // the owner's to-do / notification (?checkout=<booking>&unit=<site>).
   const [checkOutFor, setCheckOutFor] = useState<{ unitId: string; bookingId: string } | null>(null)
+  // 10/22 (Nic): the day a leased resident is leaving, so the site stops being
+  // blocked out indefinitely and can take reservations after it.
+  const [leaveDateFor, setLeaveDateFor] = useState<any>(null)
   const location = useLocation()
   const navigate = useNavigate()
   useEffect(() => {
@@ -3165,6 +3168,11 @@ export function SchedulePage() {
 
       {/* ── RESERVATION DETAIL ── click a bar to view */}
       {oooUnit && <OutOfOrderModal unit={oooUnit} onClose={() => setOooUnit(null)} />}
+      {leaveDateFor && (
+        <LeaseLeaveDateModal lease={leaveDateFor}
+          onClose={()=>setLeaveDateFor(null)}
+          onSaved={()=>{ setLeaveDateFor(null); setDetailBooking(null); qc.invalidateQueries('schedule'); qc.invalidateQueries('leases') }} />
+      )}
       {checkOutFor && (
         <EarlyCheckOutModal unitId={checkOutFor.unitId} bookingId={checkOutFor.bookingId}
           onClose={() => {
@@ -3423,7 +3431,37 @@ export function SchedulePage() {
                 {d.notes && <><div style={{color:'var(--text-3)'}}>Notes</div><div>{d.notes}</div></>}
               </div>
               {isLease ? (
-                <div style={{marginTop:16,fontSize:'.78rem',color:'var(--text-3)'}}>Leases are managed on the Leases page.</div>
+                /* 10/22 (Nic): "I need to be able to just click on it on the
+                    reservation list and move to check them out. Clicking it only
+                    pulls up a view only page... That should kind of pull up the
+                    same menu on the leases."
+                    And the reason it matters, in his words: "people with a lease
+                    right now, it's blocked out indefinitely. But if somebody tells
+                    me with notice, hey, I'm going to be leaving in about 2 weeks,
+                    I should be able to edit that lease so that that spot can be
+                    freed up for reservations, especially if we're in a busy season
+                    with a tight window."
+                    Checking out is NOT rebuilt here. The register's Checkout tab
+                    already closes a lease (routes/pos due-out takes
+                    kind: 'stay' | 'lease') and it is the only place that reads the
+                    final meters, so this sends him there rather than growing a
+                    second way to do the same thing badly. */
+                <div style={{display:'flex',flexWrap:'wrap',gap:8,marginTop:18}}>
+                  <button className="btn btn-ghost btn-sm" onClick={()=>navigate(`/leases?open=${d.id}`)}>
+                    Open the lease
+                  </button>
+                  {can('leases.edit') && (
+                    <button className="btn btn-primary btn-sm" onClick={()=>setLeaveDateFor(d)}>
+                      {d.endDate ? 'Change the move-out date' : 'They gave notice'}
+                    </button>
+                  )}
+                  {can('guests.check_out') && (
+                    <button className="btn btn-primary btn-sm"
+                      onClick={()=>navigate(`/pos?tab=checkout&property=${d.propertyId || ''}`)}>
+                      Check out
+                    </button>
+                  )}
+                </div>
               ) : (
                 <div style={{display:'flex',flexWrap:'wrap',gap:8,marginTop:18}}>
                   {can('guest_access') && <button className="btn btn-ghost btn-sm" onClick={()=>copyStayLink(d)}>Copy stay link</button>}
@@ -4551,6 +4589,82 @@ function AddMonthModal({ booking, onClose, onDone }: {
           {quote && !asking && (
             <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => send()}>{busy ? 'Adding…' : 'Add the month'}</button>
           )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+/**
+ * 10/22 (Nic) — THEY TOLD YOU THEY ARE LEAVING.
+ *
+ *   "people with a lease right now, it's blocked out indefinitely. But if
+ *    somebody tells me with notice, hey, I'm going to be leaving in about 2
+ *    weeks, I should be able to edit that lease so that that spot can be freed
+ *    up for reservations, especially if we're in a busy season with a tight
+ *    window."
+ *
+ * The whole value is the site becoming bookable from the day after they go. An
+ * open-ended lease paints across the board forever, so a busy-season week that
+ * is actually free reads as taken.
+ *
+ * It sets the END DATE and nothing else. It does not end the tenancy, move
+ * anybody out, settle any money or read a meter — the register's Checkout tab
+ * does all of that, and it is the only place that reads the final meters. This
+ * is a date on a lease, which is exactly what giving notice is.
+ */
+function LeaseLeaveDateModal({ lease, onClose, onSaved }: {
+  lease: any
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const existing = lease.endDate ? dayOnly(lease.endDate) : ''
+  const [date, setDate] = useState<string>(existing || '')
+  const [err, setErr] = useState('')
+  const start = lease.startDate ? dayOnly(lease.startDate) : null
+  const who = `${lease.firstName || ''} ${lease.lastName || ''}`.trim() || 'This resident'
+
+  const save = useMutation(
+    (endDate: string | null) => apiPatch(`/leases/${lease.id}`, { endDate }),
+    {
+      onSuccess: onSaved,
+      onError: (e: any) => setErr(e?.message || 'That did not save — try again in a moment.'),
+    })
+
+  const tooEarly = !!(date && start && date < start)
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{maxWidth:460}} onClick={e=>e.stopPropagation()}>
+        <div className="modal-title">Last day · {who}</div>
+        <div style={{fontSize:'.82rem',color:'var(--text-3)',marginBottom:14}}>
+          The last day they are on site {lease.unitNumber ? `${lease.unitNumber}` : 'this site'}.
+          It opens for reservations the day after. Nothing is checked out and no money
+          is settled — do that on the register when they actually go.
+        </div>
+        <input type="date" className="form-input" value={date}
+          min={start || undefined}
+          onChange={e=>{ setDate(e.target.value); setErr('') }} />
+        {tooEarly && (
+          <div style={{color:'var(--amber)',fontSize:'.78rem',marginTop:8}}>
+            That is before they moved in{start ? ` on ${start}` : ''}.
+          </div>
+        )}
+        {err && <div style={{color:'var(--red)',fontSize:'.78rem',marginTop:8}}>{err}</div>}
+        <div style={{display:'flex',gap:8,justifyContent:'flex-end',marginTop:18}}>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
+          {existing && (
+            <button className="btn btn-ghost btn-sm" disabled={save.isLoading}
+              onClick={()=>save.mutate(null)}>
+              They are staying after all
+            </button>
+          )}
+          <button className="btn btn-primary btn-sm"
+            disabled={!date || tooEarly || save.isLoading}
+            onClick={()=>save.mutate(date)}>
+            {save.isLoading ? 'Saving…' : 'Save'}
+          </button>
         </div>
       </div>
     </div>
