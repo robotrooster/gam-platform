@@ -364,7 +364,7 @@ async function assertLandlordSigners(
  * carried. The landlord's row may hold the property's on-site signing address
  * (services/landlordSigningContact), so it keeps its own.
  */
-async function signerDeliveryAddress(s: { role: string; email: string; user_id: string }): Promise<string> {
+export async function signerDeliveryAddress(s: { role: string; email: string; user_id: string }): Promise<string> {
   if (s.role === 'landlord') return s.email
   const u = await queryOne<{ email: string }>('SELECT email FROM users WHERE id = $1', [s.user_id])
   return u?.email ?? s.email
@@ -372,7 +372,7 @@ async function signerDeliveryAddress(s: { role: string; email: string; user_id: 
 
 // 10/5: replies reach the people who run this property (services/replyRouting) —
 // a resident's, co-signer's or witness's copy; the landlord's own copy stays GAM's.
-async function signerReplyTo(
+export async function signerReplyTo(
   signer: { role: string; user_id?: string | null }, propertyId: string | null | undefined,
 ): Promise<ReplyTo | undefined> {
   if (signer.role === 'landlord') return undefined

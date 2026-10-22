@@ -47,6 +47,29 @@ export const CREDIT_INELIGIBLE_ENTRIES = ['FLEXPAY', 'HOMEPMT'] as const
 export const BANK_PAYABLE_OWNERS = ['landlord', 'held'] as const
 
 /**
+ * THE MONEY IS WITH US — a charge whose cash has landed or is on its way, with
+ * nothing standing between it and the bank. S642 named this for "rent collected
+ * this month" (lib/rentCollected, which re-exports it); 10/22 the wash needs
+ * the same question of one month's rent, and a second spelling of a money list
+ * is how two reports start disagreeing about the same dollar.
+ *
+ * 'settled' landed. 'processing' was debited and is clearing — an ACH takes
+ * most of a week and that money is already gone from the tenant's account.
+ * 'paid_via_deposit' was swept out of their security deposit at move-out.
+ *
+ * NOT the same question as moneyTakenOrMovingRowSql below, which also counts a
+ * pending row with an intent attached and rent suspended under work trade. Both
+ * of those mean "do not ask this person for money again"; neither means the
+ * landlord is holding any.
+ */
+export const RENT_RECEIVED_STATUSES = ['settled', 'processing', 'paid_via_deposit'] as const
+
+/** `p.status IN (...)` for the list above. */
+export const rentReceivedStatusSql = (a = 'p'): string =>
+  `${alias(a)}.status IN (${RENT_RECEIVED_STATUSES.map(s => `'${s}'`).join(', ')})`
+
+
+/**
  * Nothing is moving on it and money is owed on it now, so a payer may settle it:
  *   pending with no intent, or failed (a failed row with a retry scheduled is
  *   payable; claiming it supersedes that retry — creditUse.supersedeScheduledRetry);

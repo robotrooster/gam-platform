@@ -40,9 +40,15 @@ import { withinCutoffsSql, cutoffsParam, type PropertyCutoff } from './bookkeepe
 // fragments the balances page, the tenant portal, Pay Now, the 7am overdue
 // digest and the agents read (services/openBalances).
 import { openBalanceSql, openAmountSql, workTradeOpenRowSql } from '../services/openBalances'
+import { RENT_RECEIVED_STATUSES as RECEIVED } from '../services/moneyPredicates'
 
-/** Rent the tenant has SENT — landed, or debited and still clearing. */
-export const RENT_RECEIVED_STATUSES = ['settled', 'processing', 'paid_via_deposit'] as const
+/**
+ * Rent the tenant has SENT — landed, or debited and still clearing. Defined in
+ * services/moneyPredicates and re-exported here, because 10/22 the early-
+ * departure wash asks the same question of one month's rent and the two must
+ * not drift.
+ */
+export { RENT_RECEIVED_STATUSES } from '../services/moneyPredicates'
 
 export interface RentCollected {
   basis: IncomeBasis
@@ -280,7 +286,7 @@ export async function rentHealthMtd(
   const end = lastDayOf(start)
   // The same statuses the rent card calls "sent": landed, still clearing at the
   // bank, or kept from a deposit. A returned or failed charge is owed again.
-  const SENT = RENT_RECEIVED_STATUSES.map(s => `'${s}'`).join(', ')
+  const SENT = RECEIVED.map(s => `'${s}'`).join(', ')
   const HELD = 'p.work_trade_suspended_at'
   const [r] = await query<{ invoiced: number; paid: number; work_trade_held: number }>(`
     SELECT COALESCE(SUM(GREATEST(p.amount, 0)) FILTER (WHERE ${HELD} IS NULL), 0)::float AS invoiced,

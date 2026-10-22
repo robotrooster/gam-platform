@@ -92,6 +92,23 @@ async function augustClosedThenDeleted(co: LedgerCompany, before?: () => Promise
   const misc = await idOfCode(co, '4900')
   const repl = await account(co, '4950', 'Other income (new)', 'income')
   await retireAccount({ owner: co.owner, accountId: misc, replacementAccountId: repl, actorUserId: co.ownerUserId })
+  // 10/22 (Nic): "if there's a race for something to happen first and it's
+  // finding out that something is okay if it gets there first and finding out
+  // something's not okay if it is a little bit slower, then we need to make it
+  // slower... we need to take the conservative approach to make sure things
+  // don't get missed."
+  //
+  // Closing a month and retiring an account both leave work on the ledger
+  // outbox. A caller that asks "is this ledger sound?" before that work lands
+  // is asking the wrong moment, and gets an answer that depends on how busy
+  // the machine is — this file passed alone and failed about one run in three
+  // under the deploy gate's six workers, on a drift finding that was simply
+  // not finished yet.
+  //
+  // So the setup hands back a ledger that has settled. It is drained here
+  // rather than in each test, because every test that uses this setup wants
+  // the same thing and the one that forgot is exactly how this got through.
+  await drainLedgerOutbox()
   return { aug, closed, misc, repl }
 }
 

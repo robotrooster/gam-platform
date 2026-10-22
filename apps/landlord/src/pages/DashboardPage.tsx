@@ -526,7 +526,8 @@ export function DashboardPage() {
         {/* Property health — an animated ECG whose 6 beats are the last 6
             months of rent collected (taller beat = stronger month). */}
         {!loadFailed && (
-          <div {...dash.bind('property-health')}>
+          <div {...(() => { const b = dash.bind('property-health')
+            return { ...b, style: { ...b.style, alignSelf: 'stretch' } } })()}>
             <PropertyHealthMonitor
               months={trendData}
               health={stats?.rentHealth}
@@ -536,8 +537,22 @@ export function DashboardPage() {
           </div>
         )}
 
-        {/* Recent disbursements */}
-        <div className="card" {...dash.bind('recent-disbursements')}>
+        {/* Recent disbursements.
+            10/22 (Nic): "just link it, have the recent disbursements card auto
+            size to be the same as whatever the property health is. That way, if
+            that size of that one fluctuates, the recent disbursement one
+            fluctuates as well."
+            It does fluctuate: Property Health draws a fixed chart but lists one
+            row per money category that actually has money in it — a park that
+            bills trash, water and electric is three rows taller than one that
+            bills none, and a heavy register month adds another. So no fixed
+            height would have held.
+            A grid row already equalises its items' heights; the dashboard sets
+            `alignItems: start` so a short KPI card does not stretch beside a
+            tall panel, and this opts back in. It matches whatever shares its
+            row, which survives being dragged somewhere else. */}
+        <div className="card" {...(() => { const b = dash.bind('recent-disbursements')
+          return { ...b, style: { ...b.style, alignSelf: 'stretch', display: 'flex', flexDirection: 'column' } } })()}>
           <div className="card-header">
             <span className="card-title">Recent Disbursements</span>
             {/* S605: an icon is not a way out. Give the panel a real link to the
@@ -550,10 +565,23 @@ export function DashboardPage() {
               <ArrowDownToLine size={16} style={{color:'var(--text-3)'}} />
             </span>
           </div>
+          {/* 10/22 (Nic): "you don't need to see freaking necessarily 10 miles
+              long of different payouts" — the list scrolls inside the card, so
+              the payouts never decide how tall it is. */}
           {disbursements?.length ? (
+            <div style={{flex:1,minHeight:0,overflowY:'auto'}}>
             <table className="data-table">
               <thead><tr>
-                <th>Date</th><th>Amount</th><th>Trigger</th><th>Status</th>
+                {/* 10/22 (Nic): "a little column that... shows which went to
+                    which property. Because I have two disbursements on the 12th
+                    and two disbursements on the 19th... especially with 10
+                    properties or entities."
+                    It names the COMPANY, not the property: a payout is per
+                    entity (see routes/disbursements — landlord_id, no
+                    property_id), which is exactly the Mountain View / Oak Park
+                    split he is reading. Calling it a property would be a
+                    friendlier word for the wrong thing. */}
+                <th>Date</th><th>Company</th><th>Amount</th><th>Trigger</th><th>Status</th>
               </tr></thead>
               <tbody>
                 {disbursements.map((d: any) => {
@@ -561,6 +589,10 @@ export function DashboardPage() {
                   return (
                     <tr key={d.id}>
                       <td className="mono">{dateStr ? new Date(dateStr).toLocaleDateString() : '—'}</td>
+                      <td style={{fontSize:'.78rem',maxWidth:140,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                          title={d.companyName || ''}>
+                        {d.companyName || '—'}
+                      </td>
                       <td className="mono" style={{color:'var(--green)'}}>{fmt(d.amount)}</td>
                       <td style={{fontSize:'.78rem'}}>
                         {DISBURSEMENT_TRIGGER_LABEL[d.triggerType] ?? (d.triggerType ? humanize(d.triggerType) : '—')}
@@ -571,6 +603,7 @@ export function DashboardPage() {
                 })}
               </tbody>
             </table>
+            </div>
           ) : (
             <div style={{color:'var(--text-3)',fontSize:'.82rem',padding:'16px 0'}}>No disbursements yet.</div>
           )}
