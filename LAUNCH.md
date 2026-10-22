@@ -51,6 +51,17 @@ so it stops being re-proposed at him.
   them and pays the landlord who was owed. That consequence is the control.
   Source of the data: the Square archived invoices, imported onto "moved out,
   still owes".
+  **Half built 10/21, and deliberately inert.** The store and the READ side
+  exist: `tenant_left_owing` + `tenant_left_owing_reveals` (migration applied to
+  prod and demo), `services/leftOwing.ts`, 12 tests that are almost all about
+  what it refuses to say. The flag is three words and a count; the first door
+  gives the month and the town and nothing nearer; the second door throws in
+  words rather than quietly doing nothing.
+  **Two pieces are NOT built, and nothing can flag anybody until the first of
+  them is:** (a) the sweep that WRITES a record — it needs a grace period
+  decided, because "left owing" the day after a move-out is a late bill, not a
+  person who has gone quiet; and (b) the second door, which is money moving a
+  way it never has in GAM.
   **Held for Nic's eyes on purpose (10/21), not skipped.** He said to keep
   building overnight and deploy, and everything else in that batch shipped. This
   one did not, for two reasons worth stating: its output is shown to OTHER

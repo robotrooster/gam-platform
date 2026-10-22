@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict VdwWhwyv3xiV8OsJic5p5c3h5vzXsn820qUtbUMeZCbrjZLRDdmAe9cnFLFfqLk
+\restrict 65DYt7w1RtGj1v0rhg7IxFcRy7JLJS1zCljKZcopuAFjMpz2XrIQr2S9tLtQYrJ
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -20362,6 +20362,59 @@ CREATE TABLE public.tenant_identifications (
 
 
 --
+-- Name: tenant_left_owing; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_left_owing (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid,
+    user_id uuid,
+    email text,
+    who text,
+    amount numeric(12,2) NOT NULL,
+    source_kind text NOT NULL,
+    source_key text NOT NULL,
+    left_on date,
+    settled_at timestamp with time zone,
+    settled_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT tenant_left_owing_amount_check CHECK ((amount > (0)::numeric)),
+    CONSTRAINT tenant_left_owing_source_kind_check CHECK ((source_kind = ANY (ARRAY['lease'::text, 'stay'::text])))
+);
+
+
+--
+-- Name: TABLE tenant_left_owing; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.tenant_left_owing IS 'A debt somebody walked away from, kept so a DIFFERENT landlord can be told it exists without being told what it is (10/20-21, Nic). Matched to an applicant only through a verified GAM account — never a name.';
+
+
+--
+-- Name: tenant_left_owing_reveals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_left_owing_reveals (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    owing_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    door text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT tenant_left_owing_reveals_door_check CHECK ((door = ANY (ARRAY['where_and_when'::text, 'the_total'::text])))
+);
+
+
+--
+-- Name: TABLE tenant_left_owing_reveals; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.tenant_left_owing_reveals IS 'Who opened which door on somebody else''s debt, and when. The second door means that landlord has assumed the debt (10/21, Nic) — never to be remembered differently by the two parties later.';
+
+
+--
 -- Name: tenant_notifications; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -26358,6 +26411,38 @@ ALTER TABLE ONLY public.tenant_identifications
 
 
 --
+-- Name: tenant_left_owing tenant_left_owing_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing
+    ADD CONSTRAINT tenant_left_owing_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tenant_left_owing_reveals tenant_left_owing_reveal_once; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing_reveals
+    ADD CONSTRAINT tenant_left_owing_reveal_once UNIQUE (owing_id, landlord_id, door);
+
+
+--
+-- Name: tenant_left_owing_reveals tenant_left_owing_reveals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing_reveals
+    ADD CONSTRAINT tenant_left_owing_reveals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tenant_left_owing tenant_left_owing_source_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing
+    ADD CONSTRAINT tenant_left_owing_source_uniq UNIQUE (landlord_id, source_kind, source_key);
+
+
+--
 -- Name: tenant_notifications tenant_notifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -31054,6 +31139,20 @@ CREATE INDEX idx_tenant_declared_deposits_tenant ON public.tenant_declared_depos
 --
 
 CREATE INDEX idx_tenant_identifications_tenant ON public.tenant_identifications USING btree (tenant_id);
+
+
+--
+-- Name: idx_tenant_left_owing_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_left_owing_landlord ON public.tenant_left_owing USING btree (landlord_id, settled_at);
+
+
+--
+-- Name: idx_tenant_left_owing_person; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_left_owing_person ON public.tenant_left_owing USING btree (user_id) WHERE ((settled_at IS NULL) AND (user_id IS NOT NULL));
 
 
 --
@@ -44796,6 +44895,54 @@ ALTER TABLE ONLY public.tenant_identifications
 
 
 --
+-- Name: tenant_left_owing tenant_left_owing_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing
+    ADD CONSTRAINT tenant_left_owing_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: tenant_left_owing tenant_left_owing_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing
+    ADD CONSTRAINT tenant_left_owing_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id);
+
+
+--
+-- Name: tenant_left_owing_reveals tenant_left_owing_reveals_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing_reveals
+    ADD CONSTRAINT tenant_left_owing_reveals_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: tenant_left_owing_reveals tenant_left_owing_reveals_owing_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing_reveals
+    ADD CONSTRAINT tenant_left_owing_reveals_owing_id_fkey FOREIGN KEY (owing_id) REFERENCES public.tenant_left_owing(id);
+
+
+--
+-- Name: tenant_left_owing_reveals tenant_left_owing_reveals_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing_reveals
+    ADD CONSTRAINT tenant_left_owing_reveals_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: tenant_left_owing tenant_left_owing_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_left_owing
+    ADD CONSTRAINT tenant_left_owing_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+
+--
 -- Name: tenant_notifications tenant_notifications_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -46240,5 +46387,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict VdwWhwyv3xiV8OsJic5p5c3h5vzXsn820qUtbUMeZCbrjZLRDdmAe9cnFLFfqLk
+\unrestrict 65DYt7w1RtGj1v0rhg7IxFcRy7JLJS1zCljKZcopuAFjMpz2XrIQr2S9tLtQYrJ
 
