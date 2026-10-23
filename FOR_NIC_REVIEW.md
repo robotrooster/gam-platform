@@ -19,19 +19,45 @@ $0.00**, final electric billed to nobody. 19 of October's 31 nights used.
 
 ## Three things I need you to look at
 
-### 1. The refund for an early departure is a figure, not a button yet
+### 1. The refund button — corrected, and the gap is smaller than I thought
 
-When somebody leaves in the **first half** of a month they already **paid** for,
-the rule now says money goes back. GAM works out exactly how much and shows it,
-but sending it is still a manual refund from their Payments page.
+**Your correction is in.** The halfway point now decides **only** whether the
+final utility is a wash. It no longer decides whether money can go back. The
+figure to refund is worked out and offered **whatever** the halfway point says —
+including on a departure that washes — because it is a situational call for
+whoever is at the desk, not a rule.
 
-The machinery to send it exists (it is what refunds a stay's early check-out —
-retries, "try again", bank-turned-it-down wording). Hooking a lease departure
-into it is the next real piece of work. **I did not want to half-build a path
-that moves money while you were out.**
+A property that gives nothing back still washes however early they left (your
+10/18 setting), and a month nobody paid has nothing to give back. Those are the
+only two reasons the offer is withheld, and each says so on screen.
 
-Everything else in that flow is done: the halfway fork, the resident-vs-tourist
-re-pricing, the tax inside the total, the bill adjustment when they never paid.
+**I also stopped the halfway point gating the bill adjustment**, for the same
+reason — an unpaid month is the same money question with the cash still on
+their side of the table. The screen says how much of the month they used and
+the person decides. Say so if you want that one gated after all.
+
+**And the button mostly exists already.** Looking for where to put it I found
+`paidAheadChoice` — built 10/4, decisions #46.1: for paid-ahead money on an
+ended lease, somebody with "Issue refunds" gets exactly three choices — *No
+refund*, *Refund the unused days*, *Refund a different amount* — and the money
+goes back the way it was paid, card to that card, bank to that bank, with the
+card fee returned to the tenant and Stripe's fee shown as the landlord's cost
+before they confirm.
+
+So I am not building a second refund path. **The one real gap:** that screen
+only has something to offer when the unused rent has been banked as paid-ahead
+money, and the code that banks it runs when a **booking's** dates move. A plain
+lease — RV 20 and RV 41 have no booking — whose move-out date lands mid-month
+never banks the unused part, so the button has nothing to show.
+
+**The work, for the morning:** when a lease's move-out date is set and rent is
+paid past it, bank the remainder as paid-ahead money the same way a shortened
+stay does, and make sure "the unused days" means what the departure rule says it
+means (monthly ÷ days in that month for a resident, the register's ladder with
+tax for a genuine first month). One hook, and one figure reconciled between two
+modules so they can never disagree.
+
+I stopped there rather than half-build a path that moves money.
 
 ### 2. One call I made on the adjustment, worth a yes or no
 
@@ -43,7 +69,7 @@ A late fee that **money is recorded against** is left alone, and the screen says
 so. I would rather tell you a fee stayed than quietly tear it out from under a
 receipt or a bank match.
 
-### 3. The PM fold is two steps in, four to go
+### 3. The PM fold — where it actually stands
 
 Done, and safe to leave sitting:
 
@@ -83,6 +109,36 @@ there is no real data to carry.
 | **Managed companies** | One login, several companies, scope and permissions per company. |
 
 Full API suite **15,648 green**. Landlord portal **1,331 green**.
+
+## The portfolio toggle, since you asked
+
+Right now you switch between one property and the whole portfolio. Once a
+management company is just another company on your account, that control wants
+**one more level above the properties, not a second toggle**:
+
+```
+Everything I own          ← roll-up across the companies you own
+  Oak Park Motel and RV
+  Mountain View RV Ranch
+Everything I manage       ← roll-up across companies you manage for others
+  Smith Family Trust  (managed)
+    their two parks
+  Baker Holdings LLC  (managed)
+    their park
+```
+
+One picker, three depths: a roll-up, a company, a property. Not a separate
+"owned vs managed" switch, because you already have a picker that names the
+company and a second control doing the same job in a different place is the
+thing that makes other software need a workaround. It also keeps your own rule
+intact — nothing is ever a default, and with two or more it starts on "Choose a
+company…".
+
+The two roll-ups are worth having as real entries rather than a filter: "what
+did I earn" and "what did I earn managing" are different questions, and a
+manager's cut is a different line from an owner's rent.
+
+---
 
 **Say the word and I will deploy.** I held it because you opened new items after
 the go-ahead, and nothing you need today is waiting on it.

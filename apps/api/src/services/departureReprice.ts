@@ -153,19 +153,45 @@ export function proratedUnusedRent(args: {
 /** How the nights they used were priced. */
 export type RepriceBasis = 'stay_rates' | 'monthly_prorated'
 
-/** Which way the money goes, by the halfway rule. */
+/**
+ * 10/22 (Nic), CORRECTING the first cut of this the same evening:
+ *
+ *   "the refund being a figure and not a button needs to be a button because
+ *    it's situational where we may refund somebody or we may not, depending on
+ *    the situation. The only deciding factor cannot be if they leave before
+ *    half of their paid time was over. That's just one factor for the wash on
+ *    electric, but that's not a factor for whether or not there's a refund at
+ *    all."
+ *
+ * So the halfway point answers ONE question — do we call the final utility a
+ * wash — and it answers nothing about whether money goes back. A refund is a
+ * person's decision at the desk, made with the figure in front of them, at any
+ * point in the month. Exactly as a stay's check-out already works: the desk is
+ * shown "Refund the unused nights ($X)" and chooses.
+ *
+ * The first cut had the halfway point gating both, which would have meant GAM
+ * refusing to hand back money on a departure the landlord wanted to refund.
+ */
 export type DepartureMoney =
-  /** Fewer than half the nights used, and the property gives money back. */
-  | 'prorate'
-  /** Half or more used, or a property that gives nothing back: keep it, eat the utility. */
+  /** Half or more of the paid nights used, money in hand, nothing given back. */
   | 'wash'
-  /** Nothing to decide — they used the whole month, or there is no paid month. */
+  /** Not a wash — the final utility bills as usual. Money may still go back. */
+  | 'bills'
+  /** Nothing to settle: they used the whole month, or no rent was taken or billed. */
   | 'nothing'
 
 export interface DepartureReprice {
+  /** The WASH question, and only that. Never whether money goes back. */
   which: DepartureMoney
-  /** Plain words for the desk and for the record. */
+  /** Plain words for the desk and for the record — about the wash. */
   why: string
+  /**
+   * CAN money go back at all: they paid something, and the property gives money
+   * back when somebody leaves early. Whether it SHOULD is the desk's call.
+   */
+  canRefund: boolean
+  /** Why not, when it cannot — in words for the screen. */
+  whyNoRefund: string | null
   /** Their paid month, and the part of it their money covered. */
   period: { start: string; end: string }
   daysInPeriod: number
@@ -345,35 +371,52 @@ export async function repriceDeparture(
 
   let which: DepartureMoney
   let why: string
+  const as = basis === 'stay_rates'
+    ? `${plan ?? `${nightsUsed} nights`} at the register's rates${lodgingTax > 0 ? ', lodging tax included' : ''}`
+    : 'the monthly rent divided by the days in that month'
+  const worthWords = `The ${nightsUsed} nights they used are worth ${money(repricedTotal)} — ${as}.`
+
   if (usedItAll || (paid <= 0 && unpaid <= 0)) {
     which = 'nothing'
     why = usedItAll
       ? 'They used every night of the month they paid for, so there is nothing to re-price and their final utility bills as usual.'
       : 'No rent was taken or billed for that month, so there is nothing to re-price.'
-  } else if (!firstHalf) {
+  } else if (!firstHalf && paid > 0 && givesMoneyBack) {
     which = 'wash'
-    why = `They used ${nightsUsed} of the ${daysInPeriod} nights — half the month or more — so the month stands and `
-      + 'their final utility is a wash instead of a pro-rate.'
-  } else if (!givesMoneyBack) {
+    why = `${worthWords} They used ${nightsUsed} of the ${daysInPeriod} nights — half the month or more — `
+      + 'so their final utility is a wash, unless money goes back.'
+  } else if (paid > 0 && !givesMoneyBack) {
+    // A PROPERTY THAT GIVES NOTHING BACK WASHES WHENEVER THEY LEFT. 10/18: it
+    // has nothing to ask and nothing went back by definition, so the money kept
+    // is real and the final utility is what it is set against — and the earlier
+    // they left, the more there is to set it against. The halfway point is one
+    // factor for the wash (10/22), not the only one, and this is the other.
     which = 'wash'
-    why = 'This property does not pro-rate or give money back when somebody leaves early, so the month stands '
-      + 'and their final utility is a wash.'
+    why = `${worthWords} This property does not give money back when somebody leaves early, `
+      + 'so the month stands and their final utility is a wash.'
   } else {
-    which = 'prorate'
-    const as = basis === 'stay_rates'
-      ? `${plan ?? `${nightsUsed} nights`} at the register's rates${lodgingTax > 0 ? `, lodging tax included` : ''}`
-      : 'the monthly rent divided by the days in that month'
-    why = `They left with ${daysInPeriod - nightsUsed} of ${daysInPeriod} nights unused — fewer than half the month gone — `
-      + `so the ${nightsUsed} nights they used are re-priced as ${as}: ${money(repricedTotal)}.`
+    which = 'bills'
+    why = firstHalf
+      ? `${worthWords} They left with ${daysInPeriod - nightsUsed} of ${daysInPeriod} nights unused — `
+        + 'fewer than half the month gone — so their final utility bills as usual.'
+      : `${worthWords} Nothing was taken for that month, so there is no money kept to set a utility against `
+        + 'and their final utility bills as usual.'
   }
 
-  const refundDue = which === 'prorate' ? Math.max(0, round2(paid - repricedTotal)) : 0
-  const billBecomes = which === 'prorate' && unpaid > 0
-    ? Math.max(0, round2(repricedTotal - paid))
-    : unpaid
+  // WHAT WOULD GO BACK IF SOMEBODY PRESSED IT — worked out whatever the wash
+  // says, because the two questions are not the same question (10/22).
+  const refundDue = Math.max(0, round2(paid - repricedTotal))
+  const canRefund = paid > 0 && givesMoneyBack && refundDue > 0 && !usedItAll
+  const whyNoRefund = canRefund ? null
+    : usedItAll ? 'They used every night they paid for, so there is nothing to give back.'
+    : !(paid > 0) ? 'Nothing was paid for that month, so there is nothing to give back.'
+    : !givesMoneyBack ? 'This property does not give money back when somebody leaves early.'
+    : 'The nights they used are worth everything they paid, so there is nothing to give back.'
+
+  const billBecomes = unpaid > 0 ? Math.max(0, round2(repricedTotal - paid)) : unpaid
 
   return {
-    which, why, period, daysInPeriod, nightsUsed, leftOn,
+    which, why, canRefund, whyNoRefund, period, daysInPeriod, nightsUsed, leftOn,
     worth, lodgingTax, repricedTotal, basis, plan,
     paid, unpaid, refundDue, billBecomes,
   }
@@ -462,10 +505,15 @@ export async function adjustUnpaidDepartureBill(args: {
       return no(`They paid ${money(fork.paid)} toward that month, so this is not a bill to adjust — `
         + 'it is a refund or a wash. Settle it on the check-out screen.')
     }
-    if (fork.which !== 'prorate') {
+    if (fork.which === 'nothing') {
       if (own) await client.query('COMMIT')
       return no(fork.why)
     }
+    // 10/22 (Nic): the halfway point does NOT gate this either. It is the same
+    // situational call as a refund — "it's situational where we may refund
+    // somebody or we may not" — and an unpaid month is the same money question
+    // with the cash still on their side of the table. The screen says how much
+    // of the month they used; the person pressing decides.
     if (!(fork.unpaid > 0)) {
       if (own) await client.query('COMMIT')
       return no('Nothing is billed for that month, so there is nothing to adjust.')

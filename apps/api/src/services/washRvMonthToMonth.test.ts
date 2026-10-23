@@ -182,19 +182,20 @@ describe('who the wash does NOT reach', () => {
     expect((await washVerdict({ leaseId }, p.landlordId)).verdict).toBe('bill')
   })
 
-  it('leaving in the FIRST half is a pro-rate, not a wash — 10/22', async () => {
-    // Nic, 10/22: "if they are leaving before half the paid for time, then we
-    // could prorate a refund back to their payment method on file." Somebody
-    // who paid for October and drove out on the 4th kept nothing; keeping $530
-    // of it and eating a $40 electric bill is not a wash.
+  it('leaving in the FIRST half is not a wash, and a refund is offered — 10/22', async () => {
+    // Nic, 10/22: the halfway point is "just one factor for the wash on
+    // electric, but that's not a factor for whether or not there's a refund at
+    // all." Somebody who paid for October and drove out on the 4th kept $532
+    // with no nights behind it; the desk decides whether it goes back, and the
+    // electric is not washed against it.
     const p = await park()
     const leaseId = await leaseThatEnded(p, { endedOn: '2026-10-04' })
     await rentPaid(p, leaseId, '2026-10-01')
     expect((await washVerdict({ leaseId }, p.landlordId)).verdict).toBe('bill')
 
     const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
-    expect(fork).toMatchObject({ which: 'prorate', nightsUsed: 3, daysInPeriod: 31 })
-    // $589 ÷ 31 is $19.00 a night; three nights used, so $532.00 goes back.
+    expect(fork).toMatchObject({ which: 'bills', nightsUsed: 3, daysInPeriod: 31, canRefund: true })
+    // $589 ÷ 31 is $19.00 a night; three nights used, so $532.00 may go back.
     expect(fork!.worth).toBe(57)
     expect(fork!.refundDue).toBe(532)
     expect(fork!.lodgingTax).toBe(0)
@@ -304,7 +305,7 @@ describe('what the nights they used are worth', () => {
     const leaseId = await leaseThatEnded(p, { startedOn: '2026-10-10' })
     await rentPaid(p, leaseId, '2026-10-10', 380)
     const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
-    expect(fork).toMatchObject({ which: 'prorate', nightsUsed: 10, daysInPeriod: 22 })
+    expect(fork).toMatchObject({ which: 'bills', nightsUsed: 10, daysInPeriod: 22, canRefund: true })
     // No rates on the site, so the ladder cannot price it and the money they
     // paid divided by the days it covered is the answer.
     expect(fork!.basis).toBe('monthly_prorated')
@@ -324,7 +325,7 @@ describe('what the nights they used are worth', () => {
     await rentPaid(p, leaseId, '2026-10-01')
 
     const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
-    expect(fork).toMatchObject({ which: 'prorate', basis: 'stay_rates', nightsUsed: 9 })
+    expect(fork).toMatchObject({ which: 'bills', basis: 'stay_rates', nightsUsed: 9, canRefund: true })
     expect(fork!.plan).toBe('1 week + 2 nights')
     // A week ($269) plus two nights ($98) is $367, and the lodging tax those
     // nine nights owe at 6.6% is $24.22.
@@ -441,5 +442,39 @@ describe('who owes short-term lodging tax, and who never does', () => {
     expect(fork).toMatchObject({ which: 'wash', basis: 'monthly_prorated', lodgingTax: 0 })
     const kept = await moneyKeptForDeparture({ leaseId }, p.landlordId)
     expect(kept).toMatchObject({ amountKept: 228, lodgingTaxOwed: 0, amountKeptNet: 228 })
+  })
+})
+
+describe('a refund is the desk\'s call, not the halfway point\'s — 10/22', () => {
+  it('money is offered back even when the month WASHES', async () => {
+    // Nic: "it's situational where we may refund somebody or we may not,
+    // depending on the situation. The only deciding factor cannot be if they
+    // leave before half of their paid time was over."
+    const p = await park()
+    const leaseId = await leaseThatEnded(p, { endedOn: '2026-10-20' })
+    await rentPaid(p, leaseId, '2026-10-01')
+    const fork = await repriceDeparture({ leaseId, landlordId: p.landlordId })
+    // It is a wash — and the figure to hand back is still worked out and
+    // offered. Both answers, side by side, for a person to choose.
+    expect(fork).toMatchObject({ which: 'wash', canRefund: true, refundDue: 228 })
+    expect(fork!.whyNoRefund).toBeNull()
+  })
+
+  it('and is not offered where there is nothing to give back', async () => {
+    const p = await park()
+    const unpaid = await leaseThatEnded(p, { endedOn: '2026-10-09' })
+    const forkA = await repriceDeparture({ leaseId: unpaid, landlordId: p.landlordId })
+    expect(forkA!.canRefund).toBe(false)
+    expect(forkA!.whyNoRefund).toMatch(/Nothing was paid/)
+
+    const noRefunds = await park()
+    await db.query(`UPDATE properties SET early_departure_refunds = FALSE WHERE id = $1`, [noRefunds.propertyId])
+    const l2 = await leaseThatEnded(noRefunds, { endedOn: '2026-10-09' })
+    await rentPaid(noRefunds, l2, '2026-10-01')
+    const forkB = await repriceDeparture({ leaseId: l2, landlordId: noRefunds.landlordId })
+    expect(forkB!.canRefund).toBe(false)
+    expect(forkB!.whyNoRefund).toMatch(/does not give money back/)
+    // And that property washes however early they left.
+    expect(forkB!.which).toBe('wash')
   })
 })

@@ -4654,8 +4654,12 @@ function LeaseLeaveDateModal({ lease, onClose, onSaved }: {
   /* Three shapes, and each says what will happen rather than naming a rule:
      an unpaid month that can be re-priced here, a paid month with money to go
      back, and the wash. */
-  const canAdjust = money?.which === 'prorate' && money?.unpaid > 0 && money?.paid === 0
-  const owesThemMoney = money?.which === 'prorate' && money?.refundDue > 0
+  /* 10/22 (Nic): the halfway point decides the WASH and nothing else — "that's
+     just one factor for the wash on electric, but that's not a factor for
+     whether or not there's a refund at all." So the figure to hand back is
+     shown whenever there IS one, including on a departure that washes. */
+  const canAdjust = money && money.which !== 'nothing' && money.unpaid > 0 && money.paid === 0
+  const owesThemMoney = money?.canRefund === true
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -4681,7 +4685,15 @@ function LeaseLeaveDateModal({ lease, onClose, onSaved }: {
               {money.nightsUsed} of {money.daysInPeriod} nights used
             </div>
             {money.which === 'wash' ? (
-              <div>{money.why}</div>
+              <>
+                <div>{money.why}</div>
+                {money.canRefund && (
+                  <div style={{marginTop:6,color:'var(--gold)'}}>
+                    {fmt(money.refundDue)} can still go back to them if you want it to — a refund
+                    turns the wash off, so their final utility would bill as usual.
+                  </div>
+                )}
+              </>
             ) : (
               <>
                 <div>
@@ -4691,9 +4703,12 @@ function LeaseLeaveDateModal({ lease, onClose, onSaved }: {
                 </div>
                 {owesThemMoney && (
                   <div style={{marginTop:6,color:'var(--gold)'}}>
-                    {fmt(money.paid)} was paid, so {fmt(money.refundDue)} goes back to them.
-                    Send it from their Payments page.
+                    {fmt(money.paid)} was paid, so {fmt(money.refundDue)} can go back to them —
+                    your call. Send it from their Payments page.
                   </div>
+                )}
+                {money.paid > 0 && !owesThemMoney && money.whyNoRefund && (
+                  <div style={{marginTop:6}}>{money.whyNoRefund}</div>
                 )}
                 {canAdjust && (
                   <div style={{marginTop:6}}>

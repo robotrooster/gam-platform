@@ -101,15 +101,17 @@ describe('they left on the 9th and never paid October', () => {
 })
 
 describe('when it refuses, and says why', () => {
-  it('they used half the month or more — the month stands', async () => {
+  it('past the halfway point it still adjusts — that point only decides the wash', async () => {
+    // 10/22 (Nic), correcting the first cut: the halfway point is "just one
+    // factor for the wash on electric, but that's not a factor for whether or
+    // not there's a refund at all." An unpaid month is the same money question
+    // with the cash still on their side of the table, so it is the desk's call
+    // here too — the screen says how much of the month they used.
     const p = await park()
     const { leaseId, invoiceId } = await leftOwingTheMonth(p, { endedOn: '2026-10-20', lateFees: 3 })
     const out = await adjustUnpaidDepartureBill({ leaseId, landlordId: p.landlordId, byUserId: p.userId })
-    expect(out.applied).toBe(false)
-    expect(out.why).toMatch(/half the month or more/)
-    // Nothing moved: the bill stands and so do the late fees.
-    expect(Number((await billOn(leaseId))[0].amount)).toBe(589)
-    expect(await feesOn(invoiceId)).toBe(3)
+    expect(out).toMatchObject({ applied: true, nightsUsed: 19, daysInPeriod: 31, rentNow: 361 })
+    expect(await feesOn(invoiceId)).toBe(0)
   })
 
   it('the month was actually paid — that is a refund or a wash, not an adjustment', async () => {
@@ -158,7 +160,7 @@ describe('the day they left is read as given', () => {
     const p = await park()
     const { leaseId, invoiceId } = await leftOwingTheMonth(p, { endedOn: '2026-10-09', lateFees: 2 })
     const quote = await repriceDeparture({ leaseId, landlordId: p.landlordId })
-    expect(quote).toMatchObject({ which: 'prorate', billBecomes: 152 })
+    expect(quote).toMatchObject({ which: 'bills', billBecomes: 152 })
     expect(Number((await billOn(leaseId))[0].amount)).toBe(589)
     expect(await feesOn(invoiceId)).toBe(2)
   })
