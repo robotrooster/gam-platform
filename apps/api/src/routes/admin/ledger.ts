@@ -149,8 +149,11 @@ adminLedgerRouter.get('/ledger/landlords/:landlordId/closes', async (req, res, n
     if (!exists.length) throw new AppError(404, 'No such company.')
     const settings = await getLedgerSettings(landlordId)
     const history = await query(
+      // 10/23: qualified, because `id::text AS id` makes a bare `ORDER BY id`
+      // sort the TEXT — which put close 9 above reopen 10 and showed this
+      // history out of order (services/ledgerCheck has the whole story).
       `SELECT id::text AS id, action, closed_through::text AS closed_through, reason, acted_by, acted_at
-         FROM books_period_closes WHERE landlord_id = $1 ORDER BY id DESC`, [landlordId])
+         FROM books_period_closes WHERE landlord_id = $1 ORDER BY books_period_closes.id DESC`, [landlordId])
     res.json({ success: true, data: { settings, history } })
   } catch (e) { next(e) }
 })

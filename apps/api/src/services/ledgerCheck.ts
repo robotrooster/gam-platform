@@ -154,9 +154,25 @@ export async function engineChecks(client: PoolClient, owner: LedgerOwner): Prom
   // The current lock: nothing entered or left the closed months since its
   // snapshot. 10/12 (Nic) review: the latest row, a close or a reopen that
   // left earlier months closed — each takes the snapshot of what it locks.
+  // 10/23 — ORDER BY THE COLUMN, NOT THE OUTPUT NAME.
+  //
+  // This was `ORDER BY id DESC` over a SELECT list carrying `id::text AS id`,
+  // and Postgres resolves an ORDER BY name against the OUTPUT columns first —
+  // so it sorted the id as TEXT. Text puts '9' above '10', which means a company
+  // whose close is row 9 and whose reopen is row 10 got the CLOSE back as its
+  // "latest" row, for good: August's stale snapshot compared against a month
+  // that had been deliberately reopened, and the landlord's books carried a
+  // permanent "a closed month's balances changed" integrity finding.
+  //
+  // It took the deploy gate down twice, passing in isolation and failing under
+  // the full suite — because which side of a digit boundary the two ids land on
+  // depends on how many closes the other tests made first. Qualified with the
+  // table, the name no longer matches an output column and the real bigint
+  // sorts. (The close-history read at ledgerClose.ts:499 was always written
+  // `ORDER BY c.id DESC` and was never wrong.)
   const close = (await client.query<{ id: string; action: string; closed_through: string | null }>(
     `SELECT id::text AS id, action, closed_through::text AS closed_through FROM books_period_closes
-      WHERE ${col} = $1 ORDER BY id DESC LIMIT 1`, [id])).rows[0]
+      WHERE ${col} = $1 ORDER BY books_period_closes.id DESC LIMIT 1`, [id])).rows[0]
   if (close?.closed_through) {
     for (const r of (await client.query(
       `WITH snap AS (SELECT account_id, property_id, debits, credits FROM ledger_close_balances WHERE close_id = $2),
