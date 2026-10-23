@@ -172,6 +172,7 @@ import { BooksSettingsPage } from './bookkeeping/BooksSettingsPage'
 import { OpeningBalancesPage } from './bookkeeping/OpeningBalancesPage'
 // 10/12 (Nic, L5): the company's own categories for money out and in.
 import { CategoriesPage } from './bookkeeping/CategoriesPage'
+import ManagementPage from './pages/ManagementPage'
 import { BOOKS_PATHS } from './bookkeeping/adapter'
 // Which company's books, a cache of their own, and Books' look.
 import { BookkeepingHost } from './bookkeepingHost'
@@ -318,6 +319,9 @@ function App() {
               <Route path="property-onboarding" element={<PropertyOnboardingPage />} />
               <Route path="payment-history-onboarding" element={<PaymentHistoryOnboardingPage />} />
               <Route path="pm-invitations"  element={LAUNCH_HIDDEN.has('/pm-invitations') ? <Navigate to="/dashboard" replace /> : <PmInvitationsPage />} />
+              {/* 10/23: the management company's own side of the business, now
+                  that the PM portal folded in here (PM_FOLD_PLAN.md). */}
+              <Route path="management"      element={<ManagementPage />} />
               <Route path="units"          element={<UnitsPage />} />
               <Route path="units/:id"      element={<UnitDetailPage />} />
               <Route path="tenants"        element={<TenantsPage />} />

@@ -1,112 +1,46 @@
-// S540: self-hosted fonts — no render-blocking external stylesheet
-import '@fontsource/syne/600.css'
-import '@fontsource/syne/700.css'
-import '@fontsource/syne/800.css'
-import '@fontsource/dm-sans/300.css'
-import '@fontsource/dm-sans/400.css'
-import '@fontsource/dm-sans/500.css'
-import '@fontsource/dm-sans/600.css'
-import '@fontsource/dm-mono/400.css'
-import '@fontsource/dm-mono/500.css'
-import '@fontsource/dm-sans/400-italic.css'
-import '@fontsource/inter/400.css'
-import '@fontsource/inter/500.css'
-import '@fontsource/inter/600.css'
-import '@fontsource/inter/700.css'
-import '@fontsource/jetbrains-mono/400.css'
-import '@fontsource/jetbrains-mono/500.css'
-import { SentryErrorBoundary } from './lib/sentry'
-import React from 'react'
-import ReactDOM from 'react-dom/client'
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import { QueryClient, QueryClientProvider } from 'react-query'
-import { AuthProvider, useAuth } from './context/AuthContext'
-import { Layout } from './components/Layout'
-import { DialogHost } from './components/dialogs'
-import { LoginPage } from './pages/LoginPage'
-import { PmForgotPasswordPage, PmResetPasswordPage } from './pages/PasswordRecoveryPages'
-import { RegisterPage } from './pages/RegisterPage'
-import { DashboardPage } from './pages/DashboardPage'
-import { InvitationsPage } from './pages/InvitationsPage'
-import { PropertiesPage } from './pages/PropertiesPage'
-import { OwnersPage } from './pages/OwnersPage'
-import { PropertyDetailPage } from './pages/PropertyDetailPage'
-import { FeePlansPage } from './pages/FeePlansPage'
-import { StaffPage } from './pages/StaffPage'
-import { BankingPage } from './pages/BankingPage'
-import { SettingsPage } from './pages/SettingsPage'
-import { TotpEnrollPage } from './pages/TotpEnrollPage'
-import './styles/globals.css'
+/**
+ * 10/23 (Nic) — THIS PORTAL RETIRED. IT IS PART OF THE LANDLORD PORTAL NOW.
+ *
+ *   "Blue's going to be property managing for some other people. And he doesn't
+ *    necessarily want to toggle between portals with a different login. He
+ *    wants to just adjust a view in the same screen."
+ *
+ * Thirteen pages and thirty endpoints moved, and nothing was lost — the
+ * inventory is in PM_FOLD_PLAN.md at the repo root. A management company is an
+ * entity on an account now, not an app: the company picker groups the companies
+ * you own and the ones you manage for other people, every property page reads
+ * both, and the company's own side of the business — the owners it works for,
+ * its rate sheets, its staff, its bank account — is the Management section.
+ *
+ * WHAT IS LEFT HERE IS A DOOR, not an app. The subdomain stays alive so that
+ * anybody with it bookmarked, or in an old email, lands somewhere that tells
+ * them where to go instead of on a dead host. One page, no login, no data, no
+ * API call.
+ */
+const LANDLORD_PORTAL = 'https://landlord.goldassetmanagement.com'
 
-const qc = new QueryClient({
-  defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } }
-})
-
-function PrivateRoute({ children }: { children: React.ReactNode }) {
-  const { user, loading, pmCompanies, activePmCompany, setActivePmCompany } = useAuth()
-  if (loading) return <div style={{ padding: 32, color: 'var(--text-3)' }}>Loading…</div>
-  if (!user) return <Navigate to="/login" replace />
-  // User is signed in but isn't a member of any pm_company → send them to register
-  if (pmCompanies.length === 0) return <Navigate to="/register" replace />
-  // S654 (Nic, DIRECTIVE): no default company — someone on staff at several
-  // chooses which one they are working in before any company page loads.
-  if (!activePmCompany) return (
-    <div style={{ maxWidth: 420, margin: '80px auto', padding: 24 }}>
-      <h2 style={{ marginTop: 0, color: 'var(--text-0)' }}>Choose a company</h2>
-      <p style={{ color: 'var(--text-2)', fontSize: '.88rem' }}>You work with more than one company. Pick the one you are working in now; you can switch any time from the menu.</p>
-      <div style={{ display: 'grid', gap: 8 }}>
-        {pmCompanies.map(c => (
-          <button key={c.id} className="btn btn-primary" onClick={() => setActivePmCompany(c)}>{c.name}</button>
-        ))}
+const root = document.getElementById('root')
+if (root) {
+  root.innerHTML = `
+    <main style="min-height:100vh;display:flex;align-items:center;justify-content:center;
+                 background:#0d0f12;color:#e8e6e3;font-family:system-ui,-apple-system,sans-serif;
+                 padding:24px;text-align:center">
+      <div style="max-width:30rem">
+        <h1 style="font-size:1.35rem;margin:0 0 .75rem;color:#d4af37">Property management moved</h1>
+        <p style="margin:0 0 1rem;line-height:1.6;color:#b4b0aa">
+          It is part of your landlord portal now &mdash; one login for the properties you own and
+          the ones you manage for other people, with the company picker to switch between them.
+        </p>
+        <p style="margin:0 0 1.5rem;line-height:1.6;color:#817d77;font-size:.9rem">
+          Your owners, rate sheets, staff and banking are under <strong>Management</strong>.
+        </p>
+        <a href="${LANDLORD_PORTAL}" style="display:inline-block;background:#d4af37;color:#1a1a1a;
+           padding:.7rem 1.4rem;border-radius:.4rem;text-decoration:none;font-weight:600">
+          Go to the landlord portal
+        </a>
       </div>
-    </div>
-  )
-  return <>{children}</>
+    </main>`
 }
 
-// HMR guard: when Vite re-executes this entry module, calling createRoot on
-// the same container again STACKS a second mounted app under the first
-// (duplicate screens, dead nav). Reuse the one root and just re-render into
-// it — idempotent across hot updates.
-const rootEl = document.getElementById('root')!
-const appRoot: ReturnType<typeof ReactDOM.createRoot> =
-  (window as any).__gam_app_root ?? ((window as any).__gam_app_root = ReactDOM.createRoot(rootEl))
-appRoot.render(
-  <React.StrictMode>
-    <SentryErrorBoundary fallback={<div style={{ padding: 40, textAlign: 'center', color: 'var(--text-0)' }}>
-      <div style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: 8 }}>Something went wrong</div>
-      <div style={{ fontSize: '.82rem', color: 'var(--text-3)', marginBottom: 16 }}>The error has been reported. Reload the page to try again.</div>
-      <button className="btn btn-primary" onClick={() => window.location.reload()}>Reload</button>
-    </div>}>
-    <QueryClientProvider client={qc}>
-      <AuthProvider>
-        <BrowserRouter>
-          <Routes>
-            <Route path="/login"    element={<LoginPage />} />
-            {/* S605: the PM portal had NO password recovery — no link, no page,
-                no route — while the API endpoint existed since S289. */}
-            <Route path="/forgot-password" element={<PmForgotPasswordPage />} />
-            <Route path="/reset-password"  element={<PmResetPasswordPage />} />
-            <Route path="/register" element={<RegisterPage />} />
-            <Route path="/" element={<PrivateRoute><Layout /></PrivateRoute>}>
-              <Route index             element={<Navigate to="/dashboard" replace />} />
-              <Route path="dashboard"      element={<DashboardPage />} />
-              <Route path="properties"      element={<PropertiesPage />} />
-              <Route path="properties/:id"  element={<PropertyDetailPage />} />
-              <Route path="owners"          element={<OwnersPage />} />
-              <Route path="invitations" element={<InvitationsPage />} />
-              <Route path="fee-plans"  element={<FeePlansPage />} />
-              <Route path="staff"      element={<StaffPage />} />
-              <Route path="banking"    element={<BankingPage />} />
-              <Route path="settings"   element={<SettingsPage />} />
-              <Route path="totp/enroll" element={<TotpEnrollPage />} />
-            </Route>
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
-          <DialogHost />
-        </BrowserRouter>
-      </AuthProvider>
-    </QueryClientProvider>
-    </SentryErrorBoundary>
-  </React.StrictMode>
-)
+// A bookmark should not need a click. Long enough to read why first.
+setTimeout(() => { window.location.replace(LANDLORD_PORTAL) }, 6000)

@@ -164,8 +164,10 @@ else
   # long and both are green, and in this stage they cost no wall clock at all.
   stage_run pos-tests /tmp/gam-deploy-tests-pos.log \
     "cd apps/pos && npx vitest run --reporter=dot"
-  stage_run pm-company-tests /tmp/gam-deploy-tests-pm-company.log \
-    "cd apps/pm-company && npx vitest run --reporter=dot"
+  # 10/23: apps/pm-company is a one-page door to the landlord portal now (the
+  # management portal folded in — PM_FOLD_PLAN.md). Nothing to test: no login,
+  # no data, no API call. The surface still BUILDS and deploys below, so the
+  # subdomain keeps answering for anybody who has it bookmarked.
 fi
 
 # The API's own build (tsc -b). The launchd restart that makes it live is its
@@ -198,7 +200,7 @@ if ! $CHECK_ONLY && ! $SKIP_TESTS; then
   gate_suite tenant-tests   "tenant portal suite green"   /tmp/gam-deploy-tests-tenant.log
   gate_suite landlord-tests "landlord portal suite green" /tmp/gam-deploy-tests-landlord.log
   gate_suite pos-tests        "register suite green"      /tmp/gam-deploy-tests-pos.log
-  gate_suite pm-company-tests "PM company suite green"    /tmp/gam-deploy-tests-pm-company.log
+
 fi
 
 # ── API ──────────────────────────────────────────────────────────────────

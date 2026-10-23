@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict FzaGdb2y6iaTA1B8hWtA0Ig5x3LzcFIdrkwDfqy1KXwhLCwohLkCKKAmTS6nYGs
+\restrict W0OKnSIw5BGVYIKAxTDdu3qYYEvStv3uvhIN8UVu2T4hmM7U4QTeCLxuBlUIJRf
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -33436,6 +33436,13 @@ CREATE UNIQUE INDEX ux_lease_unit_history_current ON public.lease_unit_history U
 
 
 --
+-- Name: ux_maintenance_worker_scopes_person_company; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_maintenance_worker_scopes_person_company ON public.maintenance_worker_scopes USING btree (user_id, landlord_id);
+
+
+--
 -- Name: ux_monthly_fee_accruals_property_month; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -33447,6 +33454,13 @@ CREATE UNIQUE INDEX ux_monthly_fee_accruals_property_month ON public.monthly_fee
 --
 
 CREATE UNIQUE INDEX ux_notification_preferences_user_type ON public.notification_preferences USING btree (user_id, type);
+
+
+--
+-- Name: ux_onsite_manager_scopes_person_company; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_onsite_manager_scopes_person_company ON public.onsite_manager_scopes USING btree (user_id, landlord_id);
 
 
 --
@@ -33566,6 +33580,13 @@ CREATE UNIQUE INDEX ux_propane_fills_client_key ON public.propane_fills USING bt
 --
 
 CREATE UNIQUE INDEX ux_properties_booking_slug ON public.properties USING btree (booking_slug) WHERE (booking_slug IS NOT NULL);
+
+
+--
+-- Name: ux_property_manager_scopes_person_company; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_property_manager_scopes_person_company ON public.property_manager_scopes USING btree (user_id, landlord_id);
 
 
 --
@@ -46550,5 +46571,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict FzaGdb2y6iaTA1B8hWtA0Ig5x3LzcFIdrkwDfqy1KXwhLCwohLkCKKAmTS6nYGs
+\unrestrict W0OKnSIw5BGVYIKAxTDdu3qYYEvStv3uvhIN8UVu2T4hmM7U4QTeCLxuBlUIJRf
 

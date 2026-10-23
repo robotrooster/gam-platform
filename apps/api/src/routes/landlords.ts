@@ -1633,6 +1633,20 @@ landlordsRouter.delete('/me/deposit-interest-overrides/:state/:year',
  */
 
 // GET /api/landlords/me/entities — everything this user can operate in.
+//
+// 10/23 — AND WHETHER THEY OWN IT OR MANAGE IT. The third-party management
+// portal folded into this one, so one account can hold both: Blu owns Country
+// Acres and manages Oak Park for its owner.
+//
+//   "Blue's going to be property managing for some other people. And he doesn't
+//    necessarily want to toggle between portals with a different login. He
+//    wants to just adjust a view in the same screen."
+//
+// `role` is what the picker groups on, and `property_count` counts only what
+// they can actually reach: every property of a company they OWN, and just the
+// ones the owner engaged them for on a company they MANAGE. A managed company
+// showing the owner's whole portfolio in a count would be the first lie on the
+// screen.
 landlordsRouter.get('/me/entities', requireLandlord, async (req, res, next) => {
   try {
     const rows = await query<any>(
@@ -1640,16 +1654,29 @@ landlordsRouter.get('/me/entities', requireLandlord, async (req, res, next) => {
               l.business_name,
               l.ein IS NOT NULL AS has_ein,
               l.connect_payouts_enabled,
-              (SELECT COUNT(*) FROM properties p WHERE p.landlord_id = l.id)::int AS property_count,
-              (l.user_id = $1) AS is_owner,
+              CASE WHEN own.owns THEN 'owner' ELSE 'manager' END AS role,
+              own.owns AS is_owner,
+              mine.via_pm_company_id,
+              CASE WHEN own.owns
+                   THEN (SELECT COUNT(*) FROM properties p WHERE p.landlord_id = l.id)::int
+                   ELSE COALESCE(cardinality(s.property_ids), 0)
+              END AS property_count,
               -- S633: there is no "active" entity. The account is signed into
               -- ALL of them at once; nothing switches. Kept as a false column
               -- only so an older client reading it does not crash.
               FALSE AS is_active
-         FROM landlord_members lm
-         JOIN landlords l ON l.id = lm.landlord_id
-        WHERE lm.user_id = $1
-        ORDER BY (l.user_id = $1) DESC, l.created_at ASC`,
+         FROM landlords l
+         JOIN LATERAL (
+           SELECT bool_or(lm.role = 'owner') AS owns,
+                  MAX(lm.via_pm_company_id::text) FILTER (WHERE lm.role = 'manager') AS via_pm_company_id
+             FROM landlord_members lm WHERE lm.landlord_id = l.id AND lm.user_id = $1
+         ) mine ON TRUE
+         JOIN LATERAL (SELECT (l.user_id = $1 OR COALESCE(mine.owns, FALSE)) AS owns) own ON TRUE
+         LEFT JOIN property_manager_scopes s ON s.landlord_id = l.id AND s.user_id = $1
+        WHERE l.user_id = $1
+           OR EXISTS (SELECT 1 FROM landlord_members lm2
+                       WHERE lm2.landlord_id = l.id AND lm2.user_id = $1)
+        ORDER BY own.owns DESC, l.business_name NULLS LAST, l.created_at ASC`,
       [req.user!.userId])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }

@@ -12,7 +12,7 @@ import {
   LayoutDashboard, Building2, DoorOpen, Users, CreditCard,
   ArrowDownToLine, Wrench, FileText, LogOut, Settings,
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
-  UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
+  UserSearch, ClipboardList, HeartHandshake, Briefcase, PenTool, UserPlus,
   Landmark, ClipboardCheck, MessageSquare,
   Sun, Moon, Globe, Headphones, Camera, Gauge, BookOpen, Receipt } from 'lucide-react'
 import { BOOKS_PATHS } from '../../bookkeeping/adapter'
@@ -231,6 +231,10 @@ const NAV_ITEMS: Array<{
   // Admin
   { to: '/team',          icon: Shield,           label: 'Team',             section: 'Admin' },
   { to: '/pm-invitations', icon: HeartHandshake,  label: 'PM Invitations',   section: null,          category: 'pm_invitations' },
+  // 10/23 (Nic): the third-party management portal folded into this one, so a
+  // management company's own side of the business — the owners it works for,
+  // its rate sheets, its staff, its bank account — is a section here.
+  { to: '/management',     icon: Briefcase,       label: 'Management',       section: null,          category: 'pm_invitations' },
   { to: '/settings',      icon: Settings,         label: 'Settings',         section: null,          category: 'settings' },
 ]
 
@@ -467,14 +471,17 @@ export function HubTabLayout({ hub }: { hub: Hub }) {
 // pages + backend stay intact — unhide post-launch by emptying this set.
 //   /flex-charge    — Flex Suite hidden at launch (LAUNCH_DECISIONS #7)
 //   /subleases      — unfinished (#16), no seed data
-//   /pm-invitations — PM-company portal not launching with the trio
+//   /pm-invitations — SUPERSEDED 10/23: it was hidden because the PM-company
+//                     portal was not launching with the trio. That portal is
+//                     gone — it folded into this one (PM_FOLD_PLAN.md) — so
+//                     the engagement list launches here, as a tab of
+//                     /management, and this entry is no longer hidden.
 // /work-trade PROMOTED for launch (W-54, Nic S531) — its auto-billing was
 // completed in the S517 rebuild; gets its own walkthrough pass (W-56).
 // Fitness (external SSO link, no route) is hidden via LAUNCH_HIDE_FITNESS.
 export const LAUNCH_HIDDEN = new Set<string>([
   '/flex-charge',
   '/subleases',
-  '/pm-invitations',
 ])
 export const LAUNCH_HIDE_FITNESS = true
 // S605 (Nic): subleasing is SHELVED — the workflow requires the sublessee to

@@ -390,7 +390,32 @@ export async function assertPropertyInScope(
   opts: { perm?: string | string[] } = {},
 ): Promise<void> {
   if (!user) throw new AppError(401, 'Unauthenticated')
-  if (OWNER_ROLES.includes(user.role)) return
+  // 10/23 — AN OWNER OF THEIR OWN COMPANY IS A MANAGER OF SOMEBODY ELSE'S.
+  //
+  // Folding the management portal in means Blu signs in to ONE account that
+  // owns Country Acres and manages Oak Park for its owner. His users.role is
+  // 'landlord' either way, and 'landlord' used to bypass every property check
+  // outright — so a grant of one park would have shown him the whole of
+  // somebody else's company. The bypass is right for a company they OWN and
+  // wrong for one they manage, so it now asks which this property's company is.
+  //
+  // Not a member at all falls through to the bypass, exactly as before: the
+  // company-level gates (canAccessLandlordResource, resolveLandlordTarget) are
+  // what refuse a stranger, and this function has never been the thing that
+  // did it.
+  if (OWNER_ROLES.includes(user.role)) {
+    if (user.role !== 'landlord' || !propertyId) return
+    const how = await query<{ role: string }>(
+      `SELECT m.role
+         FROM properties p
+         JOIN landlord_members m ON m.landlord_id = p.landlord_id AND m.user_id = $1
+        WHERE p.id = $2::uuid`,
+      [user.userId, propertyId])
+    if (!how.length || how.some(r => r.role === 'owner')) return
+    // Managed, not owned: the owner's grant decides, read below out of the
+    // property-manager scope for this company.
+    return await assertManagedPropertyInScope(user, propertyId, opts)
+  }
   if (user.role === 'bookkeeper') {
     // 10/12: an action is on a property the company owns today and they keep.
     // A former property is read only (lib/bookkeeperScope).
@@ -442,6 +467,32 @@ export async function assertPropertyInScope(
   // Granted by THIS property's company, or not granted here at all.
   const granted = reaching.some(r => needs.some(k => (r.permissions ?? {})[k] === true))
   if (!granted) throw new AppError(403, 'Insufficient permissions for this property')
+}
+
+/**
+ * The same question for somebody whose access to this company came from MANAGING
+ * it rather than owning it: their grant lives in property_manager_scopes for
+ * that company, whatever their own account's role says. Kept beside the worker
+ * path rather than folded into it, because the two arrive by different doors and
+ * a reader should see that.
+ */
+async function assertManagedPropertyInScope(
+  user: AuthPayload, propertyId: string, opts: { perm?: string | string[] } = {},
+): Promise<void> {
+  const rows = await query<{ property_ids: string[]; all_properties: boolean; permissions: Record<string, unknown> | null }>(
+    `SELECT s.property_ids, s.all_properties, s.permissions
+       FROM property_manager_scopes s
+       JOIN properties p ON p.landlord_id = s.landlord_id
+      WHERE s.user_id = $1 AND p.id = $2::uuid`,
+    [user.userId, propertyId])
+  const reaching = rows.filter(r => r.all_properties || r.property_ids.includes(propertyId))
+  if (!reaching.length) {
+    throw new AppError(403, 'You manage this company, but not this property')
+  }
+  const needs = opts.perm == null ? [] : (Array.isArray(opts.perm) ? opts.perm : [opts.perm])
+  if (!needs.length) return
+  if (reaching.some(r => needs.some(k => (r.permissions ?? {})[k] === true))) return
+  throw new AppError(403, 'The owner of this property has not given you that')
 }
 
 // Read-side companion to assertPropertyInScope: which properties may this

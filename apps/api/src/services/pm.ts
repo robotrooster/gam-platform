@@ -21,6 +21,7 @@ import type { PoolClient } from 'pg'
 import crypto from 'crypto'
 import { db, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
+import { grantManagedAccess, revokeManagedAccess } from './managedAccess'
 
 // ── PM resolver ────────────────────────────────────────────────────────────
 
@@ -313,6 +314,32 @@ export async function acceptPropertyInvitation(
       WHERE id=$1`,
     [invitation.id, acceptingUserId, conflict ? existingPmId : null]
   )
+
+  // 10/22–23 (Nic) — AND THE COMPANY'S PEOPLE CAN NOW SEE IT, IN THEIR OWN
+  // PORTAL, WITH THEIR OWN LOGIN.
+  //
+  // The management portal folded into the landlord portal, so an engagement is
+  // no longer "a row the other app reads" — it is access, on this property
+  // only, for the people this company employs, with the permissions their own
+  // boss gave them and capped by what THIS owner agreed to (a 'view'
+  // engagement writes nothing, ever). services/managedAccess has the rule.
+  //
+  // The property the owner is taking back comes off the people who had it, in
+  // the same breath: an engagement that was replaced is over.
+  if (conflict && existingPmId) {
+    await revokeManagedAccess(client, {
+      pmCompanyId: existingPmId,
+      landlordId: invitation.landlord_id,
+      propertyId: invitation.property_id,
+    })
+  }
+  await grantManagedAccess(client, {
+    pmCompanyId: invitation.pm_company_id,
+    landlordId: invitation.landlord_id,
+    propertyId: invitation.property_id,
+    scope: invitation.proposed_scope === 'manage' ? 'manage' : 'view',
+    grantedByUserId: acceptingUserId,
+  })
 
   return {
     invitationId: invitation.id,

@@ -88,17 +88,35 @@ PM fee cut (`allocation_pm_company_fee`) is untouched.
    instead of hopeful: today only 15 of 108 route files call a scope check by
    hand.
 
-## Order
+## Order — ALL SIX DONE (10/23)
 
-1. `landlord_members.role` gains `'manager'`; membership reads include managed
-   companies. **No behavior change for owners.**
-2. Scope resolution becomes per-company: union the rows, honor the active
-   company, never a default. Fix the `LIMIT 1`.
-3. Sub-delegation, capped by the owner's grant.
-4. The scope guard test.
-5. Move the four NEW pages into the landlord portal under Management.
-6. Retire pm.goldassetmanagement.com with a redirect; delete `apps/pm-company`
-   and its deploy stage.
+1. ✅ `landlord_members.role` takes `'manager'`, with `via_pm_company_id` so the
+   access belongs to the company the owner engaged.
+2. ✅ Scope AND permissions resolve per company. The `LIMIT 1` reads are gone;
+   a property names its company and that company's grant decides. A
+   landlord-role user who MANAGES a company no longer bypasses the property
+   check on it — that was the hole the fold would have opened.
+3. ✅ Sub-delegation: accepting an engagement grants the company's people that
+   property, with the permissions their own boss gave them, **capped by what the
+   owner agreed to** (a `view` engagement can change nothing, ever).
+   `services/managedAccess.ts`.
+4. ✅ Two guards: nothing reads a scope row by person alone
+   (`scopeReadsAreCompanyAware`), and no new landlord-side route mutates without
+   a property gate, a company gate or a stated reason
+   (`landlordRoutesAreScoped` — a ratchet over a dated debt list).
+5. ✅ One **Management** section in the landlord portal — owners and their
+   monthly statements, engagements, rate sheets, staff, banking — calling the
+   same `/pm/companies/...` endpoints the old portal did. The company picker
+   groups "Companies you own" and "Companies you manage for others".
+6. ✅ `pm.goldassetmanagement.com` is a one-page door that says where things
+   moved and forwards to the landlord portal (works with JavaScript off). The
+   thirteen pages are deleted; its test stage is gone from `deploy.sh`; the
+   surface still builds so the subdomain keeps answering a bookmark.
+
+**Still worth doing, and not part of the fold:** the eleven route files marked
+`TO VERIFY` in `landlordRoutesAreScoped` — read each and either scope it or say
+what gates it. And `maintenance-portal` wants a property gate once a management
+company has maintenance staff.
 
 ## Guards that must hold throughout
 
