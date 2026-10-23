@@ -58,30 +58,54 @@ async function getScopeForUser(userId: string, role: string):
       permissions: r.permissions || {},
     } : null
   }
-  if (role === 'property_manager') {
-    const r = await queryOne<any>(
-      `SELECT landlord_id, permissions, direct_deposit_enabled, property_ids, all_properties
-         FROM property_manager_scopes WHERE user_id = $1 LIMIT 1`,
+  // 10/22 — A WORKER CAN WORK FOR SEVERAL COMPANIES, so the pass is built from
+  // EVERY grant they hold, not from whichever row came back first.
+  //
+  // What the pass carries is ADMISSION: requirePerm opens a route on it. The
+  // authority on whether a permission was granted where it is being used is
+  // middleware/auth assertPropertyInScope, which reads the set the property's
+  // own company granted, fresh, on the request. Those are two different
+  // questions and this is the looser one — union, so a second company's grant
+  // is not lost at the door, with the narrow check done at the property.
+  //
+  // `landlordId` stays the first company, because for a worker at one company
+  // it is exactly what it always was, and nothing is allowed to resolve a
+  // company FROM it (S654: none is a default).
+  if (role === 'property_manager' || role === 'onsite_manager' || role === 'maintenance') {
+    const table = role === 'property_manager' ? 'property_manager_scopes'
+      : role === 'onsite_manager' ? 'onsite_manager_scopes' : 'maintenance_worker_scopes'
+    const rows = await query<any>(
+      `SELECT landlord_id, permissions, property_ids, all_properties${
+         role === 'property_manager' ? ', direct_deposit_enabled' : ''}
+         FROM ${table} WHERE user_id = $1 ORDER BY created_at, landlord_id`,
       [userId])
-    return r ? {
-      landlordId: r.landlord_id,
-      permissions: r.permissions || {},
-      directDepositEnabled: !!r.direct_deposit_enabled,
-      propertyIds: r.property_ids || [],
-      allProperties: !!r.all_properties,
-    } : null
-  }
-  if (role === 'onsite_manager') {
-    const r = await queryOne<any>(
-      `SELECT landlord_id, permissions, property_ids, all_properties FROM onsite_manager_scopes WHERE user_id = $1 LIMIT 1`,
-      [userId])
-    return r ? { landlordId: r.landlord_id, permissions: r.permissions || {}, propertyIds: r.property_ids || [], allProperties: !!r.all_properties } : null
-  }
-  if (role === 'maintenance') {
-    const r = await queryOne<any>(
-      `SELECT landlord_id, permissions, property_ids, all_properties FROM maintenance_worker_scopes WHERE user_id = $1 LIMIT 1`,
-      [userId])
-    return r ? { landlordId: r.landlord_id, permissions: r.permissions || {}, propertyIds: r.property_ids || [], allProperties: !!r.all_properties } : null
+    if (!rows.length) return null
+    // Deep merge: a permission set is nested in places ({ payments: { view_all:
+    // true } }) and flat dotted keys in others, and both shapes are read. A
+    // grant from either company is a grant, so true wins at any depth.
+    const grant = (into: Record<string, any>, from: Record<string, any>) => {
+      for (const [k, v] of Object.entries(from || {})) {
+        if (v && typeof v === 'object' && !Array.isArray(v)) {
+          if (!into[k] || typeof into[k] !== 'object') into[k] = {}
+          grant(into[k], v as Record<string, any>)
+        } else if (v === true || into[k] === undefined) {
+          into[k] = v === true ? true : (into[k] ?? v)
+        }
+      }
+    }
+    const permissions: Record<string, any> = {}
+    const propertyIds = new Set<string>()
+    for (const r of rows) {
+      grant(permissions, r.permissions || {})
+      for (const id of (r.property_ids || [])) propertyIds.add(id)
+    }
+    return {
+      landlordId: rows[0].landlord_id,
+      permissions,
+      ...(role === 'property_manager' ? { directDepositEnabled: rows.some((r: any) => r.direct_deposit_enabled) } : {}),
+      propertyIds: [...propertyIds],
+      allProperties: rows.every((r: any) => r.all_properties),
+    }
   }
   if (role === 'bookkeeper') {
     // 10/11: oldest assignment first, so the company on the pass is the same

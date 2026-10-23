@@ -82,10 +82,31 @@ async function clean(co: LedgerCompany): Promise<void> {
   expect(b.dr).toBe(b.cr)
 }
 
+/**
+ * 10/22 — A DRAIN THIS FILE ASKS FOR ALWAYS HAPPENS.
+ *
+ * `drainLedgerOutbox()` with no owner takes a GLOBAL advisory lock, and when it
+ * cannot get it, it returns `{ skipped: true }` and drains NOTHING. That is
+ * right for the minute cron — two of them must not pile up — and it is a quiet
+ * trap for a test, which called it to make the ledger settle and then asserted
+ * against a projection that had not been written.
+ *
+ * It cost the deploy gate a run tonight: the closed-month check compared
+ * August's reopened balances against the close snapshot and found $111 against
+ * $100, which is exactly what an undrained outbox looks like from the outside.
+ * The file passes on its own every time, which is the signature.
+ *
+ * An OWNER-SCOPED drain takes no global lock at all, so it cannot skip, and it
+ * is also tighter: only this company's work, which is all any test here wants.
+ * (10/22, Nic, on a race like this: "we need to make it slower... take the
+ * conservative approach to make sure things don't get missed.")
+ */
+const drain = (co: LedgerCompany) => drainLedgerOutbox({ ownerId: co.landlordId })
+
 /** August posted and closed, then 'Other income' (4900) deleted in favor of 4950. */
 async function augustClosedThenDeleted(co: LedgerCompany, before?: () => Promise<void>) {
   const aug = await addOtherIncome(co, { amount: 100, day: '2026-08-10' })
-  await drainLedgerOutbox()
+  await drain(co)
   await closeMonth({ owner: co.owner, through: '2026-08-31', actorUserId: co.ownerUserId })
   if (before) await before()
   const closed = await linesThrough(co, '2026-08-31')
@@ -108,7 +129,7 @@ async function augustClosedThenDeleted(co: LedgerCompany, before?: () => Promise
   // So the setup hands back a ledger that has settled. It is drained here
   // rather than in each test, because every test that uses this setup wants
   // the same thing and the one that forgot is exactly how this got through.
-  await drainLedgerOutbox()
+  await drain(co)
   return { aug, closed, misc, repl }
 }
 
@@ -122,7 +143,7 @@ describe('(a) a record dated in a closed month that arrives after its account wa
 
     // Entered after the deletion, dated inside closed August.
     const late = await addOtherIncome(co, { amount: 7, day: '2026-08-20' })
-    await drainLedgerOutbox()
+    await drain(co)
     const ps = await postingsOf('other_income', late)
     expect(ps.map(p => [p.role, p.intended_date, p.accounting_date, p.is_correction])).toEqual([
       ['post', '2026-08-20', '2026-09-01', true],
@@ -144,7 +165,7 @@ describe('(a) a record dated in a closed month that arrives after its account wa
     const co = await ledgerCompany()
     const { aug, closed, misc, repl } = await augustClosedThenDeleted(co)
     await db.query(`UPDATE landlord_other_income SET amount = 120 WHERE id = $1`, [aug])
-    await drainLedgerOutbox()
+    await drain(co)
     const ps = await postingsOf('other_income', aug)
     expect(ps.map(p => [p.role, p.intended_date, p.accounting_date, p.is_correction])).toEqual([
       ['post', '2026-08-10', '2026-08-10', false],
@@ -174,12 +195,12 @@ describe('(a) a record dated in a closed month that arrives after its account wa
     })
     const aug = await entry('2026-08-05', 1)
     const sep = await entry('2026-09-05', 2)
-    await drainLedgerOutbox()
+    await drain(co)
     await closeMonth({ owner: co.owner, through: '2026-08-31', actorUserId: co.ownerUserId })
     const closed = await linesThrough(co, '2026-08-31')
     const oddNew = await account(co, '5902', 'Odd jobs (new)', 'expense')
     await retireAccount({ owner: co.owner, accountId: odd, replacementAccountId: oddNew, actorUserId: co.ownerUserId })
-    await drainLedgerOutbox()
+    await drain(co)
     expect((await lineAccounts('manual_journal', aug)).sort()).toEqual(['1001', '5901'])
     expect((await lineAccounts('manual_journal', sep)).sort()).toEqual(['1001', '5902'])
     expect(await linesThrough(co, '2026-08-31')).toEqual(closed)
@@ -194,11 +215,11 @@ describe('(b) open months move to the replacement', () => {
     const { aug, closed, misc, repl } = await augustClosedThenDeleted(co, async () => {
       // Entered after August closed but BEFORE the deletion: a correction on September 1, on 4900.
       lateBefore = await addOtherIncome(co, { amount: 9, day: '2026-08-25' })
-      await drainLedgerOutbox()
+      await drain(co)
       expect(await lineAccounts('other_income', lateBefore)).toEqual(['1099', '4900'])
     })
     const sep = await addOtherIncome(co, { amount: 50, day: '2026-09-10' })
-    await drainLedgerOutbox()
+    await drain(co)
     expect(await lineAccounts('other_income', sep)).toEqual(['1099', '4950'])
     // The open month's correction moved with the open months, keeping its dates.
     expect(await lineAccounts('other_income', lateBefore)).toEqual(['1099', '4950'])
@@ -220,7 +241,7 @@ describe('(c) closed months never change', () => {
     await clean(co)
     expect(await lineAccounts('other_income', aug)).toEqual(['1099', '4900'])
     const reopened = await addOtherIncome(co, { amount: 11, day: '2026-08-25' })
-    await drainLedgerOutbox()
+    await drain(co)
     expect((await activeOf('other_income', reopened)).map(p => [p.intended_date, p.accounting_date, p.is_correction]))
       .toEqual([['2026-08-25', '2026-08-25', false]])
     expect(await lineAccounts('other_income', reopened)).toEqual(['1099', '4950'])
