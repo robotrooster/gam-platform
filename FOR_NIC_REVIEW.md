@@ -1,8 +1,12 @@
 # For Nic — 10/22, while you were out
 
-Everything below is **built, tested and pushed. Nothing is deployed.** The live
-site is still on this morning's build, which is correct for the two checkouts
-you needed.
+**DEPLOYED, on your go-ahead, once every suite was green.** API, landlord,
+admin and marketing all shipped and verified. The landlord portal failed its
+first build on an npm race in the parallel build stage — not a code error — and
+went out clean on the re-run.
+
+Gate: API **15,652**, tenant **353**, landlord **1,331**, register **15**, PM
+company **14**. All green.
 
 ---
 
@@ -140,5 +144,28 @@ manager's cut is a different line from an owner's rent.
 
 ---
 
-**Say the word and I will deploy.** I held it because you opened new items after
-the go-ahead, and nothing you need today is waiting on it.
+## One more thing found on the way out
+
+The deploy gate went red first time on a ledger test, and it was not a flake in
+the ordinary sense. `drainLedgerOutbox()` with no company named takes a global
+lock, and **when it cannot get the lock it quietly drains nothing** — right for
+the minute cron, a trap for a test that called it to settle the books and then
+checked them. It made the closed-month check read $111 against a $100 snapshot.
+
+Fixed by scoping those drains to the company, which takes no global lock and so
+cannot skip. **There are 272 more unchecked drains across the suite** with the
+same trap in them; making a scoped drain the only way a test settles the ledger
+is on the list for the morning.
+
+I went looking for a bug in the check itself first — `ORDER BY id DESC` to find
+the latest close looked exactly like this morning's uuid trap — and it is not
+one: that id is a bigint, so the ordering is sound. Checking beat assuming.
+
+## Left for the morning
+
+1. **The refund hook** (section 1 above) — one hook, one figure reconciled.
+2. **The drain sweep** — 272 call sites.
+3. **PM fold, steps 3 to 6** — sub-delegation, the route-scope guard, moving the
+   four pages, retiring the subdomain. `PM_FOLD_PLAN.md` has the order.
+4. **The portfolio picker** as drawn above, once there is a managed company to
+   put in it.
