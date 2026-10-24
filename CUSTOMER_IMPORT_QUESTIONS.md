@@ -72,3 +72,46 @@ Both are in this file, so the import brings them in:
   already recorded as cash with nobody attached; it needs Hamp and the tender
   corrected.
 - **Mike Prevenas** — propane $23.92, check **1006**. Not recorded yet.
+
+---
+
+# ANSWERED 10/24 — the rules the import now follows
+
+1. **The 16 non-people rows: left behind.** Plus the 7 already refused.
+2. **The 10 same-name pairs are EXACT duplicates** — same spelling, same case.
+   What differs is completeness: one row carries contact details, its twin is
+   blank. So they merge safely and the fuller row wins.
+3. **Couples are split into two people.** Nic: *"We don't want couples being on
+   there as one customer."* Rosie & Don Jorgensen → Rosie, Don. Kent & Kelly
+   Nielsen → Kent, Kelly.
+4. **No full last name → not a person.** Drops "Jeremy J" and the blank
+   first-name Tucker row.
+5. **Same phone = one person**, except **Matthew and Richard Gomez**, who are
+   two (father and son on one phone).
+6. **"Dalke Tucker" was an error — keep only Phil Tucker.** (Note: a real
+   **Dale** Tucker exists on a different phone in Indiana and is a different
+   person. Leave him alone.)
+7. **Kent and Kelly Nielsen stay as two records.** A FAMILY GROUPING is wanted
+   instead of a merge: *"if one person makes the stay and the other person makes
+   the stay, it kind of goes on both of their histories."* Its own piece of
+   work, also the right answer for the father-and-son pairs.
+
+## Martin Pina and Donald Premus — NOT a new blacklist feature
+
+Nic, 10/24: *"that was my way of saying they left without paying. The archived
+invoices from Square that I still have to import are going to show some
+outstanding balances from them... There is evidence to back them up."*
+
+So this is **the left-owing flag that already exists**, not a blacklist. It is
+the better instrument anyway: the amount is frozen at import, other landlords
+see "high risk — owes other people money" with no specifics, and the evidence is
+the invoice itself rather than anybody's opinion. Nothing new to build.
+
+They come in as ordinary customers now; the flag arrives with the Square import,
+which is still inside the onboarding window the frozen amount requires.
+
+**One thing their own data will produce:** these two SHARE A PHONE NUMBER. If a
+Square invoice carries that phone, a name+phone match could reach the wrong man.
+The matcher handles it — the name has to agree too, and "same phone, different
+name" goes to the admin review queue instead of flagging anybody. Worth watching
+when those invoices land.
