@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict W0OKnSIw5BGVYIKAxTDdu3qYYEvStv3uvhIN8UVu2T4hmM7U4QTeCLxuBlUIJRf
+\restrict DCeC2UTu8gtEelqJMIAaWBoaucOqmOzzQb2nefkOgv8hhgviO66GBAy3d2ECpYF
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -12694,6 +12694,36 @@ COMMENT ON TABLE public.home_ownerships IS 'S568: who owns the tenant-owned home
 
 
 --
+-- Name: home_sale_assumptions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.home_sale_assumptions (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    contract_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    from_tenant_id uuid NOT NULL,
+    to_tenant_id uuid NOT NULL,
+    effective_month date NOT NULL,
+    document_id uuid,
+    balance_goes_to text DEFAULT 'leaver'::text NOT NULL,
+    note text,
+    recorded_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT home_sale_assumption_changes_hands CHECK ((from_tenant_id <> to_tenant_id)),
+    CONSTRAINT home_sale_assumption_whole_month CHECK ((effective_month = (date_trunc('month'::text, (effective_month)::timestamp with time zone))::date)),
+    CONSTRAINT home_sale_assumptions_balance_goes_to_check CHECK ((balance_goes_to = ANY (ARRAY['leaver'::text, 'space'::text])))
+);
+
+
+--
+-- Name: TABLE home_sale_assumptions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.home_sale_assumptions IS '10/23 (Nic): a home-installment sale taken over by the next resident "straight across" — same price, same payment. The contract keeps its original buyer (a watched ledger column); this says who owes it from which month.';
+
+
+--
 -- Name: home_sale_contracts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -17478,7 +17508,9 @@ CREATE TABLE public.pos_transactions (
     open_ticket_id uuid,
     paid_online boolean DEFAULT false NOT NULL,
     voided_at timestamp with time zone,
-    CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card'::text, 'card_on_file'::text, 'charge'::text]))),
+    payment_reference text,
+    CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'check'::text, 'card'::text, 'card_on_file'::text, 'charge'::text]))),
+    CONSTRAINT pos_transactions_reference_shape CHECK (((payment_reference IS NULL) OR (payment_method = 'check'::text))),
     CONSTRAINT pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'partial_refund'::text, 'voided'::text])))
 );
 
@@ -17495,6 +17527,13 @@ COMMENT ON COLUMN public.pos_transactions.paid_online IS 'S653: the customer pai
 --
 
 COMMENT ON COLUMN public.pos_transactions.voided_at IS '10/12 (Nic, ledger P1): when the sale was voided (status voided). Written by the void.';
+
+
+--
+-- Name: COLUMN pos_transactions.payment_reference; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_transactions.payment_reference IS '10/23: the check number on a check sale — the same thing payments.reference holds on an invoice. NULL on every other tender.';
 
 
 --
@@ -17757,6 +17796,7 @@ CREATE TABLE public.properties (
     late_fee_accrual_period text,
     late_fee_cap_amount numeric(10,2),
     late_fee_cap_type text,
+    accepts_checks boolean DEFAULT true NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_card_fee_payer_check CHECK ((booking_card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
@@ -17926,6 +17966,13 @@ COMMENT ON COLUMN public.properties.prorates_mid_month_rent IS '10/18 (Nic): doe
 --
 
 COMMENT ON COLUMN public.properties.late_fee_initial_amount IS '10/19 (Nic): no default here, ever. A real late-fee policy lives in property_unit_type_late_fees per unit type and is stamped onto the lease; this is read only by the state-law warning on the property page and is NULL until somebody deliberately sets it.';
+
+
+--
+-- Name: COLUMN properties.accepts_checks; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.accepts_checks IS '10/23 (Nic): "that needs to be turned on or off if a property chooses to accept checks. A lot of places don''t accept them." Defaults TRUE because every property already takes a check on an invoice.';
 
 
 --
@@ -24398,6 +24445,22 @@ ALTER TABLE ONLY public.home_ownerships
 
 
 --
+-- Name: home_sale_assumptions home_sale_assumption_once_per_month; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.home_sale_assumptions
+    ADD CONSTRAINT home_sale_assumption_once_per_month UNIQUE (contract_id, effective_month);
+
+
+--
+-- Name: home_sale_assumptions home_sale_assumptions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.home_sale_assumptions
+    ADD CONSTRAINT home_sale_assumptions_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: home_sale_contracts home_sale_contracts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -29156,6 +29219,13 @@ CREATE INDEX idx_home_ownerships_sale_document ON public.home_ownerships USING b
 --
 
 CREATE INDEX idx_home_ownerships_unit ON public.home_ownerships USING btree (unit_id);
+
+
+--
+-- Name: idx_home_sale_assumption_contract; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_home_sale_assumption_contract ON public.home_sale_assumptions USING btree (contract_id, effective_month DESC);
 
 
 --
@@ -34217,6 +34287,13 @@ CREATE TRIGGER audit_flexpay_inquiries AFTER DELETE OR UPDATE ON public.flexpay_
 --
 
 CREATE TRIGGER audit_held_payout_items AFTER DELETE OR UPDATE ON public.held_payout_items FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: home_sale_assumptions audit_home_sale_assumptions; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_home_sale_assumptions AFTER DELETE OR UPDATE ON public.home_sale_assumptions FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -40431,6 +40508,54 @@ ALTER TABLE ONLY public.home_ownerships
 
 
 --
+-- Name: home_sale_assumptions home_sale_assumptions_contract_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.home_sale_assumptions
+    ADD CONSTRAINT home_sale_assumptions_contract_id_fkey FOREIGN KEY (contract_id) REFERENCES public.home_sale_contracts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: home_sale_assumptions home_sale_assumptions_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.home_sale_assumptions
+    ADD CONSTRAINT home_sale_assumptions_document_id_fkey FOREIGN KEY (document_id) REFERENCES public.lease_documents(id) ON DELETE SET NULL;
+
+
+--
+-- Name: home_sale_assumptions home_sale_assumptions_from_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.home_sale_assumptions
+    ADD CONSTRAINT home_sale_assumptions_from_tenant_id_fkey FOREIGN KEY (from_tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: home_sale_assumptions home_sale_assumptions_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.home_sale_assumptions
+    ADD CONSTRAINT home_sale_assumptions_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: home_sale_assumptions home_sale_assumptions_recorded_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.home_sale_assumptions
+    ADD CONSTRAINT home_sale_assumptions_recorded_by_fkey FOREIGN KEY (recorded_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: home_sale_assumptions home_sale_assumptions_to_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.home_sale_assumptions
+    ADD CONSTRAINT home_sale_assumptions_to_tenant_id_fkey FOREIGN KEY (to_tenant_id) REFERENCES public.tenants(id);
+
+
+--
 -- Name: home_sale_contracts home_sale_contracts_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -46571,5 +46696,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict W0OKnSIw5BGVYIKAxTDdu3qYYEvStv3uvhIN8UVu2T4hmM7U4QTeCLxuBlUIJRf
+\unrestrict DCeC2UTu8gtEelqJMIAaWBoaucOqmOzzQb2nefkOgv8hhgviO66GBAy3d2ECpYF
 

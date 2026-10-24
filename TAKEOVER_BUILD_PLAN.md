@@ -103,3 +103,64 @@ what is being papered today."* Carry-forward is the outlier.
 Plus gap 4: **the add activates on the NEW PERSON's signature**, not the
 landlord's, because being liable before the other is released is the entire
 point of this path.
+
+---
+
+# 10/24 — the counter must settle without a judgment call
+
+Nic: *"going forward, is it where the front desk person has to decide on if we
+bill somebody back the electric or if it washes out? Or is that chosen
+systematically from our list of criteria? I don't really want the front desk
+making judgment calls. I want the computer to do it for them."*
+
+**THE WASH IS SYSTEMATIC. THE REFUND IS THE LANDLORD'S. NEITHER IS THE DESK'S.**
+
+Every input the wash needs is already data:
+- did money arrive for that period (rent rows / the stay's `total_amount`)
+- nights used against half the paid period
+- `early_departure_refunds` / `prorates_mid_month_rent` on the property
+- RV month-to-month vs fixed term vs another unit type
+- work trade (absorbed, below)
+
+So the read settles the moment it is taken. What CANNOT be systematic is whether
+money goes back — Nic, 10/22: *"it's situational where we may refund somebody or
+we may not."* But that question never has to block the counter, because the
+unwind already exists: a refund issued later takes the wash back off the book and
+bills the stub (`unwindWash`, reason `refund_issued`). Settle now, unwind if the
+owner refunds. Nobody waits.
+
+## The bug that stopped Lisa (Patrick Neuman, RV 06)
+
+`washVerdict`'s no-answer branch asks "has the money answer come in?" BEFORE
+"was there any money at all". On a property that gives money back it returns
+`undecided` → `settleFinalStubForDeparture` parks the stub → the counter is told
+to wait for a landlord. Patrick's stay is **$0.00** (work camper), so the money
+question can never be answered and that read parks FOREVER.
+
+The "nothing was paid, so there is nothing to wash → bill" answer exists only on
+the no-refunds path. It has to come first, for both.
+
+## Work trade at the counter — DECIDED 10/24
+
+Nic: *"count their final electric as absorbed. And reported."*
+
+A work camper's final read settles as **absorbed** (`utility_absorbed_charges`),
+reported in the recovery figures as power the park ate — never billed, never
+washed (nothing was kept), never held. Work trade is hours, not wages, so the
+power is not priced into the hours.
+
+## Three money items waiting on the check tender
+
+The migration is in (`20261024030000`); the ROUTE and BUTTON are not. These are
+NOT to be hand-written in SQL — that skips inventory, the EOD settlement and the
+ledger projection.
+
+1. **Donald Hemp** (spelling to confirm — Nic said Hemp, then Hamp) — propane
+   $49.25, transaction `200c4976-f76c-479a-b985-c3b244d516ad`, recorded 10/23
+   2:56pm Phoenix as **cash with no customer attached**. Must become a **check,
+   number 167**, with Hemp attached. He is not in `pos_customers` yet.
+   Correcting it moves $49.25 out of that day's cash total — the EOD figure for
+   10/23 changes.
+2. **Mike Prevenis** — propane $23.92 at current prices, **check 1006**. Not yet
+   recorded at all.
+3. The per-property `accepts_checks` switch needs its settings control.
