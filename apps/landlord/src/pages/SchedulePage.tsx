@@ -1009,7 +1009,31 @@ export function SchedulePage() {
   // this screen), no fee, no lease-type dropdown: the billing type is implied
   // by stay length (≥30 monthly, ≥7 weekly, else nightly), clamped to the
   // unit's allowed list.
+  // 10/24 (Nic) — THE RESERVATION WINDOW DOES NOT CLOSE BY ACCIDENT.
+  //
+  //   "I want to make it where I can't click off of that window unless I click
+  //    confirm or abandon the reservation. Clicking anywhere else on the screen
+  //    on GAM's website should not close out of that pop-up window. That way I
+  //    can't accidentally undo a middle of a reservation with an accidental
+  //    button push."
+  //
+  // The backdrop used to close it, and closing wipes every field — so one stray
+  // click half way through typing a guest in threw the lot away with nothing
+  // asked and nothing kept. Nothing had been written to the server (the form
+  // only exists in the browser until Create), so the cost was never a bad
+  // record; it was the typing, which is the thing the desk actually spends.
+  //
+  // Now: the backdrop does nothing at all, and the ✕ asks first — but only when
+  // there is something to lose. An untouched form closes on one click, because
+  // making somebody confirm away a blank form teaches them to click through
+  // the prompt that matters.
+  const bookingFormDirty = () =>
+    !!(bookFirst.trim() || bookLast.trim() || newBooking.guestEmail.trim() || newBooking.guestPhone.trim()
+       || newBooking.checkIn || newBooking.checkOut || newBooking.totalAmount.trim() || newBooking.notes.trim())
+  const [abandonAsk, setAbandonAsk] = useState(false)
+  const askCloseBookModal = () => { if (bookingFormDirty()) setAbandonAsk(true); else closeBookModal() }
   const closeBookModal = () => {
+    setAbandonAsk(false)
     setBookingModal({show:false,unit:null})
     // 10/17: back to "no money here", which is what this form has always done.
     setBookPayMode('none')
@@ -4013,12 +4037,15 @@ export function SchedulePage() {
         // one here left the button dead with no explanation.
         const bkReady = bkNights > 0 && !!bookFirst.trim() && !!bookLast.trim()
           && (bookPayMode !== 'link' || bkEmailValid)
+        // 10/24 (Nic): the overlay has NO onClick — clicking anywhere outside
+        // this window does nothing at all. Confirm or abandon are the only ways
+        // out of a reservation half typed.
         return (
-        <div className="modal-overlay" onClick={closeBookModal}>
+        <div className="modal-overlay">
           <div className="modal" style={{maxWidth:480}} onClick={e=>e.stopPropagation()}>
             <div className="modal-header">
               <span className="modal-title">New Reservation — {bookingModal.unit?.unitNumber}</span>
-              <button className="btn btn-ghost btn-sm" onClick={closeBookModal}>✕</button>
+              <button className="btn btn-ghost btn-sm" onClick={askCloseBookModal}>✕</button>
             </div>
             <div style={{padding:'0 24px 24px',display:'grid',gap:12}}>
               <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
@@ -4058,6 +4085,19 @@ export function SchedulePage() {
                             color:bookPayMode===m?'var(--gold)':'var(--text-2)'}}>{label}</button>
                 ))}
               </div>
+              {abandonAsk && (
+                <div style={{padding:'10px 12px',borderRadius:8,background:'rgba(245,158,11,.08)',
+                             border:'1px solid rgba(245,158,11,.3)',marginBottom:10}}>
+                  <div style={{fontSize:'.82rem',color:'var(--text-1)',lineHeight:1.5,marginBottom:10}}>
+                    Abandon this reservation? Nothing has been saved and nothing is held — what you have typed
+                    is lost and the site stays free.
+                  </div>
+                  <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+                    <button className="btn btn-ghost btn-sm" onClick={()=>setAbandonAsk(false)}>Keep editing</button>
+                    <button className="btn btn-primary btn-sm" onClick={closeBookModal}>Abandon it</button>
+                  </div>
+                </div>
+              )}
               <button className="btn btn-primary" onClick={()=>createBookingMut.mutate()} disabled={!bkReady||createBookingMut.isLoading}>
                 {createBookingMut.isLoading ? (bookPayMode==='none'?'Creating...':'Holding the site…')
                   : bookPayMode==='register' ? 'Hold it and send to the register'
