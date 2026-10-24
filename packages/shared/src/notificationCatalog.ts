@@ -260,9 +260,9 @@ export const NOTIFICATION_CATALOG_SOURCE = [
   // one gets caught the way a misheard leaving date does above.
   { type: 'lease_handed_over', label: 'Your lease now ends — somebody signed for your space', group: 'leases',
     audience: 'tenant',
-    // Nothing emails this one today — it is raised in-app at the moment the
-    // replacement signs (routes/esign). Marked so its Email box prints a dash
-    // rather than a tickbox that controls nothing.
+    // The email DOES go — always, and it is not theirs to switch off
+    // (emailCategories lease_handed_over). So the Email box on this row would
+    // control nothing, and it prints a dash instead of a tickbox that lies.
     inAppOnly: true,
     when: 'Your landlord signs a new lease for your space starting while yours is still running, and the new '
       + 'resident signs it too.' },

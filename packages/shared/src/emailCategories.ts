@@ -198,6 +198,15 @@ export const EMAIL_CATEGORY_RULES: Readonly<Record<string, EmailCategoryRule>> =
   esign_signing_reminder: { label: 'Reminder: something is waiting for your signature', gate: 'esign_request' },
   esign_signing_completed: { label: 'A document is fully signed', gate: 'esign_completed' },
   esign_document_auto_voided: { label: 'A document was withdrawn', gate: 'esign_voided' },
+  // 10/24 (Nic): "the people that don't get on the app are the people that are
+  // going to need the email showing their bill." ALWAYS, not a gate: a resident
+  // finding out their tenancy ended — and what is still owed on it — is not a
+  // preference. Somebody who had switched lease emails off would learn months
+  // later, which is the one outcome this exists to prevent.
+  lease_handed_over: { label: 'Your lease is ending because somebody signed for your space', always:
+    'A resident whose lease is ended by a replacement signing for their space is told the date it ends and what '
+    + 'is still owed. It is a change to their own tenancy, made while they were not looking, so it is not theirs '
+    + 'to switch off.' },
   esign_new_lease_unsigned: { label: 'A resident has not signed yet', gate: 'esign_unsigned_reminder' },
   background_new: { label: 'A background check came back', gate: 'background_check_new' },
   pool_match_interest: { label: 'A landlord is interested in you', gate: 'match_interest' },

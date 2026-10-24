@@ -2109,6 +2109,17 @@ export function POSPage() {
                     </div>
                     {!many && <div style={{fontSize:'.75rem',color:'var(--text-2)',marginTop:2}}>{line(openTabs[0])}</div>}
                     {many && !tabsExpanded && <div style={{fontSize:'.75rem',color:'var(--text-3)',marginTop:2}}>Open the list to pick one to resume.</div>}
+                    {/* 10/24 (Nic): "I thought the window that popped up at the
+                        top of the screen, which was resume or discard, was to
+                        resume like the currently open ticket." It is not — this
+                        is an unfinished CART, and Discard here throws away a
+                        half-rung sale, never somebody's unpaid ticket. Said
+                        outright, because the two words are the same and the
+                        wrong guess loses work or looks like it loses money. */}
+                    <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:4,lineHeight:1.45}}>
+                      This is a sale that was started and never finished. Discarding it clears the cart only —
+                      open tickets and pay links stay on the open list, and nothing owed is written off.
+                    </div>
                   </div>
                   {!many && <button onClick={()=>resumeSession(openTabs[0].id)} className="btn btn-primary btn-sm">Resume</button>}
                   {!many && <button onClick={()=>discardOpenTab(openTabs[0].id)} className="btn btn-ghost btn-sm">Discard</button>}
@@ -3437,6 +3448,18 @@ export function POSPage() {
                   </div>
                   {t.note && <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:2}}>{t.note}</div>}
                 </div>
+                {/* 10/24 (Nic) — A TICKET IS NOT DISCARDABLE, AND THERE IS NO
+                    BUTTON HERE THAT PRETENDS IT IS.
+                      "Anything that's a ticket is a outstanding balance that
+                       needs to be paid. If I send somebody a point of sale
+                       ticket and they never pay it, that's a left owing money
+                       situation. Those are not able to be discarded. Cart items
+                       that never complete a sale can be discarded, but pay
+                       links and other invoice tickets, those stay."
+                    A Discard was added here earlier today and taken straight
+                    back out: a ticket nobody pays is money owed, which is what
+                    the left-owing book is for — not something a counter throws
+                    away. Settle is the only thing that closes one. */}
                 {(openTicketId===t.id||payLinkId===t.id)
                   ? <span style={{fontSize:'.72rem',color:'var(--gold)',fontWeight:700,whiteSpace:'nowrap'}}>In the cart</span>
                   : <button className="btn btn-primary btn-sm"
@@ -3800,6 +3823,9 @@ function CheckoutTab({ propertyId, onToTicket }: {
 }) {
   const [person, setPerson] = useState<PickedPerson | null>(null)
   const [picked, setPicked] = useState<any | null>(null)
+  // 10/24 (Nic): the read is taken, so the check-out step is live. Cleared when
+  // a different person is picked — a read belongs to the stay it was taken on.
+  const [readDone, setReadDone] = useState(false)
   const tenantId = person?.kind === 'resident' ? (person.tenantId ?? '') : ''
   const posCustomerId = person?.kind === 'customer' ? (person.customerId ?? '') : ''
 
@@ -3841,13 +3867,13 @@ function CheckoutTab({ propertyId, onToTicket }: {
           </div>
         ) : (
           <ClosingPickList closings={dueOut} pickedId={picked?.id ?? null}
-                           onPick={(c)=>{ setPicked(c); setPerson(null) }} />
+                           onPick={(c)=>{ setPicked(c); setPerson(null); setReadDone(false) }} />
         )}
 
         <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:6}}>Somebody else</div>
         <POSCustomerPicker propertyId={propertyId} value={person} sealedPicks
                            placeholder="Type a name, email or phone"
-                           onChange={(p)=>{ setPerson(p); setPicked(null) }} />
+                           onChange={(p)=>{ setPerson(p); setPicked(null); setReadDone(false) }} />
       </div>
 
       {/* What of theirs is ending — their own stays and leases here, never spaces. */}
@@ -3871,7 +3897,7 @@ function CheckoutTab({ propertyId, onToTicket }: {
             <div style={{fontSize:'.78rem',color:'var(--text-2)',marginBottom:8,lineHeight:1.5}}>
               {theirs.length === 1 ? 'Confirm this is what they are closing out.' : 'Which one are they closing out?'}
             </div>
-            <ClosingPickList closings={theirs} pickedId={picked?.id ?? null} onPick={(c)=>setPicked(c)} />
+            <ClosingPickList closings={theirs} pickedId={picked?.id ?? null} onPick={(c)=>{ setPicked(c); setReadDone(false) }} />
           </>)}
         </div>
       )}
@@ -3885,9 +3911,139 @@ function CheckoutTab({ propertyId, onToTicket }: {
             {picked.who ? `${picked.who} · ${picked.what}` : picked.what}
           </div>
           <StayStillOwes closing={picked} />
+          {/* 10/24 (Nic): "The checkout tab is the action of checking the person
+              out." The read no longer clears the card — it hands over to the
+              step that actually closes the stay, so the desk finishes here
+              instead of being left with nowhere to go. */}
           <ClosingReadForm propertyId={propertyId} closing={picked}
-                           onDone={(lines, notes)=>{ setPicked(null); onToTicket(lines, notes, person) }} />
+                           onDone={(lines, notes)=>{ setReadDone(true); onToTicket(lines, notes, person) }} />
+          {picked.kind === 'stay' && (
+            <FinishCheckOut closing={picked} readDone={readDone}
+                            onDone={()=>{ setPicked(null); setReadDone(false); void due.refetch() }} />
+          )}
         </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * 10/24 (Nic) — THE CHECKOUT TAB IS THE ACT OF CHECKING SOMEBODY OUT.
+ *
+ *   "Val Sutherland, I could not check out. Even though the meter read
+ *    reconciliates to nothing billed, zero kilowatts to add to the bill, the
+ *    only button at the bottom of the screen says to add to ticket. I clicked
+ *    it, just seeing if it would go through, but it refused to generate a
+ *    ticket even for $0 or anything like that. There's no way to resolve it
+ *    from that screen."
+ *
+ * He is right, and the tab was only ever half of a check-out. It read the
+ * meter and put the power on a ticket — and a stay with nothing to bill
+ * produces no ticket, so the desk was left with a recorded read, a guest
+ * standing there, and no button that finishes anything. The stay stayed
+ * `checked_in`.
+ *
+ * So the read hands over to this, which drives the check-out that already
+ * exists (routes/stayCheckOut) rather than inventing a second one. Three
+ * shapes, and the desk is never the one deciding which:
+ *
+ *   NOTHING TO SETTLE — they stayed the nights they booked and paid for them.
+ *     Val exactly: 7 nights booked, 7 stayed, $286.08 paid, $0 owed, nothing
+ *     refundable, `question: 'none'`. One button, and it is done.
+ *   A MONEY QUESTION — they left early, or they still owe. The choices come
+ *     back from the server already written as one line each ("They will owe
+ *     $280.00"), so the desk reads consequences rather than working them out.
+ *   NOT THEIRS TO ANSWER — no "Check guests out" permission, or the stay is
+ *     waiting on something. It says which, instead of a dead screen.
+ *
+ * The read is NOT a precondition. A guest can be checked out before anybody
+ * walks to the meter — the two are separate facts and forcing an order on them
+ * is how a desk gets stuck.
+ */
+function FinishCheckOut({ closing, readDone, onDone }: {
+  closing: any; readDone: boolean; onDone: () => void
+}) {
+  const today = new Date().toISOString().slice(0, 10)
+  const q = useQuery<any>(
+    ['stay-check-out', closing.id, closing.unitId],
+    () => apiGet(`/units/${closing.unitId}/bookings/${closing.id}/check-out?leftOn=${today}`),
+    { enabled: !!closing?.unitId && !!closing?.id, retry: false, staleTime: 0, refetchOnMount: 'always' },
+  )
+  const [chosen, setChosen] = useState<string | null>(null)
+  const quote: any = q.data?.data ?? q.data ?? null
+  const go = useMutation(
+    (choice: string | null) => apiPost(`/units/${closing.unitId}/bookings/${closing.id}/check-out`, {
+      leftOn: today, choice: choice ?? undefined,
+      quoteToken: quote?.quoteToken,
+      idempotencyKey: `checkout-${closing.id}-${today}`,
+    }),
+    { onSuccess: () => { toastOnce(`${quote?.guest || 'They'} are checked out.`); onDone() },
+      onError: (e: any) => toastOnce(errorMessage(e, 'The check-out did not go through — check the connection and press it again.'), { error: true }) })
+
+  if (q.isLoading) return <div style={{marginTop:12,fontSize:'.8rem',color:'var(--text-3)'}}>Reading their stay…</div>
+  if (q.isError) {
+    return <div style={{marginTop:12,fontSize:'.8rem',color:'var(--red)',lineHeight:1.5}}>
+      {errorMessage(q.error, 'Their stay could not be read — check the connection and pick them again.')}
+    </div>
+  }
+  if (!quote) return null
+  if (quote.checkedOut) {
+    return <div style={{marginTop:12,padding:'10px 12px',borderRadius:8,background:'rgba(34,197,94,.08)',
+                        border:'1px solid rgba(34,197,94,.3)',fontSize:'.82rem',color:'var(--green)'}}>
+      {quote.guest} is already checked out{quote.leftOn ? ` — left ${quote.leftOn}` : ''}.
+    </div>
+  }
+  if (!quote.canCheckOut || quote.waitsForCheckOut) {
+    return <div style={{marginTop:12,padding:'10px 12px',borderRadius:8,background:'rgba(245,158,11,.08)',
+                        border:'1px solid rgba(245,158,11,.3)',fontSize:'.82rem',color:'var(--amber)',lineHeight:1.5}}>
+      {quote.waitsForCheckOut
+        || 'Checking a guest out needs the "Check guests out" permission. Ask the account owner to turn it on for you on the Team page.'}
+    </div>
+  }
+  const choices: any[] = quote.choices ?? []
+  const simple = quote.question === 'none' && choices.length === 0
+  return (
+    <div style={{marginTop:14,paddingTop:12,borderTop:'1px solid var(--border-0)'}}>
+      <div style={{fontSize:'.74rem',color:'var(--text-3)',marginBottom:6}}>Finish the check-out</div>
+      {!readDone && (
+        <div style={{fontSize:'.76rem',color:'var(--text-3)',marginBottom:8,lineHeight:1.5}}>
+          The meter read above is not required to check somebody out — take it if you have it.
+        </div>
+      )}
+      {simple ? (
+        <>
+          <div style={{fontSize:'.82rem',color:'var(--text-2)',lineHeight:1.55,marginBottom:10}}>
+            {quote.guest} stayed the {quote.booked?.nights} night{quote.booked?.nights === 1 ? '' : 's'} they booked and
+            paid for them. Nothing is owed and nothing goes back.
+          </div>
+          <button className="btn btn-primary" style={{width:'100%'}} disabled={go.isLoading}
+            onClick={()=>go.mutate(null)}>
+            {go.isLoading ? 'Checking them out…' : `Check ${quote.guest} out`}
+          </button>
+        </>
+      ) : (
+        <>
+          <div style={{fontSize:'.82rem',color:'var(--text-2)',lineHeight:1.55,marginBottom:10}}>
+            {quote.guest} booked {quote.booked?.nights} night{quote.booked?.nights === 1 ? '' : 's'} and stayed{' '}
+            {quote.stayed?.nights}. Pick what happens to the money — each line says what it leaves.
+          </div>
+          <div style={{display:'grid',gap:8}}>
+            {choices.map((c:any)=>(
+              <button key={c.choice}
+                className={`btn ${chosen===c.choice?'btn-primary':'btn-ghost'}`}
+                style={{width:'100%',textAlign:'left',padding:'10px 12px'}}
+                disabled={go.isLoading}
+                onClick={()=>setChosen(c.choice)}>
+                <div style={{fontWeight:700,fontSize:'.84rem'}}>{c.label}</div>
+                <div style={{fontSize:'.76rem',color:'var(--text-3)',marginTop:2}}>{c.result}</div>
+              </button>
+            ))}
+          </div>
+          <button className="btn btn-primary" style={{width:'100%',marginTop:10}}
+            disabled={!chosen || go.isLoading} onClick={()=>go.mutate(chosen)}>
+            {go.isLoading ? 'Checking them out…' : chosen ? `Check ${quote.guest} out` : 'Pick one above'}
+          </button>
+        </>
       )}
     </div>
   )

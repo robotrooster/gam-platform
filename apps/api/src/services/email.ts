@@ -1144,6 +1144,51 @@ export async function emailNewLeaseDraftLapsed(to: string, recipientName: string
 }
 
 /**
+ * 10/24 (Nic) — TO THE RESIDENT BEING REPLACED, BECAUSE THE APP IS NOT WHERE
+ * THEY WILL SEE IT.
+ *
+ *   "Yes, they do need an email. Because the people that don't get on the app
+ *    are the people that are going to need the email showing their bill."
+ *
+ * A replacement signing for their space is what ends their lease
+ * (services/spotSuccession), and it can happen on a day they never log in. The
+ * in-app notice alone would reach exactly the residents least likely to read
+ * it. So the date their lease now ends goes to them by email, with what is
+ * still owed stated plainly — ending a lease forgives nothing, and somebody who
+ * finds that out a month later has been badly served.
+ *
+ * No link and no button: there is nothing for them to do here and nothing to
+ * accept. It tells them what happened and who to talk to.
+ */
+export async function emailLeaseHandedOver(to: string, o: {
+  name: string; spaceLabel: string; endsOn: string; owed: number; propertyName: string | null
+}, ctx: { landlordId?: string; leaseId?: string } = {}) {
+  const money = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  await send(to, `Your lease for ${o.spaceLabel} now ends ${o.endsOn}`,
+    base(
+      h('Your Lease Is Ending') +
+      p(`Hi ${escapeHtml(o.name)},`) +
+      p(`Your landlord has signed a new lease for <strong style="color:#eef1f8">${escapeHtml(o.spaceLabel)}</strong>` +
+        `${o.propertyName ? ` at ${escapeHtml(o.propertyName)}` : ''} starting the day after ` +
+        `<strong style="color:#eef1f8">${escapeHtml(o.endsOn)}</strong>, so your lease now ends on that date.`) +
+      (o.owed > 0
+        ? p(`<strong style="color:#eef1f8">What is still unpaid on your account — ${escapeHtml(money(o.owed))} — is still owed.</strong> ` +
+            'Ending the lease does not cancel it, and the amount is recorded in your name as it stands today. ' +
+            'It does not grow after this.')
+        : p('Nothing is outstanding on your account.')) +
+      p('If this is not what you were expecting, talk to your landlord before that date — this email is a record ' +
+        'of the change, not a notice to leave by.')
+    ),
+    {
+      category: 'lease_handed_over',
+      landlordId: ctx.landlordId ?? null,
+      relatedEntityType: ctx.leaseId ? 'lease' : null,
+      relatedEntityId: ctx.leaseId ?? null,
+    },
+  )
+}
+
+/**
  * To the landlord: households that have not signed their new lease yet — 14
  * days before it starts, and again on the day it starts. One email per stage
  * for all of them. The new lease bills its rent from its start date either way

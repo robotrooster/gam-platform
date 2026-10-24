@@ -7660,14 +7660,20 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
             if (handover) {
               // The person being released is told, by the one rule that keeps
               // this from happening quietly: whoever it affects finds out first.
-              const leaving = await queryOne<{ user_id: string; label: string }>(
-                `SELECT u.id AS user_id,
+              const leaving = await queryOne<{
+                user_id: string; label: string; email: string; who: string
+                landlord_id: string; property_name: string | null
+              }>(
+                `SELECT u.id AS user_id, u.email,
+                        u.first_name || ' ' || u.last_name AS who,
+                        l.landlord_id, p.name AS property_name,
                         COALESCE(NULLIF(un.display_label, ''), un.unit_number, 'your space') AS label
                    FROM lease_tenants lt
                    JOIN tenants t ON t.id = lt.tenant_id
                    JOIN users u ON u.id = t.user_id
                    JOIN leases l ON l.id = lt.lease_id
                    JOIN units un ON un.id = l.unit_id
+                   JOIN properties p ON p.id = un.property_id
                   WHERE lt.lease_id = $1 AND lt.status IN ('active','pending_add')
                   ORDER BY (lt.role = 'primary') DESC LIMIT 1`, [handover.sittingLeaseId])
               if (leaving) {
@@ -7686,6 +7692,20 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
                   actionUrl: '/lease',
                 }).catch(err => logger.error({ err, leaseId: handover.sittingLeaseId },
                   '[spot-succession] could not tell the departing resident their lease now ends'))
+                // 10/24 (Nic): "Yes, they do need an email. Because the people
+                // that don't get on the app are the people that are going to
+                // need the email showing their bill." The in-app notice alone
+                // reaches exactly the residents least likely to read it.
+                if (leaving.email) {
+                  const { emailLeaseHandedOver } = await import('../services/email')
+                  await emailLeaseHandedOver(leaving.email, {
+                    name: leaving.who || 'there', spaceLabel: leaving.label,
+                    endsOn: handover.endsOn, owed: handover.owed,
+                    propertyName: leaving.property_name,
+                  }, { landlordId: leaving.landlord_id, leaseId: handover.sittingLeaseId })
+                    .catch(err => logger.error({ err, leaseId: handover.sittingLeaseId },
+                      '[spot-succession] the departing resident could not be emailed'))
+                }
               }
             }
           } catch (e) {

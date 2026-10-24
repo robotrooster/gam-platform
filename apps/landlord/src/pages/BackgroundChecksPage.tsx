@@ -250,12 +250,43 @@ const asMoney = (cents: unknown): string => {
   if (!Number.isFinite(v)) return String(cents)
   return `$${(v / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
-/** "onTimePaymentRate" / "credit_file_status" → "On time payment rate". */
-const tidyKey = (k: string): string => {
-  const words = k.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').trim().toLowerCase()
-  return words.charAt(0).toUpperCase() + words.slice(1)
+/**
+ * "onTimePaymentRate" → "On time payment rate".
+ *
+ * 10/24 (Nic): "it's confusing the word balances with two split words meaning
+ * balance and cents, like loose change... it says open collections balance
+ * cents." Right, and it was mine, not Checkr's. Those fields are named for how
+ * the number is STORED — open_collections_balance_cents is an integer count of
+ * cents — and the value was already being formatted as money while the label
+ * still carried the unit. So the label read "Open collections balance cents"
+ * next to "$1,842.00", which reads like a column about loose change.
+ *
+ * The unit belongs to the storage, not to the reader: it is dropped here, and
+ * the money formatting that keys off the same suffix is untouched.
+ */
+const SAID_BETTER: Record<string, string> = {
+  // "Consider reasons" is a field's name, not a sentence anybody says.
+  considerReasons: 'Why it says consider',
+  creditScoreFactors: 'What moved the score',
+  creditFileStatus: 'Credit file',
+  evictionReportStatus: 'Eviction report',
 }
-const looksLikeRate = (k: string) => /(rate|utilization|ratio|percent)$/i.test(k)
+const tidyKey = (k: string): string => {
+  if (SAID_BETTER[k]) return SAID_BETTER[k]
+  const words = k.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').trim().toLowerCase()
+  const said = words.replace(/\s+(cents|count|months)$/, '').replace(/\bcharge offs\b/, 'charge-offs')
+  return said.charAt(0).toUpperCase() + said.slice(1)
+}
+/**
+ * A percentage, and only when the value really is one. creditUtilization
+ * matches this name but arrives as an OBJECT ({ rate, limitCents,
+ * balanceCents }), and a percentage formatter run over an object prints
+ * "NaN%" — which is exactly what the first version of the headline line did.
+ * Objects go down the nested branch before they reach here, so this is belt
+ * and braces; it is checked rather than assumed because that bug was real.
+ */
+const looksLikeRate = (k: string, v?: unknown) =>
+  /(rate|utilization|ratio|percent)$/i.test(k) && (v === undefined || typeof v === 'number')
 /**
  * Checkr's payment_timeline is two dozen months of
  * { month, lateCount, onTimeRate, onTimeCount }. The figure a landlord reads
@@ -273,6 +304,8 @@ const lateInLastMonths = (timeline: unknown, months: number): number | null => {
   return recent.reduce((n: number, m: any) => n + (Number(m.lateCount) || 0), 0)
 }
 const looksLikeMoney = (k: string) => /cents$/i.test(k)
+/** A count of months reads as months, beside a label that no longer says it. */
+const looksLikeMonths = (k: string) => /months$/i.test(k)
 
 function PaymentTimeline({ rows }: { rows: any[] }) {
   const months = [...rows].sort((a, b) => String(b.month).localeCompare(String(a.month)))
@@ -319,6 +352,10 @@ function ReportDetail({ value, depth = 0 }: { value: unknown; depth?: number }) 
     const entries = Object.entries(value as Record<string, unknown>)
       // Row ids and timestamps are plumbing, not something a landlord weighs.
       .filter(([k]) => !/^id$|Id$|^created_?At$|^updated_?At$/i.test(k))
+      // 10/24: and at the top of a product its own `status` is the verdict the
+      // row above already shows in colour — "Status: clear" under "Clear" is
+      // the page repeating itself.
+      .filter(([k]) => !(depth === 0 && k === 'status'))
     if (!entries.length) return <span style={{color:'var(--text-3)'}}>—</span>
     return (
       <div style={{display:'grid',gap:4}}>
@@ -336,7 +373,8 @@ function ReportDetail({ value, depth = 0 }: { value: unknown; depth?: number }) 
                 : <span style={{color:'var(--text-1)',fontWeight:600,textAlign:'right'}}>
                     {typeof v === 'boolean' ? (v ? 'Yes' : 'No')
                       : looksLikeMoney(k) ? asMoney(v)
-                      : looksLikeRate(k) ? asPct(v)
+                      : looksLikeRate(k, v) ? asPct(v)
+                      : looksLikeMonths(k) ? `${v} month${Number(v) === 1 ? '' : 's'}`
                       : String(v)}
                   </span>}
             </div>
@@ -695,7 +733,24 @@ function ReviewModal({ check, onClose, onDecided }: {
               </div>
             )
           )}
-          {isApproved && !forStay && (
+          {/* 10/24 (Nic): "Why is it offering me the option to draft a lease for
+              two people who are already on a lease and that background check was
+              used to populate the lease with their name and stuff?"
+              Because this was the one control in the approved block that did not
+              ask whether they are already housed — the "Not moving in for now"
+              control directly above has always asked. Robert Housley and James
+              Fenton are both on leases here and were being offered a second one;
+              Victor and Nemesio are matched to their old stays (by guest email),
+              which skips this whole block, which is why only those two looked
+              right. `housed` is true for a pending or active lease OR a live
+              draft, so this also stops a second draft being raised on top of one
+              already out for signature. */}
+          {isApproved && !forStay && check.housed && (
+            <span style={{fontSize:'.8rem',color:'var(--text-2)'}}>
+              Already on a lease here — nothing is waiting on this check.
+            </span>
+          )}
+          {isApproved && !forStay && !check.housed && (
             <>
               {needsUnit && (
                 <select className="input" style={{maxWidth:220}} value={pickedUnit} onChange={e => setPickedUnit(e.target.value)}>

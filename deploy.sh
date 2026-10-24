@@ -181,12 +181,31 @@ stage_run api-build /tmp/gam-deploy-api.log "cd apps/api && npm run build"
 # .vercel/project.json, so the two builds produce byte-identical output (checked
 # on all seven: same index-<hash>.js). The hash now comes off
 # .vercel/output/static, which is also exactly what `--prebuilt` ships.
-for entry in "${FRONTENDS[@]}"; do
-  app="${entry%%:*}"
-  [ -d "apps/$app" ] || continue
-  [ -f "apps/$app/.vercel/project.json" ] || continue
-  stage_run "build-$app" "/tmp/gam-deploy-$app.log" "cd apps/$app && npx vercel build --prod"
-done
+# 10/24 (Nic) — ONE FRONTEND BUILD AT A TIME.
+#
+# `npx vercel build` runs its own `npm install`, and every app shares the one
+# hoisted node_modules at the repo root. Seven of those at once is a race npm
+# has no cross-process lock for. On 10/24 two collided renaming `tar`: npm
+# aborted the swap, cleaned up its temp directory, and left the package gone —
+# so the landlord AND pos builds both died with the same ENOTEMPTY naming the
+# same temp dir, and the two surfaces carrying that day's fixes missed a deploy
+# that had passed every suite. It is not a flake; it is reachable any time two
+# installs touch one package.
+#
+# They still run BESIDE the suites, which are the long pole (the API suite is
+# minutes; a frontend build is seconds), so this costs almost no wall clock.
+# Each app still writes its own log and its own .rc, so the gate and the deploy
+# loop below are untouched.
+stage_run frontend-builds /tmp/gam-deploy-frontends.log '
+  for entry in "${FRONTENDS[@]}"; do
+    app="${entry%%:*}"
+    [ -d "apps/$app" ] || continue
+    [ -f "apps/$app/.vercel/project.json" ] || continue
+    echo "building $app"
+    ( cd "apps/$app" && npx vercel build --prod ) >"/tmp/gam-deploy-$app.log" 2>&1
+    echo $? >"$STAGE/build-$app.rc"
+  done
+'
 stage_run build-storefront /tmp/gam-deploy-storefront.log "cd apps/storefront && npm run build"
 # In --check the marketing build is skipped, as it always was: there is nothing
 # to compare it against without publishing.
