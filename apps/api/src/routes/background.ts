@@ -93,12 +93,33 @@ const IV_LENGTH = 16
 //     that never ran (see backgroundProvider.initiate). Both halves are fixed:
 //     the add-on is now ordered, and the cost it is priced from is the real one.
 //
-//     The add-on is NOT something this order body controls — Checkr carries it
-//     as a per-PROPERTY toggle ("Identity Intelligence") in their dashboard, and
-//     a property only appears there the first time an order names it. So every
-//     new park has to have the toggle turned on by hand the first time it shows
-//     up, or its first applicant screens without the scan they paid for. The
-//     `checkr_id_scan_missing` alarm is what catches that.
+//     10/24 — AND THE ADD-ON IS ORDERED BY THIS REQUEST, NOT BY THE DASHBOARD.
+//     This used to say the opposite: that Checkr carries the scan only as a
+//     per-PROPERTY toggle, so every new park needed it switched on by hand or
+//     its first applicant screened without the scan they paid for. Heather
+//     Miller's order settled it the other way. Country Acres did not exist in
+//     Checkr until HER order created it, so the toggle cannot have been on when
+//     it was placed (Nic turned it on afterwards) — and the scan ran anyway. It
+//     is `add_on_products` in the order body below that buys it.
+//
+//     Three things agree, which is why this is stated rather than guessed:
+//     identity_verification came back on her report and on none of the five
+//     before it; her invoice is $2.95 more than theirs; and hers is the only
+//     report carrying the selfie and the licence image, which is what the
+//     product actually produces. Nic: "on Heather, I can see a selfie and the
+//     actual picture of her driver's license. None of the other people have
+//     selfies and driver's license info on there."
+//
+//     WHAT CHECKR BILLED, versus what they advertise: the invoice delta is
+//     $2.95; their signed-in pricing page says $3.95. The constant below stays
+//     at $3.95 on Nic's call (10/24): "If they're only charging us $295, we're
+//     still gonna have our, let's still leave it at $395 in case they ever
+//     raise the price. And for now, we'll just consider it an extra dollar
+//     profit for the platform." So this number is deliberately a dollar above
+//     the current invoice — do not "correct" it to $2.95.
+//
+//     `checkr_id_scan_missing` still fires on a report with no identity
+//     product at all, which is the case worth knowing about.
 //   SCREENING_GAM_MARGIN_USD = GAM's flat margin per report ($5).
 //   Landlord is charged cost + margin ($43.94), netted from disbursement — NOT
 //   charged to the applicant, and NOT run through card processing (the landlord

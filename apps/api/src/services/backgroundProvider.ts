@@ -695,28 +695,22 @@ class CheckrProvider implements BackgroundProvider {
     // GAM's billing problem. It says so out loud instead: on the summary, so no
     // landlord is ever told an identity check happened when it did not, and to
     // the admins, so the add-on gets turned on.
-    // ── 10/24 (Nic): AND THE PRODUCT COMING BACK IS NOT PROOF EITHER.
+    // ── 10/24: THE PRODUCT COMING BACK ON THE REPORT *IS* THE ANSWER.
     //
-    // This read "the key is on the report, so the scan ran", and on Heather
-    // Miller's order (10/24, Country Acres) that said id_scan_ran: true. The
-    // Checkr RECEIPT for that same order says otherwise — one line, "Essential
-    // Tenant Screening package", listing Criminal History, Credit Report,
-    // Eviction History, Sex Offender Registry and Global Watchlist. No identity
-    // add-on, itemized nowhere. So a `clear` on identity_verification comes back
-    // with the base package whether or not the $3.95 product was bought, and
-    // this alarm — the one thing standing between a silent miss and an applicant
-    // paying for a scan nobody ran — was looking at the wrong evidence and
-    // staying quiet.
+    // Doubted for an afternoon and then settled. Heather Miller's receipt shows
+    // one line — "Essential Tenant Screening package" — with no identity add-on
+    // itemized, which read at first like the scan had not been bought even
+    // though her report came back clear on it. It had been: the line is simply
+    // not broken out. Her invoice is $2.95 above the five orders that carry no
+    // identity product, and hers is the only report holding the selfie and the
+    // licence image, which is what the product produces. Nic: "on Heather, I
+    // can see a selfie and the actual picture of her driver's license. None of
+    // the other people have selfies and driver's license info on there."
     //
-    // There is no field on the report that settles it, which is the real finding:
-    // the only authority on what was PURCHASED is what Checkr billed. Until the
-    // invoice is readable from here, the honest answer is that GAM does not
-    // know, so the summary stops asserting that it does and the alarm fires on
-    // the gap it CAN see — a report whose identity product is absent entirely.
-    // A present-but-unbilled one is flagged for a human to check against the
-    // receipt rather than silently called a pass.
-    const idScanReported = CHECKR_ID_SCAN_ADD_ON in products
-    const idScanRan = idScanReported
+    // So the presence of the product is trustworthy evidence that it ran, and
+    // its ABSENCE is the thing worth shouting about — an applicant who paid for
+    // a scan nobody performed. That is what the alarm below is for.
+    const idScanRan = CHECKR_ID_SCAN_ADD_ON in products
     if (!idScanRan) {
       try {
         const { createAdminNotification } = await import('./adminNotifications')
@@ -729,9 +723,8 @@ class CheckrProvider implements BackgroundProvider {
             + 'dashboard, go to Properties, pick this property, and turn Identity Intelligence on. A property '
             + 'appears there the first time an order names it, so a park screening its first applicant will '
             + 'always need this done once. '
-            + '10/24: a report that DOES carry the product is not proof it was billed — Heather Miller\'s '
-            + 'order came back clear on identity and the receipt showed no add-on. Check the month\'s Checkr '
-            + 'receipts against the orders before trusting either answer. '
+            + '10/24: the add-on is ordered by GAM\'s own request (add_on_products), not by the dashboard '
+            + 'switch — an order that came back WITHOUT the product is the one worth chasing. '
             + `Report ${report.id ?? reportRef}, order ${report.order_id ?? '(unknown)'}.`,
           context: { report_id: report.id ?? reportRef, order_id: report.order_id ?? null },
         })
@@ -751,12 +744,7 @@ class CheckrProvider implements BackgroundProvider {
       all_products_resolved: allTerminal,
       // 10/21: whether the live ID scan this order asked for actually ran. A
       // reader must never have to work that out from the absence of a key.
-      // 10/24: renamed in meaning, not in name — this says the product came
-      // back ON THE REPORT, which is all the report can tell us. Whether it was
-      // BILLED is a question only the receipt answers; see above.
       id_scan_ran: idScanRan,
-      id_scan_reported: idScanReported,
-      id_scan_billing_unverified: true,
       products,
       details,
       fetched_at: new Date().toISOString(),
