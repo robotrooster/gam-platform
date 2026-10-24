@@ -369,6 +369,12 @@ const DELIBERATE = new Map(Object.entries({
   'properties PATCH /:id/tenants-deposit-at-bank':
     'whether tenants may deposit rent at the landlord\'s bank is the landlord\'s money policy for the property (10/6), set on the property screen beside the payment settings; it decides what the bank feed may match by itself',
   'properties PATCH /:id/partial-payments': 'accepting part of the rent is a landlord\'s money policy, set on the property screen beside its local-laws note',
+  // 10/23 (Nic): "that needs to be turned on or off if a property chooses to
+  // accept checks. A lot of places don't accept them." The same shape as the
+  // two above — a standing answer about what the front counter may take in,
+  // given once on the property's own screen.
+  'properties PATCH /:id/accepts-checks':
+    'whether the front counter takes a check is a property\'s own answer about what it accepts as payment (10/23), set on the property screen beside the other payment settings; the register reads it to decide whether to offer a Check button and the sale route reads it again to refuse one either way',
   'landlords POST /me/pending-tenants/:intentId/document': 'the lease PDF is a file the landlord uploads',
 
   // A SIGNATURE IS THE PERSON'S. The agent never signs, never declines a

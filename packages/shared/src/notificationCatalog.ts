@@ -253,6 +253,19 @@ export const NOTIFICATION_CATALOG_SOURCE = [
     when: 'Your landlord records that your lease will not be renewed.' },
   { type: 'lease_move_out_notice', label: 'Your leaving date was written down', group: 'leases', audience: 'tenant',
     when: 'The office writes down the day you are leaving, so a misheard date gets caught.' },
+  // 10/24: the one rule that keeps a handover from happening quietly — whoever
+  // it affects finds out first. A replacement signing for the space is what
+  // ends the sitting lease (services/spotSuccession), and the person being
+  // released is told the date the same moment it is written down, so a wrong
+  // one gets caught the way a misheard leaving date does above.
+  { type: 'lease_handed_over', label: 'Your lease now ends — somebody signed for your space', group: 'leases',
+    audience: 'tenant',
+    // Nothing emails this one today — it is raised in-app at the moment the
+    // replacement signs (routes/esign). Marked so its Email box prints a dash
+    // rather than a tickbox that controls nothing.
+    inAppOnly: true,
+    when: 'Your landlord signs a new lease for your space starting while yours is still running, and the new '
+      + 'resident signs it too.' },
   { type: 'lease_move_out_notice_cancelled', label: 'Your leaving date was called off', group: 'leases', audience: 'tenant',
     when: 'A leaving date that was written down for you is called off.' },
 

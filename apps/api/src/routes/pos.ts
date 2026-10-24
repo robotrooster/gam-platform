@@ -17,7 +17,7 @@ import { logger } from '../lib/logger'
 import { todayIn } from '../lib/timezone'
 import { replyToProperty } from '../services/replyRouting'
 import { resolveLandlordTarget, ownsLandlord, landlordScopeIds } from '../lib/landlordScope'
-import { cardIdentityFromIntent, findOrCreateCustomerForCard, startSaveCardPrompt, readSaveCardAnswer, saveCardForCustomer, mergePosCustomers, readSaleCard, type CardIdentity, type CardCustomer } from '../services/posCustomerCards'
+import { cardIdentityFromIntent, findOrCreateCustomerForCard, startSaveCardPrompt, readSaveCardAnswer, saveCardForCustomer, mergePosCustomers, readSaleCard, nameIsAPlaceholder, type CardIdentity, type CardCustomer } from '../services/posCustomerCards'
 import {
   personOnSale, salePerson, nameForReader, residentRecord, applyCardToPerson, withSavepoint, cardOutcomeSentence, addCustomer, customerFromElsewhere,
   findSamePerson, standInNow, foldStandInInto, recordContactSql, tenantOfCompanySql, tenantLivesHereSql, NOT_ON_REGISTER, SALE_GONE,
@@ -365,9 +365,21 @@ posRouter.get('/settings', requirePerm('pos.ring_sale', 'pos.manage_inventory'),
   try {
     const row = await queryOne<{ pos_default_margin_pct: string | null; business_name: string | null }>(
       `SELECT pos_default_margin_pct, business_name FROM landlords WHERE id = $1`, [posLandlordId(req)])
+    // 10/23 (Nic): whether THIS property takes a check. The register already
+    // asks for its settings with the property on the query string, so the
+    // answer rides the request it was already making rather than a second one.
+    // Absent a property (the business register's own screens) the question has
+    // no answer, and the counter shows no Check button — the sale route refuses
+    // one there anyway.
+    const propertyId = typeof req.query.propertyId === 'string' && /^[0-9a-f-]{36}$/i.test(req.query.propertyId)
+      ? req.query.propertyId : null
+    const prop = propertyId ? await queryOne<{ accepts_checks: boolean }>(
+      `SELECT accepts_checks FROM properties WHERE id = $1 AND landlord_id = $2`,
+      [propertyId, posLandlordId(req)]) : null
     res.json({ success: true, data: {
       defaultMarginPct: row?.pos_default_margin_pct != null ? Number(row.pos_default_margin_pct) : null,
       businessName: row?.business_name || null,
+      acceptsChecks: prop?.accepts_checks === true,
     } })
   } catch (e) { next(e) }
 })
@@ -1347,6 +1359,33 @@ const RESERVATION_NOT_WAITING = 'That reservation is no longer waiting to be pai
 const TICKET_NOT_OPEN = 'That ticket is not on the open list any more — nothing was charged. Press Clear, then open the list to see what is still out.'
 /** 10/3 (review): one sale, one ticket or one pay link — two reservations are never settled by one payment. */
 const ONE_TICKET_OR_LINK = 'A sale settles one ticket or one pay link — press Clear, then open just one.'
+
+/**
+ * 10/23 (Nic) — A CHECK AT THE COUNTER, AND THE NUMBER THAT MAKES IT FINDABLE.
+ *
+ *   "On the point of sale system, we need to add a button to record check
+ *    payments. That also needs to be turned on or off if a property chooses to
+ *    accept checks. A lot of places don't accept them. For some reason, you can
+ *    record an invoice with a check number and record the payment, but you
+ *    can't do it on the point of sale system."
+ *
+ * The number is part of the record, not a note: it is how the park finds the
+ * payment again when the bank returns the check, and it is what the invoice side
+ * already stores (payments.reference). So a check sale without one is refused
+ * here rather than written down as an anonymous check — a park that has to go
+ * looking through a month of deposits to match one is worse off than a park that
+ * was made to type four digits.
+ *
+ * A check is FREE, like cash (S654, Nic: "There's no fee. Paying cash or check
+ * is free."), so nothing about the fee machinery is touched: serverCartTotals
+ * already treats every tender that is not a card and not a charge account as
+ * free, which is what 'check' is.
+ */
+const CHECK_NEEDS_A_NUMBER = 'Type the check number, then press Charge again — it is how this payment is found again '
+  + 'if the bank sends the check back.'
+const CHECK_NOT_TAKEN_HERE = 'This property does not take checks. Nothing was charged — take another tender, or turn '
+  + 'checks on under the property\'s settings.'
+const REFERENCE_WITHOUT_A_CHECK = 'Only a check carries a check number. Nothing was charged — press Clear and ring it again.'
 
 /**
  * 10/2 (decisions #9) — A RESERVATION TICKET CHARGES THE RESERVATION'S OWN
@@ -2580,6 +2619,9 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
             // "out for delivery" list. The link is the bill: its lines, its
             // prices and its discount are charged, whatever the cart sent.
             payLinkId,
+            // 10/23 (Nic): the check number on a check sale. Refused on any
+            // other tender — see the check gates below.
+            paymentReference,
             // S651: present only when the cart contains a stay — the site, the
             // arrival date and who it is for. Everything else about the stay is
             // derived from the item and its quantity.
@@ -2778,6 +2820,23 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     // it never goes on a charge account (whose money the landlord is owed
     // later, or never) — refused, and the guest pays it some other way.
     if (paymentMethod === 'charge' && (linkScreening || ticketScreening)) throw new AppError(400, CHARGE_ACCOUNT_NO_SCREENING)
+    // 10/23 (Nic) — THE CHECK GATES, BEFORE ANYTHING IS READ OR ANY MONEY MOVES.
+    //
+    // Blind-staff-entry safe: all three say what to do next and none of them
+    // names a figure. The property's answer is read here rather than trusted
+    // from the browser — the button is hidden when a park says no, and a hidden
+    // button is a courtesy, not a rule.
+    const checkRef = typeof paymentReference === 'string' ? paymentReference.trim() : ''
+    if (paymentMethod === 'check') {
+      if (!checkRef) throw new AppError(400, CHECK_NEEDS_A_NUMBER)
+      if (checkRef.length > 40) throw new AppError(400, 'That is longer than a check number — type the number off the check, then press Charge again.')
+      const takesChecks = propertyId ? await queryOne<{ accepts_checks: boolean }>(
+        `SELECT accepts_checks FROM properties WHERE id = $1 AND landlord_id = $2`,
+        [propertyId, posLandlordId(req)]) : null
+      if (propertyId && !takesChecks?.accepts_checks) throw new AppError(400, CHECK_NOT_TAKEN_HERE)
+    } else if (checkRef) {
+      throw new AppError(400, REFERENCE_WITHOUT_A_CHECK)
+    }
     // 10/5 (Nic, A2): a link for a stay's background check alone is settled
     // only while the stay stands and its check is not already paid for.
     if (payLink) {
@@ -3246,6 +3305,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           paymentMethod, tenantId: saleTenantId, posCustomerId: saleCustomerId, subtotal, taxAmount, surcharge: surchargeAmt, total,
           changeGiven, platformFee, stripePaymentIntentId: stripePaymentIntentId ?? cardOnFileIntentId,
           discountAmount: discountAmt, discountReason,
+          paymentReference: paymentMethod === 'check' ? checkRef : null,
           ...(paymentMethod === 'card' || paymentMethod === 'card_on_file'
             ? { payoutOwed: round2(Math.max(0, total - cardFee - gamKeeps)) } : {}),
           // 10/3 (decisions #21): a reservation's line is recorded at its price
@@ -3668,7 +3728,10 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         // guests, and their email is on their account.
         const asks = {
           askSave:  !!(cardIdentity?.generatedCard && cardIsTheirs && !cardSaved && !isResident),
-          askName:  !!(cardCustomer && c && c.first_name === 'Card' && c.last_name === 'Customer'),
+          // 10/24: the one definition, not a third hand-written copy — an
+          // unnamed card is called "Visa ••4242" now, and spelling the old
+          // placeholder out here stopped the reader asking for a name.
+          askName:  !!(cardCustomer && c && nameIsAPlaceholder(c.first_name, c.last_name)),
           askEmail: !!(cardIdentity && c && !c.email && !isResident),
         }
         let prompting = false
@@ -3786,7 +3849,11 @@ posRouter.get('/transactions/sales', requirePerm('pos.ring_sale', 'pos.end_of_da
         COUNT(*) as tx_count,
         SUM(total) as revenue,
         SUM(CASE WHEN payment_method='cash' THEN total ELSE 0 END) as cash,
-        SUM(CASE WHEN payment_method='card' THEN total ELSE 0 END) as card,
+        -- 10/24: a card on file is a card (it was in neither column before, so
+        -- the tender split did not add up to the day's revenue), and a check is
+        -- its own tender now that the counter can take one.
+        SUM(CASE WHEN payment_method IN ('card','card_on_file') THEN total ELSE 0 END) as card,
+        SUM(CASE WHEN payment_method='check' THEN total ELSE 0 END) as check_total,
         SUM(CASE WHEN payment_method='charge' THEN total ELSE 0 END) as charge
       FROM pos_transactions t
       WHERE landlord_id=$1 ${dateFilter} ${propFilter}
@@ -3825,7 +3892,8 @@ posRouter.get('/transactions/sales', requirePerm('pos.ring_sale', 'pos.end_of_da
         SUM(platform_fee) as total_fees,
         AVG(total) as avg_ticket,
         SUM(CASE WHEN payment_method='cash' THEN total ELSE 0 END) as cash_total,
-        SUM(CASE WHEN payment_method='card' THEN total ELSE 0 END) as card_total,
+        SUM(CASE WHEN payment_method IN ('card','card_on_file') THEN total ELSE 0 END) as card_total,
+        SUM(CASE WHEN payment_method='check' THEN total ELSE 0 END) as check_total,
         SUM(CASE WHEN payment_method='charge' THEN total ELSE 0 END) as charge_total
       FROM pos_transactions t
       WHERE landlord_id=$1 ${dateFilter} ${propFilter}`, salesParams)
@@ -4812,6 +4880,12 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
              WHEN t.payment_method = 'card' AND t.paid_online THEN 'pay_link'
              WHEN t.payment_method = 'card' THEN 'card_reader'
              ELSE t.payment_method END AS tender,
+        -- 10/24 (Nic): "maybe the last four of the credit card they used" —
+        -- what a desk has in hand when somebody rings about a sale they cannot
+        -- otherwise name. The card the sale was taken on, by its fingerprint.
+        (SELECT k.last4 FROM pos_customer_cards k
+          WHERE k.pos_customer_id = t.pos_customer_id AND k.last4 IS NOT NULL
+          ORDER BY k.last_seen_at DESC NULLS LAST LIMIT 1) AS card_last4,
         -- 10/3 (review): why Void is not offered on this sale (null: it may be voided).
         ${voidBlockedSql('t')} AS void_blocked,
         (SELECT json_agg(json_build_object('name', i.item_name, 'qty', i.qty, 'price', i.unit_price, 'subtotal', i.subtotal) ORDER BY i.created_at)
@@ -5475,7 +5549,10 @@ posRouter.get('/terminal/readers/:stripeReaderId/save-card-answer', requirePerm(
     let nameSet: string | null = null
     if (answer.name) {
       const cur = await queryOne<{ first_name: string; last_name: string }>(`SELECT first_name, last_name FROM pos_customers WHERE id = $1`, [tx.pos_customer_id])
-      if (cur && cur.first_name === 'Card' && cur.last_name === 'Customer') {
+      // 10/24: the one definition again — this was the fourth hand-written
+      // copy, and with an unnamed card now called "Visa ••4242" it quietly
+      // stopped writing the name the customer had just typed on the reader.
+      if (cur && nameIsAPlaceholder(cur.first_name, cur.last_name)) {
         const parts = answer.name.split(' ')
         const first = parts.length > 1 ? parts.slice(0, -1).join(' ') : parts[0]
         const last = parts.length > 1 ? parts[parts.length - 1] : ''
@@ -6071,6 +6148,94 @@ posRouter.patch('/transactions/:id/customer', requirePerm('pos.ring_sale'), asyn
       if (e?.code === '23505') throw new AppError(409, EMAIL_TAKEN_PICK)
       throw e
     } finally { client.release() }
+  } catch (e) { next(e) }
+})
+
+/**
+ * PATCH /api/pos/transactions/:id/tender — 10/24 (Nic) — THE SALE WAS RUNG ON
+ * THE WRONG TENDER, AND A VOID IS THE WRONG WAY TO SAY SO.
+ *
+ *   "one propane sale got marked as cash when the person dropped off a check.
+ *    $49.25 under Donald Hamp. So we need to correctly re-record that to be a
+ *    check and not cash."
+ *
+ *   "I want you to re-record Donald Hamp as paid with check. I don't want to
+ *    void the sale and redo it. I don't like voiding sales. It's just like it
+ *    makes it look like it was there when it wasn't. And it's just extra data
+ *    in the system that doesn't need to remain."
+ *
+ * He is right, and the reason is bookkeeping rather than taste. A void says the
+ * sale never happened; this sale did happen, for the right amount, to the right
+ * person. Only the line that says HOW it was paid is wrong. Voiding and
+ * re-ringing writes two more rows that each describe something untrue — a sale
+ * that never was, and a second sale on a day the goods did not move — to fix one
+ * word.
+ *
+ * NOTHING IS LOST BY CORRECTING IT. `audit_pos_transactions` journals the UPDATE,
+ * so what the row said before (cash, no number) is kept for good in the change
+ * journal that the Books rebuild reads. That is the whole of "keep everything"
+ * — the old value is preserved, without a void pretending the sale is not there.
+ *
+ * CASH AND CHECK ONLY, and that limit is the safety. Those are the two tenders
+ * where no money moved through a processor, so the record is purely a record of
+ * what was handed across the counter. A card sale's tender is a fact about a
+ * real authorization on GAM's account; re-labeling it would make the books
+ * disagree with Stripe. A store-account sale carries its own balance. Either of
+ * those is refused in plain words.
+ */
+posRouter.patch('/transactions/:id/tender', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const b = parseForStaff(z.object({
+      paymentMethod: z.enum(['cash', 'check']),
+      paymentReference: z.string().trim().max(40).optional().nullable(),
+    }), req.body, {
+      paymentMethod: 'Say whether it was cash or a check.',
+      paymentReference: CHECK_NEEDS_A_NUMBER,
+    }, 'That tender could not be corrected — open the sale again and pick cash or check.')
+    const tx = await queryOne<{
+      id: string; payment_method: string; property_id: string | null
+      voided_at: Date | null; refunded_at: Date | null; status: string; total: string
+    }>(`SELECT id, payment_method, property_id, voided_at, refunded_at, status, total::text AS total
+          FROM pos_transactions WHERE id = $1 AND landlord_id = $2`,
+      [req.params.id, posLandlordId(req)])
+    if (!tx) throw new AppError(404, 'That sale is not on this register.')
+    if (tx.property_id) await assertPropertyInScope(req.user, tx.property_id)
+    if (tx.voided_at) throw new AppError(400, 'That sale was voided, so there is no payment on it to correct.')
+    if (tx.refunded_at) throw new AppError(400, 'That sale was refunded — correcting how it was paid now would not '
+      + 'match what went back. Leave it as it is.')
+    if (tx.payment_method !== 'cash' && tx.payment_method !== 'check') {
+      throw new AppError(400, tx.payment_method === 'charge'
+        ? 'That sale went on a store account, which carries its own balance — it is not a cash or check payment to re-label.'
+        : 'That sale was paid by card, and the card charge is what it is. Only a cash or check sale can be re-recorded '
+          + 'as the other one.')
+    }
+    const ref = (b.paymentReference ?? '').trim()
+    if (b.paymentMethod === 'check') {
+      if (!ref) throw new AppError(400, CHECK_NEEDS_A_NUMBER)
+      const takesChecks = tx.property_id ? await queryOne<{ accepts_checks: boolean }>(
+        `SELECT accepts_checks FROM properties WHERE id = $1 AND landlord_id = $2`,
+        [tx.property_id, posLandlordId(req)]) : null
+      if (tx.property_id && !takesChecks?.accepts_checks) throw new AppError(400, CHECK_NOT_TAKEN_HERE)
+    } else if (ref) {
+      throw new AppError(400, REFERENCE_WITHOUT_A_CHECK)
+    }
+    // Cash and check are both free (S654), so no fee, surcharge or held payout
+    // moves with this — there is nothing on the money side to recompute. Change
+    // given stays as it was: if cash was handed over and change given, and it
+    // turns out to have been a check, the change is still change that was given.
+    const row = await queryOne<{ payment_method: string; payment_reference: string | null }>(
+      `UPDATE pos_transactions
+          SET payment_method = $2,
+              payment_reference = CASE WHEN $2 = 'check' THEN $3::text ELSE NULL END
+        WHERE id = $1
+        RETURNING payment_method, payment_reference`,
+      [tx.id, b.paymentMethod, ref || null])
+    logger.info({ saleId: tx.id, was: tx.payment_method, now: row!.payment_method, userId: req.user.userId },
+      'pos: a sale\'s tender was corrected')
+    res.json({ success: true, data: {
+      id: tx.id, was: tx.payment_method,
+      paymentMethod: row!.payment_method, paymentReference: row!.payment_reference,
+    } })
   } catch (e) { next(e) }
 })
 

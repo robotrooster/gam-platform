@@ -337,6 +337,202 @@ describe('POST /api/pos/transactions — happy paths', () => {
     expect(log.rows[0].reference_id).toBe(res.body.data.id)
   })
 
+  // 10/23 (Nic): "we need to add a button to record check payments. That also
+  // needs to be turned on or off if a property chooses to accept checks. A lot
+  // of places don't accept them. For some reason, you can record an invoice
+  // with a check number and record the payment, but you can't do it on the
+  // point of sale system."
+  describe('a check at the counter', () => {
+    // The check gates refuse BEFORE the cart is priced, so a refusal test must
+    // not queue a tax answer — an unconsumed mockResolvedValueOnce is picked up
+    // by whichever test runs next and prices its cart wrong.
+    const ring = async (f: any, itemId: string, body: Record<string, unknown>, priced = true) => {
+      if (priced) calculateCartTaxMock.mockResolvedValueOnce({
+        subtotal: 49.25, taxAmount: 0, lines: [{ itemId, lineSubtotal: 49.25, lineTax: 0 }],
+      })
+      return request(buildApp())
+        .post('/api/pos/transactions')
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+        .send({
+          propertyId: f.propertyId,
+          items: [{ id: itemId, name: 'Propane', qty: 1, price: 49.25, tax_rate: 0, category: 'Test Cat' }],
+          ...body,
+        })
+    }
+
+    it('records the tender and the check number, and takes no fee for it', async () => {
+      const f = await seedPosFixture()
+      const itemId = await seedPosItem(f, { sellPrice: 49.25, stockQty: 50 })
+      const res = await ring(f, itemId, { paymentMethod: 'check', paymentReference: ' 167 ' })
+      expect(res.status, JSON.stringify(res.body)).toBe(201)
+      expect(res.body.data.payment_method).toBe('check')
+      // Trimmed, because a number typed with a space is the same check.
+      expect(res.body.data.payment_reference).toBe('167')
+      // A CHECK IS FREE, like cash (S654, Nic: "There's no fee. Paying cash or
+      // check is free"). No surcharge, no platform fee, and no money held.
+      expect(Number(res.body.data.surcharge)).toBe(0)
+      expect(Number(res.body.data.platform_fee)).toBe(0)
+      expect(Number(res.body.data.total)).toBe(49.25)
+      const held = await db.query(
+        `SELECT 1 FROM held_payout_items WHERE source_type = 'pos_sale' AND source_id = $1`, [res.body.data.id])
+      expect(held.rows).toHaveLength(0)
+    })
+
+    it('refuses a check with no number, because an anonymous check cannot be found again', async () => {
+      const f = await seedPosFixture()
+      const itemId = await seedPosItem(f, { sellPrice: 49.25, stockQty: 50 })
+      const res = await ring(f, itemId, { paymentMethod: 'check', paymentReference: '   ' }, false)
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/check number/i)
+      // Nothing was written, and no stock moved.
+      const item = await db.query<{ stock_qty: string }>(`SELECT stock_qty FROM pos_items WHERE id = $1`, [itemId])
+      expect(Number(item.rows[0].stock_qty)).toBe(50)
+    })
+
+    it('refuses a check number on a tender that has none', async () => {
+      const f = await seedPosFixture()
+      const itemId = await seedPosItem(f, { sellPrice: 49.25, stockQty: 50 })
+      const res = await ring(f, itemId, { paymentMethod: 'cash', paymentReference: '167' }, false)
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/only a check/i)
+    })
+
+    it('refuses a check where the park says it does not take them, button or no button', async () => {
+      const f = await seedPosFixture()
+      await db.query(`UPDATE properties SET accepts_checks = FALSE WHERE id = $1`, [f.propertyId])
+      const itemId = await seedPosItem(f, { sellPrice: 49.25, stockQty: 50 })
+      const res = await ring(f, itemId, { paymentMethod: 'check', paymentReference: '167' }, false)
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/does not take checks/i)
+      // And the register is told so before it ever shows the button.
+      const settings = await request(buildApp())
+        .get(`/api/pos/settings?propertyId=${f.propertyId}`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(settings.body.data.acceptsChecks).toBe(false)
+    })
+
+    it('tells the register a park takes checks, which is every park by default', async () => {
+      const f = await seedPosFixture()
+      const settings = await request(buildApp())
+        .get(`/api/pos/settings?propertyId=${f.propertyId}`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(settings.body.data.acceptsChecks).toBe(true)
+    })
+  })
+
+  // 10/24 (Nic): "one propane sale got marked as cash when the person dropped
+  // off a check... I want you to re-record Donald Hamp as paid with check. I
+  // don't want to void the sale and redo it. I don't like voiding sales. It's
+  // just like it makes it look like it was there when it wasn't."
+  describe('correcting the tender on a sale already rung', () => {
+    const sell = async (f: any, method: string, ref?: string) => {
+      const itemId = await seedPosItem(f, { sellPrice: 49.25, stockQty: 50 })
+      calculateCartTaxMock.mockResolvedValueOnce({
+        subtotal: 49.25, taxAmount: 0, lines: [{ itemId, lineSubtotal: 49.25, lineTax: 0 }],
+      })
+      const res = await request(buildApp())
+        .post('/api/pos/transactions')
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+        .send({ propertyId: f.propertyId,
+                items: [{ id: itemId, name: 'Propane', qty: 1, price: 49.25, tax_rate: 0, category: 'Test Cat' }],
+                paymentMethod: method, ...(ref ? { paymentReference: ref } : {}) })
+      expect(res.status, JSON.stringify(res.body)).toBe(201)
+      return res.body.data
+    }
+    const correct = (f: any, id: string, body: Record<string, unknown>) =>
+      request(buildApp()).patch(`/api/pos/transactions/${id}/tender`)
+        .set('Authorization', `Bearer ${f.landlordToken}`).send(body)
+
+    it('re-records a cash sale as a check WITHOUT a void, and keeps what it said before', async () => {
+      const f = await seedPosFixture()
+      const sale = await sell(f, 'cash')
+      const res = await correct(f, sale.id, { paymentMethod: 'check', paymentReference: '167' })
+      expect(res.status, JSON.stringify(res.body)).toBe(200)
+      expect(res.body.data).toMatchObject({ was: 'cash', paymentMethod: 'check', paymentReference: '167' })
+
+      const row = (await db.query<any>(
+        `SELECT payment_method, payment_reference, voided_at, total::text AS total, status
+           FROM pos_transactions WHERE id = $1`, [sale.id])).rows[0]
+      expect(row).toMatchObject({ payment_method: 'check', payment_reference: '167', voided_at: null })
+      // THE SALE IS STILL THE SALE: same money, same status, not voided, and no
+      // second sale written to carry the correction.
+      expect(Number(row.total)).toBe(49.25)
+      const all = await db.query(
+        `SELECT 1 FROM pos_transactions WHERE landlord_id = $1`, [f.landlordId])
+      expect(all.rows).toHaveLength(1)
+
+      // AND NOTHING IS LOST — the change journal holds what the row said before,
+      // which is why a void is not needed to keep the history.
+      const journal = await db.query<any>(
+        `SELECT op, old_row, new_row FROM audit_row_changes
+          WHERE table_name = 'pos_transactions' AND row_id = $1 ORDER BY changed_at DESC LIMIT 1`, [sale.id])
+      expect(journal.rows).toHaveLength(1)
+      expect(journal.rows[0].op).toBe('UPDATE')
+      expect(journal.rows[0].old_row.payment_method).toBe('cash')
+      expect(journal.rows[0].old_row.payment_reference).toBeNull()
+      expect(journal.rows[0].new_row.payment_method).toBe('check')
+    })
+
+    it('goes back the other way, and clears the number with it', async () => {
+      const f = await seedPosFixture()
+      const sale = await sell(f, 'check', '167')
+      const res = await correct(f, sale.id, { paymentMethod: 'cash' })
+      expect(res.status, JSON.stringify(res.body)).toBe(200)
+      const row = (await db.query<any>(
+        `SELECT payment_method, payment_reference FROM pos_transactions WHERE id = $1`, [sale.id])).rows[0]
+      expect(row).toMatchObject({ payment_method: 'cash', payment_reference: null })
+    })
+
+    it('will not re-label a card sale, because the card charge is a real authorization', async () => {
+      const f = await seedPosFixture()
+      const sale = await sell(f, 'cash')
+      await db.query(`UPDATE pos_transactions SET payment_method = 'card', stripe_payment_intent_id = 'pi_x' WHERE id = $1`, [sale.id])
+      const res = await correct(f, sale.id, { paymentMethod: 'check', paymentReference: '167' })
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/paid by card/i)
+    })
+
+    it('will not re-label a store-account sale, which carries its own balance', async () => {
+      const f = await seedPosFixture()
+      const sale = await sell(f, 'cash')
+      await db.query(`UPDATE pos_transactions SET payment_method = 'charge' WHERE id = $1`, [sale.id])
+      const res = await correct(f, sale.id, { paymentMethod: 'cash' })
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/store account/i)
+    })
+
+    it('refuses a check with no number here too, and leaves the sale alone', async () => {
+      const f = await seedPosFixture()
+      const sale = await sell(f, 'cash')
+      const res = await correct(f, sale.id, { paymentMethod: 'check' })
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/check number/i)
+      const row = (await db.query<any>(`SELECT payment_method FROM pos_transactions WHERE id = $1`, [sale.id])).rows[0]
+      expect(row.payment_method).toBe('cash')
+    })
+
+    it('will not correct a voided or refunded sale', async () => {
+      const f = await seedPosFixture()
+      const voided = await sell(f, 'cash')
+      await db.query(`UPDATE pos_transactions SET voided_at = NOW() WHERE id = $1`, [voided.id])
+      expect((await correct(f, voided.id, { paymentMethod: 'check', paymentReference: '1' })).status).toBe(400)
+      const refunded = await sell(f, 'cash')
+      await db.query(`UPDATE pos_transactions SET refunded_at = NOW() WHERE id = $1`, [refunded.id])
+      const r = await correct(f, refunded.id, { paymentMethod: 'check', paymentReference: '1' })
+      expect(r.status).toBe(400)
+      expect(r.body.error).toMatch(/refunded/i)
+    })
+
+    it('is another landlord\'s sale to nobody else', async () => {
+      const f = await seedPosFixture()
+      const other = await seedPosFixture()
+      const sale = await sell(f, 'cash')
+      const res = await request(buildApp()).patch(`/api/pos/transactions/${sale.id}/tender`)
+        .set('Authorization', `Bearer ${other.landlordToken}`).send({ paymentMethod: 'cash' })
+      expect(res.status).toBe(404)
+    })
+  })
+
   // S652 (Nic): "charge a transaction on propane at Mountain View… it's not
   // completing the sale." Propane sells by the gallon; 4.6 gallons hit
   // integer stock columns, the database refused "-4.6", and the sale rolled
@@ -539,7 +735,12 @@ describe('POST /api/pos/transactions — happy paths', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Ice', qty: 1, price: 10 }], paymentMethod: 'card', stripePaymentIntentId: 'pi_wallet', stripeReaderId })
     expect(res.status).toBe(201)
-    expect(res.body.data.customer).toMatchObject({ firstName: 'Card', lastName: 'Customer', isNew: true, cardKeepable: false, prompting: true, asks: { askSave: false, askName: true, askEmail: true } })
+    // 10/24 (Nic): "we just had one sale earlier today that says Visa card
+    // holder. Did it not pull their name off the card?" It did — the card had
+    // no name on it. A nameless card is named by the CARD now, so two of them
+    // are tellable apart and the last four is searchable. The reader is still
+    // asked for a name, because "Visa ••4242" is a card, not a person.
+    expect(res.body.data.customer).toMatchObject({ firstName: 'Visa', lastName: '\u2022\u20224242', isNew: true, cardKeepable: false, prompting: true, asks: { askSave: false, askName: true, askEmail: true } })
     expect(startSaveCardPromptMock).toHaveBeenCalledWith(stripeReaderId, { askSave: false, askName: true, askEmail: true })
     // They type their name and an email: the record is theirs now, the receipt goes out, nothing is "kept".
     readSaveCardAnswerMock.mockResolvedValueOnce({ answered: true, yes: null, name: 'Nic Rhoades', email: 'nic@example.com' })
@@ -3438,6 +3639,7 @@ describe('10/2 (review) a wrong pick is put back with Undo', () => {
     expect(named.body.data.message).toMatch(/^Saved Pat Typed/)
     expect((await undo(f, s, named.body.data.undo)).status).toBe(200)
     expect((await db.query<any>(`SELECT first_name, last_name, email FROM pos_customers WHERE id = $1`, [standIn])).rows[0])
+      // No card identity on this stand-in at all, so it stays Card Customer.
       .toEqual({ first_name: 'Card', last_name: 'Customer', email: null })
     // A cash sale linked to a brand-new customer: undone, that record goes again.
     const cash = await saleRow(f, { paymentMethod: 'cash' })
@@ -3486,7 +3688,7 @@ describe('10/2 linking a sale to a person fills in every sale on the same card',
     const standIn = s1.body.data.pos_customer_id
     expect(s2.body.data.pos_customer_id).toBe(standIn)
     expect((await db.query<any>(`SELECT first_name, last_name, created_from FROM pos_customers WHERE id = $1`, [standIn])).rows[0])
-      .toEqual({ first_name: 'Card', last_name: 'Customer', created_from: 'card_reader' })
+      .toEqual({ first_name: 'Visa', last_name: '\u2022\u20229767', created_from: 'card_reader' })
 
     // He clicks his own name on the later sale.
     const res = await link(f, s2.body.data.id, { tenantId: nic })
@@ -3758,6 +3960,7 @@ describe('10/2 a cashier works only the properties they are assigned to', () => 
     expect(emailPosReceiptMock).not.toHaveBeenCalled()
     expect(saveCardForCustomerMock).not.toHaveBeenCalled()
     expect((await db.query<any>(`SELECT first_name, last_name, email FROM pos_customers WHERE id = $1`, [standIn])).rows[0])
+      // No card identity on this stand-in either.
       .toEqual({ first_name: 'Card', last_name: 'Customer', email: null })
     // Their own park's sale is answered.
     readSaveCardAnswerMock.mockResolvedValue({ answered: false })

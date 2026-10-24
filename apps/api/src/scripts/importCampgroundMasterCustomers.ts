@@ -136,6 +136,31 @@ export function notAName(first: string, last: string, hasContact = false): strin
   if (/\b(test|testing|xxx+|aaa+|zzz+|unknown|n\/?a|none|delete|do ?not ?use|dummy|sample)\b/i.test(whole)) {
     return 'a placeholder, not a person'
   }
+  // 10/24 (Nic), reading the pairs the first pass printed: Campground Master
+  // used the customer list as scratch paper, and these came through because
+  // they have letters in them. "Leave them all behind."
+  //
+  // They are site STATES and booking notes — "Out Of Order", "Park Model",
+  // "Summer Overload", "Week" — plus "Do Not Fill", which is an instruction to
+  // the desk, and the numbered minor/unknown placeholders. Sixteen rows.
+  if (/^(do ?not ?fill|out ?of ?order|park ?model|summer ?overload|week|month|minor ?\d*|unknown ?\d*)$/i
+        .test(squeeze(whole).replace(/\s+/g, ' ').trim())) {
+    return 'a site state or a booking note, not a person'
+  }
+  // 10/24 (Nic): "if it doesn't have a full last name, don't add it as a
+  // person." A first name and an initial is somebody the desk never finished
+  // writing down — "Jeremy J" — and a last name with no first name is the same
+  // thing from the other end. Neither can be matched to a human later.
+  const lastBare = squeeze(last).replace(/[^a-z]/gi, '')
+  const firstBare = squeeze(first).replace(/[^a-z]/gi, '')
+  if (!lastBare || lastBare.length <= 1) return 'no full last name'
+  // 10/24 (Nic), after seeing the 41 I had kept on the benefit of the doubt:
+  // "If it doesn't have a first name or a last name, if it only has a partial
+  // name, drop it. That 41 people that only have a last name, drop them."
+  //
+  // So a phone number does NOT rescue a half-written name. A customer record
+  // nobody can put a person to is noise in the list either way.
+  if (!firstBare) return 'only a last name'
   return null
 }
 
@@ -146,7 +171,47 @@ export function planFromCsv(text: string): ImportPlan {
   const dropped: Dropped[] = []
   const usedRef = new Map<string, number>()
 
-  rows.forEach((r, i) => {
+  /**
+   * 10/24 (Nic) — A COUPLE IS TWO PEOPLE, NOT ONE CUSTOMER.
+   *
+   *   "If they are people that have two names in there, where it says Rosie and
+   *    Don Jorgensen, those need to be split into two people. We don't want
+   *    couples being on there as one customer."
+   *
+   * So "Rosie & Don" Jorgensen becomes Rosie Jorgensen and Don Jorgensen, each
+   * carrying the household's phone and address, because that is what is known
+   * about both of them. (A FAMILY GROUPING so a stay by either shows on both
+   * histories is its own piece of work — he was explicit that it is not a
+   * merge: "Kent Nielsen has a record and Kelly Nielsen has a record.")
+   */
+  const splitCouple = (first: string): string[] => {
+    const parts = first.split(/\s*(?:&|\+|\band\b)\s*/i).map(squeeze).filter(Boolean)
+    return parts.length > 1 ? parts : [first]
+  }
+
+  /**
+   * 10/24 (Nic): "Just make the donkey tucker just only be Phil Tucker. Like,
+   * I'm sure that was an error."
+   *
+   * "Dalke Tucker" shares Phil Tucker's phone and is a mangling of his row. It
+   * is NOT the real Dale Tucker, who is a different man on a different number
+   * in Indiana and comes in untouched.
+   */
+  const KNOWN_ERRORS = [{ first: 'Dalke', last: 'Tucker' }]
+
+  rows.flatMap((r, i): any[] => {
+    const firstRaw = squeeze(r['First Names'] || '')
+    const lastRaw = squeeze(r['Last Name'] || '')
+    if (KNOWN_ERRORS.some(e => e.first.toLowerCase() === firstRaw.toLowerCase()
+                            && e.last.toLowerCase() === lastRaw.toLowerCase())) {
+      return [{ ...r, __drop: 'a mis-typed duplicate of another row (Nic, 10/24)' }]
+    }
+    return splitCouple(firstRaw).map(one => ({ ...r, 'First Names': one }))
+  }).forEach((r: any, i) => {
+    if (r.__drop) {
+      dropped.push({ row: i + 2, name: squeeze(`${r['First Names']} ${r['Last Name']}`), why: r.__drop })
+      return
+    }
     const first = squeeze(r['First Names'] || '')
     const last = squeeze(r['Last Name'] || '')
     const phone = tidyPhone(r['Phone 1'] || '') ?? tidyPhone(r['Phone 2'] || '') ?? tidyPhone(r['Phone 3'] || '')
@@ -229,8 +294,26 @@ export async function writePeople(q: Q, landlordId: string, people: Person[]): P
   let added = 0, updated = 0
   for (const p of people) {
     const res = await q.query<{ inserted: boolean }>(
+      // 10/24 — AN EMAIL GAM ALREADY KNOWS IS LEFT ALONE, NOT IMPORTED OVER.
+      //
+      // pos_customers has a second unique index on (landlord_id, lower(email)),
+      // and the first --apply run hit it on cardozavic68@gmail.com: somebody
+      // already a Mountain View customer in GAM is also in the old file. The
+      // run aborted with one row already committed, which made it unsafe to
+      // re-run — the worst state for an import.
+      //
+      // The old system is not the authority on somebody GAM already has, so the
+      // email is dropped from the row rather than fought over: they come in by
+      // their old reference with their phone and note, and the person GAM knows
+      // keeps the address. Nothing is merged (this script never merges) and the
+      // pair prints for Nic like every other possible duplicate.
       `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, phone, notes, created_from, elsewhere_ref)
-       VALUES ($1,$2,$3,$4,$5,$6,'import',$7)
+       SELECT $1, $2, $3,
+              CASE WHEN $4::text IS NULL THEN NULL
+                   WHEN EXISTS (SELECT 1 FROM pos_customers x
+                                 WHERE x.landlord_id = $1 AND lower(x.email) = lower($4::text))
+                   THEN NULL ELSE $4::text END,
+              $5, $6, 'import', $7
        ON CONFLICT (landlord_id, elsewhere_ref) WHERE archived_at IS NULL AND elsewhere_ref IS NOT NULL
        DO UPDATE SET
          email = COALESCE(pos_customers.email, EXCLUDED.email),

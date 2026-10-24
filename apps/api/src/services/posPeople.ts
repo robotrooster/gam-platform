@@ -84,7 +84,7 @@ import rateLimit from 'express-rate-limit'
 import type { ZodTypeAny, output as ZodOutput } from 'zod'
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
-import { mergePosCustomers, nameFromCard, cardLabel, MERGE_MOVED_TABLES, type CardIdentity, type MergeRecord } from './posCustomerCards'
+import { mergePosCustomers, nameFromCard, cardLabel, nameIsAPlaceholder, MERGE_MOVED_TABLES, type CardIdentity, type MergeRecord } from './posCustomerCards'
 import { inBook, notInBook, askingAs, type BookCaller } from './registerBook'
 
 type Q = Pick<PoolClient, 'query'>
@@ -94,7 +94,11 @@ const EMAIL = /^[^@\s]+@[^@\s]+\.[^@\s]+$/
 export const digitsOf = (s?: string | null): string => String(s ?? '').replace(/\D/g, '')
 const phoneSql = (col: string) => `regexp_replace(COALESCE(${col}, ''), '\\D', '', 'g')`
 const likeEscape = (s: string) => s.replace(/[\\%_]/g, (c) => '\\' + c)
-const isCardCustomer = (first?: string | null, last?: string | null) => first === 'Card' && last === 'Customer'
+// 10/24: one definition, in posCustomerCards — a record called "Visa ••4242"
+// is a card nobody gave a name for, so every place that refuses to present a
+// placeholder as a person keeps refusing. It is still what the HISTORY column
+// shows, because there it is the most identifying thing there is.
+const isCardCustomer = nameIsAPlaceholder
 const fullName = (first?: string | null, last?: string | null) => `${first ?? ''} ${last ?? ''}`.trim()
 const sameText = (a?: string | null, b?: string | null) =>
   String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase()

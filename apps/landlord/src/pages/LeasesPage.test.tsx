@@ -91,7 +91,14 @@ import { LeasesPage, NeverMovedInModal, DISCARD_BECAME_SIGNED_NOTE } from './Lea
 
 /** What GET /leases/:id/never-moved-in answers, as the server sends it. */
 const applies = (o: Record<string, unknown> = {}) => ({
-  applies: true, words: null, status: 'active', start_date: '2026-09-24',
+  // 10/24 — RELATIVE, NOT A FIXED DAY. This was '2026-09-24', and the
+  // never-moved-in window shows an extra warning once a lease started more
+  // than a month ago (startedOverAMonthAgo, measured against Date.now()). So
+  // this fixture quietly became "over a month old" on 2026-10-24 and the
+  // assertion below that the warning is absent began failing — on a date, not
+  // on a change. Five days ago is always five days ago.
+  applies: true, words: null, status: 'active',
+  start_date: new Date(Date.now() - 5 * 86400000).toISOString().slice(0, 10),
   lines: [
     { payment_id: 'p1', label: 'Rent', amount: 1000, due_date: '2026-10-01', utility: false },
     { payment_id: 'p2', label: 'Security deposit', amount: 500, due_date: '2026-10-01', utility: false },

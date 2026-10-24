@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from 'react-query'
-import { humanize, dueDayLabel, PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT, feeChoiceFromPayer, PARTIAL_PAYMENTS_LAW_NOTE, TENANTS_DEPOSIT_AT_BANK_LABEL, TENANTS_DEPOSIT_AT_BANK_HINT, EARLY_DEPARTURE_REFUNDS_QUESTION, EARLY_DEPARTURE_REFUNDS_HINT, MID_MONTH_PRORATION_QUESTION, MID_MONTH_PRORATION_HINT, type ProcessingFeeChoice } from '@gam/shared'
+import { humanize, dueDayLabel, PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT, feeChoiceFromPayer, PARTIAL_PAYMENTS_LAW_NOTE, TENANTS_DEPOSIT_AT_BANK_LABEL, TENANTS_DEPOSIT_AT_BANK_HINT, EARLY_DEPARTURE_REFUNDS_QUESTION, EARLY_DEPARTURE_REFUNDS_HINT, MID_MONTH_PRORATION_QUESTION, MID_MONTH_PRORATION_HINT, ACCEPTS_CHECKS_QUESTION, ACCEPTS_CHECKS_HINT, type ProcessingFeeChoice } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
 import { toast } from '../components/dialogs'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck, UserPlus, AlertTriangle } from 'lucide-react'
@@ -242,6 +242,7 @@ export function PropertyDetailPage() {
       <CardFeePayerCard property={property} onSaved={() => { qc.invalidateQueries(['property', id]); qc.invalidateQueries('properties') }} />
       <PartialPaymentsCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <TenantsDepositAtBankCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <AcceptsChecksCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <PropertyFeeScheduleSection propertyId={property.id}
         unitTypes={[...new Set((units as any[]).map(u => u.unitType).filter(Boolean))].sort()} />
       <PropertyOfficeEmailSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
@@ -888,6 +889,38 @@ export function DepartureRulesCard({ property, onSaved }: { property: any; onSav
       <YesNo on={prorates} onPick={v => save.mutate({ proratesMidMonth: v })} />
       <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginTop: 8 }}>
         {MID_MONTH_PRORATION_HINT[prorates ? 'yes' : 'no']}
+      </div>
+    </div>
+  )
+}
+
+// 10/23 (Nic) — DOES THIS PROPERTY TAKE A CHECK AT THE COUNTER?
+//   "we need to add a button to record check payments. That also needs to be
+//    turned on or off if a property chooses to accept checks. A lot of places
+//    don't accept them."
+// A question, like the departure rules, and Yes by default: every property
+// already takes a check on an invoice, so a landlord who never opens this card
+// sees no change, and a missing answer from an older cached page reads Yes too.
+export function AcceptsChecksCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (accepted: boolean) => apiPatch(`/properties/${property.id}/accepts-checks`, { accepted }),
+    { onSuccess: onSaved,
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save that answer') })
+  const on = property.acceptsChecks !== false
+  const busy = save.isLoading
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <div style={{ fontSize: '.8rem', color: 'var(--text-1)', fontWeight: 600, marginBottom: 6 }}>
+        {ACCEPTS_CHECKS_QUESTION}
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+          onClick={() => !on && save.mutate(true)}>Yes</button>
+        <button className={`btn btn-sm ${!on ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+          onClick={() => on && save.mutate(false)}>No</button>
+      </div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginTop: 8 }}>
+        {ACCEPTS_CHECKS_HINT[on ? 'yes' : 'no']}
       </div>
     </div>
   )

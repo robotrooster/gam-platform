@@ -67,9 +67,25 @@ describe('who is a person and who is a placeholder', () => {
     expect(notAName('', '719', true)).toMatch(/no letters/)
   })
 
-  it('but initials WITH a number to ring are somebody the desk met', () => {
+  // 10/24 (Nic), after seeing the ones I had kept on the benefit of the doubt:
+  // "If it doesn't have a first name or a last name, if it only has a partial
+  // name, drop it. That 41 people that only have a last name, drop them."
+  //
+  // So a phone number does not rescue a half-written name. Johnston and Nokes
+  // came in on the first run under the old rule and were deleted from the live
+  // list the same day.
+  it('drops a half-written name, phone number or no phone number', () => {
+    expect(notAName('', 'Johnston')).toMatch(/only a last name/)
+    expect(notAName('', 'Johnston', true)).toMatch(/only a last name/)
     expect(notAName('', 'RJ')).toMatch(/nothing to reach them by/)
-    expect(notAName('', 'RJ', true)).toBeNull()
+    // Initials with a number to ring used to be kept. Dropped now — which of
+    // the two reasons it lands on does not matter, only that it lands.
+    expect(notAName('', 'RJ', true)).toMatch(/only a last name/)
+    // And the other end of the same gap: a first name with no surname.
+    expect(notAName('Josh', '')).toMatch(/no full last name/)
+    expect(notAName('Josh', '', true)).toMatch(/no full last name/)
+    // A WHOLE name is still a person, with or without a way to reach them.
+    expect(notAName('Tom', 'Pike')).toBeNull()
   })
 })
 

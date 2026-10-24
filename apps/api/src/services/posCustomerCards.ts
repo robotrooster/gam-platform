@@ -85,10 +85,57 @@ export function cardLabel(card: { brand?: string | null; last4?: string | null }
   return `${names[b] ?? 'Card'} ••${card.last4}`
 }
 
-/** "JANE DOE" → Jane Doe; "DOE/JANE" (some issuers) → Jane Doe; blank → Card Customer. */
-export function nameFromCard(holder: string | null | undefined): { first: string; last: string } {
+/**
+ * 10/24 (Nic): "we just had one sale earlier today that says Visa card holder.
+ * Did it not pull their name off the card and add them as a customer into the
+ * system?"
+ *
+ * It did add them, and it did read the name off the card — the CARD said
+ * "VISA CARDHOLDER". Plenty of debit cards and tokenized wallet taps put a
+ * generic string in the cardholder-name field instead of a person, and this
+ * passed it through and title-cased it, so Mountain View ended up with five
+ * customer records all called Visa Cardholder: indistinguishable from each
+ * other in a list, and matching nothing anybody would type into a search.
+ *
+ * A placeholder is not a name. Recognized here so the card itself can name the
+ * customer instead (brand and last four, which is what the clerk sees on the
+ * screen and what Nic asked to be able to search by).
+ */
+const CARD_NAME_PLACEHOLDERS = [
+  'cardholder', 'card holder', 'cardmember', 'card member', 'acctholder', 'account holder',
+  'customer', 'card customer', 'valued customer', 'unknown', 'n/a', 'na', 'none', 'no name',
+]
+
+export function cardNameIsAPlaceholder(holder: string | null | undefined): boolean {
+  const clean = (holder ?? '').replace(/[^a-z ]/gi, ' ').replace(/\s+/g, ' ').trim().toLowerCase()
+  if (!clean) return true
+  // Strip a leading brand, which is how issuers write them: "VISA CARDHOLDER",
+  // "MASTERCARD CARD MEMBER".
+  const bare = clean.replace(/^(visa|mastercard|master card|amex|american express|discover|diners|jcb|unionpay|interac|debit|credit|card)\s+/i, '').trim()
+  return CARD_NAME_PLACEHOLDERS.includes(clean) || CARD_NAME_PLACEHOLDERS.includes(bare)
+}
+
+/**
+ * "JANE DOE" → Jane Doe; "DOE/JANE" (some issuers) → Jane Doe.
+ *
+ * No real name on the card names them by the card instead — "Visa" / "••4242" —
+ * so two unnamed taps are two tellable-apart records and the last four is
+ * searchable. Without a card to fall back on it stays Card Customer, which is
+ * what every caller before 10/24 got.
+ */
+export function nameFromCard(
+  holder: string | null | undefined,
+  card?: { brand?: string | null; last4?: string | null } | null,
+): { first: string; last: string } {
   const clean = (holder ?? '').replace(/\s+/g, ' ').trim()
-  if (!clean) return { first: 'Card', last: 'Customer' }
+  if (!clean || cardNameIsAPlaceholder(clean)) {
+    const label = cardLabel(card)
+    if (label) {
+      const i = label.lastIndexOf(' ')
+      return { first: label.slice(0, i), last: label.slice(i + 1) }
+    }
+    return { first: 'Card', last: 'Customer' }
+  }
   const title = (w: string) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
   if (clean.includes('/')) {
     const [l, f] = clean.split('/')
@@ -97,6 +144,28 @@ export function nameFromCard(holder: string | null | undefined): { first: string
   const parts = clean.split(' ').map(title)
   if (parts.length === 1) return { first: parts[0], last: '' }
   return { first: parts.slice(0, -1).join(' '), last: parts[parts.length - 1] }
+}
+
+/**
+ * IS THIS NAME A STAND-IN RATHER THAN A PERSON? — ONE DEFINITION.
+ *
+ * 10/24: there were three hand-written copies of this question (posPeople's own
+ * helper, an inline test in the sale route deciding whether to ask the reader
+ * for a name, and the fallback in nameFromCard), and the moment an unnamed card
+ * started being called "Visa ••4242" instead of "Card Customer" two of them
+ * quietly answered wrong — the register stopped asking a phone-wallet customer
+ * for their name, because the record now "had" one. Same class of bug as the
+ * enum drift CLAUDE.md warns about, so it gets the same cure: one definition
+ * everything imports.
+ */
+export const nameIsAPlaceholder = (first?: string | null, last?: string | null): boolean => {
+  const f = String(first ?? '').trim()
+  const l = String(last ?? '').trim()
+  if (!f && !l) return true
+  if (f === 'Card' && l === 'Customer') return true
+  // A card-label name: "Visa" / "••4242".
+  if (/^\u2022\u2022\d{4}$/.test(l)) return true
+  return cardNameIsAPlaceholder(`${f} ${l}`.trim())
 }
 
 export interface CardCustomer { customerId: string; isNew: boolean; cardSaved: boolean; firstName: string; lastName: string }
@@ -131,7 +200,7 @@ export async function findOrCreateCustomerForCard(client: PoolClient, opts: { la
     const r = existing.rows[0]
     return { customerId: r.pos_customer_id, isNew: false, cardSaved: !!r.stripe_payment_method_id, firstName: r.first_name, lastName: r.last_name }
   }
-  const { first, last } = nameFromCard(opts.card.cardholderName)
+  const { first, last } = nameFromCard(opts.card.cardholderName, opts.card)
   const created = await client.query<{ id: string }>(
     `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, created_from)
      VALUES ($1, $2, $3, NULL, 'card_reader') RETURNING id`, [opts.landlordId, first, last])

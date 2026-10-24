@@ -69,6 +69,11 @@ function cycleUsageFromReadings(
   multiplier = 1,
 ): number {
   let usage = cycleVal - priorVal
+  // 10/24 (Nic): one or two units down is a rounding error or a stuck face, not
+  // an odometer that went all the way round — see readingBarelyMoved. Wrapping
+  // it would turn a meter that did not move into very nearly a full face of
+  // usage, which is the single biggest wrong number this function can produce.
+  if (readingBarelyMoved(priorVal, cycleVal)) return Math.max(0, usage) * (multiplier > 0 ? multiplier : 1)
   if (usage < 0 && isRollover) usage = (meterReadingModulus(digits) - priorVal) + cycleVal
   return usage * (multiplier > 0 ? multiplier : 1)
 }
@@ -88,6 +93,77 @@ export function usageNeedsDoubleCheck(utilityType: string, usage: number): boole
   const threshold = METER_USAGE_ALERT_THRESHOLDS[utilityType] ?? null
   return threshold != null && usage > threshold
 }
+
+/**
+ * 10/24 (Nic) — A READ THAT BARELY MOVED IS A METER THAT MAY NOT BE TURNING.
+ *
+ *   "if a meter read is within one or two digits of the other read, even if
+ *    it's lower, just go straight into marking it as potentially broken,
+ *    because sometimes it can roll back a little bit, you know, or it might be
+ *    in the middle. Maybe last month somebody rounded it to 40,000 and this
+ *    month it was read as 39999. So it could, when it's within one or two, like
+ *    it could be really just broken, not actually less than before. You know,
+ *    there's a rounding error."
+ *
+ * This is what RV 06 did on 10/23: a prior read of 40000 and a closing read of
+ * 39999, on a face that had read 40000 since August. The old rule saw "below
+ * the previous read" and called it an odometer WRAP, which on a five-digit face
+ * measures 99,999 kWh — a $3,500 power bill out of a meter that had not moved
+ * all summer. It was held, so nobody was billed, but the landlord was then
+ * asked the wrong question: wrap, or swap? Neither. The meter is stuck, or the
+ * last figure was rounded.
+ *
+ * So a difference of one or two units, IN EITHER DIRECTION, is never a wrap and
+ * never usage. It is a meter to go and look at.
+ *
+ * WHERE THE LINE IS: equal to the last read, or below it by one or two. NOT one
+ * or two ABOVE. A face that moved up by two really did move up by two — a guest
+ * who stayed a night in September and never ran the air conditioner — and
+ * billing two units is both true and harmless. Flagging those would put a junk
+ * entry in the landlord's queue after every short stay, which is how a queue
+ * stops being read. Equal is the one that matters most and the one nothing
+ * caught before: a dead face reads the SAME number month after month, bills
+ * $0.00, and raises nothing, so it can sit broken for a season.
+ *
+ * WHAT THE DESK IS TOLD: nothing different. Blind staff entry (S559) only holds
+ * if a refusal cannot be read as a hint, and "your figure is within two of the
+ * last one" IS the last one, to within two. So the desk gets the same sentence
+ * every held read gets, and the fact that the meter looks stuck goes in the
+ * landlord's review note, which only the landlord sees.
+ */
+export const READING_BARELY_MOVED_UNITS = 2
+
+/**
+ * True when a read is level with the one before, or under it by at most
+ * `READING_BARELY_MOVED_UNITS`, AND enough time has passed that it should have
+ * moved.
+ *
+ * THE SAME-DAY GUARD is not a detail. The desk re-reading a meter it read five
+ * minutes ago gets the identical figure, because the figure IS identical — a
+ * card that failed, a retake, a double-press. Calling that a stuck face would
+ * hold a read the desk is simply taking again, and the retake path (a bill
+ * nobody paid going back on the ticket) would never be reached. A meter is only
+ * expected to move between DAYS, so two reads on one day are never compared.
+ *
+ * Both days are 'YYYY-MM-DD'. With either one missing the comparison is not
+ * made, which errs toward flagging — a read with no date to go by is worth a
+ * look anyway.
+ */
+export const readingBarelyMoved = (
+  priorValue: number | null | undefined, value: number,
+  priorDay?: string | null, readDay?: string | null,
+): boolean => {
+  if (priorValue == null || !Number.isFinite(priorValue) || !Number.isFinite(value)) return false
+  if (!(value <= priorValue && priorValue - value <= READING_BARELY_MOVED_UNITS)) return false
+  if (priorDay && readDay && priorDay.slice(0, 10) === readDay.slice(0, 10)) return false
+  return true
+}
+
+/** The landlord-only note on a barely-moved read. Never shown at a counter — it says which way. */
+export const BARELY_MOVED_REVIEW_NOTE =
+  'A read within a unit or two of the previous one — the meter may not be turning, or the last figure '
+  + 'was rounded. Go and look at the face: a genuine figure to confirm, or a meter to mark out of service. '
+  + 'Nothing is billed from it either way until this is settled.'
 
 /** 10/20 — WHAT THE DESK IS TOLD WHEN A MOVE-OUT READ IS HELD.
  *
@@ -2230,6 +2306,18 @@ export async function billMoveOutRead(
   // gets. Blind entry only holds if the two are indistinguishable: tell somebody
   // "that is below the last read" and they have learned the last read is higher,
   // and a few tries of that is the figure itself.
+  // 10/24 (Nic) — BARELY MOVED COMES FIRST, because it is the one case the wrap
+  // guard below got wrong rather than merely held: 39999 after 40000 is not a
+  // dropped digit and not a wrap, it is a face to go and look at. Asked
+  // regardless of where the face sits relative to its ceiling, so a meter stuck
+  // near the top is caught too, and asked of a LEVEL read as well — a dead face
+  // reading the same number every month billed $0.00 and raised nothing.
+  if (!opts.reviewed && readingBarelyMoved(priorVal, cur, prior.reading_day, read.reading_day)) {
+    await holdMoveOutReadForDoubleCheck(readingId, BARELY_MOVED_REVIEW_NOTE, opts)
+    logger.info({ meterId, readingId, utilityType: meter.utility_type },
+      'utility billing: move-out read barely moved from the one before — held as a possibly broken meter')
+    return { billed: false, reason: HELD_FOR_DOUBLE_CHECK }
+  }
   if (isRollover && !opts.reviewed && priorVal < meterReadingModulus(digits) * 0.9) {
     await holdMoveOutReadForDoubleCheck(readingId,
       'A move-out read below the previous read, on a meter nowhere near its ceiling — '

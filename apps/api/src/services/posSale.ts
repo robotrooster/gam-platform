@@ -38,6 +38,14 @@ export interface PosSaleInput {
   /** S650: the taxes charged, by name — "Lodging tax $3.11", not one "Tax" line. */
   taxBreakdown?: { name: string; rate: number; amount: number }[] | null
   /**
+   * 10/24: the check number on a check sale, the same thing payments.reference
+   * holds on an invoice. The database refuses one on any other tender
+   * (pos_transactions_reference_shape), so it is passed as it arrives rather
+   * than cleaned up here — a reference on a cash sale is a caller bug and
+   * should surface as one.
+   */
+  paymentReference?: string | null
+  /**
    * 10/5: a pay link for a stay's background check alone — GAM's screening
    * money, not the company's payers', so it does not end the landlord's free
    * onboarding window (billingActivation feeOnlyPayLinkSql is the backstop's
@@ -91,13 +99,13 @@ export async function insertPosSale(client: PoolClient, s: PosSaleInput): Promis
   cardFeeBooked: Promise<CommittedBookingOutcome | 'no_fee'>
 }> {
   const txRes = await client.query(`INSERT INTO pos_transactions
-    (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id,discount_amount,discount_reason,tax_breakdown,paid_online)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17) RETURNING *`,
+    (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id,discount_amount,discount_reason,tax_breakdown,paid_online,payment_reference)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18) RETURNING *`,
     [s.landlordId, s.tenantId || null, s.posCustomerId || null, s.cashierId,
      s.paymentMethod, s.subtotal, s.taxAmount, s.surcharge, s.total, s.changeGiven || 0, s.platformFee || 0,
      s.stripePaymentIntentId || null, s.propertyId || null, s.discountAmount || 0, s.discountReason || null,
      s.taxBreakdown && s.taxBreakdown.length ? JSON.stringify(s.taxBreakdown) : null,
-     s.paidOnline === true])
+     s.paidOnline === true, s.paymentReference || null])
   const tx = txRes.rows[0]
   // 10/5 (Nic): "money movement is the end of onboarding" — a register sale or
   // a pay link paid, cash or card, ends the landlord's free onboarding window.

@@ -254,7 +254,46 @@ function CustomerEditor({ c, all, onHistory, onChanged }: { c: any; all: any[]; 
   )
 }
 
-const TENDER_LABEL: Record<string,string> = { cash:'Cash', card:'Card · online', card_reader:'Card · in person', pay_link:'Pay link · online', pay_link_in_person_cash:'Pay link · in person (cash)', pay_link_in_person_card:'Pay link · in person (card)', card_on_file:'Card on file', charge:'Charge account' }
+/**
+ * 10/24 (Nic) — A LINE ON THE HISTORY IS A NAME AND A COUNT, NOT A PARAGRAPH.
+ *
+ *   "where it says RV site weekly, 7 nights at site, RV 12, October 17th to
+ *    24th, one quantity of one. Just change that, shorten it to RV site weekly
+ *    X1. It doesn't need to have all that other junk in the middle. Maybe if you
+ *    click on the row to expand it, it can show you the dates."
+ *
+ * So the collapsed row keeps what the thing IS and drops everything the expanded
+ * row already shows. Cut at the first comma or the first bracket, whichever
+ * comes first — a stay line is built as "<what>, <nights> at <site>, <dates>",
+ * so the head of it is the product. Anything with no comma is already short and
+ * is left exactly alone.
+ */
+const shortItemName = (name: string): string => {
+  const full = String(name ?? '').trim()
+  const cut = full.search(/[,(—–]/)
+  if (cut < 4) return full
+  return full.slice(0, cut).trim()
+}
+
+/**
+ * Find-on-page over the sales already on screen. Matches the person, what was
+ * sold, the tender, the check number and the card's last four — everything a
+ * desk would have in hand when somebody rings about a sale.
+ */
+const saleMatches = (t: any, needle: string): boolean => {
+  const q = needle.trim().toLowerCase()
+  if (!q) return true
+  const hay = [
+    t.tenantName, t.customerName, t.paymentReference, t.cardLast4,
+    t.tender, t.paymentMethod, TENDER_LABEL[t.tender || t.paymentMethod],
+    fmtPlain(t.total), new Date(t.createdAt).toLocaleDateString(),
+    ...(t.items || []).map((i: any) => i.name),
+  ]
+  return hay.some(v => v != null && String(v).toLowerCase().includes(q))
+}
+const fmtPlain = (n: unknown) => String(Number(n ?? 0).toFixed(2))
+
+const TENDER_LABEL: Record<string,string> = { cash:'Cash', check:'Check', card:'Card · online', card_reader:'Card · in person', pay_link:'Pay link · online', pay_link_in_person_cash:'Pay link · in person (cash)', pay_link_in_person_card:'Pay link · in person (card)', card_on_file:'Card on file', charge:'Charge account' }
 // S512 LAUNCH: the "charge" (FlexCharge) tender is hidden at launch with the
 // rest of the Flex Suite. The button is filtered out of the register picker so
 // a clerk can only ring cash/card; all charge code stays for post-launch.
@@ -459,7 +498,11 @@ export function POSPage() {
   type OpenTab = { id:string; total:number; openedAt:string; itemCount:number; customerName:string|null; preview:string|null }
   const [openTabs, setOpenTabs] = useState<OpenTab[]>([])
   const [tabsExpanded, setTabsExpanded] = useState(false)
-  const [method, setMethod] = useState<'cash'|'card'|'card_on_file'|'charge'>('cash')
+  const [method, setMethod] = useState<'cash'|'check'|'card'|'card_on_file'|'charge'>('cash')
+  // 10/23 (Nic): the check number, which is what makes the payment findable
+  // later — the same thing an invoice's check payment already stores. Cleared
+  // with the tender, so a number typed for one check never rides the next sale.
+  const [checkNumber, setCheckNumber] = useState('')
   // S254/S538: FlexCharge account holder can come from either backing
   // list (resident account or POS customer account). The register shows
   // ONE neutral "customer" picker; the ids stay mutually exclusive.
@@ -509,7 +552,17 @@ export function POSPage() {
   const [openTx,setOpenTx]=useState<string|null>(null)   // S653: history row expanded to its lines
   const [refundModal, setRefundModal] = useState<{show:boolean; tx:any}>({show:false,tx:null})
   // 10/3 (review): Void asks first, in the app — never a browser pop-up.
+  // 10/24 (Nic): "if I type Hamp, anything attached to Donald Hamp should show
+  // on the list, and everything else should just be hidden." A find-on-page over
+  // the history already loaded — no round trip, no new query.
+  const [historyFind, setHistoryFind] = useState('')
   const [voidAsk, setVoidAsk] = useState<any | null>(null)
+  // 10/24 (Nic): "one propane sale got marked as cash when the person dropped
+  // off a check... I don't want to void the sale and redo it. I don't like
+  // voiding sales." The sale happened and was for the right money — only the
+  // line saying HOW it was paid is wrong, so the tender is corrected in place.
+  const [tenderAsk, setTenderAsk] = useState<any | null>(null)
+  const [tenderCheckNo, setTenderCheckNo] = useState('')
   const [refundAmt, setRefundAmt] = useState('')
   const [refundReason, setRefundReason] = useState('')
   // S339: refund_method enforcement. Cashier picks cash or check for
@@ -651,7 +704,7 @@ export function POSPage() {
     // bill — the power was used, so nothing is written off: it is owed the
     // ordinary way, on their invoice or as an emailed link. The read stands.
     releaseRaisedBills()
-    setCart([]); setPerson(null); setAppliedDiscount(null); setStay(null); setCashGiven(''); setCounterCheck(null)
+    setCart([]); setPerson(null); setAppliedDiscount(null); setStay(null); setCashGiven(''); setCheckNumber(''); setCounterCheck(null)
     setOpenTicketId(null); setTicketSnapshot(null); setPayLinkId(null); setClosingRead(false)
   }
 
@@ -1357,6 +1410,9 @@ export function POSPage() {
       propertyId: registerProperty || null,
       subtotal:discountedSubtotal, taxAmount, surcharge, total, changeGiven:changeDue,
       discountAmount:discountAmt, discountReason:appliedDiscount?.name||null,
+      // 10/23 (Nic): the check number, on a check sale only. The API refuses
+      // one on any other tender, so it is sent only where it belongs.
+      paymentReference: !stripePaymentIntentId && method==='check' ? checkNumber.trim() : null,
       stripePaymentIntentId: stripePaymentIntentId || null,
       // S652: the ticket this sale settles, claimed inside the sale's own
       // transaction so two drivers cannot both charge the same tank.
@@ -1399,7 +1455,7 @@ export function POSPage() {
         })
       }
       setClientSessionId(null)
-      abandonPendingIntent(); setCart([]); setCashGiven(''); setPerson(null); setAppliedDiscount(null); setStay(null); setCounterCheck(null)
+      abandonPendingIntent(); setCart([]); setCashGiven(''); setCheckNumber(''); setPerson(null); setAppliedDiscount(null); setStay(null); setCounterCheck(null)
       setOpenTicketId(null); setTicketSnapshot(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets')
       qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-items')
       // 10/3 (review): a stay sold here took its site — the next picker reads what is free again.
@@ -1542,6 +1598,19 @@ export function POSPage() {
   const voidMut = useMutation((id:string) => apiPost(`/pos/transactions/${id}/void`, { reason:'Voided by cashier' }), {
     onSuccess: () => { setVoidAsk(null); toastOnce('Sale voided — what it took is back on the shelf'); afterVoid() },
     onError: (e: any) => { setVoidAsk(null); afterVoid(); toastOnce(errorMessage(e, 'The sale was not voided — check the connection, then press Void again.'), { error: true }) } })
+
+  const tenderMut = useMutation(
+    (b: { id: string; paymentMethod: 'cash'|'check'; paymentReference?: string }) =>
+      apiPatch(`/pos/transactions/${b.id}/tender`,
+        { paymentMethod: b.paymentMethod, paymentReference: b.paymentReference ?? null }),
+    { onSuccess: (r: any) => {
+        const m = r?.data?.paymentMethod === 'check'
+          ? `check #${r?.data?.paymentReference}` : 'cash'
+        setTenderAsk(null); setTenderCheckNo('')
+        toastOnce(`Re-recorded as paid by ${m}. The sale itself is untouched.`)
+        afterVoid()
+      },
+      onError: (e: any) => toastOnce(errorMessage(e, 'That tender was not corrected — check the connection, then try again.'), { error: true }) })
 
   // S243: SDK Bluetooth-reader discovery + connect (handheld path).
   // Smart readers (S700, WisePOS E) appear in the modal too but via
@@ -2198,7 +2267,13 @@ export function POSPage() {
                     point of sale customer, we can just auto charge them on
                     delivery and we don't even have to take the reader with us."
                     Same card, same fee — nobody is holding the plastic. */}
-                {(['cash','card','card_on_file','charge'] as const).filter(m=>!(LAUNCH_HIDE_CHARGE && m==='charge')).map(m=>(<button key={m} disabled={readerHoldsCharge} onClick={()=>setMethod(m)} style={{opacity:readerHoldsCharge&&method!==m?0.45:1,padding:'7px 0',border:"1px solid "+(method===m?'var(--gold)':'var(--border-1)'),background:method===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',cursor:'pointer',fontSize:'.75rem',fontWeight:method===m?700:400,color:method===m?'var(--gold)':'var(--text-2)'}}>{m==='card_on_file'?'On file':m==='charge'?'Charge':m==='cash'?'Cash':'Card'}</button>))}
+                {/* 10/23 (Nic): "we need to add a button to record check
+                    payments. That also needs to be turned on or off if a
+                    property chooses to accept checks. A lot of places don't
+                    accept them." A park that says no never sees the button;
+                    the sale route refuses a check there either way, because a
+                    hidden button is a courtesy and not a rule. */}
+                {(['cash','check','card','card_on_file','charge'] as const).filter(m=>!(LAUNCH_HIDE_CHARGE && m==='charge') && !(m==='check' && !posSettings?.acceptsChecks)).map(m=>(<button key={m} disabled={readerHoldsCharge} onClick={()=>setMethod(m)} style={{opacity:readerHoldsCharge&&method!==m?0.45:1,padding:'7px 0',border:"1px solid "+(method===m?'var(--gold)':'var(--border-1)'),background:method===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',cursor:'pointer',fontSize:'.75rem',fontWeight:method===m?700:400,color:method===m?'var(--gold)':'var(--text-2)'}}>{m==='card_on_file'?'On file':m==='charge'?'Charge':m==='cash'?'Cash':m==='check'?'Check':'Card'}</button>))}
               </div>
             </div>
             {method==='cash'&&(<div style={{marginBottom:10}}>
@@ -2208,6 +2283,21 @@ export function POSPage() {
                 : cashShortBy>0
                   ? <div style={{fontSize:'.82rem',color:'var(--red)',fontWeight:600,marginTop:4}}>Cash given is short by {fmt(cashShortBy)} — take the rest, then press Charge.</div>
                   : <div style={{fontSize:'.82rem',color:'var(--green)',fontWeight:600,marginTop:4}}>{changeDue>0 ? `Change: ${fmt(changeDue)}` : 'No change due'}</div>}
+            </div>)}
+            {/* 10/23 — THE CHECK NUMBER IS PART OF THE RECORD, NOT A NOTE.
+                It is how the park finds this payment again when the bank sends
+                the check back, or when the customer asks which one paid for
+                what. A check is FREE like cash (S654, Nic: "There's no fee.
+                Paying cash or check is free") — no fee line, no surcharge, and
+                no change to give. */}
+            {method==='check'&&(<div style={{marginBottom:10}}>
+              <input className="form-input" inputMode="numeric" placeholder="Check number" maxLength={40}
+                value={checkNumber} onChange={e=>setCheckNumber(e.target.value)} style={{width:'100%'}} />
+              <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:4}}>
+                {checkNumber.trim()
+                  ? 'No fee on a check, and no change to give.'
+                  : 'Type the number off the check — it is how this payment is found again later.'}
+              </div>
             </div>)}
             {/* S654 (Nic): "it should show their name on the pay screen as
                 well." 10/2 (Nic): "type their name, not a scroll down list...
@@ -2333,6 +2423,8 @@ export function POSPage() {
               || (method==='card' && !registerProperty)
               // 10/3: cash given that does not cover the total is not a sale yet.
               || (method==='cash' && cashShortBy > 0)
+              // 10/23: a check with no number is not written down yet.
+              || (method==='check' && !checkNumber.trim())
               // S652: no customer, no card — and a customer with no card saved
               // has to go on the reader, which saves it for next time.
               || (method==='card_on_file' && (!registerProperty || (!tenantId && !posCustomerId) || !cardOnFile.data))
@@ -2428,17 +2520,35 @@ export function POSPage() {
           </div>
         )}
         
+        <div style={{marginBottom:10,position:'relative'}}>
+          <input className="form-input" style={{width:'100%'}}
+            placeholder="Find a sale — name, item, check number, card last four…"
+            value={historyFind} onChange={e=>setHistoryFind(e.target.value)} />
+          {historyFind && (
+            <button className="btn btn-ghost btn-sm" onClick={()=>setHistoryFind('')}
+              style={{position:'absolute',right:6,top:'50%',transform:'translateY(-50%)'}}>Clear</button>
+          )}
+        </div>
         <div className="card" style={{padding:0}}>
           {txLoading?<div style={{padding:32,textAlign:'center',color:'var(--text-3)'}}>Loading...</div>:(
             <table className="data-table">
-              <thead><tr><th>Date</th><th>Items</th><th>Subtotal</th><th>Total</th><th>Method</th><th>Status</th><th>Actions</th></tr></thead>
+              {/* 10/24 (Nic): "add a column for customers in between the items
+                  and the subtotal." */}
+              <thead><tr><th>Date</th><th>Items</th><th>Customer</th><th>Subtotal</th><th>Total</th><th>Method</th><th>Status</th><th>Actions</th></tr></thead>
               <tbody>
-                {(txns as any[]).length?(txns as any[]).map((t:any)=>(<Fragment key={t.id}><tr style={{cursor:'pointer'}} onClick={()=>setOpenTx(o=>o===t.id?null:t.id)} title="Click to see what was sold">
+                {(() => { const shown = (txns as any[]).filter((t:any)=>saleMatches(t, historyFind)); return shown.length?shown.map((t:any)=>(<Fragment key={t.id}><tr style={{cursor:'pointer'}} onClick={()=>setOpenTx(o=>o===t.id?null:t.id)} title="Click to see what was sold">
                   <td className="mono">{new Date(t.createdAt).toLocaleDateString()}</td>
                   <td style={{color:'var(--text-3)',fontSize:'.82rem'}}>
-                    {/* S653 (Nic): "it isn't clickable" — the lines open under the row. */}
-                    {(t.items||[]).length===1 ? `${t.items[0].name} ×${Number(t.items[0].qty)}` : `${t.itemCount} items`}
+                    {/* S653 (Nic): "it isn't clickable" — the lines open under the row.
+                        10/24 (Nic): the short name here; the dates and the site
+                        are in the lines that open underneath. */}
+                    {(t.items||[]).length===1 ? `${shortItemName(t.items[0].name)} ×${Number(t.items[0].qty)}` : `${t.itemCount} items`}
                     <span style={{marginLeft:6,color:'var(--text-3)'}}>{openTx===t.id?'▾':'▸'}</span>
+                  </td>
+                  <td style={{fontSize:'.82rem'}}>
+                    {t.tenantName || t.customerName
+                      ? <span style={{color:'var(--text-1)'}}>{t.tenantName || t.customerName}</span>
+                      : <span style={{color:'var(--text-3)'}}>—</span>}
                   </td>
                   <td className="mono">{fmt(t.subtotal)}</td>
                   <td className="mono" style={{fontWeight:600}}>{fmt(t.total)}</td>
@@ -2454,12 +2564,16 @@ export function POSPage() {
                       schedule). It asks first, in the app. */}
                   <td>{t.status==='completed'&&(canRefund||(canVoid&&!t.voidBlocked))&&(<div style={{display:'flex',gap:6}}>
                     {canRefund&&<button className="btn btn-ghost btn-sm" onClick={e=>{e.stopPropagation(); setRefundModal({show:true,tx:t})}}>Refund</button>}
+                    {/* 10/24: cash and check only — a card sale's tender is a
+                        real authorization on GAM's account, and a store account
+                        carries its own balance. The API refuses either too. */}
+                    {canVoid&&(t.paymentMethod==='cash'||t.paymentMethod==='check')&&<button className="btn btn-ghost btn-sm" onClick={e=>{e.stopPropagation(); setTenderCheckNo(t.paymentReference||''); setTenderAsk(t)}}>Wrong tender</button>}
                     {canVoid&&!t.voidBlocked&&<button className="btn btn-ghost btn-sm" style={{color:'var(--red)'}} onClick={e=>{e.stopPropagation(); setVoidAsk(t)}}>Void</button>}
                   </div>)}
                   {t.status==='refunded'&&<span style={{fontSize:'.75rem',color:'var(--text-3)'}}>-{fmt(t.refundAmount)}</span>}
                   </td>
                 </tr>
-                {openTx===t.id&&(<tr><td colSpan={7} style={{background:'var(--bg-2)',padding:'8px 16px 12px'}}>
+                {openTx===t.id&&(<tr><td colSpan={8} style={{background:'var(--bg-2)',padding:'8px 16px 12px'}}>
                   <div style={{display:'grid',gap:4,fontSize:'.8rem'}}>
                     {(t.items||[]).map((it:any,i:number)=>(<div key={i} style={{display:'flex',justifyContent:'space-between',gap:12}}>
                       <span>{it.name} <span style={{color:'var(--text-3)'}}>×{Number(it.qty)} @ {fmt(it.price)}</span></span>
@@ -2492,7 +2606,7 @@ export function POSPage() {
                     </div>
                   </div>
                 </td></tr>)}
-                </Fragment>)):<tr><td colSpan={7} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No transactions yet.</td></tr>}
+                </Fragment>)):<tr><td colSpan={8} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>{historyFind ? `Nothing here matches "${historyFind}".` : 'No transactions yet.'}</td></tr>})()}
               </tbody>
             </table>
           )}
@@ -3221,6 +3335,36 @@ export function POSPage() {
 
 
 
+      {tenderAsk&&(<div className="modal-overlay" onClick={()=>{ if (!tenderMut.isLoading) { setTenderAsk(null); setTenderCheckNo('') } }}><div className="modal" style={{maxWidth:420}} onClick={e=>e.stopPropagation()}>
+        <h3 style={{margin:'0 0 8px'}}>How was this paid?</h3>
+        <div style={{fontSize:'.82rem',color:'var(--text-2)',lineHeight:1.5,marginBottom:14}}>
+          The {fmt(tenderAsk.total)} sale from {new Date(tenderAsk.createdAt).toLocaleDateString()} is recorded as
+          {' '}{tenderAsk.paymentMethod==='check'?`a check${tenderAsk.paymentReference?` (#${tenderAsk.paymentReference})`:''}`:'cash'}.
+          {' '}The sale itself is not changed — same items, same money, same day. Only how it was paid.
+        </div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:12}}>
+          {(['cash','check'] as const).map(m=>(
+            <button key={m} className={`btn btn-sm ${tenderAsk.paymentMethod===m?'btn-primary':'btn-ghost'}`}
+              disabled={tenderMut.isLoading}
+              onClick={()=>setTenderAsk({...tenderAsk,paymentMethod:m})}>{m==='cash'?'Cash':'Check'}</button>))}
+        </div>
+        {tenderAsk.paymentMethod==='check'&&(<div style={{marginBottom:12}}>
+          <input className="form-input" inputMode="numeric" placeholder="Check number" maxLength={40}
+            value={tenderCheckNo} onChange={e=>setTenderCheckNo(e.target.value)} style={{width:'100%'}} />
+          <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:4}}>
+            It is how this payment is found again if the bank sends the check back.
+          </div>
+        </div>)}
+        <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+          <button className="btn btn-ghost" disabled={tenderMut.isLoading} onClick={()=>{ setTenderAsk(null); setTenderCheckNo('') }}>Leave it</button>
+          <button className="btn btn-primary"
+            disabled={tenderMut.isLoading||(tenderAsk.paymentMethod==='check'&&!tenderCheckNo.trim())}
+            onClick={()=>tenderMut.mutate({ id:tenderAsk.id, paymentMethod:tenderAsk.paymentMethod,
+                                            paymentReference: tenderAsk.paymentMethod==='check'?tenderCheckNo.trim():undefined })}>
+            {tenderMut.isLoading?'Saving…':'Re-record it'}
+          </button>
+        </div>
+      </div></div>)}
       {voidAsk&&(<div className="modal-overlay" onClick={()=>{ if (!voidMut.isLoading) setVoidAsk(null) }}><div className="modal" style={{maxWidth:400}} onClick={e=>e.stopPropagation()}>
         <div className="modal-header"><span className="modal-title">Void this sale?</span></div>
         <div style={{padding:'0 24px 24px',display:'grid',gap:12}}>

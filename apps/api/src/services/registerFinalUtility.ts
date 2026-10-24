@@ -74,6 +74,7 @@ import { logger } from '../lib/logger'
 import { digitsOf } from './posPeople'
 import {
   tryInsertBill, usageNeedsDoubleCheck, HELD_FOR_DOUBLE_CHECK,
+  readingBarelyMoved, BARELY_MOVED_REVIEW_NOTE,
 } from './utilityBilling'
 import {
   payLinkLineNameForBill, billLineTaxRate, billTaxFitsItsCharge, billTaxDoesNotFitWords,
@@ -283,6 +284,19 @@ const isoDay = (d: unknown): string | null => {
   if (!d) return null
   const s = d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10)
   return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null
+}
+
+/**
+ * Today as the DATABASE will stamp it. A read is written with CURRENT_DATE, so
+ * the same-day test that keeps a retake from being read as a stuck meter has to
+ * use the same day Postgres will. Built from LOCAL getters on purpose:
+ * toISOString() is UTC, and after 5pm in Arizona that is already tomorrow — the
+ * evening date skew that has bitten this repo before. Same reasoning as
+ * earlyDepartureWash's asDay.
+ */
+const todayIso = (): string => {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
 /** The submeters on a site, with whether each has anything to measure from. */
@@ -790,9 +804,15 @@ export function usageAndCharge(m: MeterForRead, value: number): {
   usage: number; charge: number; tax: number; amount: number; isRollover: boolean
 } {
   const prior = m.priorValue ?? 0
-  const isRollover = value < prior
+  // 10/24 (Nic): level with the last read, or one or two under it, is a stuck
+  // face or a rounded figure — never an odometer that went all the way round.
+  // Called out as its own answer so the wrap below cannot claim it, and so the
+  // figure the desk is quoted is 0 rather than very nearly a full meter.
+  const barelyMoved = readingBarelyMoved(m.priorValue, value, m.priorDay, todayIso())
+  const isRollover = !barelyMoved && value < prior
   let turns = value - prior
-  if (turns < 0 && isRollover) turns = (meterReadingModulus(m.digits) - prior) + value
+  if (barelyMoved) turns = Math.max(0, turns)
+  else if (turns < 0 && isRollover) turns = (meterReadingModulus(m.digits) - prior) + value
   const usage = turns * m.multiplier
   const base = usage * m.ratePerUnit + m.baseFee
   const sewer = usage * m.sewerRate
@@ -875,10 +895,47 @@ export async function quoteCounterReads(
     // meter nowhere near its ceiling (a dropped digit, or a genuine wrap), or
     // usage over its utility type's threshold (a slipped digit upward). The
     // SAME sentence for both on purpose — see the header.
-    const held = (isRollover && m.priorValue < meterReadingModulus(m.digits) * 0.9)
+    // 10/24 (Nic): and a read that barely moved holds as well. Without this it
+    // would have quoted $0.00 and billed nobody in silence, which is the dead
+    // meter nobody notices — the thing the rule exists to catch.
+    const held = readingBarelyMoved(m.priorValue, r.value, m.priorDay, todayIso())
+      || (isRollover && m.priorValue < meterReadingModulus(m.digits) * 0.9)
       || usageNeedsDoubleCheck(m.utilityType, usage)
     if (held) {
-      out.push({ ...shell, block: 'double_check', note: `${label}: ${HELD_FOR_DOUBLE_CHECK}.` })
+      // 10/24 — THE DESK HEARS ABOUT THE MONEY FIRST, THEN ABOUT THE FIGURE.
+      //
+      // Lisa checked Patrick Neuman out of RV 06 on 10/23, typed 39999 against
+      // a previous read of 40000, and got back only "this one waits on the
+      // landlord's double-check". She read that as money pending and went
+      // looking for a ticket to open. Nic: "I don't want there to be a hang up
+      // when people are checking out at the front counter. The front desk
+      // person needs to be able to finalize things... I don't really want the
+      // front desk making judgment calls. I want the computer to do it for
+      // them."
+      //
+      // Two things were true and only one of them was said. He was a work
+      // camper on a stay with no cash due, so his power was in the rate he had
+      // already paid and there was never anything to collect from him WHATEVER
+      // the figure turned out to be. That is the half the counter needed.
+      //
+      // The figure itself still goes to the landlord, and that part is right: a
+      // read below the last one is also the next guest's starting point, so
+      // whether it is a slipped digit or a swapped meter is the landlord's to
+      // settle and not the counter's to guess at. The hold is unchanged — no
+      // bill is written and the read is flagged exactly as before.
+      //
+      // So only the sentence changes, and it leads with the answer: nothing to
+      // collect, and nothing for you to do. The usage is deliberately left out
+      // of it — a wrapped read prints as very nearly a full meter of
+      // kilowatts, and reading 99,999 kWh out to a guest who is standing there
+      // is worse than saying nothing at all.
+      const nobodyToBill = args.closing.payer === 'in_the_rate'
+      out.push({ ...shell, block: 'double_check',
+        note: nobodyToBill
+          ? `${label}: nothing to collect — a nightly or weekly guest's ${m.usageNoun} is in the rate they `
+            + 'already paid. The figure needs a second look before it stands as the next read\'s starting '
+            + 'point, so the landlord has it. Nothing to put on the ticket, and nothing for you to do here.'
+          : `${label}: ${HELD_FOR_DOUBLE_CHECK}.` })
       continue
     }
     if (args.closing.payer === 'in_the_rate') {
@@ -1326,9 +1383,18 @@ export async function recordCounterReads(
        RETURNING id, to_char(reading_date, 'YYYY-MM-DD') AS day`,
       [m.id, r.value, args.userId,
        `Closing read taken at the register — ${args.closing.what}`,
-       held, held
-         ? 'A closing read taken at the register that GAM will not bill as it stands — read the face again: a slipped digit, or a genuine figure to confirm'
-         : null,
+       held, !held ? null
+         // 10/24 (Nic): the landlord's note says WHICH hold it is, because the
+         // two need different things done about them — a slipped digit is
+         // retyped, a stuck face is walked out to and looked at. This column is
+         // landlord-only, which is the only reason it may name a direction at
+         // all; the desk's sentence above still names neither.
+         // todayIso(), not reading.day: this note is an argument TO the insert
+         // that creates `reading`, and the row it creates is stamped
+         // CURRENT_DATE — the same day.
+         : readingBarelyMoved(m.priorValue, r.value, m.priorDay, todayIso())
+           ? `Closing read at the register. ${BARELY_MOVED_REVIEW_NOTE}`
+           : 'A closing read taken at the register that GAM will not bill as it stands — read the face again: a slipped digit, or a genuine figure to confirm',
        carried])).rows[0]
     out.readings.push({ meterId: m.id, readingId: reading.id, held })
 

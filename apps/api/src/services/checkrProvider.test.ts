@@ -220,6 +220,102 @@ describe('CheckrProvider.parseWebhook (Tenant events)', () => {
   })
 })
 
+/**
+ * 10/24 (Nic) — WHAT THE LANDLORD IS GIVEN OUT OF A FINISHED REPORT.
+ *
+ *   "why do we not provide more of the information that came from Checker to
+ *    the landlord?... the Checker portal shows 90% on-time payments, 9 payments
+ *    late in the last 7 months, credit score only 470, credit utilization 184%.
+ *    Some of those other details are important, not just a clear or consider."
+ *
+ *   "I don't ever want landlords going to the checker dashboard. I don't want
+ *    links to pictures... They don't need the driver's license number."
+ *
+ * Built on the real shape of Heather Miller's report (order
+ * ord_-cyscQryRmOerADtv76XqA, 10/24) — the one that started this.
+ */
+describe('fetchReport — the detail the landlord is given', () => {
+  const realShapedReport = () => ({
+    id: 'rp_BE3mHuoHRPqjCvDaiGFprg',
+    order_id: 'ord_-cyscQryRmOerADtv76XqA',
+    credit_report: {
+      id: 'crd_1', status: 'consider', credit_score: 470, credit_file_status: 'available',
+      credit_summary: {
+        total_accounts: 14, on_time_payment_rate: 0.9, credit_utilization: 1.84,
+        payment_timeline: [{ month: '2026-09', late: 2 }],
+        charge_offs_count: 1, collections_count: 2, bankruptcies_count: 0,
+        average_account_age_months: 61, open_collections_balance_cents: 184200,
+        estimated_monthly_payment_cents: 92000,
+      },
+      credit_score_factors: [{ code: 'UTIL', description: 'Balances too high' }],
+      collections: { records: [{ amount_cents: 94200 }] },
+      bankruptcies: { records: [] },
+    },
+    criminal_history:      { id: 'cr_1', status: 'clear', records: [] },
+    eviction_history:      { id: 'ev_1', status: 'clear', records: [], eviction_report_status: 'available' },
+    global_watchlist:      { id: 'gw_1', status: 'clear', records: [] },
+    sex_offender_registry: { id: 'so_1', status: 'clear', records: [] },
+    identity_verification: {
+      id: 'dvt_1', status: 'clear',
+      consider_reasons: [],
+      document_type: { type: 'Identification Card', state: 'IL', country: 'USA' },
+      document_data: { first_name: 'Heather', last_name: 'Miller', dob: '1900-01-01',
+                       document_number: 'X00000000', address: '1 Main St',
+                       issue_date: '2020-01-01', expiration_date: '2030-01-01' },
+      documents_zip_url: 'https://tenant.checkr.com/api/identity_verification/documents/dvt_1',
+    },
+  })
+  const fetchIt = async () => {
+    vi.spyOn(globalThis, 'fetch' as any).mockResolvedValue({
+      ok: true, status: 200, json: async () => realShapedReport(), text: async () => '',
+    } as any)
+    return (provider as any).fetchReport('rp_BE3mHuoHRPqjCvDaiGFprg')
+  }
+
+  it('carries the numbers a landlord actually decides on, not just clear/consider', async () => {
+    const out = await fetchIt()
+    const credit = out.details.credit_report
+    // The four Nic named off the Checkr dashboard, which used to be dropped
+    // because the old allowlist rejected anything that was an object.
+    expect(credit.credit_score).toBe(470)
+    expect(credit.credit_summary.on_time_payment_rate).toBe(0.9)
+    expect(credit.credit_summary.credit_utilization).toBe(1.84)
+    expect(credit.credit_summary.payment_timeline).toEqual([{ month: '2026-09', late: 2 }])
+    // And the rest of what came with them.
+    expect(credit.credit_score_factors).toEqual([{ code: 'UTIL', description: 'Balances too high' }])
+    expect(credit.collections).toEqual({ records: [{ amount_cents: 94200 }] })
+    expect(credit.credit_summary.charge_offs_count).toBe(1)
+    // Records on every other product, not just the one-word status.
+    expect(out.details.eviction_history.records).toEqual([])
+    expect(out.details.eviction_history.eviction_report_status).toBe('available')
+    expect(out.products.credit_report).toBe('consider')
+    expect(out.result).toBe('consider')
+  })
+
+  it('never hands over the identity DOCUMENT — no images, no licence number, no link out', async () => {
+    const out = await fetchIt()
+    const id = out.details.identity_verification
+    // The verdict and its reasons are straight information and stay.
+    expect(id.status).toBe('clear')
+    expect(id.consider_reasons).toEqual([])
+    expect(id.document_type).toEqual({ type: 'Identification Card', state: 'IL', country: 'USA' })
+    // The document behind it does not travel.
+    expect(id.document_data).toBeUndefined()
+    expect(id.documents_zip_url).toBeUndefined()
+    // Nic: "I don't ever want landlords going to the checker dashboard." Nothing
+    // anywhere in what the landlord is given is a link out.
+    expect(JSON.stringify(out)).not.toMatch(/https?:\/\//)
+    expect(JSON.stringify(out)).not.toMatch(/X00000000/)
+  })
+
+  it('the raw report is still archived whole, so GAM keeps what the landlord is not shown', async () => {
+    await fetchIt()
+    const raw = (provider as any).rawReport
+    expect(raw.identity_verification.document_data.document_number).toBe('X00000000')
+    expect(raw.identity_verification.documents_zip_url).toMatch(/^https:\/\//)
+  })
+})
+
 describe('CheckrProvider.craDisclosure', () => {
   it('names Checkr as the CRA with contact details', () => {
     const d = provider.craDisclosure()

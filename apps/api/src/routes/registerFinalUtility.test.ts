@@ -387,6 +387,123 @@ describe('D5 — typing the number writes nothing; confirming writes the reading
     expect(low.body.data.reads[0].note).toBe(high.body.data.reads[0].note)
   })
 
+  it('a held figure on a stay whose power is in its rate leads with "nothing to collect"', async () => {
+    // 10/24 — PATRICK NEUMAN, RV 06. Lisa typed 39999 against a previous read
+    // of 40000 and got back only "this one waits on the landlord's
+    // double-check", read it as money pending, and went looking for a ticket to
+    // open. He was a work camper on a stay with no cash due: there was never
+    // anything to collect from him whatever the figure turned out to be.
+    //
+    // Nic: "The front desk person needs to be able to finalize things... I
+    // don't really want the front desk making judgment calls. I want the
+    // computer to do it for them."
+    const p = await park()
+    const email = `neuman-${Math.random().toString(36).slice(2)}@example.com`
+    const s = await stay(p, { email, nights: 27, withAgreement: false })
+
+    const low = await checkRead(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 4800 }] })
+    expect(low.status, JSON.stringify(low.body)).toBe(200)
+    // The figure still goes to the landlord — it is the next guest's starting
+    // point too, and which of a slipped digit or a swapped meter it was is
+    // theirs to settle.
+    expect(low.body.data.reads[0].block).toBe('double_check')
+    expect(low.body.data.reads[0].amount).toBe(0)
+    // But the money answer comes FIRST, and it is the one the counter needed.
+    expect(low.body.data.reads[0].note).toMatch(/^.*nothing to collect/i)
+    expect(low.body.data.reads[0].note).toMatch(/in the rate they already paid/i)
+    expect(low.body.data.reads[0].note).toMatch(/nothing for you to do/i)
+    // STILL BLIND. No figure, and a high read says exactly the same thing as a
+    // low one — anything that tells the two apart is the previous read.
+    expect(low.body.data.reads[0].note).not.toMatch(/\d/)
+    const high = await checkRead(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 920000 }] })
+    expect(high.body.data.reads[0].block).toBe('double_check')
+    expect(high.body.data.reads[0].note).toBe(low.body.data.reads[0].note)
+
+    const r = await putOnTicket(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 4800 }] })
+    expect(r.status, JSON.stringify(r.body)).toBe(201)
+    expect(r.body.data.lines).toHaveLength(0)
+    expect(r.body.data.notes[0]).toMatch(/nothing to collect/i)
+
+    // The read is kept and flagged; nothing billed, nothing emailed.
+    const rd = await readings(p.meterId)
+    expect(rd).toHaveLength(2)
+    expect(rd[1]).toMatchObject({ v: '4800', needs_review: true })
+    expect(await bills(p.meterId)).toHaveLength(0)
+    expect(await invoices(p.landlordId)).toHaveLength(0)
+    expect(notifyMock).not.toHaveBeenCalled()
+    // AND NOTHING IS ABSORBED YET. A wrapped read measures very nearly a full
+    // meter of kilowatts, and writing that onto the in-the-rate book would
+    // overstate what the park recovered inside its rate on the one column that
+    // exists to be trustworthy. It lands there when the landlord settles the
+    // figure, not before.
+    expect(await absorbed(p.meterId)).toHaveLength(0)
+  })
+
+  // 10/24 (Nic) — RV 06, AND THE RULE IT PRODUCED.
+  //   "if a meter read is within one or two digits of the other read, even if
+  //    it's lower, just go straight into marking it as potentially broken...
+  //    Maybe last month somebody rounded it to 40,000 and this month it was
+  //    read as 39999. So it could, when it's within one or two, like it could
+  //    be really just broken, not actually less than before."
+  describe('a face that barely moved is a meter to look at, not a wrap', () => {
+    // 39999 against 40000 is what Lisa actually typed. The old rule read it as
+    // an odometer wrap and measured 99,999 kWh.
+    for (const [what, value] of [['one under (the RV 06 case)', 39999],
+                                 ['two under', 39998],
+                                 ['dead level — the one nothing caught before', 40000]] as const) {
+      it(`${what}: no wrap, nothing billed, and the landlord is told the face may be stuck`, async () => {
+        const p = await park({ priorValue: 40000, priorDaysAgo: 23 })
+        const email = `stuck-${Math.random().toString(36).slice(2)}@example.dev`
+        const s = await stay(p, { email, nights: 27, withAgreement: true })
+
+        const q = await checkRead(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value }] })
+        expect(q.status, JSON.stringify(q.body)).toBe(200)
+        expect(q.body.data.reads[0].block).toBe('double_check')
+        // THE WHOLE POINT: not 99,999 kWh and not a $21,000 charge.
+        expect(q.body.data.reads[0].amount).toBe(0)
+        expect(q.body.data.reads[0].charge).toBe(0)
+        // Still blind at the counter — no figure, no direction.
+        expect(q.body.data.reads[0].note).not.toMatch(/\d/)
+
+        const r = await putOnTicket(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value }] })
+        expect(r.status, JSON.stringify(r.body)).toBe(201)
+        expect(r.body.data.lines).toHaveLength(0)
+        expect(await bills(p.meterId)).toHaveLength(0)
+        expect(await invoices(p.landlordId)).toHaveLength(0)
+
+        // The read is KEPT and flagged, and the LANDLORD's note says which kind
+        // of hold it is — go and look at the face, not retype a digit.
+        const rd = await readings(p.meterId)
+        expect(rd).toHaveLength(2)
+        expect(rd[1]).toMatchObject({ v: String(value), needs_review: true })
+        expect(rd[1].review_note).toMatch(/may not be turning/i)
+      })
+    }
+
+    it('three under is still a wrap question, not a stuck face — the line is at two', async () => {
+      const p = await park({ priorValue: 40000, priorDaysAgo: 23 })
+      const email = `wrap-${Math.random().toString(36).slice(2)}@example.dev`
+      const s = await stay(p, { email, nights: 27, withAgreement: true })
+      const q = await checkRead(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 39997 }] })
+      expect(q.body.data.reads[0].block).toBe('double_check')
+      const r = await putOnTicket(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 39997 }] })
+      expect(r.status).toBe(201)
+      const rd = await readings(p.meterId)
+      expect(rd[1].review_note).toMatch(/slipped digit/i)
+      expect(rd[1].review_note).not.toMatch(/may not be turning/i)
+    })
+
+    it('two ABOVE is real usage and bills, because a face that moved up did move up', async () => {
+      const p = await park({ priorValue: 40000, priorDaysAgo: 23 })
+      const email = `frugal-${Math.random().toString(36).slice(2)}@example.dev`
+      const s = await stay(p, { email, nights: 27, withAgreement: true })
+      const q = await checkRead(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 40002 }] })
+      expect(q.body.data.reads[0].block).toBeNull()
+      expect(q.body.data.reads[0].usage).toBe(2)
+      expect(q.body.data.reads[0].amount).toBeGreaterThan(0)
+    })
+  })
+
   it('refuses more digits than the face has, and records nothing at all for it', async () => {
     const p = await park()
     const email = `razo-${Math.random().toString(36).slice(2)}@example.com`

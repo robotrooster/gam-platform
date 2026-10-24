@@ -218,12 +218,145 @@ export function BackgroundChecksPage() {
 }
 
 // ========== Applicant review + decision ==========
+/**
+ * 10/24 (Nic) — EVERYTHING CHECKR SENT, RENDERED WITHOUT A FIELD LIST.
+ *
+ *   "why do we not provide more of the information that came from Checker to
+ *    the landlord?... Some of those other details are important, not just a
+ *    clear or consider."
+ *
+ * Written GENERICALLY on purpose. The reason the landlord only ever saw a score
+ * was a hand-written list of fields on the server that dropped anything it did
+ * not name, and a hand-written list here would fail the same way the first time
+ * Checkr adds a field. So this walks whatever arrived: objects nest, arrays
+ * count themselves and list their contents, and a key it has never seen before
+ * still lands on the screen with its name tidied up.
+ *
+ * The server has already held back the identity DOCUMENT — images, licence
+ * number, and any link out to Checkr's dashboard (services/backgroundProvider).
+ * Nothing here needs to know that; it renders what it is given.
+ */
+// Checkr sends rates ALREADY as percentages — on_time_payment_rate 90 means
+// 90%, and a utilization of 184 means 184%. Multiplying by 100 here (which is
+// what this did first) put "9000%" in front of a landlord, which is exactly the
+// kind of number that must never reach one.
+const asPct = (n: unknown): string => {
+  const v = Number(n)
+  if (!Number.isFinite(v)) return String(n)
+  return `${Math.round(v * 10) / 10}%`
+}
+const asMoney = (cents: unknown): string => {
+  const v = Number(cents)
+  if (!Number.isFinite(v)) return String(cents)
+  return `$${(v / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+/** "onTimePaymentRate" / "credit_file_status" → "On time payment rate". */
+const tidyKey = (k: string): string => {
+  const words = k.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').trim().toLowerCase()
+  return words.charAt(0).toUpperCase() + words.slice(1)
+}
+const looksLikeRate = (k: string) => /(rate|utilization|ratio|percent)$/i.test(k)
+/**
+ * Checkr's payment_timeline is two dozen months of
+ * { month, lateCount, onTimeRate, onTimeCount }. The figure a landlord reads
+ * off it is how many payments were late lately — Nic read "9 payments late in
+ * the last 7 months" off exactly this — so it is counted here rather than left
+ * for somebody to add up twenty-four rows by eye.
+ */
+const lateInLastMonths = (timeline: unknown, months: number): number | null => {
+  if (!Array.isArray(timeline) || !timeline.length) return null
+  const recent = [...timeline]
+    .filter((m: any) => m && typeof m === 'object' && typeof m.month === 'string')
+    .sort((a: any, b: any) => String(b.month).localeCompare(String(a.month)))
+    .slice(0, months)
+  if (!recent.length) return null
+  return recent.reduce((n: number, m: any) => n + (Number(m.lateCount) || 0), 0)
+}
+const looksLikeMoney = (k: string) => /cents$/i.test(k)
+
+function PaymentTimeline({ rows }: { rows: any[] }) {
+  const months = [...rows].sort((a, b) => String(b.month).localeCompare(String(a.month)))
+  return (
+    <div style={{display:'grid',gap:2}}>
+      {months.map((m, i) => {
+        const late = Number(m.lateCount) || 0
+        return (
+          <div key={i} style={{display:'flex',justifyContent:'space-between',gap:12,fontSize:'.78rem'}}>
+            <span style={{color:'var(--text-3)'}}>{String(m.month)}</span>
+            <span style={{textAlign:'right',color: late > 0 ? 'var(--amber,#f59e0b)' : 'var(--text-1)',fontWeight:600}}>
+              {late > 0 ? `${late} late` : 'all on time'}
+              {m.onTimeCount != null && <span style={{color:'var(--text-3)',fontWeight:500}}> · {m.onTimeCount} paid</span>}
+            </span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function ReportDetail({ value, depth = 0 }: { value: unknown; depth?: number }) {
+  if (value == null) return <span style={{color:'var(--text-3)'}}>—</span>
+  if (Array.isArray(value)) {
+    // A month-by-month payment history reads as a list of months, not as two
+    // dozen nested blocks of four fields each.
+    if (value.length && value.every((v: any) => v && typeof v === 'object' && typeof v.month === 'string')) {
+      return <PaymentTimeline rows={value as any[]} />
+    }
+    if (value.length === 0) return <span style={{color:'var(--text-3)'}}>None</span>
+    return (
+      <div style={{display:'grid',gap:6}}>
+        {value.map((v, i) => (
+          <div key={i} style={{paddingLeft:depth?8:0}}>
+            {typeof v === 'object' && v !== null
+              ? <ReportDetail value={v} depth={depth + 1} />
+              : <span style={{color:'var(--text-1)'}}>{String(v)}</span>}
+          </div>
+        ))}
+      </div>
+    )
+  }
+  if (typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      // Row ids and timestamps are plumbing, not something a landlord weighs.
+      .filter(([k]) => !/^id$|Id$|^created_?At$|^updated_?At$/i.test(k))
+    if (!entries.length) return <span style={{color:'var(--text-3)'}}>—</span>
+    return (
+      <div style={{display:'grid',gap:4}}>
+        {entries.map(([k, v]) => {
+          const nested = v !== null && typeof v === 'object'
+          return (
+            <div key={k} style={nested
+              ? {paddingTop:4}
+              : {display:'flex',justifyContent:'space-between',gap:12,fontSize:'.8rem'}}>
+              <span style={{color:'var(--text-3)'}}>{tidyKey(k)}</span>
+              {nested
+                ? <div style={{marginTop:2,paddingLeft:10,borderLeft:'1px solid var(--border-0)'}}>
+                    <ReportDetail value={v} depth={depth + 1} />
+                  </div>
+                : <span style={{color:'var(--text-1)',fontWeight:600,textAlign:'right'}}>
+                    {typeof v === 'boolean' ? (v ? 'Yes' : 'No')
+                      : looksLikeMoney(k) ? asMoney(v)
+                      : looksLikeRate(k) ? asPct(v)
+                      : String(v)}
+                  </span>}
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+  return <span style={{color:'var(--text-1)',fontWeight:600}}>{String(value)}</span>
+}
+
 function ReviewModal({ check, onClose, onDecided }: {
   check: any
   onClose: () => void
   onDecided: (denyFlow: { checkId: string; cra: Cra | null; savedTemplate: string | null } | null) => void
 }) {
   const [busy, setBusy] = useState<'' | 'approved' | 'denied'>('')
+  // 10/24 (Nic): which product's full detail is open. One at a time — the
+  // report is long and a landlord is looking for one thing at a time.
+  const [openDetail, setOpenDetail] = useState<string | null>(null)
   const decidable = DECIDABLE.has(check.status)
 
   // S639: an approval used to end at "approved" with nothing to click. The
@@ -419,7 +552,25 @@ function ReviewModal({ check, onClose, onDecided }: {
                   if (!d || typeof d !== 'object') return null
                   const bits: string[] = []
                   if (d.creditScore != null) bits.push(`score ${d.creditScore}`)
-                  if (d.recordsCount != null) bits.push(`${d.recordsCount} record${Number(d.recordsCount) === 1 ? '' : 's'}`)
+                  // 10/24: the headline figures off the credit summary, so the
+                  // line a landlord skims carries the two numbers they actually
+                  // weigh before they open anything.
+                  const cs = d.creditSummary
+                  if (cs && typeof cs === 'object') {
+                    if (cs.onTimePaymentRate != null) bits.push(`${asPct(cs.onTimePaymentRate)} on time`)
+                    // Utilization is an OBJECT — { rate, limitCents, balanceCents } —
+                    // not a number. Read as a number it rendered NaN.
+                    const util = cs.creditUtilization
+                    const rate = util && typeof util === 'object' ? util.rate : util
+                    if (rate != null) bits.push(`${asPct(rate)} utilization`)
+                    // What Nic actually reads off the timeline: how many
+                    // payments were late recently, not twenty-four months of rows.
+                    const late = lateInLastMonths(cs.paymentTimeline, 12)
+                    if (late != null) bits.push(`${late} late in 12mo`)
+                  }
+                  const recs = Array.isArray(d.records) ? d.records.length
+                    : d.recordsCount != null ? Number(d.recordsCount) : null
+                  if (recs != null) bits.push(`${recs} record${recs === 1 ? '' : 's'}`)
                   const fileStatus = d.creditFileStatus
                   if (typeof fileStatus === 'string' && fileStatus !== 'available') bits.push(humanize(fileStatus))
                   return bits.length ? bits.join(' · ') : null
@@ -445,13 +596,30 @@ function ReviewModal({ check, onClose, onDecided }: {
                       </div>
                     ) : Object.entries(products).map(([k, v]) => {
                       const extra = detailFor(k)
+                      const full = details[k]
+                      const openable = !!full && typeof full === 'object' && Object.keys(full).length > 0
+                      const isOpen = openDetail === k
                       return (
-                        <div key={k} style={{display:'flex',justifyContent:'space-between',fontSize:'.85rem',padding:'4px 0',gap:12}}>
-                          <span style={{color:'var(--text-2)'}}>{humanize(k)}</span>
-                          <span style={{textAlign:'right'}}>
-                            <span style={{color:tone(String(v)),fontWeight:600}}>{humanize(String(v))}</span>
-                            {extra && <span style={{color:'var(--text-3)',fontWeight:500}}> · {extra}</span>}
-                          </span>
+                        <div key={k}>
+                          <div
+                            onClick={openable ? () => setOpenDetail(isOpen ? null : k) : undefined}
+                            style={{display:'flex',justifyContent:'space-between',fontSize:'.85rem',padding:'4px 0',gap:12,
+                                    cursor:openable?'pointer':'default'}}>
+                            <span style={{color:'var(--text-2)'}}>
+                              {openable && <span style={{color:'var(--text-3)',marginRight:6,fontSize:'.7rem'}}>{isOpen?'▾':'▸'}</span>}
+                              {humanize(k)}
+                            </span>
+                            <span style={{textAlign:'right'}}>
+                              <span style={{color:tone(String(v)),fontWeight:600}}>{humanize(String(v))}</span>
+                              {extra && <span style={{color:'var(--text-3)',fontWeight:500}}> · {extra}</span>}
+                            </span>
+                          </div>
+                          {openable && isOpen && (
+                            <div style={{margin:'2px 0 10px 14px',padding:'8px 10px',background:'var(--bg-2)',
+                                         borderRadius:6,borderLeft:'2px solid var(--border-1)'}}>
+                              <ReportDetail value={full} />
+                            </div>
+                          )}
                         </div>
                       )
                     })}

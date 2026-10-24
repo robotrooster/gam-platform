@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict DCeC2UTu8gtEelqJMIAaWBoaucOqmOzzQb2nefkOgv8hhgviO66GBAy3d2ECpYF
+\restrict qclrn7jolhMtbzCxCRHnMWU7rR2tzFdHdjumpsednhbZvBUdspjrMrstqhqUh5y
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -14093,6 +14093,7 @@ CREATE TABLE public.lease_documents (
     renewal_unsigned_alert_14d_at timestamp with time zone,
     renewal_unsigned_alert_start_at timestamp with time zone,
     new_lease_cancel_held_at timestamp with time zone,
+    replaces_lease_id uuid,
     CONSTRAINT lease_documents_addendum_fields_check CHECK ((((document_type = 'addendum_remove'::text) AND (target_lease_tenant_id IS NOT NULL)) OR ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_terms'::text, 'sublease_agreement'::text, 'purchase_agreement'::text, 'bill_of_sale'::text, 'general_contract'::text, 'work_trade_addendum'::text])) AND (target_lease_tenant_id IS NULL) AND (promote_lease_tenant_id IS NULL)))),
     CONSTRAINT lease_documents_delivery_mode_check CHECK ((delivery_mode = ANY (ARRAY['agreement'::text, 'notice'::text]))),
     CONSTRAINT lease_documents_document_type_check CHECK ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_remove'::text, 'addendum_terms'::text, 'sublease_agreement'::text, 'purchase_agreement'::text, 'bill_of_sale'::text, 'general_contract'::text, 'work_trade_addendum'::text]))),
@@ -14140,6 +14141,13 @@ COMMENT ON COLUMN public.lease_documents.renewal_unsigned_alert_start_at IS 'S65
 --
 
 COMMENT ON COLUMN public.lease_documents.new_lease_cancel_held_at IS 'S655: when the 15-minute job could not cancel this new lease (the lease it follows ended early and nobody signed it) because money had already been paid on it, and told the landlord side and GAM. Once per document. NULL = never held.';
+
+
+--
+-- Name: COLUMN lease_documents.replaces_lease_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_documents.replaces_lease_id IS '10/24: the sitting lease this new lease replaces on the same space. Set deliberately by the landlord when drafting; never by a booking or application draft. NULL = an ordinary new lease that ends nobody.';
 
 
 --
@@ -14712,6 +14720,7 @@ CREATE TABLE public.leases (
     move_out_notice_prev_end_date date,
     prepaid_monthly_draw numeric(12,2),
     holdover_signed_end_date date,
+    replaces_lease_id uuid,
     CONSTRAINT leases_auto_renew_mode_check CHECK (((auto_renew_mode IS NULL) OR (auto_renew_mode = ANY (ARRAY['extend_same_term'::text, 'convert_to_month_to_month'::text])))),
     CONSTRAINT leases_auto_renew_mode_required CHECK (((auto_renew = false) OR (auto_renew_mode IS NOT NULL))),
     CONSTRAINT leases_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
@@ -14724,6 +14733,7 @@ CREATE TABLE public.leases (
     CONSTRAINT leases_move_in_amounts_nonneg CHECK (((COALESCE(move_in_first_month_rent, (0)::numeric) >= (0)::numeric) AND (COALESCE(move_in_proration, (0)::numeric) >= (0)::numeric))),
     CONSTRAINT leases_prepaid_monthly_draw_check CHECK (((prepaid_monthly_draw IS NULL) OR (prepaid_monthly_draw > (0)::numeric))),
     CONSTRAINT leases_rent_due_day_range CHECK (((rent_due_day IS NULL) OR ((rent_due_day >= 1) AND (rent_due_day <= 28)))),
+    CONSTRAINT leases_replaces_not_self CHECK (((replaces_lease_id IS NULL) OR (replaces_lease_id <> id))),
     CONSTRAINT leases_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'active'::text, 'expired'::text, 'terminated'::text]))),
     CONSTRAINT leases_subleasing_allowed_check CHECK ((subleasing_allowed = ANY (ARRAY['prohibited'::text, 'with_consent'::text, 'allowed'::text]))),
     CONSTRAINT leases_tenant_renewal_intent_check CHECK (((tenant_renewal_intent IS NULL) OR (tenant_renewal_intent = ANY (ARRAY['yes'::text, 'no'::text, 'unsure'::text]))))
@@ -14777,6 +14787,13 @@ COMMENT ON COLUMN public.leases.prepaid_monthly_draw IS 'S653: the most paid-ahe
 --
 
 COMMENT ON COLUMN public.leases.holdover_signed_end_date IS 'S655 (decisions 10/2 #7): the end date the household signed, kept when the lease holds over past it until its new lease starts (end_date then reads the held-over day). NULL = never held over.';
+
+
+--
+-- Name: COLUMN leases.replaces_lease_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.leases.replaces_lease_id IS '10/24: carried from the document at issuance. services/spotSuccession ends THIS lease the day before the new one starts, on the incoming resident''s signature and not before.';
 
 
 --
@@ -29544,6 +29561,13 @@ CREATE INDEX idx_lease_documents_package_group ON public.lease_documents USING b
 
 
 --
+-- Name: idx_lease_documents_replaces; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_documents_replaces ON public.lease_documents USING btree (replaces_lease_id) WHERE (replaces_lease_id IS NOT NULL);
+
+
+--
 -- Name: idx_lease_documents_work_trade_agreement; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -33503,6 +33527,13 @@ CREATE UNIQUE INDEX ux_lease_prepaid_credits_source_remittance ON public.lease_p
 --
 
 CREATE UNIQUE INDEX ux_lease_unit_history_current ON public.lease_unit_history USING btree (lease_id) WHERE (effective_to IS NULL);
+
+
+--
+-- Name: ux_leases_one_replacement_per_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_leases_one_replacement_per_lease ON public.leases USING btree (replaces_lease_id) WHERE ((replaces_lease_id IS NOT NULL) AND (status = ANY (ARRAY['pending'::text, 'active'::text])));
 
 
 --
@@ -41308,6 +41339,14 @@ ALTER TABLE ONLY public.lease_documents
 
 
 --
+-- Name: lease_documents lease_documents_replaces_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_documents
+    ADD CONSTRAINT lease_documents_replaces_lease_id_fkey FOREIGN KEY (replaces_lease_id) REFERENCES public.leases(id) ON DELETE SET NULL;
+
+
+--
 -- Name: lease_documents lease_documents_target_lease_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -41761,6 +41800,14 @@ ALTER TABLE ONLY public.leases
 
 ALTER TABLE ONLY public.leases
     ADD CONSTRAINT leases_move_out_notice_by_fkey FOREIGN KEY (move_out_notice_by) REFERENCES public.users(id);
+
+
+--
+-- Name: leases leases_replaces_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.leases
+    ADD CONSTRAINT leases_replaces_lease_id_fkey FOREIGN KEY (replaces_lease_id) REFERENCES public.leases(id) ON DELETE SET NULL;
 
 
 --
@@ -46696,5 +46743,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict DCeC2UTu8gtEelqJMIAaWBoaucOqmOzzQb2nefkOgv8hhgviO66GBAy3d2ECpYF
+\unrestrict qclrn7jolhMtbzCxCRHnMWU7rR2tzFdHdjumpsednhbZvBUdspjrMrstqhqUh5y
 

@@ -1443,6 +1443,26 @@ propertiesRouter.patch('/:id/tenants-deposit-at-bank', requirePerm('properties.e
   } catch (e) { next(e) }
 })
 
+// PATCH /api/properties/:id/accepts-checks — 10/23 (Nic): "we need to add a
+// button to record check payments. That also needs to be turned on or off if a
+// property chooses to accept checks. A lot of places don't accept them."
+//
+// One answer per property, defaulting to Yes (migration 20261024030000). The
+// register reads it to decide whether to show the Check button, and the sale
+// route reads it again to refuse a check regardless — a hidden button is a
+// courtesy, not a rule.
+propertiesRouter.patch('/:id/accepts-checks', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { accepted } = z.object({ accepted: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(`UPDATE properties SET accepts_checks = $2, updated_at = NOW() WHERE id = $1`,
+      [req.params.id, accepted])
+    res.json({ success: true, data: { propertyId: req.params.id, acceptsChecks: accepted } })
+  } catch (e) { next(e) }
+})
+
 /**
  * S655 — record a change to a property's owner-signing routing and re-route
  * the owner's open signing seats. Runs on the CALLER's transaction — the same

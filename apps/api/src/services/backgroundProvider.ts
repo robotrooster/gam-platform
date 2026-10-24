@@ -257,6 +257,24 @@ const CHECKR_TENANT_PRODUCTS = [
   'sex_offender_registry', 'global_watchlist',
 ] as const
 
+/**
+ * ONE RULE FOR WHAT A LANDLORD IS SHOWN OUT OF A PRODUCT, and it is exported so
+ * the live fetch and the backfill of reports already taken cannot drift. Three
+ * kinds of thing never travel; everything else goes, in full.
+ */
+export const HELD_FROM_LANDLORD = (key: string, value: unknown): boolean =>
+  /_url$|^url$|_uri$/i.test(key)
+  || /(^|_)(document_data|documents|images?|photos?|scans?)($|_)/i.test(key)
+  || (typeof value === 'string' && /^https?:\/\//i.test(value))
+
+export function landlordVisibleDetail(item: Record<string, unknown>): Record<string, unknown> {
+  const shown: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(item)) {
+    if (!HELD_FROM_LANDLORD(k, v)) shown[k] = v
+  }
+  return shown
+}
+
 class CheckrProvider implements BackgroundProvider {
   readonly name = 'checkr'
   /** S639: the last raw report body fetched, for the archive. */
@@ -576,20 +594,63 @@ class CheckrProvider implements BackgroundProvider {
         // landlord — so "consider" arrived looking like a verdict on the number
         // when it is a verdict against the criteria configured on the account.
         //
-        // An explicit ALLOWLIST rather than the whole object: a consumer report
-        // carries far more about a person than a tenancy decision needs, and
-        // the reason to hold a field is that it explains the status.
-        const KEEP = [
-          'credit_score', 'credit_file_status',
-          'score', 'assessment', 'decision', 'reason', 'reasons',
-          'records_count', 'result',
-        ]
-        const kept: Record<string, unknown> = {}
-        for (const k of KEEP) {
-          const v = (item as Record<string, unknown>)[k]
-          if (v !== undefined && v !== null && (typeof v !== 'object' || Array.isArray(v))) kept[k] = v
-        }
-        if (Object.keys(kept).length) details[p] = kept
+        // ── 10/24 (Nic) — THE ALLOWLIST IS GONE. THE LANDLORD GETS ALL OF IT.
+        //
+        //   "why do we not provide more of the information that came from
+        //    Checker to the landlord? Like, the landlord can only see very
+        //    little. It just says clear or consider and their credit score. But
+        //    the Checker portal shows, you know, 90% on-time payments, 9
+        //    payments late in the last 7 months, credit score only 470, credit
+        //    utilization 184%. Like, why are some of those details not in the
+        //    package that's given to the landlord for consideration? Some of
+        //    those other details are important, not just a clear or consider."
+        //
+        // And on where the line sits, which is the part that settles it:
+        //
+        //   "Anything that checker shows me on the dashboard is what they would
+        //    be willing to show a landlord... They're expecting landlords to be
+        //    set up on partnerships with them. I'm acting as a middleman for the
+        //    software, but anything that I can see on this other screen is
+        //    something they are willing to share."
+        //
+        // He is right, and the allowlist that used to live here had it backwards.
+        // CHECKR is the consumer reporting agency: they assembled the report,
+        // they took the FCRA disclosure and authorization, and the dashboard
+        // this data is drawn from is the one they built FOR LANDLORDS. GAM sits
+        // between the two as software. Deciding that a landlord may not see a
+        // field the CRA itself puts in front of them is GAM gating on a judgment
+        // that is not GAM's to make — the same "accommodate, never block" line
+        // the rest of the platform holds.
+        //
+        // The practical cost of the old rule was not theoretical. It kept a
+        // one-word verdict and a score and dropped `credit_summary` (on-time
+        // payment rate, payment timeline, utilization, account age) and
+        // `credit_score_factors` (WHY the score is what it is) on the floor,
+        // because the filter below it rejected anything that was an object. So
+        // "consider" reached the landlord with nothing to weigh it against,
+        // which is the exact complaint S639 was opened for and did not finish.
+        //
+        // ── WITH EXACTLY ONE LINE HELD, AND IT IS NOT ABOUT THE DECISION.
+        //
+        //   "I don't ever want landlords going to the checker dashboard. I
+        //    don't want links to pictures, things like that. They just need the
+        //    straight information. You don't need to give them the pictures.
+        //    They don't need the driver's license number. Whatever."
+        //
+        // So: the identity product's VERDICT and its consider_reasons are
+        // straight information and stay. The scanned identity document behind
+        // them does not — the images, and the document data (licence number,
+        // date of birth, expiry) that rides with them. Neither is something a
+        // landlord weighs; the verdict already says whether the person is who
+        // they said they were.
+        //
+        // Written as a RULE about the shape rather than a list of field names,
+        // for the same reason the allowlist above had to go: a name-by-name
+        // filter silently drops whatever Checkr adds next. Three kinds of thing
+        // never travel — anything that is a link out (a landlord belongs in
+        // GAM, not in Checkr's dashboard), the document payload, and anything
+        // whose own name says it carries an image. Everything else, in full.
+        details[p] = landlordVisibleDetail(item as Record<string, unknown>)
       }
     }
     // S642 (Nic): "We're gonna generate accounts off a legal name." An applicant
@@ -634,7 +695,28 @@ class CheckrProvider implements BackgroundProvider {
     // GAM's billing problem. It says so out loud instead: on the summary, so no
     // landlord is ever told an identity check happened when it did not, and to
     // the admins, so the add-on gets turned on.
-    const idScanRan = CHECKR_ID_SCAN_ADD_ON in products
+    // ── 10/24 (Nic): AND THE PRODUCT COMING BACK IS NOT PROOF EITHER.
+    //
+    // This read "the key is on the report, so the scan ran", and on Heather
+    // Miller's order (10/24, Country Acres) that said id_scan_ran: true. The
+    // Checkr RECEIPT for that same order says otherwise — one line, "Essential
+    // Tenant Screening package", listing Criminal History, Credit Report,
+    // Eviction History, Sex Offender Registry and Global Watchlist. No identity
+    // add-on, itemized nowhere. So a `clear` on identity_verification comes back
+    // with the base package whether or not the $3.95 product was bought, and
+    // this alarm — the one thing standing between a silent miss and an applicant
+    // paying for a scan nobody ran — was looking at the wrong evidence and
+    // staying quiet.
+    //
+    // There is no field on the report that settles it, which is the real finding:
+    // the only authority on what was PURCHASED is what Checkr billed. Until the
+    // invoice is readable from here, the honest answer is that GAM does not
+    // know, so the summary stops asserting that it does and the alarm fires on
+    // the gap it CAN see — a report whose identity product is absent entirely.
+    // A present-but-unbilled one is flagged for a human to check against the
+    // receipt rather than silently called a pass.
+    const idScanReported = CHECKR_ID_SCAN_ADD_ON in products
+    const idScanRan = idScanReported
     if (!idScanRan) {
       try {
         const { createAdminNotification } = await import('./adminNotifications')
@@ -647,6 +729,9 @@ class CheckrProvider implements BackgroundProvider {
             + 'dashboard, go to Properties, pick this property, and turn Identity Intelligence on. A property '
             + 'appears there the first time an order names it, so a park screening its first applicant will '
             + 'always need this done once. '
+            + '10/24: a report that DOES carry the product is not proof it was billed — Heather Miller\'s '
+            + 'order came back clear on identity and the receipt showed no add-on. Check the month\'s Checkr '
+            + 'receipts against the orders before trusting either answer. '
             + `Report ${report.id ?? reportRef}, order ${report.order_id ?? '(unknown)'}.`,
           context: { report_id: report.id ?? reportRef, order_id: report.order_id ?? null },
         })
@@ -666,7 +751,12 @@ class CheckrProvider implements BackgroundProvider {
       all_products_resolved: allTerminal,
       // 10/21: whether the live ID scan this order asked for actually ran. A
       // reader must never have to work that out from the absence of a key.
+      // 10/24: renamed in meaning, not in name — this says the product came
+      // back ON THE REPORT, which is all the report can tell us. Whether it was
+      // BILLED is a question only the receipt answers; see above.
       id_scan_ran: idScanRan,
+      id_scan_reported: idScanReported,
+      id_scan_billing_unverified: true,
       products,
       details,
       fetched_at: new Date().toISOString(),

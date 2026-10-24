@@ -675,6 +675,11 @@ export async function createDocumentRecord(client: any, opts: {
   // lease — completion copies the predecessor's deposits + the lease-end
   // processor hands the unit off instead of vacating.
   renewsLeaseId?: string | null,
+  // 10/24 (Nic): the SITTING tenancy this lease replaces on the same space —
+  // a different household taking the spot over (services/spotSuccession). Set
+  // only from the drafting screen, after the landlord has been shown whose
+  // tenancy it is and confirmed; never by a booking or application draft.
+  replacesLeaseId?: string | null,
   // S604 (Nic): the landlord ALREADY holds this tenant's deposit — migration
   // onboarding. The lease still states the deposit; it just isn't billed.
   depositAlreadyHeld?: boolean,
@@ -721,15 +726,19 @@ export async function createDocumentRecord(client: any, opts: {
       template_id, landlord_id, unit_id, lease_id,
       title, base_pdf_url,
       document_type, target_lease_tenant_id, promote_lease_tenant_id,
-      renews_lease_id, deposit_already_held,
+      renews_lease_id, replaces_lease_id, deposit_already_held,
       package_group_id, package_id, package_sort_order, template_version
-    ) VALUES ($1,$2,$3,$4, $5,$6, $7,$8,$9, $10,$11, $12,$13,$14,$15)
+    ) VALUES ($1,$2,$3,$4, $5,$6, $7,$8,$9, $10,$11,$12, $13,$14,$15,$16)
     RETURNING *`,
     [
       opts.templateId, opts.landlordId, opts.unitId, opts.leaseId,
       opts.title, basePdfUrl,
       opts.documentType, opts.targetLeaseTenantId, opts.promoteLeaseTenantId,
       opts.renewsLeaseId || null,
+      // 10/24 (Nic): the sitting tenancy this lease replaces, named by the
+      // landlord on the drafting screen after being shown whose it is. NULL on
+      // every ordinary lease, and NULL hands nothing over.
+      opts.replacesLeaseId || null,
       opts.depositAlreadyHeld === true,
       opts.packageGroupId ?? null, opts.packageId ?? null,
       opts.packageSortOrder ?? null, opts.templateVersion ?? null
@@ -1602,6 +1611,18 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   const startIso = leaseFieldDate(startDate)
   const leaseStatus = startIso && startIso > todayIn(doc.property_timezone) ? 'pending' : 'active'
 
+  // 10/24 (Nic + Blue): the space's two refusals, asked once more at the last
+  // gate before the lease exists — the send checked them, and a document can sit
+  // out for signature long enough for the answer to change. See
+  // services/spotSuccession.
+  if (startIso) {
+    const { whySpotCannotBeTakenOver } = await import('../services/spotSuccession')
+    const why = await whySpotCannotBeTakenOver(
+      { query: (sql: string, params?: unknown[]) => client.query(sql, params as any) } as any,
+      { unitId: doc.unit_id, startIso, replacesLeaseId: doc.replaces_lease_id, exceptLeaseId: doc.lease_id })
+    if (why) throw new AppError(409, why)
+  }
+
   // INSERT lease — writable-column portion dynamically assembled from the
   // shared spec registry. Adding a new writable value to WRITABLE_LEASE_COLUMN_SPECS
   // in @gam/shared automatically wires it into lease creation; no change here.
@@ -1666,8 +1687,13 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
       WHERE document_id = $1 AND role <> 'landlord' AND status <> 'signed'`,
     [doc.id]).then((r: any) => r.rows[0].outstanding === 0)
 
-  const tailCols = ['unit_id', 'landlord_id', 'status']
-  const tailValues: (string | null)[] = [doc.unit_id, doc.landlord_id, leaseStatus]
+  // 10/24 (Nic): a replacement lease carries the lease it replaces onto itself,
+  // so the handover at signature acts on the tenancy the LANDLORD named rather
+  // than one inferred from dates — the gate that keeps an ordinary new lease,
+  // a booking draft or an application draft from ending anybody's tenancy.
+  // NULL on every lease that is not a deliberate replacement.
+  const tailCols = ['unit_id', 'landlord_id', 'status', 'replaces_lease_id']
+  const tailValues: (string | null)[] = [doc.unit_id, doc.landlord_id, leaseStatus, doc.replaces_lease_id ?? null]
   const tailPlaceholders = tailCols.map((_, i) => '$' + (paramIdx + i))
 
   const lease = await client.query(
@@ -2661,6 +2687,36 @@ esignRouter.post('/witnesses/provision', requireAuth, requirePerm('leases.create
 // ?unitId=X → that unit's active lease + all its active tenants;
 // ?propertyId=Y → one group per active lease at the property (the
 // property-wide addendum send fans out one document per group).
+/**
+ * GET /api/esign/space-occupant?unitId=&startDate= — 10/24 (Nic):
+ *
+ *   "maybe just have the window prompt them with a, hey, this lease there's a
+ *    lease already in place for this unit. Do you want to replace this one?...
+ *    And actually show the name of the person and the unit that is being
+ *    replaced. That way, if the landlord accidentally clicked on the wrong
+ *    unit, they have all that information right in front of them."
+ *
+ * Who is on a space on a given day, so the drafting screen can say so before a
+ * replacement is set up rather than after somebody signs. Read-only: asking
+ * hands nothing over, and a space with nobody on it answers null.
+ */
+esignRouter.get('/space-occupant', requireAuth, requirePerm('leases.create'), async (req: any, res, next) => {
+  try {
+    const unitId = String(req.query.unitId ?? '')
+    const startDate = String(req.query.startDate ?? '')
+    if (!/^[0-9a-f-]{36}$/i.test(unitId)) throw new AppError(400, 'Pick a space first.')
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate)) throw new AppError(400, 'Pick the day the new lease starts first.')
+    const unit = await queryOne<{ property_id: string; landlord_id: string }>(
+      `SELECT u.property_id, p.landlord_id FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+      [unitId])
+    if (!unit) throw new AppError(404, 'That space is not on this account.')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Not your space')
+    const { whoIsOnThisSpace } = await import('../services/spotSuccession')
+    const occupant = await whoIsOnThisSpace({ query }, { unitId, startIso: startDate, landlordId: unit.landlord_id })
+    res.json({ success: true, data: { occupant } })
+  } catch (e) { next(e) }
+})
+
 esignRouter.get('/recipients', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
     const { unitId, propertyId } = req.query as { unitId?: string; propertyId?: string }
@@ -3547,10 +3603,50 @@ async function resolveUnitFromPrefill(
   return filtered[0].id
 }
 
+/**
+ * 10/24 (Nic) — A REPLACEMENT IS CHECKED BEFORE IT IS WRITTEN DOWN.
+ *
+ * The drafting screen shows the landlord whose tenancy they are about to end
+ * and asks them to confirm it, which is where the intent comes from. This is
+ * the server's own look at the same question, because a screen's confirmation
+ * is not a fact: the id has to name a tenancy that is CURRENT, on THIS space,
+ * and on the day the new lease starts. Anything else is refused outright rather
+ * than stored — a stored wrong answer ends the wrong person's lease the moment
+ * somebody signs.
+ *
+ * Only an original lease replaces anything. An addendum, a renewal or a form
+ * leaves it null whatever was posted.
+ */
+async function verifiedReplacedLease(
+  client: { query: (sql: string, params?: unknown[]) => Promise<any> },
+  o: { replacesLeaseId: unknown; unitId: string | null; docType: string; prefillValues: Record<string, string> },
+): Promise<string | null> {
+  const id = typeof o.replacesLeaseId === 'string' && /^[0-9a-f-]{36}$/i.test(o.replacesLeaseId)
+    ? o.replacesLeaseId : null
+  if (!id || !o.unitId || o.docType !== 'original_lease') return null
+  const startIso = leaseFieldDate(o.prefillValues['start_date'] ?? '')
+  if (!startIso) {
+    throw new AppError(400, 'A lease that replaces a resident has to say what day it starts, '
+      + 'because that is the day their tenancy ends. Fill in the start date, then send it.')
+  }
+  const { namedSittingLease } = await import('../services/spotSuccession')
+  const sitting = await namedSittingLease(
+    { query: (sql: string, params?: unknown[]) => client.query(sql, params as any) } as any,
+    { leaseId: id, unitId: o.unitId, startIso, newLeaseId: '00000000-0000-0000-0000-000000000000' })
+  if (!sitting) {
+    const { REPLACES_A_LEASE_THAT_DOES_NOT_FIT } = await import('../services/spotSuccession')
+    throw new AppError(409, REPLACES_A_LEASE_THAT_DOES_NOT_FIT)
+  }
+  return sitting.id
+}
+
 esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   const client = await getClient()
   try {
-    const { templateId, unitId, title, signers, basePdfUrl, prefillValues, depositAlreadyHeld } = req.body
+    const { templateId, unitId, title, signers, basePdfUrl, prefillValues, depositAlreadyHeld,
+            // 10/24: the tenancy this lease replaces, confirmed on the drafting
+            // screen. Checked against the space below — never taken on trust.
+            replacesLeaseId } = req.body
     if (!title || !signers?.length) throw new AppError(400, 'title and signers required')
 
     // Validate signer shape
@@ -3664,6 +3760,13 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
       // so state it on the lease but never bill it. Only meaningful on an
       // original_lease; an addendum has no move-in invoice.
       depositAlreadyHeld: docType === 'original_lease' && depositAlreadyHeld === true,
+      // 10/24 (Nic): verified, never trusted — it must be a current tenancy on
+      // THIS space, and only a real lease replaces one. A wrong unit picked on
+      // the drafting screen lands here as a lease that does not fit the space,
+      // and is refused rather than quietly ending somebody else's tenancy.
+      replacesLeaseId: await verifiedReplacedLease(client, {
+        replacesLeaseId, unitId: finalUnitId, docType, prefillValues: prefillValues || {},
+      }),
       signers,
       prefillValues: prefillValues || {}
     } as any)
@@ -5925,6 +6028,31 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
             { residentDecides: await residentsWhoSignFirst(doc.id, [primary, ...coTenants]) })
         }
         if (!ov.ok) throw new AppError(409, `Cannot send: ${ov.reason}`)
+        // 10/24 (Nic + Blue) — AND THE SPACE'S OWN TWO REFUSALS.
+        //
+        // The overlap check above is about the SIGNERS — their other leases,
+        // their other landlords. These two are about the SPACE: a rival
+        // replacement already signed for the same days, and a month already
+        // billed to the resident being released. Asked here so the landlord is
+        // refused while he still has the document, not after somebody signs it.
+        //
+        // One sitting lease plus one incoming lease is NOT refused — that is the
+        // whole feature. Nic: "Susie's lease goes to for several more years, and
+        // this new person is going to start November 1st." See
+        // services/spotSuccession.
+        {
+          const spaceStart = leaseFieldDate(startVal)
+          if (spaceStart) {
+            const { whySpotCannotBeTakenOver } = await import('../services/spotSuccession')
+            const why = await whySpotCannotBeTakenOver({ query }, {
+              unitId: doc.unit_id, startIso: spaceStart,
+              // Only a document the landlord drafted AS a replacement names one.
+              replacesLeaseId: doc.replaces_lease_id,
+              exceptLeaseId: doc.lease_id,
+            })
+            if (why) throw new AppError(409, `Cannot send: ${why}`)
+          }
+        }
         // S655: the dates a new lease must make sense against the one it
         // follows — until the landlord has signed (after that the terms are
         // locked and the lease is issued; a re-send only re-mails it).
@@ -7505,6 +7633,71 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
                                signed_at = COALESCE(signed_at, NOW()),
                                updated_at = NOW()
               WHERE id = $1`, [leaseResult.leaseId])
+
+          // 10/24 (Nic + Blue) — A REPLACEMENT'S SIGNATURE RELEASES THE SITTING
+          // RESIDENT, AND NOTHING BEFORE IT DOES.
+          //
+          //   "The replacement person needs to sign before it fires, right?
+          //    That's the thing that it's gated on. It's if the other person
+          //    never fully commits, he can't release the original person and
+          //    then be stuck with nothing."
+          //
+          // This is the line where that signature becomes a fact, so it is
+          // where the sitting lease gets its end date: the day before the
+          // replacement's starts. See services/spotSuccession for why this is
+          // not renewalSuccessor (a different household, no link between the two
+          // leases, and the tenant's signature rather than the landlord's).
+          //
+          // NEVER ROLLS BACK THE SIGNATURE. If the handover cannot be made —
+          // somebody else signed for the same days, or the month is already
+          // billed — the signature still stands and the landlord is told, the
+          // same way the PM transfer below handles its own failure. A signed
+          // lease that could not hand over is a thing to go and fix, not a
+          // signature to undo.
+          try {
+            const { replacementTookOverSpot } = await import('../services/spotSuccession')
+            const handover = await replacementTookOverSpot({ query }, leaseResult.leaseId)
+            if (handover) {
+              // The person being released is told, by the one rule that keeps
+              // this from happening quietly: whoever it affects finds out first.
+              const leaving = await queryOne<{ user_id: string; label: string }>(
+                `SELECT u.id AS user_id,
+                        COALESCE(NULLIF(un.display_label, ''), un.unit_number, 'your space') AS label
+                   FROM lease_tenants lt
+                   JOIN tenants t ON t.id = lt.tenant_id
+                   JOIN users u ON u.id = t.user_id
+                   JOIN leases l ON l.id = lt.lease_id
+                   JOIN units un ON un.id = l.unit_id
+                  WHERE lt.lease_id = $1 AND lt.status IN ('active','pending_add')
+                  ORDER BY (lt.role = 'primary') DESC LIMIT 1`, [handover.sittingLeaseId])
+              if (leaving) {
+                await createNotification({
+                  userId: leaving.user_id,
+                  type: 'lease_handed_over',
+                  title: `Your lease for ${leaving.label} now ends ${handover.endsOn}`,
+                  body: `Your landlord has signed a new lease for ${leaving.label} starting the next day, so yours `
+                    + `now ends ${handover.endsOn}.`
+                    + (handover.owed > 0
+                        ? ' What is unpaid on it is still owed and is recorded in your name — it does not go away '
+                          + 'when the lease ends.'
+                        : '')
+                    + ' Talk to your landlord if that is not what you expected.',
+                  data: { leaseId: handover.sittingLeaseId, endsOn: handover.endsOn },
+                  actionUrl: '/lease',
+                }).catch(err => logger.error({ err, leaseId: handover.sittingLeaseId },
+                  '[spot-succession] could not tell the departing resident their lease now ends'))
+              }
+            }
+          } catch (e) {
+            logger.error({ err: e, leaseId: leaseResult.leaseId }, '[spot-succession] handover failed')
+            await createAdminNotification({
+              severity: 'critical',
+              category: 'spot_succession_failed',
+              title:    `A replacement signed for a space but the handover could not be made`,
+              body:     e instanceof Error ? e.message : String(e),
+              context:  { lease_id: leaseResult.leaseId, document_id: doc.id },
+            }).catch(() => {})
+          }
         }
 
         // S119 post-commit: fire Stripe Transfer for any PM company leasing

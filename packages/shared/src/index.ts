@@ -6338,6 +6338,24 @@ export function lateFeeCreditedTenantText(o: {
 //     date decides after all.
 
 /** 10/6 (Nic): the per-property setting (properties.tenants_deposit_at_bank, default off) and its one line. */
+/**
+ * 10/23 (Nic) — DOES THIS PROPERTY TAKE A CHECK AT THE COUNTER?
+ *
+ *   "That also needs to be turned on or off if a property chooses to accept
+ *    checks. A lot of places don't accept them."
+ *
+ * Reads as a question a landlord answers, like the departure rules, and
+ * defaults to Yes — every property already takes a check on an invoice, so a
+ * default of No would quietly stop something that works.
+ */
+export const ACCEPTS_CHECKS_QUESTION = 'Do you take checks at the front counter?'
+export const ACCEPTS_CHECKS_HINT = {
+  yes: 'The register shows a Check button, and asks for the check number so the payment can be '
+    + 'found again if the bank sends it back. A check is free — no fee, and no change to give.',
+  no: 'The register shows no Check button, and a check cannot be rung up here. Cash and card still work, '
+    + 'and a resident can still pay their invoice by check.',
+} as const
+
 export const TENANTS_DEPOSIT_AT_BANK_LABEL = 'Tenants may deposit rent directly at the bank'
 export const TENANTS_DEPOSIT_AT_BANK_HINT =
   'Tenants deposit rent at your bank themselves. GAM matches each deposit to their bill using your bank feed.'
