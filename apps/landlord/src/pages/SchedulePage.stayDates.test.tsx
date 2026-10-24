@@ -66,6 +66,13 @@ describe('New Reservation — Add a day / Add a week / Add a month', () => {
       expect(button(label).disabled).toBe(true)
     }
     expect(nightsLine()).toBeNull()
+    // 10/24 (Nic): and the ROOM for it is there anyway, so the window does not
+    // change size when it arrives. A centred dialog that grows moves up by half
+    // of what it gained, which slid Add a day out from under the pointer
+    // between two clicks: "I have to click once and then move the mouse ever so
+    // slightly and click it again."
+    const reserved = host.querySelector('[style*="min-height"]') as HTMLElement | null
+    expect(reserved, 'the nights line keeps its space while empty').not.toBeNull()
   })
 
   it('four presses of Add a day → 4 nights, leaving four days after arrival', () => {

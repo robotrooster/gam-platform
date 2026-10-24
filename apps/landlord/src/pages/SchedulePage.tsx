@@ -4318,11 +4318,26 @@ export function StayDatesFields({ checkIn, checkOut, onChange }: {
         <button type="button" className="btn btn-primary btn-sm" disabled={!checkIn} onClick={()=>add('week')}>Add a week</button>
         <button type="button" className="btn btn-primary btn-sm" disabled={!checkIn} onClick={()=>add('month')}>Add a month</button>
       </div>
-      {valid && (
-        <div data-testid="resv-nights" style={{fontSize:'.86rem',fontWeight:700,color:'var(--text-1)',marginTop:8}}>
-          {nights} night{nights===1?'':'s'} — leaving {leavingDayLabel(checkOut)}
-        </div>
-      )}
+      {/* 10/24 (Nic) — THE SPACE FOR THIS LINE IS ALWAYS THERE, EVEN EMPTY.
+            "the text that pops up under it saying 5 nights leaving Tuesday,
+             November, whatever, that resizes the window... If I have to add 2
+             days, I click add a day twice. I have to click once and then move
+             the mouse ever so slightly and click it again. And that just bugs
+             the shit out of me."
+          The line appears BELOW the buttons, so it never pushed them down — the
+          window grew, and a centred dialog that grows moves up by half of what
+          it gained, sliding the buttons out from under the pointer between two
+          clicks of Add a day. So the row keeps its height whether the line is
+          in it or not, and the window stops changing size.
+          The line itself is still absent until the dates make sense; only the
+          room it will take is reserved. */}
+      <div style={{marginTop:8,minHeight:'1.3rem'}}>
+        {valid && (
+          <div data-testid="resv-nights" style={{fontSize:'.86rem',fontWeight:700,color:'var(--text-1)'}}>
+            {nights} night{nights===1?'':'s'} — leaving {leavingDayLabel(checkOut)}
+          </div>
+        )}
+      </div>
     </>
   )
 }
