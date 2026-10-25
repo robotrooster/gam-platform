@@ -898,8 +898,23 @@ export async function quoteCounterReads(
     // 10/24 (Nic): and a read that barely moved holds as well. Without this it
     // would have quoted $0.00 and billed nobody in silence, which is the dead
     // meter nobody notices — the thing the rule exists to catch.
-    const held = readingBarelyMoved(m.priorValue, r.value, m.priorDay, todayIso())
-      || (isRollover && m.priorValue < meterReadingModulus(m.digits) * 0.9)
+    // ── 10/25 (Nic) — A ROLLBACK NO LONGER HOLDS THE READ ──────────────────
+    //
+    //   "A meter rolling back is not a rule that I asked for. If it's 40,000 and
+    //    it rolls back 39999, that just needs to flag in the system that the
+    //    meter may be broken. I don't want to have to double check a read."
+    //
+    // readingBarelyMoved USED to be in this condition, which is how Patrick
+    // Neuman's finished stay ended up with a "closing read still due" AND a
+    // "reading to double-check" sitting on it: "Neither of those should be
+    // there... The system is not operating correctly if those are there."
+    //
+    // The figure still bills nothing extra — the usage math above already reads
+    // a rollback as no usage rather than a full wrap round the dial — and the
+    // METER gets flagged instead (flagMeterLooksBroken, at the confirm). A
+    // genuinely suspicious USAGE (a slipped digit upward) still holds, because
+    // that one would overbill a guest who is standing at the counter.
+    const held = (isRollover && m.priorValue < meterReadingModulus(m.digits) * 0.9)
       || usageNeedsDoubleCheck(m.utilityType, usage)
     if (held) {
       // 10/24 — THE DESK HEARS ABOUT THE MONEY FIRST, THEN ABOUT THE FIGURE.
@@ -1383,20 +1398,30 @@ export async function recordCounterReads(
        RETURNING id, to_char(reading_date, 'YYYY-MM-DD') AS day`,
       [m.id, r.value, args.userId,
        `Closing read taken at the register — ${args.closing.what}`,
+       // 10/25: a rollback no longer holds, so a hold is now only ever a figure
+       // GAM will not bill as it stands — one sentence, no branch.
        held, !held ? null
-         // 10/24 (Nic): the landlord's note says WHICH hold it is, because the
-         // two need different things done about them — a slipped digit is
-         // retyped, a stuck face is walked out to and looked at. This column is
-         // landlord-only, which is the only reason it may name a direction at
-         // all; the desk's sentence above still names neither.
-         // todayIso(), not reading.day: this note is an argument TO the insert
-         // that creates `reading`, and the row it creates is stamped
-         // CURRENT_DATE — the same day.
-         : readingBarelyMoved(m.priorValue, r.value, m.priorDay, todayIso())
-           ? `Closing read at the register. ${BARELY_MOVED_REVIEW_NOTE}`
-           : 'A closing read taken at the register that GAM will not bill as it stands — read the face again: a slipped digit, or a genuine figure to confirm',
+         : 'A closing read taken at the register that GAM will not bill as it stands — read the face again: a slipped digit, or a genuine figure to confirm',
        carried])).rows[0]
     out.readings.push({ meterId: m.id, readingId: reading.id, held })
+
+    // ── 10/25 (Nic): THE METER CARRIES THE SUSPICION, NOT THE LANDLORD ───────
+    //
+    // "That just needs to flag in the system that the meter may be broken. I
+    // don't want to have to double check a read." So the read above stands and
+    // bills; this says somebody should go and look at the dial. Deliberately not
+    // out_of_service — that stops it being billed at all, and billing never
+    // blocks on a flag.
+    if (readingBarelyMoved(m.priorValue, r.value, m.priorDay, todayIso())) {
+      await client.query(
+        `UPDATE utility_meters
+            SET looks_broken_at = COALESCE(looks_broken_at, NOW()),
+                looks_broken_reason = $2, updated_at = NOW()
+          WHERE id = $1`,
+        [m.id, `Read ${r.value.toLocaleString()} on ${reading.day} against `
+             + `${(m.priorValue ?? 0).toLocaleString()} before it — the dial barely moved, or went backwards. `
+             + `The read was taken and billed as no usage; the meter may be stuck or swapped.`])
+    }
 
     if (quote.block === 'double_check' || quote.block === 'no_baseline') {
       out.notes.push(quote.note!)

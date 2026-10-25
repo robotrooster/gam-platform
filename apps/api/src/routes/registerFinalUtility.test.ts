@@ -31,7 +31,7 @@ vi.mock('../services/email', async (orig) => ({
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
-import { db } from '../db'
+import { db, query } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant,
   seedUtilityMeter,
@@ -451,32 +451,49 @@ describe('D5 — typing the number writes nothing; confirming writes the reading
     for (const [what, value] of [['one under (the RV 06 case)', 39999],
                                  ['two under', 39998],
                                  ['dead level — the one nothing caught before', 40000]] as const) {
-      it(`${what}: no wrap, nothing billed, and the landlord is told the face may be stuck`, async () => {
+      it(`${what}: no wrap, nothing billed, and the METER is flagged — the read is not held`, async () => {
         const p = await park({ priorValue: 40000, priorDaysAgo: 23 })
         const email = `stuck-${Math.random().toString(36).slice(2)}@example.dev`
         const s = await stay(p, { email, nights: 27, withAgreement: true })
 
         const q = await checkRead(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value }] })
         expect(q.status, JSON.stringify(q.body)).toBe(200)
-        expect(q.body.data.reads[0].block).toBe('double_check')
-        // THE WHOLE POINT: not 99,999 kWh and not a $21,000 charge.
+        // ── 10/25 (Nic) — THE METER IS FLAGGED, NOT THE READ ─────────────────
+        //
+        //   "A meter rolling back is not a rule that I asked for. If it's 40,000
+        //    and it rolls back 39999, that just needs to flag in the system that
+        //    the meter may be broken. I don't want to have to double check a
+        //    read."
+        //
+        // This test used to assert block 'double_check' and needs_review TRUE,
+        // from my misreading of his 10/24 words — he said mark the METER
+        // potentially broken and I held the READ. That is what left Patrick
+        // Neuman's finished stay carrying both a "closing read still due" and a
+        // "reading to double-check": "Neither of those should be there... The
+        // system is not operating correctly if those are there. Full stop."
+        expect(q.body.data.reads[0].block).toBeNull()
+        // THE PART THAT DOES NOT CHANGE: not 99,999 kWh and not a $21,000
+        // charge. A rollback still reads as no usage, never a wrap.
         expect(q.body.data.reads[0].amount).toBe(0)
         expect(q.body.data.reads[0].charge).toBe(0)
-        // Still blind at the counter — no figure, no direction.
-        expect(q.body.data.reads[0].note).not.toMatch(/\d/)
 
         const r = await putOnTicket(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value }] })
         expect(r.status, JSON.stringify(r.body)).toBe(201)
-        expect(r.body.data.lines).toHaveLength(0)
-        expect(await bills(p.meterId)).toHaveLength(0)
         expect(await invoices(p.landlordId)).toHaveLength(0)
 
-        // The read is KEPT and flagged, and the LANDLORD's note says which kind
-        // of hold it is — go and look at the face, not retype a digit.
+        // The read stands, unheld — nothing for him to double-check.
         const rd = await readings(p.meterId)
         expect(rd).toHaveLength(2)
-        expect(rd[1]).toMatchObject({ v: String(value), needs_review: true })
-        expect(rd[1].review_note).toMatch(/may not be turning/i)
+        expect(rd[1]).toMatchObject({ v: String(value), needs_review: false })
+
+        // The METER carries the suspicion instead, and says why.
+        const m = await query<any>(
+          `SELECT looks_broken_at, looks_broken_reason FROM utility_meters WHERE id = $1`, [p.meterId])
+        expect(m[0].looks_broken_at).not.toBeNull()
+        expect(m[0].looks_broken_reason).toMatch(/barely moved|backwards/i)
+        // NOT out of service: a flag must never stop a meter being billed.
+        const svc = await query<any>(`SELECT out_of_service FROM utility_meters WHERE id = $1`, [p.meterId])
+        expect(svc[0].out_of_service).toBe(false)
       })
     }
 

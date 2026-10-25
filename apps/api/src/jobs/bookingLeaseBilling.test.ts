@@ -2209,6 +2209,80 @@ describe('S548 pull-out meter read prompt', () => {
     expect(second.prompted).toBe(0)
   })
 
+  // ── 10/25 (Nic) — A READ THAT WAS TAKEN IS NOT A READ THAT IS DUE ─────────
+  //
+  //   "That flow of checking people out at the front desk, when we input his
+  //    meter read, it did not transfer it to the meter reads on the meter
+  //    reading tab... I'm getting two notifications for the same spot that's
+  //    already done and over with."
+  //
+  // It HAD transferred — Patrick Neuman, RV 06, 39999 on 10/23, move_out_final —
+  // and the rollback rule he asked for then held it, because 40000 → 39999 is
+  // within a digit. The read correctly stays outstanding (a dropped digit must
+  // not make the walk look done, 10/20), but the notice said there was "no
+  // closing read", which is why he thought the register had lost it.
+  it('says a held read is waiting on the landlord, not that no read was taken', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    await db.query(`UPDATE leases SET end_date = CURRENT_DATE - 2 WHERE id=$1`, [s.leaseId])
+    const client = await getClient()
+    let meterId: string
+    try {
+      await client.query('BEGIN')
+      meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    // The desk took the closing read and GAM is holding the figure.
+    await db.query(
+      `INSERT INTO utility_meter_readings (meter_id, reading_date, billing_cycle_month, reading_value, reason, needs_review, review_note, created_by_user_id)
+       VALUES ($1, CURRENT_DATE - 1, date_trunc('month', CURRENT_DATE)::date, 39999, 'move_out_final', TRUE, 'within a digit of the one before', $2)`,
+      [meterId!, s.userId])
+
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+    const n = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(n.rows.length).toBeGreaterThanOrEqual(1)
+    const { title, body } = n.rows[0]
+    // The title no longer claims a read is due when one was taken.
+    expect(title).toMatch(/waiting on you/i)
+    expect(title).not.toMatch(/still due/i)
+    // And the body says what to actually DO — settle a figure, not walk a meter.
+    expect(body).toMatch(/was taken and is waiting on you/i)
+    expect(body).toMatch(/Readings to double-check/)
+    expect(body).not.toMatch(/no closing read/i)
+  })
+
+  it('a spot with a settled read drops off, while an unread one still says due', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    await db.query(`UPDATE leases SET end_date = CURRENT_DATE - 2 WHERE id=$1`, [s.leaseId])
+    const client = await getClient()
+    let meterId: string
+    try {
+      await client.query('BEGIN')
+      meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    // Unread: the old wording still applies, because nobody has been to the meter.
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+    const due = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(due.rows[0].body).toMatch(/no closing read/i)
+
+    // Settled: it stops being chased at all.
+    await db.query(`DELETE FROM notifications WHERE type='moveout_meter_reads_due'`)
+    await db.query(
+      `INSERT INTO utility_meter_readings (meter_id, reading_date, billing_cycle_month, reading_value, reason, needs_review, created_by_user_id)
+       VALUES ($1, CURRENT_DATE - 1, date_trunc('month', CURRENT_DATE)::date, 41000, 'move_out_final', FALSE, $2)`, [meterId!, s.userId])
+    expect((await promptMoveOutMeterReads()).prompted).toBe(0)
+  })
+
   it('no submeter on the departing site → no prompt', async () => {
     const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
     const s = await seedStack()

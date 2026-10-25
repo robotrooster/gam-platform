@@ -622,6 +622,8 @@ type ClosingReadDue = {
   property_id: string; property_name: string; landlord_id: string
   unit_number: string; who: string | null
   departed_on: string; left_today: boolean; confirmed_gone: boolean
+  /** A read WAS taken since they left and is held for the landlord to settle. */
+  read_held: boolean
 }
 
 export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
@@ -637,7 +639,28 @@ export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
       -- notice names the one that has been waiting longest.
       SELECT DISTINCT ON (u.id)
              p.id AS property_id, p.name AS property_name, p.landlord_id,
-             u.unit_number, d.who, d.departed_on, d.confirmed_gone
+             u.unit_number, d.who, d.departed_on, d.confirmed_gone,
+             -- 10/25 (Nic): A READ WAS TAKEN AND IS WAITING ON HIM.
+             --
+             -- "That flow of checking people out at the front desk, when we
+             --  input his meter read, it did not transfer it to the meter reads
+             --  on the meter reading tab... I'm getting two notifications for
+             --  the same spot that's already done and over with."
+             --
+             -- It DID transfer (Patrick Neuman, RV 06, 39999 on 10/23,
+             -- move_out_final) — and then the rollback rule he asked for held it,
+             -- because 40000 → 39999 is within a digit. The read stays
+             -- outstanding on purpose (see the 10/20 note below: a dropped digit
+             -- must not make the walk look done). But the notice then told him
+             -- there was "no closing read", which is not true, reads as nobody
+             -- having taken one, and is why he thought the register had lost it.
+             --
+             -- So the notice needs to know the difference. This says a read
+             -- exists and is held; the bucket it feeds says what to actually do.
+             EXISTS (
+               SELECT 1 FROM utility_meter_readings rh
+                WHERE rh.meter_id = m.id AND rh.reading_date >= d.departed_on
+                  AND rh.needs_review) AS read_held
         FROM departures d
         JOIN units u ON u.id = d.unit_id
         JOIN properties p ON p.id = u.property_id
@@ -655,7 +678,7 @@ export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
              AND r.needs_review = false)
        ORDER BY u.id, (d.departed_on = CURRENT_DATE) DESC, d.departed_on
     )
-    SELECT property_id, property_name, landlord_id, unit_number, who, confirmed_gone,
+    SELECT property_id, property_name, landlord_id, unit_number, who, confirmed_gone, read_held,
            to_char(departed_on, 'YYYY-MM-DD') AS departed_on,
            departed_on = CURRENT_DATE AS left_today
       FROM outstanding
@@ -686,13 +709,19 @@ export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
     if (already) continue
 
     const prop = rows[0]
-    const todayRows = rows.filter(r => r.left_today)
-    const gone = rows.filter(r => !r.left_today && r.confirmed_gone)
+    // 10/25 (Nic): a spot whose read is HELD is not a spot with no read, and
+    // saying so was the whole complaint. It comes out of the other three
+    // buckets entirely and gets its own sentence, because the action is
+    // different: confirm a figure, not walk to a meter.
+    const held = rows.filter(r => r.read_held)
+    const unread = rows.filter(r => !r.read_held)
+    const todayRows = unread.filter(r => r.left_today)
+    const gone = unread.filter(r => !r.left_today && r.confirmed_gone)
     // Past their check-out and NOT checked out: the rig is very likely still
     // sitting there. Saying they left would be a plain untruth in an email to
     // the landlord and every staffer on the property, so it says what the desk
     // actually has on the books.
-    const stillOn = rows.filter(r => !r.left_today && !r.confirmed_gone)
+    const stillOn = unread.filter(r => !r.left_today && !r.confirmed_gone)
     const parts: string[] = []
     if (todayRows.length) {
       parts.push(
@@ -717,10 +746,23 @@ export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
         `${stillOn.length === 1 ? 'the stay' : 'the stays'} out: until the read is taken their usage rolls onto ` +
         `whoever pulls in next.`)
     }
+    if (held.length) {
+      parts.push(
+        `${held.length} closing read${held.length === 1 ? ' was' : 's were'} taken and ${held.length === 1 ? 'is' : 'are'} waiting on you: ` +
+        `${held.map(r => `${spot(r)} — left ${short(r.departed_on)}`).join('; ')}. ` +
+        `The figure did not sit right with the one before it, so GAM is holding it rather than billing it. ` +
+        `Settle ${held.length === 1 ? 'it' : 'them'} under Readings to double-check — confirm the number or save a corrected one, ` +
+        `and the final bill goes out. Nobody needs to walk back to ${held.length === 1 ? 'that meter' : 'those meters'} unless you want a second look.`)
+    }
     const body = parts.join(' ')
+    // 10/25 (Nic): the title said reads were "due" for a spot whose read was
+    // taken, which is what made him think the register had lost it. When the
+    // only thing left is a figure to confirm, the title says that instead.
     const title = todayRows.length
       ? `Pull-out meter reads due today — ${prop.property_name}`
-      : `Closing meter reads still due — ${prop.property_name}`
+      : unread.length === 0 && held.length
+        ? `Closing meter read${held.length === 1 ? '' : 's'} waiting on you — ${prop.property_name}`
+        : `Closing meter reads still due — ${prop.property_name}`
 
     const landlord = await queryOne<{ user_id: string; email: string }>(
       `SELECT l.user_id, u.email FROM landlords l JOIN users u ON u.id = l.user_id

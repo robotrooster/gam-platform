@@ -44,6 +44,52 @@ export function emailTemplate(title: string, body: string, cta?: { label: string
  * page can no longer be missing a type. Adding a notification means adding its
  * catalog entry (label, when-it-fires, audience, group) first.
  */
+/**
+ * ── 10/25 (Nic, DIRECTIVE) — A TEAM MEMBER GETS NO EMAIL FROM GAM ───────────
+ *
+ *   "You mentioned Lisa Scheeler getting the emails. Why is she getting emails?
+ *    She is a front desk employee. She looks at the screen when she's there, and
+ *    when she's clocked out at home, that's it. She is operating as a team
+ *    member, not as a landlord. She doesn't need the wake-up calls at 3 in the
+ *    morning... Lisa does not need any emails from GAM except for two-factor
+ *    authentication to log in or like changing a password if she ever requests
+ *    to do that. Because I've already had her be confused by emails. She's
+ *    gotten an email and said, well, I thought I already took care of this."
+ *
+ *   "This is what I'm telling you about designing it so that a monkey can do it
+ *    — any extra information is overloading these people. It needs to hold their
+ *    hand the whole way, only tell them what to do, not show them anything
+ *    extra."
+ *
+ * So staff get the IN-APP copy — which is the whole point, they read the screen
+ * on shift — and never the email. It overrides `critical` deliberately: the
+ * reason a type is critical is that the LANDLORD must not miss it, and a notice
+ * arriving in an employee's personal inbox at 3am is not how it reaches them.
+ * Nothing is lost; the same row is on their screen when they next look.
+ *
+ * Auth mail is unaffected because it never comes through here — verification,
+ * password reset and 2FA are direct sends in services/email.
+ *
+ * SCOPED TO onsite_manager, deliberately. Lisa holds that role. Maintenance,
+ * property managers, bookkeepers and business staff are NOT included — a
+ * third-party property manager or an outside accountant may work entirely by
+ * email, and which of them should go quiet is Nic's call. Each is one entry on
+ * NO_EMAIL_ROLES when he says so.
+ */
+// 10/25: ONSITE MANAGER ONLY — the role Lisa actually holds, and the one Nic
+// described: somebody who works a shift at a counter and reads the screen while
+// they are there. I first wrote this as four roles on my own reading of "team
+// member" and he pulled me up on it: a property manager can be a third-party
+// management company's staff whose whole job runs by email, and maintenance and
+// business staff are his to decide on, not mine to assume.
+const NO_EMAIL_ROLES: readonly string[] = ['onsite_manager']
+
+/** Does this recipient read GAM on shift rather than in their inbox? */
+async function isTeamMember(userId: string): Promise<boolean> {
+  const u = await queryOne<{ role: string }>('SELECT role FROM users WHERE id=$1', [userId])
+  return !!u && NO_EMAIL_ROLES.includes(u.role)
+}
+
 export async function createNotification(p: {
   userId: string; landlordId?: string; type: NotificationType; title: string; body: string; data?: any
   // S527 W-1: in-app deep-link — clicking the notification lands on the
@@ -85,7 +131,9 @@ export async function createNotification(p: {
       )
       notificationId = ins?.id ?? null
     }
-    if (emailOk && p.sendEmail && p.emailTo) {
+    // 10/25 (Nic): staff read the screen, not their inbox. See NO_EMAIL_ROLES.
+    const teamMember = p.sendEmail && p.emailTo ? await isTeamMember(p.userId) : false
+    if (emailOk && p.sendEmail && p.emailTo && !teamMember) {
       // S106: routed through the central send() in services/email.ts so
       // every notification email writes to email_send_log and surfaces
       // in the failure dashboard. Pre-S106 the local stub just

@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict K7uwCgxLKyjpICIcqSYnGNx5dS1A3EYR5vsBafw6VuL3bhL6SPpHaxoHhRbrlWa
+\restrict WYjBK9vsOuOYlXu9914bdU6OZwtS2gPvhexyXwog0djRjrNjBYIpbStHhbvCfvQ
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -22125,6 +22125,8 @@ CREATE TABLE public.utility_meters (
     zero_use_confirmed_at timestamp with time zone,
     zero_use_confirmed_by_user_id uuid,
     zero_use_stops_flat_charge boolean DEFAULT false NOT NULL,
+    looks_broken_at timestamp with time zone,
+    looks_broken_reason text,
     CONSTRAINT utility_meters_billing_method_check CHECK ((billing_method = ANY (ARRAY['submeter'::text, 'rubs'::text, 'master_bill_to_landlord'::text, 'flat_rate'::text]))),
     CONSTRAINT utility_meters_check CHECK ((((billing_method = 'rubs'::text) AND (rubs_allocation_method IS NOT NULL)) OR ((billing_method <> 'rubs'::text) AND (rubs_allocation_method IS NULL)))),
     CONSTRAINT utility_meters_digits_check CHECK (
@@ -22202,6 +22204,13 @@ COMMENT ON COLUMN public.utility_meters.zero_use_confirmed_by_user_id IS '10/12 
 --
 
 COMMENT ON COLUMN public.utility_meters.zero_use_stops_flat_charge IS '10/13 (Nic): the landlord''s answer to "Stop the flat charge too?" when marking a flat-rate meter "Works, nobody using it". TRUE: the flat charge is not billed while zero_use_confirmed_at is set, and bills again once it is cleared. Counts only while zero_use_confirmed_at is set; written and cleared with it.';
+
+
+--
+-- Name: COLUMN utility_meters.looks_broken_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.utility_meters.looks_broken_at IS 'When a read made this meter look broken (a rollback, or a figure that barely moved when it should have). The read still bills; this is a prompt to go and look at the meter. Cleared when somebody confirms it is fine.';
 
 
 --
@@ -46770,5 +46779,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict K7uwCgxLKyjpICIcqSYnGNx5dS1A3EYR5vsBafw6VuL3bhL6SPpHaxoHhRbrlWa
+\unrestrict WYjBK9vsOuOYlXu9914bdU6OZwtS2gPvhexyXwog0djRjrNjBYIpbStHhbvCfvQ
 
