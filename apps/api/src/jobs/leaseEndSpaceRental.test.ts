@@ -20,7 +20,7 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLeaseTenant } from '../test/dbHelpers'
 import { processLeaseEnds } from './scheduler'
 
 beforeEach(async () => { await cleanupAllSchema() })
@@ -40,8 +40,13 @@ async function leaseEndingYesterday(opts: { ownership: 'tenant' | 'landlord'; un
                            signed_by_tenant, signed_by_landlord)
        VALUES ($1, $2, 'active', 'fixed_term', CURRENT_DATE - 90, CURRENT_DATE - 1, 589, TRUE, TRUE)
        RETURNING id`, [unitId, landlordId])
+    // A household on the lease: a deposit return is for somebody, and
+    // createOrFetchDraft refuses a lease with no primary tenant (correctly —
+    // there is nobody to refund).
+    const tenantId = await seedTenant(client)
+    await seedLeaseTenant(client, { leaseId: lease.rows[0].id, tenantId })
     await client.query('COMMIT')
-    return { unitId, leaseId: lease.rows[0].id, landlordId }
+    return { unitId, leaseId: lease.rows[0].id, landlordId, tenantId }
   } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
 }
 
@@ -79,5 +84,50 @@ describe('a lease whose end date has passed', () => {
     expect(l.status).toBe('expired')
     expect(l.end_date).not.toBeNull()            // the agreed end stands
     expect((await unitNow(f.unitId)).status).toBe('vacant')
+  })
+})
+
+describe('the deposit return a lease end leaves behind', () => {
+  // 10/24 — found while building the counter move-out: processLeaseEnds cut the
+  // draft and announced it with createAdminNotification, which writes to
+  // admin_notifications — GAM'S OWN surface. The landlord, whose finalize is the
+  // only thing that pays a refund or raises the gap invoice, was never told.
+  // Pre-existing for every expiring lease; it matters more now that the front
+  // desk can end a tenancy and Nic's rule is that the money is not theirs:
+  // "front desk does not choose to issue refund without permission, it goes to
+  // landlord to initiate" — which only works if the landlord hears about it.
+  it('tells the LANDLORD it is waiting on them, not only GAM', async () => {
+    const f = await leaseEndingYesterday({ ownership: 'landlord', unitType: 'mobile_home' })
+    await processLeaseEnds()
+
+    const owner = (await db.query<{ user_id: string }>(
+      `SELECT user_id FROM landlords WHERE id = $1`, [f.landlordId])).rows[0]
+    const mine = (await db.query<any>(
+      `SELECT type, title, body, action_url FROM notifications
+        WHERE user_id = $1 AND type = 'deposit_return_waiting'`, [owner.user_id])).rows
+    expect(mine).toHaveLength(1)
+    expect(mine[0].title).toMatch(/waiting on you/i)
+    // It says where to go and what finalizing does, so it is actionable rather
+    // than an alert somebody has to decode.
+    expect(mine[0].action_url).toContain('deposit-return')
+    expect(mine[0].body).toMatch(/finalize/i)
+
+    // And GAM still hears about it — this ADDED the landlord, it did not move
+    // the announcement off the admin surface.
+    const admin = (await db.query<any>(
+      `SELECT 1 FROM admin_notifications WHERE category = 'deposit_return_draft_created'`)).rows
+    expect(admin.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('tells them once, not once per run', async () => {
+    const f = await leaseEndingYesterday({ ownership: 'landlord', unitType: 'mobile_home' })
+    await processLeaseEnds()
+    await processLeaseEnds()
+    const owner = (await db.query<{ user_id: string }>(
+      `SELECT user_id FROM landlords WHERE id = $1`, [f.landlordId])).rows[0]
+    const mine = (await db.query<any>(
+      `SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'deposit_return_waiting'`,
+      [owner.user_id])).rows
+    expect(mine).toHaveLength(1)
   })
 })

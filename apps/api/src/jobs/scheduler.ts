@@ -508,6 +508,38 @@ export async function processLeaseEnds(onlyLeaseId?: string | null, theyActually
         try {
           const { createOrFetchDraft } = await import('../services/depositReturn')
           const draft = await createOrFetchDraft(lease.id)
+          // ── 10/24: TELL THE LANDLORD, not only GAM ────────────────────────
+          //
+          // Their finalize is the only thing that pays a refund or raises the
+          // gap invoice, so a draft nobody tells them about is a deposit that
+          // sits past whatever deadline the state sets. The admin notice below
+          // stays — GAM wants to know a draft exists too; this ADDS the person
+          // who has to act on it. One per deposit return, not per lease-end.
+          try {
+            const owner = await queryOne<{ user_id: string }>(
+              `SELECT user_id FROM landlords WHERE id = $1`, [lease.landlord_id])
+            if (owner) {
+              const { createNotification } = await import('../services/notifications')
+              const kept = Number(draft.cleaning_fee_amount) > 0
+                ? `$${draft.cleaning_fee_amount} in fees already taken off`
+                : 'no fees to take off'
+              await createNotification({
+                userId: owner.user_id,
+                landlordId: lease.landlord_id,
+                type: 'deposit_return_waiting',
+                title: `Deposit return waiting on you — ${lease.unit_number}`,
+                body: `${lease.unit_number}'s tenancy ended. Its deposit return is drafted `
+                    + `($${draft.total_deposit} deposit, ${kept}). Add any damage lines and `
+                    + `finalize it to send the refund or raise the difference as an invoice.`,
+                data: { leaseId: lease.id, depositReturnId: draft.id,
+                        totalDeposit: Number(draft.total_deposit) },
+                actionUrl: `/leases/${lease.id}/deposit-return`,
+              })
+            }
+          } catch (e) {
+            logger.error({ err: e, leaseId: lease.id }, '[LeaseEnd] landlord deposit-return notice failed')
+          }
+
           const { createAdminNotification } = await import('../services/adminNotifications')
           await createAdminNotification({
             severity: 'info',

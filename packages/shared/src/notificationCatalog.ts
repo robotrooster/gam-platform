@@ -187,6 +187,27 @@ export const NOTIFICATION_CATALOG_SOURCE = [
   { type: 'deposit_refund_failed', label: 'A deposit refund failed', group: 'money_out', audience: 'landlord',
     inAppOnly: true,
     when: 'A deposit refund to a former resident is rejected or comes back.' },
+  // ── 10/24 — A DEPOSIT RETURN NOBODY TOLD THE LANDLORD ABOUT ───────────────
+  //
+  // When a tenancy ends, processLeaseEnds cuts the deposit-return draft and
+  // announced it with createAdminNotification — which writes to
+  // admin_notifications, GAM's OWN platform surface. The landlord, whose
+  // finalize is the only thing that pays a refund or raises a gap invoice, was
+  // never told it was waiting. A deposit then sits until somebody happens to
+  // open the lease, past whatever deadline the state gives for returning it.
+  //
+  // It matters more since 10/24, because the front desk can end a tenancy now
+  // (POST /pos/checkout/lease/:id/finish) and Nic's rule is that the money
+  // decision is NOT theirs: "front desk does not choose to issue refund without
+  // permission, it goes to landlord to initiate." Which only works if the
+  // landlord hears about it.
+  //
+  // Not deposit_return_approval below: that one is a different event — a team
+  // member finalized a return above the landlord's threshold — and reusing it
+  // would make this catalog's own `when:` a lie.
+  { type: 'deposit_return_waiting', label: 'A deposit return is waiting for you', group: 'money_out', audience: 'landlord',
+    inAppOnly: true,
+    when: 'A tenancy ended and its deposit return is drafted, with unpaid rent, utilities and move-out fees already taken off the deposit — it needs you to finalize it.' },
   { type: 'deposit_return_approval', label: 'A deposit return needs your approval', group: 'money_out', audience: 'landlord',
     inAppOnly: true,
     when: 'A deposit return is drawn up and waiting on you to approve it.' },
