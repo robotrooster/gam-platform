@@ -357,6 +357,24 @@ export function FrontDeskPage() {
   const { data: rows = [], isLoading, isError: callsFailed, error: callsError, refetch: refetchCalls } = useQuery<Row[]>(
     'pending-tenants', () => apiGet<Row[]>('/landlords/me/pending-tenants'),
     { ...FRESH_LIST, enabled: canSeeCalls })
+  // ── 10/24 (Nic): WHO TO RING BECAUSE THE PARK IS NEARLY FULL ─────────────
+  //
+  //   "I would like the note to prompt us to ask them, but only do that when
+  //    we're nearing capacity. Don't waste time when we have plenty of other
+  //    open space."
+  //
+  // The server decides whether to say anything at all (services/stayFollowUps:
+  // short-stay sites only, out-of-order excluded, 3 or fewer usable, 30-day
+  // window). With room to spare this comes back empty and nothing is drawn, so
+  // the page is unchanged on an ordinary day.
+  const { data: followUpsRaw } = useQuery<any[]>(
+    'stay-followups',
+    () => apiGet<any[]>('/landlords/me/stay-followups'),
+    { ...FRESH_LIST, enabled: canSeeCalls })
+  // A null body (or a refused read) must never crash the page — the card
+  // simply is not drawn. Array.isArray, not `= []`: a default only covers
+  // undefined, and the server can answer null.
+  const followUps: any[] = Array.isArray(followUpsRaw) ? followUpsRaw : []
   // S639: the money half. Same endpoint the outstanding-balances page uses, so
   // the counter and the office can never quote different numbers — and it is
   // already property-scoped and already excludes work trade. (No payments
@@ -595,6 +613,61 @@ export function FrontDeskPage() {
       {!canSeeOwed && (
         <div className="card" style={{ padding: '10px 14px', marginBottom: 12, fontSize: '.82rem', color: 'var(--text-2)' }}>
           Who owes money is not shown here. Ask the owner to turn on "View who owes + contact" for you.
+        </div>
+      )}
+      {/* ── 10/24 (Nic): AT THE TOP, AS TIME SENSITIVE ────────────────────────
+          "The main front desk work list... with those items at the top of the
+          list as time sensitive."
+          ABOVE the money rows on purpose, which is worth knowing before anybody
+          reorders it: money sits first on this page for a documented reason (it
+          is what somebody standing at the counter is usually there for), and Nic
+          put these above it anyway. A space nobody has committed to is the thing
+          that cannot be recovered later — by the time the guest decides and the
+          desk rings the person who wanted a long-term spot, "they found a
+          different spot to go".
+          Its own card rather than a phase of the list below: that list is the
+          onboarding pipeline, and these people are already living here. */}
+      {followUps.length > 0 && (
+        <div className="card" style={{ padding: '12px 14px', marginBottom: 12,
+             border: '1px solid var(--amber, #d9a441)' }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 8 }}>
+            <CalendarX size={14} style={{ color: 'var(--amber, #d9a441)' }} />
+            <span style={{ fontWeight: 600, fontSize: '.86rem' }}>
+              Ask these {followUps.length === 1 ? 'person' : 'people'} if they are staying
+            </span>
+            <span style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>
+              — the park is nearly full, so their answer is a site somebody else could have
+            </span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {followUps.map((f: any) => (
+              <div key={`${f.tenantId}-${f.statedEndsOn}`}
+                   style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10,
+                            fontSize: '.82rem', lineHeight: 1.5 }}>
+                <span style={{ fontWeight: 600 }}>{f.name}</span>
+                {f.unitNumber && <span style={{ color: 'var(--text-3)' }}>{f.unitNumber}</span>}
+                <span style={{ color: 'var(--text-2)' }}>{f.say}</span>
+                {f.phone && (
+                  <a href={`tel:${f.phone}`} className="btn btn-ghost btn-sm">
+                    <Phone size={11} /> {f.phone}
+                  </a>
+                )}
+                {f.email && (
+                  <a href={`mailto:${f.email}`} className="btn btn-ghost btn-sm">
+                    <Mail size={11} /> {f.email}
+                  </a>
+                )}
+              </div>
+            ))}
+          </div>
+          {/* 10/24 (Nic): "just a note, nothing scheduled." Saying they are
+              leaving writes NOTHING on the lease — that is the mechanism that
+              put a hard end date on RV 15. The tenancy ends by hand when they
+              actually go, on the Move-outs tab. */}
+          <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8, lineHeight: 1.5 }}>
+            Their answer is a note, not a date — nothing here changes a lease. When somebody
+            actually leaves, end it under Move-outs.
+          </div>
         </div>
       )}
       <div className="filter-bar">

@@ -1014,6 +1014,24 @@ export function SchedulePage() {
     { staleTime: 30000, keepPreviousData: true, enabled: !!schedulePropertyId }
   )
 
+  // ── 10/24 (Nic): A MARK ON THE BARS OF PEOPLE WORTH ASKING ───────────────
+  //
+  // He asked for "both" surfaces and then the front desk too. Here it is a mark
+  // on the bar itself, because the schedule is where somebody is deciding who
+  // goes where, and a stay that might end is a site that might open.
+  //
+  // Empty unless a park is down to 3 or fewer usable short-stay sites
+  // (services/stayFollowUps), so nothing is drawn on an ordinary day — this
+  // board only just got readable and must not grow permanent decoration.
+  const { data: followUpsRaw } = useQuery<any[]>(
+    'stay-followups', () => apiGet<any[]>('/landlords/me/stay-followups'),
+    { staleTime: 60_000, keepPreviousData: true })
+  // Null-safe: a refused or empty read draws nothing rather than throwing.
+  const askIfStaying = useMemo(() => {
+    const list: any[] = Array.isArray(followUpsRaw) ? followUpsRaw : []
+    return new Set(list.map(f => String(f.tenantId ?? '')).filter(Boolean))
+  }, [followUpsRaw])
+
   const { data: history = [] } = useQuery(
     'schedule-history',
     () => apiGet('/units/schedule/history?limit=150'),
@@ -2768,6 +2786,28 @@ export function SchedulePage() {
                                     }}
                                   />
                                 )}
+                                {/* ── 10/24 (Nic): "ASK THEM IF THEY'RE STAYING" ──────────
+                                    A hollow ring at the bar's start when this person's
+                                    STATED stay is nearly up and the park is nearly full
+                                    (services/stayFollowUps decides both; with room to
+                                    spare the list is empty and nothing is drawn). Hollow,
+                                    and only at the start, so it reads as a question
+                                    rather than competing with the solid amber
+                                    acknowledgment dot beside it. */}
+                                {isStart && askIfStaying.has(String(booking.tenantId ?? '')) && (
+                                  <span
+                                    title={`${booking.guestName || [booking.firstName, booking.lastName].filter(Boolean).join(' ') || 'They'} said how long when they applied and it is nearly up — ask whether they are staying on. Their answer changes nothing on the lease.`}
+                                    style={{
+                                      position:'absolute',
+                                      bottom:-4, right:-4,
+                                      width:10, height:10,
+                                      borderRadius:'50%',
+                                      background:'transparent',
+                                      border:'2px solid var(--bg-1)',
+                                      boxShadow:'0 0 0 2px var(--amber, #d9a441)',
+                                    }}
+                                  />
+                                )}
                                 {/* Edge grips — drag to extend/shorten the stay by its edge
                                     (left = check-in, right = check-out). Reservations that are
                                     not yet history; a locked bar shows no grips at all. */}
@@ -2884,6 +2924,9 @@ export function SchedulePage() {
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--gold)',borderRadius:2,opacity:.3,marginRight:4}}/>Today</span>
           <span><span style={{display:'inline-block',width:12,height:12,borderRadius:2,opacity:.6,marginRight:4,background:'repeating-linear-gradient(45deg, var(--red) 0 3px, transparent 3px 6px)'}}/>Out of order (faded = was out, now back)</span>
           <span><span style={{display:'inline-block',width:10,height:10,borderRadius:'50%',background:'var(--amber)',border:'2px solid var(--bg-1)',marginRight:4,verticalAlign:'middle'}}/>Ack pending</span>
+          {/* 10/24 (Nic): only appears when a park is nearly full, so the strip
+              explains it rather than leaving an unexplained ring on a bar. */}
+          <span><span style={{display:'inline-block',width:10,height:10,borderRadius:'50%',background:'transparent',border:'2px solid var(--bg-1)',boxShadow:'0 0 0 2px var(--amber, #d9a441)',marginRight:5,marginLeft:2,verticalAlign:'middle'}}/>Ask if they are staying</span>
           {/* 10/18 (review): say where a locked bar's dates CAN be changed —
               "keeps its dates" read as "nothing can change them," and a desk
               with a wrong arrival day on a finished stay needs the one place

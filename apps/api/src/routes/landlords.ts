@@ -3040,6 +3040,32 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit-pending', requirePerm('tena
 })
 
 
+// GET /api/landlords/me/stay-followups
+//
+// 10/24 (Nic) — WHO TO RING, AND ONLY WHEN IT MATTERS.
+//
+//   "I would like the note to prompt us to ask them, but only do that when
+//    we're nearing capacity. Don't waste time when we have plenty of other open
+//    space."
+//
+// An applicant's stated length never becomes a lease term any more
+// (routes/background, services/applicationLeaseDraft) — it is a note. This is
+// what the note is for. See services/stayFollowUps for the gate: short-stay
+// sites only, out-of-order excluded, 3 or fewer usable, 30-day window.
+//
+// Same permission and the same two scopes as the call list it appears on: the
+// account's companies, and a staff member's own park and nothing else.
+landlordsRouter.get('/me/stay-followups', requirePerm('tenants.create', 'front_desk.view'), async (req, res, next) => {
+  try {
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) return void res.json({ success: true, data: [] })
+    const scopedPropertyIds = await getScopedPropertyIds(req.user)
+    const { stayFollowUps, followUpSentence } = await import('../services/stayFollowUps')
+    const rows = await stayFollowUps({ landlordIds, scopedPropertyIds })
+    res.json({ success: true, data: rows.map(f => ({ ...f, say: followUpSentence(f) })) })
+  } catch (e) { next(e) }
+})
+
 // GET /api/landlords/me/pending-tenants
 // Returns this landlord's unresolved pending intents, joined to user info.
 // The pending list page reads from this. Resolved intents are excluded —

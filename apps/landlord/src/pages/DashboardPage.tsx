@@ -142,6 +142,18 @@ export function DashboardPage() {
     { staleTime: Infinity, keepPreviousData: true }
   )
 
+  // 10/24 (Nic): empty unless a park is down to 3 or fewer usable short-stay
+  // sites, so the tile below is absent on an ordinary day rather than zero.
+  const { data: followUpsRaw } = useQuery<any[]>(
+    'stay-followups',
+    () => apiGet<any[]>('/landlords/me/stay-followups'),
+    { staleTime: 60_000, keepPreviousData: true },
+  )
+  // A null body (or a refused read) must never crash the page — the card
+  // simply is not drawn. Array.isArray, not `= []`: a default only covers
+  // undefined, and the server can answer null.
+  const followUps: any[] = Array.isArray(followUpsRaw) ? followUpsRaw : []
+
   const { data: disbursements } = useQuery(
     'disbursements-recent',
     () => apiGet<any[]>('/disbursements'),
@@ -446,6 +458,24 @@ export function DashboardPage() {
           <div className="kpi-value">{stats?.occupancyRate ?? 0}%</div>
           <div className="kpi-sub">{stats?.activeUnits || 0} of {stats?.totalUnits || 0} units active</div>
         </div>
+        {/* ── 10/24 (Nic): WHO TO ASK, WHEN THE PARK IS NEARLY FULL ──────────
+            Beside the occupancy figure, because it is the same question asked
+            usefully: a percentage tells you how full you are, this tells you
+            which phone call would free a site. The server says nothing at all
+            unless a park is down to 3 or fewer usable short-stay sites
+            (services/stayFollowUps), so this card is simply absent on an
+            ordinary day rather than sitting there at zero. */}
+        {followUps.length > 0 && (
+          <div className="kpi-card" style={{ cursor: 'pointer', border: '1px solid var(--amber, #d9a441)' }}
+               onClick={()=>navigate('/front-desk?tab=calls')}>
+            <div className="kpi-label">Ask if they are staying</div>
+            <div className="kpi-value">{followUps.length}</div>
+            <div className="kpi-sub">
+              {followUps.length === 1 ? 'stay is' : 'stays are'} near the length they asked for,
+              and {followUps.length === 1 ? 'that park is' : 'those parks are'} nearly full
+            </div>
+          </div>
+        )}
         {/* S527 W-4: land pre-filtered to active units. */}
         {/* S641 (Nic): "my active units KPI card says thirty three, and the
             expected monthly rent card only says thirty. So you have a three

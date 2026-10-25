@@ -5808,7 +5808,7 @@ unitsRouter.get('/schedule/master', requirePerm(
     // on the space it happened in, ending the day they left it.
     const leases = await query<any>(`
       SELECT l.*, u.unit_number, u.unit_type, p.name as property_name,
-        vlat.first_name, vlat.last_name, vlat.email, vlat.phone,
+        vlat.tenant_id, vlat.first_name, vlat.last_name, vlat.email, vlat.phone,
         h.unit_id AS unit_id,
         GREATEST(l.start_date, h.effective_from) AS start_date,
         -- the stretch on a space they LEFT ends the day before the move, so
@@ -5824,7 +5824,10 @@ unitsRouter.get('/schedule/master', requirePerm(
       LEFT JOIN LATERAL (
         -- S527 W-55: email/phone too — the schedule detail popup shows the
         -- same contact fields for leases as for reservations.
-        SELECT first_name, last_name, email, phone
+        -- 10/24: tenant_id too, so the board can mark the bars of people whose
+        -- stated stay is nearly up (services/stayFollowUps keys on the tenant).
+        -- Without it the schedule had a name and no id to match on.
+        SELECT tenant_id, first_name, last_name, email, phone
         FROM v_lease_active_tenants
         WHERE lease_id = l.id AND role = 'primary'
         LIMIT 1
