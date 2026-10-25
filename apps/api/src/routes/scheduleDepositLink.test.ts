@@ -124,9 +124,20 @@ const bookingRow = async (id: string) => (await query<any>(
   `SELECT status, deposit_amount::float AS deposit_amount, deposit_paid_at, deposit_link_sent_at,
           deposit_link_sent_by, deposit_pay_link_id, unit_id
      FROM unit_bookings WHERE id = $1`, [id]))[0]
+// 10/24 (Nic): the deposit ask now also mints a WHOLE-STAY link, because the
+// email carries two buttons — "it's the deposit or the full amount, no type
+// box". Every assertion below is about the DEPOSIT link not being duplicated by
+// a second ask, so this helper keeps its original meaning and leaves the
+// companion out; the companion has its own test at the bottom of the file.
 const links = async (f: any) => query<any>(
   `SELECT id, token, status, total::float AS total, customer_email, booking_id, label
-     FROM pos_pay_links WHERE landlord_id = $1 ORDER BY created_at`, [f.landlordId])
+     FROM pos_pay_links WHERE landlord_id = $1 AND label NOT ILIKE '%whole stay%'
+    ORDER BY created_at`, [f.landlordId])
+
+/** The companion "pay it all" link the same ask mints, when it mints one. */
+const wholeStayLinks = async (f: any) => query<any>(
+  `SELECT id, total::float AS total, label FROM pos_pay_links
+    WHERE landlord_id = $1 AND label ILIKE '%whole stay%' ORDER BY created_at`, [f.landlordId])
 
 describe('asking a reservation already on the schedule for its deposit', () => {
   it('asks the guest for the deposit the booking site would have quoted, and records that it asked', async () => {
@@ -456,5 +467,31 @@ describe('asking a reservation already on the schedule for its deposit', () => {
     expect(other.body.error).toMatch(/already booked for those dates/)
     expect((await bookingRow(id)).unit_id).toBe(f.unitIds[0])
     expect(await query<any>(`SELECT id FROM unit_bookings WHERE guest_name = 'Pat Ruiz'`)).toHaveLength(0)
+  })
+})
+
+describe('the whole-stay button beside the deposit', () => {
+  // 10/24 (Nic): "There's two buttons. They toggle the deposit amount or the
+  // full amount, and that's it... No type box." A guest who wanted to settle up
+  // front had no way to — the deposit link charges the deposit, and no route
+  // anywhere lets a payer name a figure.
+  it('mints one companion link for the whole stay, for more than the deposit', async () => {
+    const f = await seed()
+    const id = (await takeReservation(f, f.unitIds[0])).body.data.id
+    expect([200, 201]).toContain((await ask(f, f.unitIds[0], id)).status)
+    const whole = await wholeStayLinks(f)
+    const dep = await links(f)
+    expect(whole).toHaveLength(1)
+    expect(dep).toHaveLength(1)
+    expect(whole[0].total).toBeGreaterThan(dep[0].total)
+  })
+
+  it('asked twice, still only one of each — the companion does not multiply either', async () => {
+    const f = await seed()
+    const id = (await takeReservation(f, f.unitIds[0])).body.data.id
+    expect([200, 201]).toContain((await ask(f, f.unitIds[0], id)).status)
+    expect([200, 201]).toContain((await ask(f, f.unitIds[0], id)).status)
+    expect(await wholeStayLinks(f)).toHaveLength(1)
+    expect(await links(f)).toHaveLength(1)
   })
 })

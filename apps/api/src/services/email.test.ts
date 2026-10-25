@@ -59,7 +59,11 @@ import * as email from './email'
 beforeEach(async () => {
   await cleanupAllSchema()
   resendSendMock.mockReset()
-  resendSendMock.mockResolvedValue({ data: { id: `${MSG_DEFAULT}-${Math.random().toString(36).slice(2, 8)}` }, error: null } as any)
+  // 10/24: a RESOLVED VALUE is one fixed id handed to every send in the test,
+  // which duplicated against the unique index as soon as a test sent twice.
+  // An implementation gives each call its own.
+  resendSendMock.mockImplementation(async () =>
+    ({ data: { id: `${MSG_DEFAULT}-${Math.random().toString(36).slice(2, 10)}` }, error: null }) as any)
   // S553: send() suppresses the real network call in every non-production
   // mode (test included) so no other suite fires a live email to fake
   // addresses. THIS file mocks the Resend client and asserts on the send

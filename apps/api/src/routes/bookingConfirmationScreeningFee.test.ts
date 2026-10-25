@@ -160,8 +160,17 @@ const askForDeposit = (f: any, bookingId: string) =>
   request(buildApp()).post(`/api/units/${f.unitId}/bookings/${bookingId}/deposit-link`)
     .set('Authorization', `Bearer ${f.token}`).send({})
 
+// 10/24 (Nic): a deposit ask also mints a whole-stay link now (two buttons in
+// one email). These tests are about where the screening FEE rides, which is the
+// deposit link, so the companion is left out of this helper rather than every
+// count in the file being loosened.
 const linkRows = () => query<any>(
-  `SELECT id, label, total::float AS total, items FROM pos_pay_links ORDER BY created_at`)
+  `SELECT id, label, total::float AS total, items FROM pos_pay_links
+    WHERE label NOT ILIKE '%whole stay%' ORDER BY created_at`)
+/** The companion, for the one test that asserts the fee rides it too. */
+const wholeStayRows = () => query<any>(
+  `SELECT id, label, total::float AS total, items FROM pos_pay_links
+    WHERE label ILIKE '%whole stay%' ORDER BY created_at`)
 const checkLinesIn = (links: any[]) => links.flatMap(l =>
   (Array.isArray(l.items) ? l.items : []).filter((i: any) => i?.screening === true))
 const confirmationLogs = () => query<any>(

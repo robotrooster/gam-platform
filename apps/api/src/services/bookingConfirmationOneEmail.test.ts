@@ -112,7 +112,15 @@ const bookingRow = async (id: string) => (await query<any>(
           deposit_link_sent_at, deposit_link_sent_by, deposit_amount::float AS deposit_amount
      FROM unit_bookings WHERE id = $1`, [id]))[0]
 
-const linksOut = () => query<any>(`SELECT id, status, token, label FROM pos_pay_links`)
+// 10/24 (Nic): one ask now mints the deposit link AND a whole-stay companion,
+// because the one email carries two buttons ("it's the deposit or the full
+// amount, no type box"). This file is about ONE EMAIL, which it asserts
+// directly on guestMail() and resendSendMock — so the companion is left out of
+// here rather than those counts being loosened.
+const linksOut = () => query<any>(
+  `SELECT id, status, token, label FROM pos_pay_links WHERE label NOT ILIKE '%whole stay%'`)
+/** Both links, for asserting the second button exists without an extra email. */
+const allLinksOut = () => query<any>(`SELECT id, status, label FROM pos_pay_links`)
 
 const send = async (bookingId: string, byUserId: string) => {
   const b = await loadConfirmationBooking(bookingId)
@@ -143,6 +151,11 @@ describe('pressing send puts ONE email in front of the guest', () => {
     expect(links).toHaveLength(1)
     expect(links[0].status).toBe('open')
     expect((await bookingRow(id)).deposit_pay_link_id).toBe(links[0].id)
+    // 10/24: the whole-stay companion rides the SAME email — two buttons, never
+    // two emails. The mail assertions above already pin that there is one.
+    const all = await allLinksOut()
+    expect(all.length).toBeLessThanOrEqual(2)
+    expect(all.filter((l: any) => /whole stay/i.test(l.label)).length).toBeLessThanOrEqual(1)
   })
 
   it('records the ask on the confirmation, because the confirmation IS the ask', async () => {

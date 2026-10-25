@@ -36,7 +36,11 @@ import * as email from './email'
 beforeEach(async () => {
   await cleanupAllSchema()
   resendSendMock.mockReset()
-  resendSendMock.mockResolvedValue({ data: { id: `${MSG_DEFAULT}-${Math.random().toString(36).slice(2, 8)}` }, error: null } as any)
+  // 10/24: a RESOLVED VALUE is one fixed id handed to every send in the test,
+  // which duplicated against the unique index as soon as a test sent twice.
+  // An implementation gives each call its own.
+  resendSendMock.mockImplementation(async () =>
+    ({ data: { id: `${MSG_DEFAULT}-${Math.random().toString(36).slice(2, 10)}` }, error: null }) as any)
   process.env.EMAIL_SEND_LIVE = '1'   // hits the mock above, never the network
 })
 afterEach(() => { delete process.env.EMAIL_SEND_LIVE })
