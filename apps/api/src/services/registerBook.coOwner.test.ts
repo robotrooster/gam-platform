@@ -206,14 +206,20 @@ describe('the register book stops at the caller\'s own companies', () => {
     for (const h of named) {
       expect(h.kind).toBe('elsewhere')
       expect(h.email).toBeNull()
-      expect(h.phone).toBeNull()
+      // 10/24 (Nic): the PHONE crosses company lines on purpose now — "they are
+      // all customers of GAM". What this test is actually about is unchanged and
+      // is asserted below: a co-owner of ONE company gets no site, no tenancy,
+      // no live account contact and no card off the sibling company's record.
       expect(h.tenantId).toBeNull()
       expect(h.customerId).toBeNull()
       expect(h.hint ?? '').not.toMatch(/Site|Mountain View|resident/i)
     }
-    // Nothing of Nic's rode along in the payload at all.
+    // 10/24 (Nic): his PHONE is shared across companies on purpose — "they are
+    // all customers of GAM" — so it is no longer on this list. Everything this
+    // test exists for still is: his address, his tenancy, the sibling company's
+    // own record of him, that company, its park, and his site (below).
     const wire = JSON.stringify(hits)
-    for (const secret of [curtis.email, '6025550177', '5550177', curtis.tenantId, hisRecord, a.mtn, a.mtnPark]) {
+    for (const secret of [curtis.email, curtis.tenantId, hisRecord, a.mtn, a.mtnPark]) {
       expect(wire).not.toContain(secret)
     }
     expect(wire).not.toContain('MH 19')

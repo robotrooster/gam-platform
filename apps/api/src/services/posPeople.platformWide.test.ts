@@ -160,22 +160,28 @@ describe('somebody who belongs to another company', () => {
     expect(hit).toBeTruthy()
     expect(hit!.kind).toBe('elsewhere')
 
-    // THE LINE NIC DREW: "the landlord at each property can't see what the
-    // other one does." A name, and a hint that tells two Noras apart. The hint
-    // is the masked email because the clerk typed that email themselves; it
-    // hands back nothing they did not already have.
-    expect(hit!.hint).toBe('n•••@gmail.com')
+    // THE LINE NIC DREW, as he redrew it on 10/24: "Name and phone number
+    // should be visible between different properties... They are all customers
+    // of GAM. So sharing that information between landlords when it's just a
+    // name and phone number and no other sensitive information is okay."
+    //
+    // So the phone crosses — the desk is recognising a guest, not retyping a
+    // number off a screen. The EMAIL does not: it stays masked, and the hit's
+    // email field stays null, because an address is what somebody can be
+    // written to at and it is not needed to know who is at the counter.
+    expect(hit!.hint).toBe('(602) 555-0199 · n•••@gmail.com')
     expect(hit!.email).toBeNull()
-    expect(hit!.phone).toBeNull()
+    expect(hit!.phone).toBe('+1 (602) 555-0199')
     expect(hit!.tenantId).toBeNull()
     expect(hit!.customerId).toBeNull()
 
-    // Nothing else of theirs rode along in the payload at all — not the other
-    // company, not the park, not "resident", not a lease, balance or id.
+    // Everything the line still holds back rode along nowhere: not the other
+    // company, not the park, not "resident", not a lease, balance or id, and
+    // not their email.
     const wire = JSON.stringify(hit)
     for (const secret of [
       stranger.tenantId, stranger.userId, theirs.landlordId, theirs.parkA, theirs.parkB,
-      '602', '5550199', '0199', 'nora.vance@gmail.com',
+      'nora.vance@gmail.com',
     ]) expect(wire).not.toContain(secret)
     expect(wire).not.toMatch(/resident|lease|balance|site|Site/i)
   })
@@ -190,16 +196,21 @@ describe('somebody who belongs to another company', () => {
       landlordId: mine.landlordId, propertyId: mine.parkA, userId: mine.userId, q, allowElsewhere: true, caller: mine.userId })
 
     expect((await look('6025550143')).some((h) => h.name === 'Dale Mercer')).toBe(true)
-    // A piece of a number lists nobody, so a hint can never be grown into the rest.
+    // 10/24 UNCHANGED BY THE UNMASKING, and the reason it matters more now:
+    // a piece of a number still lists NOBODY. The phone is visible on a hit, so
+    // this filter is the thing standing between "I have this person's number and
+    // want their name" and a fishing expedition through other parks' guests.
     expect((await look('5550143')).some((h) => h.name === 'Dale Mercer')).toBe(false)
     expect((await look('0143')).some((h) => h.name === 'Dale Mercer')).toBe(false)
     // A piece of an email, likewise.
     expect((await look('mercer.dev')).some((h) => h.name === 'Dale Mercer')).toBe(false)
 
-    // Typed whole, the hint may show the last four — it is what they typed.
+    // Typed whole, they come back with the number itself — formatted, so the
+    // desk can read it back to the guest — and still no email.
     const whole = (await look('6025550143')).find((h) => h.name === 'Dale Mercer')!
-    expect(whole.hint).toBe('phone ••0143')
-    expect(whole.phone).toBeNull()
+    expect(whole.hint).toBe('(602) 555-0143 · d•••@mercer.dev')
+    expect(whole.phone).toBe('6025550143')
+    expect(whole.email).toBeNull()
   })
 })
 

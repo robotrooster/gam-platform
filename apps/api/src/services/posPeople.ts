@@ -44,10 +44,12 @@
  * (never a piece of one) — "If there's five Bobs next door... I type Bob and then I
  * remember the last name... If they're a point of sale customer, it doesn't
  * matter. It doesn't link to the tenancy at all." Someone from elsewhere shows
- * as a name and a masked contact hint ONLY (j•••@gmail.com, or "phone on
- * file" — never digits of a phone the clerk did not type; elsewhereHint) —
- * never their company, site, "resident", lease, balance, payments or ids — and
- * picking them makes (or finds) a register record in THIS company. See
+ * as a name and their PHONE (10/24, Nic — "they are all customers of GAM. So
+ * sharing that information between landlords when it's just a name and phone
+ * number and no other sensitive information is okay"), with their email still
+ * masked (j•••@gmail.com; elsewhereHint) — never their company, site,
+ * "resident", lease, balance, payments or ids — and picking them makes (or
+ * finds) a register record in THIS company holding that name and phone. See
  * searchElsewhere, the one place that rule lives.
  *
  * WHO A SALE CAN NAME. A register customer of this company, or a tenant tied to
@@ -86,6 +88,7 @@ import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { mergePosCustomers, nameFromCard, cardLabel, nameIsAPlaceholder, MERGE_MOVED_TABLES, type CardIdentity, type MergeRecord } from './posCustomerCards'
 import { inBook, notInBook, askingAs, type BookCaller } from './registerBook'
+import { formatPhone } from '@gam/shared'
 
 type Q = Pick<PoolClient, 'query'>
 
@@ -606,9 +609,10 @@ async function tenantOfRecord(q: Q, customerId: string): Promise<string | null> 
  *   - someone this company already has by that person's email or phone → that
  *     record;
  *   - picked from elsewhere before → the record that pick made;
- *   - otherwise a NEW record of this company's: their name, and only an email
- *     or phone the clerk typed in full. Nothing else crosses — no contact they
- *     did not type, no tenancy link, nothing of the other company's.
+ *   - otherwise a NEW record of this company's: their name and their phone
+ *     (10/24, Nic: "they are all customers of GAM"), plus an email only when the
+ *     clerk typed it in full. Nothing else crosses — no tenancy link, no
+ *     company, no site, no balance, nothing else of the other company's.
  */
 export async function customerFromElsewhere(q: Q, landlordId: string, userId: string, pick: string,
                                             caller: BookCaller): Promise<{ customerId: string; tenantId: string | null; existing: boolean }> {
@@ -650,7 +654,12 @@ export async function customerFromElsewhere(q: Q, landlordId: string, userId: st
      VALUES ($1, $2, $3, $4, $5, 'manual', $6)
      ON CONFLICT (landlord_id, elsewhere_ref) WHERE archived_at IS NULL AND elsewhere_ref IS NOT NULL DO NOTHING
      RETURNING id`,
-    [landlordId, String(src.first_name ?? '').trim() || 'Customer', String(src.last_name ?? '').trim(), typedEmail, c.p ?? null, ref])).rows[0]
+    [landlordId, String(src.first_name ?? '').trim() || 'Customer', String(src.last_name ?? '').trim(), typedEmail,
+     // 10/24 (Nic): their phone comes with them. It was already on the clerk's
+     // screen from the search, so withholding it from the record only meant
+     // somebody retyped it; `c.p` (a number the clerk typed whole) stays the
+     // fallback for a source row that has none.
+     src.phone ?? c.p ?? null, ref])).rows[0]
   if (made) return { customerId: made.id, tenantId: null, existing: false }
   const raced = (await q.query<{ id: string }>(
     `SELECT id FROM pos_customers WHERE ${inBook('landlord_id', '$1', wr)} AND elsewhere_ref = $2 AND archived_at IS NULL
@@ -1048,7 +1057,12 @@ function wordsOf(q: string): string[] {
 }
 
 /** Every typed word must match the first name, last name or email; 3+ digits match inside the phone. */
-function wordFilter(words: string[], cols: { first: string; last: string; email: string; phone: string }, params: any[]): string {
+// 10/24 (Nic), on keeping a merged duplicate's old spelling searchable: "one of
+// those is obviously wrong because it's such a unique name. That it needs to be
+// consolidated into the right one. You don't need to store the old one
+// anywhere." So a misspelling is not an alias to carry forward — it is simply
+// wrong, and the phone number is the key that makes the spelling not matter.
+function wordFilter(cols: { first: string; last: string; email: string; phone: string }, words: string[], params: any[]): string {
   if (!words.length) return 'FALSE'
   return words.map((w) => {
     const p = params.push(`%${likeEscape(w)}%`)
@@ -1334,19 +1348,37 @@ export function maskedHint(email: string | null | undefined, phone: string | nul
 }
 
 /**
- * The hint on somebody from ELSEWHERE. 10/2 (review): never digits of a phone
- * the clerk did not type. "Bob Smith · phone ••0199" handed a stranger's last
- * four digits to anyone who typed a name; with the area code and the last four
- * known, about a thousand whole-number guesses (each one a search that either
- * finds Bob Smith or does not) rebuilt the rest of his number. So: the masked
- * email (j•••@gmail.com — the first letter and the domain); with no email,
- * "phone on file"; "phone ••0199" only when the clerk typed that whole number
- * themselves (it tells them nothing they did not type).
+ * The hint on somebody from ELSEWHERE.
+ *
+ * 10/24 (Nic, DIRECTIVE — supersedes the 10/2 masking of the phone):
+ *
+ *   "Name and phone number should be visible between different properties in
+ *    terms of booking a reservation for RV sites... A customer at one property
+ *    that's got a lease at one property can be a customer at my other property
+ *    for buying propane, etc. They are all customers of GAM. So sharing that
+ *    information between landlords when it's just a name and phone number and
+ *    no other sensitive information is okay."
+ *
+ * WHAT THE 10/2 REVIEW WAS GUARDING, so a later session does not re-mask this
+ * without knowing it was decided: "Bob Smith · phone ••0199" handed a
+ * stranger's last four digits to anyone who typed a name, and with the area
+ * code and the last four known, about a thousand whole-number guesses — each
+ * one a search that either finds Bob Smith or does not — rebuilt the rest. That
+ * reasoning was about leaking PART of a number; showing the WHOLE number is
+ * Nic's call on what GAM shares, and the guess-the-rest attack it describes has
+ * nothing left to guess. What bounds the harvest instead is the rate limit that
+ * was already there: crossCompanyLimiter, CROSS_COMPANY_MAX per
+ * CROSS_COMPANY_WINDOW_MS per clerk, ELSEWHERE_LIMIT rows a search.
+ *
+ * The EMAIL is still masked (j•••@gmail.com). Nic named the name and the phone;
+ * an address is the thing somebody can be written to at, and it is not needed to
+ * recognise a guest at the counter.
  */
-export function elsewhereHint(email: string | null | undefined, phone: string | null | undefined, phoneTypedWhole: boolean): string | null {
-  const d = digitsOf(phone)
-  if (phoneTypedWhole && d.length >= 4) return `phone ••${d.slice(-4)}`
-  return maskEmail(email) ?? (d.length >= 4 ? 'phone on file' : null)
+export function elsewhereHint(email: string | null | undefined, phone: string | null | undefined, _phoneTypedWhole?: boolean): string | null {
+  // formatPhone is the platform's one phone formatter (packages/shared) — it
+  // hands back a non-US number untouched rather than mangling it.
+  const shown = digitsOf(phone).length >= 7 ? formatPhone(phone) : null
+  return [shown, maskEmail(email)].filter(Boolean).join(' · ') || null
 }
 
 const ELSEWHERE_LIMIT = 8
@@ -1363,11 +1395,14 @@ const ELSEWHERE_LIMIT = 8
  * and other companies' register customers — and so does an email or phone
  * typed WHOLE: the whole address (or the whole part before the "@"), the whole
  * number (elsewhereFilter; "gmail.com", "7@gmail.com" or "550199" lists nobody,
- * so the masked hint can never be grown into the rest of it). Each comes back as
- * a NAME and a MASKED contact hint (elsewhereHint: j•••@gmail.com, else "phone
- * on file" — the last digits of a phone only when the clerk typed it whole) and
- * nothing else — no company, no site, no "resident", no lease, balance or
- * payment history, no ids, not even their real email or phone. Up to eight.
+ * so a masked email can never be grown into the rest of it). Each comes back as
+ * a NAME and their PHONE, with the email masked (elsewhereHint: j•••@gmail.com)
+ * — and nothing else: no company, no site, no "resident", no lease, balance or
+ * payment history, no ids, and not their real email. Up to eight.
+ *
+ * 10/24 (Nic) unmasked the phone on purpose — see elsewhereHint for what the
+ * 10/2 masking was guarding and why the whole number is a different question
+ * from a leaked last-four. The harvest bound is crossCompanyLimiter.
  * Not listed: anyone this register already lists as its own, which since
  * 10/20 means EVERY resident and invitee of every property this ACCOUNT owns
  * (searchPeople, below) and every register customer in its book — by record, by
@@ -1463,8 +1498,12 @@ async function searchElsewhere(opts: { landlordId: string; userId: string; typed
     out.push({
       key: `x:${createHash('sha256').update(pick).digest('hex').slice(0, 16)}`, kind: 'elsewhere',
       tenantId: null, customerId: null, name: fullName(first, last),
-      hint: elsewhereHint(r.email, r.phone, !!(typedDigits && phone10 && typedDigits === phone10)),
-      firstName: first, lastName: last, email: null, phone: null, pick,
+      hint: elsewhereHint(r.email, r.phone),
+      // 10/24 (Nic): the phone crosses, so the reservation form can fill it in
+      // and the desk is not retyping a number off a screen. The email does not
+      // (elsewhereHint) — only one the clerk typed in full reaches the record
+      // they create, exactly as before.
+      firstName: first, lastName: last, email: null, phone: r.phone ?? null, pick,
     })
     if (out.length >= ELSEWHERE_LIMIT) break
   }
@@ -1547,7 +1586,7 @@ export async function searchPeople(opts: { landlordId: string; propertyId: strin
        LEFT JOIN properties pr ON pr.id = un.property_id
       WHERE ${inBook('l.landlord_id', '$1', W)}
         AND lt.status <> 'void'   -- a voided place was never theirs
-        AND ${wordFilter(words, acct, rp)}
+        AND ${wordFilter(acct, words, rp)}
       GROUP BY t.id, u.first_name, u.last_name, u.email, u.phone
       ORDER BY rnk, here DESC, last_purchase DESC NULLS LAST, u.last_name, u.first_name
       LIMIT 40`, rp)
@@ -1567,7 +1606,7 @@ export async function searchPeople(opts: { landlordId: string; propertyId: strin
          LEFT JOIN units un ON un.id = i.unit_id
          LEFT JOIN properties pr ON pr.id = i.property_id
         WHERE ${inBook('i.landlord_id', '$1', W)} AND i.cancelled_at IS NULL
-          AND ${wordFilter(words, acct, ip)}
+          AND ${wordFilter(acct, words, ip)}
         ORDER BY t.id, (i.property_id = $2) DESC, i.created_at DESC
      ) v
      ORDER BY v.rnk, v.here DESC, v.last_name, v.first_name
@@ -1597,7 +1636,7 @@ export async function searchPeople(opts: { landlordId: string; propertyId: strin
         WHERE ${inBook('c.landlord_id', '$1', wc)} AND c.archived_at IS NULL
      ) p
      WHERE NOT (p.tenant_id IS NULL AND p.first_name = 'Card' AND p.last_name = 'Customer' AND p.own_email IS NULL AND p.own_phone IS NULL)
-       AND ${wordFilter(words, { first: 'p.first_name', last: 'p.last_name', email: 'p.email', phone: 'p.phone' }, cp)}
+       AND ${wordFilter({ first: 'p.first_name', last: 'p.last_name', email: 'p.email', phone: 'p.phone' }, words, cp)}
      ORDER BY rnk, p.last_purchase DESC NULLS LAST, p.last_name, p.first_name
      LIMIT 40`, cp)
 

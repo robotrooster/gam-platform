@@ -1496,8 +1496,28 @@ async function draftLeaseForApprovedCheck(check: any, scope: string[], bodyUnitI
     // node-postgres hands DATE back as a Date object; format it as a day, not
     // via String() ("Thu Oct 01 …" is not a date the drafter can read).
     startDate: ymd(check.desired_move_in),
-    termMonths: check.desired_term_months ? Number(check.desired_term_months) : null,
-    monthToMonth: !!check.desired_month_to_month,
+    // ── 10/24 (Nic, DIRECTIVE) — WHAT AN APPLICANT SAYS IS A NOTE, NOT A TERM ──
+    //
+    //   "Every single lease on both of my properties is month to month... I
+    //    guarantee you that I did not type January 31st into the lease."
+    //   "The 3 months becomes a note, not a contract term, and every drafted
+    //    lease starts month to month with no end date."
+    //
+    // desired_term_months is the applicant's own answer to "how long do you
+    // want to stay" on the screening form — a guess, typed by somebody who has
+    // not seen the place yet. It used to be handed to the drafter as the LEASE
+    // TERM, which computed a hard end date (computeLeaseEnd snaps to month-end)
+    // and silently set lease_type = 'fixed_term'. James Fenton said "3 months"
+    // on 10/5 and got a binding lease ending 2027-01-31 on RV 15 — in the
+    // park's busiest month — which nothing on the lease screen disclosed, and
+    // which the nightly job would then have expired and freed the space for.
+    //
+    // Nic's rule: a lease holds the space until somebody actually leaves, and
+    // paying ahead is the only other way to lock a space out. So the term is
+    // NOT passed. The answer is not thrown away either — it stays on the
+    // background check, which is where the follow-up prompt reads it from.
+    termMonths: null,
+    monthToMonth: true,
     actorUserId,
   })
   // A walk-up's pick is remembered on the check so a second click needs no pick.

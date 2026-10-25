@@ -63,6 +63,7 @@ export function UnitSubtypesSection({ propertyId }: { propertyId: string }) {
       unitType,
       rvSiteLayout:      mode(ofType.map(u => u.rvSiteLayout)) ?? 'none',
       rvAmpService:      mode(ofType.map(u => u.rvAmpService)) ?? 'none',
+      rvMaxRigLengthFt:  numMode(ofType.map(u => u.rvMaxRigLengthFt)),
       dwellingOwnership: mode(ofType.map(u => u.dwellingOwnership)) ?? 'tenant',
       bedrooms:          numMode(ofType.map(u => u.bedrooms)),
       bathrooms:         numMode(ofType.map(u => u.bathrooms)),
@@ -190,6 +191,9 @@ function SubtypeEditor({ propertyId, initial, seed, existing = [], onDone, onCan
     bathrooms:    initial?.bathrooms != null ? String(initial.bathrooms) : (seed?.bathrooms ?? ''),
     rvSiteLayout: initial?.rvSiteLayout ?? seed?.rvSiteLayout ?? 'none',
     rvAmpService: initial?.rvAmpService ?? seed?.rvAmpService ?? 'none',
+    // 10/24 (Nic): the longest rig this CLASS of pad takes, stated once instead
+    // of on every site of the class. Blank = no stated limit, every rig fits.
+    rvMaxRigLengthFt: initial?.rvMaxRigLengthFt != null ? String(initial.rvMaxRigLengthFt) : (seed?.rvMaxRigLengthFt ?? ''),
     dwellingOwnership: initial?.dwellingOwnership ?? seed?.dwellingOwnership ?? 'tenant',
     storageSize:  initial?.storageSize ?? seed?.storageSize ?? '',
     rentAmount:      initial?.rentAmount?.toString() ?? seed?.rentAmount ?? '',
@@ -214,6 +218,7 @@ function SubtypeEditor({ propertyId, initial, seed, existing = [], onDone, onCan
         bathrooms: next.bathrooms === '' ? null : next.bathrooms,
         rvSiteLayout: next.unitType === 'rv_spot' ? next.rvSiteLayout : null,
         rvAmpService: next.unitType === 'rv_spot' ? next.rvAmpService : null,
+        rvMaxRigLengthFt: next.unitType === 'rv_spot' && next.rvMaxRigLengthFt !== '' ? Number(next.rvMaxRigLengthFt) : null,
         storageSize: next.unitType === 'storage' ? next.storageSize : null,
         rentAmount: null, securityDeposit: null, nightlyRate: null, weeklyRate: null, monthlyRate: null,
       })
@@ -273,6 +278,7 @@ function SubtypeEditor({ propertyId, initial, seed, existing = [], onDone, onCan
       bathrooms: hasBeds ? num(f.bathrooms) : null,
       rvSiteLayout: isRv ? f.rvSiteLayout : null,
       rvAmpService: isRv ? f.rvAmpService : null,
+      rvMaxRigLengthFt: isRv && f.rvMaxRigLengthFt !== '' ? Number(f.rvMaxRigLengthFt) : null,
       dwellingOwnership: ownershipRelevant ? f.dwellingOwnership : null,
       storageSize: f.unitType === 'storage' ? (f.storageSize.trim() || null) : null,
       rentAmount: num(f.rentAmount), securityDeposit: num(f.securityDeposit),
@@ -331,6 +337,17 @@ function SubtypeEditor({ propertyId, initial, seed, existing = [], onDone, onCan
                 <option value="50">50 amp</option>
                 <option value="both">30/50 amp</option>
               </select>
+            </div>
+            <div>
+              <div style={lbl}>Longest rig (feet)</div>
+              {/* Stated here, every site of this class inherits it the same way
+                  it inherits the layout and the amps — a park with "Big rig
+                  pull-through" says 45 once, not forty-five times. The site owns
+                  the number from the moment it exists, so moving one pad's limit
+                  never moves another's. */}
+              <input className="input" type="number" min={1} max={120} placeholder="any length"
+                value={f.rvMaxRigLengthFt}
+                onChange={e => set('rvMaxRigLengthFt', e.target.value)} />
             </div>
           </>
         )}

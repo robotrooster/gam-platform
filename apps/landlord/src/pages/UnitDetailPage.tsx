@@ -131,6 +131,9 @@ export function UnitDetailPage() {
       occupancyMode: unit.occupancyMode || 'whole_unit',
       rvSiteLayout: unit.rvSiteLayout || 'none',
       rvAmpService: unit.rvAmpService || 'none',
+      // 10/24: null is "nobody has measured this pad", which is NOT the same as
+      // zero — so it stays null rather than becoming '' and then 0 on save.
+      rvMaxRigLengthFt: unit.rvMaxRigLengthFt ?? null,
       storageSize: unit.storageSize || '',
       lotRentAmount: unit.lotRentAmount != null ? String(unit.lotRentAmount) : '',
     })
@@ -162,6 +165,7 @@ export function UnitDetailPage() {
       occupancyMode: f.occupancyMode,
       rvSiteLayout: f.rvSiteLayout,
       rvAmpService: f.rvAmpService,
+      rvMaxRigLengthFt: f.rvMaxRigLengthFt ?? null,
       storageSize: f.storageSize || null,
       lotRentAmount: num(f.lotRentAmount),
     })
@@ -462,6 +466,23 @@ export function UnitDetailPage() {
                           <option value="none">—</option><option value="30">30 amp</option><option value="50">50 amp</option><option value="both">30/50 amp</option>
                         </select>
                       )}
+                    </div>
+                    {/* 10/24 (Nic): "I'm trying to make a reservation right now
+                        where somebody's got a 37 foot camper. They can't go in the
+                        small sites, right?" The longest rig this pad takes. Left
+                        blank it means nobody has measured it, and every rig fits —
+                        so no park's availability changes until it is filled in.
+                        A reservation carrying a longer rig than this is never
+                        OFFERED this site, and the nightly compression will not
+                        move one here either. */}
+                    <div className="data-row"><span className="data-key">Longest rig</span>
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <input {...inpS} type="number" min={1} max={120} placeholder="any length"
+                          style={{ ...inpS.style, maxWidth: 110 }}
+                          value={editForm.rvMaxRigLengthFt ?? ''}
+                          onChange={e => set('rvMaxRigLengthFt', e.target.value === '' ? null : Number(e.target.value))} />
+                        <span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>feet</span>
+                      </span>
                     </div>
                   </>}
                   {editForm.unitType === 'storage' && (

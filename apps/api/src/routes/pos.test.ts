@@ -3894,7 +3894,10 @@ describe('10/2 linking a sale to a person fills in every sale on the same card',
     const res = await link(f, sale, { match: { pick: byName.pick } })
     expect(res.status, JSON.stringify(res.body)).toBe(200)
     const row = (await db.query<any>(`SELECT landlord_id, first_name, last_name, email, phone FROM pos_customers WHERE id = $1`, [res.body.data.pos_customer_id])).rows[0]
-    expect(row).toEqual({ landlord_id: f.landlordId, first_name: 'Zed', last_name: 'Elsewhere', email: null, phone: null })
+    // 10/24 (Nic): their phone comes with them — it was already on the clerk's
+    // screen, so withholding it from the record only meant somebody retyped it.
+    // The email still only crosses when the clerk typed it in full.
+    expect(row).toEqual({ landlord_id: f.landlordId, first_name: 'Zed', last_name: 'Elsewhere', email: null, phone: '602-555-0199' })
     // Typed in full, the email they typed comes too — on a fresh company.
     const g = await seedPosFixture()
     const sale2 = await saleRow(g)
@@ -3902,7 +3905,7 @@ describe('10/2 linking a sale to a person fills in every sale on the same card',
     const res2 = await link(g, sale2, { match: { pick: byEmail.pick } })
     expect(res2.status, JSON.stringify(res2.body)).toBe(200)
     expect((await db.query<any>(`SELECT email, phone FROM pos_customers WHERE id = $1`, [res2.body.data.pos_customer_id])).rows[0])
-      .toEqual({ email: 'zed@elsewhere.com', phone: null })
+      .toEqual({ email: 'zed@elsewhere.com', phone: '602-555-0199' })
     // A pick that is not one the search handed out is nobody.
     expect((await link(f, sale, { match: { pick: 'not-a-real-pick-not-a-real-pick-not-a-real-pick' } })).status).toBe(404)
   })
@@ -4055,18 +4058,21 @@ describe('10/2 typing a name at the register finds the person', () => {
     await customerRow(other, 'Card', 'Customer', { fromCard: true })           // a nameless card is nobody
     await customerRow(other, 'Bob', 'Printed', { fromCard: true })             // an unconfirmed card record is nobody
     const bobs = (await searchAt(f, 'bob')).body.data
-    // 10/2 (review): never digits of a stranger's phone the clerk did not type
-    // — a masked email, else just "phone on file".
+    // 10/24 (Nic, DIRECTIVE — replaces the 10/2 phone masking): "Name and phone
+    // number should be visible between different properties... They are all
+    // customers of GAM." So the phone shows, formatted, ready to read back to
+    // the guest. The EMAIL is still masked — that is the line now.
     expect(bobs.map((p: any) => [p.name, p.hint, p.kind])).toEqual([
-      ['Bob Marsh', 'phone on file', 'elsewhere'],
+      ['Bob Marsh', '(480) 555-0111', 'elsewhere'],
       ['Bob Tanner', 'b•••@gmail.com', 'elsewhere'],
     ])
-    // A whole email, a whole phone, part of a last name. A phone typed whole
-    // comes back with its own last four (nothing the clerk did not type).
-    expect((await searchAt(f, 'zed@elsewhere.com')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zed Elsewhere', 'z•••@elsewhere.com']])
-    expect((await searchAt(f, '602-555-0199')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zed Elsewhere', 'phone ••0199']])
-    expect((await searchAt(f, 'zed')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zed Elsewhere', 'z•••@elsewhere.com']])
-    expect((await searchAt(f, '480-555-0111')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Bob Marsh', 'phone ••0111']])
+    // A whole email, a whole phone, part of a last name — all find them, and
+    // all come back with the same hint, because the hint no longer depends on
+    // what the clerk happened to type.
+    expect((await searchAt(f, 'zed@elsewhere.com')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zed Elsewhere', '(602) 555-0199 · z•••@elsewhere.com']])
+    expect((await searchAt(f, '602-555-0199')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zed Elsewhere', '(602) 555-0199 · z•••@elsewhere.com']])
+    expect((await searchAt(f, 'zed')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zed Elsewhere', '(602) 555-0199 · z•••@elsewhere.com']])
+    expect((await searchAt(f, '480-555-0111')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Bob Marsh', '(480) 555-0111']])
     expect((await searchAt(f, 'awa')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zoe Away', 'z•••@away.com']])
     // Never a piece of an email or phone.
     expect((await searchAt(f, 'zed@else')).body.data).toEqual([])
@@ -4076,12 +4082,15 @@ describe('10/2 typing a name at the register finds the person', () => {
     // No company, no site, no "resident", no ids, no real email or phone.
     const all = await Promise.all(['bob', 'zed', 'zoe', 'zed@elsewhere.com'].map((q) => searchAt(f, q)))
     const raw = JSON.stringify(all.map((r) => r.body))
+    // 10/24: the phone is deliberately NOT on this list any more — it is the one
+    // thing Nic opened up. Everything else it ever held is still held back: the
+    // other company, its property, every id, "resident", a site, and the email.
     for (const leak of [other.landlordId, other.propertyId, zedId, zoe, bob1, 'Test Property', 'resident', 'zed@elsewhere.com', 'zoe@away.com',
-                        'btanner', '602-555-0199', '6025550199', '480-555-0111', 'Site']) {
+                        'btanner', 'Site']) {
       expect(raw).not.toContain(leak)
     }
     for (const hit of all.flatMap((r) => r.body.data)) {
-      expect(hit).toMatchObject({ kind: 'elsewhere', tenantId: null, customerId: null, email: null, phone: null })
+      expect(hit).toMatchObject({ kind: 'elsewhere', tenantId: null, customerId: null, email: null })
       expect(typeof hit.pick).toBe('string')
     }
   })
@@ -4097,6 +4106,8 @@ describe('10/2 typing a name at the register finds the person', () => {
     const zoeHit = (await searchAt(f, 'zoe')).body.data[0]
     const picked = await post(pickBody(zoeHit.pick))
     expect(picked.status, JSON.stringify(picked.body)).toBe(201)
+    // Zoe has no phone on file at the other company, so there is nothing to
+    // bring across — the record is her name alone, as before.
     expect(picked.body.data).toMatchObject({ first_name: 'Zoe', last_name: 'Away', email: null, phone: null, kind: 'customer', tenant_id: null })
     const zoeRow = (await db.query<any>(`SELECT landlord_id, tenant_id, email, phone, elsewhere_ref FROM pos_customers WHERE id = $1`, [picked.body.data.id])).rows[0]
     expect(zoeRow).toMatchObject({ landlord_id: f.landlordId, tenant_id: null, email: null, phone: null })   // no tenancy link
@@ -4110,7 +4121,7 @@ describe('10/2 typing a name at the register finds the person', () => {
     // Typed in full: that email (and only that) comes with them.
     const zedHit = (await searchAt(f, 'zed@elsewhere.com')).body.data[0]
     const zed = await post(pickBody(zedHit.pick))
-    expect(zed.body.data).toMatchObject({ first_name: 'Zed', last_name: 'Elsewhere', email: 'zed@elsewhere.com', phone: null })
+    expect(zed.body.data).toMatchObject({ first_name: 'Zed', last_name: 'Elsewhere', email: 'zed@elsewhere.com', phone: '602-555-0199' })
     // The other company's records are untouched.
     expect((await db.query<any>(`SELECT landlord_id, email FROM pos_customers WHERE id = $1`, [zedId])).rows[0])
       .toEqual({ landlord_id: other.landlordId, email: 'zed@elsewhere.com' })
@@ -4268,17 +4279,25 @@ describe('10/2 typing a name at the register finds the person', () => {
   // 10/2 (review, again): and the last four themselves were the shortcut — with
   // the area code known, ~1,000 whole-number guesses rebuilt the number. A
   // name search shows no phone digits at all.
-  it('a stranger\'s email or phone cannot be grown out of the masked hint, one character at a time', async () => {
+  it('a stranger\'s email cannot be grown out of the masked hint, one character at a time', async () => {
     const f = await seedPosFixture()
     const other = await seedPosFixture()
     await customerRow(other, 'Bob', 'Smith', { email: 'zqprivate77@gmail.com', phone: '602-555-0199' })
     await customerRow(other, 'Bob', 'Nomail', { phone: '602-555-0177' })
     const hit = async (q: string) => (await searchAt(f, q)).body.data.filter((p: any) => p.kind === 'elsewhere').length
-    expect((await searchAt(f, 'bob smith')).body.data[0]).toMatchObject({ name: 'Bob Smith', hint: 'z•••@gmail.com' })
-    expect((await searchAt(f, 'bob nomail')).body.data[0]).toMatchObject({ name: 'Bob Nomail', hint: 'phone on file' })
+    // 10/24 (Nic): the PHONE is shared on purpose now — "they are all customers
+    // of GAM" — so there is nothing left to grow it out of. The EMAIL is still
+    // masked, and this is what stops the masked part being guessed a character
+    // at a time: a PIECE of an address finds nobody, so no guess is ever
+    // confirmed. (The same filter also means a phone must be typed whole, which
+    // is why handing back the whole number tells a fisher nothing.)
+    expect((await searchAt(f, 'bob smith')).body.data[0]).toMatchObject({ name: 'Bob Smith', hint: '(602) 555-0199 · z•••@gmail.com' })
+    expect((await searchAt(f, 'bob nomail')).body.data[0]).toMatchObject({ name: 'Bob Nomail', hint: '(602) 555-0177' })
     const named = (await searchAt(f, 'bob')).body.data
     expect(named).toHaveLength(2)
-    for (const p of named) expect(`${p.hint} ${p.name} ${p.email} ${p.phone}`).not.toMatch(/\d/)
+    // Their real address never comes back, by any route.
+    for (const p of named) expect(`${p.hint} ${p.email}`).not.toContain('zqprivate77')
+    for (const p of named) expect(p.email).toBeNull()
     for (const guess of ['bob @gmail.com', 'bob 7@gmail.com', 'bob 77@gmail.com', 'bob 8@gmail.com', 'bob e77@gmail.com',
                          'bob 990199', 'bob 550199', 'bob 5550199', 'bob 25550199', 'bob 025550199']) {
       expect(await hit(guess), guess).toBe(0)
@@ -4352,7 +4371,7 @@ describe('10/2 typing a name at the register finds the person', () => {
     const res = await link(f, sale, { match: { pick: hit.pick } })
     expect(res.status, JSON.stringify(res.body)).toBe(200)
     expect((await db.query<any>(`SELECT first_name, phone FROM pos_customers WHERE id = $1`, [res.body.data.pos_customer_id])).rows[0])
-      .toEqual({ first_name: 'Zed', phone: null })
+      .toEqual({ first_name: 'Zed', phone: '602-555-0199' })
     // The old way of naming someone from elsewhere (their email or phone) is not accepted.
     expect((await link(f, sale, { match: { phone: '6025550199' } })).status).toBe(400)
   })

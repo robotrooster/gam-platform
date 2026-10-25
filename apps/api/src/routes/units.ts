@@ -11,7 +11,7 @@ import { canonicalUnitNumber, UNIT_TYPE_PREFIX, BOOKING_STATUSES, BOOKING_STATUS
 import { STAY_TERMS, STAY_SCREENING_NIGHTS, stayHeldWords, type StayTerms } from '@gam/shared'
 import { stayDepositAsk, STAY_DEPOSIT_ASK_REFUSAL } from '@gam/shared'
 import { centsWords, NEVER_MOVED_IN_NOTE, NEVER_MOVED_IN_REASON } from '../lib/unwindIssuedLease'
-import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, leaseTypesForUnitType, isShortStayByNature, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
+import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, isRigTooLongForSite, MAX_RIG_LENGTH_FT, SHORT_STAY_LOCKED_UNIT_TYPES, leaseTypesForUnitType, isShortStayByNature, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE, type StayConflict } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
@@ -780,11 +780,13 @@ function deskOnlyRefusal(
   booking: {
     status: string; notes: string | null; guest_name: string | null; guest_email: string | null
     guest_phone: string | null; required_site_layout: string | null; required_amp_service: string | null
+    rig_length_ft: number | null
     locked_to_unit: boolean | null; avoided_unit_ids: string[] | null
   },
   sent: {
     status: unknown; notes: unknown; guestName: unknown; guestEmail: unknown; guestPhone: unknown
-    requiredSiteLayout: unknown; requiredAmpService: unknown; lockedToUnit: unknown; avoidedIn: string[] | null
+    requiredSiteLayout: unknown; requiredAmpService: unknown; rigLengthFt: unknown
+    lockedToUnit: unknown; avoidedIn: string[] | null
     checkInChanged: boolean; checkOutChanged: boolean; unitChanged: boolean; toCheckOut: boolean
   },
 ): string | null {
@@ -801,7 +803,11 @@ function deskOnlyRefusal(
   // (Blank notes leave the notes as they are.)
   if (sent.notes && differs(sent.notes, booking.notes)) parts.push('notes')
   if (differs(sent.requiredSiteLayout, booking.required_site_layout)
-      || differs(sent.requiredAmpService, booking.required_amp_service)) parts.push('site needs')
+      || differs(sent.requiredAmpService, booking.required_amp_service)
+      // 10/24: the rig's length is a site need like the others — it decides
+      // which pads the stay may sit on. (undefined = not sent; differs() also
+      // treats an explicit clear as "not sent", same as the two above.)
+      || differs(sent.rigLengthFt, booking.rig_length_ft)) parts.push('site needs')
   if (typeof sent.lockedToUnit === 'boolean' && sent.lockedToUnit !== (booking.locked_to_unit === true)) {
     parts.push('lock to the site')
   }
@@ -1150,6 +1156,11 @@ unitsRouter.get('/available', async (req, res, next) => {
       excludeBookingId:   z.string().uuid().nullish(),
       requiredSiteLayout: z.enum(RV_SITE_LAYOUTS as unknown as [string, ...string[]]).nullish(),
       requiredAmpService: z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).nullish(),
+      // 10/24 (Nic): "somebody's got a 37 foot camper. They can't go in the
+      // small sites, right?" A rig length on the ask drops every pad too short
+      // for it out of the picker, so the counter is never offered a site the
+      // trailer does not fit on.
+      rigLengthFt:        z.coerce.number().int().positive().max(MAX_RIG_LENGTH_FT).nullish(),
       propertyId:         z.string().uuid().nullish(),
     }).parse(req.query)
     // S633: the account's companies, not one. Availability spans the portfolio.
@@ -1182,7 +1193,8 @@ unitsRouter.get('/available', async (req, res, next) => {
     })
     const data = rows.filter(u =>
       !isSiteLayoutMismatch(q.requiredSiteLayout, u.rv_site_layout) &&
-      !isAmpServiceMismatch(q.requiredAmpService, u.rv_amp_service))
+      !isAmpServiceMismatch(q.requiredAmpService, u.rv_amp_service) &&
+      !isRigTooLongForSite(q.rigLengthFt, u.rv_max_rig_length_ft))
     res.json({ success: true, data })
   } catch (e) { next(e) }
 })
@@ -1310,6 +1322,11 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       securityDeposit: z.number().min(0).optional(),
       rvSiteLayout:    z.enum(RV_SITE_LAYOUTS as unknown as [string, ...string[]]).optional(),
       rvAmpService:    z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).optional(),
+      // 10/24 (Nic): the longest rig this pad takes, in feet. Blank means the
+      // park has not measured it and every rig fits (isRigTooLongForSite reads
+      // a missing limit as a fit), so no existing park changes until somebody
+      // fills it in. Inherited from the site class when the class states one.
+      rvMaxRigLengthFt: z.number().int().positive().max(MAX_RIG_LENGTH_FT).nullable().optional(),
       // S550: who owns the dwelling — drives the inspection checklist
       // (site-only for tenant-owned MH/RV vs full interior). Only meaningful
       // for rv_spot / mobile_home; defaulted below.
@@ -1421,6 +1438,11 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
     const bathrooms = body.bathrooms ?? num(sub?.bathrooms) ?? 1
     // RV sub-type fields only apply to rv_spot units; storage size to storage.
     const rvLayout = unitType === 'rv_spot' ? (body.rvSiteLayout ?? sub?.rv_site_layout ?? 'none') : 'none'
+    // 10/24: same inheritance as the layout and the amps — the request wins, the
+    // site class fills in, and a space that is not an RV pad has no rig limit.
+    const rvMaxRig = unitType === 'rv_spot'
+      ? (body.rvMaxRigLengthFt ?? sub?.rv_max_rig_length_ft ?? null)
+      : null
     const rvAmp    = unitType === 'rv_spot' ? (body.rvAmpService ?? sub?.rv_amp_service ?? 'none') : 'none'
     const storageSize = unitType === 'storage' ? (body.storageSize?.trim() || sub?.storage_size || null) : null
     // Same rule for short-stay rates — the subtype describes the space, it does
@@ -1517,10 +1539,10 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       const leaseTypesAllowed = leaseTypesForUnitType(unitType, !!body.isBookable)
       const [unit] = await query<any>(`
         INSERT INTO units (property_id, landlord_id, unit_number, building, unit_type, bedrooms, bathrooms, sqft,
-                           rent_amount, security_deposit, rv_site_layout, rv_amp_service,
+                           rent_amount, security_deposit, rv_site_layout, rv_amp_service, rv_max_rig_length_ft,
                            nightly_rate, weekly_rate, monthly_rate, storage_size, subtype_id, status,
                            is_bookable, lease_types_allowed, dwelling_ownership, lot_rent_amount, is_multi_level, is_ada_accessible, floor_level, living_areas, features, owner_household_size, occupancy_mode)
-        VALUES ($1,$2,$3,$28,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+        VALUES ($1,$2,$3,$28,$4,$5,$6,$7,$8,$9,$10,$11,$29,$12,$13,$14,$15,$16,$17,
                 $18, $19::text[], $20, $21, $22, $23, $24, $25, $26::jsonb, $27,
                 -- S558: new unit inherits the property's default occupancy mode
                 -- (a seed, not a governing setting — the unit owns it after).
@@ -1536,7 +1558,9 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
          body.ownerHouseholdSize ?? 1,
          // $28 — the building. Trimmed to NULL so blank and absent are the
          // same thing; the unique index treats them as one.
-         (body.building ?? null) ? String(body.building).trim() || null : null]
+         (body.building ?? null) ? String(body.building).trim() || null : null,
+         // $29 — the pad's rig limit, resolved above.
+         rvMaxRig]
       )
       // S630: link EVERY selected subtype. units.subtype_id above holds the
       // first one for readers not yet moved over; unit_subtype_links is the
@@ -1764,6 +1788,10 @@ export const UNIT_CLONE_COPIED = [
   'monthly_rate', 'is_bookable', 'lease_types_allowed', 'check_in_time',
   'check_out_time', 'amenities', 'unit_description', 'min_stay_nights',
   'max_stay_nights', 'import_extra_data', 'rv_site_layout', 'rv_amp_service',
+  // 10/24: how long a rig the pad takes is a fact about the GROUND, and a
+  // retire-and-replace is the same ground under a new record — so it copies,
+  // beside the layout and the amps it belongs with.
+  'rv_max_rig_length_ft',
   'storage_size', 'subtype_id', 'dwelling_ownership', 'occupancy_mode',
   'lot_rent_amount', 'is_multi_level', 'is_ada_accessible', 'floor_level',
   'features', 'living_areas',
@@ -2157,7 +2185,7 @@ unitsRouter.get('/:id/economics', async (req, res, next) => {
 unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (req, res, next) => {
   try {
     const { unitType, nightlyRate, weeklyRate, monthlyRate, minStayNights, maxStayNights,
-            checkInTime, checkOutTime, amenities, unitDescription, isBookable, rvSiteLayout, rvAmpService,
+            checkInTime, checkOutTime, amenities, unitDescription, isBookable, rvSiteLayout, rvAmpService, rvMaxRigLengthFt,
             dwellingOwnership, occupancyMode, lotRentAmount, isMultiLevel, isAdaAccessible } = req.body
 
     if (rvSiteLayout != null && !RV_SITE_LAYOUTS.includes(rvSiteLayout)) {
@@ -2172,6 +2200,21 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
     }
     if (rvAmpService != null && !RV_AMP_SERVICES.includes(rvAmpService)) {
       throw new AppError(400, `Invalid rvAmpService '${rvAmpService}'`)
+    }
+    // 10/24 (Nic): the longest rig this pad takes. Refused in plain words here
+    // rather than reaching units_rv_max_rig_length_sane and coming back as a
+    // 500. Absent leaves it alone; an explicit null clears the limit (they
+    // re-measured and the pad takes anything).
+    let rigLimitSet: number | null | undefined = undefined
+    if (rvMaxRigLengthFt !== undefined) {
+      if (rvMaxRigLengthFt === null || rvMaxRigLengthFt === '') rigLimitSet = null
+      else {
+        const n = Number(rvMaxRigLengthFt)
+        if (!Number.isInteger(n) || n <= 0 || n > MAX_RIG_LENGTH_FT) {
+          throw new AppError(400, `A site's rig limit is a whole number of feet between 1 and ${MAX_RIG_LENGTH_FT}.`)
+        }
+        rigLimitSet = n
+      }
     }
 
     const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
@@ -2198,6 +2241,10 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
       amenities=$10, unit_description=$11, is_bookable=$12,
       rv_site_layout=COALESCE($14,rv_site_layout),
       rv_amp_service=COALESCE($15,rv_amp_service),
+      -- 10/24: absent leaves the limit alone; $22 says the save meant to touch
+      -- it, so an explicit clear actually clears instead of being swallowed by
+      -- COALESCE the way a null layout is.
+      rv_max_rig_length_ft = CASE WHEN $22::boolean THEN $21::int ELSE rv_max_rig_length_ft END,
       dwelling_ownership=COALESCE($16,dwelling_ownership),
       occupancy_mode=COALESCE($17,occupancy_mode),
       lot_rent_amount=COALESCE($18,lot_rent_amount),
@@ -2211,7 +2258,8 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
        dwellingOwnership ?? null, occupancyMode ?? null,
        lotRentAmount == null ? null : Number(lotRentAmount),
        typeof isMultiLevel === 'boolean' ? isMultiLevel : null,
-       typeof isAdaAccessible === 'boolean' ? isAdaAccessible : null])
+       typeof isAdaAccessible === 'boolean' ? isAdaAccessible : null,
+       rigLimitSet ?? null, rigLimitSet !== undefined])
 
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
@@ -2600,6 +2648,10 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       source:      z.string().nullish(),
       requiredSiteLayout: z.enum(RV_SITE_LAYOUTS as unknown as [string, ...string[]]).nullish(),
       requiredAmpService: z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).nullish(),
+      // 10/24 (Nic): how long the rig is. The pad's own limit lives on the
+      // unit (rv_max_rig_length_ft); this is the trailer that has to fit on
+      // it, and it travels with the stay so every later move re-checks it.
+      rigLengthFt: z.coerce.number().int().positive().max(MAX_RIG_LENGTH_FT).nullish(),
       // S652 (Nic): pin this stay to this exact site, or let the nightly
       // compression move it to an equivalent one. Movable is the default — the
       // lock is for when the counter promised somebody that particular space.
@@ -2815,12 +2867,14 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
           (unit_id, landlord_id, tenant_id, guest_name, guest_email, guest_phone,
            lease_type, check_in, check_out, nights, nightly_rate, weekly_rate,
            total_amount, platform_fee, notes, source, required_site_layout, required_amp_service,
+           rig_length_ft,
            locked_to_unit, status, hold_expires_at, avoided_unit_ids, booked_check_out)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NULL,$21::uuid[],$9) RETURNING *`,
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,NULL,$22::uuid[],$9) RETURNING *`,
           [unit.id, unit.landlord_id, body.tenantId ?? null, body.guestName ?? null, body.guestEmail ?? null,
            body.guestPhone ?? null, body.leaseType, body.checkIn, body.checkOut, nights,
            body.nightlyRate ?? unit.nightly_rate ?? null, body.weeklyRate ?? unit.weekly_rate ?? null,
            total, platformFee, body.notes ?? null, body.source ?? 'direct', body.requiredSiteLayout ?? 'none', body.requiredAmpService ?? 'none',
+           body.rigLengthFt ?? null,
            body.lockedToUnit === true, bookingStatus, avoided])).rows[0]
         // 10/6 (Nic): the landlord's "Returning guest" (who and when), counted
         // against the property's allowance under its lock — and the stay's work
@@ -3514,7 +3568,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
   // anywhere after the move puts them back (catch, below); the commit empties it.
   let relocated: RelocatedStay[] = []
   try {
-    const { status, notes, checkIn, checkOut, unitId, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService, lockedToUnit } = req.body
+    const { status, notes, checkIn, checkOut, unitId, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService, rigLengthFt, lockedToUnit } = req.body
     // S653: an avoid list on an edit replaces the whole list (null/absent = unchanged).
     const avoidedIn: string[] | null = Array.isArray(req.body.avoidedUnitIds)
       ? req.body.avoidedUnitIds.filter((x: any) => typeof x === 'string').slice(0, 50) : null
@@ -3523,6 +3577,20 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     }
     if (requiredAmpService != null && !RV_AMP_SERVICES.includes(requiredAmpService)) {
       throw new AppError(400, `Invalid requiredAmpService '${requiredAmpService}'`)
+    }
+    // 10/24 (Nic): the rig's length, refused in words rather than reaching the
+    // column's CHECK and coming back as a 500. Absent means "leave it alone";
+    // an explicit null clears it (they measured it and it was a car).
+    let rigLenSet: number | null | undefined = undefined
+    if (rigLengthFt !== undefined) {
+      if (rigLengthFt === null || rigLengthFt === '') rigLenSet = null
+      else {
+        const n = Number(rigLengthFt)
+        if (!Number.isInteger(n) || n <= 0 || n > MAX_RIG_LENGTH_FT) {
+          throw new AppError(400, `A rig length is a whole number of feet between 1 and ${MAX_RIG_LENGTH_FT}.`)
+        }
+        rigLenSet = n
+      }
     }
     // S655 (Step 6 fix round): a status the schedule does not have is refused
     // in words, with nothing written. It used to reach the database and come
@@ -3615,7 +3683,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // written.
     if (!userHasPerm(req.user, 'schedule.edit_reservation')) {
       const refusal = deskOnlyRefusal(booking, {
-        status, notes, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService, lockedToUnit,
+        status, notes, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService, rigLengthFt, lockedToUnit,
         avoidedIn, checkInChanged, checkOutChanged, unitChanged, toCheckOut,
       })
       if (refusal) throw new AppError(403, refusal)
@@ -4338,7 +4406,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
           // fits. Their site was already revealed, but this move is their
           // own choice: extend-and-relocate beats no-extension.
           const candidates = await query<any>(`
-            SELECT id, unit_number, rv_site_layout, rv_amp_service
+            SELECT id, unit_number, rv_site_layout, rv_amp_service, rv_max_rig_length_ft
               FROM units
              WHERE property_id = $1 AND id != $2
                AND is_bookable = TRUE
@@ -4347,6 +4415,9 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
           const compatible = candidates.filter((c: any) =>
             !isSiteLayoutMismatch(booking.required_site_layout, c.rv_site_layout) &&
             !isAmpServiceMismatch(booking.required_amp_service, c.rv_amp_service) &&
+            // 10/24 (Nic): the extending guest's own move is still a move. A
+            // 37-foot trailer does not go on a 30-foot pad to make room.
+            !isRigTooLongForSite(booking.rig_length_ft, c.rv_max_rig_length_ft) &&
             // S653; 10/6 (review): the list this same save stores — a site
             // added to the avoid list in the edit that lengthens the stay is
             // already avoided here.
@@ -4788,6 +4859,9 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
               platform_fee=COALESCE($12,platform_fee),
               required_site_layout=COALESCE($13,required_site_layout),
               required_amp_service=COALESCE($14,required_amp_service),
+              -- 10/24 (Nic): absent leaves the length alone; $23 says the save
+              -- meant to touch it, so an explicit clear actually clears.
+              rig_length_ft = CASE WHEN $23::boolean THEN $22::int ELSE rig_length_ft END,
               locked_to_unit=COALESCE($15,locked_to_unit),
               -- 10/20 (Nic): a confirmed hand move off a promised space stops
               -- the stay claiming the new one was promised. Read off the row
@@ -4834,6 +4908,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
            checkOutChanged || endsLease ? newCheckOut : null,
            checkOutMoved ? (bookedForEvent ?? booking.check_out_day) : checkOutRestored ? checkOutRestored.to : null,
            unitChanged, PROMISED_LOCK_REASONS, MOVED_OFF_PROMISED_SITE,
+           rigLenSet ?? null, rigLenSet !== undefined,
           ])).rows[0]
 
         // ── 10/20 (Nic): THE MOVE OFF A PROMISED SPACE IS ITS OWN RECORD ─────
@@ -5632,6 +5707,10 @@ unitsRouter.get('/schedule/master', requirePerm(
       SELECT u.id, u.unit_number, u.unit_type, u.status, u.rent_amount,
         u.nightly_rate, u.weekly_rate, u.monthly_rate, u.is_bookable, u.lease_types_allowed,
         u.rv_site_layout, u.rv_amp_service,
+        -- 10/24: the pad's rig limit. The schedule's reservation flow compares a
+        -- guest's rig length against it (rvMismatchReasons) — left out of this
+        -- list the comparison reads undefined and silently never warns.
+        u.rv_max_rig_length_ft,
         u.check_in_time, u.check_out_time, u.amenities, u.unit_description,
         p.id as property_id, p.name as property_name,
         p.nightly_rate as property_nightly_rate, p.weekly_rate as property_weekly_rate,

@@ -286,6 +286,9 @@ export async function processLeaseEnds() {
   try {
     const ended = await query<any>(`
       SELECT l.*, un.id as unit_id_ref, un.unit_number,
+             -- 10/24 (Nic): who owns the DWELLING decides whether this end date
+             -- may free the space. See the block below.
+             un.dwelling_ownership, un.unit_type,
              (l.end_date < CURRENT_DATE) AS past_end
       FROM leases l
       JOIN units un ON un.id = l.unit_id
@@ -294,6 +297,42 @@ export async function processLeaseEnds() {
         AND l.end_date <= CURRENT_DATE
     `)
     for (const lease of ended) {
+      // ── 10/24 (Nic, DIRECTIVE) — A RENTED SPACE IS NOT A RENTED HOME ────────
+      //
+      //   "You're making it a contradiction on what I said, but the good news is
+      //    that we are having different structure for different unit types. RV
+      //    sites are not the same thing as a new lease in an apartment or
+      //    whatever. When the tenant owns the unit and they're just renting the
+      //    space, like in an RV, that doesn't matter. It can be month to month.
+      //    It can auto renew."
+      //
+      // S562 retired auto-renew so that nobody is TRAPPED by forgetting a lease
+      // end — a real protection when the landlord owns the home somebody lives
+      // in. It does not apply when the resident owns their own dwelling and is
+      // renting the ground under it: they can leave whenever they like, with
+      // their home, and the thing that actually hurts them is being put out of a
+      // space because a date nobody chose went by.
+      //
+      // And on the park's side the same date is a liability: "February is one of
+      // our busiest times, and if he's a person that decides he's going to stay
+      // longer, like, we can't have that reservation messing up on us." A space
+      // rental therefore does NOT expire on its end date — the end date simply
+      // lapses and the lease carries on month to month, holding the space until
+      // somebody actually leaves. Nothing is vacated, nobody is billed out, no
+      // deposit-return draft is cut.
+      //
+      // Both halves of Nic's rule, in one gate: a lease holds a space
+      // indefinitely, and paying ahead is the only other way to lock one out.
+      if (lease.dwelling_ownership === 'tenant') {
+        await query(
+          `UPDATE leases
+              SET end_date = NULL, lease_type = 'month_to_month', updated_at = NOW()
+            WHERE id = $1 AND status = 'active'`, [lease.id])
+        logger.info(
+          `[LeaseEnd] ${lease.unit_number}: tenant-owned dwelling on a rented space — ` +
+          `end date ${lease.end_date} lapsed to month-to-month, space held, nothing vacated`)
+        continue
+      }
       {
         // Auto-renew RETIRED (Nic, S562): a lease NEVER auto-extends or reverts to
         // month-to-month. Every lease expires at its end_date unless a signed

@@ -32,7 +32,7 @@
 // current site.
 import { query } from '../db'
 import { logger } from '../lib/logger'
-import { isSiteLayoutMismatch, isAmpServiceMismatch } from '@gam/shared'
+import { isSiteLayoutMismatch, isAmpServiceMismatch, isRigTooLongForSite } from '@gam/shared'
 
 interface Interval { checkIn: string; checkOut: string }
 interface Site {
@@ -40,6 +40,8 @@ interface Site {
   unit_number: string
   rv_site_layout: string | null
   rv_amp_service: string | null
+  /** 10/24: the longest rig this site takes, in feet. NULL = not stated. */
+  rv_max_rig_length_ft: number | null
   timeline: Interval[]
 }
 
@@ -106,7 +108,7 @@ async function followMovedStay(bookingId: string): Promise<void> {
 export async function compressPropertySchedule(propertyId: string): Promise<CompressionMove[]> {
   // Sites that can host a stay — same predicate as the public booking site.
   const siteRows = await query<any>(`
-    SELECT id, unit_number, rv_site_layout, rv_amp_service
+    SELECT id, unit_number, rv_site_layout, rv_amp_service, rv_max_rig_length_ft
       FROM units
      WHERE property_id = $1
        AND is_bookable = TRUE
@@ -136,7 +138,7 @@ export async function compressPropertySchedule(propertyId: string): Promise<Comp
   const bookingRows = await query<any>(`
     SELECT b.id, b.unit_id, b.guest_name, b.status, b.hold_expires_at,
            b.site_reveal_sent_at, b.required_site_layout, b.required_amp_service,
-           b.locked_to_unit, b.avoided_unit_ids,
+           b.locked_to_unit, b.avoided_unit_ids, b.rig_length_ft,
            b.check_in::text AS check_in, b.check_out::text AS check_out,
            EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id) AS has_lease
       FROM unit_bookings b
@@ -173,6 +175,9 @@ export async function compressPropertySchedule(propertyId: string): Promise<Comp
     for (const s of sites) {
       if (isSiteLayoutMismatch(b.required_site_layout, s.rv_site_layout)) continue
       if (isAmpServiceMismatch(b.required_amp_service, s.rv_amp_service)) continue
+      // 10/24 (Nic): and it has to physically fit. Silent on both sides until
+      // somebody has measured — a park with no lengths set packs as before.
+      if (isRigTooLongForSite(b.rig_length_ft, s.rv_max_rig_length_ft)) continue
       // S653 (Nic): "they didn't like the spot they were in last year."
       if ((b.avoided_unit_ids ?? []).includes(s.id)) continue
       if (s.timeline.some(t => overlaps(t, win))) continue
@@ -293,6 +298,7 @@ export async function relocateBlockingBookings(
   const blockers = await query<any>(`
     SELECT b.id, b.guest_name, b.status, b.hold_expires_at, b.site_reveal_sent_at,
            b.required_site_layout, b.required_amp_service, b.locked_to_unit, b.avoided_unit_ids,
+           b.rig_length_ft,
            b.check_in::text AS check_in, b.check_out::text AS check_out,
            u.property_id, u.unit_number,
            EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id) AS has_lease
@@ -323,7 +329,7 @@ export async function relocateBlockingBookings(
     // blocker's requirements, not this unit. Best-fit keeps the schedule
     // consolidated even mid-relocation.
     const candidates = await query<any>(`
-      SELECT id, unit_number, rv_site_layout, rv_amp_service
+      SELECT id, unit_number, rv_site_layout, rv_amp_service, rv_max_rig_length_ft
         FROM units
        WHERE property_id = $1 AND id != $2
          AND is_bookable = TRUE
@@ -332,6 +338,7 @@ export async function relocateBlockingBookings(
     const compatible = candidates.filter((c: any) =>
       !isSiteLayoutMismatch(blk.required_site_layout, c.rv_site_layout) &&
       !isAmpServiceMismatch(blk.required_amp_service, c.rv_amp_service) &&
+      !isRigTooLongForSite(blk.rig_length_ft, c.rv_max_rig_length_ft) &&
       !(blk.avoided_unit_ids ?? []).includes(c.id))   // S653: never onto a site they asked not to have
     const ranked = await rankUnitsBestFit(
       compatible.map((c: any) => c.id),

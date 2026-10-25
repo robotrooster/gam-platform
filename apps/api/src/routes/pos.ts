@@ -5804,7 +5804,21 @@ function phoneDigits(col: string): string { return PHONE_DIGITS.replace('$$X$$',
 // name, or an email or phone typed whole, as a name and a masked hint only
 // (services/posPeople searchElsewhere). Two characters before anything is looked up; a search over
 // 120 characters is refused; looking elsewhere is limited per person.
-posRouter.get('/people', requirePerm('pos.ring_sale'), peopleQueryGuard, peopleSearchLimiter, crossCompanyLimiter, async (req: any, res, next) => {
+//
+// 10/24 (Nic) — THE SAME LOOKUP ANSWERS THE RESERVATION DESK.
+//
+//   "If somebody's making a reservation that has been here before, we need a way
+//    to have it just select a previous person instead of typing out their full
+//    name... maybe start with the phone number and if they've been here before,
+//    it pre-populates them."
+//
+// That is this search, not a second one: same people, same cross-company rule,
+// same limits, one place to get right. What stood in the way was the gate —
+// pos.ring_sale — which a front-desk person who books stays and never touches
+// the register does not hold. Somebody trusted to create a reservation is
+// trusted to find out who the guest is, so the reservation permission opens it
+// too. Nothing about WHAT comes back changes with the key used to get in.
+posRouter.get('/people', requirePerm('pos.ring_sale', 'schedule.edit_reservation'), peopleQueryGuard, peopleSearchLimiter, crossCompanyLimiter, async (req: any, res, next) => {
   try {
     const propertyId = String(req.query.propertyId ?? '')
     if (!/^[0-9a-f-]{36}$/i.test(propertyId)) throw new AppError(400, 'Pick the property at the top of the register first.')

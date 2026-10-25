@@ -3106,6 +3106,13 @@ export interface PropertyUnitSubtype {
   bathrooms?: number | string | null
   rvSiteLayout?: string | null
   rvAmpService?: string | null
+  /**
+   * 10/24 (Nic): the longest rig this class of pad takes, in feet. Null means
+   * the park has stated no limit and every rig fits (isRigTooLongForSite reads a
+   * missing limit as a fit). A unit created from this class inherits it exactly
+   * the way it inherits the layout and the amps, and owns it from then on.
+   */
+  rvMaxRigLengthFt?: number | null
   dwellingOwnership?: string | null
   storageSize?: string | null
   rentAmount: number | string | null
@@ -3237,6 +3244,40 @@ export function isAmpServiceMismatch(required: string | null | undefined, actual
   if (!actual || actual === 'none') return true
   return required !== actual
 }
+
+/**
+ * 10/24 (Nic) — WILL THE RIG FIT ON THE SITE?
+ *
+ *   "somebody's got a 37 foot camper. They can't go in the small sites."
+ *
+ * The third thing a reservation can require, beside layout and amps, and the
+ * one that was missing while the schedule was already free to move bookings
+ * around: nothing described how long a site was, so a 37-foot fifth wheel could
+ * be re-sited onto a short one and the guest would learn about it on arrival
+ * morning.
+ *
+ * SILENT WHEN EITHER NUMBER IS UNKNOWN, and that is the important half.
+ * Mountain View has no lengths on any site today; a rule that treated "not
+ * stated" as "will not fit" would empty the board overnight. So a park that
+ * never fills these in behaves exactly as it does now, and the rule only bites
+ * once somebody has actually measured both.
+ *
+ * Longer than the site is a mismatch; equal fits — a 30-foot site takes a
+ * 30-foot rig, which is how a park describes its own sites.
+ */
+export function isRigTooLongForSite(
+  rigLengthFt: number | null | undefined,
+  siteMaxLengthFt: number | null | undefined,
+): boolean {
+  const rig = Number(rigLengthFt)
+  const site = Number(siteMaxLengthFt)
+  if (!Number.isFinite(rig) || rig <= 0) return false
+  if (!Number.isFinite(site) || site <= 0) return false
+  return rig > site
+}
+
+/** The longest rig a park will sensibly describe, and what the CHECK allows. */
+export const MAX_RIG_LENGTH_FT = 120
 
 export enum PropertyType {
   RESIDENTIAL  = 'residential',

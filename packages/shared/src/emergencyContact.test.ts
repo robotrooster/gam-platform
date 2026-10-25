@@ -5,7 +5,7 @@
  * have made them write.
  */
 import { describe, it, expect } from 'vitest'
-import { parseEmergencyContact, formatPhone, namesLikelySamePerson } from './emergencyContact'
+import { parseEmergencyContact, formatPhone, usDigits, typingPhone, namesLikelySamePerson } from './emergencyContact'
 
 describe('S640 parsing what somebody wrote on a lease', () => {
   it('name then number', () => {
@@ -87,7 +87,35 @@ describe('S640 formatting', () => {
   })
   it('leaves anything else alone rather than mangling it', () => {
     expect(formatPhone('12345')).toBe('12345')
+    // 10/24: a number carrying the US country code formats instead of coming
+    // back as 16025550199. Numbers reach GAM both ways.
+    expect(formatPhone('+1 (602) 555-0199')).toBe('(602) 555-0199')
+    expect(formatPhone('16025550199')).toBe('(602) 555-0199')
+    expect(usDigits('+1 (602) 555-0199')).toBe('6025550199')
+    expect(usDigits('6025550199')).toBe('6025550199')
+    expect(usDigits('441632960999')).toBeNull()   // not a US number — untouched
+    expect(formatPhone('441632960999')).toBe('441632960999')
     expect(formatPhone(null)).toBeNull()
+  })
+
+  it('formats a phone as it is typed, and will not take an eleventh digit', () => {
+    // 10/24 (Nic): "I don't want to have to type dashes or parentheses on
+    // everything." One formatter for every phone field on the platform.
+    expect(typingPhone('5')).toBe('5')
+    expect(typingPhone('520')).toBe('520')
+    expect(typingPhone('5209')).toBe('(520) 9')
+    expect(typingPhone('520903')).toBe('(520) 903')
+    expect(typingPhone('5209038')).toBe('(520) 903-8')
+    expect(typingPhone('5209038134')).toBe('(520) 903-8134')
+    // Past ten digits nothing more goes in, so a slipped keystroke cannot
+    // silently make the number wrong.
+    expect(typingPhone('52090381349999')).toBe('(520) 903-8134')
+    // Pasting a number that leads with the country code lands correctly
+    // instead of eating the last digit.
+    expect(typingPhone('+1 (520) 903-8134')).toBe('(520) 903-8134')
+    // Punctuation typed by hand is simply ignored.
+    expect(typingPhone('(520) 903-8134')).toBe('(520) 903-8134')
+    expect(typingPhone('')).toBe('')
   })
 })
 

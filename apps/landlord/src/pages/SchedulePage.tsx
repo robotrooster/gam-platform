@@ -5,7 +5,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Search, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, priceStay, stayLowerRateWords, stayNightsBetween, addStayDays, addCalendarMonths, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, BOOKING_SOURCES, BOOKING_SOURCE_LABEL, stayHoldWords, stayDepositAsk, type BookingStatus, type BookingSource, camelizeKeys, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms, longCalendarDate } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, priceStay, stayLowerRateWords, stayNightsBetween, addStayDays, addCalendarMonths, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, isRigTooLongForSite, MAX_RIG_LENGTH_FT, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, BOOKING_SOURCES, BOOKING_SOURCE_LABEL, stayHoldWords, stayDepositAsk, type BookingStatus, type BookingSource, camelizeKeys, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms, longCalendarDate, typingPhone } from '@gam/shared'
 import { toast, appConfirm, appPrompt, appChoose } from '../components/dialogs'
 import { pastEndChoices, pastEndQuestion } from '../lib/earlyCheckOut'
 import { RequiredPropertySelect, usePropertyScope } from '../components/ListControls'
@@ -331,7 +331,32 @@ function GuestAccessModal({ booking, onClose }: { booking: ResvBooking; onClose:
  * words once a refund has gone out. Clicking a locked bar still opens its
  * window — reading a stay is never the thing we take away.
  */
-export type ScheduleBarKind = 'lease' | 'reserved' | 'checked_in' | 'checked_out' | 'no_show'
+export type ScheduleBarKind = 'lease' | 'reserved' | 'reserved_paid' | 'checked_in' | 'checked_out' | 'no_show'
+
+/**
+ * 10/24 (Nic) — HAS THIS ONE PAID ME, OR HAVEN'T THEY.
+ *
+ *   "Does the color shift to a reservation that's made and secured with a
+ *    deposit? ... I don't know what, more of a purplish color that won't be too
+ *    close to anything."
+ *
+ * Every un-arrived reservation was one amber, paid or not, and the money was
+ * readable in exactly one place: inside the reservation's own window, after you
+ * clicked it. So the only way to know who still owed for a site was to open
+ * every bar on the board one at a time.
+ *
+ * Money in hand is any of the three ways it arrives: the deposit cleared, the
+ * whole balance cleared, or they paid at the register on the way in (a walk-in
+ * carries a register sale and no deposit row at all). Any one of them means the
+ * site is secured, so any one of them turns the bar purple.
+ *
+ * Amber stays the one that has NOT paid, deliberately: amber already means
+ * "deal with this" everywhere else in GAM, so the bar that still owes money is
+ * the one that catches the eye across a 100-space board.
+ */
+export function stayIsSecured(booking: any): boolean {
+  return !!(booking?.depositPaidAt || booking?.balancePaidAt || booking?.posTransactionId)
+}
 
 export function scheduleBarKind(booking: any): ScheduleBarKind {
   // A lease row is the one that carries a start date (the schedule's leases
@@ -342,13 +367,21 @@ export function scheduleBarKind(booking: any): ScheduleBarKind {
   if (status === 'checked_out') return 'checked_out'
   if (status === 'no_show') return 'no_show'
   // Tentative and confirmed are the same thing to the eye: booked, nobody has
-  // arrived. (Canceled stays never reach the calendar at all.)
-  return 'reserved'
+  // arrived. (Canceled stays never reach the calendar at all.) What DOES show
+  // is whether the money came in — see stayIsSecured above.
+  return stayIsSecured(booking) ? 'reserved_paid' : 'reserved'
 }
 
 export const SCHEDULE_BAR_COLOR: Record<ScheduleBarKind, string> = {
   lease: 'var(--blue)',
   reserved: 'var(--amber)',
+  // 10/24 (Nic): secured by money. Purple was the one direction with open space
+  // in BOTH themes — a yellow bright enough to read apart from amber on dark
+  // has to darken to roughly #ca8a04 on light, which is brand gold (#c9a227) to
+  // the eye. #a855f7 is already GAM's purple in Books, so the platform is not
+  // growing a sixth hue, and it is lighter as well as a different hue from the
+  // blue lease bar it sits beside. Both values in SCHEDULE_BAR_THEME_CSS below.
+  reserved_paid: 'var(--sched-fill-reserved-paid)',
   checked_in: 'var(--green)',
   // 10/18 (review) — WHY FINISHED HISTORY DOES NOT JUST REUSE --green-dim.
   //
@@ -384,6 +417,7 @@ export const SCHEDULE_BAR_COLOR: Record<ScheduleBarKind, string> = {
 export const SCHEDULE_BAR_TEXT: Record<ScheduleBarKind, string> = {
   lease: '#e6ecff',
   reserved: 'var(--sched-ink-reserved)',
+  reserved_paid: 'var(--sched-ink-reserved-paid)',
   checked_in: 'var(--sched-ink-checked-in)',
   checked_out: 'var(--sched-ink-checked-out)',
   no_show: 'var(--sched-ink-no-show)',
@@ -393,6 +427,7 @@ export const SCHEDULE_BAR_TEXT: Record<ScheduleBarKind, string> = {
 export const SCHEDULE_BAR_SHADOW: Record<ScheduleBarKind, string> = {
   lease: '0 1px 2px rgba(0,0,0,.6)',
   reserved: 'var(--sched-shadow-reserved)',
+  reserved_paid: 'var(--sched-shadow-reserved-paid)',
   checked_in: 'var(--sched-shadow-checked-in)',
   checked_out: 'var(--sched-shadow-checked-out)',
   no_show: 'var(--sched-shadow-no-show)',
@@ -412,6 +447,9 @@ export const SCHEDULE_BAR_THEME_CSS = `
 :root{
   --sched-ink-reserved:#1a1200;
   --sched-ink-checked-in:#07210f;
+  --sched-fill-reserved-paid:#a855f7;
+  --sched-ink-reserved-paid:#1b0a2e;
+  --sched-shadow-reserved-paid:0 1px 2px rgba(255,255,255,.55);
   --sched-shadow-reserved:0 1px 2px rgba(255,255,255,.6);
   --sched-shadow-checked-in:0 1px 2px rgba(255,255,255,.55);
   --sched-fill-checked-out:var(--green-dim);
@@ -424,6 +462,9 @@ export const SCHEDULE_BAR_THEME_CSS = `
 :root[data-theme="light"]{
   --sched-ink-reserved:#ffffff;
   --sched-ink-checked-in:#ffffff;
+  --sched-fill-reserved-paid:#7e22ce;
+  --sched-ink-reserved-paid:#ffffff;
+  --sched-shadow-reserved-paid:0 1px 2px rgba(0,0,0,.5);
   --sched-shadow-reserved:0 1px 2px rgba(0,0,0,.5);
   --sched-shadow-checked-in:0 1px 2px rgba(0,0,0,.5);
   --sched-fill-checked-out:#8ec4a3;
@@ -434,16 +475,162 @@ export const SCHEDULE_BAR_THEME_CSS = `
   --sched-shadow-no-show:0 1px 2px rgba(255,255,255,.55);
 }`
 
+/**
+ * 10/24 (Nic) — WHO IS IT FOR, WITHOUT TYPING THEM OUT AGAIN.
+ *
+ *   "If somebody's making a reservation that has been here before, we need a way
+ *    to have it just select a previous person instead of typing out their full
+ *    name. Like if I'm typing the name William maybe it pre-populates from a
+ *    drop-down list of any other Williams in the system, and I can just click
+ *    the right one. Or maybe start with the phone number and if they've been
+ *    here before, it pre-populates them."
+ *
+ * The four guest fields, with the platform's people search behind the name and
+ * phone boxes. Typing two characters in any of them lists matches; clicking one
+ * fills all four and the dropdown goes away.
+ *
+ * WHERE THE PEOPLE COME FROM. GET /pos/people — the same search the register's
+ * History tab uses, not a second one: this property's residents, every register
+ * customer in the account's book, and (10/2, settled) everybody else on GAM by
+ * part of a name or a whole phone number. A person from another company comes
+ * back as a name and their phone only (10/24, Nic: "they are all customers of
+ * GAM. So sharing that information between landlords when it's just a name and
+ * phone number and no other sensitive information is okay") — never their
+ * company, site, lease, balance, payment history or ids.
+ *
+ * NOTHING IS WRITTEN BY PICKING. A reservation keeps the guest's name, email and
+ * phone on the booking itself, so a pick only FILLS THE BOXES — it creates no
+ * customer record and links no accounts. Whatever the clerk does next is still
+ * the clerk's to change.
+ *
+ * ONE COPY. These fields were written out twice — once in the waitlist block and
+ * once under "Who is it for" — so a change to either drifted from the other.
+ */
+function GuestFields(props: {
+  propertyId: string | null | undefined
+  first: string; last: string; email: string; phone: string
+  setFirst: (v: string) => void
+  setLast: (v: string) => void
+  setEmail: (v: string) => void
+  setPhone: (v: string) => void
+}) {
+  const { propertyId } = props
+  // Which box is being typed in, and what is in it. One dropdown, under that box.
+  const [lookingIn, setLookingIn] = useState<'first' | 'last' | 'phone' | null>(null)
+  const [typed, setTyped] = useState('')
+  const [debounced, setDebounced] = useState('')
+  const [dismissed, setDismissed] = useState(false)
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(typed), 250)
+    return () => clearTimeout(t)
+  }, [typed])
+
+  // The server wants two characters and refuses over 120; it also limits how
+  // often one person may look outside their own company. Asking only once the
+  // typing settles keeps a name like "William" to one search, not seven.
+  const term = debounced.trim()
+  const askable = !!propertyId && term.length >= 2 && term.length <= 120 && !dismissed
+  const { data: found, isFetching } = useQuery(
+    ['guest-lookup', propertyId, term],
+    () => apiGet(`/pos/people?propertyId=${propertyId}&q=${encodeURIComponent(term)}`),
+    { enabled: askable, keepPreviousData: true, staleTime: 30_000 },
+  )
+  const hits: any[] = askable && Array.isArray(found?.data) ? found!.data : []
+
+  const take = (h: any) => {
+    props.setFirst(String(h.firstName ?? '').trim())
+    props.setLast(String(h.lastName ?? '').trim())
+    // Only overwrite what the pick actually knows — a clerk who already typed an
+    // email for somebody whose record has none does not lose it.
+    if (h.email) props.setEmail(String(h.email))
+    if (h.phone) props.setPhone(typingPhone(String(h.phone)))
+    setLookingIn(null); setTyped(''); setDebounced(''); setDismissed(true)
+  }
+
+  // A box the clerk is typing in drives the search; changing anything by hand
+  // after a pick starts a fresh one.
+  const watch = (which: 'first' | 'last' | 'phone', v: string) => {
+    setLookingIn(which); setTyped(v); setDismissed(false)
+  }
+
+  const Found = () => (
+    <div style={{position:'absolute',top:'calc(100% + 4px)',left:0,right:0,zIndex:30,minWidth:240,maxHeight:260,overflowY:'auto',
+                 background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:8,boxShadow:'0 10px 30px rgba(0,0,0,.45)'}}>
+      {hits.map((h) => (
+        <button key={h.key} type="button" onClick={() => take(h)}
+          style={{display:'block',width:'100%',textAlign:'left',padding:'8px 10px',background:'transparent',
+                  border:'none',borderBottom:'1px solid var(--border-1)',cursor:'pointer',color:'var(--text-0)'}}>
+          <div style={{fontSize:'.8rem',fontWeight:600}}>{h.name}</div>
+          {h.hint && <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:1}}>{h.hint}</div>}
+        </button>
+      ))}
+      <button type="button" onClick={() => { setLookingIn(null); setDismissed(true) }}
+        style={{display:'block',width:'100%',textAlign:'left',padding:'7px 10px',background:'transparent',border:'none',
+                cursor:'pointer',color:'var(--text-3)',fontSize:'.7rem'}}>
+        Nobody here — keep what I typed
+      </button>
+    </div>
+  )
+
+  const box = (which: 'first' | 'last' | 'phone', el: any) => (
+    <div style={{position:'relative'}}>
+      {el}
+      {lookingIn === which && hits.length > 0 && <Found />}
+    </div>
+  )
+
+  return (
+    <>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+        {box('first',
+          <input className="form-input" placeholder="First name" style={{width:'100%'}}
+            value={props.first}
+            onChange={e => { props.setFirst(e.target.value); watch('first', e.target.value) }} />)}
+        {box('last',
+          <input className="form-input" placeholder="Last name" style={{width:'100%'}}
+            value={props.last}
+            onChange={e => { props.setLast(e.target.value); watch('last', e.target.value) }} />)}
+        <input className="form-input" type="email" placeholder="Email" style={{width:'100%'}}
+          value={props.email} onChange={e => props.setEmail(e.target.value)} />
+        {box('phone',
+          // 10/24 (Nic): "I don't want to have to type dashes or parentheses on
+          // everything." typingPhone is the platform's one formatter — digits in,
+          // (520) 903-8134 out, and an eleventh digit will not go in.
+          <input className="form-input" type="tel" placeholder="Phone" style={{width:'100%'}}
+            value={props.phone}
+            onChange={e => { const v = typingPhone(e.target.value); props.setPhone(v); watch('phone', v) }} />)}
+      </div>
+      {/* Said once, under the boxes, so the desk knows the list is there without
+          a dropdown having to appear to tell them. */}
+      <div style={{fontSize:'.68rem',color:'var(--text-3)',marginTop:5}}>
+        {isFetching && askable
+          ? 'Looking…'
+          : 'Been here before? Start typing their phone number or name and pick them from the list.'}
+      </div>
+    </>
+  )
+}
+
 /** One floating name, pinned over its bar (S575) — see nameOverlays. */
 type NameOverlay = {
   key: string; left: number; top: number; height: number; width: number
   label: string; kind: ScheduleBarKind; locked: boolean
 }
 
-/** Locked = the dates are no longer the calendar's to change. */
+/**
+ * Locked = the dates are no longer the calendar's to change.
+ *
+ * 10/24: this list was written out twice — here and again in nameOverlays for
+ * the floating name's padlock — so adding a bar kind meant finding both. One
+ * list now, read by both. A SECURED reservation is deliberately NOT on it: the
+ * money being in hand does not settle the dates, and a paid guest who calls to
+ * move a day still gets moved (see stayIsSecured).
+ */
+export const LOCKED_BAR_KINDS: readonly ScheduleBarKind[] = ['lease', 'checked_out', 'no_show']
+
 export function isScheduleBarLocked(booking: any): boolean {
-  const kind = scheduleBarKind(booking)
-  return kind === 'lease' || kind === 'checked_out' || kind === 'no_show'
+  return LOCKED_BAR_KINDS.includes(scheduleBarKind(booking))
 }
 
 /**
@@ -584,7 +771,7 @@ export function SchedulePage() {
   // confirm is open (it reads, fresh, what canceling it changes).
   const [cancelFor, setCancelFor] = useState<any>(null)
   // Edit mode for an existing reservation (the detail panel). null = view-only.
-  const [editForm, setEditForm] = useState<{guestName:string; guestEmail:string; guestPhone:string; checkIn:string; checkOut:string; unitId:string; notes:string; requiredSiteLayout:string; requiredAmpService:string; avoid:string} | null>(null)
+  const [editForm, setEditForm] = useState<{guestName:string; guestEmail:string; guestPhone:string; checkIn:string; checkOut:string; unitId:string; notes:string; requiredSiteLayout:string; requiredAmpService:string; rigLengthFt:number|null; avoid:string} | null>(null)
   const [editError, setEditError] = useState('')
   const [resvError, setResvError] = useState('')
   const [resvFirst, setResvFirst] = useState('')
@@ -641,6 +828,13 @@ export function SchedulePage() {
     label?: string | null
     amount?: number | null
     neverExpires?: boolean
+    /**
+     * 10/24 (Nic): this window opened straight off MAKING the reservation, so
+     * it carries no link to copy — the desk's next move is the next guest, not
+     * a URL. Opened by asking a reservation that already exists for its deposit
+     * link, it is false and the link is handed over.
+     */
+    justBooked?: boolean
   } | null>(null)
   // 10/6 (Nic): "Returning guest — they've stayed with us before" (no
   // background check) and "Work trade" on the new-reservation form.
@@ -663,6 +857,10 @@ export function SchedulePage() {
     enabled: !!editForm && !!detailBooking && !detailBooking.isLease && !detailBooking.returningGuestAt,
   })
   const [resvAmp, setResvAmp] = useState<string>('none')
+  // 10/24 (Nic): "I'm trying to make a reservation right now where somebody's got
+  // a 37 foot camper. They can't go in the small sites, right?" How long their
+  // rig is, as a string so the box can be empty (= they did not say).
+  const [resvRig, setResvRig] = useState<string>('')
   const [selectedCell, setSelectedCell] = useState<{unitId:string; date:string}|null>(null)
   // Booking-guest access: the link a no-account guest uses to reach their
   // stay assistant. Generated on demand per booking.
@@ -793,6 +991,9 @@ export function SchedulePage() {
         excludeBookingId: detailBooking.id,
         requiredSiteLayout: editForm.requiredSiteLayout || 'none',
         requiredAmpService: editForm.requiredAmpService || 'none',
+        // 10/24: a stay being moved keeps its rig, so the sites offered for the
+        // move are only the ones it fits on.
+        ...(editForm.rigLengthFt ? { rigLengthFt: String(editForm.rigLengthFt) } : {}),
       })}`
     : null
   const { data: editAvailableUnits } = useQuery(
@@ -1125,6 +1326,9 @@ export function SchedulePage() {
         isDeposit: true, neverExpires: true,
         emailedNow: data.depositLink.emailed !== false,
         emailFailed: data.depositLink.emailed === false,
+        // 10/24 (Nic): straight off making the reservation. No link on screen
+        // here — see the window below.
+        justBooked: true,
       })
       return
     }
@@ -1217,7 +1421,7 @@ export function SchedulePage() {
   // database on the way here, so there is nothing to unwind — only screen state
   // to drop, and all of it goes.
   const closeNewResv = () => {
-    setNewResvOpen(false); setResvError(''); setResvFirst(''); setResvLast(''); setResvLayout('none'); setResvAmp('none'); setResvAvoid('')
+    setNewResvOpen(false); setResvError(''); setResvFirst(''); setResvLast(''); setResvLayout('none'); setResvAmp('none'); setResvRig(''); setResvAvoid('')
     setShowAvail(false); setPickedUnit(null); setLockSite(false); setPayMode('link')
     setResvReturning(false); setResvWorkTrade(false); setResvWt(defaultWorkTradeTerms())
     setNewBooking({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
@@ -1225,12 +1429,16 @@ export function SchedulePage() {
   // Combined RV-requirement mismatch reasons for a unit (layout + amp). Empty =
   // compatible. Used by the new-reservation cards, drag-move, and edit panel so
   // one guardrail covers both constraints with a single warning/confirm.
-  const rvMismatchReasons = (reqLayout: any, reqAmp: any, u: any): string[] => {
+  const rvMismatchReasons = (reqLayout: any, reqAmp: any, u: any, rigFt?: any): string[] => {
     const r: string[] = []
     if (isSiteLayoutMismatch(reqLayout, u?.rvSiteLayout))
       r.push(`needs ${RV_SITE_LAYOUT_LABEL[reqLayout as keyof typeof RV_SITE_LAYOUT_LABEL]}, unit is ${RV_SITE_LAYOUT_LABEL[(u?.rvSiteLayout||'none') as keyof typeof RV_SITE_LAYOUT_LABEL]}`)
     if (isAmpServiceMismatch(reqAmp, u?.rvAmpService))
       r.push(`needs ${RV_AMP_SERVICE_LABEL[reqAmp as keyof typeof RV_AMP_SERVICE_LABEL]}, unit is ${RV_AMP_SERVICE_LABEL[(u?.rvAmpService||'none') as keyof typeof RV_AMP_SERVICE_LABEL]}`)
+    // 10/24 (Nic): said in feet, because that is the thing the clerk has to
+    // repeat to the guest — "that spot is 30 foot, your rig is 37".
+    if (isRigTooLongForSite(rigFt, u?.rvMaxRigLengthFt))
+      r.push(`rig is ${Number(rigFt)} ft, this site takes ${Number(u?.rvMaxRigLengthFt)} ft`)
     return r
   }
   // Picking a unit submits the reservation with the stay total computed for it.
@@ -1245,6 +1453,7 @@ export function SchedulePage() {
       totalAmount:stayPriceForUnit(u).total, source:'direct',
       requiredSiteLayout: resvLayout,
       requiredAmpService: resvAmp,
+      rigLengthFt: resvRig.trim() === '' ? null : Number(resvRig),
       // S652: movable unless the counter promised them that exact space.
       lockedToUnit: lockSite,
       // S653: the sites they asked not to have, at the property this stay is at.
@@ -1495,6 +1704,10 @@ export function SchedulePage() {
           return
         }
         setResvLink({
+          // 10/24 (Nic): asked FOR from a reservation that already exists —
+          // somebody went looking for this link, so this is the one window that
+          // hands it over.
+          justBooked: false,
           url: sent.link.url,
           emailedTo: sent.sentTo || b?.guestEmail || null,
           guest: sent.guestName || b?.guestName || 'the guest',
@@ -1562,6 +1775,7 @@ export function SchedulePage() {
         notes: vars.form.notes.trim() || null,
         requiredSiteLayout: vars.form.requiredSiteLayout,
         requiredAmpService: vars.form.requiredAmpService,
+        rigLengthFt: vars.form.rigLengthFt,
         // S653: typed numbers → ids at the stay's property; [] clears the list.
         avoidedUnitIds: (() => {
           const toks = vars.form.avoid.split(/[,;\n]|\band\b/i).map(t => t.trim().toLowerCase().replace(/\s+/g, '')).filter(Boolean)
@@ -1620,6 +1834,7 @@ export function SchedulePage() {
       checkIn: dayOnly(d.checkIn), checkOut: dayOnly(d.checkOut), unitId: d.unitId, notes: d.notes || '',
       requiredSiteLayout: d.requiredSiteLayout || 'none',
       requiredAmpService: d.requiredAmpService || 'none',
+      rigLengthFt: d.rigLengthFt ?? null,
       avoid: (d.avoidedUnitIds || []).map((id:string)=>unitNumberOf(id)).filter(Boolean).join(', '),
     })
     setEditReturning(false)
@@ -1747,7 +1962,7 @@ export function SchedulePage() {
           // 10/18 (Nic): the lock marker is not a lease marker — a checked-out
           // stay and a no-show wear it too, because their dates are just as
           // settled as a lease's.
-          locked: kind === 'lease' || kind === 'checked_out' || kind === 'no_show',
+          locked: LOCKED_BAR_KINDS.includes(kind),
         })
       }
       bookings.forEach((b: any) => { if (b.unitId === unit.id) add(b.id, b.checkIn, b.checkOut, scheduleBarKind(b), b.guestName || 'Guest') })
@@ -2611,8 +2826,13 @@ export function SchedulePage() {
               a soft hold was locked in, and a clerk reading the board would
               turn away a walk-in who would have paid for that site. It names
               both statuses instead, so the color claims nothing the bar does
-              not say. (Splitting the hold into its own shade is Nic's call.) */}
-          <span><span style={{display:'inline-block',width:12,height:12,background:'var(--amber)',borderRadius:2,marginRight:4}}/>Booked — not arrived yet ({BOOKING_STATUS_LABEL.tentative} or {BOOKING_STATUS_LABEL.confirmed})</span>
+              not say. 10/24 (Nic) answered that call: the money splits the amber
+              in two, so amber is now the un-arrived stay that has NOT paid and
+              purple is the one that has. The wording follows the fills. */}
+          <span><span style={{display:'inline-block',width:12,height:12,background:'var(--amber)',borderRadius:2,marginRight:4}}/>Booked, nothing paid yet ({BOOKING_STATUS_LABEL.tentative} or {BOOKING_STATUS_LABEL.confirmed})</span>
+          {/* Reads the same theme-aware fill the bar does, so the strip cannot
+              drift from the board it explains. */}
+          <span><span style={{display:'inline-block',width:12,height:12,background:SCHEDULE_BAR_COLOR.reserved_paid,borderRadius:2,marginRight:4}}/>Booked and paid — deposit, balance or register</span>  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--green)',borderRadius:2,marginRight:4}}/>{BOOKING_STATUS_LABEL.checked_in}</span>  // wire-ok: a booking-status key on a shared map, not a field off an API response
           {/* The two faded swatches read the same theme-aware fill the bars do,
               so the strip can never drift from the board it explains. */}
@@ -3250,7 +3470,7 @@ export function SchedulePage() {
         // (the mismatch warning below covers it if it no longer qualifies).
         const availIds = editAvailableUnits ? new Set((editAvailableUnits as any[]).filter((u:any)=>u.isBookable).map((u:any)=>u.id)) : null
         const unitOptions = units.filter((u:any)=> (availIds ? availIds.has(u.id) : u.isBookable) || u.id===editForm?.unitId)
-        const editReasons = isEditing ? rvMismatchReasons(editForm!.requiredSiteLayout, editForm!.requiredAmpService, eu) : []
+        const editReasons = isEditing ? rvMismatchReasons(editForm!.requiredSiteLayout, editForm!.requiredAmpService, eu, editForm!.rigLengthFt) : []
         return (
         <div className="modal-overlay" onClick={closeDetail}>
           <div className="modal" style={{maxWidth:440}} onClick={e=>e.stopPropagation()}>
@@ -3280,6 +3500,16 @@ export function SchedulePage() {
                         {RV_AMP_SERVICES.filter(a=>a!=='both').map(a=><option key={a} value={a}>{a==='none'?'No preference':RV_AMP_SERVICE_LABEL[a]}</option>)}
                       </select>
                     </div>
+                    <div>
+                      {/* 10/24 (Nic): correctable here, because a rig gets
+                          measured wrong at the counter and the number decides
+                          every later move the schedule may make for this stay. */}
+                      <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Rig length (feet)</div>
+                      <input className="form-input" type="number" min={1} max={MAX_RIG_LENGTH_FT} style={{width:'100%'}}
+                        placeholder="not given"
+                        value={editForm!.rigLengthFt ?? ''}
+                        onChange={e=>setEditForm(s=>s&&({...s,rigLengthFt: e.target.value===''?null:Number(e.target.value)}))} />
+                    </div>
                   </div>
                   {editReasons.length>0 && <div style={{fontSize:'.7rem',color:'var(--amber)'}}>⚠ Unit {eu?.unitNumber}: {editReasons.join('; ')}. You can still save.</div>}
                   <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Sites to avoid</div>
@@ -3291,7 +3521,7 @@ export function SchedulePage() {
                   <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Guest name</div><input className="form-input" style={{width:'100%'}} value={editForm!.guestName} onChange={e=>setEditForm(s=>s&&({...s,guestName:e.target.value}))} /></div>
                   <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
                     <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Email</div><input className="form-input" style={{width:'100%'}} value={editForm!.guestEmail} onChange={e=>setEditForm(s=>s&&({...s,guestEmail:e.target.value}))} /></div>
-                    <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" style={{width:'100%'}} value={editForm!.guestPhone} onChange={e=>setEditForm(s=>s&&({...s,guestPhone:e.target.value}))} /></div>
+                    <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" type="tel" style={{width:'100%'}} value={editForm!.guestPhone} onChange={e=>setEditForm(s=>s&&({...s,guestPhone:typingPhone(e.target.value)}))} /></div>
                   </div>
                   <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Notes</div><textarea className="form-input" style={{width:'100%',minHeight:54}} value={editForm!.notes} onChange={e=>setEditForm(s=>s&&({...s,notes:e.target.value}))} /></div>
                   {/* 10/6 (Nic): the stay's work trade — ticked, changed or taken off. */}
@@ -3708,6 +3938,18 @@ export function SchedulePage() {
                       {RV_AMP_SERVICES.filter(a=>a!=='both').map(a=><option key={a} value={a}>{a==='none'?'Any service':RV_AMP_SERVICE_LABEL[a]}</option>)}
                     </select>
                   </div>
+                  <div>
+                    {/* 10/24 (Nic): how long their rig is. Sites too short for it
+                        drop out of the list below, so the counter is never offered
+                        a pad the trailer does not fit on — and because the length
+                        is stored with the stay, the nightly compression will not
+                        move them onto one later either. */}
+                    <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Rig length (optional)</div>
+                    <input className="form-input" type="number" min={1} max={MAX_RIG_LENGTH_FT}
+                      style={{width:'100%'}} placeholder="feet, e.g. 37"
+                      value={resvRig}
+                      onChange={e=>{ setResvRig(e.target.value); setPickedUnit(null) }} />
+                  </div>
                 </div>
 
                 <div style={{marginTop:10}}>
@@ -3746,11 +3988,14 @@ export function SchedulePage() {
                   <div style={{padding:'12px',background:'var(--bg-3)',borderRadius:8}}>
                     <div style={{fontSize:'.82rem',color:'var(--amber)',fontWeight:600,marginBottom:8}}>Nothing is free for those dates.</div>
                     <div style={{fontSize:'.76rem',color:'var(--text-3)',marginBottom:10}}>Take their details and put them on the waitlist — they get a 1-hour claim link the moment something opens.</div>
-                    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
-                      <input className="form-input" placeholder="First name" value={resvFirst} onChange={e=>setResvFirst(e.target.value)} />
-                      <input className="form-input" placeholder="Last name" value={resvLast} onChange={e=>setResvLast(e.target.value)} />
-                      <input className="form-input" type="email" placeholder="Email" value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} />
-                      <input className="form-input" placeholder="Phone" value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} />
+                    <div style={{marginBottom:10}}>
+                      <GuestFields
+                        propertyId={schedulePropertyId}
+                        first={resvFirst} last={resvLast}
+                        email={newBooking.guestEmail} phone={newBooking.guestPhone}
+                        setFirst={setResvFirst} setLast={setResvLast}
+                        setEmail={(v)=>setNewBooking(s=>({...s,guestEmail:v}))}
+                        setPhone={(v)=>setNewBooking(s=>({...s,guestPhone:v}))} />
                     </div>
                     {!validEmail
                       ? <div style={{fontSize:'.74rem',color:'var(--amber)'}}>An email address is where the claim link goes.</div>
@@ -3761,7 +4006,7 @@ export function SchedulePage() {
                 ) : (
                   <div style={{display:'grid',gap:8,maxHeight:280,overflowY:'auto'}}>
                     {offered.map((u:any)=>{
-                      const reasons = rvMismatchReasons(resvLayout, resvAmp, u)
+                      const reasons = rvMismatchReasons(resvLayout, resvAmp, u, resvRig)
                       const mismatch = reasons.length > 0
                       const facts = u.unitType==='rv_spot' ? rvSiteFactsLabel(u) : ''
                       const price = stayPriceForUnit(u)
@@ -3805,12 +4050,13 @@ export function SchedulePage() {
                 <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--gold)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:8}}>
                   3 · Who is it for · {pickedUnit.unitNumber}
                 </div>
-                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-                  <input className="form-input" placeholder="First name" value={resvFirst} onChange={e=>setResvFirst(e.target.value)} />
-                  <input className="form-input" placeholder="Last name" value={resvLast} onChange={e=>setResvLast(e.target.value)} />
-                  <input className="form-input" type="email" placeholder="Email" value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} />
-                  <input className="form-input" placeholder="Phone" value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} />
-                </div>
+                <GuestFields
+                  propertyId={pickedUnit.propertyId || schedulePropertyId}
+                  first={resvFirst} last={resvLast}
+                  email={newBooking.guestEmail} phone={newBooking.guestPhone}
+                  setFirst={setResvFirst} setLast={setResvLast}
+                  setEmail={(v)=>setNewBooking(s=>({...s,guestEmail:v}))}
+                  setPhone={(v)=>setNewBooking(s=>({...s,guestPhone:v}))} />
 
                 {/* S652 (Nic): movable by default. The nightly compression can
                     shuffle this stay onto an equivalent site to close gaps —
@@ -3886,7 +4132,7 @@ export function SchedulePage() {
                           || !resvGuestName || createResvMut.isLoading
                           || (resvWorkTrade && (!resvWt.coveredCharges.length || !validEmail))}
                         onClick={async ()=>{
-                          const reasons = rvMismatchReasons(resvLayout, resvAmp, pickedUnit)
+                          const reasons = rvMismatchReasons(resvLayout, resvAmp, pickedUnit, resvRig)
                           if (reasons.length && !(await appConfirm(`${pickedUnit.unitNumber} doesn't match:\n· ${reasons.join('\n· ')}\n\nReserve it anyway?`, { confirmLabel: 'Reserve it' }))) return
                           setResvError(''); createResvMut.mutate(pickedUnit)
                         }}>
@@ -4052,7 +4298,7 @@ export function SchedulePage() {
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>First name</div><input className="form-input" style={{width:'100%'}} value={bookFirst} onChange={e=>setBookFirst(e.target.value)} /></div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Last name</div><input className="form-input" style={{width:'100%'}} value={bookLast} onChange={e=>setBookLast(e.target.value)} /></div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Email</div><input className="form-input" type="email" style={{width:'100%'}} value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} /></div>
-                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" type="tel" style={{width:'100%'}} value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} /></div>
+                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" type="tel" style={{width:'100%'}} value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:typingPhone(e.target.value)}))} /></div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-in</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkIn} onChange={e=>setNewBooking(s=>({...s,checkIn:e.target.value}))} /></div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-out</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkOut} onChange={e=>setNewBooking(s=>({...s,checkOut:e.target.value}))} /></div>
               </div>
@@ -4191,12 +4437,27 @@ export function SchedulePage() {
                         ? <>Emailed to <b>{resvLink.emailedTo}</b>{linkAsksFor(resvLink)}. The site is held for {resvLink.guest} until they pay it.</>
                         : <>The site is held for {resvLink.guest} until this is paid.</>}
               </div>
-              <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:10}}>
-                <input readOnly value={resvLink.url}
-                  style={{flex:1,fontSize:'.72rem',padding:'6px 8px',background:'var(--bg-1)',border:'1px solid var(--border-1)',borderRadius:6,color:'var(--text-2)'}}
-                  onFocus={e=>e.currentTarget.select()} />
-                <button className="btn btn-primary btn-sm" onClick={()=>{navigator.clipboard?.writeText(resvLink.url); toast('Link copied.')}}>Copy</button>
-              </div>
+              {/* 10/24 (Nic) — NO LINK ON THE WINDOW THAT JUST MADE A BOOKING.
+                    "if the email didn't go through, like, how am I going to
+                     show them the link? If they were here, I would just send
+                     them the pay link or use the point of sale... the
+                     reservation just needs to be completed and move on. If they
+                     end up not getting the link, then we can access it from the
+                     reservation."
+                  The desk has just taken a booking and the next thing it does is
+                  the next guest. A URL to copy is only any use to somebody who
+                  went looking for it, and that door already exists: open the
+                  reservation and ask for the deposit again, which hands back the
+                  same link rather than emailing twice. So the link shows there
+                  and not here. */}
+              {!resvLink.justBooked && (
+                <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:10}}>
+                  <input readOnly value={resvLink.url}
+                    style={{flex:1,fontSize:'.72rem',padding:'6px 8px',background:'var(--bg-1)',border:'1px solid var(--border-1)',borderRadius:6,color:'var(--text-2)'}}
+                    onFocus={e=>e.currentTarget.select()} />
+                  <button className="btn btn-primary btn-sm" onClick={()=>{navigator.clipboard?.writeText(resvLink.url); toast('Link copied.')}}>Copy</button>
+                </div>
+              )}
               <div style={{fontSize:'.72rem',color:'var(--text-3)',lineHeight:1.5}}>
                 {/* 10/18 (review): a deposit link never expires, but a link the
                     register sent does — so this does not promise otherwise

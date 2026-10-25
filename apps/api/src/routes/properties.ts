@@ -32,6 +32,7 @@ import { MAINTENANCE_CATEGORIES,
   CARD_FEE_PAYERS,
   PROCESSING_FEE_CHOICES,
   type ProcessingFeeChoice,
+  MAX_RIG_LENGTH_FT,
 } from '@gam/shared'
 import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
@@ -787,6 +788,12 @@ const unitSubtypeSchema = z.object({
   // S550: subtype-level dwelling ownership (rv_spot / mobile_home only) —
   // "MH Lot" mints tenant-owned units, "Park Model Rental" mints park-owned.
   dwellingOwnership: z.enum(['landlord', 'tenant']).nullable().optional(),
+  // 10/24 (Nic): the longest rig this CLASS of pad takes, in feet. A park with
+  // "Big rig pull-through" and "Back-in compact" states 45 and 28 once here
+  // instead of on 100 sites one at a time; a unit created from the class
+  // inherits it exactly the way it inherits the layout and the amps, and the
+  // unit owns it from that moment (moving one pad's limit never moves another's).
+  rvMaxRigLengthFt: z.number().int().positive().max(MAX_RIG_LENGTH_FT).nullable().optional(),
 })
 
 // POST /api/properties/:id/unit-subtypes — create (or update via id) one
@@ -813,6 +820,9 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
       body.rentAmount ?? null, body.securityDeposit ?? null,
       body.nightlyRate ?? null, body.weeklyRate ?? null, body.monthlyRate ?? null,
       ownershipRelevant ? body.dwellingOwnership ?? null : null,
+      // Only an RV pad has a rig limit; a type switch must not leave a stale
+      // "45 ft" on what is now an apartment class.
+      isRv ? body.rvMaxRigLengthFt ?? null : null,
     ]
 
     // S613 (Nic, DATA LOSS): a create whose name already existed used to
@@ -828,7 +838,8 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
     // picker are unusable. So the collision is refused out loud, naming what
     // already exists and what it holds, instead of being resolved by deletion.
     const clash = await queryOne<any>(
-      `SELECT id, name, rv_site_layout, rv_amp_service, bedrooms, bathrooms, storage_size
+      `SELECT id, name, rv_site_layout, rv_amp_service, rv_max_rig_length_ft,
+              bedrooms, bathrooms, storage_size
          FROM property_unit_subtypes
         WHERE property_id=$1 AND unit_type=$2 AND lower(btrim(name))=lower(btrim($3))
           AND ($4::uuid IS NULL OR id <> $4)`,
@@ -841,6 +852,9 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
           ? (clash.rv_site_layout === 'pull_through' ? 'pull-through' : 'back-in') : null,
         clash.rv_amp_service && clash.rv_amp_service !== 'none'
           ? (clash.rv_amp_service === 'both' ? '30/50 amp' : `${clash.rv_amp_service} amp`) : null,
+        // 10/24: "up to 45 ft" among the facts, so the refusal tells the
+        // landlord which of two same-named classes they are looking at.
+        clash.rv_max_rig_length_ft ? `up to ${clash.rv_max_rig_length_ft} ft` : null,
         clash.storage_size || null,
       ].filter(Boolean).join(', ')
       throw new AppError(409,
@@ -857,8 +871,8 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
            unit_type=$2, name=$3, bedrooms=$4, bathrooms=$5, rv_site_layout=$6,
            rv_amp_service=$7, storage_size=$8, rent_amount=$9, security_deposit=$10,
            nightly_rate=$11, weekly_rate=$12, monthly_rate=$13,
-           dwelling_ownership=$14, updated_at=NOW()
-         WHERE id=$15 AND property_id=$1
+           dwelling_ownership=$14, rv_max_rig_length_ft=$15, updated_at=NOW()
+         WHERE id=$16 AND property_id=$1
          RETURNING *`,
         [...vals, body.id],
       )
@@ -868,8 +882,9 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
         `INSERT INTO property_unit_subtypes
            (property_id, unit_type, name, bedrooms, bathrooms, rv_site_layout,
             rv_amp_service, storage_size, rent_amount, security_deposit,
-            nightly_rate, weekly_rate, monthly_rate, dwelling_ownership)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            nightly_rate, weekly_rate, monthly_rate, dwelling_ownership,
+            rv_max_rig_length_ft)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
          RETURNING *`,
         vals,
       )

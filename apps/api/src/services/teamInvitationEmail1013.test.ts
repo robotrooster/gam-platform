@@ -9,9 +9,27 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
-const { resendSendMock } = vi.hoisted(() => ({
-  resendSendMock: vi.fn(async () => ({ data: { id: 'msg_default' }, error: null }) as any),
-}))
+// 10/24 — WHY THIS PROVIDER ID IS GENERATED RATHER THAN A FIXED STRING.
+//
+// email_send_log.provider_message_id carries a UNIQUE index across the WHOLE
+// table (idx_email_send_log_provider_msg), and the suite runs six workers
+// against ONE gam_test database. Three files mocked the provider with the SAME
+// fixed id — email.test.ts, newLeaseEmails.test.ts and
+// teamInvitationEmail1013.test.ts — so whichever two landed together failed on
+// the duplicate key, and only ever under parallelism. Each of them passed when
+// run alone, which is why it read as a deploy-only flake: deploy.sh is the only
+// thing that runs them side by side.
+const { resendSendMock, MSG_DEFAULT } = vi.hoisted(() => {
+  // Unique per CALL, not per file: one suite sends many emails and the index is
+  // unique across the whole table, so a per-file id collided with itself too.
+  // MSG_DEFAULT is the stable prefix the assertions match on.
+  const MSG_DEFAULT = `msg_default-${Math.random().toString(36).slice(2, 10)}`
+  let n = 0
+  return {
+    MSG_DEFAULT,
+    resendSendMock: vi.fn(async () => ({ data: { id: `${MSG_DEFAULT}-${++n}` }, error: null }) as any),
+  }
+})
 vi.mock('resend', () => ({
   Resend: class {
     emails = { send: resendSendMock }

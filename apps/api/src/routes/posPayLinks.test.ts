@@ -412,7 +412,7 @@ describe('finding who to send a link to', () => {
 // 10/2: the same search the register uses — and the leak it closes. Searching
 // a stranger by email used to hand back their phone number too.
 describe('the pay-link search is the register\'s search', () => {
-  it('a stranger found by email comes back with their name and a masked hint only — no email, no full phone, no ids; a property is required', async () => {
+  it('a stranger found by email comes back with their name and phone, their email still masked, no ids; a property is required', async () => {
     const f = await seed()
     const other = await seed({ connect: false })
     await db.query(`INSERT INTO pos_customers (landlord_id, first_name, last_name, email, phone) VALUES ($1,'Zed','Elsewhere','zed@elsewhere.com','602-555-0199')`,
@@ -421,12 +421,15 @@ describe('the pay-link search is the register\'s search', () => {
       .set('Authorization', `Bearer ${f.token}`)
     expect(res.status).toBe(200)
     expect(res.body.data).toHaveLength(1)
-    // 10/2 (review): found by the email typed whole, the hint is that email
-    // masked — never digits of their phone.
-    expect(res.body.data[0]).toMatchObject({ kind: 'elsewhere', name: 'Zed Elsewhere', email: null, phone: null, customerId: null, tenantId: null,
-                                             hint: 'z•••@elsewhere.com' })
-    expectNoFigures(res.body, ['0199'])
-    for (const leak of ['zed@elsewhere.com', '602-555-0199', '6025550199', other.landlordId, other.propertyId]) {
+    // 10/24 (Nic, DIRECTIVE — replaces the 10/2 phone masking): "Name and phone
+    // number should be visible between different properties... They are all
+    // customers of GAM." The pay-link picker is the register's own search
+    // (services/posPeople), so it follows the same rule rather than a second
+    // one: the phone comes back, the EMAIL stays masked.
+    expect(res.body.data[0]).toMatchObject({ kind: 'elsewhere', name: 'Zed Elsewhere', email: null, customerId: null, tenantId: null,
+                                             hint: '(602) 555-0199 · z•••@elsewhere.com' })
+    // Their address and the other company are still held back.
+    for (const leak of ['zed@elsewhere.com', other.landlordId, other.propertyId]) {
       expect(JSON.stringify(res.body)).not.toContain(leak)
     }
     // Over 120 characters is refused here too.

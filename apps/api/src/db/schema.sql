@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict qclrn7jolhMtbzCxCRHnMWU7rR2tzFdHdjumpsednhbZvBUdspjrMrstqhqUh5y
+\restrict K7uwCgxLKyjpICIcqSYnGNx5dS1A3EYR5vsBafw6VuL3bhL6SPpHaxoHhRbrlWa
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -18392,10 +18392,12 @@ CREATE TABLE public.property_unit_subtypes (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     dwelling_ownership text,
+    rv_max_rig_length_ft integer,
     CONSTRAINT property_unit_subtypes_bathrooms_check CHECK ((bathrooms >= (0)::numeric)),
     CONSTRAINT property_unit_subtypes_bedrooms_check CHECK ((bedrooms >= 0)),
     CONSTRAINT property_unit_subtypes_dwelling_ownership_check CHECK (((dwelling_ownership IS NULL) OR (dwelling_ownership = ANY (ARRAY['landlord'::text, 'tenant'::text])))),
     CONSTRAINT property_unit_subtypes_name_check CHECK (((length(TRIM(BOTH FROM name)) >= 1) AND (length(TRIM(BOTH FROM name)) <= 60))),
+    CONSTRAINT property_unit_subtypes_rig_length_sane CHECK (((rv_max_rig_length_ft IS NULL) OR ((rv_max_rig_length_ft > 0) AND (rv_max_rig_length_ft <= 120)))),
     CONSTRAINT property_unit_subtypes_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT property_unit_subtypes_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
     CONSTRAINT property_unit_subtypes_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'campsite'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'parking'::text, 'boat_slip'::text, 'land_lot'::text, 'commercial'::text])))
@@ -21041,6 +21043,7 @@ CREATE TABLE public.unit_bookings (
     deposit_off_platform_ref text,
     import_extra_data jsonb,
     folded_into_person_merge_id uuid,
+    rig_length_ft integer,
     CONSTRAINT unit_bookings_deposit_off_platform_method_check CHECK (((deposit_off_platform_method IS NULL) OR (deposit_off_platform_method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text, 'bank_deposit'::text, 'other'::text])))),
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
     CONSTRAINT unit_bookings_lock_reason_check CHECK (((lock_reason IS NULL) OR (lock_reason = ANY (ARRAY['promised_before_gam'::text, 'promised_at_the_counter'::text, 'moved_off_promised_site'::text])))),
@@ -21048,6 +21051,7 @@ CREATE TABLE public.unit_bookings (
     CONSTRAINT unit_bookings_migration_shape CHECK (((migrated_at IS NULL) = (migrated_door IS NULL))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
+    CONSTRAINT unit_bookings_rig_length_sane CHECK (((rig_length_ft IS NULL) OR ((rig_length_ft > 0) AND (rig_length_ft <= 120)))),
     CONSTRAINT unit_bookings_status_check CHECK ((status = ANY (ARRAY['tentative'::text, 'confirmed'::text, 'checked_in'::text, 'checked_out'::text, 'cancelled'::text, 'no_show'::text]))),
     CONSTRAINT unit_bookings_stay_terms_check CHECK (((stay_terms IS NULL) OR (stay_terms = ANY (ARRAY['lease'::text, 'stay'::text]))))
 );
@@ -21198,6 +21202,13 @@ COMMENT ON COLUMN public.unit_bookings.deposit_off_platform_method IS 'How a dep
 --
 
 COMMENT ON COLUMN public.unit_bookings.folded_into_person_merge_id IS '10/20 (Nic): the landlord said this reservation''s guest is somebody already in the book (person_merges). The row stays on the board exactly as booked; the matcher stops asking about it.';
+
+
+--
+-- Name: COLUMN unit_bookings.rig_length_ft; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.rig_length_ft IS '10/24: how long the guest''s camper is (feet), asked at the counter and on the booking site. NULL = not stated.';
 
 
 --
@@ -21517,6 +21528,7 @@ CREATE TABLE public.units (
     owner_occupant_name text,
     owner_occupant_phone text,
     owner_occupant_email text,
+    rv_max_rig_length_ft integer,
     CONSTRAINT units_building_not_blank CHECK (((building IS NULL) OR (btrim(building) <> ''::text))),
     CONSTRAINT units_dwelling_ownership_check CHECK ((dwelling_ownership = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT units_floor_level_check CHECK (((floor_level IS NULL) OR (floor_level = ANY (ARRAY['ground_floor'::text, 'upper_floor'::text, 'basement'::text, 'multi_floor'::text])))),
@@ -21524,6 +21536,7 @@ CREATE TABLE public.units (
     CONSTRAINT units_occupancy_mode_check CHECK ((occupancy_mode = ANY (ARRAY['whole_unit'::text, 'by_room'::text]))),
     CONSTRAINT units_owner_household_size_check CHECK (((owner_household_size >= 1) AND (owner_household_size <= 30))),
     CONSTRAINT units_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
+    CONSTRAINT units_rv_max_rig_length_sane CHECK (((rv_max_rig_length_ft IS NULL) OR ((rv_max_rig_length_ft > 0) AND (rv_max_rig_length_ft <= 120)))),
     CONSTRAINT units_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
     CONSTRAINT units_status_check CHECK ((status = ANY (ARRAY['vacant'::text, 'available'::text, 'active'::text, 'delinquent'::text, 'suspended'::text, 'owner_use'::text, 'utility_service'::text]))),
     CONSTRAINT units_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'campsite'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'parking'::text, 'boat_slip'::text, 'land_lot'::text, 'commercial'::text])))
@@ -21612,6 +21625,13 @@ COMMENT ON COLUMN public.units.display_label IS 'S652: what the park calls this 
 --
 
 COMMENT ON COLUMN public.units.owner_occupant_name IS 'S653: who lives in an owner-use space (contact only; read when status = owner_use).';
+
+
+--
+-- Name: COLUMN units.rv_max_rig_length_ft; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.units.rv_max_rig_length_ft IS '10/24: the longest rig (feet) this site takes. NULL = not stated, and never blocks.';
 
 
 --
@@ -31756,6 +31776,13 @@ CREATE INDEX idx_units_property ON public.units USING btree (property_id);
 --
 
 CREATE INDEX idx_units_replaces ON public.units USING btree (replaces_unit_id) WHERE (replaces_unit_id IS NOT NULL);
+
+
+--
+-- Name: idx_units_rig_length; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_units_rig_length ON public.units USING btree (property_id, rv_max_rig_length_ft) WHERE (rv_max_rig_length_ft IS NOT NULL);
 
 
 --
@@ -46743,5 +46770,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict qclrn7jolhMtbzCxCRHnMWU7rR2tzFdHdjumpsednhbZvBUdspjrMrstqhqUh5y
+\unrestrict K7uwCgxLKyjpICIcqSYnGNx5dS1A3EYR5vsBafw6VuL3bhL6SPpHaxoHhRbrlWa
 

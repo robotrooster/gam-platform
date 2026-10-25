@@ -22,6 +22,7 @@ import {
   UNIT_TYPES, UNIT_TYPE_LABEL,
   EARLY_DEPARTURE_REFUNDS_QUESTION, EARLY_DEPARTURE_REFUNDS_HINT,
   MID_MONTH_PRORATION_QUESTION, MID_MONTH_PRORATION_HINT,
+  typingPhone,
 } from '@gam/shared'
 
 const STEPS = [
@@ -51,12 +52,9 @@ function formatEin(raw: string): string {
   const d = raw.replace(/\D/g, '').slice(0, 9)
   return d.length > 2 ? `${d.slice(0, 2)}-${d.slice(2)}` : d
 }
-function formatPhone(raw: string): string {
-  const d = raw.replace(/\D/g, '').slice(0, 10)
-  if (d.length <= 3) return d
-  if (d.length <= 6) return `(${d.slice(0, 3)}) ${d.slice(3)}`
-  return `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`
-}
+// 10/24 (Nic, "let's get it all uniform"): this was a private copy of the
+// as-you-type formatter. It now lives in packages/shared as typingPhone, so the
+// reservation form and every other phone field behave identically.
 
 export function OnboardingPage() {
   const navigate = useNavigate()
@@ -418,7 +416,7 @@ export function OnboardingPage() {
                 <div style={{ marginBottom: 14 }}>
                   <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Phone Number *</label>
                   <input className="input" type="tel" placeholder="(555) 000-0000" inputMode="numeric" value={profile.phone}
-                    onChange={e => setProfile(p => ({ ...p, phone: formatPhone(e.target.value) }))} style={{ width: '100%' }} autoFocus />
+                    onChange={e => setProfile(p => ({ ...p, phone: typingPhone(e.target.value) }))} style={{ width: '100%' }} autoFocus />
                   {errors.phone && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.phone}</div>}
                 </div>
 
