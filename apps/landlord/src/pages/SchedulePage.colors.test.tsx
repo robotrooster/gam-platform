@@ -391,7 +391,7 @@ describe('scheduleBarKind / isScheduleBarLocked', () => {
     // 10/24: the slime fill joined it — bright in both themes, so its dark ink
     // never flips either. Every darker lime that could carry white ink on the
     // light theme landed ~23 deltaE from the checked-in green, under threshold.
-    expect(SCHEDULE_BAR_TEXT.reserved_paid_full).toMatch(/^#/)
+    expect(SCHEDULE_BAR_TEXT.reserved_paid_full).toMatch(/^#/)  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
     expect(SCHEDULE_BAR_THEME_CSS).toContain('--sched-ink-reserved')
     expect(SCHEDULE_BAR_THEME_CSS).toContain(':root[data-theme="light"]')
   })

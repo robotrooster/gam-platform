@@ -1648,8 +1648,14 @@ export async function createBookingDepositLink(opts: {
    * (createScreeningFeeLink).
    */
   screeningFee?: number | null
-}): Promise<{ id: string; url: string; emailed: boolean } | null> {
+}): Promise<{
+  id: string; url: string; emailed: boolean
+  /** 10/24: the companion whole-stay link the same email offered, when it offered one. */
+  inFull?: { id: string; url: string; amount: number } | null
+} | null> {
   const fee = round2(Number(opts.screeningFee) || 0)
+  /** 10/24: the companion "pay it all" link, when paying it all is more than the deposit. */
+  let inFull: any = null
   if (!(opts.amount > 0)) {
     if (!(fee > 0)) return null
     return createScreeningFeeLink({ bookingId: opts.bookingId, landlordId: opts.landlordId, propertyId: opts.propertyId,
@@ -1685,6 +1691,46 @@ export async function createBookingDepositLink(opts: {
       [token, opts.landlordId, opts.propertyId, owner.user_id,
        fee > 0 ? 'Reservation deposit and background check' : 'Reservation deposit', JSON.stringify(items), total, opts.guestName,
        opts.guestEmail.toLowerCase(), opts.bookingId, prop.booking_card_fee_payer === 'customer'])).rows[0]
+
+    // ── 10/24 (Nic) — THE WHOLE STAY, AS ITS OWN LINK ───────────────────────
+    //
+    //   "There's two buttons. They toggle the deposit amount or the full amount,
+    //    and that's it... No type box."
+    //
+    // Minted beside the deposit, in the same transaction, so the one email can
+    // carry both and neither exists without the other. Two links rather than two
+    // amounts on one: a pay link is an invoice for a fixed sum, GET /pay/:token
+    // goes straight to the card screen with no page in between, and
+    // settleLinkBooking already stamps the stay paid in full by comparing what
+    // was paid against the total — so this needs no money logic of its own.
+    //
+    // Only when paying it all is actually MORE than the deposit: a stay whose
+    // deposit already is the whole stay (a one-night stop at 100%) would
+    // otherwise show the guest two buttons for the same figure.
+    const stayTotal = round2(Number(
+      (await client.query<{ total: number }>(
+        `SELECT COALESCE(total_amount, 0)::float AS total FROM unit_bookings WHERE id = $1`,
+        [opts.bookingId])).rows[0]?.total ?? 0))
+    const wholeAsk = round2(stayTotal + fee)
+    if (stayTotal > 0 && wholeAsk > total + 0.005) {
+      const wholeItems = [
+        { id: null, name: 'The whole stay', qty: 1, price: stayTotal, tax: 0 },
+        ...items.filter((it: any) => it.name !== 'Reservation deposit' && Number(it.price) === fee && fee > 0),
+      ]
+      const wholeToken = crypto.randomBytes(24).toString('hex')
+      inFull = (await client.query(
+        `INSERT INTO pos_pay_links
+           (token, landlord_id, property_id, created_by, kind, label, items,
+            subtotal, tax_amount, discount_amount, total,
+            customer_name, customer_email, booking_id, card_fee_on_top)
+         VALUES ($1,$2,$3,$4,'one_time',$5,$6::jsonb,$7,0,0,$7,$8,$9,$10,$11)
+         RETURNING *`,
+        [wholeToken, opts.landlordId, opts.propertyId, owner.user_id,
+         fee > 0 ? 'The whole stay and background check' : 'The whole stay',
+         JSON.stringify(wholeItems), wholeAsk, opts.guestName,
+         opts.guestEmail.toLowerCase(), opts.bookingId,
+         prop.booking_card_fee_payer === 'customer'])).rows[0]
+    }
     await client.query('COMMIT')
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
@@ -1700,13 +1746,19 @@ export async function createBookingDepositLink(opts: {
     label: link.label, amount: Number(link.total), cardFee: customerFee, url: payLinkUrl(link.token),
     neverExpires: true,
     note: await linkEmailNote(link),
+    alsoPayInFull: inFull
+      ? { url: payLinkUrl(inFull.token), amount: Number(inFull.total) }
+      : null,
     // 10/5: replies reach the people who run this property (services/replyRouting).
     ctx: { landlordId: opts.landlordId, payLinkId: link.id, replyTo: replyToProperty(link.property_id) },
   }).then(() => true).catch((e: unknown) => {
     logger.error({ err: e, payLinkId: link.id }, '[deposit-link] email failed')
     return false
   })
-  return { id: link.id, url: payLinkUrl(link.token), emailed }
+  return {
+    id: link.id, url: payLinkUrl(link.token), emailed,
+    inFull: inFull ? { id: inFull.id, url: payLinkUrl(inFull.token), amount: Number(inFull.total) } : null,
+  }
 }
 
 /**

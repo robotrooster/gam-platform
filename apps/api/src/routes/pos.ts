@@ -2126,6 +2126,117 @@ posRouter.get('/checkout/due-out', requirePerm('pos.ring_sale'), async (req: any
   } catch (e) { next(e) }
 })
 
+/**
+ * ── 10/24 (Nic) — THE DESK FINISHES A LEASE MOVE-OUT ─────────────────────────
+ *
+ *   "If somebody were to move out of an unsubmetered unit, there's no way to
+ *    check them out through that checkout flow on the point of sale system."
+ *
+ * He was right, and it was worse than one dead end: the Checkout tab only ever
+ * offered a finish button for a STAY (`kind === 'stay'`), so a lease move-out
+ * read the final meter — or was told there was no meter to read — and then had
+ * nowhere to go. The master schedule deliberately sends lease check-outs HERE
+ * ("the register's Checkout tab already closes a lease"), so the two surfaces
+ * pointed at each other and neither finished the job.
+ *
+ * WHO MAY PRESS IT, and why it is not leases.terminate. Nic:
+ *
+ *   "I think this should be split based on my personal front desk not having
+ *    lease permission. They can do the process to check them out, any invoices
+ *    for remaining balance generated and billed against deposit. Front desk does
+ *    not choose to issue refund without permission, it goes to landlord to
+ *    initiate."
+ *
+ * So the gate is the CHECK-OUT permission the desk already holds. What this does
+ * is the move-out: the lease ends, the household comes off it, the space frees,
+ * and the deposit-return DRAFT is cut — which sweeps unpaid rent, utilities and
+ * move-out fees against the deposit on its own (services/depositReturn
+ * calculateDepositReturn). Issuing money is NOT here: the landlord's finalize is
+ * what creates the refund payment or the gap invoice, and that stays theirs.
+ *
+ * It closes out through processLeaseEnds, the same path the 2am sweep uses, with
+ * `theyActuallyLeft` — because a clerk pressing this is a person saying they are
+ * going, which is the one thing that frees a space a date must never free.
+ */
+posRouter.post('/checkout/lease/:leaseId/finish',
+  requirePerm('guests.check_out', 'pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const landlordId = posLandlordId(req)
+    const propertyId = await assertPropertyIsLandlords(landlordId, req.body?.propertyId)
+    await assertPropertyInScope(req.user, propertyId)
+    if (!/^[0-9a-f-]{36}$/i.test(String(req.params.leaseId))) throw new AppError(404, LEASE_NOT_AT_THIS_COUNTER)
+
+    // The lease must be this company's, on this property, and still running. A
+    // lease id from anywhere else is refused by name rather than acted on.
+    const lease = await queryOne<any>(
+      `SELECT l.id, l.status, l.unit_id, un.unit_number, p.timezone,
+              COALESCE(us.first_name || ' ' || us.last_name, 'They') AS who
+         FROM leases l
+         JOIN units un ON un.id = l.unit_id
+         JOIN properties p ON p.id = un.property_id
+         LEFT JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.status IN ('active','pending_remove')
+         LEFT JOIN tenants t ON t.id = lt.tenant_id
+         LEFT JOIN users us ON us.id = t.user_id
+        WHERE l.id = $1 AND l.landlord_id = $2 AND un.property_id = $3
+        ORDER BY lt.created_at NULLS LAST
+        LIMIT 1`, [req.params.leaseId, landlordId, propertyId])
+    if (!lease) throw new AppError(404, LEASE_NOT_AT_THIS_COUNTER)
+    if (lease.status !== 'active') {
+      throw new AppError(409, `${lease.who} is not on an active lease on ${lease.unit_number} any more — ` +
+        'refresh the Checkout tab and pick them again.')
+    }
+
+    // The day they left is the park's today, never the server's (a UTC server
+    // has rolled over to tomorrow by 5pm in Phoenix).
+    const leftOn = todayIn(lease.timezone ?? null)
+    await query(
+      `UPDATE leases SET end_date = $2::date, updated_at = NOW() WHERE id = $1 AND status = 'active'`,
+      [lease.id, leftOn])
+    const { processLeaseEnds } = await import('../jobs/scheduler')
+    await processLeaseEnds(lease.id, true)
+
+    const after = await queryOne<any>(
+      `SELECT l.status, u.status AS unit_status,
+              (SELECT dr.id FROM deposit_returns dr WHERE dr.lease_id = l.id ORDER BY dr.created_at DESC LIMIT 1) AS deposit_return_id
+         FROM leases l JOIN units u ON u.id = l.unit_id WHERE l.id = $1`, [lease.id])
+    // If the close-out did not take, say so rather than reporting success on a
+    // tenancy that is still running.
+    if (after?.status === 'active') {
+      throw new AppError(409, `${lease.who}'s move-out did not complete — nothing was changed. Try it again.`)
+    }
+    res.json({ success: true, data: {
+      leftOn, unitNumber: lease.unit_number, who: lease.who,
+      spaceFreed: after?.unit_status === 'vacant',
+      depositReturnId: after?.deposit_return_id ?? null,
+    } })
+  } catch (e) { next(e) }
+})
+
+/**
+ * 10/24 (Nic): "typing a name in that flow is pulling up every customer in GAM
+ * right now. Like, it should only pull up people that are actually specific to
+ * a lease or stay at that property."
+ *
+ * The Checkout tab's own search. NOT /pos/people — that one reaches the whole
+ * platform on purpose, because a stranger can walk up and buy propane, and it
+ * is the wrong population for a close-out. This one is people with a stay or a
+ * lease on THIS property and nobody else: no other park, no other company, no
+ * elsewhere leg to limit because there is no elsewhere.
+ */
+posRouter.get('/checkout/people', requirePerm('pos.ring_sale', 'guests.check_out'),
+  peopleQueryGuard, peopleSearchLimiter, async (req: any, res, next) => {
+  try {
+    const landlordId = posLandlordId(req)
+    const propertyId = await assertPropertyIsLandlords(landlordId, req.query.propertyId)
+    await assertPropertyInScope(req.user, propertyId)
+    const { checkoutPeopleHere } = await import('../services/registerFinalUtility')
+    const people = await checkoutPeopleHere(db, {
+      landlordId, propertyId, typed: String(req.query.q ?? ''),
+    })
+    res.json({ success: true, data: people })
+  } catch (e) { next(e) }
+})
+
 /** Who the desk has in front of them, and what of theirs can be closed out. */
 posRouter.get('/final-utility/customer', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
   try {
@@ -2154,6 +2265,9 @@ posRouter.get('/final-utility/customer', requirePerm('pos.ring_sale'), async (re
     res.json({ success: true, data: found })
   } catch (e) { next(e) }
 })
+
+const LEASE_NOT_AT_THIS_COUNTER =
+  'That lease is not on this register — open the Checkout tab again and pick them from the list.'
 
 const FINAL_UTILITY_WORDS: Record<string, string> = {
   propertyId: 'Pick the property at the top of the register first, then take the closing read again.',

@@ -2330,6 +2330,24 @@ export async function emailPayLink(args: {
   note?: string | null
   /** A link with no expiry (a deposit or a background check) — the email does not say 14 days. */
   neverExpires?: boolean
+  /**
+   * 10/24 (Nic) — THE SECOND BUTTON.
+   *
+   *   "I don't want them to have a type in amount that they pay. There's two
+   *    buttons. They toggle the deposit amount or the full amount, and that's
+   *    it. There's no 'I can only put $200 down right now, but I wanted to pay
+   *    the whole thing', blah blah blah. It's two buttons. It's the deposit or
+   *    the full amount. No type box."
+   *
+   * A guest who wants to settle the whole stay up front had no way to: the
+   * deposit link charges the deposit and nothing else, and no route anywhere
+   * lets a payer name their own figure. So the email carries a second link for
+   * the whole stay. Two links rather than two amounts on one, because a pay link
+   * IS an invoice for a fixed sum — the page goes straight to the card screen
+   * with no step in between, and settleLinkBooking already stamps a stay paid in
+   * full on its own when what was paid covers the total.
+   */
+  alsoPayInFull?: { url: string; amount: number } | null
   ctx?: { landlordId?: string; payLinkId?: string; replyTo?: ReplyTo }
 }) {
   const money = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
@@ -2342,7 +2360,13 @@ export async function emailPayLink(args: {
         (args.cardFee > 0 ? `<strong style="color:#eef1f8">Card processing fee:</strong> ${money(args.cardFee)}<br>` : '') +
         `<strong style="color:#eef1f8">Total:</strong> ${money(args.amount + args.cardFee)}`) +
       (args.note ? p(escapeHtml(args.note)) : '') +
-      btn('Pay by card', args.url) +
+      btn(args.alsoPayInFull ? `Pay the deposit · ${money(args.amount)}` : 'Pay by card', args.url) +
+      // The whole stay, for a guest who would rather be done with it. Second,
+      // so the deposit stays the obvious thing to press.
+      (args.alsoPayInFull
+        ? p(`Or settle the whole stay now and owe nothing on arrival.`)
+          + btn(`Pay in full · ${money(args.alsoPayInFull.amount)}`, args.alsoPayInFull.url)
+        : '') +
       p(args.neverExpires ? 'To pay another way, contact the office.' : 'The link works for 14 days. To pay another way, contact the office.')
     ),
     {

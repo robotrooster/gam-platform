@@ -282,7 +282,23 @@ export async function handOffOpenItemsToRenewal(
   }
 }
 
-export async function processLeaseEnds() {
+/**
+ * 10/24 (Nic) — ONE LEASE, BECAUSE SOMEBODY IS AT THE COUNTER LEAVING.
+ *
+ * The nightly sweep and the front desk's check-out are the SAME close-out:
+ * expire the lease, take the household off it, free the space, emit the credit
+ * event, and cut the deposit-return draft the landlord finalizes. Giving the
+ * desk its own copy of that would be a second way to do the same thing badly,
+ * so it calls this with the one lease it is closing.
+ *
+ * `theyActuallyLeft` is the difference between the two callers, and it is not a
+ * detail: a tenant-owned dwelling's end date LAPSES when it passes unattended
+ * (see the space-rental gate below — a date nobody chose must never put somebody
+ * off their space). But a clerk pressing Check out is a person saying they are
+ * going, which is the one case Nic said should free the space. So the sweep
+ * passes nothing and the counter passes true.
+ */
+export async function processLeaseEnds(onlyLeaseId?: string | null, theyActuallyLeft = false) {
   try {
     const ended = await query<any>(`
       SELECT l.*, un.id as unit_id_ref, un.unit_number,
@@ -295,7 +311,8 @@ export async function processLeaseEnds() {
       WHERE l.status = 'active'
         AND l.end_date IS NOT NULL
         AND l.end_date <= CURRENT_DATE
-    `)
+        AND ($1::uuid IS NULL OR l.id = $1)
+    `, [onlyLeaseId ?? null])
     for (const lease of ended) {
       // ── 10/24 (Nic, DIRECTIVE) — A RENTED SPACE IS NOT A RENTED HOME ────────
       //
@@ -323,7 +340,7 @@ export async function processLeaseEnds() {
       //
       // Both halves of Nic's rule, in one gate: a lease holds a space
       // indefinitely, and paying ahead is the only other way to lock one out.
-      if (lease.dwelling_ownership === 'tenant') {
+      if (lease.dwelling_ownership === 'tenant' && !theyActuallyLeft) {
         await query(
           `UPDATE leases
               SET end_date = NULL, lease_type = 'month_to_month', updated_at = NOW()

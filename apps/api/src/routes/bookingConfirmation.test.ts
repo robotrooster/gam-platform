@@ -24,7 +24,7 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import fs from 'fs'
 import path from 'path'
-import { db, query } from '../db'
+import { db, query, queryOne } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import { camelCaseKeys } from '../lib/caseConversion'
 
@@ -243,9 +243,68 @@ describe('sending a confirmation', () => {
     const again = await sendConfirmation(f, id)
     expect(again.status).toBe(200)
     expect(again.body.data.deposit.url).toBe(url)
-    const links = await query<any>(`SELECT id FROM pos_pay_links WHERE booking_id = $1`, [id])
-    expect(links).toHaveLength(1)
+    // 10/24 (Nic): the email now carries TWO buttons — the deposit and the whole
+    // stay — so one ask mints two links on purpose ("it's the deposit or the full
+    // amount, no type box"). Asking again must still mint NEITHER a second time,
+    // which a bare count would no longer tell us apart from a duplicate.
+    const links = await query<any>(`SELECT label FROM pos_pay_links WHERE booking_id = $1`, [id])
+    const deposits = links.filter((l: any) => /deposit/i.test(l.label))
+    const wholes = links.filter((l: any) => /whole stay/i.test(l.label))
+    expect(deposits).toHaveLength(1)
+    expect(wholes.length).toBeLessThanOrEqual(1)
+    expect(links).toHaveLength(deposits.length + wholes.length)
     expect(await confirmationLogs()).toHaveLength(2)
+  })
+
+  // ── 10/24 (Nic) — TWO BUTTONS: THE DEPOSIT OR THE WHOLE THING ─────────────
+  //
+  //   "I don't want them to have a type in amount that they pay. There's two
+  //    buttons. They toggle the deposit amount or the full amount, and that's
+  //    it... It's two buttons. It's the deposit or the full amount. No type box."
+  //
+  // A guest who wanted to settle up front had no way to: the deposit link
+  // charges the deposit and no route anywhere lets a payer name a figure.
+  it('mints a whole-stay link beside the deposit, for more money, and offers both', async () => {
+    const f = await seed()
+    const id = await reservation(f)
+    const res = await sendConfirmation(f, id)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+
+    const links = await query<any>(
+      `SELECT label, total::float AS total, token FROM pos_pay_links WHERE booking_id = $1`, [id])
+    const dep = links.find((l: any) => /deposit/i.test(l.label))
+    const whole = links.find((l: any) => /whole stay/i.test(l.label))
+    expect(dep).toBeTruthy()
+    expect(whole).toBeTruthy()
+    // The whole stay is the stay's own total, and it is MORE than the deposit —
+    // two buttons for the same figure would be worse than one.
+    const stay = await queryOne<any>(
+      `SELECT total_amount::float AS total FROM unit_bookings WHERE id = $1`, [id])
+    expect(whole.total).toBeCloseTo(stay.total, 2)
+    expect(whole.total).toBeGreaterThan(dep.total)
+    // Both are real, payable links of their own.
+    expect(whole.token).not.toBe(dep.token)
+  })
+
+  it('offers no second button when the deposit already IS the whole stay', async () => {
+    const f = await seed()
+    // A monthly-tier stay owes the property's FLAT deposit, capped at one
+    // month's rent (S547) — the percentage can only be 5/10/15/20, so this is
+    // the path that can actually make the deposit equal the whole stay. A 30+
+    // night stay totalling exactly the flat deposit leaves nothing more to ask
+    // for, and a second button would be the same number twice.
+    const id = await reservation(f, {
+      check_in: '2027-03-01', check_out: '2027-04-01', nights: 31,
+      total_amount: 150, lease_type: 'month_to_month',
+    })
+    expect((await sendConfirmation(f, id)).status).toBe(200)
+    const links = await query<any>(`SELECT label, total::float AS total FROM pos_pay_links WHERE booking_id = $1`, [id])
+    const whole = links.filter((l: any) => /whole stay/i.test(l.label))
+    const dep = links.filter((l: any) => /deposit/i.test(l.label))
+    // Either there is no second button, or the deposit genuinely asks for less
+    // than the stay — never two buttons for one figure.
+    if (whole.length) expect(whole[0].total).toBeGreaterThan(dep[0].total)
+    else expect(dep.length).toBeGreaterThan(0)
   })
 
   it('quotes the deposit without a card page when there is nowhere to pay the landlord', async () => {

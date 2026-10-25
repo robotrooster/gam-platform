@@ -1844,3 +1844,120 @@ export async function releaseCounterBills(
   }
   return { released: r.rows.length }
 }
+
+/**
+ * ── 10/24 (Nic) — THE CHECKOUT BOX SEARCHES WHO IS *HERE*, NOT ALL OF GAM ────
+ *
+ *   "When I go to the checkout list and go to check somebody out, typing a name
+ *    in that flow is pulling up every customer in GAM right now. Like, it should
+ *    only pull up people that are actually specific to a lease or stay at that
+ *    property."
+ *
+ * The tab was reusing the register's people picker, which is right for a SALE —
+ * a stranger can walk up and buy propane, and the platform-wide search is how
+ * the counter finds them (services/posPeople searchElsewhere). It is wrong for a
+ * CHECK-OUT: you cannot check out somebody who was never here, so every name it
+ * offered beyond this property was noise at best and somebody else's customer at
+ * worst.
+ *
+ * So this searches exactly the population the close-out can act on: people with
+ * a stay or a lease ON THIS PROPERTY. Nothing crosses a company or a park, and
+ * there is no elsewhere leg to disable, because there is no elsewhere.
+ *
+ * Deliberately generous on WHICH stays and leases: a stay that ended last week
+ * still has a final read and a balance to settle, and somebody who moved out
+ * yesterday can still be the person at the counter. Cancelled and no-show stays
+ * are excluded — there was never anybody on the site to check out.
+ */
+export interface CheckoutPersonHit {
+  name: string
+  hint: string
+  tenantId: string | null
+  posCustomerId: string | null
+  email: string | null
+  phone: string | null
+}
+
+export async function checkoutPeopleHere(
+  q: Q, args: { landlordId: string; propertyId: string; typed: string },
+): Promise<CheckoutPersonHit[]> {
+  const typed = String(args.typed ?? '').trim()
+  if (typed.length < 2 || typed.length > 120) return []
+  const like = `%${typed.replace(/[\\%_]/g, (c) => '\\' + c)}%`
+  const digits = digitsOf(typed)
+  // Three or more digits typed is a phone search; fewer is just part of a name.
+  const phoneLike = digits.length >= 3 ? `%${digits}%` : null
+
+  const rows = await q.query<any>(
+    `WITH here AS (
+       -- Everybody on a STAY at this property. A guest with no GAM account is
+       -- named on the booking itself, which is why the booking's own columns
+       -- are read and not only the tenant's.
+       SELECT b.tenant_id,
+              COALESCE(NULLIF(TRIM(b.guest_name), ''),
+                       NULLIF(TRIM(CONCAT_WS(' ', gu.first_name, gu.last_name)), '')) AS name,
+              COALESCE(NULLIF(TRIM(b.guest_email), ''), gu.email) AS email,
+              COALESCE(NULLIF(TRIM(b.guest_phone), ''), gu.phone) AS phone,
+              un.unit_number,
+              'stay'::text AS what,
+              b.check_in AS since
+         FROM unit_bookings b
+         JOIN units un ON un.id = b.unit_id
+         LEFT JOIN tenants gt ON gt.id = b.tenant_id
+         LEFT JOIN users gu ON gu.id = gt.user_id
+        WHERE un.property_id = $2 AND b.landlord_id = $1
+          AND b.status NOT IN ('cancelled', 'no_show')
+       UNION ALL
+       -- Everybody on a LEASE at this property, including one that just ended:
+       -- a move-out still has a final read and a balance to settle.
+       SELECT t.id AS tenant_id,
+              NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS name,
+              u.email, u.phone, un.unit_number,
+              'lease'::text AS what,
+              l.start_date AS since
+         FROM leases l
+         JOIN units un ON un.id = l.unit_id
+         JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.status <> 'void'
+         JOIN tenants t ON t.id = lt.tenant_id
+         JOIN users u ON u.id = t.user_id
+        WHERE un.property_id = $2 AND l.landlord_id = $1
+          AND l.status IN ('active', 'pending', 'expired', 'terminated')
+     )
+     SELECT DISTINCT ON (COALESCE(here.tenant_id::text, lower(here.email), here.name))
+            here.name, here.email, here.phone, here.unit_number, here.what, here.tenant_id
+       FROM here
+      WHERE here.name IS NOT NULL
+        AND (here.name ILIKE $3
+             OR here.email ILIKE $3
+             OR ($4::text IS NOT NULL
+                 AND regexp_replace(COALESCE(here.phone, ''), '\\D', '', 'g') LIKE $4))
+      ORDER BY COALESCE(here.tenant_id::text, lower(here.email), here.name), here.since DESC
+      LIMIT 20`,
+    [args.landlordId, args.propertyId, like, phoneLike])
+
+  // A register record for the same person, so picking them hands the close-out
+  // the id it already understood (it looks them up by tenant or customer).
+  const out: CheckoutPersonHit[] = []
+  for (const r of rows.rows) {
+    let posCustomerId: string | null = null
+    if (!r.tenant_id) {
+      const rec = await q.query<{ id: string }>(
+        `SELECT id FROM pos_customers
+          WHERE landlord_id = $1 AND archived_at IS NULL
+            AND (($2::text IS NOT NULL AND lower(email) = lower($2))
+              OR ($3::text <> '' AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') = $3))
+          ORDER BY created_at LIMIT 1`,
+        [args.landlordId, r.email ?? null, digitsOf(r.phone).slice(-10)])
+      posCustomerId = rec.rows[0]?.id ?? null
+    }
+    out.push({
+      name: r.name,
+      hint: `${r.what === 'lease' ? 'lease' : 'stay'} · ${r.unit_number}`,
+      tenantId: r.tenant_id ?? null,
+      posCustomerId,
+      email: r.email ?? null,
+      phone: r.phone ?? null,
+    })
+  }
+  return out
+}

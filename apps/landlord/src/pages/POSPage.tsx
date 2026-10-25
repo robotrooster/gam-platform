@@ -3870,9 +3870,12 @@ function CheckoutTab({ propertyId, onToTicket }: {
                            onPick={(c)=>{ setPicked(c); setPerson(null); setReadDone(false) }} />
         )}
 
-        <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:6}}>Somebody else</div>
-        <POSCustomerPicker propertyId={propertyId} value={person} sealedPicks
-                           placeholder="Type a name, email or phone"
+        <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:6}}>Somebody else here</div>
+        {/* 10/24 (Nic): hereOnly — "it should only pull up people that are
+            actually specific to a lease or stay at that property." The register's
+            platform-wide search is right for a sale and wrong for a check-out. */}
+        <POSCustomerPicker propertyId={propertyId} value={person} hereOnly
+                           placeholder="Type a name or phone"
                            onChange={(p)=>{ setPerson(p); setPicked(null); setReadDone(false) }} />
       </div>
 
@@ -3917,9 +3920,17 @@ function CheckoutTab({ propertyId, onToTicket }: {
               instead of being left with nowhere to go. */}
           <ClosingReadForm propertyId={propertyId} closing={picked}
                            onDone={(lines, notes)=>{ setReadDone(true); onToTicket(lines, notes, person) }} />
-          {picked.kind === 'stay' && (
+          {picked.kind === 'stay' ? (
             <FinishCheckOut closing={picked} readDone={readDone}
                             onDone={()=>{ setPicked(null); setReadDone(false); void due.refetch() }} />
+          ) : (
+            /* 10/24 (Nic): "if somebody were to move out of an unsubmetered
+               unit, there's no way to check them out through that checkout flow
+               on the point of sale system." A lease used to get the meter form
+               and then nothing — while the master schedule deliberately sent
+               lease check-outs here. */
+            <FinishLeaseMoveOut propertyId={propertyId} closing={picked}
+                                onDone={()=>{ setPicked(null); setReadDone(false); setPerson(null); void due.refetch() }} />
           )}
         </div>
       )}
@@ -3960,6 +3971,69 @@ function CheckoutTab({ propertyId, onToTicket }: {
  * walks to the meter — the two are separate facts and forcing an order on them
  * is how a desk gets stuck.
  */
+/**
+ * 10/24 (Nic) — FINISHING A LEASE MOVE-OUT AT THE COUNTER.
+ *
+ * What the desk may do, in his words:
+ *
+ *   "I think this should be split based on my personal front desk not having
+ *    lease permission. They can do the process to check them out, any invoices
+ *    for remaining balance generated and billed against deposit. Front desk does
+ *    not choose to issue refund without permission, it goes to landlord to
+ *    initiate."
+ *
+ * So this ends the tenancy, frees the space and leaves the deposit return as a
+ * DRAFT — unpaid rent, utilities and move-out fees already swept against the
+ * deposit by the server. It never issues money: the landlord's finalize is what
+ * writes a refund or a gap invoice, and the copy here says so out loud so a
+ * clerk is never left wondering whether they just paid somebody.
+ */
+function FinishLeaseMoveOut({ propertyId, closing, onDone }: {
+  propertyId: string; closing: any; onDone: () => void
+}) {
+  const [confirming, setConfirming] = useState(false)
+  const go = useMutation(
+    () => apiPost(`/pos/checkout/lease/${closing.id}/finish`, { propertyId }),
+    {
+      onSuccess: (r: any) => {
+        const d = r?.data ?? r
+        toastOnce(`${d?.who || 'They'} are moved out of ${d?.unitNumber || 'their space'}.`
+          + (d?.depositReturnId ? ' The deposit return is waiting for the owner.' : ''))
+        onDone()
+      },
+      onError: (e: any) => toastOnce(
+        errorMessage(e, 'The move-out did not go through — check the connection and press it again.'),
+        { error: true }),
+    })
+
+  return (
+    <div style={{marginTop:12}}>
+      <div style={{fontSize:'.78rem',color:'var(--text-2)',lineHeight:1.55,marginBottom:10}}>
+        Ending this lease frees {closing.spaceLabel || 'the space'} and settles what is owed
+        against their deposit. Anything left to pay back to them is the owner's to send —
+        you are not issuing a refund here.
+      </div>
+      {!confirming ? (
+        <button className="btn btn-primary" onClick={()=>setConfirming(true)}>
+          Finish the move-out
+        </button>
+      ) : (
+        <div style={{display:'flex',flexWrap:'wrap',gap:8,alignItems:'center'}}>
+          <span style={{fontSize:'.78rem',color:'var(--text-1)'}}>
+            {closing.who ? `${closing.who} has moved out?` : 'They have moved out?'}
+          </span>
+          <button className="btn btn-primary btn-sm" disabled={go.isLoading}
+                  onClick={()=>go.mutate()}>
+            {go.isLoading ? 'Finishing…' : 'Yes, they are gone'}
+          </button>
+          <button className="btn btn-ghost btn-sm" disabled={go.isLoading}
+                  onClick={()=>setConfirming(false)}>Not yet</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function FinishCheckOut({ closing, readDone, onDone }: {
   closing: any; readDone: boolean; onDone: () => void
 }) {
