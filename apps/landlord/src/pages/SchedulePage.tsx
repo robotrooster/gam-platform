@@ -331,7 +331,7 @@ function GuestAccessModal({ booking, onClose }: { booking: ResvBooking; onClose:
  * words once a refund has gone out. Clicking a locked bar still opens its
  * window — reading a stay is never the thing we take away.
  */
-export type ScheduleBarKind = 'lease' | 'reserved' | 'reserved_paid' | 'checked_in' | 'checked_out' | 'no_show'
+export type ScheduleBarKind = 'lease' | 'reserved' | 'reserved_part_paid' | 'reserved_paid_full' | 'checked_in' | 'checked_out' | 'no_show'
 
 /**
  * 10/24 (Nic) — HAS THIS ONE PAID ME, OR HAVEN'T THEY.
@@ -358,6 +358,31 @@ export function stayIsSecured(booking: any): boolean {
   return !!(booking?.depositPaidAt || booking?.balancePaidAt || booking?.posTransactionId)
 }
 
+/**
+ * 10/24 (Nic) — PAID IN FULL IS ITS OWN COLOUR, AND WHY IT EARNS ONE.
+ *
+ * I argued a third shade did not change anything at the counter, because a
+ * part-paid and a fully-paid reservation both mean "do not give this site
+ * away". Nic:
+ *
+ *   "Both paid in part or paid in full means we can't give the spot away, but
+ *    it does add a distinction that changes what we do at the counter. We don't
+ *    take money at the counter if they're paid in full."
+ *
+ * That is the whole point: the fill tells the desk whether to reach for the
+ * card reader when somebody walks up. Nothing else on the board says it, and
+ * the difference between $15 down on a three-night stay and the whole thing
+ * paid is exactly what a clerk needs before they start asking for money.
+ *
+ * balance_paid_at is the column that MEANS the balance is settled — a register
+ * sale for a stay sets it alongside balance_billed_at (routes/pos), and so does
+ * a pay link that covers the rest. So it is the one thing read here; a deposit
+ * or a register id without it is money in hand with more still owed.
+ */
+export function stayIsPaidInFull(booking: any): boolean {
+  return !!booking?.balancePaidAt
+}
+
 export function scheduleBarKind(booking: any): ScheduleBarKind {
   // A lease row is the one that carries a start date (the schedule's leases
   // come from the lease, stays come from the booking).
@@ -369,7 +394,8 @@ export function scheduleBarKind(booking: any): ScheduleBarKind {
   // Tentative and confirmed are the same thing to the eye: booked, nobody has
   // arrived. (Canceled stays never reach the calendar at all.) What DOES show
   // is whether the money came in — see stayIsSecured above.
-  return stayIsSecured(booking) ? 'reserved_paid' : 'reserved'
+  if (stayIsPaidInFull(booking)) return 'reserved_paid_full'
+  return stayIsSecured(booking) ? 'reserved_part_paid' : 'reserved'
 }
 
 export const SCHEDULE_BAR_COLOR: Record<ScheduleBarKind, string> = {
@@ -381,7 +407,18 @@ export const SCHEDULE_BAR_COLOR: Record<ScheduleBarKind, string> = {
   // the eye. #a855f7 is already GAM's purple in Books, so the platform is not
   // growing a sixth hue, and it is lighter as well as a different hue from the
   // blue lease bar it sits beside. Both values in SCHEDULE_BAR_THEME_CSS below.
-  reserved_paid: 'var(--sched-fill-reserved-paid)',
+  reserved_part_paid: 'var(--sched-fill-reserved-paid)',
+  // 10/24 (Nic): "I don't know if paid in full would be like a lime green type
+  // of color or something, slime green, like that Nickelodeon slime color."
+  //
+  // #a4d233 measured against every other fill before it was picked: 38.8 deltaE
+  // from the checked-in green on the dark theme and 51.8 on the light, 40.8 from
+  // the brand gold — against a 25 threshold, where the green pair Nic could not
+  // tell apart measured 14.9. It is the ONE fill besides the lease bar that does
+  // not flip with the theme: bright with near-black ink reads at 9.3:1 on both,
+  // and every darker lime that could carry white ink landed ~23 from the
+  // checked-in green, which is the collision this board already learned to fear.
+  reserved_paid_full: '#a4d233',
   checked_in: 'var(--green)',
   // 10/18 (review) — WHY FINISHED HISTORY DOES NOT JUST REUSE --green-dim.
   //
@@ -417,7 +454,9 @@ export const SCHEDULE_BAR_COLOR: Record<ScheduleBarKind, string> = {
 export const SCHEDULE_BAR_TEXT: Record<ScheduleBarKind, string> = {
   lease: '#e6ecff',
   reserved: 'var(--sched-ink-reserved)',
-  reserved_paid: 'var(--sched-ink-reserved-paid)',
+  reserved_part_paid: 'var(--sched-ink-reserved-paid)',
+  // Dark ink on a bright fill, in both themes — see the fill above.
+  reserved_paid_full: '#17210a',
   checked_in: 'var(--sched-ink-checked-in)',
   checked_out: 'var(--sched-ink-checked-out)',
   no_show: 'var(--sched-ink-no-show)',
@@ -427,7 +466,8 @@ export const SCHEDULE_BAR_TEXT: Record<ScheduleBarKind, string> = {
 export const SCHEDULE_BAR_SHADOW: Record<ScheduleBarKind, string> = {
   lease: '0 1px 2px rgba(0,0,0,.6)',
   reserved: 'var(--sched-shadow-reserved)',
-  reserved_paid: 'var(--sched-shadow-reserved-paid)',
+  reserved_part_paid: 'var(--sched-shadow-reserved-paid)',
+  reserved_paid_full: '0 1px 2px rgba(255,255,255,.55)',
   checked_in: 'var(--sched-shadow-checked-in)',
   checked_out: 'var(--sched-shadow-checked-out)',
   no_show: 'var(--sched-shadow-no-show)',
@@ -2832,7 +2872,10 @@ export function SchedulePage() {
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--amber)',borderRadius:2,marginRight:4}}/>Booked, nothing paid yet ({BOOKING_STATUS_LABEL.tentative} or {BOOKING_STATUS_LABEL.confirmed})</span>
           {/* Reads the same theme-aware fill the bar does, so the strip cannot
               drift from the board it explains. */}
-          <span><span style={{display:'inline-block',width:12,height:12,background:SCHEDULE_BAR_COLOR.reserved_paid,borderRadius:2,marginRight:4}}/>Booked and paid — deposit, balance or register</span>  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
+          <span><span style={{display:'inline-block',width:12,height:12,background:SCHEDULE_BAR_COLOR.reserved_part_paid,borderRadius:2,marginRight:4}}/>Deposit in — balance still due at arrival</span>  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
+          {/* 10/24 (Nic): the one the desk acts on — "we don't take money at the
+              counter if they're paid in full." */}
+          <span><span style={{display:'inline-block',width:12,height:12,background:SCHEDULE_BAR_COLOR.reserved_paid_full,borderRadius:2,marginRight:4}}/>Paid in full — take no money at the counter</span>  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--green)',borderRadius:2,marginRight:4}}/>{BOOKING_STATUS_LABEL.checked_in}</span>  // wire-ok: a booking-status key on a shared map, not a field off an API response
           {/* The two faded swatches read the same theme-aware fill the bars do,
               so the strip can never drift from the board it explains. */}

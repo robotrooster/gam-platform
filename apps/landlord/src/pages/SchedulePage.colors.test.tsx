@@ -325,7 +325,8 @@ describe('the legend says what the colors mean', () => {
     // statuses stay named on the amber swatch, because both can be unpaid.
     expect(legend).toContain('Booked, nothing paid yet (Tentative or Confirmed)')
     expect(legend).not.toContain('Confirmed — not arrived yet')
-    expect(legend).toContain('Booked and paid')
+    expect(legend).toContain('Deposit in — balance still due')
+    expect(legend).toContain('Paid in full — take no money at the counter')
     expect(legend).toContain('Checked in')
     expect(legend).toContain('Checked out')
     expect(legend).toContain('No-show')
@@ -341,10 +342,15 @@ describe('scheduleBarKind / isScheduleBarLocked', () => {
     // 10/24 (Nic): money in hand splits the amber. All three ways it arrives —
     // the deposit cleared, the whole balance cleared, or they paid at the
     // register on the way in — mean the same thing to the board.
-    expect(scheduleBarKind({ status: 'tentative', depositPaidAt: '2026-10-24T00:00:00Z' })).toBe('reserved_paid')
-    expect(scheduleBarKind({ status: 'confirmed', depositPaidAt: '2026-10-24T00:00:00Z' })).toBe('reserved_paid')
-    expect(scheduleBarKind({ status: 'confirmed', balancePaidAt: '2026-10-24T00:00:00Z' })).toBe('reserved_paid')
-    expect(scheduleBarKind({ status: 'confirmed', posTransactionId: 'd2f1c0de-0000-4000-8000-000000000001' })).toBe('reserved_paid')
+    // Money in hand with more still owed: purple.
+    expect(scheduleBarKind({ status: 'tentative', depositPaidAt: '2026-10-24T00:00:00Z' })).toBe('reserved_part_paid')
+    expect(scheduleBarKind({ status: 'confirmed', depositPaidAt: '2026-10-24T00:00:00Z' })).toBe('reserved_part_paid')
+    expect(scheduleBarKind({ status: 'confirmed', posTransactionId: 'd2f1c0de-0000-4000-8000-000000000001' })).toBe('reserved_part_paid')
+    // 10/24 (Nic): "we don't take money at the counter if they're paid in full."
+    // balance_paid_at is the column that says the balance is settled, so it is
+    // what turns the bar slime — with or without a deposit before it.
+    expect(scheduleBarKind({ status: 'confirmed', balancePaidAt: '2026-10-24T00:00:00Z' })).toBe('reserved_paid_full')
+    expect(scheduleBarKind({ status: 'tentative', depositPaidAt: '2026-10-20T00:00:00Z', balancePaidAt: '2026-10-24T00:00:00Z' })).toBe('reserved_paid_full')
     // A stay somebody has arrived at is green whether it is paid or not — the
     // purple is only ever about an un-arrived reservation.
     expect(scheduleBarKind({ status: 'checked_in', depositPaidAt: '2026-10-24T00:00:00Z' })).toBe('checked_in')
@@ -366,21 +372,26 @@ describe('scheduleBarKind / isScheduleBarLocked', () => {
   it('every kind has a color, and no two live states share one', () => {
     expect(SCHEDULE_BAR_COLOR.lease).toBe('var(--blue)')
     expect(SCHEDULE_BAR_COLOR.reserved).toBe('var(--amber)')
-    expect(SCHEDULE_BAR_COLOR.reserved_paid).toBe('var(--sched-fill-reserved-paid)')  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
+    expect(SCHEDULE_BAR_COLOR.reserved_part_paid).toBe('var(--sched-fill-reserved-paid)')  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
+    expect(SCHEDULE_BAR_COLOR.reserved_paid_full).toBe('#a4d233')  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
     expect(SCHEDULE_BAR_COLOR.checked_in).toBe('var(--green)')  // wire-ok: a booking-status key on a shared map, not a field off an API response
     expect(SCHEDULE_BAR_COLOR.checked_out).toBe('var(--sched-fill-checked-out)')  // wire-ok: a booking-status key on a shared map, not a field off an API response
     expect(SCHEDULE_BAR_COLOR.no_show).toBe('var(--sched-fill-no-show)')  // wire-ok: a booking-status key on a shared map, not a field off an API response
-    expect(new Set(Object.values(SCHEDULE_BAR_COLOR)).size).toBe(6)
+    expect(new Set(Object.values(SCHEDULE_BAR_COLOR)).size).toBe(7)
   })
 
   it('every fill but the lease bar takes its ink from the theme', () => {
     // All of those fills invert between the dark and light themes, so one fixed
     // ink would be unreadable in whichever theme it was not picked for.
-    for (const kind of ['reserved', 'reserved_paid', 'checked_in', 'checked_out', 'no_show'] as const) {
+    for (const kind of ['reserved', 'reserved_part_paid', 'checked_in', 'checked_out', 'no_show'] as const) {
       expect(SCHEDULE_BAR_TEXT[kind]).toMatch(/^var\(--sched-ink-/)
     }
     // Blue is dark in both themes, so it keeps its one light ink.
     expect(SCHEDULE_BAR_TEXT.lease).toMatch(/^#/)
+    // 10/24: the slime fill joined it — bright in both themes, so its dark ink
+    // never flips either. Every darker lime that could carry white ink on the
+    // light theme landed ~23 deltaE from the checked-in green, under threshold.
+    expect(SCHEDULE_BAR_TEXT.reserved_paid_full).toMatch(/^#/)
     expect(SCHEDULE_BAR_THEME_CSS).toContain('--sched-ink-reserved')
     expect(SCHEDULE_BAR_THEME_CSS).toContain(':root[data-theme="light"]')
   })
@@ -473,7 +484,7 @@ const deltaE = (a: string, b: string) => {
   return Math.hypot(A[0] - B[0], A[1] - B[1], A[2] - B[2])
 }
 
-const KINDS = ['lease', 'reserved', 'reserved_paid', 'checked_in', 'checked_out', 'no_show'] as const
+const KINDS = ['lease', 'reserved', 'reserved_part_paid', 'reserved_paid_full', 'checked_in', 'checked_out', 'no_show'] as const
 /** Comfortably above the 14.9 that read as one color, below every real pair. */
 const TELL_APART = 25
 
@@ -510,7 +521,7 @@ describe.each([
     // Blue is the near neighbour, because the lease bars sit on the same grid;
     // gold is not a bar fill at all but it IS what the Today column, the drag
     // preview and every action button wear, so purple has to clear it too.
-    const paid = resolve(SCHEDULE_BAR_COLOR.reserved_paid, tokens)  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
+    const paid = resolve(SCHEDULE_BAR_COLOR.reserved_part_paid, tokens)  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
     const lease = resolve(SCHEDULE_BAR_COLOR.lease, tokens)
     const gold = resolve('var(--gold)', tokens)
     expect(deltaE(paid, lease)).toBeGreaterThan(TELL_APART)
@@ -521,9 +532,21 @@ describe.each([
     // The whole point of the split: these two were ONE amber, and the only way
     // to tell them apart was to open every bar on the board one at a time.
     const unpaid = resolve(SCHEDULE_BAR_COLOR.reserved, tokens)
-    const paid = resolve(SCHEDULE_BAR_COLOR.reserved_paid, tokens)  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
+    const paid = resolve(SCHEDULE_BAR_COLOR.reserved_part_paid, tokens)  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
     expect(unpaid).not.toBe(paid)
     expect(deltaE(unpaid, paid)).toBeGreaterThan(TELL_APART)
+  })
+
+  it('paid in full is plainly not part-paid, nor a guest already on the site', async () => {
+    // 10/24 (Nic): this fill decides whether the desk reaches for the card
+    // reader, so the two it must never be mistaken for are the other purple
+    // reservation and the green of somebody already checked in.
+    const full = resolve(SCHEDULE_BAR_COLOR.reserved_paid_full, tokens)  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
+    const part = resolve(SCHEDULE_BAR_COLOR.reserved_part_paid, tokens)  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
+    const here = resolve(SCHEDULE_BAR_COLOR.checked_in, tokens)  // wire-ok: a booking-status key on a shared map, not a field off an API response
+    expect(deltaE(full, part)).toBeGreaterThan(TELL_APART)
+    expect(deltaE(full, here)).toBeGreaterThan(TELL_APART)
+    expect(deltaE(full, resolve('var(--gold)', tokens))).toBeGreaterThan(TELL_APART)
   })
 
   it('the guest name is readable on every bar', () => {
