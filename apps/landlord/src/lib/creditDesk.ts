@@ -655,11 +655,23 @@ export function postAnchor(q: Pick<DeskQuote, 'anchorOpen' | 'anchorPaymentId' |
   return q.rows[0]?.id ?? q.oldBalance[0]?.id ?? q.bills?.[0]?.rows[0]?.id ?? null
 }
 
-// ─── 10/14 (Nic): the desk picks the bills ──────────────────────────────────
-// "we also need to be able to log each separate bill as one payment ... the
-// only thing I wanted paid together was the itemized lines of that invoice."
-// Each bill is ticked on its own; within one space the oldest bill is paid
-// first (October waits for September); two spaces are independent.
+// ─── THE OPEN BILLS, AS A STATEMENT ────────────────────────────────────────
+//
+// 10/14 (Nic) gave the desk a tick box per bill: "we also need to be able to
+// log each separate bill as one payment ... the only thing I wanted paid
+// together was the itemized lines of that invoice."
+//
+// 10/27 (Nic) took the boxes back out: "that checkbox beside each bill before
+// cash check or money order can turn on, that is something you decided.
+// That's not what I want at all. That's clunky. That adds an extra step to
+// things that just need to be smooth. Disable that checkbox. There's no reason
+// for it to exist." It had just stopped a resident's cash at the counter.
+//
+// So the desk takes the whole balance and the server lands it oldest bill
+// first — the platform's standing rule either way (10/15: "money gets applied
+// to the most outstanding balance first"). What is left here is the grouping
+// that made the bills readable; the choosing is gone, with it
+// canPickBill / togglePick / picksStillOpen / quoteMatchesPick.
 
 /** The open bills, by space, in the quote's order (oldest first). */
 export function billsBySpace(bills: readonly DeskQuoteBill[]): Array<{ key: string; label: string | null; bills: DeskQuoteBill[] }> {
@@ -673,50 +685,59 @@ export function billsBySpace(bills: readonly DeskQuoteBill[]): Array<{ key: stri
   return out
 }
 
-/** A bill may be ticked once every older open bill of its space is. */
-export function canPickBill(b: Pick<DeskQuoteBill, 'olderBillIds'>, picked: readonly string[]): boolean {
-  return b.olderBillIds.every(id => picked.includes(id))
+/**
+ * ── 10/27: THE AMOUNT SAYS WHICH BILLS IT PAYS ──────────────────────────────
+ *
+ * With the tick boxes gone, something still has to answer the question they
+ * answered: a household owing September and October hands over one month's
+ * rent — is that a part payment of their balance (refused where the property
+ * is pay-in-full) or payment in full of September (which is all 10/14's boxes
+ * ever did)?
+ *
+ * The amount answers it. Bills are paid oldest first, so money that comes to
+ * exactly the oldest bill, or the oldest two, or the oldest three, pays those
+ * bills WHOLE and leaves nothing half-paid — no rent part-collected, no
+ * eviction clock reset, which is what the pay-in-full rule protects. Anything
+ * else really is a part payment and the rule still refuses it.
+ *
+ * Returns the ids of the bills the amount clears whole, oldest first — empty
+ * when it clears none of them exactly. services/manualPaymentSettle applies
+ * the same rule server-side; this mirrors it so the window says yes to the
+ * same amounts the server will take.
+ */
+export function billsClearedByAmount(
+  bills: readonly Pick<DeskQuoteBill, 'id' | 'owed'>[] | null | undefined,
+  tenderedCents: number,
+): string[] {
+  if (!bills || bills.length === 0 || tenderedCents <= 0) return []
+  const ids: string[] = []
+  let run = 0
+  for (const b of bills) {
+    run += toCents(b.owed)
+    ids.push(b.id)
+    if (run === tenderedCents) return ids
+    if (run > tenderedCents) return []
+  }
+  return []
 }
 
 /**
- * Tick or untick one bill. Unticking a bill unticks every newer bill of its
- * space too (they wait on it); a bill whose older bills are not ticked is not
- * ticked. Returned in the quote's bill order.
+ * The amounts that DO pay whole bills, oldest first — what the desk can be
+ * told when the amount handed over clears none of them: "$457.07 pays the
+ * September bill, $902.29 pays the first two, $1,272.42 pays all of it."
+ * Every running total, smallest first, the full balance last.
  */
-export function togglePick(bills: readonly DeskQuoteBill[], picked: readonly string[], id: string): string[] {
-  const b = bills.find(x => x.id === id)
-  if (!b) return picked.filter(x => bills.some(y => y.id === x))
-  let next: Set<string>
-  if (picked.includes(id)) {
-    next = new Set(picked.filter(x => x !== id))
-    // Drop everything that (now) waits on a bill not ticked.
-    let changed = true
-    while (changed) {
-      changed = false
-      for (const o of bills) if (next.has(o.id) && !o.olderBillIds.every(x => next.has(x))) { next.delete(o.id); changed = true }
-    }
-  } else {
-    if (!canPickBill(b, picked)) return [...picked]
-    next = new Set([...picked, id])
-  }
-  return bills.filter(x => next.has(x.id)).map(x => x.id)
+export function wholeBillAmountsCents(
+  bills: readonly Pick<DeskQuoteBill, 'owed'>[] | null | undefined,
+): number[] {
+  if (!bills || bills.length === 0) return []
+  const out: number[] = []
+  let run = 0
+  for (const b of bills) { run += toCents(b.owed); out.push(run) }
+  return out
 }
 
-/** The bills still ticked that the quote still lists (a bill paid meanwhile drops off). */
-export function picksStillOpen(bills: readonly DeskQuoteBill[], picked: readonly string[]): string[] {
-  const open = new Set(bills.map(b => b.id))
-  return picked.filter(id => open.has(id))
-}
-
-/** The quote read is for exactly the bills ticked (an older server: always). */
-export function quoteMatchesPick(q: Pick<DeskQuote, 'bills' | 'pickedBillIds'>, picked: readonly string[]): boolean {
-  if (!q.bills) return true
-  const got = [...(q.pickedBillIds ?? [])].sort()
-  const want = [...picked].sort()
-  return got.length === want.length && got.every((x, i) => x === want[i])
-}
-
-/** "September bill" — a bill by its month, for the picker. */
+/** "September bill" — a bill by its month, for the list of bills. */
 export function pickBillName(b: Pick<DeskQuoteBill, 'dueDate'>): string {
   return billName(b.dueDate, 'bill')
 }
@@ -993,6 +1014,24 @@ export function partialPlan(q: DeskQuote, choice: CreditChoice, tenderedC: numbe
 }
 
 /**
+ * What to add to a "that is short" refusal where whole bills WOULD be taken:
+ * the amounts that pay the oldest bill, the oldest two, and so on. Empty when
+ * there is only one bill (the owed figure already says it), or when credit is
+ * being spent (the bills' own figures are not what is owed then).
+ */
+function wholeBillAmountsText(q: DeskQuote, creditUsedCents: number): string {
+  if (creditUsedCents > 0) return ''
+  const bills = q.bills ?? []
+  if (bills.length < 2) return ''
+  const runs = wholeBillAmountsCents(bills)
+  const words = runs.map((c, i) => `${money(toDollars(c))} pays ${
+    i === 0 ? `the ${pickBillName(bills[0])}`
+    : i === runs.length - 1 ? 'all of it'
+    : `the oldest ${i + 1} bills`}`)
+  return ` Whole bills can be taken: ${words.join('; ')}.`
+}
+
+/**
  * THE DESK'S QUESTIONS, ASKED BEFORE RECORD (services/manualPaymentSettle is
  * the authority; this mirrors it so the window asks instead of being refused):
  *   - Use or Save, whenever credit could pay part of the bill (Nic, 10/2);
@@ -1039,9 +1078,16 @@ export function planTender(q: DeskQuote, input: TenderInput): TenderPlan {
   // 10/6 (Nic): the credit goes on the bill even when it pays only part of it
   // and nothing is handed over — the pay-in-full rule is about their own money.
   const creditOnlyPart = tenderedC === 0 && creditUsedC > 0 && tenderedC < owedC
-  if (tenderedC < owedC && !q.partialPaymentsAllowed && !creditOnlyPart) {
+  // 10/27: money that comes to exactly the oldest bill, or the oldest few,
+  // pays those bills whole — not a part payment (billsClearedByAmount). Only
+  // where no credit is being spent: with credit on the bill the amount owed is
+  // no longer the bills' own figures, so the old rule stands and the desk is
+  // asked for the lot.
+  const clearsWholeBills = creditUsedC === 0 && billsClearedByAmount(q.bills, tenderedC).length > 0
+  if (tenderedC < owedC && !q.partialPaymentsAllowed && !creditOnlyPart && !clearsWholeBills) {
     return stop('short',
-      `That is ${money(toDollars(owedC - tenderedC))} short — ${money(toDollars(tenderedC))} against ${money(toDollars(owedC))} owed. Rent is paid in full.`)
+      `That is ${money(toDollars(owedC - tenderedC))} short — ${money(toDollars(tenderedC))} against ${money(toDollars(owedC))} owed. Rent is paid in full.`
+      + wholeBillAmountsText(q, creditUsedC))
   }
   // 10/5 (Nic): the property takes part payments — "there's really no way to
   // stop somebody from going into the bank and making a partial".

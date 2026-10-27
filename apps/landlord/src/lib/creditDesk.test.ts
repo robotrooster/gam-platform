@@ -18,7 +18,7 @@ import {
   postConfirmQuestion, numberRequired, tenantCreditLines, tenantCreditHeadline,
   deskFigures, sameFigures, figuresMovedMessage, payerHits, matchPayerHits, returnDetail, chargeMonthsRange,
   readChargesById, plainRefusal, localToday, calendarDay, localDayOf, awaitingOpensAtWord,
-  billsBySpace, canPickBill, togglePick, picksStillOpen, quoteMatchesPick, pickBillName,
+  billsBySpace, pickBillName, billsClearedByAmount, wholeBillAmountsCents,
   type DeskQuote, type DeskQuoteBill, type DeskQuoteRow, type TenderInput, type OutstandingRow, type PickerLease,
 } from './creditDesk'
 import { PAYMENT_STATUSES, PAYMENT_STATUS_LABEL } from '@gam/shared'
@@ -972,7 +972,7 @@ describe('review fix (10/6): no credit talk while a balance is owed, and no "pai
   })
 })
 
-describe('10/14 (Nic): the desk ticks the bills — each invoice is its own thing', () => {
+describe('10/27 (Nic): the bills are a statement, not a form — no tick boxes', () => {
   // Billy Miranda: RV 34 and RV 35, two leases, a September and an October bill each.
   const b = (id: string, leaseId: string, unit: string, dueDate: string, older: string[] = []): DeskQuoteBill => ({
     id, leaseId, unitNumber: unit, dueDate, total: 100, creditAlreadyApplied: 0, owed: 100, olderBillIds: older,
@@ -989,33 +989,36 @@ describe('10/14 (Nic): the desk ticks the bills — each invoice is its own thin
     expect(pickBillName(bills[2])).toBe('October bill')
   })
 
-  it('October waits for September within a space; the other space is independent', () => {
-    expect(canPickBill(bills[2], [])).toBe(false)
-    expect(canPickBill(bills[2], ['34sep'])).toBe(true)
-    expect(canPickBill(bills[2], ['35sep'])).toBe(false)
-    // A newer bill whose older bill is not ticked stays unticked.
-    expect(togglePick(bills, [], '34oct')).toEqual([])
-    expect(togglePick(bills, [], '34sep')).toEqual(['34sep'])
-    expect(togglePick(bills, ['34sep'], '34oct')).toEqual(['34sep', '34oct'])
-    // RV 35 alone, without touching RV 34.
-    expect(togglePick(bills, [], '35sep')).toEqual(['35sep'])
+  // 10/27: the helpers that decided WHICH bills a payment paid are gone —
+  // canPickBill, togglePick, picksStillOpen, quoteMatchesPick. The desk takes
+  // the whole balance and the server lands it oldest bill first, so there is
+  // nothing left to choose or to keep in step. What stays is the grouping that
+  // makes the bills readable, tested above.
+
+  it('the amount names the bills: a run of whole bills from the oldest, or nothing', () => {
+    // Billy's bills come to 457.07, 445.22 and 370.13 in the quote's order.
+    const b3 = [
+      { id: '34sep', owed: 457.07 }, { id: '35sep', owed: 445.22 }, { id: '34oct', owed: 370.13 },
+    ]
+    expect(billsClearedByAmount(b3, 45707)).toEqual(['34sep'])
+    expect(billsClearedByAmount(b3, 90229)).toEqual(['34sep', '35sep'])
+    expect(billsClearedByAmount(b3, 127242)).toEqual(['34sep', '35sep', '34oct'])
+    // A cent out, a bill left half-paid, or more than the lot: names nothing.
+    expect(billsClearedByAmount(b3, 45706)).toEqual([])
+    expect(billsClearedByAmount(b3, 50000)).toEqual([])
+    expect(billsClearedByAmount(b3, 127243)).toEqual([])
+    // Never a later bill without the ones before it: 445.22 is the SECOND
+    // bill's own figure and pays no run.
+    expect(billsClearedByAmount(b3, 44522)).toEqual([])
+    expect(billsClearedByAmount(b3, 0)).toEqual([])
+    expect(billsClearedByAmount(undefined, 45707)).toEqual([])
+    expect(billsClearedByAmount([], 45707)).toEqual([])
+    // The amounts the desk can be told about.
+    expect(wholeBillAmountsCents(b3)).toEqual([45707, 90229, 127242])
+    expect(wholeBillAmountsCents([])).toEqual([])
   })
 
-  it('unticking a bill unticks the newer bills of its space, and only those', () => {
-    expect(togglePick(bills, ['34sep', '35sep', '34oct', '35oct'], '34sep')).toEqual(['35sep', '35oct'])
-    expect(togglePick(bills, ['34sep', '34oct'], '34oct')).toEqual(['34sep'])
-  })
-
-  it('a ticked bill paid meanwhile drops off; Record waits for a read of exactly the bills ticked', () => {
-    expect(picksStillOpen(bills.slice(1), ['34sep', '35sep'])).toEqual(['35sep'])
-    expect(quoteMatchesPick({ bills, pickedBillIds: ['35sep', '34sep'] }, ['34sep', '35sep'])).toBe(true)
-    expect(quoteMatchesPick({ bills, pickedBillIds: ['34sep'] }, ['34sep', '35sep'])).toBe(false)
-    expect(quoteMatchesPick({ bills, pickedBillIds: [] }, [])).toBe(true)
-    // An older server sends no bills: nothing to match.
-    expect(quoteMatchesPick({ pickedBillIds: undefined }, ['x'])).toBe(true)
-  })
-
-  it('nothing ticked: Record still has a charge to post to, and the reader still lists every space', () => {
+  it('Record has a charge to post to, and the reader still lists every space', () => {
     const q = quote({ rows: [], anchorOpen: false, bills })
     expect(postAnchor(q)).toBe('34sep-rent')
     expect(readerLeases(q).map(x => x.leaseId)).toEqual(['L34', 'L35'])

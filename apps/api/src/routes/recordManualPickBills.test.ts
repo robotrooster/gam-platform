@@ -148,6 +148,90 @@ const statusOf = async (ids: string[]) => (await db.query<{ status: string }>(
 const usesOn = async (ids: string[]) => (await db.query<{ n: string }>(
   `SELECT COUNT(*)::text AS n FROM credit_uses WHERE payment_id = ANY($1::uuid[])`, [ids])).rows[0].n
 
+// ── 10/27: THE TICK BOXES ARE GONE; THE AMOUNT NAMES THE BILLS ──────────────
+//
+// Nic, after the boxes stopped a resident's cash at the counter: "that
+// checkbox beside each bill before cash check or money order can turn on,
+// that is something you decided. That's not what I want at all. That's
+// clunky ... Disable that checkbox. There's no reason for it to exist."
+//
+// The desk names no bills now. Where a property is pay-in-full, an amount
+// that comes to exactly the oldest bill — or the oldest two — pays those
+// bills WHOLE, which is all the boxes ever did, so it is taken. An amount
+// that would leave a bill half-paid is still refused.
+//
+// The gate and the split read the bills in the same order, so an amount the
+// gate lets through always lands on exactly the bills it was measured
+// against. Where two spaces have bills due the SAME day their order is not
+// meaningful, no prefix matches one space's bill alone, and the desk is
+// refused rather than having the money land somewhere it did not mean — that
+// case is the whole balance or the property's part-payment setting.
+describe('10/27: a pay-in-full property takes whole bills by their amount, with no bills named', () => {
+  /** One space, two months: September $457.07 then October $370.13. */
+  async function twoMonths(s: Stack) {
+    return {
+      sep: await bill(s, s.rv34, [{ type: 'rent', amount: 220 }, { type: 'utility', amount: 237.07 }], 43),
+      oct: await bill(s, s.rv34, [{ type: 'rent', amount: 220 }, { type: 'utility', amount: 150.13 }], 13),
+    }
+  }
+
+  it('September alone is taken for its own amount — no bills named, nothing left part-paid', async () => {
+    const s = await stack()                 // accept_partial_payments = FALSE
+    const b = await twoMonths(s)
+    const res = await record(s, b.sep.ids[0], { method: 'cash', amountTendered: 457.07 })
+    expect(res.status).toBe(200)
+    expect(await statusOf(b.sep.ids)).toEqual(['settled', 'settled'])
+    expect(await statusOf(b.oct.ids)).toEqual(['pending', 'pending'])
+  })
+
+  it('both months together are taken as well', async () => {
+    const s = await stack()
+    const b = await twoMonths(s)
+    const res = await record(s, b.sep.ids[0], { method: 'cash', amountTendered: 827.20 })
+    expect(res.status).toBe(200)
+    expect(await statusOf(b.sep.ids)).toEqual(['settled', 'settled'])
+    expect(await statusOf(b.oct.ids)).toEqual(['settled', 'settled'])
+  })
+
+  it('the oldest TWO of three months: taken whole, the newest left open', async () => {
+    const s = await stack()
+    const b = await twoMonths(s)
+    // A third month on the same space, newest of the three.
+    const nov = await bill(s, s.rv34, [{ type: 'rent', amount: 220 }], 1)
+    // 457.07 + 370.13 — less than the 1,047.20 balance, so this is the rule
+    // doing the work and not simply "they paid everything".
+    const res = await record(s, b.sep.ids[0], { method: 'cash', amountTendered: 827.20 })
+    expect(res.status).toBe(200)
+    expect(await statusOf(b.sep.ids)).toEqual(['settled', 'settled'])
+    expect(await statusOf(b.oct.ids)).toEqual(['settled', 'settled'])
+    expect(await statusOf(nov.ids)).toEqual(['pending'])
+  })
+
+  it('an amount that would leave October half-paid is still refused, and nothing is recorded', async () => {
+    const s = await stack()
+    const b = await twoMonths(s)
+    const res = await record(s, b.sep.ids[0], { method: 'cash', amountTendered: 600 })
+    expect(res.status).toBe(422)
+    expect(res.body.error).toContain('Rent is paid in full')
+    expect(await statusOf(b.sep.ids)).toEqual(['pending', 'pending'])
+    expect(await statusOf(b.oct.ids)).toEqual(['pending', 'pending'])
+  })
+
+  it('a cent out is refused: it is not a whole bill', async () => {
+    const s = await stack()
+    const b = await twoMonths(s)
+    expect((await record(s, b.sep.ids[0], { method: 'cash', amountTendered: 457.06 })).status).toBe(422)
+    expect((await record(s, b.sep.ids[0], { method: 'cash', amountTendered: 457.08 })).status).toBe(422)
+    expect(await statusOf(b.sep.ids)).toEqual(['pending', 'pending'])
+  })
+
+  it('where the property takes part payments nothing changed: any amount is still taken', async () => {
+    const s = await stack({ partial: true })
+    const b = await twoMonths(s)
+    expect((await record(s, b.sep.ids[0], { method: 'cash', amountTendered: 600 })).status).toBe(200)
+  })
+})
+
 describe('the desk lists every open bill, by space, and picks none', () => {
   it('nothing picked: every bill listed with the older bills of its space; nothing is being paid yet', async () => {
     const s = await stack()

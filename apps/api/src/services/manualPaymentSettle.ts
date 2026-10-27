@@ -541,6 +541,32 @@ const spaceNumber = (q: Pick<DeskQuote, 'bills'>, leaseId: string): string | nul
   q.bills.find(b => b.leaseId === leaseId)?.unitNumber ?? null
 
 /**
+ * The bills an amount clears WHOLE, oldest first — empty when it clears none
+ * of them exactly. 10/27: this is what replaced the desk's tick boxes, so the
+ * window (lib/creditDesk billsClearedByAmount) mirrors it exactly; the two
+ * must agree or the desk is offered an amount the server then refuses.
+ *
+ * A bill's owed is what its rows still owe after any credit already applied
+ * (owedOn, the same map the split below spends).
+ */
+export function billsClearedByAmount(
+  bills: readonly DeskBill[],
+  owedOn: ReadonlyMap<string, number>,
+  tenderedCents: number,
+): string[] {
+  if (bills.length === 0 || tenderedCents <= 0) return []
+  const ids: string[] = []
+  let run = 0
+  for (const b of bills) {
+    run += b.rows.reduce((t, r) => t + (owedOn.get(r.id) ?? 0), 0)
+    ids.push(b.id)
+    if (run === tenderedCents) return ids
+    if (run > tenderedCents) return []
+  }
+  return []
+}
+
+/**
  * 10/14 (Nic): why the bills picked cannot be taken as they are — a picked
  * bill no longer open here (409: look at the bills again), or one an older
  * open bill of its space waits on (422: "October waits for September").
@@ -1271,7 +1297,28 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   // goes on the oldest lines first (the plan), part of a line where it runs
   // out, and the rest stays owed.
   const creditOnlyPart = partial && tendered === 0 && useCredit && creditUsed > 0
-  if (partial && !q.partialAllowed && !creditOnlyPart) {
+  // ── 10/27 (Nic): THE AMOUNT SAYS WHICH BILLS IT PAYS ──────────────────────
+  //
+  // 10/14 gave the desk a tick box per bill so it could log "each separate
+  // bill as one payment". 10/27 took the boxes out — "That's clunky. That adds
+  // an extra step to things that just need to be smooth" — after they stopped
+  // a resident's cash at the counter.
+  //
+  // Something still has to answer what the boxes answered: a household owing
+  // September and October hands over one month's rent. Where the property is
+  // pay-in-full, is that refused as a part payment, or taken as September paid
+  // in full? The AMOUNT answers it. Bills are paid oldest first (the split
+  // below), so money coming to exactly the oldest bill — or the oldest two, or
+  // three — pays those bills WHOLE. Nothing is left half-paid, no rent is part
+  // collected and no eviction clock is reset, which is the whole point of the
+  // pay-in-full rule. Anything else is a real part payment and is still
+  // refused.
+  //
+  // Only where no credit is being spent: with credit on the bill, what is owed
+  // is no longer the bills' own figures, so the plain rule stands.
+  const clearsWholeBills = !partial ? false
+    : creditUsed === 0 && tendered > 0 && billsClearedByAmount(q.bills, owedOn, tendered).length > 0
+  if (partial && !q.partialAllowed && !creditOnlyPart && !clearsWholeBills) {
     throw new AppError(422,
       `That is ${money(owed - tendered)} short — ${money(tendered)} against ${money(owed)} owed. Rent is paid in full.`)
   }

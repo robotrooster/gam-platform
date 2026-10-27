@@ -11,6 +11,7 @@ import {
 } from '../services/rentRoll'
 import { AppError } from '../middleware/errorHandler'
 import { chargeLabelColumnsSql, chargeLabel, chargeDetail } from '../services/invoiceNotice'
+import { openBillsFor, NOT_ON_A_BILL as OPEN_BILLS_NOT_ON_A_BILL } from '../services/openBills'
 import { tenantLivesHereSql } from '../services/posPeople'
 import { askingAs, bookCaller } from '../services/registerBook'
 import { landlordScopeIds } from '../lib/landlordScope'
@@ -429,7 +430,8 @@ balancesRouter.get('/rent-roll/history', requirePerm('payments.view_all'), async
 })
 
 /** The group a charge on no invoice is shown under (a counter charge, a carried balance). */
-export const NOT_ON_A_BILL = 'Not on a bill'
+/** The group a charge on no invoice is shown under. One definition: services/openBills. */
+export const NOT_ON_A_BILL = OPEN_BILLS_NOT_ON_A_BILL
 
 /**
  * GET /api/balances/:tenantId/invoices — S634 (Nic, DIRECTIVE).
@@ -458,137 +460,23 @@ export const NOT_ON_A_BILL = 'Not on a bill'
  */
 balancesRouter.get('/:tenantId/invoices', requirePerm('balances.view'), async (req, res, next) => {
   try {
-    const landlordIds = landlordScopeIds(req.user!)
-    const scopedIds = await getScopedPropertyIds(req.user)
-    // S641 (Nic): "I don't want her to see the covered by work trade." A
-    // work-trade arrangement is between the landlord and that resident; the
-    // front desk needs the amount owed, not the private terms behind it.
-    // Stripped from the RESPONSE rather than hidden on the screen — a figure
-    // (or a line saying "Work trade — suspended") that never leaves the server
-    // cannot be read out of a network tab. What is owed never included those
-    // lines anyway (openBalanceSql), so the desk still sees the right number.
-    const seesWorkTrade = userHasPerm(req.user, 'payments.view_all', 'books.view')
-
-    // Every charge of this person's with these companies, on a bill that still
-    // has something owed (or owed itself with no bill).
-    const lines = await query<any>(`
-      WITH mine AS (
-        SELECT p.*, inv.tenant_id AS inv_tenant_id
-          FROM payments p
-          LEFT JOIN invoices inv ON inv.id = p.invoice_id
-          LEFT JOIN units u ON u.id = p.unit_id
-         WHERE COALESCE(p.tenant_id, inv.tenant_id) = $1
-           AND p.landlord_id = ANY($2::uuid[])
-           AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
-           -- GAM's FlexPay pull is the tenant's arrangement with GAM: it never
-           -- appears anywhere a landlord or their staff can see (CLAUDE.md).
-           AND p.entry_description IS DISTINCT FROM 'FLEXPAY'
-           -- 10/12 (Nic, G9): a voided line (owed by nobody, kept as a record)
-           -- is not one of the bill's lines here; it stays on file and in the
-           -- full history.
-           AND p.status <> 'voided'
-      ),
-      open_bills AS (
-        SELECT DISTINCT m.invoice_id FROM mine m
-         WHERE m.invoice_id IS NOT NULL AND ${openBalanceSql('m')} AND ${openAmountSql('m')} > 0
-      )
-      SELECT m.invoice_id, m.id, m.type, m.entry_description, m.amount, m.status,
-             to_char(m.due_date, 'YYYY-MM-DD') AS due_date, m.notes,
-             (m.work_trade_suspended_at IS NOT NULL) AS work_trade,
-             ${openBalanceSql('m')} AS open,
-             CASE WHEN ${openBalanceSql('m')} THEN ${openAmountSql('m')} ELSE 0 END AS open_amount,
-             -- 10/6 (Nic): credit already applied to the line (whole or part).
-             (SELECT COALESCE(SUM(cu.amount), 0) FROM credit_uses cu
-               WHERE cu.payment_id = m.id AND cu.status = 'applied') AS credit_applied,
-             ${chargeLabelColumnsSql('m')}
-        FROM mine m
-       WHERE m.invoice_id IN (SELECT invoice_id FROM open_bills)
-          OR (m.invoice_id IS NULL AND ${openBalanceSql('m')} AND ${openAmountSql('m')} > 0)
-       ORDER BY m.due_date ASC, m.type ASC, m.created_at ASC`,
-      [req.params.tenantId, landlordIds, scopedIds])
-    if (lines.length === 0) return res.json({ success: true, data: [] })
-
-    const invoiceIds = [...new Set(lines.map((l: any) => l.invoice_id).filter(Boolean))]
-    const invoices = invoiceIds.length === 0 ? [] : await query<any>(`
-      SELECT i.id, i.invoice_number, to_char(i.due_date, 'YYYY-MM-DD') AS due_date, i.status,
-             -- S641 (Nic): "when somebody goes on their history from last year
-             -- that it shows that they were in that spot at that time." An
-             -- invoice renders the number the space carried on its own due
-             -- date, not whatever it was renamed to since.
-             unit_number_on(i.unit_id, i.due_date) AS unit_number_then,
-             i.subtotal_rent, i.subtotal_fees, i.subtotal_utilities,
-             i.subtotal_deposits, i.subtotal_late_fees,
-             i.work_trade_credit_amount,
-             u.unit_number, pr.name AS property_name
-        FROM invoices i
-        LEFT JOIN units u       ON u.id  = i.unit_id
-        LEFT JOIN properties pr ON pr.id = u.property_id
-       WHERE i.id = ANY($1::uuid[])
-       ORDER BY i.due_date ASC, i.invoice_number ASC`, [invoiceIds])
-
-    // 10/6 (Nic): "Credits need to not settle by line item. It needs to be a
-    // credit against the entire balance." A line is shown at what it is; the
-    // credit on the bill is ONE figure under the lines (credit_applied), and
-    // money paid is another (amount_paid) — never a line marked "covered by
-    // prepaid credit … collected by the landlord" (the raw note is not the
-    // line's words: label and detail are, payment tags stripped).
-    const shape = (l: any) => ({
-      id: l.id, type: l.type, entry_description: l.entry_description,
-      amount: l.amount, status: l.status, due_date: l.due_date, notes: l.notes,
-      label: chargeLabel(l), detail: chargeDetail(l),
-      open: l.open === true,
-      credit_applied: Number(l.credit_applied ?? 0),
-      // Money (not credit) that paid it: settled, clearing, or taken from the deposit.
-      paid: Math.round(moneyPaidOf(l) * 100) / 100,
+    // 10/27: the query that builds these bills now lives in
+    // services/openBills, so the printed sheet (GET /bills-to-print) and this
+    // page cannot drift apart about what a bill says. The contract and the
+    // reasoning behind every piece of it moved with it.
+    const { bills } = await openBillsFor({
+      tenantIds: [req.params.tenantId],
+      landlordIds: landlordScopeIds(req.user!),
+      scopedPropertyIds: await getScopedPropertyIds(req.user),
+      // S641 (Nic): "I don't want her to see the covered by work trade." A
+      // work-trade arrangement is between the landlord and that resident; the
+      // front desk needs the amount owed, not the private terms behind it.
+      // Stripped from the RESPONSE rather than hidden on the screen — a figure
+      // (or a line saying "Work trade — suspended") that never leaves the server
+      // cannot be read out of a network tab. What is owed never included those
+      // lines anyway (openBalanceSql), so the desk still sees the right number.
+      seesWorkTrade: userHasPerm(req.user, 'payments.view_all', 'books.view'),
     })
-    const visible = (l: any) => seesWorkTrade || !l.work_trade
-    const money = (xs: any[], f: (l: any) => number) =>
-      Math.round(xs.reduce((s, l) => s + Math.round(f(l) * 100), 0)) / 100
-    // Money that came in on it: settled, still clearing, or taken from the deposit.
-    const paidOf = (l: any) => (!l.work_trade && ['settled', 'processing', 'paid_via_deposit'].includes(l.status)) ? Number(l.amount) : 0
-    // Of that, what money paid (credit applied to a paid line is not money paid).
-    const moneyPaidOf = (l: any) => paidOf(l) > 0 ? Math.max(0, paidOf(l) - Number(l.credit_applied ?? 0)) : 0
-    // Credit applied to the line, whether the line is paid or still open in part.
-    const creditOf = (l: any) => l.work_trade ? 0 : Number(l.credit_applied ?? 0)
-
-    const data: any[] = invoices.map((i: any) => {
-      const mine = lines.filter((l: any) => l.invoice_id === i.id)
-      const balance = money(mine, l => Number(l.open_amount))
-      const amountPaid = money(mine, moneyPaidOf)
-      const creditApplied = money(mine, creditOf)
-      const row: any = {
-        ...i,
-        // Money paid on it (cash, check, card, bank) — never the credit.
-        amount_paid: amountPaid,
-        // 10/6 (Nic): the credit applied against this bill, as one figure.
-        credit_applied: creditApplied,
-        balance,
-        // What this bill comes to now: what was paid on it, the credit applied,
-        // and what it still owes (late fees included, which the invoice's own
-        // total never was).
-        total_amount: Math.round((amountPaid + creditApplied + balance) * 100) / 100,
-        lines: mine.filter(visible).map(shape),
-      }
-      if (!seesWorkTrade) {
-        delete row.work_trade_credit_amount
-        delete row.work_trade_credit_hours
-      }
-      return row
-    })
-    const loose = lines.filter((l: any) => !l.invoice_id)
-    if (loose.length) {
-      const balance = money(loose, l => Number(l.open_amount))
-      data.push({
-        id: 'not-on-a-bill',
-        invoice_number: NOT_ON_A_BILL,
-        due_date: loose[0].due_date,
-        status: 'pending',
-        unit_number_then: null, unit_number: null, property_name: null,
-        amount_paid: money(loose, moneyPaidOf), credit_applied: money(loose, creditOf), balance,
-        total_amount: Math.round((money(loose, moneyPaidOf) + money(loose, creditOf) + balance) * 100) / 100,
-        lines: loose.filter(visible).map(shape),
-      })
-    }
-    res.json({ success: true, data })
+    res.json({ success: true, data: bills })
   } catch (e) { next(e) }
 })

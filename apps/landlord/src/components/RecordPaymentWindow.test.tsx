@@ -1132,8 +1132,61 @@ describe('a card waiting on its bank is said on its own line at the desk', () =>
   })
 })
 
-describe('10/14 (Nic): each bill is its own thing — the desk ticks the bills', () => {
-  // Billy Miranda: RV 34 and RV 35 on two leases.
+// ── 10/27: NO TICK BOXES AT THE DESK ────────────────────────────────────────
+//
+// 10/14 gave each bill a tick box. On 10/27 it stopped a resident's cash:
+// "the front desk buttons are not working ... The only button working is the
+// card on the reader button, and Lisa Scheeler has cash for her trailer
+// payment." Every way of paying by hand waited on a box; the reader button was
+// the only one that never did.
+//
+// Nic's call: "that checkbox beside each bill before cash check or money order
+// can turn on, that is something you decided. That's not what I want at all.
+// That's clunky. That adds an extra step to things that just need to be
+// smooth. Disable that checkbox. There's no reason for it to exist."
+//
+// So the desk takes the whole balance, the server lands it oldest bill first,
+// and the bills are shown as a statement of what the money covered.
+describe('10/27: the desk takes the balance — no bills to tick', () => {
+  const BILL = '2f34d230-b6ae-47cb-a603-f529f4016cf4'
+  const ROW  = '3a2e0585-9ed5-4ebc-929c-55f3830b89fe'
+  const lisaRow = {
+    id: ROW, leaseId: 'LMH1', invoiceId: BILL, type: 'home_payment', entryDescription: 'HOMEPMT',
+    amount: 333.33, dueDate: '2026-10-10', creditAlreadyApplied: 0, creditIfUsed: 0,
+    notes: 'Home payment 1 of 34', unitNumber: 'MH 01', propertyName: 'Mountain View RV Ranch',
+  }
+  const lisaBill = {
+    id: BILL, leaseId: 'LMH1', unitNumber: 'MH 01', dueDate: '2026-10-10',
+    total: 333.33, creditAlreadyApplied: 0, owed: 333.33, olderBillIds: [], rows: [lisaRow],
+  }
+
+  it("Lisa's trailer payment: nothing to tick, Cash is live, and the cash records", async () => {
+    server.quote = deskQuote(0, {
+      rows: [lisaRow], currentTotal: 333.33, owedIfUsed: 333.33, owedIfSaved: 333.33,
+      fullBalance: 333.33, bills: [lisaBill], pickedBillIds: null, bankDepositAllowed: false,
+    })
+    await open()
+    // No box, no instruction to find one.
+    expect(host.querySelector('input[type=checkbox]')).toBeNull()
+    expect(text()).not.toContain('Tick the bills')
+    // The bill is read whole: no ?bills= on the read at all.
+    expect(server.gets.filter(u => u.includes('/record-manual/quote')))
+      .toEqual(['/payments/r1/record-manual/quote'])
+    // Live the moment the window opens, with the bill's own figures on screen.
+    expect(button(/^Cash$/)!.disabled).toBe(false)
+    expect(text()).toContain('Home payment')
+    expect(text()).toContain('$333.33')
+
+    await press(/^Cash$/)
+    await type(amountBox(), '333.33')
+    await press(/^Record \$333\.33/)
+    await until(() => records().length === 1, 'the cash recorded')
+    expect(records()[0]).toMatchObject({ method: 'cash', amountTendered: 333.33 })
+    // Nothing names bills any more — the server decides where it lands.
+    expect(records()[0].bills).toBeUndefined()
+  })
+
+  // Billy Miranda: RV 34 and RV 35 on two leases, three open bills between them.
   const line = (id: string, leaseId: string, unit: string, dueDate: string, amount: number, invoiceId: string) => ({
     id, leaseId, invoiceId, type: 'rent', entryDescription: 'RENT', amount, dueDate,
     creditAlreadyApplied: 0, notes: null, unitNumber: unit, propertyName: 'Oak Park',
@@ -1147,56 +1200,67 @@ describe('10/14 (Nic): each bill is its own thing — the desk ticks the bills',
     bill('35sep', 'L35', 'RV 35', '2026-09-01', 445.22),
     bill('34oct', 'L34', 'RV 34', '2026-10-01', 370.13, ['34sep']),
   ]
-  /** The server's quote for the bills named in ?bills=. */
-  const forUrl = (url: string) => {
-    const named = (/[?&]bills=([^&]*)/.exec(url)?.[1] ?? '').split(',').filter(Boolean)
-    const rows = bills.filter(b => named.includes(b.id)).flatMap(b => b.rows)
-    const current = Math.round(rows.reduce((t, r) => t + r.amount * 100, 0)) / 100
-    return deskQuote(0, {
-      rows, currentTotal: current, owedIfUsed: current, owedIfSaved: current, fullBalance: 1272.42,
-      bills, pickedBillIds: bills.filter(b => named.includes(b.id)).map(b => b.id), pickRefusal: null,
+
+  it('several bills across two spaces: all of them listed and taken together, still no boxes', async () => {
+    const rows = bills.flatMap(b => b.rows)
+    server.quote = deskQuote(0, {
+      rows, currentTotal: 1272.42, owedIfUsed: 1272.42, owedIfSaved: 1272.42,
+      fullBalance: 1272.42, bills, pickedBillIds: null,
     })
-  }
-  const box = (unit: string, month: string) => {
-    const group = [...host.querySelectorAll('.cd-bill-group')].find(g => g.textContent?.includes(`Space ${unit}`))
-    const label = [...(group?.querySelectorAll('label.cd-check') ?? [])].find(l => l.textContent?.startsWith(`${month} bill`))
-    return label?.querySelector('input[type=checkbox]') as HTMLInputElement | undefined
-  }
-
-  it('nothing is ticked for the desk; October waits for September; RV 34 alone is recorded with its bills named', async () => {
-    server.quoteFor = forUrl
     await open()
-    expect(server.gets.find(u => u.includes('/record-manual/quote'))).toBe('/payments/r1/record-manual/quote?bills=')
-    expect(text()).toContain('Tick the bills this money pays.')
-    expect(box('RV 34', 'September')!.checked).toBe(false)
-    expect(box('RV 35', 'September')!.checked).toBe(false)
-    expect(box('RV 34', 'October')!.disabled).toBe(true)
-    expect(text()).toContain('Tick the September bill first — the oldest bill is paid first.')
-    expect(button(/^Cash$/)!.disabled).toBe(true)
+    expect(host.querySelectorAll('input[type=checkbox]').length).toBe(0)
+    expect(text()).not.toContain('Tick the bills')
+    // Each bill named under its own space, oldest first — a statement to read out.
+    expect(text()).toContain('Space RV 34')
+    expect(text()).toContain('Space RV 35')
+    expect(text()).toContain('September bill')
+    expect(text()).toContain('October bill')
+    expect(text()).toContain('These bills')
+    expect(button(/^Cash$/)!.disabled).toBe(false)
 
-    await act(async () => { box('RV 34', 'September')!.click() })
-    await until(() => server.gets.includes('/payments/r1/record-manual/quote?bills=34sep'), 'the bill read for RV 34\'s September')
-    await until(() => !box('RV 34', 'October')!.disabled, 'October open once September is ticked')
-    await act(async () => { box('RV 34', 'October')!.click() })
-    await until(() => server.gets.includes('/payments/r1/record-manual/quote?bills=34sep,34oct'), 'the bill read for both RV 34 bills')
-    await until(() => text().includes('$827.20'), 'the total of the bills ticked')
     await press(/^Cash$/)
-    await type(amountBox(), '827.20')
-    await press(/^Record \$827\.20/)
+    await type(amountBox(), '1272.42')
+    await press(/^Record \$1,?272\.42/)
     await until(() => records().length === 1, 'the record')
-    expect(records()[0]).toMatchObject({ method: 'cash', amountTendered: 827.2, bills: ['34sep', '34oct'] })
+    expect(records()[0]).toMatchObject({ method: 'cash', amountTendered: 1272.42 })
+    expect(records()[0].bills).toBeUndefined()
   })
 
-  it('unticking September unticks October too, and nothing left ticked puts the method away', async () => {
-    server.quoteFor = forUrl
+  // What the boxes used to do, done by the amount instead: the bills are paid
+  // oldest first, so one month's rent pays that month's bill whole.
+  const threeBills = () => deskQuote(0, {
+    rows: bills.flatMap(b => b.rows), currentTotal: 1272.42, owedIfUsed: 1272.42,
+    owedIfSaved: 1272.42, fullBalance: 1272.42, bills, pickedBillIds: null,
+    partialPaymentsAllowed: false,
+  })
+
+  it("one space's September rent is taken where the property is pay-in-full — the amount names the bill", async () => {
+    server.quote = threeBills()
     await open()
-    await act(async () => { box('RV 34', 'September')!.click() })
-    await until(() => !box('RV 34', 'October')!.disabled, 'October open')
-    await act(async () => { box('RV 34', 'October')!.click() })
     await press(/^Cash$/)
-    await act(async () => { box('RV 34', 'September')!.click() })
-    await until(() => !box('RV 34', 'October')!.checked && box('RV 34', 'October')!.disabled, 'October unticked with September')
-    expect(button(/^Record /)).toBeUndefined()
-    expect(button(/^Cash$/)!.disabled).toBe(true)
+    await type(amountBox(), '457.07')
+    await press(/^Record \$457\.07/)
+    await until(() => records().length === 1, 'September taken on its own')
+    expect(records()[0]).toMatchObject({ method: 'cash', amountTendered: 457.07 })
+  })
+
+  it('the oldest two bills together are taken as well', async () => {
+    server.quote = threeBills()
+    await open()
+    await press(/^Cash$/)
+    await type(amountBox(), '902.29')
+    await until(() => !!button(/^Record \$902\.29/) && !button(/^Record \$902\.29/)!.disabled, 'both September bills')
+  })
+
+  it('an amount that leaves a bill half-paid is still refused, and says which amounts work', async () => {
+    server.quote = threeBills()
+    await open()
+    await press(/^Cash$/)
+    await type(amountBox(), '500.00')
+    await until(() => text().includes('That is $772.42 short'), 'the pay-in-full refusal')
+    expect(text()).toContain('Whole bills can be taken: $457.07 pays the September bill')
+    expect(text()).toContain('$902.29 pays the oldest 2 bills')
+    expect(text()).toContain('$1,272.42 pays all of it')
+    expect(button(/^Record /)!.disabled).toBe(true)
   })
 })
