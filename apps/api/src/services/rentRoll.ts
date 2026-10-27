@@ -237,9 +237,10 @@ export async function rentRollProperties(opts: {
   cutoffs?: readonly PropertyCutoff[] | null
 }): Promise<RentRollProperty[]> {
   if (!opts.landlordIds.length) return []
-  const rows = await query<{ id: string; name: string; spaces: number; owned: boolean }>(`
+  const rows = await query<{ id: string; name: string; spaces: number; owned: boolean; paper_bills: boolean }>(`
     WITH ${VIEWABLE_PROPERTIES_CTE}
     SELECT pr.id, pr.name, (pr.landlord_id = ANY($1::uuid[])) AS owned,
+           COALESCE(pr.print_all_bills, FALSE) AS paper_bills,
            (SELECT COUNT(*) FROM units u WHERE u.property_id = pr.id AND u.retired_at IS NULL)::int AS spaces
       FROM properties pr
       JOIN viewable v ON v.id = pr.id
@@ -248,6 +249,8 @@ export async function rentRollProperties(opts: {
     propertyId: r.id, name: r.name, spaces: Number(r.spaces) || 0,
     // A former property of a bookkeeper's is history only (rentRollProperty).
     owned: r.owned === true && !opts.cutoffs?.some(c => c.propertyId === r.id),
+    // 10/27: does this property hand deliver its bills?
+    paperBills: r.paper_bills === true,
   }))
 }
 

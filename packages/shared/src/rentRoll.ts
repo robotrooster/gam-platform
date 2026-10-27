@@ -186,6 +186,12 @@ export interface RentRollProperty {
    * there; it has no open month (the Payments page answers 404 for it).
    */
   owned: boolean
+  /**
+   * 10/27 (Nic): this property hand delivers paper bills
+   * (properties.print_all_bills). The Payments page shows "Print all
+   * outstanding" for it; a property that does not, does not see the button.
+   */
+  paperBills: boolean
 }
 
 /** A resident on the household's lease (primary first). */

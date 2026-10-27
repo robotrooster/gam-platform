@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { query } from '../db'
+import { query, queryOne } from '../db'
 import {
   listOpenTenantBalances, openBalanceSql, openAmountSql, outstandingTotals, seesGrandTotals,
   OUTSTANDING_ROW_STATUS_LABEL,
@@ -458,6 +458,141 @@ export const NOT_ON_A_BILL = OPEN_BILLS_NOT_ON_A_BILL
  * Same scope and the same property lock as the list itself: an account's own
  * companies' charges, and a property-scoped worker sees only their assignments.
  */
+/**
+ * ── 10/27 (Nic): PAPER BILLS ────────────────────────────────────────────────
+ *
+ *   "It's a setting on the landlord page, a property level setting. Do you want
+ *    to print paper copies of the bills when these are generated? Make it
+ *    easier. Just make a button on each invoice that can be printed and make it
+ *    where there's a quick print all outstanding button."
+ *
+ * Why it exists at all, from 10/26: landlords who hand-deliver bills to doors on
+ * the first of the month — "especially where utilities are billed back and they
+ * don't exactly know what their bill is going to be."
+ *
+ * GET /api/balances/bills-to-print?propertyId=…            every open bill there
+ * GET /api/balances/bills-to-print?tenantId=…               one household's
+ * GET /api/balances/bills-to-print?tenantId=…&invoiceId=…   one bill, on its own
+ *
+ * The property is derived from the resident when it is not named, so the button
+ * ON a bill needs nothing but the bill.
+ *
+ * The bills themselves come from services/openBills — the same query the
+ * on-screen breakdown reads, so the sheet in somebody's hand and the screen
+ * behind the counter can never disagree about a late fee. Each line already
+ * carries its own words (`detail`), which is where the meter read lives, and
+ * that is the whole reason these get hand-delivered.
+ *
+ * Scope: the same permission and property lock as the balances list itself.
+ */
+balancesRouter.get('/bills-to-print', requirePerm('payments.view_all', 'balances.view'), async (req, res, next) => {
+  try {
+    const q = z.object({
+      propertyId: z.string().uuid('Pick a property.').optional(),
+      tenantId: z.string().uuid().optional(),
+      invoiceId: z.string().uuid().optional(),
+    }).safeParse(req.query)
+    if (!q.success) throw new AppError(400, q.error.issues[0]?.message ?? 'Pick a property.')
+    if (!q.data.propertyId && !q.data.tenantId) throw new AppError(400, 'Pick a property.')
+
+    const landlordIds = landlordScopeIds(req.user!)
+    const scopedIds = await getScopedPropertyIds(req.user)
+    // The button ON a bill knows the resident, not the park. Derive it from
+    // where they owe, then put it through the SAME scope check as a named one —
+    // deriving an id must never be a way around the property lock.
+    const propertyId = q.data.propertyId ?? (await queryOne<{ id: string }>(
+      `SELECT DISTINCT un.property_id AS id
+         FROM payments p
+         LEFT JOIN invoices inv ON inv.id = p.invoice_id
+         JOIN units un ON un.id = p.unit_id
+        WHERE COALESCE(p.tenant_id, inv.tenant_id) = $1
+          AND p.landlord_id = ANY($2::uuid[])
+        LIMIT 1`, [q.data.tenantId, landlordIds]))?.id
+    if (!propertyId) throw new AppError(404, 'There is nothing to print for them.')
+    const property = await rentRollPropertyFor(req, propertyId)
+
+    // Who has something open at this property. One household per lease — the
+    // bill is the household's, and a co-tenant must not produce a second sheet
+    // for the same bill.
+    const people = await query<{ tenant_id: string; name: string; unit_number: string | null; lease_id: string | null }>(
+      `SELECT DISTINCT ON (COALESCE(p.lease_id::text, p.tenant_id::text))
+              COALESCE(p.tenant_id, inv.tenant_id) AS tenant_id,
+              TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS name,
+              un.unit_number, p.lease_id
+         FROM payments p
+         LEFT JOIN invoices inv ON inv.id = p.invoice_id
+         LEFT JOIN units un ON un.id = p.unit_id
+         LEFT JOIN tenants t ON t.id = COALESCE(p.tenant_id, inv.tenant_id)
+         LEFT JOIN users u ON u.id = t.user_id
+        WHERE un.property_id = $1
+          AND p.landlord_id = ANY($2::uuid[])
+          AND COALESCE(p.tenant_id, inv.tenant_id) IS NOT NULL
+          AND ($3::uuid IS NULL OR COALESCE(p.tenant_id, inv.tenant_id) = $3::uuid)
+          AND p.entry_description IS DISTINCT FROM 'FLEXPAY'
+          AND p.status <> 'voided'
+          AND ${openBalanceSql('p')} AND ${openAmountSql('p')} > 0
+        ORDER BY COALESCE(p.lease_id::text, p.tenant_id::text), un.unit_number, p.due_date`,
+      [propertyId, landlordIds, q.data.tenantId ?? null])
+
+    // The letterhead: who the bill is FROM. A hand-delivered invoice has to
+    // name the office and say where to take the money, or it is a note.
+    const head = await queryOne<{
+      street1: string | null; street2: string | null
+      city: string | null; state: string | null; zip: string | null
+      office_phone: string | null; office_email: string | null; company: string | null
+    }>(
+      `SELECT pr.street1, pr.street2, pr.city, pr.state, pr.zip, pr.office_phone, pr.office_email,
+              COALESCE(NULLIF(l.business_name, ''), u.first_name || ' ' || u.last_name) AS company
+         FROM properties pr
+         JOIN landlords l ON l.id = pr.landlord_id
+         JOIN users u ON u.id = l.user_id
+        WHERE pr.id = $1`, [propertyId])
+    const letterhead = {
+      id: property.id,
+      name: property.name,
+      company: head?.company ?? null,
+      address: [head?.street1, head?.street2].filter(Boolean).join(', ') || null,
+      cityLine: [head?.city, [head?.state, head?.zip].filter(Boolean).join(' ')]
+        .filter(Boolean).join(', ') || null,
+      phone: head?.office_phone ?? null,
+      email: head?.office_email ?? null,
+    }
+
+    if (people.length === 0) {
+      return res.json({ success: true, data: { property: letterhead, households: [] } })
+    }
+
+    const { bills, leaseOf, tenantOf } = await openBillsFor({
+      tenantIds: people.map(p => p.tenant_id),
+      landlordIds,
+      scopedPropertyIds: scopedIds,
+      // S641: a work-trade line is between the landlord and that resident. A
+      // sheet carried to a door is the last place to print it for a viewer who
+      // may not see it.
+      seesWorkTrade: userHasPerm(req.user, 'payments.view_all', 'books.view'),
+      groupLooseBy: 'lease',
+    })
+    // "a button on each invoice that can be printed" — one bill, on its own.
+    const wanted = q.data.invoiceId ? bills.filter(b => String(b.id) === q.data.invoiceId) : bills
+
+    // Each bill lands on the household whose lease it bills; a charge on no
+    // lease falls back to the resident the invoice names.
+    const households = people.map(p => ({
+      tenantId: p.tenant_id,
+      name: p.name || 'Resident',
+      unitNumber: p.unit_number,
+      bills: wanted.filter(b =>
+        (p.lease_id && leaseOf.get(String(b.id)) === p.lease_id)
+        || (!p.lease_id && tenantOf.get(String(b.id)) === p.tenant_id)),
+    })).filter(h => h.bills.length > 0)
+
+    res.json({
+      success: true,
+      data: { property: letterhead, households },
+    })
+  } catch (e) { next(e) }
+})
+
 balancesRouter.get('/:tenantId/invoices', requirePerm('balances.view'), async (req, res, next) => {
   try {
     // 10/27: the query that builds these bills now lives in

@@ -79,6 +79,40 @@ import { dateIn, todayIn, monthStartOf } from '../lib/timezone'
  * definition; a landlord is not.
  */
 export const FLEX_DEPOSIT_MIN_LANDLORD_DAYS = 30
+
+/**
+ * ── 10/27 (Nic): THE WINDOW AFTER SIGNING ───────────────────────────────────
+ *
+ * A bank is verified only by microdeposits, which take a day or two to land,
+ * and FlexDeposit refuses anyone whose bank is not verified. Accepting the
+ * invite and signing the lease happen in ONE sitting, so a resident who waits
+ * to link their bank is asking the landlord to wait on the deposit:
+ *
+ *   "They just need to initiate that process like on the day they sign the
+ *    lease. If they wait a day or two to like do that, they're not eligible for
+ *    flex deposit... The day they accept their invite and link the bank, that's
+ *    the same day they sign. It all happens at the same time."
+ *
+ * So two things, and they are different questions:
+ *
+ *   STARTED IT ON THE DAY. The bank link must have been begun by the end of
+ *   the day they signed (tenants.bank_pending_since keeps the FIRST start, so
+ *   a later attempt cannot backdate it).
+ *
+ *   FINISHED IT IN FIVE DAYS. Microdeposits get the days they need, and then
+ *   the deposit is simply owed as billed.
+ *
+ * Five, in his words, and the reason is the landlord's money rather than the
+ * resident's convenience: "we have to account for mid month lease starts or
+ * pro rated terms for early move in. those landlords will want the money the
+ * quickest."
+ *
+ * This is a window on the OFFER, never on the billing. The deposit is invoiced
+ * at move-in exactly as it always was and the landlord is not made to wait;
+ * enrolling inside the window is what converts that charge into installment 1
+ * plus the fee.
+ */
+export const FLEX_DEPOSIT_SIGNING_WINDOW_DAYS = 5
 export const FLEX_DEPOSIT_MIN_RECENT_ON_TIME_PAYMENTS = 1
 export const FLEX_DEPOSIT_PAYMENT_LOOKBACK_DAYS = 90
 
@@ -96,6 +130,10 @@ export interface FlexDepositEligibility {
     // 10/27: the LANDLORD is not established enough to offer FlexDeposit at —
     // too new, not vetted for payouts, or no money moving through GAM.
     | 'landlord_not_established'
+    // 10/27: the bank link was not begun on the day they signed.
+    | 'bank_link_not_started_on_signing_day'
+    // 10/27: more than FLEX_DEPOSIT_SIGNING_WINDOW_DAYS since they signed.
+    | 'signing_window_closed'
     | 'insufficient_on_time_payment_history'
     // 10/26: the platform is at its FlexDeposit ceiling. Nothing about this
     // tenant — they qualify, there is simply no room right now.
@@ -196,6 +234,40 @@ export async function flexDepositCapacity(): Promise<{
  * custody model a missed installment is not a default and carries no
  * lasting disqualification — restriction, if any, is "until current."
  */
+/**
+ * ── 10/27 (Nic): THE NUDGE SHOWN BEFORE THEY SIGN ───────────────────────────
+ *
+ *   "Before signing, they need to have a pop-up that says, in order to, it
+ *    needs to not be blocking. It needs to tell them, hey, in order to do flex
+ *    deposit, please link your bank account."
+ *
+ * Returns the deposit to name in that nudge, or null when there is nothing to
+ * say. Shown only where it could matter: this lease has a deposit to split,
+ * and their bank is neither verified nor already begun — somebody who has
+ * started is already doing the thing we would be asking for.
+ *
+ * Takes the USER, because that is what a signer row carries. Reading a
+ * tenant_id off a signer is what made the first version of this silently do
+ * nothing: the column does not exist, and the lookup simply never ran.
+ */
+export async function flexDepositSignPrompt(
+  userId: string,
+): Promise<{ depositAmount: number } | null> {
+  if (!await isFlexDepositVisible()) return null
+  return await queryOne<{ depositAmount: number }>(
+    `SELECT sd.total_amount::float8 AS "depositAmount"
+       FROM tenants t
+       JOIN security_deposits sd ON sd.tenant_id = t.id
+      WHERE t.user_id = $1
+        AND sd.status IN ('pending', 'partial')
+        AND sd.total_amount > 0
+        AND t.ach_verified IS NOT TRUE
+        AND t.bank_pending_since IS NULL
+      ORDER BY sd.created_at DESC
+      LIMIT 1`,
+    [userId])
+}
+
 export async function getFlexDepositEligibility(tenantId: string): Promise<FlexDepositEligibility> {
   const t = await queryOne<{
     ach_verified: boolean
@@ -296,6 +368,40 @@ export async function getFlexDepositEligibility(tenantId: string): Promise<FlexD
   // reported as 'no_deposit_row' below, not as a landlord problem.
   if (co && !(co.established && co.payouts_enabled && co.money_moving)) {
     blockers.push('landlord_not_established')
+  }
+
+  // ── 10/27 (Nic): STARTED ON THE DAY, FINISHED INSIDE FIVE ─────────────────
+  //
+  // Measured against the lease they are taking, in the PROPERTY's own day —
+  // a signature at 7pm Phoenix is still that day, and UTC would have called it
+  // tomorrow and refused somebody who did everything right.
+  const sign = await queryOne<{ signed_on: string | null; started_on: string | null; days_since: number | null }>(
+    `SELECT (l.signed_at AT TIME ZONE p.timezone)::date::text        AS signed_on,
+            (t.bank_pending_since AT TIME ZONE p.timezone)::date::text AS started_on,
+            ((NOW() AT TIME ZONE p.timezone)::date
+               - (l.signed_at AT TIME ZONE p.timezone)::date)        AS days_since
+       FROM security_deposits sd
+       JOIN leases l ON l.id = sd.lease_id
+       JOIN units u ON u.id = l.unit_id
+       JOIN properties p ON p.id = u.property_id
+       JOIN tenants t ON t.id = sd.tenant_id
+      WHERE sd.tenant_id = $1
+        AND sd.status IN ('pending', 'partial')
+      ORDER BY sd.created_at DESC
+      LIMIT 1`,
+    [tenantId],
+  )
+  // Nothing signed yet is not a failure — the offer is open until it is.
+  if (sign?.signed_on) {
+    if (sign.days_since !== null && Number(sign.days_since) > FLEX_DEPOSIT_SIGNING_WINDOW_DAYS) {
+      blockers.push('signing_window_closed')
+    }
+    // A verified bank is proof enough on its own: they plainly did the work,
+    // and holding the start date against somebody already verified would be
+    // refusing them for the paperwork rather than the fact.
+    if (!t.ach_verified && (!sign.started_on || sign.started_on > sign.signed_on)) {
+      blockers.push('bank_link_not_started_on_signing_day')
+    }
   }
 
   if (!isFirstLease) {
@@ -1135,115 +1241,34 @@ export interface CustodyChargeResult {
  * Idempotent via UNIQUE (cycle_month, tenant_id).
  */
 export async function processFlexDepositCustodyFee(now: Date = new Date()): Promise<CustodyChargeResult> {
-  // S654: the custody fee is GAM's own monthly fee, so its month is GAM's
-  // (Phoenix, the database's zone) — not UTC, which is already next month
-  // after 5 pm on the last day.
-  const cycle = monthStartOf(dateIn(null, now))
-  const out: CustodyChargeResult = {
-    cycle_month: cycle, candidates_scanned: 0, charges_created: 0,
-    charges_skipped_existing: 0, errors: 0,
+  // ── 10/27: THERE IS NO MONTHLY CUSTODY FEE ANY MORE ───────────────────────
+  //
+  // On 10/26 the fee became ONE service fee, priced by deposit size and the
+  // number of payments, collected in full with the first payment — and both
+  // documents the resident accepts were rewritten to say so in terms:
+  //
+  //   Custody Agreement § 7: "No monthly fee is charged for the period GAM
+  //   holds the Deposit, and no further fee arises if Tenant moves to another
+  //   property on the Platform and the Deposit is forwarded."
+  //   Consumer ToS § 9.1: "There is no monthly fee for the time GAM holds your
+  //   deposit."
+  //
+  // This job was left running. Anybody enrolling would have signed that
+  // sentence and then been charged $3 a month from their second cycle — GAM
+  // taking money its own agreement says it will not take. It never fired on a
+  // real plan only because the product was switched off until 10/26 and there
+  // are still zero plans in production.
+  //
+  // It returns empty rather than being deleted: flex_deposit_custody_charges
+  // keeps the rows it already wrote (GAM keeps everything), the webhook and
+  // GAM-first routing that settle such a charge stay correct for any row that
+  // exists, and if a monthly fee is ever priced again it will be priced from a
+  // table like every other fee rather than from a constant resurrected here.
+  // The scheduler may keep calling it; it is a no-op.
+  return {
+    cycle_month: monthStartOf(dateIn(null, now)),
+    candidates_scanned: 0, charges_created: 0, charges_skipped_existing: 0, errors: 0,
   }
-  if (!await isFlexDepositVisible()) return out
-
-  const rows = await query<{
-    tenant_id:          string
-    stripe_customer_id: string | null
-    landlord_id:        string
-    lease_id:           string
-    unit_id:            string
-  }>(
-    `SELECT DISTINCT t.id AS tenant_id, t.stripe_customer_id,
-            l.landlord_id, l.id AS lease_id, l.unit_id
-       FROM tenants t
-       JOIN security_deposits sd ON sd.tenant_id = t.id
-       JOIN leases l            ON l.id = sd.lease_id
-      WHERE sd.flex_deposit_enabled = TRUE
-        AND sd.flex_deposit_plan_status IN ('active', 'completed')
-        AND sd.custody_fee_active = TRUE
-        AND sd.status <> 'voided'
-        AND l.status IN ('active', 'pending')`,
-  )
-  out.candidates_scanned = rows.length
-
-  const stripe = getStripe()
-  for (const r of rows) {
-    try {
-      const insert = await queryOne<{ id: string }>(
-        `INSERT INTO flex_deposit_custody_charges
-           (tenant_id, cycle_month, amount, status)
-         VALUES ($1, $2, $3, 'pending')
-         ON CONFLICT (cycle_month, tenant_id) DO NOTHING
-         RETURNING id`,
-        [r.tenant_id, cycle, FLEX_DEPOSIT_CUSTODY_FEE],
-      )
-      if (!insert) {
-        out.charges_skipped_existing += 1
-        continue
-      }
-      if (!r.stripe_customer_id) {
-        out.errors += 1
-        continue
-      }
-
-      let paymentMethodId: string | null = null
-      try {
-        const cust = await stripe.customers.retrieve(r.stripe_customer_id)
-        if (cust && !(cust as any).deleted) {
-          const c = cust as any
-          paymentMethodId = c.invoice_settings?.default_payment_method ?? c.default_source ?? null
-        }
-      } catch {}
-      if (!paymentMethodId) { out.errors += 1; continue }
-
-      // S261: supersedence boost on custody pull. The just-inserted
-      // custody row is status='pending', so it's not in the FIFO list.
-      const boost = await computeTenantGamOutstandingTotal(r.tenant_id)
-      const pullAmount = Math.round((FLEX_DEPOSIT_CUSTODY_FEE + boost) * 100) / 100
-
-      const intent = await createRentPlatformCharge({
-        amount:              pullAmount,
-        stripeCustomerId:    r.stripe_customer_id,
-        paymentMethodId,
-        paymentMethodTypes:  ['us_bank_account'],
-        entryDescription:    'SUBSCRIP',
-        metadata: {
-          gam_purpose:    'flexdeposit_custody_fee',
-          gam_charge_id:  insert.id,
-          gam_tenant_id:  r.tenant_id,
-          gam_cycle:      cycle,
-        },
-      })
-
-      const pay = await queryOne<{ id: string }>(
-        `INSERT INTO payments (
-           landlord_id, tenant_id, lease_id, unit_id,
-           type, amount, status, entry_description,
-           due_date, stripe_payment_intent_id, notes,
-           gam_supersedence_amount, revenue_owner
-         -- -- S609: GAM's own fee (REVENUE_OWNERS, packages/shared) — never an owner share. A tenant opt-in product.
-         ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', 'SUBSCRIP',
-                   $6, $7, $8, $9, 'gam')
-         RETURNING id`,
-        [
-          r.landlord_id, r.tenant_id, r.lease_id, r.unit_id,
-          pullAmount.toFixed(2), cycle, intent.id,
-          `FlexDeposit custody fee ${cycle}`,
-          boost.toFixed(2),
-        ],
-      )
-      await query(
-        `UPDATE flex_deposit_custody_charges
-            SET payment_id = $1, updated_at = NOW()
-          WHERE id = $2`,
-        [pay!.id, insert.id],
-      )
-      out.charges_created += 1
-    } catch (e: any) {
-      logger.error({ err: e, ctx: r.tenant_id }, '[flexdeposit][custody]')
-      out.errors += 1
-    }
-  }
-  return out
 }
 
 // ── Webhook hooks ────────────────────────────────────────────────

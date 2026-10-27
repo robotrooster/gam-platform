@@ -1387,6 +1387,28 @@ propertiesRouter.patch('/:id/office-email', requirePerm('properties.edit'), asyn
   } catch (e) { next(e) }
 })
 
+// PATCH /api/properties/:id/paper-bills — 10/27 (Nic). Does this property hand
+// deliver paper bills?
+//
+//   "It's a setting on the landlord page, a property level setting. Do you want
+//    to print paper copies of the bills when these are generated?"
+//
+// Per PROPERTY, not per resident: a park that delivers to doors delivers to all
+// of them, and asking each resident was the clunky version he rejected (the
+// tenants.prefers_paper_bill column from 10/26 is unused and says so).
+propertiesRouter.patch('/:id/paper-bills', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { paperBills } = z.object({ paperBills: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, req.params.id)
+    await query(`UPDATE properties SET print_all_bills = $2, updated_at = NOW() WHERE id = $1`,
+      [req.params.id, paperBills])
+    res.json({ success: true, data: { propertyId: req.params.id, paperBills } })
+  } catch (e) { next(e) }
+})
+
 // PATCH /api/properties/:id/broken-meter-estimate — S648 (Nic). Whether a
 // broken or stuck submeter on an occupied space bills the low end of what
 // occupied neighbors used, or nothing until it is repaired. The landlord's

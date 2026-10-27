@@ -17,6 +17,7 @@ import { PropertyLateFeeSection } from './PropertyLateFeeSection'
 import { PropertyFeeScheduleSection } from './PropertyFeeScheduleSection'
 import { PropertyLeaseSigningSection } from './PropertyLeaseSigningSection'
 import { PropertyOfficeEmailSection } from './PropertyOfficeEmailSection'
+import { PropertyPaperBillsSection } from './PropertyPaperBillsSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 import { UtilityMetersPage } from './UtilityMetersPage'
@@ -248,6 +249,7 @@ export function PropertyDetailPage() {
       <PropertyFeeScheduleSection propertyId={property.id}
         unitTypes={[...new Set((units as any[]).map(u => u.unitType).filter(Boolean))].sort()} />
       <PropertyOfficeEmailSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <PropertyPaperBillsSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       {isOwner && <PropertyLeaseSigningSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />}
       {/* S558: the security-deposit multiplier is a LEASE term (set on the
             lease template, deposit = rent × template.deposit_months), not a

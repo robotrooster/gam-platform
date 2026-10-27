@@ -6685,6 +6685,32 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
     // (most states have no statute) or document types where deposit
     // terms don't apply (addendum_add / addendum_remove are tenant-
     // roster changes, not term changes).
+    // ── 10/27 (Nic): TELL THEM TO LINK THE BANK BEFORE THEY SIGN ───────────
+    //
+    //   "Tenant logs in to sign. Before signing, they need to have a pop-up
+    //    that says, in order to, it needs to not be blocking. It needs to tell
+    //    them, hey, in order to do flex deposit, please link your bank account."
+    //
+    // Signing is the LAST thing that happens — the landlord signs first to lock
+    // the terms, so the resident's signature is what executes the lease and
+    // writes the move-in invoice. There is no window afterwards. And a bank is
+    // verified only by microdeposits, which take a day or two, so being told
+    // after signing is being told too late: "They just need to initiate that
+    // process like on the day they sign the lease."
+    //
+    // NOT BLOCKING, deliberately. It says what to do and gets out of the way;
+    // a resident who does not want FlexDeposit signs straight past it.
+    //
+    // Only where it could matter: the product is on, this lease has a deposit,
+    // and their bank is neither verified nor already begun.
+    let flex_deposit_prompt: { depositAmount: number } | null = null
+    try {
+      if (doc.document_type === 'original_lease' && signer?.user_id) {
+        const { flexDepositSignPrompt } = await import('../services/flexDeposit')
+        flex_deposit_prompt = await flexDepositSignPrompt(signer.user_id)
+      }
+    } catch { /* a prompt that cannot be worked out is simply not shown */ }
+
     let deposit_interest_context: any = null
     const showsDepositTerms = doc.document_type === 'original_lease' || doc.document_type === 'addendum_terms'
     if (showsDepositTerms && doc.property_state) {
@@ -6880,7 +6906,7 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
       docExec, doc.unit_id,
       leaseFieldDate((fields as any[]).find(f => f.lease_column === 'start_date'
         && f.value != null && String(f.value).trim() !== '')?.value))
-    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, renewal_billing, property_late_fee, existing_tenancy, rent_due_mode, prorates_mid_month_rent, rent_due_day_rule, readOnly, waitingOn, closedReason, packageDocs } })
+    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, flex_deposit_prompt, carried_deposit, carried_rent, renewal_billing, property_late_fee, existing_tenancy, rent_due_mode, prorates_mid_month_rent, rent_due_day_rule, readOnly, waitingOn, closedReason, packageDocs } })
   } catch (e) { next(e) }
 })
 

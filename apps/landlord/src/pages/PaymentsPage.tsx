@@ -8,7 +8,7 @@ import {
 import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { useAuth } from '../context/AuthContext'
-import { X, CheckCircle, Gift, ChevronRight } from 'lucide-react'
+import { X, CheckCircle, Gift, ChevronRight, Printer } from 'lucide-react'
 import { appConfirm } from '../components/dialogs'
 import { money, toCents, monthTitle, serverStatus, serverMessage, dayWord, CREDIT_USE_RULE } from '../lib/creditDesk'
 import { RecordPaymentWindow, PostPaymentForm } from '../components/RecordPaymentWindow'
@@ -336,6 +336,17 @@ export function PaymentsPage() {
         <p className="page-subtitle">This month: invoiced, paid and still owed, one property at a time</p>
       </div>
       <div className="cd-actions">
+        {/* ── 10/27 (Nic): PRINT ALL OUTSTANDING ──────────────────────────────
+            "make it where there's a quick print all outstanding button."
+            Only where the property says it hand delivers (its Paper bills
+            setting) — a park that emails its bills never sees it. One page per
+            household, each with its meter readings, ready for the doors. */}
+        {roll && !refused && properties.find(p => p.propertyId === propertyId)?.paperBills && (
+          <a className="btn btn-ghost" style={{ textDecoration: 'none' }}
+             href={`/bills/print?propertyId=${propertyId}`} target="_blank" rel="noreferrer">
+            <Printer size={14} /> Print all outstanding
+          </a>
+        )}
         {/* S641: only for someone who can finish it (Take payments). */}
         {canTake && roll && !refused && (
           <button className="btn btn-primary" onClick={() => { setNotice(null); setPicking(true) }}>Record payment</button>

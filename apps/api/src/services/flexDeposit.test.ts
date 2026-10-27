@@ -27,7 +27,9 @@
 
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db } from '../db'
-import { getFlexDepositEligibility, FLEX_DEPOSIT_MIN_LANDLORD_DAYS } from './flexDeposit'
+import {
+  getFlexDepositEligibility, FLEX_DEPOSIT_MIN_LANDLORD_DAYS, FLEX_DEPOSIT_SIGNING_WINDOW_DAYS,
+} from './flexDeposit'
 import {
   withRollback, cleanupAllSchema,
   seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant,
@@ -48,6 +50,9 @@ async function buildEligibilityStack(
     depositStatus?:                      'pending' | 'partial' | 'funded'
     /** The deposit's size. Defaults to 500 — inside the grid's lowest bracket. */
     depositAmount?:                      number
+    /** 10/27: when the lease was signed, and when the bank link was begun. */
+    signedDaysAgo?:                      number
+    bankStartedDaysAgo?:                 number | null
     seedPriorLease?:                     boolean
     seedPriorPlan?:                      boolean
     /** 10/27: the landlord's own standing — vetted, established, collecting. */
@@ -159,6 +164,21 @@ async function buildEligibilityStack(
        VALUES ($1, $2, $3, 400, 'funded', 'gam_escrow', TRUE, 'completed')`,
       [otherUnitId, otherLeaseId, tenantId],
     )
+  }
+
+  // 10/27: the signing day and the day the bank link began, which together
+  // decide whether FlexDeposit is still on offer.
+  if (opts.signedDaysAgo !== undefined) {
+    await client.query(
+      `UPDATE leases SET signed_at = NOW() - ($2::int || ' days')::interval WHERE id = $1`,
+      [upcomingLeaseId, opts.signedDaysAgo])
+  }
+  if (opts.bankStartedDaysAgo !== undefined) {
+    await client.query(
+      `UPDATE tenants SET bank_pending_since = CASE WHEN $2::int IS NULL THEN NULL
+                            ELSE NOW() - ($2::int || ' days')::interval END
+        WHERE id = $1`,
+      [tenantId, opts.bankStartedDaysAgo])
   }
 
   // Money actually settling through GAM for this company, inside the window.
@@ -585,5 +605,145 @@ describe('getFlexDepositEligibility — a deposit above the grid', () => {
     const four = r.choices.find(c => c.payments === 4)!
     expect([four.fee, four.installment, four.payUpFront, four.firstPull])
       .toEqual([173, 750, 0, 923])
+  })
+})
+
+
+// ── 10/27 (Nic): STARTED ON THE DAY, FINISHED INSIDE FIVE ───────────────────
+//
+//   "They just need to initiate that process like on the day they sign the
+//    lease. If they wait a day or two to like do that, they're not eligible for
+//    flex deposit."
+//
+// A bank is verified only by microdeposits and they take a day or two, so the
+// window exists to give them those days — not to let the landlord wait a week
+// on a deposit. Five, because "we have to account for mid month lease starts or
+// pro rated terms for early move in. those landlords will want the money the
+// quickest."
+describe('getFlexDepositEligibility — the window after signing', () => {
+  const sign = async (o: Parameters<typeof buildEligibilityStack>[1]) => {
+    const client = await db.connect()
+    let tenantId: string
+    try {
+      await client.query('BEGIN')
+      const stack = await buildEligibilityStack(client, {
+        bgStatus: 'approved', riskLevel: 'low', ...o,
+      })
+      tenantId = stack.tenantId
+      await client.query('COMMIT')
+    } finally { client.release() }
+    return await getFlexDepositEligibility(tenantId)
+  }
+
+  it('signed today, bank link begun today, microdeposits still in flight: offered', async () => {
+    const r = await sign({ achVerified: false, signedDaysAgo: 0, bankStartedDaysAgo: 0 })
+    expect(r.blockers).toEqual(['ach_unverified'])   // the only thing left is the wait
+    expect(r.blockers).not.toContain('bank_link_not_started_on_signing_day')
+    expect(r.blockers).not.toContain('signing_window_closed')
+  })
+
+  it('signed yesterday and never started the bank: refused for the day, not the wait', async () => {
+    const r = await sign({ achVerified: false, signedDaysAgo: 1, bankStartedDaysAgo: null })
+    expect(r.blockers).toContain('bank_link_not_started_on_signing_day')
+  })
+
+  it('signed two days ago and only started the bank today: too late', async () => {
+    const r = await sign({ achVerified: false, signedDaysAgo: 2, bankStartedDaysAgo: 0 })
+    expect(r.blockers).toContain('bank_link_not_started_on_signing_day')
+  })
+
+  it('five days on from signing is still inside the window', async () => {
+    const r = await sign({ achVerified: true, signedDaysAgo: FLEX_DEPOSIT_SIGNING_WINDOW_DAYS, bankStartedDaysAgo: FLEX_DEPOSIT_SIGNING_WINDOW_DAYS })
+    expect(r.blockers).toEqual([])
+    expect(r.eligible).toBe(true)
+  })
+
+  it('a day past it, the deposit is simply owed as billed', async () => {
+    const r = await sign({ achVerified: true, signedDaysAgo: FLEX_DEPOSIT_SIGNING_WINDOW_DAYS + 1, bankStartedDaysAgo: FLEX_DEPOSIT_SIGNING_WINDOW_DAYS + 1 })
+    expect(r.blockers).toEqual(['signing_window_closed'])
+    expect(r.eligible).toBe(false)
+  })
+
+  it('a verified bank is proof on its own — the start date is not held against them', async () => {
+    // Verified, but the link was begun the day AFTER signing. They plainly did
+    // the work; refusing here would be refusing the paperwork, not the fact.
+    const r = await sign({ achVerified: true, signedDaysAgo: 2, bankStartedDaysAgo: 1 })
+    expect(r.blockers).toEqual([])
+    expect(r.eligible).toBe(true)
+  })
+
+  it('nothing signed yet is not a refusal — the offer is open until it is', async () => {
+    const r = await sign({ achVerified: true })   // signed_at untouched (null)
+    expect(r.blockers).toEqual([])
+  })
+})
+
+
+// ── 10/27 (Nic): THE NUDGE BEFORE THEY SIGN ─────────────────────────────────
+//
+//   "Before signing, they need to have a pop-up that says... hey, in order to
+//    do flex deposit, please link your bank account."
+//
+// The first version of this read a tenant_id off the SIGNER row. That column
+// does not exist, so the lookup never ran and the prompt silently never
+// appeared — the kind of nothing that looks exactly like a working feature.
+describe('flexDepositSignPrompt — what the signer is told before signing', () => {
+  // There is no point nudging somebody about a product that is switched off,
+  // so the prompt checks visibility — which means these tests have to switch
+  // it on, the way production has it.
+  beforeEach(async () => {
+    await db.query(
+      `INSERT INTO system_features (key, enabled, description)
+       VALUES ('flexdeposit_rollout_visible', TRUE, '10/27 test')
+       ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
+  })
+
+  it('says nothing at all while the product is switched off', async () => {
+    await db.query(`UPDATE system_features SET enabled = FALSE WHERE key = 'flexdeposit_rollout_visible'`)
+    const { prompt } = await promptFor({ achVerified: false, depositAmount: 900, bankStartedDaysAgo: null })
+    expect(prompt).toBeNull()
+  })
+
+  const promptFor = async (o: Parameters<typeof buildEligibilityStack>[1]) => {
+    const client = await db.connect()
+    let userId: string
+    try {
+      await client.query('BEGIN')
+      const stack = await buildEligibilityStack(client, { bgStatus: 'approved', riskLevel: 'low', ...o })
+      userId = (await client.query<{ user_id: string }>(
+        `SELECT user_id FROM tenants WHERE id = $1`, [stack.tenantId])).rows[0].user_id
+      await client.query('COMMIT')
+    } finally { client.release() }
+    const { flexDepositSignPrompt } = await import('./flexDeposit')
+    return { userId: userId!, prompt: await flexDepositSignPrompt(userId!) }
+  }
+
+  it('names the deposit when there is one and no bank yet', async () => {
+    const { prompt } = await promptFor({ achVerified: false, depositAmount: 900, bankStartedDaysAgo: null })
+    expect(prompt).toEqual({ depositAmount: 900 })
+  })
+
+  it('says nothing once the bank is verified — they have already done it', async () => {
+    const { prompt } = await promptFor({ achVerified: true, depositAmount: 900 })
+    expect(prompt).toBeNull()
+  })
+
+  it('says nothing while microdeposits are already in flight', async () => {
+    const { prompt } = await promptFor({ achVerified: false, depositAmount: 900, bankStartedDaysAgo: 0 })
+    expect(prompt).toBeNull()
+  })
+
+  it('says nothing when the landlord is charging no deposit', async () => {
+    const { prompt } = await promptFor({ achVerified: false, skipDeposit: true })
+    expect(prompt).toBeNull()
+  })
+
+  it('says nothing to somebody with no tenant profile at all', async () => {
+    const { flexDepositSignPrompt } = await import('./flexDeposit')
+    const u = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, first_name, last_name, role, email_verified)
+       VALUES ($1, 'x', 'No', 'Profile', 'tenant', TRUE) RETURNING id`,
+      [`noprofile-${Date.now()}@test.dev`])
+    expect(await flexDepositSignPrompt(u.rows[0].id)).toBeNull()
   })
 })

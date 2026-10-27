@@ -165,11 +165,16 @@ const post = <T,>(url: string, body?: any) => api.post<{success:boolean;data:T;m
 // until GAM reviews the lease + verifies SSI/SSDI income and approves;
 // only approved tenants can enroll (server-enforced).
 function useFlexVisibility() {
-  const { data } = useQuery('flex-visibility',
+  const { data, isLoading } = useQuery('flex-visibility',
     () => get<{ flexpay: boolean; flexdeposit: boolean; flexcredit: boolean }>('/tenants/flex-visibility'),
     { staleTime: 5 * 60 * 1000, retry: false })
   const v = data ?? { flexpay: false, flexdeposit: false, flexcredit: false }
-  return { ...v, any: v.flexpay || v.flexdeposit || v.flexcredit }
+  // 10/27: `settled` says the answer is actually IN, not merely absent. The
+  // Flex page used to redirect to Home on `!any`, which is true for the first
+  // paint of every cold load — so opening /services by URL or bookmark bounced
+  // you off it, while clicking the sidebar link worked because the answer was
+  // already cached. "Not yet known" and "none of them" are different facts.
+  return { ...v, any: v.flexpay || v.flexdeposit || v.flexcredit, settled: !isLoading }
 }
 
 // ── AUTH ──────────────────────────────────────────────────────
@@ -1713,7 +1718,7 @@ function HomePage() {
           </div>
           {flexVis.flexcredit && <div className="dr"><span className="dk">Credit Reporting</span><span className={`badge ${me?.creditReportingEnrolled?'b-green':'b-muted'}`}>{me?.creditReportingEnrolled?'Active — $5/mo':'Not enrolled'}</span></div>}
           {flexVis.flexpay && <div className="dr"><span className="dk">FlexPay</span><span className={`badge ${me?.flexpayPausedMultiLease?'b-amber':me?.flexpayEnrolled?'b-green':'b-muted'}`}>{me?.flexpayPausedMultiLease?'⏸ Paused — 2+ leases':me?.flexpayEnrolled?`Active — day ${me.flexpayPullDay}`:'Not enrolled'}</span></div>}
-          {flexVis.flexdeposit && <div className="dr"><span className="dk">FlexDeposit</span><span className={`badge ${me?.flexDepositEnrolled?'b-green':'b-muted'}`}>{me?.flexDepositEnrolled?'Active — $3/mo':'Not enrolled'}</span></div>}
+          {flexVis.flexdeposit && <div className="dr"><span className="dk">FlexDeposit</span><span className={`badge ${me?.flexDepositEnrolled?'b-green':'b-muted'}`}>{me?.flexDepositEnrolled?'Active':'Not enrolled'}</span></div>}
           <div style={{marginTop:16}}>
             <span className="btn btn-g btn-sm">Manage services →</span>
           </div>
@@ -2360,8 +2365,20 @@ function FlexPayInquireModal({ survey, onClose, onSuccess }: { survey?: boolean;
 }
 
 // FlexPay is a payment-scheduling subscription. Tenant picks a pull day
-// (6-28: Nic 10/2, never the 1st-5th — FLEXPAY_FORBIDDEN_PULL_DAYS); fee is a
-// FLAT $25/month (S562) — pull day is scheduling only. Day 28 cap covers all
+// (6-28: Nic 10/2, never the 1st-5th — FLEXPAY_FORBIDDEN_PULL_DAYS).
+//
+// ── 10/27: THE PRICE IS NOT FLAT AND THE DAY IS NOT ONLY SCHEDULING ────────
+// S562's flat $25 is gone. The fee comes from flexpay_fee_schedule, priced by
+// the amount GAM fronts that cycle CROSSED WITH the benefit Wednesday the
+// chosen day falls in — $23 to $79. So the day a resident picks moves their
+// price, and this screen may not promise otherwise.
+//
+// Enrollment is CLOSED (flexpay_enrollment_open), so nobody can reach this
+// today. Before it opens, this modal has to QUOTE the chosen day from the
+// table as the slider moves — GET /tenants/flexpay already returns previewFee
+// for a resident who has a day set, and the enrollment case needs the same
+// quote by candidate day. Until then it names no figure rather than a wrong
+// one. Day 28 cap covers all
 // U.S. social security payout windows (SSDI 4th-Wed-of-month). S314:
 // click-accept of the Subscription Terms is required + persisted. S655: the
 // terms summary is FLEXPAY_TERMS (shared) — the same sections the PDF, emails
@@ -2374,8 +2391,7 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
   const [fullTermsText, setFullTermsText] = useState<string | null>(null)
   const [loadingTerms, setLoadingTerms] = useState(false)
   const [error, setError] = useState('')
-  const fee = 25  // S562: FlexPay is a flat $25/month (pull day is scheduling only)
-
+  // 10/27: no figure is invented here — see the note above this component.
   async function openFullTerms() {
     setLoadingTerms(true)
     try {
@@ -2416,7 +2432,7 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
       <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:520}}>
         <div className="modal-t">⚡ Enroll in FlexPay</div>
         <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:20}}>
-          Pick the day GAM collects from your bank each month — match it to when your income lands. Your FlexPay fee is a flat <strong>$25/month</strong> no matter which day you choose.
+          Pick the day GAM collects from your bank each month — match it to when your income lands. Your FlexPay fee depends on your rent and the day you pick, and is shown to you before you confirm.
         </p>
 
         <div className="fg">
@@ -2432,9 +2448,9 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
         <div style={{background:'var(--bg3)',borderRadius:10,padding:16,marginBottom:16,marginTop:16}}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
             <span style={{fontWeight:700,color:'var(--t0)',fontSize:'.875rem'}}>Monthly FlexPay fee</span>
-            <span style={{fontFamily:'var(--font-m)',fontSize:'1.4rem',fontWeight:800,color:'var(--gold)'}}>${fee}</span>
+            <span style={{fontFamily:'var(--font-m)',fontSize:'.9rem',fontWeight:700,color:'var(--t2)'}}>Shown before you confirm</span>
           </div>
-          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>Flat $25/month · day {pullDay} is just your pull schedule</div>
+          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>Set by your rent and the payday your {ordinal(pullDay)} falls in</div>
         </div>
 
         {error && <div className="alert a-warn" style={{marginBottom:12}}>{error}</div>}
@@ -2443,7 +2459,7 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
         <div style={{background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:8,padding:14,marginBottom:14,fontSize:'.72rem',color:'var(--t2)',lineHeight:1.5}}>
           <div style={{fontWeight:700,color:'var(--t0)',marginBottom:8,fontSize:'.78rem'}}>FlexPay Subscription Terms — please review</div>
           <p style={{marginBottom:8}}>
-            <strong style={{color:'var(--t1)'}}>Subscription, not a loan.</strong> FlexPay is a payment-date coordination subscription. GAM does not advance funds on your behalf. You authorize a recurring ACH pull from your verified bank account on the pull day you choose; your monthly fee is a flat $25 regardless of that day.
+            <strong style={{color:'var(--t1)'}}>Subscription, not a loan.</strong> FlexPay is a payment-date coordination subscription. GAM does not advance funds on your behalf. You authorize a recurring ACH pull from your verified bank account on the pull day you choose; your monthly fee is set by your rent and the payday your chosen day falls in, and is shown to you before you confirm.
           </p>
           {FLEXPAY_TERMS.map((t, i) => (
             <p key={t.key} style={{marginBottom: i === FLEXPAY_TERMS.length - 1 ? 0 : 8}}>
@@ -2477,7 +2493,7 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
         <div className="modal-f">
           <button className="btn btn-g" onClick={onClose}>Cancel</button>
           <button className="btn btn-p" disabled={mut.isLoading || !tosAck} onClick={()=>mut.mutate()}>
-            {mut.isLoading ? <span className="spinner"/> : `Enroll — $${fee}/month`}
+            {mut.isLoading ? <span className="spinner"/> : 'Enroll in FlexPay'}
           </button>
         </div>
         {showFullTerms && fullTermsText && (
@@ -2494,8 +2510,9 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
 
 // ── FLEXPAY CHANGE-PULL-DAY MODAL ─────────────────────────────────────────
 // Enrolled tenants can move their pull day; the change takes effect NEXT
-// cycle (the current cycle's pull is already scheduled). Fee recomputes to
-// flat $25/month; the new day is scheduling only.
+// cycle (the current cycle's pull is already scheduled). 10/27: moving the day
+// can MOVE THE PRICE — the grid is rent crossed with the benefit Wednesday the
+// day falls in — so this screen must not imply the fee is unchanged.
 function FlexPayChangeDayModal({
   currentDay, onClose, onSuccess,
 }: { currentDay: number; onClose: () => void; onSuccess: () => void }) {
@@ -2503,7 +2520,6 @@ function FlexPayChangeDayModal({
   // rule starts the picker at the nearest offered day.
   const [pullDay, setPullDay] = useState(offeredPullDay(currentDay || 15))
   const [error, setError] = useState('')
-  const fee = 25  // S562: FlexPay is a flat $25/month (pull day is scheduling only)
 
   const mut = useMutation(
     () => fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/flexpay/pull-day', {
@@ -2525,7 +2541,7 @@ function FlexPayChangeDayModal({
       <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:480}}>
         <div className="modal-t">⚡ Change FlexPay pull day</div>
         <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:20}}>
-          Pick a new day of the month, any day from the {pullDayRangeText()}. This takes effect <strong>next billing cycle</strong> — your current cycle's pull is already scheduled. Your FlexPay fee stays a flat $25/month.
+          Pick a new day of the month, any day from the {pullDayRangeText()}. This takes effect <strong>next billing cycle</strong> — your current cycle's pull is already scheduled. Your fee is set by your rent and the payday your new day falls in, so moving it can change what you pay.
         </p>
         <div className="fg">
           <label className="fl">Pull day of month</label>
@@ -2538,9 +2554,9 @@ function FlexPayChangeDayModal({
         <div style={{background:'var(--bg3)',borderRadius:10,padding:16,margin:'16px 0'}}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
             <span style={{fontWeight:700,color:'var(--t0)',fontSize:'.875rem'}}>New monthly fee (next cycle)</span>
-            <span style={{fontFamily:'var(--font-m)',fontSize:'1.4rem',fontWeight:800,color:'var(--gold)'}}>${fee}</span>
+            <span style={{fontFamily:'var(--font-m)',fontSize:'.9rem',fontWeight:700,color:'var(--t2)'}}>Shown before you confirm</span>
           </div>
-          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>Flat $25/month · day {pullDay} is just your pull schedule</div>
+          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>Moving your day can move your fee — it is set by your rent and the payday the {ordinal(pullDay)} falls in</div>
         </div>
         {error && <div className="alert a-red" style={{marginBottom:12}}>{error}</div>}
         <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
@@ -2714,6 +2730,13 @@ function FlexDepositModal({
                 person's. Said as a fact about the property, because a
                 resident is not told how their landlord is doing with GAM. */}
             {eligibility?.blockers?.includes('landlord_not_established') && `FlexDeposit is not available at this property yet.`}
+            {/* 10/27 (Nic): the two window refusals, said as facts about
+                timing rather than as a judgement about them. A bank is
+                verified only by microdeposits and that takes a day or two,
+                which is exactly why the link has to be started on signing day
+                — so the reason is given, not just the refusal. */}
+            {eligibility?.blockers?.includes('bank_link_not_started_on_signing_day') && `To split your deposit, your bank had to be linked on the day you signed — verifying one takes a couple of days, so it has to start right away. Your deposit is owed as billed.`}
+            {eligibility?.blockers?.includes('signing_window_closed') && `The window to split this deposit has closed. It is owed as billed.`}
             {eligibility?.blockers?.includes('insufficient_on_time_payment_history') && `FlexDeposit requires at least one on-time rent payment on a prior lease in the last 90 days.`}
           </div>
           <div className="modal-f"><button className="btn btn-g" onClick={onClose}>Close</button></div>
@@ -3170,7 +3193,25 @@ function ServicesPage() {
       // S655 (decisions #35.8): a payment-date coordination subscription —
       // never described as advancing, fronting or lending money.
       desc: 'FlexPay pays your monthly bill to your landlord on time, and GAM collects it from your bank on the day you choose — matched to when your income lands. A payment-date subscription: not a loan, no interest, no penalties.',
-      price: '$25/month',
+      // ── 10/27 (Nic): NO PRICE ON THE CARD ────────────────────────────────
+      //
+      //   "I want flex pay to not show a flat price. For the people. I want it
+      //    to say learn more and kind of probe them for information before
+      //    revealing the price. If they see that price without having done any
+      //    of the work to get verified, they're just going to take the late
+      //    fee. They'll be like, oh, it only saves me a couple bucks and I
+      //    don't have to do all this sign up. So it's not worth it."
+      //
+      // A price read cold is compared against a late fee in the abstract and
+      // loses. The same price read AFTER their own history is on screen — what
+      // they were actually charged, against what this would have cost — is a
+      // different conversation. So the card opens the conversation and the
+      // figure arrives inside it (FLEXPAY_SAVINGS_SPEC).
+      //
+      // It is also no longer ONE price: the grid is rent crossed with the
+      // payday their pull day falls in, $23 to $79, so there is no honest flat
+      // figure to print here even if we wanted one.
+      price: null,
       enrolled: me?.flexpayEnrolled,
       // S581: paused because the tenant now holds more than one lease.
       warning: fpMultiLeasePaused
@@ -3186,6 +3227,7 @@ function ServicesPage() {
       action: () => (fpLaunched && fpApproved) ? setFlexPayModal(true) : setFlexPayInquireModal(true),
       loading: false,
       highlight: me?.flexpayEnrolled
+        // Already enrolled: this is THEIR price, which they agreed to — shown.
         ? `Day ${me.flexpayPullDay} · $${me.flexpayMonthlyFee}/mo`
         : !fpLaunched
           ? (fpInquiry
@@ -3202,7 +3244,9 @@ function ServicesPage() {
           ? (!me?.achVerified ? '⚠ Approved — verify your bank account to enroll' : `✓ Approved — pick your pull day (the ${pullDayRangeText()})`)
           : 'For SSI/SSDI recipients — tap to request access',
       locked: fpLaunched && fpApproved && !me?.achVerified,
-      ctaLabel: !fpLaunched ? 'Take the survey' : fpApproved ? 'Enroll' : 'I’m interested',
+      // 10/27: "Learn more" before any number — the survey and the interest
+      // step are where the probing happens.
+      ctaLabel: !fpLaunched ? 'Learn more' : fpApproved ? 'Enroll' : 'Learn more',
       // statusBadge REPLACES the CTA button — so in survey mode only
       // the already-surveyed state gets one (nothing more to do);
       // the not-yet-surveyed state keeps the "Take the survey" CTA.
@@ -3215,8 +3259,12 @@ function ServicesPage() {
     {
       id: 'flexdeposit',
       name: 'FlexDeposit',
-      desc: 'Split your security deposit into 2–4 monthly installments. Pay the first one at move-in; the rest spread over the next months.',
-      price: '$3/month custody fee',
+      // 10/27: the $3/month custody fee is GONE — there is ONE service fee,
+      // by deposit size and the number of payments, collected in full with the
+      // first payment. The amount is not named here because it depends on both:
+      // the modal shows each choice priced before anything is chosen.
+      desc: 'Split your security deposit into 2 or 4 payments. The first payment and the whole service fee are collected at move-in; the rest come monthly.',
+      price: 'One service fee, by deposit size — shown before you choose',
       enrolled: me?.flexDepositEnrolled,
       action: () => setFlexDepositModal(true),
       loading: false,
@@ -3233,6 +3281,8 @@ function ServicesPage() {
     s.id === 'credit' ? flexVis.flexcredit :
     s.id === 'flexpay' ? flexVis.flexpay :
     flexVis.flexdeposit)
+  // Wait for the answer before acting on it — see useFlexVisibility.
+  if (!flexVis.settled) return <div className="ks" style={{padding:24}}>Loading…</div>
   if (!flexVis.any) return <Navigate to="/home" replace />
 
   return (
@@ -3254,7 +3304,10 @@ function ServicesPage() {
             {s.highlight && <div style={{fontSize:'.75rem',color:'var(--t3)',background:'var(--bg4)',padding:'6px 10px',borderRadius:6}}>{s.highlight}</div>}
             {(s as any).warning && <div className="alert a-warn" style={{fontSize:'.75rem',margin:0,lineHeight:1.45}}>⏸ {(s as any).warning}</div>}
             <div className="dr" style={{border:'none',padding:0}}>
-              <span className="price-tag">{s.price}</span>
+              {/* 10/27: a card may carry NO price (FlexPay) — the figure
+                  arrives inside the conversation, not on the tile. An empty
+                  tag would still hold its space and read as a missing number. */}
+              {s.price ? <span className="price-tag">{s.price}</span> : <span />}
               {s.enrolled
                 ? <span style={{display:'flex',gap:8,alignItems:'center'}}>
                     <span className={`badge ${(s as any).warning ? 'b-amber' : 'b-green'}`}>{(s as any).warning ? '⏸ Paused' : '✓ Active'}</span>

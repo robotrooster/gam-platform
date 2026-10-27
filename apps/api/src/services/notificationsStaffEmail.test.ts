@@ -76,6 +76,62 @@ describe('who GAM emails', () => {
   // leases, about refunds, about anything that needs to be emailed." A property
   // manager can be a third party running the place from somewhere else, so
   // their inbox IS their desk.
+  // ── 10/27 (Nic): THE METER-READ NOTICE, END TO END ───────────────────────
+  //
+  //   "Lisa's still apparently getting emails about Val Sutherland and Patrick
+  //    Newman needing a meter read to be done. I thought we fixed her to not
+  //    get any more emails."
+  //
+  // She was fixed — on 10/25 at 14:18, six hours AFTER that morning's 07:00
+  // send, which is the last one she got. But the rule lived in
+  // createNotification and the only tests were on createNotification, so
+  // nothing proved the notice that actually reached her routes through it with
+  // the right recipients. Between 10/25 and 10/27 no departure was outstanding,
+  // so the live system never exercised it either — the quiet was the reads
+  // being settled, not the fix being proven.
+  //
+  // This drives the real job, with her real shape: an on-site manager who can
+  // read meters, and the owner, on one property with one departed site.
+  it('the closing-read notice reaches the desk on screen and the owner by email', async () => {
+    const { promptMoveOutMeterReads } = await import('./utilityReadingRuns')
+    const {
+      seedProperty, seedUnit, seedLease, seedTenant, seedLeaseTenant, seedUtilityMeter,
+    } = await import('../test/dbHelpers')
+    const c = await db.connect()
+    let landlordId: string, ownerUserId: string, propertyId: string, unitId: string
+    try {
+      const l = await seedLandlord(c)
+      landlordId = l.landlordId; ownerUserId = l.userId
+      propertyId = await seedProperty(c, { landlordId, ownerUserId, managedByUserId: ownerUserId })
+      unitId = await seedUnit(c, { propertyId, landlordId, rentAmount: 500 })
+      const leaseId = await seedLease(c, { unitId, landlordId, rentAmount: 500, status: 'active' })
+      const tenantId = await seedTenant(c)
+      await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
+      // They left two days ago and nobody has read the meter.
+      await c.query(`UPDATE leases SET end_date = CURRENT_DATE - 2 WHERE id = $1`, [leaseId])
+      const meterId = await seedUtilityMeter(c, { propertyId, utilityType: 'electric' })
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, unitId])
+    } finally { c.release() }
+
+    // Lisa: on-site manager, this property, allowed to read meters.
+    const lisa = await personWithRole('onsite_manager')
+    await query(
+      `INSERT INTO onsite_manager_scopes (user_id, landlord_id, all_properties, property_ids, permissions)
+       VALUES ($1, $2, FALSE, ARRAY[$3::uuid], '{"utility.read_meters": true}'::jsonb)`,
+      [lisa, landlordId!, propertyId!])
+
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+
+    // Both of them have it on screen.
+    expect(await inAppCount(lisa)).toBe(1)
+    expect(await inAppCount(ownerUserId!)).toBe(1)
+
+    // Only the owner's inbox. Hers stays empty — that is the whole complaint.
+    const emailed = sendMock.mock.calls.map((a: any[]) => a[0]?.userId)
+    expect(emailed).toContain(ownerUserId!)
+    expect(emailed).not.toContain(lisa)
+  })
+
   it('still emails a property manager', async () => {
     const c = await db.connect()
     let landlordId: string

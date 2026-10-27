@@ -1048,6 +1048,23 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
     confirmFirst: true,
   },
   {
+    id: 'set_paper_bills',
+    audience: 'landlord', method: 'PATCH',
+    path: '/api/properties/:propertyId/paper-bills',
+    pathParams: ['propertyId'],
+    description:
+      'Turn paper bills on or off for one property \u2014 whether this park hand delivers printed bills to doors. ' +
+      'On: the month\u2019s bills can be printed in one go from the Payments page, one page per household with each ' +
+      'utility\u2019s meter reading on it. Residents still get their bill by email either way, so this adds paper, it ' +
+      'never takes the email away. Read their choice back before sending.',
+    params: {
+      propertyId: { type: 'string', description: 'The property as the landlord refers to it — its NAME is fine.' },
+      paperBills: { type: 'boolean', description: 'true = we hand deliver printed bills here; false = email only.' },
+    },
+    required: ['propertyId', 'paperBills'],
+    confirmFirst: true,
+  },
+  {
     id: 'set_broken_meter_billing',
     audience: 'landlord', method: 'PATCH',
     path: '/api/properties/:propertyId/broken-meter-estimate',

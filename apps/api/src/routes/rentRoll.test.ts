@@ -182,9 +182,11 @@ describe('GET /api/balances/rent-roll/properties', () => {
     await space(mv, 'RV 2')
     const all = await get(owner(p), '/api/balances/rent-roll/properties')
     expect(all.status, JSON.stringify(all.body)).toBe(200)
+    // 10/27: paperBills rides along — the Payments page shows "Print all
+    // outstanding" only where the property hand delivers. Off until asked for.
     expect(all.body.data).toEqual([
-      { propertyId: mv.propertyId, name: 'Mountain View RV Ranch', spaces: 2, owned: true },
-      { propertyId: p.propertyId, name: 'Oak Park Motel and RV', spaces: 1, owned: true },
+      { propertyId: mv.propertyId, name: 'Mountain View RV Ranch', spaces: 2, owned: true, paperBills: false },
+      { propertyId: p.propertyId, name: 'Oak Park Motel and RV', spaces: 1, owned: true, paperBills: false },
     ])
     const locked = await get(await teamToken(p, 'onsite_manager', { 'payments.view_all': true }, [p.propertyId]), '/api/balances/rent-roll/properties')
     expect(locked.body.data.map((x: any) => x.name)).toEqual(['Oak Park Motel and RV'])

@@ -77,6 +77,7 @@ import { UnitDetailPage }  from './pages/UnitDetailPage'
 import { TenantsPage }     from './pages/TenantsPage'
 import { TenantDetailPage } from './pages/TenantDetailPage'
 import { TenantPaymentReportPage } from './pages/TenantPaymentReportPage'
+import { BillPrintPage } from './pages/BillPrintPage'
 import DuplicatePeoplePage from './pages/DuplicatePeoplePage'
 import { PendingTenantsPage } from './pages/PendingTenantsPage'
 import { PaymentsPage }    from './pages/PaymentsPage'
@@ -329,6 +330,10 @@ function App() {
               {/* 10/12 (Nic): the household's payment report, printable — opened
                   from a name on the Rent Roll or from the tenant profile. */}
               <Route path="tenants/:id/report" element={<TenantPaymentReportPage />} />
+              {/* 10/27 (Nic): the paper bill — one sheet per household, printed
+                  for a door. ?propertyId= for every outstanding bill there,
+                  &tenantId= for one. */}
+              <Route path="bills/print" element={<BillPrintPage />} />
               {/* 10/20 (Nic): "this looks like the same person" — the pairs GAM
                   noticed, for a person to answer. */}
               <Route path="duplicate-people" element={<DuplicatePeoplePage />} />
