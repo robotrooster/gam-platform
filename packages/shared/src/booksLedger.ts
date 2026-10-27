@@ -974,6 +974,10 @@ export const LEDGER_EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   // platform's own; what a tenant is actually charged posts from the charge.
   flexpay_fee_schedule: CONFIGURATION,
   flexdeposit_fee_schedule: CONFIGURATION,
+  // 10/27: what moving a FlexDeposit to a new unit costs — a price card like
+  // the grids beside it, not a transaction. The CHARGE it prices is an
+  // ordinary payments row and is captured there.
+  flexdeposit_move_fee_schedule: CONFIGURATION,
   pm_monthly_fee_accruals: 'the PM company owner-statement layer, not a landlord posting source',
   user_balance_ledger: 'balances follow from allocation_splits and the payout records',
   ledger_derived_facts: 'a note on which stored facts were worked out, not money moved',

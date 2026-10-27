@@ -2639,8 +2639,11 @@ function FeatureRequestModal({ onClose, onSuccess }: { onClose: () => void; onSu
 function FlexDepositModal({
   eligibility, onClose, onSuccess,
 }: { eligibility: any; onClose: () => void; onSuccess: () => void }) {
-  const choices: Array<{ payments: number; fee: number; installment: number; firstPull: number; total: number }> =
-    eligibility?.choices ?? []
+  const choices: Array<{
+    payments: number; fee: number; installment: number; firstPull: number; total: number
+    /** 10/27: the part above the top of the grid, paid in full with payment 1. */
+    payUpFront?: number
+  }> = eligibility?.choices ?? []
   const [count, setCount] = useState<number>(choices[0]?.payments ?? 2)
   const [tosAck, setTosAck] = useState(false)
   const [showFullTerms, setShowFullTerms] = useState(false)
@@ -2652,6 +2655,12 @@ function FlexDepositModal({
   const eligible = !!eligibility?.eligible
   const picked = choices.find(c => c.payments === count) ?? choices[0] ?? null
   const installmentAmt = picked?.installment ?? 0
+  // 10/27 (Nic): a deposit over the top of the price grid is split on the
+  // CEILING and the rest is paid in full with the first payment, so the
+  // division shown has to be of the split part — "$4,000 ÷ 4" would read $1,000
+  // beside payments of $750.
+  const upFront = Number(picked?.payUpFront ?? 0)
+  const splitPart = Math.round((deposit - upFront) * 100) / 100
 
   async function openFullTerms() {
     setLoadingTerms(true)
@@ -2701,7 +2710,10 @@ function FlexDepositModal({
             {eligibility?.blockers?.includes('no_deposit_row')    && 'No upcoming deposit found. FlexDeposit must be enrolled before move-in.'}
             {eligibility?.blockers?.includes('already_funded')    && 'Your deposit is already fully funded. FlexDeposit can only be enrolled before paying the deposit.'}
             {eligibility?.blockers?.includes('not_ssi_ssdi')      && 'FlexDeposit is currently available only to SSDI/SSI recipients with verified income.'}
-            {eligibility?.blockers?.includes('insufficient_platform_tenure') && `FlexDeposit requires at least 30 days on the GAM platform. Check back closer to your move-in date.`}
+            {/* 10/27: the 30 days are the LANDLORD's standing, not this
+                person's. Said as a fact about the property, because a
+                resident is not told how their landlord is doing with GAM. */}
+            {eligibility?.blockers?.includes('landlord_not_established') && `FlexDeposit is not available at this property yet.`}
             {eligibility?.blockers?.includes('insufficient_on_time_payment_history') && `FlexDeposit requires at least one on-time rent payment on a prior lease in the last 90 days.`}
           </div>
           <div className="modal-f"><button className="btn btn-g" onClick={onClose}>Close</button></div>
@@ -2760,7 +2772,8 @@ function FlexDepositModal({
             <span style={{fontFamily:'var(--font-m)',fontSize:'1.4rem',fontWeight:800,color:'var(--gold)'}}>${installmentAmt.toFixed(2)}</span>
           </div>
           <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>
-            ${deposit.toFixed(2)} ÷ {count} installments. First due at move-in.
+            ${splitPart.toFixed(2)} ÷ {count} installments. First due at move-in.
+            {upFront > 0 && ` The remaining $${upFront.toFixed(2)} of your deposit is paid in full with the first payment.`}
           </div>
           {picked && (
             <div style={{marginTop:12,paddingTop:12,borderTop:'1px solid var(--b1)'}}>
@@ -2768,7 +2781,7 @@ function FlexDepositModal({
                   WHOLE fee. Showing only the installment size would understate
                   it by the fee, which is the one number they are deciding on. */}
               <div style={{display:'flex',justifyContent:'space-between',fontSize:'.78rem',color:'var(--t2)'}}>
-                <span>At move-in (first payment + the whole fee)</span>
+                <span>At move-in (first payment + the whole fee{upFront > 0 ? ` + $${upFront.toFixed(2)} of deposit` : ''})</span>
                 <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--t0)'}}>
                   ${picked.firstPull.toFixed(2)}
                 </span>

@@ -62,7 +62,23 @@ import { dateIn, todayIn, monthStartOf } from '../lib/timezone'
 // S330: signal thresholds for the eligibility-check workflow promised
 // in Consumer Privacy Policy § 2.1. All rule-based — no scoring or
 // underwriting (preserves the not-credit structural defense).
-export const FLEX_DEPOSIT_MIN_TENURE_DAYS = 30
+/**
+ * ── 10/27 (Nic): THE 30 DAYS ARE THE LANDLORD'S, NOT THE RESIDENT'S ─────────
+ *
+ *   "the 30 day gate was against the landlord profile. landlord has to be
+ *    vetted and moving money through the system. not the new tenant"
+ *
+ * S330 wrote this as a check on the RESIDENT's account age, which was both
+ * the wrong party and impossible to satisfy: FlexDeposit is only ever offered
+ * at move-in, and somebody moving in has had an account for a day. It never
+ * bit because the product was switched off.
+ *
+ * The party worth vetting is the landlord. GAM holds the deposit in custody
+ * while the landlord's books read it as settled, so the exposure is a park
+ * that turns out not to be real, or not to be collecting. A resident is new by
+ * definition; a landlord is not.
+ */
+export const FLEX_DEPOSIT_MIN_LANDLORD_DAYS = 30
 export const FLEX_DEPOSIT_MIN_RECENT_ON_TIME_PAYMENTS = 1
 export const FLEX_DEPOSIT_PAYMENT_LOOKBACK_DAYS = 90
 
@@ -77,7 +93,9 @@ export interface FlexDepositEligibility {
     | 'not_ssi_ssdi'
     | 'already_funded'
     | 'tenant_not_found'
-    | 'insufficient_platform_tenure'
+    // 10/27: the LANDLORD is not established enough to offer FlexDeposit at —
+    // too new, not vetted for payouts, or no money moving through GAM.
+    | 'landlord_not_established'
     | 'insufficient_on_time_payment_history'
     // 10/26: the platform is at its FlexDeposit ceiling. Nothing about this
     // tenant — they qualify, there is simply no room right now.
@@ -95,8 +113,9 @@ export interface FlexDepositEligibility {
    * plus the WHOLE fee ("they pay the first payment and their entire fee at
    * once"), which is the number that matters at move-in.
    *
-   * Empty when there is no deposit to price, or when it is $3,000 or more and
-   * no plan is offered.
+   * Empty when there is no deposit to price, or for a payment count the
+   * product does not sell. 10/27: a deposit ABOVE the grid is no longer empty —
+   * it is priced at the ceiling, with the remainder in `payUpFront`.
    */
   choices: Array<{
     payments:    number
@@ -104,6 +123,14 @@ export interface FlexDepositEligibility {
     installment: number
     firstPull:   number
     total:       number
+    /**
+     * 10/27 (Nic): the part of the deposit ABOVE the top of the price grid,
+     * collected in full with payment 1 rather than split. 0 for almost
+     * everybody — only a deposit at or over $3,000 has any. His words: "they
+     * can split the $3,000 into four payments ... and then they pay the
+     * difference of that $1,000 gap from $3,000 to $4,000 all at once."
+     */
+    payUpFront:  number
   }>
 }
 
@@ -174,10 +201,8 @@ export async function getFlexDepositEligibility(tenantId: string): Promise<FlexD
     ach_verified: boolean
     ssi_ssdi: boolean
     bg_status: string | null
-    tenure_days: number
   }>(
-    `SELECT ach_verified, ssi_ssdi, background_check_status AS bg_status,
-            EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400 AS tenure_days
+    `SELECT ach_verified, ssi_ssdi, background_check_status AS bg_status
        FROM tenants WHERE id = $1`,
     [tenantId],
   )
@@ -228,29 +253,49 @@ export async function getFlexDepositEligibility(tenantId: string): Promise<FlexD
   // made about the applicant. The on-time check below stays: it is an
   // ELIGIBILITY gate, the same for everyone, not a difference in terms.
 
-  // ── 10/26: THE TENURE GATE CANNOT APPLY AT MOVE-IN ──────────────────────
+  // ── 10/27 (Nic): THE LANDLORD IS WHAT GETS VETTED ───────────────────────
   //
-  // S330 added a 30-day platform-tenure gate as a fraud defense against
-  // just-signed-up accounts. But FlexDeposit's only entry point IS move-in
-  // ("Opt-in at move-in", Consumer ToS § 9.1), and a resident moving in
-  // tomorrow has zero days of tenure — so the gate made the product
-  // impossible to use for the thing it exists to do. It had never bitten
-  // because the product was switched off until 10/26.
+  //   "the 30 day gate was against the landlord profile. landlord has to be
+  //    vetted and moving money through the system. not the new tenant"
   //
-  // The fix applies the reasoning THIS FILE ALREADY USES three lines below,
-  // where the on-time-payment-history gate exempts a first-lease tenant
-  // because "they have no payment history to check; the BG-approved gate
-  // covers the cold-start risk." Account age is the same kind of proxy, and a
-  // FlexDeposit applicant must ALREADY have: an approved background check tied
-  // to this tenancy, admin-verified SSDI/SSI income, and a verified bank
-  // account. That is far stronger evidence of a real person than the age of a
-  // row, so the gate adds nothing here and blocks everything.
+  // Three facts about the company whose deposit this is, none of them a
+  // judgement about anybody (so the not-credit structure is untouched):
   //
-  // It still applies to a RETURNING resident, where account age means
-  // something and there is history to have waited for. Flagged in the S658
-  // handoff as a decision Nic should look at rather than inherit.
-  if (!isFirstLease && t.tenure_days < FLEX_DEPOSIT_MIN_TENURE_DAYS) {
-    blockers.push('insufficient_platform_tenure')
+  //   established    the company has been on GAM at least
+  //                  FLEX_DEPOSIT_MIN_LANDLORD_DAYS.
+  //   vetted         Stripe Connect payouts are enabled — Stripe has run its
+  //                  own KYC on the business and will pay it. That is the
+  //                  vetting; GAM does not keep a second opinion of it.
+  //   money moving   money has actually settled through GAM for them inside
+  //                  the same window. A park that signed up and never
+  //                  collected is not a park GAM should be holding deposits
+  //                  for, however old the row is.
+  //
+  // Read off the DEPOSIT's own unit, so it is the company that will be handed
+  // this deposit — not whoever else the resident may also rent from.
+  const co = await queryOne<{
+    established: boolean; payouts_enabled: boolean; money_moving: boolean
+  }>(
+    `SELECT (NOW() - l.created_at) >= ($2::int || ' days')::interval AS established,
+            COALESCE(l.connect_payouts_enabled, FALSE)              AS payouts_enabled,
+            EXISTS (SELECT 1 FROM payments p
+                     WHERE p.landlord_id = l.id
+                       AND p.status = 'settled'
+                       AND p.settled_at > NOW() - ($2::int || ' days')::interval) AS money_moving
+       FROM security_deposits sd
+       JOIN units un      ON un.id = sd.unit_id
+       JOIN properties pr  ON pr.id = un.property_id
+       JOIN landlords l    ON l.id = pr.landlord_id
+      WHERE sd.tenant_id = $1
+        AND sd.status IN ('pending', 'partial')
+      ORDER BY sd.created_at DESC
+      LIMIT 1`,
+    [tenantId, FLEX_DEPOSIT_MIN_LANDLORD_DAYS],
+  )
+  // No row here means there is no deposit to read a landlord off; that is
+  // reported as 'no_deposit_row' below, not as a landlord problem.
+  if (co && !(co.established && co.payouts_enabled && co.money_moving)) {
+    blockers.push('landlord_not_established')
   }
 
   if (!isFirstLease) {
@@ -309,18 +354,26 @@ export async function getFlexDepositEligibility(tenantId: string): Promise<FlexD
   if (depositAmount !== null && depositAmount > 0) {
     const asOf = new Date().toISOString().slice(0, 10)
     for (const payments of FLEX_DEPOSIT_PAYMENT_CHOICES) {
-      const fee = await quoteFlexDepositServiceFee(depositAmount, payments, asOf)
-      if (fee === null) continue   // no bracket at this size: no plan offered
-      const installment = roundHalfEvenCents(depositAmount / payments)
+      // 10/27: a deposit over the top of the grid is no longer refused — the
+      // plan covers the ceiling and the rest is paid up front with payment 1.
+      const { quoteFlexDepositFeeCapped } = await import('./flexFees')
+      const q = await quoteFlexDepositFeeCapped(depositAmount, payments, asOf)
+      if (q === null) continue   // no price for this payment count: no plan
+      const { fee } = q
+      const { splittable, payUpFront } = q.split
+      const installment = roundHalfEvenCents(splittable / payments)
       // Installment 1 carries the rounding residue, as the schedule does.
       const first = roundHalfEvenCents(
-        installment + roundHalfEvenCents(depositAmount - installment * payments))
+        installment + roundHalfEvenCents(splittable - installment * payments))
       choices.push({
         payments,
         fee,
         installment,
-        firstPull: roundHalfEvenCents(first + fee),
+        // What the first collection actually takes: payment 1, the whole fee,
+        // and the part above the ceiling.
+        firstPull: roundHalfEvenCents(first + fee + payUpFront),
         total: roundHalfEvenCents(depositAmount + fee),
+        payUpFront,
       })
     }
   }
@@ -370,7 +423,16 @@ export interface FlexDepositSchedule {
    * installment 1 (10/26, Nic).
    */
   serviceFee:             number
-  /** What the first pull actually takes: installment 1 + the whole fee. */
+  /**
+   * 10/27 (Nic): the part of the deposit ABOVE the top of the price grid. It
+   * is NOT split — it is collected in full with payment 1 — so a deposit over
+   * $3,000 can still have a plan on the first $3,000. 0 for almost everybody.
+   */
+  payUpFront:             number
+  /**
+   * What the first pull actually takes: installment 1, the whole fee, and the
+   * part above the ceiling.
+   */
   firstPullTotal:         number
 }
 
@@ -395,13 +457,20 @@ export interface FlexDepositSchedule {
  * return settle against collected principal without GAM's fee leaking into it.
  */
 function computeFlexDepositSchedule(args: {
+  /**
+   * The part a plan covers. 10/27: for a deposit above the top of the grid
+   * this is the CEILING, not the whole deposit — the rest rides in payUpFront.
+   */
   depositTotal:      number
   installmentCount:  number
   startDate:         string
   rentDueDay:        number
   serviceFee:        number
+  /** The part collected in full with payment 1 rather than split. Default 0. */
+  payUpFront?:       number
 }): FlexDepositSchedule {
   const total = args.depositTotal
+  const payUpFront = roundHalfEvenCents(args.payUpFront ?? 0)
   const installmentAmount = roundHalfEvenCents(total / args.installmentCount)
   // Rounding residue lives on installment 1 so the sum equals total.
   const residue = roundHalfEvenCents(total - installmentAmount * args.installmentCount)
@@ -422,7 +491,11 @@ function computeFlexDepositSchedule(args: {
     installments, installmentAmount, firstAmount, uncollectedAtMoveIn,
     totalInstallmentAmount, startDate: args.startDate, rentDueDay: args.rentDueDay,
     serviceFee: args.serviceFee,
-    firstPullTotal: roundHalfEvenCents(firstAmount + args.serviceFee),
+    payUpFront,
+    // 10/27: the part above the ceiling goes with the first pull, not into the
+    // split — "they pay the first payment of the $3,000, so $750, and then
+    // they pay the difference of that $1,000 gap ... all at once."
+    firstPullTotal: roundHalfEvenCents(firstAmount + args.serviceFee + payUpFront),
   }
 }
 
@@ -477,15 +550,21 @@ export async function previewFlexDepositSchedule(args: {
   }
   const dep = await fetchUnfundedDeposit(args.tenantId)
   if (!dep) return { ok: false, reason: 'No unfunded deposit on file' }
-  // 10/26: the plan's price from the table. No bracket (a deposit of $3,000 or
-  // more) means no plan is offered — refused, never treated as free.
-  const serviceFee = await quoteFlexDepositServiceFee(
+  // 10/26: the plan's price from the table; a payment count the product does
+  // not sell has none, and is refused rather than read as free.
+  // 10/27 (Nic): a deposit ABOVE the top of the grid is no longer refused — the
+  // plan covers the ceiling ($3,000) and the rest is collected in full with
+  // payment 1 (quoteFlexDepositFeeCapped).
+  const { quoteFlexDepositFeeCapped } = await import('./flexFees')
+  const capped = await quoteFlexDepositFeeCapped(
     Number(dep.total_amount), args.installmentCount, todayIn('America/Phoenix'))
-  if (serviceFee === null) {
-    return { ok: false, reason: 'FlexDeposit covers deposits under $3,000.' }
+  if (capped === null) {
+    return { ok: false, reason: 'Choose 2 payments or 4 — those are the two FlexDeposit splits.' }
   }
+  const serviceFee = capped.fee
   const schedule = computeFlexDepositSchedule({
-    depositTotal:     Number(dep.total_amount),
+    depositTotal:     capped.split.splittable,
+    payUpFront:       capped.split.payUpFront,
     installmentCount: args.installmentCount,
     startDate:        dep.start_date.slice(0, 10),
     rentDueDay:       dep.rent_due_day,
@@ -532,15 +611,21 @@ export async function enrollFlexDeposit(args: {
   const dep = await fetchUnfundedDeposit(args.tenantId)
   if (!dep) return { ok: false, reason: 'No unfunded deposit on file' }
 
-  // 10/26: the plan's price from the table. No bracket (a deposit of $3,000 or
-  // more) means no plan is offered — refused, never treated as free.
-  const serviceFee = await quoteFlexDepositServiceFee(
+  // 10/26: the plan's price from the table; a payment count the product does
+  // not sell has none, and is refused rather than read as free.
+  // 10/27 (Nic): a deposit ABOVE the top of the grid is no longer refused — the
+  // plan covers the ceiling ($3,000) and the rest is collected in full with
+  // payment 1 (quoteFlexDepositFeeCapped).
+  const { quoteFlexDepositFeeCapped } = await import('./flexFees')
+  const capped = await quoteFlexDepositFeeCapped(
     Number(dep.total_amount), args.installmentCount, todayIn('America/Phoenix'))
-  if (serviceFee === null) {
-    return { ok: false, reason: 'FlexDeposit covers deposits under $3,000.' }
+  if (capped === null) {
+    return { ok: false, reason: 'Choose 2 payments or 4 — those are the two FlexDeposit splits.' }
   }
+  const serviceFee = capped.fee
   const schedule = computeFlexDepositSchedule({
-    depositTotal:     Number(dep.total_amount),
+    depositTotal:     capped.split.splittable,
+    payUpFront:       capped.split.payUpFront,
     installmentCount: args.installmentCount,
     startDate:        dep.start_date.slice(0, 10),
     rentDueDay:       dep.rent_due_day,
@@ -1458,76 +1543,231 @@ async function settleFlexDepositPayAhead(depositId: string): Promise<void> {
   }
 }
 
-// ── Cross-property top-up (S516) ─────────────────────────────────
+// ── Moving a FlexDeposit to a new unit (S516, re-specified 10/27) ──────────
 
 /**
- * S516: generate top-up installments for a carried-forward FlexDeposit whose
- * new property requires a LARGER deposit. The difference is spread into
- * monthly installments (tiered on the top-up amount) that the existing
- * installment cron collects — "option 1": the custody fee keeps running. The
- * tenant may instead fund the whole remainder at once via payAheadFlexDeposit
- * — "option 2": the custody fee stops. The option is expressed by tenant
- * behavior; no upfront choice is required.
+ * ── 10/27 (Nic): A TOP-UP HAS TWO ROUTES, AND NEITHER IS AUTOMATIC ──────────
  *
- * Must run inside the caller's transaction (the forward execute). New rows are
- * numbered AFTER the deposit's existing (now-settled) installments so the
- * unique (deposit, number) constraint holds; each carries installment_count =
- * the new grand total.
+ * A resident whose deposit GAM holds moves to a unit with a larger deposit. The
+ * difference is a top-up, and Nic set two routes for it:
+ *
+ *   "i told you two things because there are 2 routes. a route for splitting
+ *    the top up into payments and a route where its collected in single
+ *    payment."
+ *
+ *   IN ONE PULL   the whole difference, collected once. One fee, $25, and the
+ *                 $5 movement cost is INSIDE it — "The $25 price would already
+ *                 have that $5 price included in it."
+ *
+ *   SPLIT 2 or 4  a plan on the top-up amount, priced from the grid on the
+ *                 bracket the TOP-UP falls in ("most people's top up, if
+ *                 anything, will fall in that under $1,000 category"), plus the
+ *                 $5 movement cost as its own line — "the transfer costs of
+ *                 having it go to the new landlord on the split payment
+ *                 system."
+ *
+ * WHAT THE $25 BUYS, in his words, because it is the answer to "what am I
+ * paying for" and it is why this is a service price rather than a cut of their
+ * money: "what's to stop people on the new deposit from if they need their
+ * deposit money to get into the new place, it's the speed of access to it. If
+ * they need to wait to get their check mailed from GAM for the deposit refund,
+ * just to be able to cash it to give it back to the new landlord, the $25 is
+ * buying them the speed and the instantaneousness of having it recorded right
+ * there."
+ *
+ * The cost of COLLECTING is separate either way — "that's not including any
+ * banking fees. ACH pull for that collection would still be on there as a
+ * separate line item."
+ *
+ * WHY NOTHING HAPPENS BY ITSELF. Until 10/27 the forward silently scheduled a
+ * split, so a resident was put on a payment plan nobody offered them and
+ * charged a fee priced as if the top-up were a new deposit. A plan is a thing
+ * people accept. So the forward now leaves the deposit simply UNDER-FUNDED —
+ * which is the custody model's own normal state, carrying no debt and no
+ * acceleration — and a route has to be elected before anything is charged.
  */
-export async function scheduleFlexDepositTopUp(
-  client: PoolClient,
-  args: { depositId: string; topUpAmount: number },
-): Promise<{ count: number }> {
-  if (args.topUpAmount <= 0) return { count: 0 }
+/**
+ * What the one-pull fee buys, in the resident's words rather than ours. Nic,
+ * 10/27, when he worked out why the price is defensible:
+ *
+ *   "what's to stop people on the new deposit from if they need their deposit
+ *    money to get into the new place, it's the speed of access to it. If they
+ *    need to wait to get their check mailed from GAM for the deposit refund,
+ *    just to be able to cash it to give it back to the new landlord, the $25
+ *    is buying them the speed and the instantaneousness of having it recorded
+ *    right there."
+ *
+ * Exported so every surface that offers the choice says the same thing, and so
+ * nobody writes a fresh justification for a price that already has one. It
+ * names no amount — the amount comes from the price card.
+ */
+export const FLEX_DEPOSIT_MOVE_IN_FULL_COPY =
+  'Your deposit moves across the moment you pay it — no waiting on a refund check to arrive, '
+  + 'be cashed, and handed to your new landlord.'
 
-  const info = await client.query<{
-    tenant_id: string; rent_due_day: number;
-    risk_level: FlexDepositRiskLevel | null; max_num: number;
-    timezone: string;
-  }>(
-    `SELECT sd.tenant_id, l.rent_due_day, bc.risk_level,
-            COALESCE((SELECT MAX(installment_number)
-                        FROM flex_deposit_installments
-                       WHERE security_deposit_id = sd.id), 0) AS max_num,
-            p.timezone
+export interface FlexDepositTopUpQuote {
+  topUpAmount: number
+  /** The whole difference in one pull. */
+  payInFull: { fee: number; firstPull: number; total: number }
+  /** 2 or 4 payments, priced on the top-up's own bracket plus the movement fee. */
+  splits: Array<{
+    payments:    number
+    /** The grid's price for splitting this amount. */
+    fee:         number
+    /** The movement cost, charged beside it. */
+    movementFee: number
+    installment: number
+    /** What the first collection takes: payment 1 + both fees + anything above the grid. */
+    firstPull:   number
+    total:       number
+    /** The part above the top of the grid, collected in full. 0 in practice. */
+    payUpFront:  number
+  }>
+}
+
+/**
+ * What a top-up would cost each way. Null when there is no top-up owed, or
+ * when no price is in effect — a move with no price is refused, never free.
+ */
+export async function quoteFlexDepositTopUp(
+  depositId: string, asOf?: string,
+): Promise<FlexDepositTopUpQuote | null> {
+  const dep = await queryOne<{ total_amount: string; collected_amount: string; timezone: string }>(
+    `SELECT sd.total_amount::text, sd.collected_amount::text, p.timezone
        FROM security_deposits sd
        JOIN leases l ON l.id = sd.lease_id
        JOIN units u ON u.id = l.unit_id
        JOIN properties p ON p.id = u.property_id
-       LEFT JOIN tenants t ON t.id = sd.tenant_id
-       LEFT JOIN background_checks bc ON bc.id = t.background_check_id
+      WHERE sd.id = $1`,
+    [depositId],
+  )
+  if (!dep) return null
+  const topUpAmount = roundHalfEvenCents(
+    Number(dep.total_amount) - Number(dep.collected_amount))
+  if (topUpAmount <= 0) return null
+
+  const on = asOf ?? todayIn(dep.timezone)
+  const { quoteFlexDepositFeeCapped, quoteFlexDepositMoveFees } = await import('./flexFees')
+  const move = await quoteFlexDepositMoveFees(on)
+  if (move === null) return null
+
+  const splits: FlexDepositTopUpQuote['splits'] = []
+  for (const payments of FLEX_DEPOSIT_PAYMENT_CHOICES) {
+    const q = await quoteFlexDepositFeeCapped(topUpAmount, payments, on)
+    if (q === null) continue
+    const { splittable, payUpFront } = q.split
+    const installment = roundHalfEvenCents(splittable / payments)
+    const first = roundHalfEvenCents(
+      installment + roundHalfEvenCents(splittable - installment * payments))
+    splits.push({
+      payments,
+      fee: q.fee,
+      movementFee: move.splitMovement,
+      installment,
+      firstPull: roundHalfEvenCents(first + q.fee + move.splitMovement + payUpFront),
+      total: roundHalfEvenCents(topUpAmount + q.fee + move.splitMovement),
+      payUpFront,
+    })
+  }
+
+  return {
+    topUpAmount,
+    payInFull: {
+      fee: move.paidInFull,
+      firstPull: roundHalfEvenCents(topUpAmount + move.paidInFull),
+      total: roundHalfEvenCents(topUpAmount + move.paidInFull),
+    },
+    splits,
+  }
+}
+
+/**
+ * Charge a top-up by the route the resident chose.
+ *
+ * `{ route: 'in_full' }` writes ONE deposit charge for the whole difference
+ * plus GAM's single move fee. No installments: nothing is split, so the plan
+ * machinery is not involved at all.
+ *
+ * `{ route: 'split', payments }` writes the installments (numbered after the
+ * deposit's existing ones so the unique (deposit, number) constraint holds),
+ * the grid's price for splitting, and the movement fee beside it.
+ *
+ * Must run inside the caller's transaction. The deposit charge is the
+ * resident's own custody principal; both fees are GAM's revenue and are kept
+ * in their own rows so a deposit return can never hand a fee back.
+ */
+export async function electFlexDepositTopUp(
+  client: PoolClient,
+  args: { depositId: string; route: 'in_full' | 'split'; payments?: number },
+): Promise<{ ok: true; charged: number; installments: number } | { ok: false; reason: string }> {
+  const quote = await quoteFlexDepositTopUp(args.depositId)
+  if (!quote) return { ok: false, reason: 'No top-up is owed on this deposit.' }
+
+  const info = await client.query<{
+    tenant_id: string; lease_id: string; unit_id: string; landlord_id: string;
+    rent_due_day: number; max_num: number; timezone: string;
+  }>(
+    `SELECT sd.tenant_id, sd.lease_id, u.id AS unit_id, p.landlord_id,
+            l.rent_due_day, p.timezone,
+            COALESCE((SELECT MAX(installment_number)
+                        FROM flex_deposit_installments
+                       WHERE security_deposit_id = sd.id), 0) AS max_num
+       FROM security_deposits sd
+       JOIN leases l ON l.id = sd.lease_id
+       JOIN units u ON u.id = l.unit_id
+       JOIN properties p ON p.id = u.property_id
       WHERE sd.id = $1`,
     [args.depositId],
   ).then(r => r.rows[0])
-  if (!info) return { count: 0 }
+  if (!info) return { ok: false, reason: 'Deposit not found.' }
 
-  const count = getFlexDepositMaxInstallments(args.topUpAmount, info.risk_level) ?? 2
+  const feeRow = async (amount: number, note: string) => {
+    await client.query(
+      `INSERT INTO payments (
+         unit_id, lease_id, tenant_id, landlord_id,
+         type, amount, status, due_date, entry_description, revenue_owner, notes
+       ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', CURRENT_DATE, 'FLEXDEP', 'gam', $6)`,
+      [info.unit_id, info.lease_id, info.tenant_id, info.landlord_id, amount.toFixed(2), note])
+  }
+
+  if (args.route === 'in_full') {
+    // The whole difference, once. Its own deposit-type row: custody principal,
+    // which comes back at move-out.
+    await client.query(
+      `INSERT INTO payments (
+         unit_id, lease_id, tenant_id, landlord_id,
+         type, amount, status, due_date, entry_description, notes
+       ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', CURRENT_DATE, 'DEPOSIT', $6)`,
+      [
+        info.unit_id, info.lease_id, info.tenant_id, info.landlord_id,
+        quote.topUpAmount.toFixed(2),
+        `FlexDeposit top-up, paid in full (deposit ${args.depositId})`,
+      ])
+    await feeRow(quote.payInFull.fee,
+      `FlexDeposit move — top-up recorded at once (deposit ${args.depositId})`)
+    return { ok: true, charged: quote.payInFull.firstPull, installments: 0 }
+  }
+
+  const payments = args.payments ?? 0
+  const chosen = quote.splits.find(s => s.payments === payments)
+  if (!chosen) {
+    return { ok: false, reason: 'Choose 2 payments or 4 — those are the two FlexDeposit splits.' }
+  }
   // Anchor to next month so the first top-up pull is upcoming, not overdue.
   // S654: "this month" is the property's month; UTC is already next month
   // after 5 pm on the last day in Phoenix, which would skip a month.
   const startDate = addMonths(monthStartOf(todayIn(info.timezone)), 1)
-  // A top-up is priced the same way, on the top-up amount and its own count.
-  const topUpFee = await quoteFlexDepositServiceFee(
-    args.topUpAmount, count, todayIn(info.timezone))
-  if (topUpFee === null) {
-    // This path runs inside the caller's transaction and has no refusal
-    // channel, so it throws: a top-up with no price must roll the whole thing
-    // back rather than schedule installments at no charge.
-    throw new AppError(409,
-      `A FlexDeposit top-up of $${args.topUpAmount.toFixed(2)} has no price in the schedule `
-      + `(FlexDeposit covers deposits under $3,000).`)
-  }
   const schedule = computeFlexDepositSchedule({
-    depositTotal:     args.topUpAmount,
-    installmentCount: count,
+    depositTotal:     roundHalfEvenCents(chosen.installment * payments),
+    payUpFront:       chosen.payUpFront,
+    installmentCount: payments,
     startDate,
     rentDueDay:       info.rent_due_day,
-    serviceFee:       topUpFee,
+    serviceFee:       chosen.fee,
   })
   const maxNum = Number(info.max_num)
-  const grandTotal = maxNum + count
-
-  for (let i = 1; i <= count; i++) {
+  const grandTotal = maxNum + payments
+  for (let i = 1; i <= payments; i++) {
     const inst = schedule.installments[i - 1]
     const pulls = computeInstallmentPullDates(startDate, i, info.rent_due_day)
     await client.query(
@@ -1538,10 +1778,11 @@ export async function scheduleFlexDepositTopUp(
       [
         args.depositId, info.tenant_id, maxNum + i, grandTotal,
         inst.amount.toFixed(2), inst.dueDate, pulls.primary, pulls.retry,
-      ],
-    )
+      ])
   }
-
+  await feeRow(chosen.fee, `FlexDeposit top-up split into ${payments} (deposit ${args.depositId})`)
+  await feeRow(chosen.movementFee,
+    `FlexDeposit move — transfer to the new landlord (deposit ${args.depositId})`)
   await client.query(
     `UPDATE security_deposits
         SET installment_count      = $2,
@@ -1552,10 +1793,9 @@ export async function scheduleFlexDepositTopUp(
       WHERE id = $1`,
     [
       args.depositId, grandTotal, schedule.installmentAmount.toFixed(2),
-      count, schedule.installments[0].dueDate,
-    ],
-  )
-  return { count }
+      payments, schedule.installments[0].dueDate,
+    ])
+  return { ok: true, charged: chosen.firstPull, installments: payments }
 }
 
 // ── helpers ─────────────────────────────────────────────────────

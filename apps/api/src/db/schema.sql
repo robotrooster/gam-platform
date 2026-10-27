@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict AdmXSbRylCabUCEKDxeePmx86dbeW2bTZZaIQ6HcciQJczqK08M1kwQAJOzEXTT
+\restrict VB5MVVDtggEYyv1f8DIGbWSxeghwObXPeFS9BhVClFknN2mPKb2g9VRSjVLhqU1
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -12596,7 +12596,29 @@ CREATE TABLE public.flexdeposit_fee_schedule (
 -- Name: TABLE flexdeposit_fee_schedule; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.flexdeposit_fee_schedule IS 'FlexDeposit service fee by deposit bracket and installment count. Exactly two counts are sold, 2 and 4 (10/26, Nic), at the SAME price for everybody at a given deposit size — that uniformity is what keeps it a service price rather than a credit decision. Not offered at $3,000 or more. Re-pricing appends a row with a later effective_from.';
+COMMENT ON TABLE public.flexdeposit_fee_schedule IS 'FlexDeposit service fee by deposit bracket and installment count. Exactly two counts are sold, 2 and 4 (10/26, Nic), at the SAME price for everybody at a given deposit size — that uniformity is what keeps it a service price rather than a credit decision. A deposit at or above the top bracket''s ceiling is served at the ceiling''s price (10/27): the plan splits the ceiling and the remainder is collected in full with payment 1. Re-pricing appends a row with a later effective_from.';
+
+
+--
+-- Name: flexdeposit_move_fee_schedule; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.flexdeposit_move_fee_schedule (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    paid_in_full_fee numeric(10,2) NOT NULL,
+    split_movement_fee numeric(10,2) NOT NULL,
+    effective_from date NOT NULL,
+    note text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT flexdeposit_move_fee_nonneg CHECK (((paid_in_full_fee >= (0)::numeric) AND (split_movement_fee >= (0)::numeric)))
+);
+
+
+--
+-- Name: TABLE flexdeposit_move_fee_schedule; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.flexdeposit_move_fee_schedule IS 'What moving a FlexDeposit custody balance to a new unit costs (10/27, Nic): one flat fee when the top-up is collected in a single pull, or a smaller movement fee charged beside the grid price when it is split into 2 or 4. Effective-dated; a re-price appends a forward-dated row. The ACH or card cost of collecting is a separate pass-through.';
 
 
 --
@@ -24809,6 +24831,22 @@ ALTER TABLE ONLY public.flexdeposit_capacity
 
 ALTER TABLE ONLY public.flexdeposit_fee_schedule
     ADD CONSTRAINT flexdeposit_fee_schedule_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: flexdeposit_move_fee_schedule flexdeposit_move_fee_one_per_date; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexdeposit_move_fee_schedule
+    ADD CONSTRAINT flexdeposit_move_fee_one_per_date UNIQUE (effective_from);
+
+
+--
+-- Name: flexdeposit_move_fee_schedule flexdeposit_move_fee_schedule_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexdeposit_move_fee_schedule
+    ADD CONSTRAINT flexdeposit_move_fee_schedule_pkey PRIMARY KEY (id);
 
 
 --
@@ -47352,5 +47390,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict AdmXSbRylCabUCEKDxeePmx86dbeW2bTZZaIQ6HcciQJczqK08M1kwQAJOzEXTT
+\unrestrict VB5MVVDtggEYyv1f8DIGbWSxeghwObXPeFS9BhVClFknN2mPKb2g9VRSjVLhqU1
 

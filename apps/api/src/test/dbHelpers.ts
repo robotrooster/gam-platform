@@ -14,6 +14,7 @@
  */
 
 import { randomUUID } from 'crypto'
+import { seedFlexPriceCards } from './flexPriceCards'
 import { formatUnitNumber } from '../lib/format'
 import type { PoolClient } from 'pg'
 import { db, getClient } from '../db'
@@ -51,6 +52,9 @@ const CLEANUP_KEEPS: readonly string[] = [
   // What things cost, and how a score is computed.
   'platform_processing_rates', 'stripe_processing_costs', 'deposit_pool_yield_rates',
   'credit_score_formulas', 'flexpay_fee_schedule', 'flexdeposit_fee_schedule',
+  // 10/27: what moving a FlexDeposit to a new unit costs. A price card like
+  // the grids — FK-free, seeded by its own migration — so the wipe keeps it.
+  'flexdeposit_move_fee_schedule',
   // What the agents and the documents are made of.
   'agent_knowledge_chunks', 'disclosure_library_documents', 'disclosure_library_fields',
   'document_sleeves', 'library_coverage_items', 'platform_announcements', 'sales_calendar_feed',
@@ -190,12 +194,26 @@ export async function cleanupAllSchema(): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     try {
       await db.query(WIPE_TEST_DATA)
-      return
+      break
     } catch (e: any) {
       if ((e?.code !== '40P01' && e?.code !== '55P03') || attempt >= 5) throw e
       await new Promise(resolve => setTimeout(resolve, 20 * attempt))
     }
   }
+  // ── 10/27: THE FLEX PRICE CARDS ARE ALWAYS THERE ───────────────────────────
+  //
+  // They are a catalog the wipe deliberately keeps (CLEANUP_KEEPS) and
+  // globalSetup seeds them once into the template, so in the ordinary case this
+  // is a no-op — the insert is guarded on the table being empty.
+  //
+  // It is here because a file that BORROWS the tables can leave them empty for
+  // every later file in the same worker, and did: services/flexFees.test.ts
+  // deleted both when it finished, and whichever price-dependent file vitest
+  // scheduled behind it failed with the services' (correct) refusal instead of
+  // a fee. Two full runs failed that way on two unrelated tests. That file now
+  // puts the grid back itself, and this makes it structural rather than a
+  // courtesy: no test can start without prices, whatever ran before it.
+  await seedFlexPriceCards(sql => db.query(sql))
 }
 
 /**

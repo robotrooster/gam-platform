@@ -130,16 +130,116 @@ describe('executeDepositPortability — custody forwarding (S516)', () => {
     expect(carried.status).toBe('partial')
     expect(carried.custody_fee_active).toBe(true)
 
-    // Top-up installments were generated for the $500 difference, numbered
-    // after the original (settled) schedule, and are pending for the cron.
+    // ── 10/27 (Nic): NOTHING IS CHARGED AND NOTHING IS SPLIT YET ────────────
+    //
+    // This used to assert that top-up installments were generated here. They
+    // were — which meant a resident was put on a payment plan nobody offered
+    // them, at a fee priced as if the $500 were a new deposit. There are two
+    // routes now and a plan is a thing people accept, so the forward leaves the
+    // deposit under-funded and the charge waits for the election.
     const topups = await db.query(
-      `SELECT amount::text, installment_number, status
-         FROM flex_deposit_installments
-        WHERE security_deposit_id = $1 AND status = 'pending'
-        ORDER BY installment_number`, [s.depositId])
-    expect(topups.rows.length).toBeGreaterThanOrEqual(2)
-    expect(topups.rows.every(r => Number(r.installment_number) > 2)).toBe(true)
-    const sum = topups.rows.reduce((a, r) => a + Number(r.amount), 0)
-    expect(sum).toBeCloseTo(500, 2)
+      `SELECT 1 FROM flex_deposit_installments
+        WHERE security_deposit_id = $1 AND status = 'pending'`, [s.depositId])
+    expect(topups.rows.length).toBe(0)
+    const charges = await db.query(
+      `SELECT 1 FROM payments WHERE tenant_id = $1 AND status = 'pending'`, [s.tenantId])
+    expect(charges.rows.length).toBe(0)
+  })
+
+  // ── 10/27 (Nic): THE TWO ROUTES ──────────────────────────────────────────
+  //
+  //   "i told you two things because there are 2 routes. a route for splitting
+  //    the top up into payments and a route where its collected in single
+  //    payment."
+  //
+  // $500 owed. One pull is $500 + $25 (the $5 movement is inside the $25 —
+  // "The $25 price would already have that $5 price included in it"). Split is
+  // the grid's under-$1,000 price on the TOP-UP, $48 on 2 or $67 on 4, plus $5
+  // beside it.
+  describe('what the top-up costs each way, and what each route charges', () => {
+    const forwarded = async () => {
+      const s = await seedForwardScenario(1500)
+      await authorizeDepositPortability({
+        tenantId: s.tenantId, depositId: s.depositId,
+        targetLeaseId: s.leaseB, signature: 'tenant-signed',
+      })
+      await executeDepositPortability({ depositId: s.depositId })
+      return s
+    }
+
+    it('quotes one pull at $25 and the splits at the top-up\'s own bracket plus $5', async () => {
+      const s = await forwarded()
+      const { quoteFlexDepositTopUp } = await import('./flexDeposit')
+      const q = (await quoteFlexDepositTopUp(s.depositId))!
+      expect(q.topUpAmount).toBe(500)
+      expect(q.payInFull).toEqual({ fee: 25, firstPull: 525, total: 525 })
+      expect(q.splits.map(x => [x.payments, x.fee, x.movementFee, x.installment, x.total]))
+        .toEqual([[2, 48, 5, 250, 553], [4, 67, 5, 125, 572]])
+      // The first collection takes payment 1 and both fees.
+      expect(q.splits[0].firstPull).toBe(250 + 48 + 5)
+      expect(q.splits[1].firstPull).toBe(125 + 67 + 5)
+    })
+
+    it('in one pull: one deposit charge, one fee, no installments', async () => {
+      const s = await forwarded()
+      const { electFlexDepositTopUp } = await import('./flexDeposit')
+      const c = await db.connect()
+      try {
+        await c.query('BEGIN')
+        const r = await electFlexDepositTopUp(c, { depositId: s.depositId, route: 'in_full' })
+        expect(r).toEqual({ ok: true, charged: 525, installments: 0 })
+        await c.query('COMMIT')
+      } finally { c.release() }
+      const rows = await db.query<{ type: string; amount: string; revenue_owner: string }>(
+        `SELECT type, amount::text, revenue_owner FROM payments
+          WHERE tenant_id = $1 AND status = 'pending' ORDER BY type`, [s.tenantId])
+      // The deposit row takes the default owner, exactly as FlexDeposit
+      // installment 1 does at move-in (jobs/moveInBundle) — it is custody
+      // principal that comes back at move-out. The fee is GAM's, in its own
+      // row, so a deposit return can never hand it back.
+      expect(rows.rows.map(r => [r.type, Number(r.amount), r.revenue_owner]))
+        .toEqual([['deposit', 500, 'landlord'], ['fee', 25, 'gam']])
+      const inst = await db.query(
+        `SELECT 1 FROM flex_deposit_installments
+          WHERE security_deposit_id = $1 AND status = 'pending'`, [s.depositId])
+      expect(inst.rows.length).toBe(0)
+    })
+
+    it('split into four: four payments of $125, the $67 grid price and the $5 movement', async () => {
+      const s = await forwarded()
+      const { electFlexDepositTopUp } = await import('./flexDeposit')
+      const c = await db.connect()
+      try {
+        await c.query('BEGIN')
+        const r = await electFlexDepositTopUp(c, { depositId: s.depositId, route: 'split', payments: 4 })
+        expect(r).toEqual({ ok: true, charged: 197, installments: 4 })
+        await c.query('COMMIT')
+      } finally { c.release() }
+      const inst = await db.query<{ amount: string; installment_number: number }>(
+        `SELECT amount::text, installment_number FROM flex_deposit_installments
+          WHERE security_deposit_id = $1 AND status = 'pending'
+          ORDER BY installment_number`, [s.depositId])
+      expect(inst.rows.map(r => Number(r.amount))).toEqual([125, 125, 125, 125])
+      // Numbered after the original (settled) schedule, so the unique
+      // (deposit, number) constraint holds.
+      expect(inst.rows.every(r => Number(r.installment_number) > 2)).toBe(true)
+      const fees = await db.query<{ amount: string }>(
+        `SELECT amount::text FROM payments
+          WHERE tenant_id = $1 AND type = 'fee' AND revenue_owner = 'gam'
+          ORDER BY amount::numeric`, [s.tenantId])
+      expect(fees.rows.map(r => Number(r.amount))).toEqual([5, 67])
+    })
+
+    it('a payment count the product does not sell is refused', async () => {
+      const s = await forwarded()
+      const { electFlexDepositTopUp } = await import('./flexDeposit')
+      const c = await db.connect()
+      try {
+        await c.query('BEGIN')
+        const r = await electFlexDepositTopUp(c, { depositId: s.depositId, route: 'split', payments: 3 })
+        expect(r).toMatchObject({ ok: false })
+        await c.query('ROLLBACK')
+      } finally { c.release() }
+    })
   })
 })

@@ -11,7 +11,7 @@
  *   - no_bg_result / bg_not_approved    : background_check_status != 'approved'
  *   - risk_level_missing                : BG row missing risk_level
  *   - no_deposit_row / already_funded   : security_deposits state
- *   - insufficient_platform_tenure (S330):
+ *   - landlord_not_established (10/27):
  *       has prior lease AND tenants.created_at < 30d ago
  *       (first-lease-ever tenants are exempt — 10/26: move-in is
  *        FlexDeposit's only entry point, so a first-lease tenant has no
@@ -27,7 +27,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db } from '../db'
-import { getFlexDepositEligibility, FLEX_DEPOSIT_MIN_TENURE_DAYS } from './flexDeposit'
+import { getFlexDepositEligibility, FLEX_DEPOSIT_MIN_LANDLORD_DAYS } from './flexDeposit'
 import {
   withRollback, cleanupAllSchema,
   seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant,
@@ -46,11 +46,30 @@ async function buildEligibilityStack(
     tenantCreatedAt?:                    string  // ISO; defaults to NOW()
     skipDeposit?:                        boolean
     depositStatus?:                      'pending' | 'partial' | 'funded'
+    /** The deposit's size. Defaults to 500 — inside the grid's lowest bracket. */
+    depositAmount?:                      number
     seedPriorLease?:                     boolean
     seedPriorPlan?:                      boolean
+    /** 10/27: the landlord's own standing — vetted, established, collecting. */
+    landlordCreatedAt?:                  string   // ISO; defaults to 60 days ago
+    landlordPayoutsEnabled?:             boolean  // defaults true
+    landlordMoneyMoving?:                boolean  // defaults true
   } = {},
 ): Promise<{ tenantId: string; landlordId: string }> {
   const { userId: ownerUserId, landlordId } = await seedLandlord(client)
+  // ── 10/27 (Nic): THE 30 DAYS ARE THE LANDLORD'S ──────────────────────────
+  // "landlord has to be vetted and moving money through the system. not the
+  // new tenant." Every test here is about the RESIDENT, so the landlord is
+  // seeded the way a real one looks by default — on GAM for two months,
+  // vetted by Stripe for payouts, money settling — and the three landlord
+  // cases are exercised on their own below.
+  await client.query(
+    `UPDATE landlords
+        SET created_at = COALESCE($2::timestamptz, NOW() - INTERVAL '60 days'),
+            connect_payouts_enabled = $3
+      WHERE id = $1`,
+    [landlordId, opts.landlordCreatedAt ?? null, opts.landlordPayoutsEnabled ?? true],
+  )
   const tenantId = await seedTenant(client)
   // Fetch the tenant's user_id — background_checks.user_id is NOT NULL.
   const tu = await client.query<{ user_id: string }>(
@@ -110,8 +129,9 @@ async function buildEligibilityStack(
     await client.query(
       `INSERT INTO security_deposits
          (unit_id, lease_id, tenant_id, total_amount, status, held_by)
-       VALUES ($1, $2, $3, 500, $4, 'gam_escrow')`,
-      [unitId, upcomingLeaseId, tenantId, opts.depositStatus ?? 'pending'],
+       VALUES ($1, $2, $3, $5, $4, 'gam_escrow')`,
+      [unitId, upcomingLeaseId, tenantId, opts.depositStatus ?? 'pending',
+       (opts.depositAmount ?? 500).toFixed(2)],
     )
   }
 
@@ -138,6 +158,18 @@ async function buildEligibilityStack(
           flex_deposit_enabled, flex_deposit_plan_status)
        VALUES ($1, $2, $3, 400, 'funded', 'gam_escrow', TRUE, 'completed')`,
       [otherUnitId, otherLeaseId, tenantId],
+    )
+  }
+
+  // Money actually settling through GAM for this company, inside the window.
+  if (opts.landlordMoneyMoving !== false) {
+    await client.query(
+      `INSERT INTO payments
+         (landlord_id, tenant_id, unit_id, lease_id, type, amount, status,
+          entry_description, due_date, settled_at)
+       VALUES ($1, $2, $3, $4, 'rent', 1000, 'settled', 'RENT',
+               CURRENT_DATE - 10, NOW() - INTERVAL '10 days')`,
+      [landlordId, tenantId, unitId, upcomingLeaseId],
     )
   }
 
@@ -295,90 +327,81 @@ describe('getFlexDepositEligibility — pre-existing blockers', () => {
   })
 })
 
-// Account ages either side of the S330 tenure gate. Derived from the service
-// constant so a change to the threshold moves both fixtures with it instead
-// of leaving them silently on the wrong side of the line; one day of slack is
-// far more than any clock drift inside a test run.
-const DAY_MS = 86_400_000
-const UNDER_TENURE_DAYS = FLEX_DEPOSIT_MIN_TENURE_DAYS - 1
-const OVER_TENURE_DAYS  = FLEX_DEPOSIT_MIN_TENURE_DAYS + 1
 // Well inside the 90d on-time-payment lookback, and after the account in the
-// under-tenure cases was opened, so the fixture stays chronologically sane.
+// returning-resident cases was opened, so the fixture stays chronologically sane.
+const DAY_MS = 86_400_000
 const RECENT_ON_TIME_PAYMENT_DAYS = 7
 const daysAgoIso = (days: number): string =>
   new Date(Date.now() - days * DAY_MS).toISOString()
 
-describe('getFlexDepositEligibility — S330 platform tenure', () => {
-  // 10/26: the tenure gate now exempts a first-lease tenant —
-  // `!isFirstLease && tenure_days < FLEX_DEPOSIT_MIN_TENURE_DAYS`.
-  // FlexDeposit's only entry point is move-in, so a resident moving in
-  // tomorrow has zero tenure and the gate made the product impossible to use
-  // for the thing it exists to do. Same reasoning the on-time-payment-history
-  // gate already applies to a first lease: there is no history to have waited
-  // for, and an approved background check + admin-verified SSDI/SSI income +
-  // a verified bank account cover the cold-start risk. A RETURNING resident,
-  // where account age does mean something, is still gated — so this reads as
-  // two cases, not one relaxed one.
-  it('does NOT block a first-lease tenant created < 30 days ago (the move-in case)', async () => {
+// ── 10/27 (Nic): THE 30 DAYS BELONG TO THE LANDLORD ─────────────────────────
+//
+//   "the 30 day gate was against the landlord profile. landlord has to be
+//    vetted and moving money through the system. not the new tenant"
+//
+// S330 wrote it as a check on the RESIDENT's account age, which was the wrong
+// party and unsatisfiable: FlexDeposit is only offered at move-in, so the
+// person being asked has had an account for a day. It never bit because the
+// product was off. GAM holds the deposit while the landlord's books read it as
+// settled, so the party worth vetting is the landlord.
+describe('getFlexDepositEligibility — the landlord has to be established', () => {
+  const landlordCase = async (opts: Parameters<typeof buildEligibilityStack>[1]) => {
     const client = await db.connect()
     let tenantId: string
     try {
       await client.query('BEGIN')
       const stack = await buildEligibilityStack(client, {
-        achVerified: true, bgStatus: 'approved', riskLevel: 'low',
-        tenantCreatedAt: daysAgoIso(UNDER_TENURE_DAYS),
-        // No seedPriorLease — this is the tenant's first lease ever.
+        achVerified: true, bgStatus: 'approved', riskLevel: 'low', ...opts,
       })
       tenantId = stack.tenantId
       await client.query('COMMIT')
     } finally { client.release() }
-    const r = await getFlexDepositEligibility(tenantId)
-    expect(r.blockers).not.toContain('insufficient_platform_tenure')
-    // A brand-new account at move-in must come out fully eligible, or the
-    // product still cannot be used at its only entry point.
+    return await getFlexDepositEligibility(tenantId)
+  }
+
+  it('a brand-new resident at an established park is fully eligible — the move-in case', async () => {
+    // Zero days on the platform, which is every move-in there will ever be.
+    const r = await landlordCase({ tenantCreatedAt: new Date().toISOString() })
     expect(r.blockers).toEqual([])
     expect(r.eligible).toBe(true)
   })
 
-  it('still blocks insufficient_platform_tenure for a RETURNING resident created < 30 days ago', async () => {
-    const client = await db.connect()
-    let tenantId: string
-    try {
-      await client.query('BEGIN')
-      const stack = await buildEligibilityStack(client, {
-        achVerified: true, bgStatus: 'approved', riskLevel: 'low',
-        tenantCreatedAt: daysAgoIso(UNDER_TENURE_DAYS),
-        seedPriorLease: true,
-      })
-      tenantId = stack.tenantId
-      // The prior lease also switches on the on-time-payment-history gate;
-      // give it a qualifying payment so tenure is the ONLY thing left that
-      // can block, and the exact-equality assertion below proves it fired.
-      await emitOnTimePayment(
-        client, tenantId,
-        new Date(Date.now() - RECENT_ON_TIME_PAYMENT_DAYS * DAY_MS),
-      )
-      await client.query('COMMIT')
-    } finally { client.release() }
-    const r = await getFlexDepositEligibility(tenantId)
-    expect(r.blockers).toEqual(['insufficient_platform_tenure'])
+  it('blocks when the company has been on GAM less than 30 days', async () => {
+    const r = await landlordCase({ landlordCreatedAt: daysAgoIso(FLEX_DEPOSIT_MIN_LANDLORD_DAYS - 1) })
+    expect(r.blockers).toEqual(['landlord_not_established'])
     expect(r.eligible).toBe(false)
   })
 
-  it('does not block on tenure when a returning resident was created > 30 days ago', async () => {
+  it('blocks when the company is not vetted for payouts', async () => {
+    const r = await landlordCase({ landlordPayoutsEnabled: false })
+    expect(r.blockers).toEqual(['landlord_not_established'])
+  })
+
+  it('blocks when no money has settled through GAM for the company', async () => {
+    const r = await landlordCase({ landlordMoneyMoving: false })
+    expect(r.blockers).toEqual(['landlord_not_established'])
+  })
+
+  it('an old account with nothing moving through it is still not established', async () => {
+    const r = await landlordCase({
+      landlordCreatedAt: daysAgoIso(400), landlordMoneyMoving: false,
+    })
+    expect(r.blockers).toEqual(['landlord_not_established'])
+  })
+
+  it("a returning resident's own account age is not a gate any more", async () => {
     const client = await db.connect()
     let tenantId: string
     try {
       await client.query('BEGIN')
       const stack = await buildEligibilityStack(client, {
         achVerified: true, bgStatus: 'approved', riskLevel: 'low',
-        tenantCreatedAt: daysAgoIso(OVER_TENURE_DAYS),
-        // A prior lease, so the gate is live for this tenant and the pass
-        // side of the threshold is genuinely exercised rather than skipped
-        // by the first-lease exemption.
+        tenantCreatedAt: daysAgoIso(1),
         seedPriorLease: true,
       })
       tenantId = stack.tenantId
+      // The prior lease switches on the on-time-payment gate; satisfy it so
+      // the equality below proves nothing else fired.
       await emitOnTimePayment(
         client, tenantId,
         new Date(Date.now() - RECENT_ON_TIME_PAYMENT_DAYS * DAY_MS),
@@ -386,7 +409,6 @@ describe('getFlexDepositEligibility — S330 platform tenure', () => {
       await client.query('COMMIT')
     } finally { client.release() }
     const r = await getFlexDepositEligibility(tenantId)
-    expect(r.blockers).not.toContain('insufficient_platform_tenure')
     expect(r.blockers).toEqual([])
     expect(r.eligible).toBe(true)
   })
@@ -508,5 +530,60 @@ describe('getFlexDepositEligibility — happy path', () => {
     expect(r.max_installments).toBeGreaterThan(0)
     expect(r.risk_level).toBe('low')
     expect(r.deposit_amount).toBe(500)
+  })
+})
+
+
+// ── 10/27 (Nic): A DEPOSIT OVER THE TOP OF THE GRID STILL GETS A PLAN ───────
+//
+//   "We don't do deposits over $3,000. So that means if somebody's splitting a
+//    payment more than that ... say the payment's $4,000 for the deposit. They
+//    can split the $3,000 into four payments, they pay the $167 or whatever the
+//    fee is, for the four payments, they pay the first payment of the $3,000,
+//    so $750, and then they pay the difference of that $1,000 gap from $3,000
+//    to $4,000 all at once."
+//
+// This is what the RESIDENT is offered, which is where it has to be right: a
+// $4,000 deposit used to be refused a plan outright.
+describe('getFlexDepositEligibility — a deposit above the grid', () => {
+  const offered = async (depositAmount: number) => {
+    const client = await db.connect()
+    let tenantId: string
+    try {
+      await client.query('BEGIN')
+      const stack = await buildEligibilityStack(client, {
+        achVerified: true, bgStatus: 'approved', riskLevel: 'low', depositAmount,
+      })
+      tenantId = stack.tenantId
+      await client.query('COMMIT')
+    } finally { client.release() }
+    return await getFlexDepositEligibility(tenantId)
+  }
+
+  it("Nic's $4,000: a plan on the first $3,000, $1,000 up front, and it IS offered", async () => {
+    const r = await offered(4000)
+    expect(r.eligible).toBe(true)
+    const four = r.choices.find(c => c.payments === 4)!
+    expect(four.fee).toBe(173)
+    expect(four.installment).toBe(750)
+    expect(four.payUpFront).toBe(1000)
+    // The first collection: payment 1 + the whole fee + the part above the grid.
+    expect(four.firstPull).toBe(750 + 173 + 1000)
+    expect(four.total).toBe(4000 + 173)
+    const two = r.choices.find(c => c.payments === 2)!
+    expect([two.fee, two.installment, two.payUpFront]).toEqual([124, 1500, 1000])
+  })
+
+  it('a deposit inside the grid has nothing up front', async () => {
+    const r = await offered(900)
+    expect(r.choices.map(c => [c.payments, c.fee, c.installment, c.payUpFront]))
+      .toEqual([[2, 48, 450, 0], [4, 67, 225, 0]])
+  })
+
+  it('exactly at the ceiling: the whole $3,000 splits, nothing up front', async () => {
+    const r = await offered(3000)
+    const four = r.choices.find(c => c.payments === 4)!
+    expect([four.fee, four.installment, four.payUpFront, four.firstPull])
+      .toEqual([173, 750, 0, 923])
   })
 })

@@ -291,6 +291,26 @@ export async function declineDepositPortability(args: {
  *
  * Idempotent: re-running on a 'carried_forward' deposit no-ops.
  */
+/**
+ * The two routes and what each costs, for the notice GAM reads when a forward
+ * leaves a top-up owed. Read from the price tables, never written here, so a
+ * re-price reaches the desk the day it takes effect.
+ */
+async function topUpRoutesLine(depositId: string): Promise<string> {
+  try {
+    const { quoteFlexDepositTopUp } = await import('./flexDeposit')
+    const q = await quoteFlexDepositTopUp(depositId)
+    if (!q) return ''
+    const money = (n: number) => `$${n.toFixed(2)}`
+    const splits = q.splits.map(s =>
+      `${s.payments} payments of ${money(s.installment)} (${money(s.fee)} + ${money(s.movementFee)} movement)`)
+    return `One pull: ${money(q.topUpAmount)} + ${money(q.payInFull.fee)}. Split: ${splits.join('; ')}.`
+  } catch {
+    // A price that cannot be read must not cost GAM the notification.
+    return ''
+  }
+}
+
 export async function executeDepositPortability(args: {
   depositId: string
 }): Promise<{ status: 'carried_forward' | 'pending_transfer'; new_lease_id: string }> {
@@ -414,11 +434,19 @@ export async function executeDepositPortability(args: {
           [args.depositId],
         )
       } else {
+        // ── 10/27 (Nic): A TOP-UP IS OWED, AND NOTHING IS CHARGED YET ───────
+        //
         // Larger deposit at the new property → a top-up is owed. The deposit
-        // stays under-funded; custody fee continues. For a FlexDeposit, spread
-        // the difference into installments the cron auto-collects (option 1,
-        // fee stays); the tenant may pay it off via pay-ahead (option 2, fee
-        // stops). For a non-FlexDeposit gam_escrow deposit, just flag it.
+        // stays under-funded and the custody fee continues, which is the
+        // custody model's own normal state: no debt, no acceleration.
+        //
+        // This used to SCHEDULE A SPLIT right here, so a resident ended up on a
+        // payment plan nobody offered them, at a fee priced as if the top-up
+        // were a new deposit. There are two routes now — one pull for $25, or
+        // 2/4 payments at the grid price plus $5 — and a plan is a thing people
+        // accept, so the charge waits for the election
+        // (flexDeposit electFlexDepositTopUp). The notification below carries
+        // both prices so whoever is standing with the resident can say them.
         topUpOwed = difference
         if (dep.flex_deposit_enabled) {
           await client.query(
@@ -428,8 +456,6 @@ export async function executeDepositPortability(args: {
               WHERE id = $1`,
             [args.depositId],
           )
-          const { scheduleFlexDepositTopUp } = await import('./flexDeposit')
-          await scheduleFlexDepositTopUp(client, { depositId: args.depositId, topUpAmount: difference })
         } else {
           await client.query(
             `UPDATE security_deposits
@@ -449,8 +475,8 @@ export async function executeDepositPortability(args: {
         await createAdminNotification({
           severity: 'info',
           category: 'deposit_portability_topup_owed',
-          title:    `FlexDeposit forward — top-up of $${topUpOwed.toFixed(2)} scheduled — tenant ${dep.tenant_id}`,
-          body:     `Deposit ${args.depositId} carried forward to lease ${target.id}; the new property's required deposit is $${topUpOwed.toFixed(2)} more than the carried balance. ${dep.flex_deposit_enabled ? 'Top-up installments scheduled (auto-collected monthly); the tenant may pay it off early via pay-ahead, which stops the custody fee.' : 'Custody fee continues until funded.'}`,
+          title:    `FlexDeposit forward — top-up of $${topUpOwed.toFixed(2)} owed — tenant ${dep.tenant_id}`,
+          body:     `Deposit ${args.depositId} carried forward to lease ${target.id}; the new property's required deposit is $${topUpOwed.toFixed(2)} more than the carried balance. ${dep.flex_deposit_enabled ? `Nothing is charged yet: the resident chooses to pay it in one pull or split it into 2 or 4. ${await topUpRoutesLine(args.depositId)}` : 'Custody fee continues until funded.'}`,
           context:  { deposit_id: args.depositId, tenant_id: dep.tenant_id, new_lease_id: target.id, top_up_owed: topUpOwed },
         })
       } catch (e) {

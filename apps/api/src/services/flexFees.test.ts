@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { query } from '../db'
-import { quoteFlexPayFee, quoteFlexDepositFee, flexPayGrid } from './flexFees'
+import {
+  quoteFlexPayFee, quoteFlexDepositFee, flexPayGrid,
+  flexDepositSplit, quoteFlexDepositFeeCapped, quoteFlexDepositMoveFees,
+} from './flexFees'
+import { seedFlexPriceCards, type SqlExec } from '../test/flexPriceCards'
 
 /**
  * The test database is schema-only, so this file seeds the grids itself — using
@@ -47,12 +51,22 @@ async function seedGrids() {
 }
 
 beforeAll(seedGrids)
+// ── 10/27: PUT THE CATALOG BACK, DON'T EMPTY IT ──────────────────────────────
+//
 // A price card is reference data the suite keeps (dbHelpers CLEANUP_KEEPS), so
-// this file clears what it seeded rather than leaving it for the next file in
-// the worker.
+// whatever this file leaves in these tables is what every LATER file in the
+// same worker reads. This used to DELETE both and stop there, which left the
+// worker with no prices at all: every later file that priced anything got the
+// services' (correct) refusal instead of a fee. The suite stayed green only
+// while vitest happened to schedule nothing price-dependent behind this file —
+// it did not, twice, failing once in depositForwarding and once in
+// incomeBasisReservationMoney, each passing on its own.
+//
+// So it restores the grid globalSetup seeded rather than wiping it.
 afterAll(async () => {
   await query(`DELETE FROM flexpay_fee_schedule`)
   await query(`DELETE FROM flexdeposit_fee_schedule`)
+  await seedFlexPriceCards(query as unknown as SqlExec)
 })
 
 describe('FlexPay price grid', () => {
@@ -310,5 +324,63 @@ describe('the schedules themselves', () => {
       `INSERT INTO flexpay_fee_schedule (rent_min, rent_max, benefit_wednesday, fee)
        VALUES (2000, 1000, 3, 20)`,
     )).rejects.toThrow()
+  })
+})
+
+
+// ── 10/27 (Nic): A DEPOSIT OVER THE TOP OF THE GRID ─────────────────────────
+//
+//   "We don't do deposits over $3,000. So that means if somebody's splitting a
+//    payment more than that ... say the payment's $4,000 for the deposit. They
+//    can split the $3,000 into four payments, they pay the $167 or whatever the
+//    fee is, for the four payments, they pay the first payment of the $3,000,
+//    so $750, and then they pay the difference of that $1,000 gap from $3,000
+//    to $4,000 all at once."
+//
+// His worked example IS the test. (The fee is $173, not $167 — he said "or
+// whatever the fee is"; the table is the authority.)
+describe('a deposit above the grid splits the ceiling and pays the rest up front', () => {
+  it("Nic's $4,000 on four payments: $173 fee, $750 a payment, $1,000 up front", async () => {
+    const split = await flexDepositSplit(4000, 4, SEEDED)
+    expect(split).toEqual({ splittable: 3000, payUpFront: 1000, ceiling: 3000 })
+    const q = await quoteFlexDepositFeeCapped(4000, 4, SEEDED)
+    expect(q!.fee).toBe(173)
+    expect(q!.split).toEqual({ splittable: 3000, payUpFront: 1000, ceiling: 3000 })
+    // The plan's own payments are the ceiling split four ways.
+    expect(split!.splittable / 4).toBe(750)
+    // And on two payments it is the same ceiling at the 2-payment price.
+    expect((await quoteFlexDepositFeeCapped(4000, 2, SEEDED))!.fee).toBe(124)
+  })
+
+  it('a deposit inside the grid is untouched — nothing is ever paid up front', async () => {
+    expect(await flexDepositSplit(900, 4, SEEDED)).toEqual({ splittable: 900, payUpFront: 0, ceiling: 3000 })
+    expect((await quoteFlexDepositFeeCapped(900, 4, SEEDED))!.fee).toBe(67)
+    expect((await quoteFlexDepositFeeCapped(2999.99, 4, SEEDED))!.fee).toBe(173)
+  })
+
+  it('exactly at the ceiling: the whole $3,000 splits, nothing up front, top price', async () => {
+    const split = await flexDepositSplit(3000, 4, SEEDED)
+    expect(split).toEqual({ splittable: 3000, payUpFront: 0, ceiling: 3000 })
+    // Before 10/27 this was refused outright: the brackets are half-open, so
+    // $3,000 falls outside the $2,500-3,000 row and had no price at all.
+    expect(await quoteFlexDepositFee(3000, 4, SEEDED)).toBeNull()
+    expect((await quoteFlexDepositFeeCapped(3000, 4, SEEDED))!.fee).toBe(173)
+  })
+
+  it('a payment count the product does not sell has no ceiling and no price', async () => {
+    expect(await flexDepositSplit(4000, 3, SEEDED)).toBeNull()
+    expect(await quoteFlexDepositFeeCapped(4000, 3, SEEDED)).toBeNull()
+  })
+})
+
+// ── 10/27 (Nic): THE TWO FEES FOR A MOVE ────────────────────────────────────
+describe('moving a FlexDeposit to a new unit', () => {
+  it('reads $25 for one pull and $5 to record a split movement', async () => {
+    const f = await quoteFlexDepositMoveFees(SEEDED)
+    expect(f).toMatchObject({ paidInFull: 25, splitMovement: 5 })
+  })
+
+  it('a date before any schedule has no price — a move is refused, never free', async () => {
+    expect(await quoteFlexDepositMoveFees('2019-12-31')).toBeNull()
   })
 })

@@ -116,6 +116,127 @@ export async function quoteFlexDepositFee(
 }
 
 /**
+ * ── 10/27 (Nic): A DEPOSIT BIGGER THAN THE GRID STILL GETS A PLAN ───────────
+ *
+ * The grid stops at $3,000 and a value at or above the top bracket's ceiling
+ * has no price, so a $4,000 deposit used to be refused a plan outright. Nic's
+ * rule instead:
+ *
+ *   "We don't do deposits over $3,000. So that means if somebody's splitting a
+ *    payment more than that ... say the payment's $4,000 for the deposit. They
+ *    can split the $3,000 into four payments, they pay the $167 or whatever the
+ *    fee is, for the four payments, they pay the first payment of the $3,000,
+ *    so $750, and then they pay the difference of that $1,000 gap from $3,000
+ *    to $4,000 all at once."
+ *
+ * So the plan covers the ceiling and the rest is paid up front. Expressed as a
+ * cap rather than a bracket lookup on purpose: the brackets stay half-open and
+ * a missing one stays an error, while this is one stated rule above the top of
+ * the table.
+ *
+ * The ceiling is READ from the schedule, not written here — add a $3,000-3,499
+ * bracket one day and the cap moves with it. A bracket with no max (open-ended)
+ * means there is no ceiling and nothing is ever paid up front.
+ *
+ * Returns null when the schedule has no rows at all for that payment count:
+ * no ceiling can be known, so the caller refuses rather than inventing one.
+ */
+export interface FlexDepositSplit {
+  /** The part a plan covers, priced by the grid. */
+  splittable: number
+  /** The part collected in full with payment 1 — 0 for almost everybody. */
+  payUpFront: number
+  /** The top of the schedule, or null when the top bracket is open-ended. */
+  ceiling: number | null
+}
+export async function flexDepositSplit(
+  depositTotal: number,
+  payments: number,
+  asOf: string,
+): Promise<FlexDepositSplit | null> {
+  if (!(depositTotal >= 0) || !Number.isFinite(depositTotal)) return null
+  if (!isAllowedFlexDepositPaymentCount(payments)) return null
+  const rows = await columnRows('flexdeposit', 'payments', payments, asOf)
+  if (rows.length === 0) return null
+  // The ceiling is the top bracket's max. An open-ended top bracket (max null)
+  // covers everything, so there is no ceiling and no up-front remainder.
+  const top = rows.reduce((hi, r) => (r.min > hi.min ? r : hi), rows[0])
+  const ceiling = top.max
+  if (ceiling === null || depositTotal < ceiling) {
+    return { splittable: depositTotal, payUpFront: 0, ceiling }
+  }
+  return {
+    splittable: ceiling,
+    payUpFront: Math.round((depositTotal - ceiling) * 100) / 100,
+    ceiling,
+  }
+}
+
+/**
+ * What a deposit of this size costs to split, with the over-ceiling rule
+ * applied: a deposit at or above the top of the grid is priced AT the top
+ * bracket (the part a plan can cover), not refused.
+ *
+ * Null still means no price — the schedule does not cover this payment count,
+ * or has no rows at all.
+ */
+export async function quoteFlexDepositFeeCapped(
+  depositTotal: number,
+  payments: number,
+  asOf: string,
+): Promise<(FlexFeeQuote & { split: FlexDepositSplit }) | null> {
+  const split = await flexDepositSplit(depositTotal, payments, asOf)
+  if (split === null) return null
+  // Priced on the splittable part — but the brackets are half-open, so the
+  // ceiling itself ($3,000) falls OUTSIDE the top bracket ($2,500-3,000) and
+  // has no price of its own. A cent under is inside it, and every value in a
+  // bracket carries the same fee, so that is the bracket's price. This bites
+  // at exactly the ceiling as well as above it: a $3,000 deposit splits whole
+  // with nothing up front, and still has to be priced somewhere.
+  const atCeiling = split.ceiling !== null && split.splittable >= split.ceiling
+  const priceAt = atCeiling ? split.ceiling! - 0.01 : split.splittable
+  const q = await quoteFlexDepositFee(priceAt, payments, asOf)
+  return q === null ? null : { ...q, split }
+}
+
+/**
+ * The two flat fees for moving a FlexDeposit custody balance to a new unit
+ * (10/27, Nic — flexdeposit_move_fee_schedule):
+ *
+ *   paidInFull     the top-up collected in ONE pull. Nothing is split, so the
+ *                  bracket grid does not come into it, and this is the only
+ *                  fee: $25.
+ *   splitMovement  charged BESIDE the grid price when the top-up goes on a
+ *                  2-or-4 payment plan — $5 "for recording it against the new
+ *                  landlord's books".
+ *
+ * The cost of actually collecting (ACH or card) is a separate pass-through and
+ * is not in here.
+ *
+ * Null when no schedule is in effect on `asOf` — a move with no price is
+ * refused, never free.
+ */
+export async function quoteFlexDepositMoveFees(
+  asOf: string,
+): Promise<{ paidInFull: number; splitMovement: number; effectiveFrom: string } | null> {
+  const rows = await query<{ pif: string; smf: string; effective_from: string }>(
+    `SELECT paid_in_full_fee::text AS pif, split_movement_fee::text AS smf,
+            effective_from::text AS effective_from
+       FROM flexdeposit_move_fee_schedule
+      WHERE effective_from <= $1::date
+      ORDER BY effective_from DESC
+      LIMIT 1`,
+    [asOf],
+  )
+  if (rows.length === 0) return null
+  return {
+    paidInFull: Number(rows[0].pif),
+    splitMovement: Number(rows[0].smf),
+    effectiveFrom: rows[0].effective_from,
+  }
+}
+
+/**
  * The whole FlexPay grid, for the admin screen that shows and edits it.
  * Ordered so it reads as the table Nic designed: cheapest bracket first,
  * Wednesdays left to right.

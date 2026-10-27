@@ -77,6 +77,7 @@ const NOT_JOURNALED: Record<string, string> = {
   // its own history and never overwrites a price that was charged.
   flexpay_fee_schedule: 'a rate table — re-pricing appends a row, never an update',
   flexdeposit_fee_schedule: 'a rate table — re-pricing appends a row, never an update',
+  flexdeposit_move_fee_schedule: 'a rate table — re-pricing appends a row, never an update',
   scheduled_lease_changes: 'a change waiting to be made — the lease it makes is journaled',
   sublessee_invitations: 'an invitation (subleasing is shelved)',
   business_quote_lines: 'a quote — what is billed is copied to business_invoice_lines',

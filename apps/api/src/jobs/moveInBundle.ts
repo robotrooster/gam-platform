@@ -489,12 +489,22 @@ export async function generateMoveInInvoice(
     let flexDepositActive = false
     let flexDepositSecurityDepositId: string | null = null
     let flexDepositServiceFee = 0
+    let flexDepositPayUpFront = 0
     if (depositFee && inputs.tenant_id) {
-      const fdRow = await client.query<{ id: string; flex_deposit_enabled: boolean; first_amount: string | null; portability_status: string; service_fee: string | null }>(
+      const fdRow = await client.query<{ id: string; flex_deposit_enabled: boolean; first_amount: string | null; portability_status: string; service_fee: string | null; pay_up_front: string }>(
         `SELECT sd.id, sd.flex_deposit_enabled, sd.portability_status,
                 sd.flex_deposit_service_fee::text AS service_fee,
                 (SELECT amount::text FROM flex_deposit_installments
-                  WHERE security_deposit_id = sd.id AND installment_number = 1) AS first_amount
+                  WHERE security_deposit_id = sd.id AND installment_number = 1) AS first_amount,
+                -- 10/27 (Nic): the part of the deposit ABOVE the top of the
+                -- price grid. The plan splits the ceiling; this is "the
+                -- difference of that $1,000 gap from $3,000 to $4,000", paid
+                -- all at once with payment 1. DERIVED rather than stored — the
+                -- installments are the plan, so the deposit less what they come
+                -- to IS the unsplit part, and the two can never disagree.
+                GREATEST(sd.total_amount - COALESCE((
+                  SELECT SUM(amount) FROM flex_deposit_installments
+                   WHERE security_deposit_id = sd.id), 0), 0)::text AS pay_up_front
            FROM security_deposits sd
           WHERE sd.tenant_id = $1 AND sd.lease_id = $2 AND sd.status <> 'voided'
           LIMIT 1`,
@@ -510,6 +520,7 @@ export async function generateMoveInInvoice(
         flexDepositSecurityDepositId = fdRow.rows[0].id
         // 10/26 (Nic): the WHOLE service fee rides installment 1.
         flexDepositServiceFee = Math.round(Number(fdRow.rows[0].service_fee ?? 0) * 100) / 100
+        flexDepositPayUpFront = Math.round(Number(fdRow.rows[0].pay_up_front ?? 0) * 100) / 100
         firstInstallmentAmount = Number(fdRow.rows[0].first_amount)
         // Invoice deposit line disappears; landlord doesn't see
         // anything deposit-related on this invoice.
@@ -760,6 +771,35 @@ export async function generateMoveInInvoice(
           inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
           flexDepositServiceFee.toFixed(2), invoiceDueDate,
           `FlexDeposit service fee (deposit ${flexDepositSecurityDepositId})`,
+        ]
+      )
+    }
+
+    // ── 10/27 (Nic): THE PART ABOVE THE GRID, PAID ALL AT ONCE ───────────────
+    //
+    //   "say the payment's $4,000 for the deposit. They can split the $3,000
+    //    into four payments ... and then they pay the difference of that $1,000
+    //    gap from $3,000 to $4,000 all at once."
+    //
+    // A deposit over the top of the price grid still gets a plan — on the
+    // ceiling. The rest is not split: it rides the first collection, alongside
+    // installment 1 and the whole fee.
+    //
+    // Its OWN row, type 'deposit', beside installment 1 rather than folded into
+    // it: it is the resident's own custody principal (so it belongs in
+    // collected_amount and comes back at move-out, unlike GAM's fee), but it is
+    // not an installment and must not read as one on a ledger or a receipt.
+    // Zero for everybody under $3,000, which is almost everybody.
+    if (flexDepositActive && flexDepositPayUpFront > 0) {
+      await client.query(
+        `INSERT INTO payments (
+           unit_id, lease_id, tenant_id, landlord_id,
+           type, amount, status, due_date, entry_description, notes
+         ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', $6, 'DEPOSIT', $7)`,
+        [
+          inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
+          flexDepositPayUpFront.toFixed(2), invoiceDueDate,
+          `Deposit above the FlexDeposit plan, paid in full (deposit ${flexDepositSecurityDepositId})`,
         ]
       )
     }

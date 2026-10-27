@@ -105,7 +105,7 @@ GAM charges a **one-time service fee of ${{Service_Fee}}** (the "**Service Fee**
 
 The Service Fee is consideration for the custody and installment-administration service only. It is **not part of the Deposit** and is never credited toward it: the custody balance that Tenant's Landlord may claim against, and that is returned to Tenant at move-out, consists only of the amounts Tenant funded toward the Deposit itself. No monthly fee is charged for the period GAM holds the Deposit, and no further fee arises if Tenant moves to another property on the Platform and the Deposit is forwarded (Consumer ToS § 9.1.6).
 
-FlexDeposit is not offered where the Deposit is $3,000.00 or more.
+Where the Deposit is **$3,000.00 or more**, the installment schedule in Section 4 covers the first $3,000.00, priced at the highest bracket in the then-current fee schedule, and the balance of the Deposit above that amount is collected in full with installment 1 rather than split. That balance is Tenant's own deposit principal and is returned under Section 9 on the same terms as the rest.
 
 ## 8. No Debt / No Recourse Acknowledgment
 
@@ -122,6 +122,19 @@ GAM will not, and may not under this Agreement: sue Tenant, file an action in an
 - **On Tenant's default under the lease**, {{Landlord_Display_Name}}'s claim is satisfied from the Deposit GAM holds for Tenant, limited to the amount actually funded.
 - This Agreement takes effect on the Effective Date and continues until the earlier of: (a) Tenant having fully funded the Deposit; (b) the return or disbursement of the Deposit at lease end; (c) Tenant's revocation under Section 5.2 (in which case the consequences of Section 8 apply); or (d) the bankruptcy events described in Consumer ToS § 9.1.8, on which GAM may terminate this Agreement, asserts no claim against Tenant's bankruptcy estate, and the Deposit remains returnable to Tenant under Consumer ToS § 6.
 - Where applicable law requires a security deposit to be held in a separate, escrow, or interest-bearing account, GAM holds it accordingly and pays any required statutory interest.
+
+## 9A. Moving to Another Unit on the Platform
+
+Tenant may move to another unit served by the Platform and carry the Deposit GAM holds with them, instead of waiting for a refund to be returned and a new deposit to be paid. Tenant authorizes GAM to transfer the custody balance to the new tenancy and to record it against the new landlord as Tenant's deposit on the date of the move.
+
+**If the new unit requires a larger deposit**, the difference ("Top-Up") is Tenant's own deposit principal and is funded one of two ways, at Tenant's election. Nothing is charged until Tenant elects:
+
+- **In one payment.** The whole Top-Up is collected once, together with one flat service fee for the move, as stated in the Platform's then-current fee schedule. That fee is what Tenant pays for the balance being recorded at the new unit immediately rather than Tenant waiting for a refund to be issued, delivered, and paid over again.
+- **Split into 2 or 4 payments.** The Top-Up is funded on a schedule on the same terms as Section 4, priced by the Top-Up amount under the same fee schedule as an original plan, plus a separate flat fee for transferring the balance to the new landlord.
+
+Either way the cost of collecting each payment (an ACH return or card processing cost actually charged to GAM) is passed through at GAM's cost under Consumer ToS § 5.4 and is not included in the fees above. Until the Top-Up is funded the Deposit is simply under-funded, exactly as Section 8 provides: Tenant owes GAM nothing, nothing is accelerated, and {{Landlord_Display_Name}}'s claim is limited to the amount actually held.
+
+**If the new unit requires the same or a smaller deposit**, the carried balance satisfies it in full and no fee of any kind applies to the move. Any excess remains Tenant's and is returned under Section 9.
 
 ## 10. Incorporation of Consumer Terms of Service
 

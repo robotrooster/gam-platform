@@ -10,29 +10,36 @@ FlexPay stays visible-but-closed (`flexpay_enrollment_open = false`) — Nic:
 
 ---
 
-## READ FIRST: a gate that would have blocked tomorrow's move-in
+## SETTLED 10/27: the 30 days are the LANDLORD's, not the resident's
 
-FlexDeposit's eligibility gate carried a **30-day platform-tenure requirement**
-(S330, a fraud defense against just-signed-up accounts). But FlexDeposit's only
-entry point is move-in, and a resident moving in tomorrow has **zero days** of
-tenure — so the product was impossible to use for the one thing it exists to do.
-It had never bitten because the product was switched off.
+FlexDeposit's eligibility gate carried a 30-day platform-tenure requirement and
+I read it as the RESIDENT's account age. It was never meant to be. Nic:
 
-**What I changed, and why it is not me quietly weakening a fraud control:** the
-gate now exempts a first-lease tenant, which is exactly the reasoning this file
-already applies three lines below, where the on-time-payment-history gate
-exempts a first lease because "they have no payment history to check; the
-BG-approved gate covers the cold-start risk." Account age is the same kind of
-proxy. A FlexDeposit applicant must already have an approved background check
-tied to this tenancy, admin-verified SSDI/SSI income, and a verified bank
-account — stronger evidence of a real person than the age of a database row. The
-gate still applies to a **returning** resident, where account age means
-something.
+> "the 30 day gate was against the landlord profile. landlord has to be vetted
+> and moving money through the system. not the new tenant"
 
-**This is a fraud control and it is your call, not mine.** If you want the 30
-days back for everyone, it is one condition in
-`services/flexDeposit.ts` — but FlexDeposit then cannot be used at move-in at
-all, and tomorrow's onboarding will report `insufficient_platform_tenure`.
+Which is also why it was unsatisfiable: FlexDeposit is only ever offered at
+move-in, so the person being asked has had an account for a day. It never bit
+because the product was switched off.
+
+GAM holds the deposit in custody while the landlord's books read it as settled,
+so the party worth vetting is the landlord. The gate now asks three facts about
+the company whose deposit it is — none of them a judgement about anybody, so
+the not-credit structure is untouched:
+
+| | what it means |
+|---|---|
+| established | the company has been on GAM at least 30 days (`FLEX_DEPOSIT_MIN_LANDLORD_DAYS`) |
+| vetted | Stripe Connect **payouts enabled** — Stripe ran its own KYC on the business and will pay it. GAM keeps no second opinion |
+| money moving | money has actually settled through GAM for them in the same 30 days. A park that signed up and never collected is not one to hold deposits for, however old the row is |
+
+Read off the deposit's own unit, so it is the company that will be handed this
+deposit — not whoever else the resident may also rent from. The blocker is
+`landlord_not_established`; the resident is told only "FlexDeposit is not
+available at this property yet", never how their landlord is doing with GAM.
+
+**Checked against production the day it changed:** Mountain View, Oak Park and
+TruBlu Management (Country Acres) all pass. The five empty accounts do not.
 
 ### The other things that must be true for tomorrow
 
@@ -326,3 +333,124 @@ predates it — Shane Rueff, Kim Bowman and others are already in there). I kept
 to the existing convention rather than inventing a new one mid-deploy, but it is
 worth a deliberate decision about whether real names belong in a public
 repository.
+
+---
+
+# 10/27 — the desk, the landlord gate, and moving a FlexDeposit
+
+## The tick boxes are gone from the desk window
+
+Lisa Scheeler stood at the counter with cash for her trailer payment and every
+way of paying by hand was greyed out. 10/14 had given each bill a tick box and
+gated Cash / Check / Money order on it; "Card on the reader" was the one button
+never gated, which is why it was the only one that worked. She had ONE open
+bill, so there was nothing to choose — only a box to find.
+
+Nic: *"that checkbox beside each bill before cash check or money order can turn
+on, that is something you decided. That's not what I want at all. That's
+clunky... Disable that checkbox. There's no reason for it to exist."*
+
+The desk takes the balance now. Bills are still listed, named and split by
+space, as a statement of what the money covered. **The AMOUNT answers what the
+boxes answered:** bills are paid oldest first, so money coming to exactly the
+oldest bill — or the oldest two — pays those bills whole and is taken even where
+the property is pay-in-full. Anything that would leave a bill half-paid is still
+refused, and the refusal names the amounts that would work. The gate
+(`lib/creditDesk` billsClearedByAmount) and the server
+(`services/manualPaymentSettle` billsClearedByAmount) read the bills in one
+order, so an amount let through always lands on the bills it was measured
+against. Where two spaces have bills due the SAME day no prefix matches one
+space alone, and the desk is refused rather than having money land somewhere it
+did not mean — that case is the whole balance or the property's part-payment
+setting.
+
+Gone with the boxes: `canPickBill`, `togglePick`, `picksStillOpen`,
+`quoteMatchesPick`. The server still ACCEPTS `?bills=` — a browser holding an
+old bundle sends it — and it keeps working.
+
+## The 30-day gate belongs to the landlord
+
+Nic: *"the 30 day gate was against the landlord profile. landlord has to be
+vetted and moving money through the system. not the new tenant."* See the
+section above; the resident's account age is no longer a gate at all.
+
+## Moving a FlexDeposit to a new unit
+
+Two routes, neither automatic. The forward used to schedule a split silently,
+so a resident ended up on a plan nobody offered them at a fee priced as if the
+top-up were a new deposit. Now the forward leaves the deposit under-funded —
+the custody model's own normal state — and a route is elected before anything
+is charged (`electFlexDepositTopUp`).
+
+| route | what it costs |
+|---|---|
+| one pull | the top-up + **$25**. The $5 movement cost is INSIDE it |
+| split 2 or 4 | the grid's price for the TOP-UP's bracket (most land under $1,000 → $48 / $67) + **$5** movement |
+
+The cost of collecting (ACH or card) is a separate pass-through either way.
+Prices live in `flexdeposit_move_fee_schedule`, effective-dated like the grids,
+so a re-price appends a row and needs no deploy.
+
+What the $25 buys, in Nic's words and worth keeping because it is the answer to
+"what am I paying for": *"it's the speed of access to it. If they need to wait
+to get their check mailed from GAM for the deposit refund, just to be able to
+cash it to give it back to the new landlord, the $25 is buying them the speed
+and the instantaneousness of having it recorded right there."* It is in
+`FLEX_DEPOSIT_MOVE_IN_FULL_COPY` so every surface says the same thing.
+
+**A percentage was considered and rejected.** Nic floated 3% of the top-up. It
+is the one shape that breaks the structure — a charge scaling with the amount
+reads as a charge FOR the money, which he killed himself for FlexPay — and on a
+top-up paid in full nothing is financed, so a percentage of funds moved prices
+like a money transmitter. It also loses money on small ones: 3% of $100 is $3
+against a $6 ACH pull.
+
+## A deposit over $3,000 is served now, not refused
+
+Nic: *"say the payment's $4,000 for the deposit. They can split the $3,000 into
+four payments... and then they pay the difference of that $1,000 gap from
+$3,000 to $4,000 all at once."*
+
+The plan covers the schedule's ceiling, priced at the top bracket; the
+remainder is collected in full with payment 1. $4,000 on four payments: **$173
+fee, $750 a payment, $1,000 up front, first collection $1,923.** The ceiling is
+READ from the table, so adding a higher bracket moves the cap by itself. The
+brackets stay half-open and a missing one stays an error, never a zero — this is
+one stated rule ABOVE the top of the table. The custody agreement and the
+Consumer ToS said FlexDeposit was "not offered" at $3,000 or more; both now
+state the real rule, and the agreement gained a section 9A for the move.
+
+## A test defect worth knowing about: a borrowed catalog left empty
+
+`services/flexFees.test.ts` borrows the two price tables to check the grid
+formulas and used to DELETE both when it finished. Those tables are deliberately
+never cleared between tests (CLEANUP_KEEPS), so every later file in the same
+worker read NO prices and got the services' correct refusal instead of a fee.
+Two full runs failed that way on two unrelated tests — once in
+`depositForwarding` ("a FlexDeposit top-up of $500.00 has no price in the
+schedule"), once in `incomeBasisReservationMoney` — each passing on its own.
+
+Fixed twice over: that file restores the grid (`src/test/flexPriceCards`, one
+definition shared with globalSetup), and `cleanupAllSchema` re-seeds it before
+every test, so no file can start without prices whatever ran before it.
+
+**The lesson for the next catalog:** a test that borrows a CLEANUP_KEEPS table
+has to put it back, and "back" has to mean one agreed thing.
+
+## Still open
+
+- **`incomeBasisReservationMoney`** has a separate intermittent failure that
+  survives the fix above: it passes alone and beside its neighbors, pins its own
+  dates with `atDate`, and the failing comparison is an array of rows keyed by
+  generated uuids — an ORDER tie broken by a random id. It failed before this
+  session's changes too and touches none of them. Worth running down: find the
+  ORDER BY whose tie is broken by `id` and give it a deterministic second key.
+- **Paper bills** — Nic re-specified them on 10/27 as a property-level setting
+  plus a Print button on each bill and one "Print all outstanding": *"I don't
+  know why you skipped like the smallest, easiest thing."* Not built. The
+  `invoices.printed_at` migration I drafted is parked, not applied — it assumed
+  a to-do nudge he did not ask for.
+- **The FlexDeposit expansion limit** — he asked for a safe-but-aggressive rule
+  for how fast to take plans on, from an observed default rate and the share of
+  a defaulter's schedule that goes unfunded. The ceiling is hand-set at 10 plans
+  / $15,000 and is safe for the first customers, so this is not blocking Blue.
