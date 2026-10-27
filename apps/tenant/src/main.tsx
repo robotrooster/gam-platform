@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry, startVersionWatch, unlockScrollIfStandalone } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, startVersionWatch, unlockScrollIfStandalone, installPrintLightTheme } from '@gam/shared'
 import { renewTenantSession } from './lib/sessionRenewal'
 import { utilityLine } from './lib/utilityLine'
 // S540: self-hosted fonts — no render-blocking external stylesheet
@@ -798,7 +798,7 @@ function Layout() {
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
           </button>
         </header>
-        <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <><NewLeaseBanner me={tenantMe} /><Outlet /></>}</div>
+        <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <><NewLeaseBanner me={tenantMe} /><FixedIncomeBanner /><Outlet /></>}</div>
         <DialogHost />
       </div>
       {showFullNav && !serviceOnly && !isRenterPoolOnly && <FlexsuiteReAcceptanceGate />}
@@ -1322,6 +1322,72 @@ function joinNames(list: string[]): string {
 // the portal while it waits. The words are a new lease / a rent update: their
 // current lease stays as it is until the new one starts. It never reads as
 // "your lease is ending".
+/**
+ * ── 10/26 (Nic): THE FIXED-INCOME QUESTION, ANSWERED WITHOUT LEAVING ────────
+ *
+ *   "Maybe the survey could just literally be in the banner, like pop up on
+ *    their screen. Are you on fixed income? Yes or no? If yes, it takes them
+ *    to the descriptor of FlexPay. If they click no, then boom, they're just
+ *    flagged no, and it's done and over with right there without leaving the
+ *    page."
+ *
+ * And it is never a gate: "not a gatekeeping thing while they're trying to set
+ * up their password and verify the email and all that stuff. We need to just
+ * ask it casually later at like the first login."
+ *
+ * So: one question, two buttons, dismissible, asked once. "No" closes it for
+ * good in place. "Yes" goes to the FlexPay page, which is where the interest
+ * request and the proof-of-income upload already live. Saying yes qualifies
+ * nobody — the server records it as self-reported and never touches the
+ * verified flag that gates enrolling.
+ */
+function FixedIncomeBanner() {
+  const location = useLocation()
+  const qc = useQueryClient()
+  const navigate = useNavigate()
+  const { data } = useQuery<{ show: boolean; answered: boolean | null }>(
+    'fixed-income-prompt', () => get<{ show: boolean; answered: boolean | null }>('/tenants/me/fixed-income-prompt'),
+    { retry: false, staleTime: 5 * 60 * 1000 })
+  const [closed, setClosed] = useState(false)
+  const answer = useMutation(
+    (onFixedIncome: boolean) => post('/tenants/me/fixed-income', { onFixedIncome }),
+    { onSettled: () => qc.invalidateQueries('fixed-income-prompt') })
+
+  if (!data?.show || closed) return null
+  // Never over the signing flow or the move-in gate — the same places the
+  // lease banner stays out of.
+  if (location.pathname.startsWith('/sign')) return null
+
+  const say = (onFixedIncome: boolean) => {
+    setClosed(true)
+    answer.mutate(onFixedIncome)
+    if (onFixedIncome) navigate('/flexpay')
+  }
+
+  return (
+    <div style={{
+      background: 'rgba(201,162,39,.10)', border: '1px solid rgba(201,162,39,.35)',
+      borderRadius: 10, padding: '14px 16px', marginBottom: 18, lineHeight: 1.6,
+      display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap',
+    }}>
+      <div>
+        <div style={{ fontWeight: 700, color: 'var(--gold)', marginBottom: 2 }}>
+          Are you on a fixed income?
+        </div>
+        <div style={{ fontSize: '.88rem', color: 'var(--text-1)' }}>
+          Social Security, SSI, SSDI, a pension or disability. If you are, there may be a way to
+          line your rent up with the day your money arrives. Asking once — your landlord is not
+          told either way.
+        </div>
+      </div>
+      <div style={{ display: 'flex', gap: 8, whiteSpace: 'nowrap' }}>
+        <button className="btn btn-primary" onClick={() => say(true)}>Yes</button>
+        <button className="btn btn-ghost" onClick={() => say(false)}>No</button>
+      </div>
+    </div>
+  )
+}
+
 function NewLeaseBanner({ me }: { me: any }) {
   const location = useLocation()
   const docId = me?.pendingRenewalDocumentId
@@ -2551,17 +2617,31 @@ function FeatureRequestModal({ onClose, onSuccess }: { onClose: () => void; onSu
   )
 }
 
-// ── FLEXDEPOSIT ENROLL MODAL (S246) ───────────────────────────────────────
-// Pre-move-in flow. Tenant picks 2..maxInstallments (max comes from
-// the eligibility payload — deposit amount × BG risk_level). The
-// move-in invoice generator reads security_deposits.flexDepositEnabled
-// after enrollment and excludes the deposit line from the landlord-
-// facing invoice. GAM fronts the gap on move-in via Connect Transfer.
+// ── FLEXDEPOSIT ENROLL MODAL (S246; reworked 10/26) ───────────────────────
+// Pre-move-in flow. TWO choices, 2 payments or 4, at the same price for
+// everybody with the same deposit (Nic, 10/26):
+//
+//   "The same amount of installments at the same amount of security deposit
+//    needs to be the same price for everybody. That's what keeps it not
+//    lending. It's a service they're paying for. It's like window tinting."
+//
+// So this screen shows both choices WITH their fee and lets them pick. It never
+// shows a price table, and nothing about the person changes either price.
+//
+// The whole fee is collected with installment 1, so `firstPull` — not the
+// installment size — is the number that matters at move-in.
+//
+// The move-in invoice generator reads security_deposits.flex_deposit_enabled
+// and excludes the deposit line from the LANDLORD-facing invoice: the landlord
+// sees their rent and the deposit as settled, never which installment the
+// resident is on. GAM holds the cash in custody and floats nothing.
 
 function FlexDepositModal({
   eligibility, onClose, onSuccess,
 }: { eligibility: any; onClose: () => void; onSuccess: () => void }) {
-  const [count, setCount] = useState<number>(eligibility?.maxInstallments ?? 2)
+  const choices: Array<{ payments: number; fee: number; installment: number; firstPull: number; total: number }> =
+    eligibility?.choices ?? []
+  const [count, setCount] = useState<number>(choices[0]?.payments ?? 2)
   const [tosAck, setTosAck] = useState(false)
   const [showFullTerms, setShowFullTerms] = useState(false)
   const [fullTermsText, setFullTermsText] = useState<string | null>(null)
@@ -2569,9 +2649,9 @@ function FlexDepositModal({
   const [error, setError] = useState('')
 
   const deposit = Number(eligibility?.depositAmount ?? 0)
-  const max = eligibility?.maxInstallments ?? null
   const eligible = !!eligibility?.eligible
-  const installmentAmt = max ? Math.round((deposit / count) * 100) / 100 : 0
+  const picked = choices.find(c => c.payments === count) ?? choices[0] ?? null
+  const installmentAmt = picked?.installment ?? 0
 
   async function openFullTerms() {
     setLoadingTerms(true)
@@ -2635,25 +2715,40 @@ function FlexDepositModal({
       <div className="modal" onClick={e => e.stopPropagation()} style={{maxWidth:560}}>
         <div className="modal-t">🏦 Enroll in FlexDeposit</div>
         <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:16}}>
-          Split your ${deposit.toFixed(2)} deposit into 2–{max} installments. Pay the first one at move-in; the rest pull automatically over the following months.
+          Split your ${deposit.toFixed(2)} deposit into 2 payments or 4. You pay the first one
+          at move-in together with the whole service fee; the rest pull automatically over the
+          following months.
         </p>
+        {/* 10/26 (Nic): "the screen where they sign up for flex deposit says on
+            it that the landlord has no control over flex deposit. It is not
+            offered by the landlord. It's offered by the software." */}
+        <div style={{fontSize:'.74rem',color:'var(--t3)',lineHeight:1.55,marginBottom:16,
+                     padding:'10px 12px',background:'var(--bg3)',borderRadius:8}}>
+          FlexDeposit is offered by GAM, not by your landlord. Your landlord does not control it,
+          is not told which payment you are on, and sees your deposit as settled either way. The
+          price below is the same for everyone with a deposit your size.
+        </div>
 
         <div className="fg">
           <label className="fl">Number of installments</label>
           <div style={{display:'flex',gap:8,marginTop:8}}>
-            {Array.from({length: (max ?? 2) - 1}, (_, i) => i + 2).map(n => (
+            {choices.map(c => (
               <button
-                key={n}
-                onClick={() => setCount(n)}
+                key={c.payments}
+                onClick={() => setCount(c.payments)}
                 style={{
-                  flex:1, padding:'10px', borderRadius:8,
-                  border: count === n ? '2px solid var(--gold)' : '1px solid var(--b1)',
-                  background: count === n ? 'rgba(201,162,39,.08)' : 'var(--bg3)',
-                  cursor:'pointer', fontWeight:600,
-                  color: count === n ? 'var(--gold)' : 'var(--t2)',
+                  flex:1, padding:'12px 10px', borderRadius:8, textAlign:'left',
+                  border: count === c.payments ? '2px solid var(--gold)' : '1px solid var(--b1)',
+                  background: count === c.payments ? 'rgba(201,162,39,.08)' : 'var(--bg3)',
+                  cursor:'pointer',
+                  color: count === c.payments ? 'var(--gold)' : 'var(--t2)',
                   fontSize:'.85rem',
                 }}>
-                {n} payments
+                <div style={{fontWeight:700}}>{c.payments} payments</div>
+                {/* The fee is the decision, so it is on the button. */}
+                <div style={{fontSize:'.74rem',opacity:.85,marginTop:2}}>
+                  ${c.fee.toFixed(2)} service fee
+                </div>
               </button>
             ))}
           </div>
@@ -2667,6 +2762,34 @@ function FlexDepositModal({
           <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>
             ${deposit.toFixed(2)} ÷ {count} installments. First due at move-in.
           </div>
+          {picked && (
+            <div style={{marginTop:12,paddingTop:12,borderTop:'1px solid var(--b1)'}}>
+              {/* What they actually hand over at move-in: installment 1 + the
+                  WHOLE fee. Showing only the installment size would understate
+                  it by the fee, which is the one number they are deciding on. */}
+              <div style={{display:'flex',justifyContent:'space-between',fontSize:'.78rem',color:'var(--t2)'}}>
+                <span>At move-in (first payment + the whole fee)</span>
+                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--t0)'}}>
+                  ${picked.firstPull.toFixed(2)}
+                </span>
+              </div>
+              <div style={{display:'flex',justifyContent:'space-between',fontSize:'.78rem',color:'var(--t2)',marginTop:4}}>
+                <span>Then {count - 1} × ${picked.installment.toFixed(2)}, monthly</span>
+                <span style={{fontFamily:'var(--font-m)',color:'var(--t2)'}}>
+                  ${(Math.round(picked.installment * (count - 1) * 100) / 100).toFixed(2)}
+                </span>
+              </div>
+              <div style={{display:'flex',justifyContent:'space-between',fontSize:'.78rem',marginTop:6,
+                           paddingTop:6,borderTop:'1px solid var(--b1)',fontWeight:700,color:'var(--t0)'}}>
+                <span>Total</span>
+                <span style={{fontFamily:'var(--font-m)'}}>${picked.total.toFixed(2)}</span>
+              </div>
+              <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>
+                ${deposit.toFixed(2)} deposit + ${picked.fee.toFixed(2)} service fee. The deposit is
+                yours and comes back to you at move-out; the fee is what GAM charges for the service.
+              </div>
+            </div>
+          )}
         </div>
 
         {error && <div className="alert a-warn" style={{marginBottom:12}}>{error}</div>}
@@ -5058,6 +5181,11 @@ function Root() {
 }
 
 installDatePickerAutoClose()
+
+// 10/26 (Nic): a printed page is always the light theme, whatever the screen
+// is set to — he printed an eviction balance summary in dark mode and got a
+// solid black sheet. Installed once here; restores the viewer's theme after.
+installPrintLightTheme()
 
 // HMR guard: when Vite re-executes this entry module, calling createRoot on
 // the same container again STACKS a second mounted app under the first

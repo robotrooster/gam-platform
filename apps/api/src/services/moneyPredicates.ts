@@ -43,6 +43,16 @@ function ref(r: string): string {
 export const CREDIT_ELIGIBLE_TYPES = ['rent', 'utility', 'late_fee', 'fee'] as const
 /** Entries credit never pays: GAM's FlexPay pull, a home/trailer payment (M4 trigger). */
 export const CREDIT_INELIGIBLE_ENTRIES = ['FLEXPAY', 'HOMEPMT'] as const
+/**
+ * 10/26 (Nic): what a tenant's OWN overpayment may pay — the two above plus a
+ * home/trailer payment, because "let their own overpayment pay a trailer
+ * payment" (Kim Bowman's $10.40 of change could not reach the $100 he owed).
+ * FLEXPAY stays barred to every kind of credit: it is GAM's own collection.
+ * Credit the landlord ISSUED keeps the stricter lists above — hours worked and
+ * a goodwill credit do not buy somebody a trailer.
+ */
+export const CREDIT_ELIGIBLE_TYPES_PAID_AHEAD = [...CREDIT_ELIGIBLE_TYPES, 'home_payment'] as const
+export const CREDIT_INELIGIBLE_ENTRIES_PAID_AHEAD = ['FLEXPAY'] as const
 /** Who may take money at the desk, by bank deposit or by a posted payment. */
 export const BANK_PAYABLE_OWNERS = ['landlord', 'held'] as const
 
@@ -119,6 +129,40 @@ export function moneyTakenOrMovingRowSql(a = 'p'): string {
 }
 
 /**
+ * 10/25 (Nic): A CHARGE ON A TRAILER BILL IS NOT ON THE LEASE'S BILL.
+ *
+ *   "Should trailer payments get their own invoice separately payable from lot
+ *    rent? Yeah, let's do that."
+ *
+ * An installment (home/trailer) sale is billed on its own document
+ * (invoices.home_sale_contract_id — services/homeSale). Its charge still
+ * carries the buyer's lease_id, because the lease is real and the books, the
+ * rent roll and the deposit sweep all go on reading it exactly as before. What
+ * changes is only WHICH BILL IT IS ON: the lease's Pay Now must not sweep it
+ * up, because rent is pay-in-full and that would make the trailer payment
+ * unpayable on its own — the thing Dominic Gonzalez's trust money and Lisa
+ * Scheeler's work trade both need.
+ *
+ * True when the row (alias `a`) is NOT on an installment-sale bill. Use it
+ * wherever a set is built from "this lease's charges"; never in the accounting
+ * and reporting reads, which are meant to see the money.
+ */
+export function notOnHomeSaleBillSql(a = 'p'): string {
+  const x = alias(a)
+  return `NOT EXISTS (SELECT 1 FROM invoices inv_hs
+                       WHERE inv_hs.id = ${x}.invoice_id
+                         AND inv_hs.home_sale_contract_id IS NOT NULL)`
+}
+
+/** The rows of ONE installment-sale bill: its own charges, nothing else. */
+export function homeSaleScopeRowSql(a: string, contractRef: string): string {
+  const x = alias(a)
+  const contract = ref(contractRef)
+  return `${x}.invoice_id IN (SELECT inv_hsc.id FROM invoices inv_hsc
+                               WHERE inv_hsc.home_sale_contract_id = ${contract})`
+}
+
+/**
  * The portal and autopay pay-in-full set for ONE lease: every payable row of
  * the lease, plus every payable row on the lease's invoices (a neighbor
  * landlord's utility on a converged invoice, S616; GAM's own fees), but never a
@@ -131,6 +175,7 @@ export function requiredRowSql(a: string, leaseRef: string): string {
   return `(${payableRowSql(x)}
       AND (${x}.lease_id = ${lease}
            OR ${x}.invoice_id IN (SELECT inv_req.id FROM invoices inv_req WHERE inv_req.lease_id = ${lease}))
+      AND ${notOnHomeSaleBillSql(x)}
       AND ${x}.type <> 'carried_balance')`
 }
 
@@ -208,18 +253,42 @@ export function depositOrMoveOutRowSql(a = 'p'): string {
  *   unit and a lease. (A row a dispute reopened takes only the credit that
  *   dispute gave back — creditEligibleRowForCreditSql, decisions #48.7.)
  */
-export function creditEligibleRowSql(a = 'p'): string {
+export function creditEligibleRowSql(a = 'p', opts: { paidAhead?: boolean } = {}): string {
   const x = alias(a)
-  return `(${creditEligibleBaseSql(x)}
+  return `(${creditEligibleBaseSql(x, opts)}
       AND ${x}.reversal_id IS NULL)`
 }
 
 /** The credit rule without its reopened-row term (shared by the two below). */
-function creditEligibleBaseSql(x: string): string {
+/**
+ * 10/26 (Nic): `paidAhead` admits a HOME/TRAILER PAYMENT, because a tenant's
+ * OWN overpayment may pay it — "let their own overpayment pay a trailer
+ * payment". Kim Bowman's $10.40 of change from a $550 bank deposit could not
+ * reach the $100 home payment he still owed, so the money was stuck on both
+ * sides while the net was right.
+ *
+ * It is scoped to paid-ahead credit on purpose. Credit the landlord ISSUED and
+ * work-trade credit stay barred: hours worked and a goodwill credit do not buy
+ * somebody a trailer. FLEXPAY is barred to every kind — GAM's own collection is
+ * not a landlord charge.
+ *
+ * Kept kind-aware rather than simply loosened, because this predicate also
+ * decides the "credit available" figure a tenant is SHOWN. Loosening it for
+ * everybody would quote issued credit against a trailer payment and then have
+ * the trigger refuse the payment.
+ *
+ * Mirrors credit_uses_apply (migration 20261026090000). The two must agree:
+ * the trigger is the backstop, this is the figure.
+ */
+function creditEligibleBaseSql(x: string, opts: { paidAhead?: boolean } = {}): string {
+  const types = opts.paidAhead
+    ? `'rent','utility','late_fee','fee','home_payment'`
+    : `'rent','utility','late_fee','fee'`
+  const entries = opts.paidAhead ? `'FLEXPAY'` : `'FLEXPAY','HOMEPMT'`
   return `(${payableRowSql(x)}
       AND ${x}.revenue_owner = 'landlord'
-      AND ${x}.type IN ('rent','utility','late_fee','fee')
-      AND ${x}.entry_description NOT IN ('FLEXPAY','HOMEPMT')
+      AND ${x}.type IN (${types})
+      AND ${x}.entry_description NOT IN (${entries})
       AND NOT ${depositOrMoveOutRowSql(x)}
       AND ${x}.unit_id IS NOT NULL
       AND ${x}.lease_id IS NOT NULL)`
@@ -362,16 +431,18 @@ export function isDepositOrMoveOutRow(r: MoneyRowFacts): boolean {
   return r.entry_description === 'DEPOSIT' && r.lease_fee_id === null
 }
 
-export function isCreditEligibleRow(r: MoneyRowFacts): boolean {
+export function isCreditEligibleRow(r: MoneyRowFacts, opts: { paidAhead?: boolean } = {}): boolean {
   requireColumns(r, CREDIT_ELIGIBLE_COLUMNS, 'isCreditEligibleRow')
-  return isCreditEligibleBase(r) && r.reversal_id === null
+  return isCreditEligibleBase(r, opts) && r.reversal_id === null
 }
 
-function isCreditEligibleBase(r: MoneyRowFacts): boolean {
+function isCreditEligibleBase(r: MoneyRowFacts, opts: { paidAhead?: boolean } = {}): boolean {
+  const types = opts.paidAhead ? CREDIT_ELIGIBLE_TYPES_PAID_AHEAD : CREDIT_ELIGIBLE_TYPES
+  const entries = opts.paidAhead ? CREDIT_INELIGIBLE_ENTRIES_PAID_AHEAD : CREDIT_INELIGIBLE_ENTRIES
   return isPayableRow(r)
     && r.revenue_owner === 'landlord'
-    && (CREDIT_ELIGIBLE_TYPES as readonly string[]).includes(r.type)
-    && !(CREDIT_INELIGIBLE_ENTRIES as readonly string[]).includes(r.entry_description)
+    && (types as readonly string[]).includes(r.type)
+    && !(entries as readonly string[]).includes(r.entry_description)
     && !isDepositOrMoveOutRow(r)
     && r.unit_id !== null
     && r.lease_id !== null

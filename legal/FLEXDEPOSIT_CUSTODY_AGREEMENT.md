@@ -40,7 +40,7 @@ The Effective Date of this Agreement is the date Tenant electronically signs bel
 
 The parties expressly agree and intend that this Agreement is a custody-and-installment service only. **This Agreement is not, and shall not be construed as, a loan, an extension of consumer credit, a "credit transaction" under the Truth in Lending Act (15 U.S.C. § 1601 et seq.) or Regulation Z (12 C.F.R. Part 1026), an extension of credit under the Equal Credit Opportunity Act (15 U.S.C. § 1691 et seq.) or Regulation B (12 C.F.R. Part 1002), a consumer financial product or service under the Consumer Financial Protection Act (12 U.S.C. § 5481 et seq.), a debt under the Fair Debt Collection Practices Act (15 U.S.C. § 1692 et seq.), or a "loan" or "extension of credit" under the consumer-finance, consumer-installment-loan, small-loan, or usury statutes of any state.**
 
-The installments described in Section 4 fund **Tenant's own security deposit** — they are not repayment of any advance, loan, or extension of credit, because GAM advances and lends nothing. **No debt is created by this Agreement**, and Tenant has no enforceable obligation to repay any amount to GAM. The custody fee in Section 7 is consideration for the custody service only; it is not principal, not interest, and not a finance charge as defined in 12 C.F.R. § 1026.4.
+The installments described in Section 4 fund **Tenant's own security deposit** — they are not repayment of any advance, loan, or extension of credit, because GAM advances and lends nothing. **No debt is created by this Agreement**, and Tenant has no enforceable obligation to repay any amount to GAM. The service fee in Section 7 is consideration for the custody and installment-administration service only; it is a single fixed amount set before Tenant accepts, and it is not principal, not interest, not an origination or application fee, and not a finance charge as defined in 12 C.F.R. § 1026.4. It does not accrue with time, does not increase if an installment is missed, and no further fee of any kind arises under this Agreement.
 
 ## 3. Custody of Your Deposit
 
@@ -99,7 +99,13 @@ Tenant acknowledges and authorizes the GAM-first payment routing described in Co
 
 ## 7. Custody Fee
 
-While GAM holds the Deposit in custody, GAM charges a custody fee of **${{Custody_Fee}} per month** (the "**Custody Fee**"). The Custody Fee is consideration for the custody service only. If Tenant moves to another property on the Platform and the Deposit is forwarded into custody for the new property, the Custody Fee dissolves once the Deposit is marked in the new operator's books, and Tenant will not be charged a further Custody Fee for the forwarded Deposit (Consumer ToS § 9.1.6).
+GAM charges a **one-time service fee of ${{Service_Fee}}** (the "**Service Fee**") for Tenant's plan. The Service Fee is set by the size of the Deposit and the number of installments Tenant's plan uses, is disclosed to Tenant in this Agreement before acceptance, and does **not** change afterward.
+
+**The Service Fee is collected in full with the first installment.** Tenant's first collection is installment 1 plus the whole Service Fee; installments 2 through N collect installment amounts only, with no further fee.
+
+The Service Fee is consideration for the custody and installment-administration service only. It is **not part of the Deposit** and is never credited toward it: the custody balance that Tenant's Landlord may claim against, and that is returned to Tenant at move-out, consists only of the amounts Tenant funded toward the Deposit itself. No monthly fee is charged for the period GAM holds the Deposit, and no further fee arises if Tenant moves to another property on the Platform and the Deposit is forwarded (Consumer ToS § 9.1.6).
+
+FlexDeposit is not offered where the Deposit is $3,000.00 or more.
 
 ## 8. No Debt / No Recourse Acknowledgment
 

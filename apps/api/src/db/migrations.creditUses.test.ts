@@ -216,7 +216,6 @@ describe('S655 credit_uses: what a use may be', () => {
         await charge(c, f, { type: 'fee', entry: 'FLEXPAY', amount: 485 }),
         await charge(c, f, { type: 'fee', entry: 'DEPOSIT', amount: 120 }),          // move-out shortfall
         await charge(c, f, { type: 'deposit', entry: 'DEPOSIT', amount: 460 }),      // the security deposit itself
-        await charge(c, f, { type: 'home_payment', entry: 'HOMEPMT', amount: 200 }),
         await charge(c, f, { type: 'platform_fee', entry: 'SUBSCRIP', owner: 'gam', amount: 2 }),
         await charge(c, f, { type: 'fee', entry: 'OTHERFEE', owner: 'held', amount: 460 }),
       ]
@@ -226,6 +225,34 @@ describe('S655 credit_uses: what a use may be', () => {
       }
       expect(await remaining(c, 'tenant_credits', credit)).toBe(1000)
       expect(await remaining(c, 'lease_prepaid_credits', paidAheadId)).toBe(1000)
+    })
+  })
+
+  /**
+   * 10/26 (Nic): "let their own overpayment pay a trailer payment." A home
+   * payment is the one charge whose eligibility depends on WHICH KIND of credit
+   * is being spent — the tenant's own overpayment may, a credit the landlord
+   * issued may not. Kim Bowman's $10.40 of change could not reach the $100 he
+   * owed, so the money was stuck on both sides while the net was right.
+   */
+  it("a home payment takes the tenant's own overpayment, and no other credit", async () => {
+    await withRollback(async c => {
+      const f = await household(c)
+      const credit = await issued(c, f, 1000)
+      const paidAheadId = await paidAhead(c, f, 1000)
+      const home = await charge(c, f, { type: 'home_payment', entry: 'HOMEPMT', amount: 200 })
+
+      // Credit the landlord issued: refused, as before.
+      await refusedUse(c, { tenantCreditId: credit, paymentId: home, leaseId: f.leaseId, amount: 1 },
+        /not an eligible landlord charge/)
+      expect(await remaining(c, 'tenant_credits', credit)).toBe(1000)
+
+      // The tenant's own overpayment: taken, and only part of the line.
+      await c.query(
+        `INSERT INTO credit_uses (prepaid_credit_id, payment_id, lease_id, amount, billing_month, source, status, applied_at)
+         VALUES ($1, $2, $3, 10.40, date_trunc('month', CURRENT_DATE)::date, 'whole_bill', 'applied', NOW())`,
+        [paidAheadId, home, f.leaseId])
+      expect(await remaining(c, 'lease_prepaid_credits', paidAheadId)).toBe(989.60)
     })
   })
 

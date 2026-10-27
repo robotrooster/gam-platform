@@ -75,6 +75,8 @@ interface PendingInvoice {
   total_amount: string
   work_trade_credit_amount: string
   work_trade_agreement_id: string | null
+  /** 10/25: set when this bill is an installment (home/trailer) sale's own. */
+  home_sale_contract_id: string | null
   unit_number: string | null
   property_id: string
   property_name: string | null
@@ -328,6 +330,7 @@ export async function sendPendingInvoiceNotices(
            i.total_amount::text,
            i.work_trade_credit_amount::text,
            i.work_trade_agreement_id,
+           i.home_sale_contract_id,
            u.unit_number, u.property_id, p.name AS property_name,
            tu.id         AS tenant_user_id,
            tu.email      AS tenant_email,
@@ -393,7 +396,20 @@ export async function sendPendingInvoiceNotices(
       // told so the next pass does not keep reconsidering it; a trade that
       // leaves something owed (a utility the agreement does not cover) is a
       // real bill and goes out with only the owed lines on it.
-      if (inv.work_trade_agreement_id && lines.length === 0) {
+      // 10/25: and a bill with NOTHING LEFT TO SAY is never announced, whatever
+      // emptied it. Until a trailer payment got a bill of its own
+      // (invoices.home_sale_contract_id), work trade was the only way a bill
+      // could end up with no lines. Void such a sale and its bill is left
+      // holding one voided line, which nobody is sent — so the pass would have
+      // mailed the buyer "nothing due" for a bill that no longer exists.
+      //
+      // But "no lines" is not the same as "nothing to say": a month the trade
+      // covered has a real statement to make — nothing due, and the trade
+      // shown as the credit that did it — so a bill carrying a work-trade
+      // credit still goes out (that is what the S654 skip above is for: only
+      // where an AGREEMENT says no bills go to this resident at all).
+      const workTradeToReport = Number(inv.work_trade_credit_amount) > 0
+      if (lines.length === 0 && !workTradeToReport) {
         await query(`UPDATE invoices SET sent_at = NOW() WHERE id = $1`, [inv.id])
         result.skippedCovered++
         continue
@@ -405,15 +421,21 @@ export async function sendPendingInvoiceNotices(
       // WHOLE bill; otherwise the tenant is asked" when they pay. A line that
       // was already paid with money (a check that beat the email) is listed as
       // covered, not due. 10/6 (Nic): credit already applied to the bill —
-      // money paid ahead goes on by itself, whole or in part — is one "Credit
-      // applied" figure under the lines (creditOnBill), never a line's tag.
+      // money paid ahead goes on by itself, whole or in part — is ONE figure
+      // (creditOnBill), never a line's tag. 10/26: that figure now shows in the
+      // PAID category of the summary ("Paid — paid-ahead credit") rather than
+      // as a deduction above "Still owed"; see services/email.ts.
       const total = Math.round(lines.reduce((s, l) => s + (l.open ? Math.round(Number(l.open_amount) * 100) : 0), 0)) / 100
       const onBill = creditOnBill(lines)
 
       // The credit Pay Now will offer them for this bill: the household plan's
       // share for this lease (oldest bill first, eligible lines only, within a
       // monthly draw cap). Said beside the bill, never netted off it.
-      const leaseId = lines.find(l => l.lease_id)?.lease_id ?? null
+      // 10/25: never beside a trailer bill. Credit does not pay a home payment
+      // (moneyPredicates CREDIT_INELIGIBLE_ENTRIES), and the charge still
+      // carries the buyer's lease, so without this the email would offer the
+      // lease's credit against a bill it cannot be spent on.
+      const leaseId = inv.home_sale_contract_id ? null : lines.find(l => l.lease_id)?.lease_id ?? null
       let creditAvailable = 0
       if (leaseId && inv.tenant_id && total > 0) {
         const c = await creditBeside({ tenantId: inv.tenant_id, landlordIds: [inv.landlord_id], leaseIds: [leaseId] })

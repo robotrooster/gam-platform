@@ -20,6 +20,7 @@ import { ClaimPage } from './pages/ClaimPage'
 import { InvoicePaidPage } from './pages/InvoicePaidPage'
 import { resolveBookingSlug } from './lib/slug'
 import './styles.css'
+import { installPrintLightTheme } from '@gam/shared'
 
 // In production each property's booking site is a GAM subdomain; when the
 // host carries a property slug, the apex path IS the booking page.
@@ -49,6 +50,11 @@ function Landing() {
     </div>
   )
 }
+
+// 10/26 (Nic): a printed page is always the light theme, whatever the screen
+// is set to — he printed an eviction balance summary in dark mode and got a
+// solid black sheet. Installed once here; restores the viewer's theme after.
+installPrintLightTheme()
 
 // HMR guard: when Vite re-executes this entry module, calling createRoot on
 // the same container again STACKS a second mounted app under the first

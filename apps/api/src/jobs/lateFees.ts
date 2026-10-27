@@ -102,14 +102,19 @@ function qualifyingInvoicesSql(rowFilter: string): string {
         ls.late_from::text AS late_from,
         d.today::text AS today_local,
         g.days AS late_fee_grace_days,
-        COALESCE(l.late_fee_initial_type, sa.late_fee_initial_type) AS late_fee_initial_type,
-        COALESCE(l.late_fee_initial_amount, sa.late_fee_initial_amount)::text AS late_fee_initial_amount,
-        COALESCE(l.late_fee_accrual_type, sa.late_fee_accrual_type) AS late_fee_accrual_type,
-        COALESCE(l.late_fee_accrual_amount, sa.late_fee_accrual_amount)::text AS late_fee_accrual_amount,
-        COALESCE(l.late_fee_accrual_period, sa.late_fee_accrual_period) AS late_fee_accrual_period,
-        COALESCE(l.late_fee_accrual_from, sa.late_fee_accrual_from, 'grace_end') AS late_fee_accrual_from,
-        COALESCE(l.late_fee_cap_type, sa.late_fee_cap_type) AS late_fee_cap_type,
-        COALESCE(l.late_fee_cap_amount, sa.late_fee_cap_amount)::text AS late_fee_cap_amount
+        -- 10/25 (Nic): and an INSTALLMENT CONTRACT, the third document a bill
+        -- can belong to. "It's an installment contract that may carry its own
+        -- late terms... we need to have the capability for landlords." Exactly
+        -- one of the three is present per the invoices CHECK, so these stay
+        -- unambiguous rather than becoming a precedence rule.
+        COALESCE(l.late_fee_initial_type, sa.late_fee_initial_type, hs.late_fee_initial_type) AS late_fee_initial_type,
+        COALESCE(l.late_fee_initial_amount, sa.late_fee_initial_amount, hs.late_fee_initial_amount)::text AS late_fee_initial_amount,
+        COALESCE(l.late_fee_accrual_type, sa.late_fee_accrual_type, hs.late_fee_accrual_type) AS late_fee_accrual_type,
+        COALESCE(l.late_fee_accrual_amount, sa.late_fee_accrual_amount, hs.late_fee_accrual_amount)::text AS late_fee_accrual_amount,
+        COALESCE(l.late_fee_accrual_period, sa.late_fee_accrual_period, hs.late_fee_accrual_period) AS late_fee_accrual_period,
+        COALESCE(l.late_fee_accrual_from, sa.late_fee_accrual_from, hs.late_fee_accrual_from, 'grace_end') AS late_fee_accrual_from,
+        COALESCE(l.late_fee_cap_type, sa.late_fee_cap_type, hs.late_fee_cap_type) AS late_fee_cap_type,
+        COALESCE(l.late_fee_cap_amount, sa.late_fee_cap_amount, hs.late_fee_cap_amount)::text AS late_fee_cap_amount
       FROM invoices i
       -- S615: an invoice belongs to EITHER a lease or a utility service
       -- agreement, so the lease join can no longer be an inner one — it was
@@ -141,6 +146,11 @@ function qualifyingInvoicesSql(rowFilter: string): string {
             AND NOT EXISTS (
               SELECT 1 FROM cross_property_service_links cl
                WHERE cl.service_agreement_id = sa.id AND cl.status = 'active')
+      -- 10/25 (Nic): the installment (home/trailer) contract whose own bill
+      -- this is. Its terms apply to its own bill only — a trailer payment is
+      -- never on a rent bill, so there is no two-documents-one-bill question
+      -- of the kind S616 had to settle for utilities.
+      LEFT JOIN home_sale_contracts hs ON hs.id = i.home_sale_contract_id
       JOIN units u ON u.id = COALESCE(i.unit_id, l.unit_id)
       JOIN properties p ON p.id = u.property_id
       -- 10/12 (Nic): "Grace = lease, else property, else 5 — the only chain."
@@ -154,7 +164,8 @@ function qualifyingInvoicesSql(rowFilter: string): string {
       -- check, the home-payment rule below and processInvoice all use the
       -- same number.
       CROSS JOIN LATERAL (
-        SELECT COALESCE(l.late_fee_grace_days, sa.late_fee_grace_days, p.late_fee_grace_days, 5) AS days
+        SELECT COALESCE(l.late_fee_grace_days, sa.late_fee_grace_days, hs.late_fee_grace_days,
+                        p.late_fee_grace_days, 5) AS days
       ) g
       -- The park's today.
       CROSS JOIN LATERAL (SELECT ${propertyDaySql('NOW()', 'p')} AS today) d
@@ -214,8 +225,13 @@ function qualifyingInvoicesSql(rowFilter: string): string {
           AND NOT EXISTS (SELECT 1 FROM invoices ip
                            WHERE ip.lease_id = l.id AND ip.due_date < i.due_date AND ip.status <> 'void')
         )
-        AND COALESCE(l.late_fee_enabled, sa.late_fee_enabled) = true
-        AND COALESCE(l.late_fee_initial_amount, sa.late_fee_initial_amount) IS NOT NULL
+        -- 10/25: the installment contract is the third document that can turn
+        -- fees on. Left out of THESE two (while its terms were read above), a
+        -- trailer bill had l and sa both NULL, so the COALESCE compared NULL to
+        -- true and the bill was filtered out — the landlord's own late terms
+        -- would have been saved, shown, and then silently never charged.
+        AND COALESCE(l.late_fee_enabled, sa.late_fee_enabled, hs.late_fee_enabled) = true
+        AND COALESCE(l.late_fee_initial_amount, sa.late_fee_initial_amount, hs.late_fee_initial_amount) IS NOT NULL
         -- The first late day is the lateness start + grace (due the 1st, 5 days
         -- of grace: the 6th), and the fee charges at midnight on it — '>=', not
         -- '>' (10/12, Nic: "the 6th is late, the day late fees start").
@@ -266,6 +282,12 @@ function qualifyingInvoicesSql(rowFilter: string): string {
              AND pb.status IN ('pending', 'failed')
              AND pb.amount > 0
              AND pb.work_trade_suspended_at IS NULL
+             -- 10/25: this applies only to bills written BEFORE 10/25. A
+             -- trailer payment is its own bill now (invoices.home_sale_contract_id),
+             -- written late_fee_exempt, so no new installment is ever on a rent
+             -- bill and none can be the line that keeps one late. The rule stays
+             -- because the bills that already carry one are still being paid.
+             --
              -- 10/12 (Nic): a charge the tenant could not have seen cannot make
              -- them late. Since the landlord's signature starts a home sale
              -- billing, an installment can join a bill that is ALREADY late
@@ -489,16 +511,18 @@ async function processInvoice(
   // out, a bounce made the rent $0 here: a percent fee charged nothing, and a
   // percent cap read as reached, which stopped even a flat fee.
   //
-  // S615: a UTILITY-SERVICE invoice (no lease, no rent row anywhere) bases the
-  // percentage on its own billable charges instead — the utilities, which are
-  // the entire obligation. Without this a percent-of-rent property would
-  // compute every such fee as exactly $0 and a percent CAP would return 0
-  // remaining, which blocks even a FLAT fee: the bill would look configured,
-  // qualify, and then quietly never charge anything. Scoped to lease_id IS
-  // NULL so a leased invoice's basis is byte-identical to what it was.
-  const isServiceInvoice = inv.lease_id == null
+  // S615: a bill with NO LEASE and so no rent row anywhere bases the percentage
+  // on its own billable charges instead — for a utility-service bill the
+  // utilities, and (10/25) for an installment contract's own bill the
+  // installment, which in each case is the entire obligation. Without this a
+  // percent-of-rent property would compute every such fee as exactly $0 and a
+  // percent CAP would return 0 remaining, which blocks even a FLAT fee: the
+  // bill would look configured, qualify, and then quietly never charge
+  // anything. Scoped to lease_id IS NULL so a leased invoice's basis is
+  // byte-identical to what it was.
+  const ownChargesAreTheObligation = inv.lease_id == null
   const { rows: rentRows } = await client.query<{ total: string }>(
-    isServiceInvoice
+    ownChargesAreTheObligation
       ? `SELECT COALESCE(SUM(amount), 0)::text AS total
            FROM payments
           WHERE invoice_id = $1 AND type <> 'late_fee'

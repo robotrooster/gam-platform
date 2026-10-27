@@ -41,12 +41,19 @@
 //                      billed by the month.
 // Late fees never decide it (10/12: "Late fees are never a bill and never
 // decide a month's color"); they are in Invoiced and Owed.
-export const RENT_ROLL_MONTH_STATUSES = ['paid', 'paid_late', 'partial', 'owes', 'due', 'none'] as const
+// 10/25 (Nic): 'covered' — a month the WORK TRADE settled, not money. Lisa
+// Scheeler came in to make a trailer payment, read the green "Paid" against her
+// name on the financials page, and took it to mean her trailer payment was
+// already paid. It meant her RENT was covered by her hours. Nic: "I would just
+// make it say covered or something instead of paid." Still green — nothing is
+// owed and nothing is late — but it never says money arrived, because none did.
+export const RENT_ROLL_MONTH_STATUSES = ['paid', 'covered', 'paid_late', 'partial', 'owes', 'due', 'none'] as const
 export type RentRollMonthStatus = typeof RENT_ROLL_MONTH_STATUSES[number]
 export const RENT_ROLL_ROW_STATUSES = [...RENT_ROLL_MONTH_STATUSES, 'vacant', 'occupied', 'stay'] as const
 export type RentRollRowStatus = typeof RENT_ROLL_ROW_STATUSES[number]
 export const RENT_ROLL_STATUS_LABEL: Record<RentRollRowStatus, string> = {
   paid:      'Paid',
+  covered:   'Covered',
   paid_late: 'Paid late',
   partial:   'Partial',
   owes:      'Owes',
@@ -60,6 +67,7 @@ export const RENT_ROLL_STATUS_COLORS = ['green', 'orange', 'yellow', 'red', 'gra
 export type RentRollStatusColor = typeof RENT_ROLL_STATUS_COLORS[number]
 export const RENT_ROLL_STATUS_COLOR: Record<RentRollRowStatus, RentRollStatusColor> = {
   paid:      'green',
+  covered:   'green',
   paid_late: 'orange',
   partial:   'yellow',
   owes:      'red',
@@ -118,9 +126,14 @@ export const STAY_PAYMENT_METHOD_LABEL: Record<'card' | 'card_on_file' | 'cash' 
 export function rentRollStatusOf(
   stamp: 'paid_on_time' | 'partial' | 'paid_late' | 'outstanding' | 'due' | null | undefined,
   daysPastGrace: number,
+  /**
+   * 10/25 (Nic): the work trade covered the whole month — no money came in, so
+   * the month reads "Covered", never "Paid". Omitted (or false) reads as money.
+   */
+  workTradeOnly = false,
 ): RentRollMonthStatus {
   switch (stamp) {
-    case 'paid_on_time': return 'paid'
+    case 'paid_on_time': return workTradeOnly ? 'covered' : 'paid'
     case 'paid_late':    return 'paid_late'
     case 'partial':      return daysPastGrace > 0 ? 'owes' : 'partial'
     case 'outstanding':  return 'owes'

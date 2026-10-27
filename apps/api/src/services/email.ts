@@ -3427,8 +3427,15 @@ export async function emailInvoiceReady(
     workTradeCredit?: number
     /**
      * 10/6 (Nic): credit already applied against this bill (money paid ahead
-     * goes on by itself) — one "Credit applied" line under the charges, then
-     * "Still owed". Never a tag on a line.
+     * goes on by itself). Never a tag on a line — the line keeps its own
+     * amount.
+     *
+     * 10/26 (Nic): it is rendered in the PAID category, not as a deduction.
+     * The summary reads "Total invoiced", then "Paid — paid-ahead credit",
+     * then "Total owed": "maybe you just have it in the paid category, like
+     * '$10.40 paid ahead credit'... And then the owed is $10.40 less than what
+     * the bill is." The old "Credit applied" / "Still owed" labels no longer
+     * exist, so do not grep for them.
      */
     creditApplied?: number
     /** S655: the credit Pay Now will offer for this bill — said beside it, never netted. */
@@ -3448,11 +3455,6 @@ export async function emailInvoiceReady(
     `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:${l.covered ? '#7a8aaa' : '#b8c4d8'};margin-bottom:5px">
        <span>${escapeHtml(l.label)}${l.covered ? ` <span style="font-size:.72rem;color:#5fbf7f">&mdash; covered (${escapeHtml(l.coveredHow || 'already paid')})</span>` : ''}${l.detail ? `<span style="display:block;font-size:.74rem;color:#7a8aaa">${escapeHtml(l.detail)}</span>` : ''}</span><span style="${l.covered ? 'text-decoration:line-through' : ''}">${money(l.amount)}</span>
      </div>`).join('')
-
-  const deduction = (label: string, amount: number) =>
-    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#5fbf7f;margin-bottom:5px">
-       <span>${label}</span><span>-${money(amount)}</span>
-     </div>`
 
   // A zero balance is still worth sending: it is the tenant's proof that the
   // month was covered, and the commonest cause is work trade.
@@ -3477,13 +3479,53 @@ export async function emailInvoiceReady(
          <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${escapeHtml(args.unitLabel)}</div>
          <div style="font-size:.72rem;color:#7a8aaa;margin-bottom:10px">Invoice ${escapeHtml(args.invoiceNumber)} &middot; due ${escapeHtml(args.dueDateLabel)}</div>
          ${rows}` +
-      (args.workTradeCredit && args.workTradeCredit > 0 ? deduction('Work trade', args.workTradeCredit) : '') +
-      (args.creditApplied && args.creditApplied > 0 ? deduction('Credit applied', args.creditApplied) : '') +
-      `   <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+      // ── 10/26 (Nic): INVOICED, PAID, OWED — AND CREDIT SITS IN *PAID* ──────
+      //
+      //   "It'll show total invoiced, total paid, total owed... maybe you just
+      //    have it in the paid category, like '$10.40 paid ahead credit' or
+      //    whatever. And then the owed is $10.40 less than what the bill is."
+      //
+      // It used to read as a DEDUCTION under the charges and then "Still
+      // owed", which makes credit look like a discount on the bill. It is not:
+      // it is money of theirs that has already gone against it. So the three
+      // figures are named, and the credit is one of the things making up what
+      // has been paid.
+      //
+      // `args.total` is already net of credit and work trade, so the invoiced
+      // figure is the total plus whatever has been applied — which keeps the
+      // three lines arithmetically consistent with each other whatever the
+      // caller passes.
+      (() => {
+        const applied = (args.creditApplied ?? 0) + (args.workTradeCredit ?? 0)
+        const owed = Math.max(0, args.total)
+        const invoiced = Math.round((owed + applied) * 100) / 100
+        if (applied <= 0) {
+          // Nothing paid against it yet: one line, as before.
+          return `   <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
                      border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
-           <span>${settled ? 'Balance' : (args.creditApplied && args.creditApplied > 0 ? 'Still owed' : 'Total due')}</span><span>${money(Math.max(0, args.total))}</span>
+           <span>${settled ? 'Balance' : 'Total due'}</span><span>${money(owed)}</span>
          </div>
-       </div>` +
+       </div>`
+        }
+        const row = (label: string, amount: string, strong = false) =>
+          `<div style="display:flex;justify-content:space-between;font-size:.86rem;margin-bottom:5px;${
+            strong ? 'font-weight:800;color:#eef1f8;' : 'color:#b8c4d8;'}">
+             <span>${label}</span><span>${amount}</span>
+           </div>`
+        return `   <div style="border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
+           ${row('Total invoiced', money(invoiced))}
+           ${(args.creditApplied ?? 0) > 0
+             ? `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#5fbf7f;margin-bottom:5px">
+                  <span>Paid &mdash; paid-ahead credit</span><span>${money(args.creditApplied ?? 0)}</span>
+                </div>` : ''}
+           ${(args.workTradeCredit ?? 0) > 0
+             ? `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#5fbf7f;margin-bottom:5px">
+                  <span>Paid &mdash; work trade</span><span>${money(args.workTradeCredit ?? 0)}</span>
+                </div>` : ''}
+           ${row(settled ? 'Balance' : 'Total owed', money(owed), true)}
+         </div>
+       </div>`
+      })() +
       // S655 (Nic, 10/2): credit is used when they pay — they choose "Use all"
       // or "Save it for later" — so it is said here, not taken off the bill.
       (!settled && credit > 0

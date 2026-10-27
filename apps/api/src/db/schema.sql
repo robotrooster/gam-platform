@@ -28,7 +28,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict WYjBK9vsOuOYlXu9914bdU6OZwtS2gPvhexyXwog0djRjrNjBYIpbStHhbvCfvQ
+\restrict AdmXSbRylCabUCEKDxeePmx86dbeW2bTZZaIQ6HcciQJczqK08M1kwQAJOzEXTT
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -1617,7 +1617,7 @@ COMMENT ON FUNCTION public.credit_remaining_moves_by_ledger() IS 'S655 C0: amoun
 
 CREATE FUNCTION public.credit_uses_apply() RETURNS trigger
     LANGUAGE plpgsql
-    AS $$
+    AS $_$
 DECLARE
   -- current_setting(..., true) is NULL when the setting was never made in this
   -- session, so the switch is read through COALESCE: NULL must mean "off".
@@ -1777,8 +1777,22 @@ BEGIN
       -- same dispute gave back — the credit whose spend on the disputed
       -- original it undid ('reversed') — decisions #48.7.
       IF pay.revenue_owner IS DISTINCT FROM 'landlord'
-         OR pay.type NOT IN ('rent','utility','late_fee','fee')
-         OR pay.entry_description IN ('FLEXPAY','HOMEPMT')
+         -- 10/26 (Nic): a tenant's OWN overpayment may pay their trailer
+         -- payment. Kim Bowman paid $550 against $639.60; it settled rent,
+         -- water and the late fee exactly, and the $10.40 left over became
+         -- paid-ahead credit that could never touch the $100 home payment he
+         -- still owed. The net was right and the money was stuck.
+         --
+         -- Scoped to PAID-AHEAD credit (NEW.prepaid_credit_id): it is his
+         -- money, against his own bill. Credit the landlord ISSUED and
+         -- work-trade credit stay barred — hours worked and a goodwill credit
+         -- do not buy somebody a trailer (the same rule that keeps work trade
+         -- off a home payment). FLEXPAY stays barred to every kind: that is
+         -- GAM's own collection, not a landlord charge.
+         OR NOT (pay.type IN ('rent','utility','late_fee','fee')
+                 OR (pay.type = 'home_payment' AND NEW.prepaid_credit_id IS NOT NULL))
+         OR pay.entry_description = 'FLEXPAY'
+         OR (pay.entry_description = 'HOMEPMT' AND NEW.prepaid_credit_id IS NULL)
          OR (pay.entry_description = 'DEPOSIT' AND pay.lease_fee_id IS NULL)
          OR pay.work_trade_suspended_at IS NOT NULL
          OR (pay.reversal_id IS NOT NULL AND NOT (
@@ -1930,7 +1944,7 @@ BEGIN
     UPDATE payments SET amount = amount - NEW.amount WHERE id = NEW.payment_id;
   END IF;
   RETURN NEW;
-END $$;
+END $_$;
 
 
 --
@@ -11395,6 +11409,95 @@ CREATE TABLE public.csv_import_attempts (
 
 
 --
+-- Name: customer_profile_links; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.customer_profile_links (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    profile_id uuid NOT NULL,
+    kind text NOT NULL,
+    ref_id uuid NOT NULL,
+    landlord_id uuid,
+    business_id uuid,
+    matched_on jsonb DEFAULT '[]'::jsonb NOT NULL,
+    points integer NOT NULL,
+    confirmed_by uuid,
+    confirmed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT customer_profile_links_kind_check CHECK ((kind = ANY (ARRAY['tenant'::text, 'pos_customer'::text, 'business_customer'::text]))),
+    CONSTRAINT customer_profile_links_one_holder CHECK (((landlord_id IS NOT NULL) <> (business_id IS NOT NULL))),
+    CONSTRAINT customer_profile_links_points_check CHECK ((points >= 3))
+);
+
+
+--
+-- Name: TABLE customer_profile_links; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.customer_profile_links IS 'Every place a GAM customer turns up: a resident row, a register customer, a
+   service-business customer. One row per appearance, so "anywhere that person
+   pops up in GAM" is one read. points/matched_on record WHY it was linked.';
+
+
+--
+-- Name: customer_profiles; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.customer_profiles (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    first_name text NOT NULL,
+    last_name text NOT NULL,
+    phone text,
+    email text,
+    points_changed_at timestamp with time zone,
+    points_changed_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    pay_code_hash text,
+    pay_code_set_at timestamp with time zone,
+    pay_code_failures integer DEFAULT 0 NOT NULL,
+    pay_code_locked_until timestamp with time zone,
+    pay_code_last_used_at timestamp with time zone
+);
+
+
+--
+-- Name: TABLE customer_profiles; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.customer_profiles IS 'One GAM customer per person, across every business on the platform (Nic,
+   10/25). Identity only — name, phone, email. No balance, no lease, no payment
+   history, no card. NOT a login: users is that. Matched on three agreeing data
+   points (packages/shared customerMatch).';
+
+
+--
+-- Name: COLUMN customer_profiles.pay_code_hash; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.customer_profiles.pay_code_hash IS 'bcrypt hash of the 6-8 digit code the customer memorizes (Nic, 10/25) — the
+   second factor that makes a phone number an identifier rather than an
+   authorization. NEVER stored, returned, logged or emailed in the clear. NULL =
+   no factor set, and a profile with no factor can authorize nothing.';
+
+
+--
+-- Name: COLUMN customer_profiles.pay_code_failures; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.customer_profiles.pay_code_failures IS 'Consecutive wrong codes, counted on the ACCOUNT so trying from somewhere new
+   does not reset it. A six-digit code is only a million guesses.';
+
+
+--
+-- Name: COLUMN customer_profiles.pay_code_locked_until; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.customer_profiles.pay_code_locked_until IS 'Set when the failure count hits the ceiling; no code is accepted until it
+   passes. On the account, because the attacker chooses where to try from.';
+
+
+--
 -- Name: customer_push_subscriptions; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -12447,6 +12550,56 @@ COMMENT ON TABLE public.flexcredit_inquiries IS 'S565 FlexCredit demand-capture:
 
 
 --
+-- Name: flexdeposit_capacity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.flexdeposit_capacity (
+    id boolean DEFAULT true NOT NULL,
+    max_active_plans integer,
+    max_uncollected numeric(12,2),
+    note text,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_by uuid,
+    CONSTRAINT flexdeposit_capacity_one_row CHECK ((id IS TRUE)),
+    CONSTRAINT flexdeposit_capacity_sane CHECK ((((max_active_plans IS NULL) OR (max_active_plans >= 0)) AND ((max_uncollected IS NULL) OR (max_uncollected >= (0)::numeric))))
+);
+
+
+--
+-- Name: TABLE flexdeposit_capacity; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.flexdeposit_capacity IS 'Platform-wide ceiling on concurrent FlexDeposit plans and total uncollected deposit (10/26, Nic). Either limit closes enrollment; NULL disables that limit. One row.';
+
+
+--
+-- Name: flexdeposit_fee_schedule; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.flexdeposit_fee_schedule (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    deposit_min numeric(12,2) NOT NULL,
+    deposit_max numeric(12,2),
+    payments integer NOT NULL,
+    fee numeric(12,2) NOT NULL,
+    effective_from date DEFAULT CURRENT_DATE NOT NULL,
+    note text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT flexdeposit_fee_nonneg CHECK ((fee >= (0)::numeric)),
+    CONSTRAINT flexdeposit_fee_payments_check CHECK (((payments >= 2) AND (payments <= 6))),
+    CONSTRAINT flexdeposit_fee_range_check CHECK (((deposit_max IS NULL) OR (deposit_max > deposit_min))),
+    CONSTRAINT flexdeposit_fee_schedule_payments_check CHECK (((payments >= 2) AND (payments <= 6)))
+);
+
+
+--
+-- Name: TABLE flexdeposit_fee_schedule; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.flexdeposit_fee_schedule IS 'FlexDeposit service fee by deposit bracket and installment count. Exactly two counts are sold, 2 and 4 (10/26, Nic), at the SAME price for everybody at a given deposit size — that uniformity is what keeps it a service price rather than a credit decision. Not offered at $3,000 or more. Re-pricing appends a row with a later effective_from.';
+
+
+--
 -- Name: flexpay_advances; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -12479,6 +12632,7 @@ CREATE TABLE public.flexpay_advances (
     pull_date date,
     pull_attempts integer DEFAULT 0 NOT NULL,
     pull_last_error text,
+    subscription_fee numeric(10,2),
     CONSTRAINT flexpay_advances_amounts_check CHECK (((rent_amount >= (0)::numeric) AND (tenant_fee_amount > (0)::numeric))),
     CONSTRAINT flexpay_advances_pull_attempts_nonneg CHECK ((pull_attempts >= 0)),
     CONSTRAINT flexpay_advances_pull_day_check CHECK (((pull_day >= 1) AND (pull_day <= 28))),
@@ -12508,6 +12662,13 @@ COMMENT ON COLUMN public.flexpay_advances.pull_attempts IS 'S655: runs that trie
 
 
 --
+-- Name: COLUMN flexpay_advances.subscription_fee; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.flexpay_advances.subscription_fee IS 'The FlexPay subscription fee this cycle was PRICED at, from flexpay_fee_schedule, stamped at cover and never changed (10/26). GAM''s revenue for the month; platform_revenue_ledger books this. tenant_fee_amount is the TOTAL the tenant owes and grows with pass-through return/dispute costs, which are never GAM earnings.';
+
+
+--
 -- Name: flexpay_blocked_states; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -12517,6 +12678,34 @@ CREATE TABLE public.flexpay_blocked_states (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT flexpay_blocked_states_state_check CHECK ((length(state) = 2))
 );
+
+
+--
+-- Name: flexpay_fee_schedule; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.flexpay_fee_schedule (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    rent_min numeric(12,2) NOT NULL,
+    rent_max numeric(12,2),
+    benefit_wednesday integer NOT NULL,
+    fee numeric(12,2) NOT NULL,
+    effective_from date DEFAULT CURRENT_DATE NOT NULL,
+    note text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT flexpay_fee_nonneg CHECK ((fee >= (0)::numeric)),
+    CONSTRAINT flexpay_fee_range_check CHECK (((rent_max IS NULL) OR (rent_max > rent_min))),
+    CONSTRAINT flexpay_fee_wednesday_check CHECK ((benefit_wednesday = ANY (ARRAY[2, 3, 4])))
+);
+
+
+--
+-- Name: TABLE flexpay_fee_schedule; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.flexpay_fee_schedule IS 'FlexPay price by rent bracket x benefit Wednesday (Nic, 10/26). A FIXED price
+   for the bracket, never a percentage of the particular rent — "we are trying
+   to stay out of lender territory". Replaces the flat $25/month.';
 
 
 --
@@ -12751,9 +12940,27 @@ CREATE TABLE public.home_sale_contracts (
     plan_type text DEFAULT 'amortized'::text NOT NULL,
     purchase_document_id uuid,
     activated_at timestamp with time zone,
+    late_fee_enabled boolean DEFAULT false NOT NULL,
+    late_fee_grace_days integer,
+    late_fee_initial_type text,
+    late_fee_initial_amount numeric(12,2),
+    late_fee_accrual_type text,
+    late_fee_accrual_amount numeric(12,2),
+    late_fee_accrual_period text,
+    late_fee_accrual_from text,
+    late_fee_cap_type text,
+    late_fee_cap_amount numeric(12,2),
+    card_payments_blocked boolean DEFAULT false NOT NULL,
+    tracked_not_billed boolean DEFAULT false NOT NULL,
     CONSTRAINT home_sale_contracts_annual_interest_rate_check CHECK ((annual_interest_rate >= (0)::numeric)),
     CONSTRAINT home_sale_contracts_down_payment_check CHECK ((down_payment >= (0)::numeric)),
     CONSTRAINT home_sale_contracts_financed_amount_check CHECK ((financed_amount >= (0)::numeric)),
+    CONSTRAINT home_sale_contracts_late_fee_accrual_from_check CHECK (((late_fee_accrual_from IS NULL) OR (late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text])))),
+    CONSTRAINT home_sale_contracts_late_fee_accrual_period_check CHECK (((late_fee_accrual_period IS NULL) OR (late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text])))),
+    CONSTRAINT home_sale_contracts_late_fee_accrual_type_check CHECK (((late_fee_accrual_type IS NULL) OR (late_fee_accrual_type = ANY (ARRAY['flat'::text, 'percent'::text])))),
+    CONSTRAINT home_sale_contracts_late_fee_cap_type_check CHECK (((late_fee_cap_type IS NULL) OR (late_fee_cap_type = ANY (ARRAY['flat'::text, 'percent'::text])))),
+    CONSTRAINT home_sale_contracts_late_fee_grace_days_check CHECK (((late_fee_grace_days IS NULL) OR (late_fee_grace_days >= 0))),
+    CONSTRAINT home_sale_contracts_late_fee_initial_type_check CHECK (((late_fee_initial_type IS NULL) OR (late_fee_initial_type = ANY (ARRAY['flat'::text, 'percent'::text])))),
     CONSTRAINT home_sale_contracts_monthly_payment_check CHECK ((monthly_payment >= (0)::numeric)),
     CONSTRAINT home_sale_contracts_plan_type_check CHECK ((plan_type = ANY (ARRAY['amortized'::text, 'flat'::text]))),
     CONSTRAINT home_sale_contracts_sale_price_check CHECK ((sale_price > (0)::numeric)),
@@ -12791,6 +12998,35 @@ COMMENT ON COLUMN public.home_sale_contracts.activated_at IS '10/12 (ledger P1):
 
 
 --
+-- Name: COLUMN home_sale_contracts.late_fee_enabled; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.home_sale_contracts.late_fee_enabled IS 'The signed installment contract charges a late fee. Default FALSE: a fee
+   nobody signed for is never charged. The bill is written late_fee_exempt
+   while this is false (services/homeSale ownBillFor).';
+
+
+--
+-- Name: COLUMN home_sale_contracts.card_payments_blocked; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.home_sale_contracts.card_payments_blocked IS 'Refuse card payments on this contract''s bills (Nic, 10/25). For an
+   installment whose money belongs to another set of books — Dominic Gonzalez''s
+   goes to the trust — where a chargeback would have to be unwound twice.';
+
+
+--
+-- Name: COLUMN home_sale_contracts.tracked_not_billed; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.home_sale_contracts.tracked_not_billed IS 'TRUE: GAM bills nothing for this contract — no invoice, no charge, no money
+   through GAM. It keeps the schedule, reminds when a payment is due, and records
+   it when somebody marks it paid (home_sale_installments.settled_off_platform_at).
+   For an installment whose money belongs to another set of books: Dominic
+   Gonzalez pays the trust, not the park. Default FALSE = GAM invoices it.';
+
+
+--
 -- Name: home_sale_installments; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -12805,8 +13041,18 @@ CREATE TABLE public.home_sale_installments (
     remaining_balance numeric(12,2) NOT NULL,
     payment_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    settled_off_platform_at timestamp with time zone
+    settled_off_platform_at timestamp with time zone,
+    reminded_at timestamp with time zone
 );
+
+
+--
+-- Name: COLUMN home_sale_installments.reminded_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.home_sale_installments.reminded_at IS 'When the buyer was told this payment is due, on a tracked (not billed)
+   contract. Stamped once, so the nightly run reminds once per installment and
+   not once a night.';
 
 
 --
@@ -12880,7 +13126,8 @@ CREATE TABLE public.invoices (
     service_agreement_id uuid,
     subtotal_home_payments numeric(12,2) DEFAULT 0 NOT NULL,
     voided_from_lease_id uuid,
-    CONSTRAINT invoices_payer_source_check CHECK ((((lease_id IS NOT NULL) <> (service_agreement_id IS NOT NULL)) OR ((status = 'void'::text) AND (lease_id IS NULL) AND (service_agreement_id IS NULL) AND (voided_from_lease_id IS NOT NULL)))),
+    home_sale_contract_id uuid,
+    CONSTRAINT invoices_payer_source_check CHECK (((((((lease_id IS NOT NULL))::integer + ((service_agreement_id IS NOT NULL))::integer) + ((home_sale_contract_id IS NOT NULL))::integer) = 1) OR ((status = 'void'::text) AND (lease_id IS NULL) AND (service_agreement_id IS NULL) AND (home_sale_contract_id IS NULL) AND (voided_from_lease_id IS NOT NULL)))),
     CONSTRAINT invoices_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'partial'::text, 'settled'::text, 'void'::text]))),
     CONSTRAINT invoices_subtotal_deposits_check CHECK ((subtotal_deposits >= (0)::numeric)),
     CONSTRAINT invoices_subtotal_fees_check CHECK ((subtotal_fees >= (0)::numeric)),
@@ -12926,6 +13173,15 @@ COMMENT ON COLUMN public.invoices.subtotal_home_payments IS 'S654: home-sale ins
 --
 
 COMMENT ON COLUMN public.invoices.voided_from_lease_id IS '10/12 (G7): the lease a void bill was written on, when the void gave the lease''s due date back (lease_id is then NULL): a bill a shortened stay emptied. Kept forever.';
+
+
+--
+-- Name: COLUMN invoices.home_sale_contract_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.invoices.home_sale_contract_id IS 'The installment (home/trailer) sale this bill is for. Set => the bill is that
+   contract''s own document, paid by itself, and carries no space rent. NULL on
+   every lease bill and every utility-service bill.';
 
 
 --
@@ -14042,6 +14298,7 @@ CREATE TABLE public.lease_document_signers (
     declined_at timestamp with time zone,
     decline_reason text,
     reminder_count integer DEFAULT 0 NOT NULL,
+    invite_resend_count integer DEFAULT 0 NOT NULL,
     CONSTRAINT lease_document_signers_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'sent'::text, 'viewed'::text, 'signed'::text, 'declined'::text])))
 );
 
@@ -14051,6 +14308,13 @@ CREATE TABLE public.lease_document_signers (
 --
 
 COMMENT ON COLUMN public.lease_document_signers.reminder_count IS 'S639: how many signing reminders this signer has been sent. Capped so a document that is never signed stops mailing the person instead of nudging forever.';
+
+
+--
+-- Name: COLUMN lease_document_signers.invite_resend_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.lease_document_signers.invite_resend_count IS 'How many times the 48-hour timeout path has re-sent this signer their signing request. Capped (see processEsignTimeouts) so a document nobody signs stops emailing rather than asking forever.';
 
 
 --
@@ -15665,7 +15929,7 @@ CREATE TABLE public.payments (
     work_trade_settlement_id uuid,
     space_carryforward_id uuid,
     CONSTRAINT payments_deposit_collected_by_check CHECK (((deposit_collected_by IS NULL) OR (deposit_collected_by = ANY (ARRAY['gam'::text, 'landlord'::text])))),
-    CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text, 'PROPANE'::text, 'RETURNFEE'::text, 'MANUALPAY'::text, 'HOMEPMT'::text, 'FCPAYDOWN'::text, 'DECLINEFEE'::text, 'BALANCE'::text, 'OTHERFEE'::text]))),
+    CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text, 'FLEXDEP'::text, 'PROPANE'::text, 'RETURNFEE'::text, 'MANUALPAY'::text, 'HOMEPMT'::text, 'FCPAYDOWN'::text, 'DECLINEFEE'::text, 'BALANCE'::text, 'OTHERFEE'::text]))),
     CONSTRAINT payments_gam_supersedence_amount_nonneg CHECK ((gam_supersedence_amount >= (0)::numeric)),
     CONSTRAINT payments_issued_credit_amount_nonneg CHECK ((issued_credit_amount >= (0)::numeric)),
     CONSTRAINT payments_manual_method_check CHECK (((manual_method IS NULL) OR (manual_method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text, 'bank_deposit'::text, 'prior_arrangement'::text])))),
@@ -17814,6 +18078,9 @@ CREATE TABLE public.properties (
     late_fee_cap_amount numeric(10,2),
     late_fee_cap_type text,
     accepts_checks boolean DEFAULT true NOT NULL,
+    home_payments_own_bill boolean DEFAULT true NOT NULL,
+    credit_save_up_allowed boolean DEFAULT true NOT NULL,
+    print_all_bills boolean DEFAULT false NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_card_fee_payer_check CHECK ((booking_card_fee_payer = ANY (ARRAY['customer'::text, 'landlord'::text]))),
     CONSTRAINT properties_booking_deposit_pct_steps CHECK ((booking_deposit_pct = ANY (ARRAY[(5)::numeric, (10)::numeric, (15)::numeric, (20)::numeric]))),
@@ -17990,6 +18257,34 @@ COMMENT ON COLUMN public.properties.late_fee_initial_amount IS '10/19 (Nic): no 
 --
 
 COMMENT ON COLUMN public.properties.accepts_checks IS '10/23 (Nic): "that needs to be turned on or off if a property chooses to accept checks. A lot of places don''t accept them." Defaults TRUE because every property already takes a check on an invoice.';
+
+
+--
+-- Name: COLUMN properties.home_payments_own_bill; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.home_payments_own_bill IS 'TRUE (default): an installment (home/trailer) payment is billed on the
+   contract''s own bill, paid separately from the space rent. FALSE: it rides
+   the buyer''s rent bill for that month, when there is one. A buyer with no
+   rent bill for the month is billed on their own bill either way.';
+
+
+--
+-- Name: COLUMN properties.credit_save_up_allowed; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.credit_save_up_allowed IS 'FALSE: the pay screen never offers "Save it for later" — account credit goes
+   on the bill being paid and the tenant pays the rest (Nic, 10/26). Credit
+   already auto-applies to an open balance on every property regardless of this
+   (10/15); this governs only the payer''s option to hold it back. An
+   overpayment surplus is still banked and applied at the next bill run.';
+
+
+--
+-- Name: COLUMN properties.print_all_bills; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.print_all_bills IS 'Landlord prints every bill regardless of each resident''s preference (10/26, Nic: "maybe there''s a quick toggle for landlords that are just like, I''m going to print them all anyway").';
 
 
 --
@@ -19028,6 +19323,7 @@ CREATE TABLE public.security_deposits (
     custody_fee_active boolean DEFAULT true NOT NULL,
     voided_at timestamp with time zone,
     void_reason text,
+    flex_deposit_service_fee numeric(10,2),
     CONSTRAINT security_deposits_held_by_check CHECK ((held_by = ANY (ARRAY['gam_escrow'::text, 'landlord'::text]))),
     CONSTRAINT security_deposits_no_acceleration_chk CHECK (((balance_due_full_at IS NULL) AND (balance_due_total IS NULL))),
     CONSTRAINT security_deposits_no_advance_chk CHECK (((gam_advance_amount IS NULL) OR (gam_advance_amount = (0)::numeric))),
@@ -19078,6 +19374,13 @@ COMMENT ON COLUMN public.security_deposits.voided_at IS '10/12 (G8): when this d
 --
 
 COMMENT ON COLUMN public.security_deposits.void_reason IS '10/12 (G8): why the deposit record was voided, in plain words.';
+
+
+--
+-- Name: COLUMN security_deposits.flex_deposit_service_fee; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.security_deposits.flex_deposit_service_fee IS 'GAM''s one-time FlexDeposit service fee for this plan, from flexdeposit_fee_schedule at enrollment, collected in full with installment 1 (10/26, Nic). NOT part of collected_amount and never returned to the tenant at move-out. NULL = no FlexDeposit plan, or a plan predating this column.';
 
 
 --
@@ -20195,7 +20498,7 @@ CREATE TABLE public.system_features (
 CREATE TABLE public.tenant_autopay (
     id uuid DEFAULT public.gen_random_uuid() NOT NULL,
     tenant_id uuid NOT NULL,
-    lease_id uuid NOT NULL,
+    lease_id uuid,
     enabled boolean DEFAULT true NOT NULL,
     pull_day integer,
     payment_method_id text,
@@ -20208,6 +20511,8 @@ CREATE TABLE public.tenant_autopay (
     disarmed_reason text,
     last_success_cycle date,
     use_credit boolean DEFAULT false NOT NULL,
+    home_sale_contract_id uuid,
+    CONSTRAINT tenant_autopay_one_owner CHECK (((lease_id IS NOT NULL) <> (home_sale_contract_id IS NOT NULL))),
     CONSTRAINT tenant_autopay_pull_day_check CHECK (((pull_day IS NULL) OR ((pull_day >= 1) AND (pull_day <= 28))))
 );
 
@@ -20252,6 +20557,15 @@ COMMENT ON COLUMN public.tenant_autopay.disarmed_reason IS 'S609: why autopay st
 --
 
 COMMENT ON COLUMN public.tenant_autopay.use_credit IS 'S655 (Nic): "use my account credit first". Off by default: autopay charges the whole bill and the credit waits for the tenant. Tenant-only, like the rest of this table.';
+
+
+--
+-- Name: COLUMN tenant_autopay.home_sale_contract_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenant_autopay.home_sale_contract_id IS 'The installment (home/trailer) sale this enrollment pays. Exactly one of
+   lease_id / home_sale_contract_id is set: enrolling rent never enrolls the
+   trailer payment, and the other way round (Nic, 10/25).';
 
 
 --
@@ -20441,6 +20755,29 @@ CREATE TABLE public.tenant_identifications (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT tenant_identifications_id_type_check CHECK ((id_type = ANY (ARRAY['drivers_license'::text, 'state_id'::text, 'passport'::text, 'military_id'::text, 'tribal_id'::text, 'permanent_resident_card'::text, 'other'::text])))
 );
+
+
+--
+-- Name: tenant_income_documents; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_income_documents (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tenant_id uuid NOT NULL,
+    url text NOT NULL,
+    filename text NOT NULL,
+    uploaded_at timestamp with time zone DEFAULT now() NOT NULL,
+    removed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE tenant_income_documents; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.tenant_income_documents IS 'Proof of income a resident attached in the tenant portal (10/26, Nic). Not a gate on anything; soft-deleted, never erased.';
 
 
 --
@@ -20855,6 +21192,11 @@ CREATE TABLE public.tenants (
     bank_verify_nudge_count integer DEFAULT 0 NOT NULL,
     bank_pending_since timestamp with time zone,
     ach_suspended_at timestamp with time zone,
+    fixed_income_self_reported boolean,
+    fixed_income_asked_at timestamp with time zone,
+    fixed_income_answered_at timestamp with time zone,
+    prefers_paper_bill boolean,
+    paper_bill_asked_at timestamp with time zone,
     CONSTRAINT tenants_background_check_status_check CHECK ((background_check_status = ANY (ARRAY['not_started'::text, 'submitted'::text, 'approved'::text, 'denied'::text, 'cancelled'::text, 'expired'::text, 'waived'::text]))),
     CONSTRAINT tenants_flexpay_pull_day_check CHECK (((flexpay_pull_day IS NULL) OR ((flexpay_pull_day >= 1) AND (flexpay_pull_day <= 28)))),
     CONSTRAINT tenants_income_arrival_day_check CHECK (((income_arrival_day >= 1) AND (income_arrival_day <= 28))),
@@ -20903,6 +21245,41 @@ COMMENT ON COLUMN public.tenants.bank_pending_since IS 'S655: a bank is waiting 
 --
 
 COMMENT ON COLUMN public.tenants.ach_suspended_at IS 'S655: NACHA zero-tolerance block, written by handle-return. Split out of ach_verified, which now only means "has a verified bank". chargeLeaseBalance refuses ACH while set.';
+
+
+--
+-- Name: COLUMN tenants.fixed_income_self_reported; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenants.fixed_income_self_reported IS 'What the resident said in the "Are you on fixed income?" banner. NULL = never answered. SELF-REPORTED ONLY — tenants.ssi_ssdi is the verified flag that gates FlexPay, and a tap here must never set it.';
+
+
+--
+-- Name: COLUMN tenants.fixed_income_asked_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenants.fixed_income_asked_at IS 'When the banner was last shown, so it is asked once and not every login.';
+
+
+--
+-- Name: COLUMN tenants.fixed_income_answered_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenants.fixed_income_answered_at IS 'When they answered either way. With a NULL answer and a non-NULL asked_at, they dismissed it.';
+
+
+--
+-- Name: COLUMN tenants.prefers_paper_bill; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenants.prefers_paper_bill IS 'Resident wants their bill on paper, hand delivered (10/26, Nic). NULL = never asked, which is NOT the same as no. Read by the bill-generation print queue (PAPER_BILLS_SPEC.md); never gates anything.';
+
+
+--
+-- Name: COLUMN tenants.paper_bill_asked_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tenants.paper_bill_asked_at IS 'When the preference was last asked, so onboarding can tell "no" from "not asked yet".';
 
 
 --
@@ -24011,6 +24388,22 @@ ALTER TABLE ONLY public.csv_import_attempts
 
 
 --
+-- Name: customer_profile_links customer_profile_links_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.customer_profile_links
+    ADD CONSTRAINT customer_profile_links_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: customer_profiles customer_profiles_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.customer_profiles
+    ADD CONSTRAINT customer_profiles_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: customer_push_subscriptions customer_push_subscriptions_endpoint_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24403,6 +24796,22 @@ ALTER TABLE ONLY public.flexcredit_inquiries
 
 
 --
+-- Name: flexdeposit_capacity flexdeposit_capacity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexdeposit_capacity
+    ADD CONSTRAINT flexdeposit_capacity_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: flexdeposit_fee_schedule flexdeposit_fee_schedule_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexdeposit_fee_schedule
+    ADD CONSTRAINT flexdeposit_fee_schedule_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: flexpay_advances flexpay_advances_cycle_tenant_uniq; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -24424,6 +24833,14 @@ ALTER TABLE ONLY public.flexpay_advances
 
 ALTER TABLE ONLY public.flexpay_blocked_states
     ADD CONSTRAINT flexpay_blocked_states_pkey PRIMARY KEY (state);
+
+
+--
+-- Name: flexpay_fee_schedule flexpay_fee_schedule_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_fee_schedule
+    ADD CONSTRAINT flexpay_fee_schedule_pkey PRIMARY KEY (id);
 
 
 --
@@ -26584,6 +27001,14 @@ ALTER TABLE ONLY public.tenant_declared_deposits
 
 ALTER TABLE ONLY public.tenant_identifications
     ADD CONSTRAINT tenant_identifications_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tenant_income_documents tenant_income_documents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_income_documents
+    ADD CONSTRAINT tenant_income_documents_pkey PRIMARY KEY (id);
 
 
 --
@@ -28750,6 +29175,34 @@ CREATE INDEX idx_csv_import_attempts_platform_committed ON public.csv_import_att
 
 
 --
+-- Name: idx_customer_profile_links_profile; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_customer_profile_links_profile ON public.customer_profile_links USING btree (profile_id);
+
+
+--
+-- Name: idx_customer_profiles_email; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_customer_profiles_email ON public.customer_profiles USING btree (lower(email)) WHERE (email IS NOT NULL);
+
+
+--
+-- Name: idx_customer_profiles_name; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_customer_profiles_name ON public.customer_profiles USING btree (lower(last_name), lower(first_name));
+
+
+--
+-- Name: idx_customer_profiles_phone; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_customer_profiles_phone ON public.customer_profiles USING btree (phone) WHERE (phone IS NOT NULL);
+
+
+--
 -- Name: idx_customer_push_subs_customer; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -29293,6 +29746,13 @@ CREATE INDEX idx_home_sale_contracts_unit ON public.home_sale_contracts USING bt
 --
 
 CREATE INDEX idx_home_sale_installments_contract ON public.home_sale_installments USING btree (contract_id);
+
+
+--
+-- Name: idx_home_sale_installments_to_remind; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_home_sale_installments_to_remind ON public.home_sale_installments USING btree (billing_month) WHERE ((payment_id IS NULL) AND (settled_off_platform_at IS NULL) AND (reminded_at IS NULL));
 
 
 --
@@ -31361,6 +31821,13 @@ CREATE INDEX idx_tenant_identifications_tenant ON public.tenant_identifications 
 
 
 --
+-- Name: idx_tenant_income_documents_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_income_documents_tenant ON public.tenant_income_documents USING btree (tenant_id) WHERE (removed_at IS NULL);
+
+
+--
 -- Name: idx_tenant_left_owing_email; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -33251,6 +33718,13 @@ CREATE UNIQUE INDEX suspended_utility_one_per_meter_unit_cycle ON public.suspend
 
 
 --
+-- Name: tenant_autopay_one_per_home_sale; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX tenant_autopay_one_per_home_sale ON public.tenant_autopay USING btree (home_sale_contract_id) WHERE (home_sale_contract_id IS NOT NULL);
+
+
+--
 -- Name: tenant_roster_drafts_live_email_key; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -33482,6 +33956,13 @@ CREATE UNIQUE INDEX ux_cpsl_live_unit ON public.cross_property_service_links USI
 
 
 --
+-- Name: ux_customer_profile_links_ref; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_customer_profile_links_ref ON public.customer_profile_links USING btree (kind, ref_id);
+
+
+--
 -- Name: ux_document_packages_default; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -33503,6 +33984,20 @@ CREATE UNIQUE INDEX ux_early_departure_wash_per_lease ON public.early_departure_
 
 
 --
+-- Name: ux_flexdeposit_fee_bracket; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_flexdeposit_fee_bracket ON public.flexdeposit_fee_schedule USING btree (deposit_min, payments, effective_from);
+
+
+--
+-- Name: ux_flexpay_fee_bracket; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_flexpay_fee_bracket ON public.flexpay_fee_schedule USING btree (rent_min, benefit_wednesday, effective_from);
+
+
+--
 -- Name: ux_home_ownership_active_per_unit; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -33514,6 +34009,13 @@ CREATE UNIQUE INDEX ux_home_ownership_active_per_unit ON public.home_ownerships 
 --
 
 CREATE UNIQUE INDEX ux_home_sale_active_per_unit ON public.home_sale_contracts USING btree (unit_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: ux_invoices_home_sale_contract_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_invoices_home_sale_contract_cycle ON public.invoices USING btree (home_sale_contract_id, due_date) WHERE (home_sale_contract_id IS NOT NULL);
 
 
 --
@@ -33773,6 +34275,13 @@ CREATE UNIQUE INDEX ux_tenant_declared_deposits_receipt_photo_url ON public.tena
 --
 
 CREATE UNIQUE INDEX ux_tenant_declared_deposits_recorded_remittance ON public.tenant_declared_deposits USING btree (recorded_remittance_id) WHERE (recorded_remittance_id IS NOT NULL);
+
+
+--
+-- Name: ux_tenant_income_documents_url; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_tenant_income_documents_url ON public.tenant_income_documents USING btree (url);
 
 
 --
@@ -39727,6 +40236,38 @@ ALTER TABLE ONLY public.csv_import_attempts
 
 
 --
+-- Name: customer_profile_links customer_profile_links_confirmed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.customer_profile_links
+    ADD CONSTRAINT customer_profile_links_confirmed_by_fkey FOREIGN KEY (confirmed_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: customer_profile_links customer_profile_links_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.customer_profile_links
+    ADD CONSTRAINT customer_profile_links_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: customer_profile_links customer_profile_links_profile_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.customer_profile_links
+    ADD CONSTRAINT customer_profile_links_profile_id_fkey FOREIGN KEY (profile_id) REFERENCES public.customer_profiles(id) ON DELETE CASCADE;
+
+
+--
+-- Name: customer_profiles customer_profiles_points_changed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.customer_profiles
+    ADD CONSTRAINT customer_profiles_points_changed_by_fkey FOREIGN KEY (points_changed_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
 -- Name: customer_push_subscriptions customer_push_subscriptions_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -40399,6 +40940,14 @@ ALTER TABLE ONLY public.flexcredit_inquiries
 
 
 --
+-- Name: flexdeposit_capacity flexdeposit_capacity_updated_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexdeposit_capacity
+    ADD CONSTRAINT flexdeposit_capacity_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id);
+
+
+--
 -- Name: flexpay_advances flexpay_advances_fee_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -40716,6 +41265,14 @@ ALTER TABLE ONLY public.invitations
 
 ALTER TABLE ONLY public.invoice_sequences
     ADD CONSTRAINT invoice_sequences_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: invoices invoices_home_sale_contract_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invoices
+    ADD CONSTRAINT invoices_home_sale_contract_id_fkey FOREIGN KEY (home_sale_contract_id) REFERENCES public.home_sale_contracts(id) ON DELETE SET NULL;
 
 
 --
@@ -45103,6 +45660,14 @@ ALTER TABLE ONLY public.system_features
 
 
 --
+-- Name: tenant_autopay tenant_autopay_home_sale_contract_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_autopay
+    ADD CONSTRAINT tenant_autopay_home_sale_contract_id_fkey FOREIGN KEY (home_sale_contract_id) REFERENCES public.home_sale_contracts(id) ON DELETE CASCADE;
+
+
+--
 -- Name: tenant_autopay tenant_autopay_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -45260,6 +45825,14 @@ ALTER TABLE ONLY public.tenant_identifications
 
 ALTER TABLE ONLY public.tenant_identifications
     ADD CONSTRAINT tenant_identifications_verified_by_fkey FOREIGN KEY (verified_by) REFERENCES public.users(id);
+
+
+--
+-- Name: tenant_income_documents tenant_income_documents_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_income_documents
+    ADD CONSTRAINT tenant_income_documents_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
 
 
 --
@@ -46779,5 +47352,5 @@ CREATE EVENT TRIGGER ledger_ddl_guard ON ddl_command_end
 -- PostgreSQL database dump complete
 --
 
-\unrestrict WYjBK9vsOuOYlXu9914bdU6OZwtS2gPvhexyXwog0djRjrNjBYIpbStHhbvCfvQ
+\unrestrict AdmXSbRylCabUCEKDxeePmx86dbeW2bTZZaIQ6HcciQJczqK08M1kwQAJOzEXTT
 

@@ -79,10 +79,20 @@ async function waitingSale(o: { landlordSigned?: boolean } = {}) {
   }, true)
 }
 
+/**
+ * 10/25 (Nic): the home payment is on the SALE's own bill now, never the rent
+ * bill ("should trailer payments get their own invoice separately payable from
+ * lot rent? Yeah, let's do that"). `homeLines` reads the sale's bill; `bill`
+ * stays the rent bill, which the start must leave untouched.
+ */
 const state = async (contractId: string, invoiceId: string) => ({
   contract: await queryOne<any>(`SELECT status, installments_billed, installments_paid FROM home_sale_contracts WHERE id = $1`, [contractId]),
   installments: (await queryOne<any>(`SELECT COUNT(*)::int AS n FROM home_sale_installments WHERE contract_id = $1`, [contractId]))!.n,
-  homeLines: await query<any>(`SELECT amount::float AS amount, notes FROM payments WHERE invoice_id = $1 AND type = 'home_payment'`, [invoiceId]),
+  homeLines: await query<any>(
+    `SELECT p.amount::float AS amount, p.notes FROM payments p
+       JOIN invoices i ON i.id = p.invoice_id
+      WHERE i.home_sale_contract_id = $1 AND p.type = 'home_payment'
+      ORDER BY p.notes`, [contractId]),
   bill: await queryOne<any>(`SELECT total_amount::float AS total, subtotal_home_payments::float AS home FROM invoices WHERE id = $1`, [invoiceId]),
 })
 
@@ -97,11 +107,17 @@ describe('oct12_activate_landlord_signed_home_sales', () => {
     expect(r.started[0]).toMatchObject({
       contractId: s.contractId, property: 'Country Acres', unit: 'MH 18',
       installmentsCreated: 60, stampedOffPlatform: 2,
-      attached: [{ installmentNumber: 3, amount: 100, invoiceId: s.invoiceId, dueDate: s.thisMonth, invoiceNumber: 'INV-2026-00024' }],
     })
+    // 10/25: a bill of the sale's own, not the rent bill it used to join.
+    expect(r.started[0].attached).toHaveLength(1)
+    expect(r.started[0].attached[0]).toMatchObject({
+      installmentNumber: 3, amount: 100, dueDate: s.thisMonth,
+    })
+    expect(r.started[0].attached[0].invoiceId).not.toBe(s.invoiceId)
+    const billNumber = r.started[0].attached[0].invoiceNumber
     const printed: string[] = []
     printStartReport(r, l => printed.push(l))
-    expect(printed.join('\n')).toContain('home payment 3 $100.00 → bill INV-2026-00024')
+    expect(printed.join('\n')).toContain(`home payment 3 $100.00 → bill ${billNumber}`)
 
     expect(await state(s.contractId, s.invoiceId)).toEqual(before)
     expect(before).toMatchObject({ contract: { status: 'pending_signature' }, installments: 0, homeLines: [], bill: { total: 466.5, home: 0 } })
@@ -115,7 +131,8 @@ describe('oct12_activate_landlord_signed_home_sales', () => {
       contract: { status: 'active', installments_billed: 3, installments_paid: 2 },
       installments: 60,
       homeLines: [{ amount: 100, notes: 'Home payment 3 of 60' }],
-      bill: { total: 566.5, home: 100 },
+      // The rent bill never moved.
+      bill: { total: 466.5, home: 0 },
     })
     const again = await tx(c => activateLandlordSignedHomeSales(c), true)
     expect(again).toEqual({ started: [], skipped: [] })

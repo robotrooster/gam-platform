@@ -22,7 +22,7 @@ import { chargeLeaseBalance, chargeLeaseBalanceSchema, resolveTargetLease,
 import { releaseUnconfirmedCardCharges, releaseUnconfirmedChargeDetailed, CARD_RELEASE_NOTE,
          confirmedOnScreen, heldForCardholder } from '../jobs/paymentReconcile'
 import { getClient } from '../db'
-import { payableRowSql, lockHousehold } from '../services/moneyPredicates'
+import { payableRowSql, lockHousehold, notOnHomeSaleBillSql } from '../services/moneyPredicates'
 import { settleManualRentPayment, deskQuote, backdatedLateFeesPreview, tenantsDepositAtBank, pickRefusal, DESK_SURPLUS_HANDLING, DESK_SURPLUS_HANDLING_LABEL } from '../services/manualPaymentSettle'
 import { canDeleteLateFees, deleteLateFee, LATE_FEE_DELETE_NOT_ALLOWED } from '../services/lateFeeDelete'
 import { runWholeBillCheckAfterCommit, supersedeScheduledRetry, cancelSupersededIntents,
@@ -142,6 +142,8 @@ paymentsRouter.post('/quote', async (req, res, next) => {
       method:  z.enum(['ach', 'card']),
       leaseId: z.string().uuid().optional(),
       serviceAgreementId: z.string().uuid().optional(),
+      // 10/25 (Nic): a trailer payment's own bill, quoted and paid by itself.
+      homeSaleContractId: z.string().uuid().optional(),
       useCredit: z.boolean().optional(),
       // "Pay all" with "Use all": the leases this run charges before this one,
       // in order (balance-context payAll.order). The quote is this lease's
@@ -154,7 +156,8 @@ paymentsRouter.post('/quote', async (req, res, next) => {
       runLeaseIds: z.array(z.string().uuid()).min(1).max(50).optional(),
     }).parse(req.body)
 
-    if (req.user!.role === 'tenant' && body.runLeaseIds && !body.leaseId && !body.serviceAgreementId && body.amount == null) {
+    if (req.user!.role === 'tenant' && body.runLeaseIds && !body.leaseId && !body.serviceAgreementId
+        && !body.homeSaleContractId && body.amount == null) {
       const tenantId = req.user!.profileId as string
       const client = await getClient()
       try {
@@ -177,6 +180,12 @@ paymentsRouter.post('/quote', async (req, res, next) => {
           `SELECT id FROM utility_service_agreements WHERE id = $1 AND tenant_id = $2 AND status = 'active'`,
           [body.serviceAgreementId, tenantId])
         if (!owns) throw new AppError(404, 'Service agreement not found')
+      } else if (body.homeSaleContractId) {
+        // The buyer's own contract only — a trailer bill is nobody else's to quote.
+        const owns = await queryOne<{ id: string }>(
+          `SELECT id FROM home_sale_contracts WHERE id = $1 AND tenant_id = $2 AND status = 'active'`,
+          [body.homeSaleContractId, tenantId])
+        if (!owns) throw new AppError(404, 'Home sale not found')
       } else {
         leaseId = await resolveTargetLease(tenantId, body.leaseId ?? null).catch((e) => {
           // Nothing owed: fall through to the plain fee on the amount asked.
@@ -184,9 +193,11 @@ paymentsRouter.post('/quote', async (req, res, next) => {
           throw e
         })
       }
-      if (leaseId || body.serviceAgreementId) {
+      if (leaseId || body.serviceAgreementId || body.homeSaleContractId) {
         const q = await quoteLeaseCharge({
-          tenantId, leaseId, serviceAgreementId: leaseId ? undefined : body.serviceAgreementId,
+          tenantId, leaseId,
+          serviceAgreementId: leaseId ? undefined : body.serviceAgreementId,
+          homeSaleContractId: leaseId ? undefined : body.homeSaleContractId,
           useCredit: body.useCredit === true, paymentMethodType: body.method,
           afterLeaseIds: leaseId ? body.afterLeaseIds : undefined,
         })
@@ -210,6 +221,7 @@ paymentsRouter.post('/quote', async (req, res, next) => {
           intlCardSurcharge: body.method === 'card',
           leaseId: leaseId ?? null,
           serviceAgreementId: leaseId ? null : body.serviceAgreementId ?? null,
+          homeSaleContractId: leaseId ? null : body.homeSaleContractId ?? null,
           // The whole bill now, before any credit.
           outstanding: Math.round((q.requiredTotal + q.carriedTotal) * 100) / 100,
           requiredNow: Math.round(saved * 100) / 100,
@@ -221,6 +233,9 @@ paymentsRouter.post('/quote', async (req, res, next) => {
           creditUsed: q.landing.creditUsedCents / 100,
           payIfUsed: Math.round((saved - usable) * 100) / 100,
           payIfSaved: Math.round(saved * 100) / 100,
+          // 10/26 (Nic): this property does not allow saving credit up, so
+          // there is no choice to offer — the credit goes on the bill.
+          creditMustBeUsed: usable > 0 && !q.ctx.creditSaveUpAllowed,
           coversWholeBill: q.coversWholeBill,
           // Credit another bank payment still holds, and why, in plain words:
           // why only part of the credit on file can pay this bill.
@@ -1003,6 +1018,11 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
                OR EXISTS (SELECT 1 FROM lease_tenants lt
                            WHERE lt.lease_id = COALESCE(p.lease_id, inv.lease_id) AND lt.tenant_id = $1
                              AND lt.status IN ('active','pending_add','pending_remove')))
+          -- 10/25: a trailer payment is its own bill. Its row still carries the
+          -- buyer's lease_id (the books read it), so without this the lease
+          -- would be planned for a bill it does not own and drawn with nothing
+          -- on it. It is listed under homeContracts below instead.
+          AND ${notOnHomeSaleBillSql('p')}
           AND (${payableRowSql('p')} OR p.status = 'processing')`,
       [tenantId])).rows.map(r => r.lease_id)
 
@@ -1062,6 +1082,9 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
         creditOnFile: plan.creditOnFile,
         payIfUsed: plan.usableCredit > 0 ? payIfUsed : payIfSaved,
         payIfSaved,
+        // 10/26 (Nic): where the property does not allow saving credit up the
+        // pay screen asks nothing — it says the credit is going on the bill.
+        creditMustBeUsed: plan.usableCredit > 0 && !plan.ctx.creditSaveUpAllowed,
         coversWholeBill: plan.coversWholeBill,
         // 10/4: credit another bank payment still holds (an earlier bill's
         // scheduled retry) — left alone, the rest of the bill charged — and the
@@ -1126,6 +1149,7 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
           usableCredit: plan.usableCredit,
           expectedCredit: plan.usableCredit,
           payIfUsed: plan.usableCredit > 0 ? r2(l.payIfSaved - plan.usableCredit) : l.payIfSaved,
+          creditMustBeUsed: plan.usableCredit > 0 && !plan.ctx.creditSaveUpAllowed,
           coversWholeBill: plan.coversWholeBill,
           creditWaiting: plan.creditStillHeldElsewhere,
           creditWaitingNote: plan.creditWaitingNote,
@@ -1185,19 +1209,90 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
       })
     }
 
+    // ── 10/25 (Nic): THE TRAILER PAYMENT'S OWN BILL ─────────────────────────
+    //
+    //   "Should trailer payments get their own invoice separately payable from
+    //    lot rent? Yeah, let's do that, and they need to be clearly labeled —
+    //    I've had some people literally try to say, oh, I paid my rent, and
+    //    then it's like, no, that was the trailer payment, you have the space
+    //    rent too."
+    //
+    // One card per installment sale, beside the lease's and the utility
+    // agreement's, with its own Pay Now. It says what it is and what is left on
+    // the contract, so nobody can mistake it for rent or think paying it
+    // covered the space. Never late-fee'd (the bill is written exempt — a
+    // purchase agreement carries no late-fee terms), and credit never pays it
+    // (HOMEPMT is credit-ineligible), so there is no credit prompt here.
+    const homeRows = (await client.query<any>(
+      `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type, p.notes,
+              p.entry_description, u.unit_number, pr.name AS property_name,
+              inv.home_sale_contract_id, inv.invoice_number,
+              c.installments_total, c.installments_paid, c.monthly_payment::float AS monthly_payment,
+              -- 10/25 (Nic): this bill takes no card when the contract says so,
+              -- and autopay on it is its own decision, never the rent's.
+              c.card_payments_blocked,
+              COALESCE(ap.enabled, FALSE) AS autopay_on,
+              ap.pull_day AS autopay_pull_day
+         FROM payments p
+         JOIN invoices inv ON inv.id = p.invoice_id
+         JOIN home_sale_contracts c ON c.id = inv.home_sale_contract_id
+         LEFT JOIN tenant_autopay ap ON ap.home_sale_contract_id = c.id AND ap.tenant_id = $1
+         JOIN units u ON u.id = p.unit_id
+         JOIN properties pr ON pr.id = u.property_id
+        WHERE p.tenant_id = $1 AND inv.home_sale_contract_id IS NOT NULL
+          AND ${payableRowSql('p')}
+        ORDER BY p.due_date ASC, p.created_at ASC, p.id`,
+      [tenantId])).rows
+    const byContract = new Map<string, any>()
+    for (const r of homeRows) {
+      let g = byContract.get(r.home_sale_contract_id)
+      if (!g) {
+        g = {
+          homeSaleContractId: r.home_sale_contract_id,
+          unitNumber: r.unit_number, propertyName: r.property_name,
+          dueDate: r.due_date, outstanding: 0, rows: [],
+          installmentsTotal: r.installments_total,
+          installmentsPaid: r.installments_paid,
+          monthlyPayment: r.monthly_payment,
+          cardsBlocked: r.card_payments_blocked === true,
+          autopayOn: r.autopay_on === true,
+          autopayPullDay: r.autopay_pull_day ?? null,
+        }
+        byContract.set(r.home_sale_contract_id, g)
+      }
+      g.outstanding = r2(g.outstanding + r.amount)
+      if (r.due_date < g.dueDate) g.dueDate = r.due_date
+      g.rows.push({ id: r.id, amount: r.amount, dueDate: r.due_date, type: r.type,
+                    notes: r.notes, label: chargeLabel(r) })
+    }
+    // Priced exactly as /pay-balance charges this bill — its property's fee
+    // payer, any tenant-payer platform fee on top — the same as a lease's.
+    const homeContracts: any[] = []
+    for (const h of byContract.values()) {
+      const plan = await planLeaseCharge(client, { tenantId, scope: { kind: 'home_sale', homeSaleContractId: h.homeSaleContractId } })
+      homeContracts.push({
+        // plan.ctx already carries the contract's card rule, so a blocked bill
+        // never quotes a card here either.
+        ...h, methodCosts: billMethodCosts(plan.ctx, h.outstanding, await tenantPassthroughFor(plan.ctx.propertyId, client)),
+        awaitingConfirmation: awaiting.filter(x => x.homeSaleContractId === h.homeSaleContractId).map(awaitingView),
+      })
+    }
+
     res.json({ success: true, data: {
       totalOutstanding: r2(leases.reduce((s, l) => s + l.outstanding, 0)
-        + serviceAgreements.reduce((s, a) => s + a.outstanding, 0)),
+        + serviceAgreements.reduce((s, a) => s + a.outstanding, 0)
+        + homeContracts.reduce((s, h) => s + h.outstanding, 0)),
       // Legacy scalar: blocked only if EVERY lease is (leases[].paymentBlocked is the real signal).
       paymentBlocked: leases.length ? leases.every(l => l.paymentBlocked) : false,
       leases,
       serviceAgreements,
+      homeContracts,
       // decisions.md #48.4: every held card payment in one list, for the
       // Payments page — a bill whose whole amount is held shows nothing owed,
       // so its lease card (and the pay window) is not drawn; this is where the
       // page offers Confirm / Cancel for it.
       awaitingCardConfirmations: awaiting.map(awaitingView),
-      rows: [...allRows, ...serviceRows],
+      rows: [...allRows, ...serviceRows, ...homeRows],
     } })
   } catch (e) { next(e) } finally { client.release() }
 })
@@ -1345,6 +1440,38 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
       const result = await chargeLeaseBalance({
         tenantId,
         serviceAgreementId: body.serviceAgreementId,
+        amount:            body.amount,
+        paymentMethodId:   body.paymentMethodId,
+        paymentMethodType: body.paymentMethodType,
+        source:            'portal',
+        credit:            creditChoice,
+        idempotencyKey:    body.idempotencyKey ?? null,
+        confirmOnScreen:   body.confirmOnScreen === true,
+      })
+      return res.json({ success: true, data: result })
+    }
+
+    // 10/25 (Nic): A TRAILER PAYMENT IS PAID BY ITSELF.
+    //
+    //   "Should trailer payments get their own invoice separately payable from
+    //    lot rent? Yeah, let's do that."
+    //
+    // The installment sale's own bill, settled in one charge like a lease's.
+    // Ownership is checked against the contract: a buyer may have no lease
+    // here at all (the investor who owns homes in parks he does not own), and
+    // a buyer who does have one must still be able to pay this bill without
+    // paying the space rent — Lisa Scheeler is on work trade and gets no rent
+    // bill, and Dominic Gonzalez's trailer money is the trust's while his
+    // space rent is the park's.
+    if (body.homeSaleContractId) {
+      const owns = await queryOne<{ id: string }>(
+        `SELECT id FROM home_sale_contracts
+          WHERE id = $1 AND tenant_id = $2 AND status = 'active'`,
+        [body.homeSaleContractId, tenantId])
+      if (!owns) throw new AppError(404, 'Home sale not found')
+      const result = await chargeLeaseBalance({
+        tenantId,
+        homeSaleContractId: body.homeSaleContractId,
         amount:            body.amount,
         paymentMethodId:   body.paymentMethodId,
         paymentMethodType: body.paymentMethodType,
@@ -1505,6 +1632,8 @@ interface AwaitingCardConfirmationRow {
   leaseId: string | null
   /** The service agreement whose bill it holds (a payer with no lease); null on a lease. */
   serviceAgreementId: string | null
+  /** 10/25: the installment (home/trailer) sale whose own bill it holds; null otherwise. */
+  homeSaleContractId: string | null
   amount: number
   heldOnLease: number
   confirmBy: string
@@ -1532,12 +1661,19 @@ async function awaitingCardConfirmations(
 ): Promise<AwaitingCardConfirmationRow[]> {
   const pending = (await client.query<{
     pi: string; created_at: string; gross: string; lease_id: string | null; agreement_id: string | null
+    home_contract_id: string | null
     held: string; payer_id: string; first_name: string | null; last_name: string | null
     remittance_id: string; landlord_id: string; tz: string | null
   }>(
     `SELECT r.stripe_payment_intent_id AS pi, r.created_at, r.id AS remittance_id, r.landlord_id,
             COALESCE(r.gross_amount, r.amount)::text AS gross,
-            COALESCE(p.lease_id, inv.lease_id) AS lease_id, inv.service_agreement_id AS agreement_id,
+            -- 10/25: a charge on an installment sale's own bill carries the
+            -- buyer's lease_id too (the books read it), so the contract has to
+            -- win here or the hold would be shown on the lease's card.
+            CASE WHEN inv.home_sale_contract_id IS NULL
+                 THEN COALESCE(p.lease_id, inv.lease_id) END AS lease_id,
+            inv.service_agreement_id AS agreement_id,
+            inv.home_sale_contract_id AS home_contract_id,
             SUM(p.amount)::text AS held, r.tenant_id AS payer_id, u.first_name, u.last_name,
             MIN(pr.timezone) AS tz
        FROM tenant_remittances r
@@ -1553,7 +1689,7 @@ async function awaitingCardConfirmations(
              OR EXISTS (SELECT 1 FROM lease_tenants lt
                          WHERE lt.lease_id = COALESCE(p.lease_id, inv.lease_id) AND lt.tenant_id = $1
                            AND lt.status IN ('active','pending_add','pending_remove')))
-      GROUP BY r.stripe_payment_intent_id, r.created_at, r.id, r.landlord_id, 5, 6, 7, r.tenant_id, u.first_name, u.last_name`,
+      GROUP BY r.stripe_payment_intent_id, r.created_at, r.id, r.landlord_id, 5, 6, 7, 8, r.tenant_id, u.first_name, u.last_name`,
     [tenantId])).rows
   if (pending.length === 0) return []
   const out: AwaitingCardConfirmationRow[] = []
@@ -1572,7 +1708,7 @@ async function awaitingCardConfirmations(
     // shown as waiting on the tenant's bank, nor offered to cancel.
     if (!heldForCardholder(pi)) continue
     const st = pi!.status
-    if (!r.lease_id && !r.agreement_id) continue
+    if (!r.lease_id && !r.agreement_id && !r.home_contract_id) continue
     const mine = r.payer_id === tenantId
     out.push({
       paymentIntentId: r.pi,
@@ -1580,6 +1716,7 @@ async function awaitingCardConfirmations(
       landlordId: r.landlord_id,
       leaseId: r.lease_id,
       serviceAgreementId: r.lease_id ? null : r.agreement_id,
+      homeSaleContractId: r.home_contract_id,
       amount: Math.round(Number(r.gross) * 100) / 100,
       heldOnLease: Math.round(Number(r.held) * 100) / 100,
       confirmBy: new Date(new Date(r.created_at).getTime() + CARD_CONFIRM_HOLD_MINUTES * 60_000).toISOString(),
@@ -1688,6 +1825,7 @@ function awaitingView(a: AwaitingCardConfirmationRow) {
     paymentIntentId: a.paymentIntentId, remittanceId: a.remittanceId, amount: a.amount, confirmBy: a.confirmBy,
     canConfirm: a.canConfirm, mine: a.mine, payerName: a.mine ? null : a.payerName,
     leaseId: a.leaseId, serviceAgreementId: a.serviceAgreementId,
+    homeSaleContractId: a.homeSaleContractId,
   }
 }
 
@@ -2222,6 +2360,10 @@ paymentsRouter.get('/:id/record-manual/quote', requirePerm('take_payment'), asyn
       // 10/5 (Nic): the property takes part payments — less than the bill may
       // be recorded (oldest bills first; what is left stays owed, late fees and all).
       partialPaymentsAllowed: q.partialAllowed,
+      // 10/26 (Nic): the landlord turned saving off everywhere this credit
+      // would land, so the window states where the credit is going instead of
+      // asking Use or Save.
+      creditMustBeUsed: q.creditMustBeUsed,
       // 10/5 (Nic): with ?depositedOn=, the late fees charged after that day
       // that come off when the deposit pays this bill in full (0: none).
       lateFeesOffIfPaidInFull,
@@ -2418,10 +2560,35 @@ function readerLineName(row: ChargeLabelRow): string {
   return line.length > 60 ? `${line.slice(0, 57)}…` : line
 }
 
+/**
+ * 10/25: WHICH BILL THE READER IS TAKING A CARD FOR. One definition, used by
+ * the quote and by the capture so they can never disagree.
+ *
+ * An installment (home/trailer) charge is on its own bill AND carries the
+ * buyer's lease, so the contract must be read first — the lease scope
+ * deliberately excludes it (moneyPredicates notOnHomeSaleBillSql), so scoping
+ * such a charge to the lease would charge the resident's RENT instead.
+ * Scoping it correctly also means the contract's own rules apply: a contract
+ * with cards blocked refuses here exactly as it does online, which is the whole
+ * point for an installment whose money belongs to another set of books.
+ */
+function readerScope(pmt: { lease_id: string | null; service_agreement_id: string | null; home_sale_contract_id: string | null }) {
+  if (pmt.home_sale_contract_id) return { homeSaleContractId: pmt.home_sale_contract_id }
+  if (pmt.lease_id) return { leaseId: pmt.lease_id }
+  return { serviceAgreementId: pmt.service_agreement_id ?? undefined }
+}
+
 async function readerAnchor(req: any, paymentId: string) {
   const pmt = await queryOne<any>(
     `SELECT p.id, p.landlord_id, p.tenant_id, p.lease_id, p.status, p.work_trade_suspended_at,
-            u.property_id, inv.service_agreement_id
+            u.property_id, inv.service_agreement_id,
+            -- 10/25: an installment (home/trailer) charge sits on its own bill
+            -- and ALSO carries the buyer's lease (the books read it), so the
+            -- contract has to win here. Without it the reader would charge the
+            -- LEASE's balance — which excludes this very charge — and take the
+            -- resident's rent money for a trailer payment nobody paid, or
+            -- refuse with "nothing outstanding" on a work-trade lease.
+            inv.home_sale_contract_id
        FROM payments p
        JOIN units u ON u.id = p.unit_id
        LEFT JOIN invoices inv ON inv.id = p.invoice_id
@@ -2625,8 +2792,7 @@ paymentsRouter.post('/reader/intents/:pi/resend', requirePerm('take_payment'), a
 async function readerQuote(pmt: any, choice: ReaderChoice = {}) {
   const run = (useCredit: boolean | undefined) => chargeLeaseBalance({
     tenantId: pmt.tenant_id,
-    leaseId: pmt.lease_id ?? undefined,
-    serviceAgreementId: pmt.lease_id ? undefined : (pmt.service_agreement_id ?? undefined),
+    ...readerScope(pmt),
     chargeEverything: true, dryRun: true,
     credit: useCredit == null ? null : { use: useCredit, expected: choice.expectedCredit ?? null },
     towardOldBalance: choice.towardOldBalance ?? null,
@@ -2652,13 +2818,19 @@ async function readerQuote(pmt: any, choice: ReaderChoice = {}) {
     total: x.chargeAmount,
   })
   // Before the desk answers, both prices — "Use $X: card $Y" / "Save: card $Z".
-  const both = q.usableCredit > 0 && choice.useCredit == null
+  // 10/26 (Nic): where the landlord turned saving off there is nothing to
+  // compare — the credit is on the bill either way, so showing "Use $X / Save"
+  // would offer a choice the server has already made (and both columns would
+  // print the same card total).
+  const both = q.usableCredit > 0 && choice.useCredit == null && !q.creditMustBeUsed
     ? { ifUsed: figures(await run(true)), ifSaved: figures(q) } : {}
   return {
     // The whole bill, before any credit.
     outstanding: q.outstanding,
     usableCredit: q.usableCredit,
-    needsCreditChoice: q.usableCredit > 0 && choice.useCredit == null,
+    needsCreditChoice: q.usableCredit > 0 && choice.useCredit == null && !q.creditMustBeUsed,
+    // 10/26: told so the reader block can STATE where the credit went.
+    creditMustBeUsed: q.creditMustBeUsed,
     useCredit: q.creditUsed > 0,
     creditUsed: q.creditUsed,
     creditApplied: q.creditUsed,
@@ -2758,8 +2930,7 @@ paymentsRouter.post('/reader/intents/:pi/capture', requirePerm('take_payment'), 
       const pmt = await readerAnchor(req, String(pi.metadata?.gam_anchor_payment_id))
       booked = await chargeLeaseBalance({
         tenantId: pmt.tenant_id,
-        leaseId: pmt.lease_id ?? undefined,
-        serviceAgreementId: pmt.lease_id ? undefined : (pmt.service_agreement_id ?? undefined),
+        ...readerScope(pmt),
         chargeEverything: true,
         credit: choice.useCredit == null ? null : { use: choice.useCredit, expected: choice.expectedCredit ?? null },
         towardOldBalance: choice.towardOldBalance ?? null,

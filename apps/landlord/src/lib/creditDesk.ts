@@ -516,6 +516,13 @@ export interface DeskQuote {
    * fees still apply). Absent or false: pay in full.
    */
   partialPaymentsAllowed?: boolean
+  /**
+   * 10/26 (Nic): the landlord turned "let residents save credit for later" OFF
+   * at every property this credit would pay on, so there is no Use/Save
+   * question — the credit goes on the bill and the window says where it went.
+   * Absent or false: ask, as before.
+   */
+  creditMustBeUsed?: boolean
   /** 10/5 (Nic): read with ?depositedOn= — late fees charged after that day, off this bill when the deposit pays it in full. */
   lateFeesOffIfPaidInFull?: number
   /** 10/5: the same, bill by bill — a bill the deposit pays only in part keeps its own. */
@@ -553,8 +560,27 @@ export function onboardingLateFeeBoxApplies(
 export type CreditChoice = 'use' | 'save' | null
 
 /** Must the desk answer Use or Save before recording? Whenever any credit could pay part of this bill. */
-export function creditChoiceNeeded(q: Pick<DeskQuote, 'creditAvailable'>): boolean {
-  return toCents(q.creditAvailable) > 0
+export function creditChoiceNeeded(q: Pick<DeskQuote, 'creditAvailable' | 'creditMustBeUsed'>): boolean {
+  // 10/26 (Nic): where the landlord's answer is "use it", the desk is not
+  // asked. Credit still lands on the bill — see creditCoversBill, which is the
+  // question every figure depends on.
+  return toCents(q.creditAvailable) > 0 && q.creditMustBeUsed !== true
+}
+
+/**
+ * Whether the credit actually lands on this bill — true when the desk said Use,
+ * and true WITHOUT being asked where the landlord turned saving off.
+ *
+ * Kept separate from creditChoiceNeeded on purpose: "is there a question to
+ * ask" and "is the credit being spent" stopped being the same thing on 10/26,
+ * and collapsing them would show the desk the owed-if-SAVED figure while the
+ * server spent the credit.
+ */
+export function creditCoversBill(
+  q: Pick<DeskQuote, 'creditAvailable' | 'creditMustBeUsed'>, choice: CreditChoice,
+): boolean {
+  if (toCents(q.creditAvailable) <= 0) return false
+  return q.creditMustBeUsed === true || choice === 'use'
 }
 
 /**
@@ -564,9 +590,16 @@ export function creditChoiceNeeded(q: Pick<DeskQuote, 'creditAvailable'>): boole
  * longer matches the server's and the server refuses with a 409, so the payer
  * is asked again instead of having a different amount spent silently.
  */
-export function creditToUseFor(q: Pick<DeskQuote, 'creditAvailable'>, choice: CreditChoice, shownCents?: number | null): number | undefined {
-  if (!creditChoiceNeeded(q)) return undefined
-  if (choice === 'use') return toDollars(shownCents ?? toCents(q.creditAvailable))
+export function creditToUseFor(
+  q: Pick<DeskQuote, 'creditAvailable' | 'creditMustBeUsed'>, choice: CreditChoice, shownCents?: number | null,
+): number | undefined {
+  const usable = toCents(q.creditAvailable)
+  if (usable <= 0) return undefined
+  // 10/26: nobody was asked, so send the figure the window displayed. The
+  // server still refuses a figure that no longer matches, so a credit that
+  // moved while the window was open is asked about rather than spent silently.
+  if (q.creditMustBeUsed === true) return toDollars(shownCents ?? usable)
+  if (choice === 'use') return toDollars(shownCents ?? usable)
   if (choice === 'save') return 0
   return undefined
 }
@@ -604,8 +637,10 @@ export function figuresMovedMessage(before: DeskFigures, after: DeskFigures): st
 }
 
 /** Money owed now for the bill the desk takes, after the Use / Save answer. */
-export function deskOwedCents(q: Pick<DeskQuote, 'owedIfUsed' | 'owedIfSaved' | 'creditAvailable'>, choice: CreditChoice): number {
-  return choice === 'use' && creditChoiceNeeded(q) ? toCents(q.owedIfUsed) : toCents(q.owedIfSaved)
+export function deskOwedCents(
+  q: Pick<DeskQuote, 'owedIfUsed' | 'owedIfSaved' | 'creditAvailable' | 'creditMustBeUsed'>, choice: CreditChoice,
+): number {
+  return creditCoversBill(q, choice) ? toCents(q.owedIfUsed) : toCents(q.owedIfSaved)
 }
 
 /** What the old (carried-forward) balance still owes. */
@@ -974,7 +1009,7 @@ export function partialPlan(q: DeskQuote, choice: CreditChoice, tenderedC: numbe
 export function planTender(q: DeskQuote, input: TenderInput): TenderPlan {
   const isCash = input.method === 'cash'
   const usableC = toCents(q.creditAvailable)
-  const creditUsedC = input.choice === 'use' && usableC > 0 ? usableC : 0
+  const creditUsedC = creditCoversBill(q, input.choice) ? usableC : 0
   const owedC = deskOwedCents(q, input.choice)
   const oldOwedC = oldBalanceOwedCents(q)
   const hasRows = (q.rows ?? []).length > 0
@@ -994,7 +1029,9 @@ export function planTender(q: DeskQuote, input: TenderInput): TenderPlan {
     return stop('credit_moved', figuresMovedMessage(
       { ...deskFigures(q), credit: input.answeredCreditCents }, deskFigures(q)))
   }
-  if (usableC > 0 && input.choice === null) {
+  // 10/26: only asked where the landlord allows saving; otherwise the credit
+  // is already on the bill and the window states it.
+  if (creditChoiceNeeded(q) && input.choice === null) {
     return stop('choose_credit',
       `They have ${money(toDollars(usableC))} of credit that can pay part of this bill. Choose Use or Save first.`)
   }
@@ -1196,6 +1233,13 @@ export interface ReaderQuote extends ReaderFigures {
   outstanding: number
   usableCredit: number
   needsCreditChoice: boolean
+  /**
+   * 10/26 (Nic): the property turned "let residents save credit for later"
+   * OFF, so the reader is not asked either — the credit is on the bill and the
+   * block states it. The server already applied it when working this quote out,
+   * so needsCreditChoice comes back false alongside this.
+   */
+  creditMustBeUsed?: boolean
   useCredit: boolean
   creditUsed: number
   creditApplied: number
@@ -1208,9 +1252,17 @@ export interface ReaderQuote extends ReaderFigures {
 }
 
 /** What a reader quote, charge and show are told: the Use/Save answer with the figure shown, and any old-balance amount. */
-export function readerChoiceParams(usableCredit: number, choice: CreditChoice, towardOldCents: number | null): Record<string, unknown> {
+export function readerChoiceParams(
+  usableCredit: number, choice: CreditChoice, towardOldCents: number | null, mustUse = false,
+): Record<string, unknown> {
   const out: Record<string, unknown> = {}
-  if (toCents(usableCredit) > 0 && choice !== null) {
+  // 10/26: nobody is asked where saving is off, but the figure still goes with
+  // the charge so a credit that moved since the quote is refused rather than a
+  // different amount spent quietly.
+  if (toCents(usableCredit) > 0 && mustUse && choice === null) {
+    out.useCredit = true
+    out.expectedCredit = toDollars(toCents(usableCredit))
+  } else if (toCents(usableCredit) > 0 && choice !== null) {
     out.useCredit = choice === 'use'
     out.expectedCredit = toDollars(toCents(usableCredit))
   }
@@ -1235,7 +1287,11 @@ export function readerReady(
   choice: CreditChoice,
 ): { ready: boolean; reason: string | null } {
   if (!q) return { ready: false, reason: null }
-  if (toCents(q.usableCredit) > 0 && choice === null) {
+  // 10/26 (Nic): where the landlord turned saving off there is no question to
+  // put, so the reader is ready without one — asking would hold the payment on
+  // an answer the server has already made.
+  const mustUse = (q as Partial<ReaderQuote>).creditMustBeUsed === true
+  if (toCents(q.usableCredit) > 0 && choice === null && !mustUse) {
     return { ready: false, reason: `Ask whether to use their ${money(q.usableCredit)} credit or save it, before sending the amount to the reader.` }
   }
   if (!(toCents(q.total) > 0)) {

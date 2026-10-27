@@ -33,8 +33,20 @@ describe('action parity — the gap stays closed', () => {
     // and the duplicate-person screens. Raised on purpose, with each of those
     // six named in DELIBERATE — the ceiling is here to catch a bulk addition
     // nobody decided about, not to be nudged past one build at a time.
-    expect(gap.all.length).toBeGreaterThan(250)
-    expect(gap.all.length).toBeLessThan(475)
+    // 10/26: 476 counted, after the applicant's optional proof-of-income
+    // upload and the resident's own fixed-income answer, both named in
+    // DELIBERATE. The build's other two endpoints (the income file serve and
+    // the banner's should-I-show read) are GETs, which this guard never
+    // counts — only mutating routes are in the surface.
+    // The ceiling is the real count plus about one build's worth of routes,
+    // the same headroom the 10/14 raise used: wide enough that an ordinary
+    // build does not trip it, tight enough that a bulk addition nobody
+    // decided about still does. The floor catches the opposite failure — the
+    // silo list rotting and taking a whole product's endpoints out of view.
+    const SURFACE_FLOOR = 250
+    const SURFACE_CEILING = 500
+    expect(gap.all.length).toBeGreaterThan(SURFACE_FLOOR)
+    expect(gap.all.length).toBeLessThan(SURFACE_CEILING)
   })
 
   it('every endpoint is either reachable or deliberately not — nothing is merely forgotten', () => {

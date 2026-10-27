@@ -92,7 +92,22 @@ export const LANDLORD_ASSIGNABLE_ROLES = [
 export type LandlordAssignableRole = typeof LANDLORD_ASSIGNABLE_ROLES[number]
 export const LANDLORD_ASSIGNABLE_ROLE_LABEL: Record<LandlordAssignableRole, string> = {
   property_manager: 'Property Manager',
-  onsite_manager:   'On-Site Manager',
+  // ── 10/25 (Nic) — NOT "MANAGER" ─────────────────────────────────────────
+  //
+  //   "Lisa is not the on-site manager. Lisa is front desk help... She is not
+  //    given permission to do leases. She's not given permission to do refunds,
+  //    various other things. Manager is not a word I would label with her
+  //    permission set."
+  //
+  // He is right, and her grants say so: reservations, check-in and check-out,
+  // the register, meter reads, the front desk page — and no leases, no refunds,
+  // no property editing. The word was GAM's, never his.
+  //
+  // The KEY stays `onsite_manager`: it names the scope container
+  // (onsite_manager_scopes) and the JWT claim, and renaming it would be a
+  // migration plus a couple of hundred permission checks for no change anybody
+  // can see. This label is what every screen, invite and email actually shows.
+  onsite_manager:   'Front Desk',
   maintenance:      'Maintenance',
   bookkeeper:       'Bookkeeper',
 }
@@ -5893,6 +5908,11 @@ export const RESERVE_CONFIG = {
 //   low risk      → max for the band
 //   medium risk   → max − 1 (floor 2)
 //   high+         → 2 only
+/**
+ * @deprecated 10/26 — FlexDeposit sells 2 or 4 to everyone, so a band's
+ * "maxInstallments" no longer decides anything. Kept because getFlexDepositTier
+ * is still exported for pre-S246 callers; nothing new should read it.
+ */
 export const FLEX_DEPOSIT_TIERS = [
   { maxDeposit: 500,     maxInstallments: 2 },
   { maxDeposit: 1000,    maxInstallments: 3 },
@@ -6092,14 +6112,60 @@ export function getReservePhase(occupiedUnits: number): { phase: 1|2|3; rate: nu
  */
 export type FlexDepositRiskLevel = 'low' | 'medium' | 'high' | 'very_high'
 
+/**
+ * How many installments a FlexDeposit plan may be split into.
+ *
+ * 10/26 (Nic): "Lots of recent late payments, we only offer them a split into
+ * 2 versus a split into 6. It's not that they're getting denied, it's just that
+ * they get less options."
+ *
+ * TWO INPUTS, AND BOTH ARE GAM'S OWN:
+ *  - `riskLevel` — GAM's own application-risk model (services/riskScore.ts:
+ *    identity quality, employment, income against rent, application
+ *    behavior). NOT a credit report and NOT a credit score.
+ *  - `recentLatePayments` — how many times this person has paid GAM late
+ *    inside the lookback window, from GAM's own payment record.
+ *
+ * WHY THE INPUT MATTERS MORE THAN THE RULE. A credit report is a *consumer
+ * report*: using one to give somebody fewer options is an adverse action under
+ * FCRA, owing them a notice naming the bureau and the score, and it is direct
+ * evidence of a risk-based decision made on a consumer report — which is what
+ * a credit decision looks like. GAM's own experience with its own customer is
+ * none of those things; every business prices on it. So NEVER feed a bureau
+ * score or a credit-report field into this function. Keeping FlexDeposit's
+ * "service-tier qualification, not a credit decision" posture depends on it.
+ *
+ * Nobody is denied here — the floor is always 2, so the worst outcome is
+ * fewer, larger installments rather than no plan.
+ */
 export function getFlexDepositMaxInstallments(
-  depositAmount: number,
+  _depositAmount: number,
   riskLevel: FlexDepositRiskLevel | null | undefined,
 ): number | null {
+  // 10/26 (Nic): EVERYBODY GETS BOTH CHOICES. 2 or 4, same price for the same
+  // deposit, whoever they are.
+  //
+  // This used to narrow the options by GAM's risk level (and, briefly, by their
+  // payment record with GAM). Both are gone on purpose: giving one applicant
+  // fewer options than another IS a decision made about that applicant, and
+  // under FCRA an adverse action needs only to rest "in part" on such
+  // information. With the variation removed there is nothing to be adverse
+  // about — the price is a function of the deposit and the split, and neither
+  // is set by GAM about the person.
+  //
+  //   "That way there's no adverse anything. People don't have a choice.
+  //    There's no 'in part' by limiting their options. It's only based on their
+  //    rent, which is not set by us."
+  //
+  // riskLevel is still required: a null means the screening has not produced a
+  // result yet, and the eligibility gate reports that as risk_level_missing.
+  // It no longer changes the answer. Deposit size does not either — it sets the
+  // PRICE of each choice, never which choices exist.
   if (!riskLevel) return null
-  const band = FLEX_DEPOSIT_TIERS.find(t => depositAmount <= t.maxDeposit) ?? FLEX_DEPOSIT_TIERS[FLEX_DEPOSIT_TIERS.length - 1]
-  const downgrade = riskLevel === 'low' ? 0 : riskLevel === 'medium' ? 1 : 99
-  return Math.max(2, band.maxInstallments - downgrade)
+  // The larger of the two choices FlexDeposit sells. Named from flexFees so
+  // there is one definition of what is sellable; index.ts re-exports that
+  // module below, which is why it is imported rather than re-stated here.
+  return FLEX_DEPOSIT_PAYMENT_CHOICES[FLEX_DEPOSIT_PAYMENT_CHOICES.length - 1]
 }
 
 /** Backwards-compatible shim — returns the band's max-installment
@@ -6194,7 +6260,7 @@ export type PaymentType = typeof PAYMENT_TYPES[number]
 // Its own descriptor rather than 'RENT': this is what the tenant sees on their
 // bank statement, and a debt they recognize as an old balance should not appear
 // as a rent charge they might read as a duplicate.
-export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'PROPANE', 'RETURNFEE', 'HOMEPMT', 'FCPAYDOWN', 'DECLINEFEE', 'BALANCE'] as const
+export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'FLEXDEP', 'PROPANE', 'RETURNFEE', 'HOMEPMT', 'FCPAYDOWN', 'DECLINEFEE', 'BALANCE'] as const
 export type PaymentEntryDescription = typeof PAYMENT_ENTRY_DESCRIPTIONS[number]
 
 // S562: manual (off-platform) rent payment recording. A landlord/staff records
@@ -6562,6 +6628,10 @@ export const PAYMENT_ENTRY_DESCRIPTION_LABELS: Partial<Record<PaymentEntryDescri
   DECLINEFEE: 'Declined-payment fee',
   ONTIMEPAY: 'On-time pay',
   FLEXPAY:   'FlexPay',
+  // 10/26: GAM's FlexDeposit service fee, charged in full with installment 1.
+  // Its own name because the resident reads it on their bill and it lands in
+  // GAM's book — never 'OTHERFEE', and never folded into deposit principal.
+  FLEXDEP:   'FlexDeposit fee',
   HOMEPMT:   'Home payment',
 }
 
@@ -6819,11 +6889,22 @@ export function formatInvoiceNumber(year: number, sequence: number): string {
 
 export * from './lateFees';
 export * from './autopaySchedule';
+// 10/26: FlexPay and FlexDeposit bracket pricing. The grids themselves live in
+// flexpay_fee_schedule / flexdeposit_fee_schedule; this is the matching logic.
+import { FLEX_DEPOSIT_PAYMENT_CHOICES } from './flexFees';
+export * from './flexFees';
+
+// 10/26: a printed page is always the light theme, whatever the screen is set
+// to. Nic printed an eviction balance summary in dark mode and got a solid
+// black sheet. Browser-only — never imported by the API.
+export * from './printTheme';
 // S624: property timezone from state + ZIP. Fifteen states split, so state alone
 // is wrong for all of them — and an unresolvable ZIP is FLAGGED, not guessed.
 export * from './propertyTimezone';
 // S640: reading an emergency contact out of a free-text lease field.
 export * from './emergencyContact';
+// 10/25 (Nic): one GAM customer per person, and the three-point match rule.
+export * from './customerMatch';
 
 // ============================================================================
 // Pending tenant intent parser types (S29c-2-A backend, S29c-2-B UI)

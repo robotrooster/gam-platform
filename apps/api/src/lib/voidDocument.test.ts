@@ -253,10 +253,25 @@ describe('voiding an installment contract only the landlord signed', () => {
             (SELECT COUNT(*)::int FROM payments p WHERE p.invoice_id = i.id AND p.type = 'home_payment'
                                                     AND p.status = 'voided') AS voided_home_lines
        FROM invoices i WHERE id = $1`, [id]))[0]
+  /**
+   * 10/25 (Nic): the home payment is on the SALE's own bill now, not the rent
+   * bill ("should trailer payments get their own invoice separately payable
+   * from lot rent? Yeah, let's do that"), so the void's work is read there.
+   * The rent bill is read with billOf, to say it was left alone.
+   */
+  const saleBillOf = async (saleId: string) => (await query<any>(
+    `SELECT i.status, i.total_amount::float AS total, i.subtotal_home_payments::float AS home,
+            (SELECT COUNT(*)::int FROM payments p WHERE p.invoice_id = i.id AND p.type = 'home_payment'
+                                                    AND p.status <> 'voided') AS home_lines,
+            (SELECT COUNT(*)::int FROM payments p WHERE p.invoice_id = i.id AND p.type = 'home_payment'
+                                                    AND p.status = 'voided') AS voided_home_lines
+       FROM invoices i WHERE i.home_sale_contract_id = $1`, [saleId]))[0]
 
   it('takes the home payment off the bill and cancels the sale', async () => {
     const { doc, saleId, invoiceId } = await billingSale()
-    expect(await billOf(invoiceId)).toMatchObject({ total: 600, home: 150, home_lines: 1 })
+    // The rent bill is the rent alone; the home payment has a bill of its own.
+    expect(await billOf(invoiceId)).toMatchObject({ total: 450, home: 0, home_lines: 0 })
+    expect(await saleBillOf(saleId)).toMatchObject({ total: 150, home: 150, home_lines: 1 })
     const client = await db.connect()
     try {
       await client.query('BEGIN')
@@ -264,7 +279,10 @@ describe('voiding an installment contract only the landlord signed', () => {
       await client.query('COMMIT')
     } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e } finally { client.release() }
     expect(await saleStatus(saleId)).toBe('cancelled')
-    expect(await billOf(invoiceId)).toMatchObject({ status: 'pending', total: 450, home: 0, home_lines: 0, voided_home_lines: 1 })
+    // The sale's own bill is emptied to nothing, its line kept as a record.
+    expect(await saleBillOf(saleId)).toMatchObject({ total: 0, home: 0, home_lines: 0, voided_home_lines: 1 })
+    // And the rent bill never moved.
+    expect(await billOf(invoiceId)).toMatchObject({ status: 'pending', total: 450, home: 0, home_lines: 0 })
     const unbilled = await query<any>(
       `SELECT 1 FROM home_sale_installments WHERE contract_id = $1 AND payment_id IS NOT NULL`, [saleId])
     expect(unbilled).toHaveLength(0)
@@ -273,7 +291,7 @@ describe('voiding an installment contract only the landlord signed', () => {
     const kept = await query<any>(
       `SELECT p.amount::float AS amount, p.void_reason, p.voided_at IS NOT NULL AS stamped,
               (SELECT i.contract_id FROM home_sale_installments i WHERE i.id = p.home_sale_installment_id) AS contract_id
-         FROM payments p WHERE p.invoice_id = $1 AND p.type = 'home_payment'`, [invoiceId])
+         FROM payments p WHERE p.type = 'home_payment'`)
     expect(kept).toEqual([{ amount: 150, void_reason: HOME_SALE_VOIDED_CHARGE_REASON, stamped: true, contract_id: saleId }])
     // Every figure reads as it did when the home payment was deleted.
     const who = (await query<any>(`SELECT landlord_id, tenant_id FROM invoices WHERE id = $1`, [invoiceId]))[0]
@@ -284,7 +302,7 @@ describe('voiding an installment contract only the landlord signed', () => {
 
   it('refuses once a home payment from it was paid — nothing changes', async () => {
     const { doc, saleId, invoiceId } = await billingSale()
-    await query(`UPDATE payments SET status = 'settled', settled_at = now() WHERE invoice_id = $1 AND type = 'home_payment'`, [invoiceId])
+    await query(`UPDATE payments SET status = 'settled', settled_at = now() WHERE type = 'home_payment'`)
     const client = await db.connect()
     try {
       await client.query('BEGIN')
@@ -293,7 +311,7 @@ describe('voiding an installment contract only the landlord signed', () => {
       await client.query('ROLLBACK')
     } finally { client.release() }
     expect(await saleStatus(saleId)).toBe('active')
-    expect(await billOf(invoiceId)).toMatchObject({ home: 150, home_lines: 1 })
+    expect(await saleBillOf(saleId)).toMatchObject({ home: 150, home_lines: 1 })
   })
 
   it('a void that skips those steps is stopped by the database, not left billing', async () => {
@@ -314,7 +332,7 @@ describe('voiding an installment contract only the landlord signed', () => {
       await client.query('ROLLBACK')
     } finally { client.release() }
     expect(await saleStatus(saleId)).toBe('paid_off')
-    expect(await billOf(invoiceId)).toMatchObject({ home: 150, home_lines: 1 })
+    expect(await saleBillOf(saleId)).toMatchObject({ home: 150, home_lines: 1 })
   })
 
   /** Waits until some other connection is blocked on a lock. */
@@ -347,7 +365,8 @@ describe('voiding an installment contract only the landlord signed', () => {
       expect((await attaching).attached).toEqual([])
     } catch (e) { await voiding.query('ROLLBACK').catch(() => {}); throw e } finally { voiding.release() }
     expect(await saleStatus(saleId)).toBe('cancelled')
-    expect(await billOf(invoiceId)).toMatchObject({ total: 450, home: 0, home_lines: 0, voided_home_lines: 1 })
+    expect(await saleBillOf(saleId)).toMatchObject({ total: 0, home: 0, home_lines: 0, voided_home_lines: 1 })
+    expect(await billOf(invoiceId)).toMatchObject({ total: 450, home: 0 })
   })
 
   it('a void outside voidDocument that races the start sees the lines the start wrote, and stops', async () => {
@@ -369,7 +388,7 @@ describe('voiding an installment contract only the landlord signed', () => {
     } catch (e) { await starting.query('ROLLBACK').catch(() => {}); throw e } finally { starting.release() }
     // Not a cancelled sale with its charge left on the bill.
     expect(await saleStatus(saleId)).toBe('active')
-    expect(await billOf(invoiceId)).toMatchObject({ home: 150, home_lines: 1 })
+    expect(await saleBillOf(saleId)).toMatchObject({ home: 150, home_lines: 1 })
   })
 
   it('a landlord-only sale with nothing on a bill yet is cancelled however the void happens', async () => {

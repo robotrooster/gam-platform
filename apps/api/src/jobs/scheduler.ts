@@ -997,6 +997,15 @@ async function remindByPacket(rows: any[], tag: string): Promise<number> {
   return sent
 }
 
+/**
+ * 10/25 — how many times the 48-hour timeout path may re-send a signing request
+ * before it gives up. Five, matching the ceiling S639 put on the 2-hour nudge
+ * for the same failure mode: "somebody who has ignored five daily reminders is
+ * not going to sign because of a sixth; they need a phone call, and the document
+ * auto-voids anyway."
+ */
+export const SIGNING_REQUEST_MAX_RESENDS = 5
+
 export async function processEsignTimeouts() {
   try {
     // Pass 1: reminders.
@@ -1168,6 +1177,22 @@ export async function processEsignTimeouts() {
             FROM lease_document_signers s
             LEFT JOIN users su ON su.id = s.user_id
            WHERE s.document_id = $1 AND s.status <> 'signed'
+             -- ── 10/25: FIVE ASKS, THEN STOP ───────────────────────────────
+             --
+             -- Re-sending here stamps invite_sent_at = NOW(), which makes the
+             -- document 48 hours stale again two days later — so this path
+             -- re-asked forever. Jolyn Whitfield got 108 signing requests in
+             -- October across nine documents, every two days since the 2nd;
+             -- Kyra Smith the same. Those two were 28% of every email GAM sent
+             -- this month, and September came to 3,215 — over Resend's free tier.
+             --
+             -- The same ceiling S639 put on the 2-hour nudge one block above,
+             -- for the same failure mode and by the same reasoning: somebody
+             -- who has ignored five asks is not going to sign because of a
+             -- sixth, they need a phone call, and the document auto-voids
+             -- anyway. Its counter is its own because a re-sent REQUEST and a
+             -- reminder are different acts on different clocks.
+             AND COALESCE(s.invite_resend_count, 0) < ${SIGNING_REQUEST_MAX_RESENDS}
            ORDER BY s.order_index
            LIMIT 1`, [d.id])
         const landlordSigned = await query<any>(`
@@ -1197,7 +1222,9 @@ export async function processEsignTimeouts() {
                   replyTo: replyToProperty(d.property_id) })
               await query(
                 `UPDATE lease_document_signers
-                    SET status='sent', invite_sent=TRUE, invite_sent_at=NOW() WHERE id=$1`, [s.id])
+                    SET status='sent', invite_sent=TRUE, invite_sent_at=NOW(),
+                        invite_resend_count = COALESCE(invite_resend_count, 0) + 1
+                  WHERE id=$1`, [s.id])
             } catch (e) {
               logger.error({ err: e, signer_id: s.id }, '[ESIGN-TIMEOUTS] resend failed')
             }
@@ -2948,11 +2975,26 @@ export function schedulerInit() {
   cron.schedule('20 4 * * *', async () => {
     try {
       const { billDueHomeSaleInstallments, reconcileAllHomeSaleContracts } = await import('../services/homeSale')
-      // S654: the month on GAM's home calendar (Phoenix), not the host's clock.
-      const asOf = monthStartOf(todayIn(null))
+      // S654: the day on GAM's home calendar (Phoenix), not the host's clock.
+      // 10/25: the DAY, not the month's first. An installment bills when its
+      // own date arrives — Lisa Scheeler's falls on the 10th, and a month-start
+      // comparison billed it a month late every month.
+      const asOf = todayIn(null)
       const billed = await billDueHomeSaleInstallments(asOf)
+      // 10/25 (Nic): a contract GAM tracks but does not bill gets a REMINDER
+      // instead of an invoice — "we are going to send reminders about that
+      // contract payment being due... it stays off the books." Once per
+      // installment. Its own try, so a reminder that fails never costs anybody
+      // their billing.
+      let reminded = 0
+      try {
+        const { remindTrackedHomePayments } = await import('../services/homeSale')
+        reminded = await remindTrackedHomePayments(asOf)
+      } catch (e) {
+        logger.error({ err: e }, '[home-sale-billing] tracked payment reminders failed')
+      }
       await reconcileAllHomeSaleContracts()
-      if (billed) logger.info({ billed, asOf }, '[home-sale-billing]')
+      if (billed || reminded) logger.info({ billed, reminded, asOf }, '[home-sale-billing]')
     } catch (e) { logger.error({ err: e }, '[home-sale-billing] fatal') }
     // S654: 04:20 Phoenix, so the run and its Phoenix month agree on any host.
   }, { timezone: 'America/Phoenix' })

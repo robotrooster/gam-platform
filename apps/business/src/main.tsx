@@ -51,6 +51,7 @@ import { BookableServicesPage } from './pages/BookableServicesPage'
 import { BookkeepingPage } from './pages/BookkeepingPage'
 import { DialogHost } from './components/dialogs'
 import './styles/globals.css'
+import { installPrintLightTheme } from '@gam/shared'
 
 function Protected({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth()
@@ -113,6 +114,11 @@ function App() {
     </BrowserRouter>
   )
 }
+
+// 10/26 (Nic): a printed page is always the light theme, whatever the screen
+// is set to — he printed an eviction balance summary in dark mode and got a
+// solid black sheet. Installed once here; restores the viewer's theme after.
+installPrintLightTheme()
 
 // HMR guard: when Vite re-executes this entry module, calling createRoot on
 // the same container again STACKS a second mounted app under the first

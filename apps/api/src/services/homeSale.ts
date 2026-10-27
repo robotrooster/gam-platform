@@ -9,11 +9,12 @@
 // would collide with the rent idempotency unique + trigger rent late-fee/eviction
 // logic that must not apply to a purchase installment).
 import type { PoolClient } from 'pg'
-import { query, getClient } from '../db'
+import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 import { lockHousehold } from './moneyPredicates'
+import { allocateInvoiceNumber } from './invoiceNumbers'
 import { computeAmortization } from '@gam/shared'
 import { z } from 'zod'
 
@@ -586,6 +587,27 @@ function escapeHtml(s: string): string {
  * `dryRun` does the whole thing and rolls it back: what it reports is what a
  * real run would do, and nothing changes.
  */
+/**
+ * 10/25 (Nic): the buyer's due installments, right after their rent bill was
+ * written on a property that BUNDLES. "Let landlords choose how it gets
+ * bundled." Called by jobs/invoiceGeneration once the bill is committed, so
+ * the installment joins the bill it belongs on instead of waiting a day.
+ *
+ * Does nothing when the unit has no active sale, or when the buyer is somebody
+ * other than this lease's resident — the sale is looked up BY the buyer, so a
+ * home somebody else is buying is never billed to whoever lives there.
+ * Idempotent, and it goes through the one writer, so a property that is set to
+ * separate still gets separate bills if this is ever called for one.
+ */
+export async function attachDueInstallmentsForUnitBuyer(unitId: string, tenantId: string | null): Promise<void> {
+  if (!tenantId) return
+  const live = await queryOne<{ id: string }>(
+    `SELECT id FROM home_sale_contracts
+      WHERE unit_id = $1 AND tenant_id = $2 AND status = 'active'`, [unitId, tenantId])
+  if (!live) return
+  await attachDueInstallmentsToOpenInvoices(live.id)
+}
+
 export async function attachDueInstallmentsToOpenInvoices(
   contractId: string, opts: { dryRun?: boolean } = {},
 ): Promise<{ attached: AttachedInstallment[] }> {
@@ -610,6 +632,229 @@ export async function attachDueInstallmentsToOpenInvoices(
 }
 
 /** The attach, on the caller's transaction (no BEGIN/COMMIT of its own). */
+/**
+ * 10/25 (Nic): A TRAILER PAYMENT IS ITS OWN BILL.
+ *
+ *   "Should trailer payments get their own invoice separately payable from lot
+ *    rent? Yeah, let's do that, and they need to be clearly labeled — I've had
+ *    some people literally try to say, oh, I paid my rent, and then it's like,
+ *    no, that was the trailer payment, you have the space rent too."
+ *
+ * The installment used to ride whatever bill was handy: the buyer's rent bill
+ * when they were its primary resident (jobs/invoiceGeneration), and no bill at
+ * all otherwise. Both were wrong:
+ *   * Lisa Scheeler is on work trade, so she gets no rent bill. Her trailer
+ *     payment had nowhere to land.
+ *   * Dominic Gonzalez's space rent is the park's money; his trailer payment is
+ *     the trust's. One bill cannot be paid into two books.
+ *   * Rent is pay-in-full platform-wide, so sharing the rent bill made the
+ *     trailer payment unpayable on its own — which both of the above need.
+ *
+ * So every installment now lands on the contract's OWN bill for its month,
+ * whoever the buyer is and whether or not they rent the space. One bill per
+ * contract per month (ux_invoices_home_sale_contract_cycle).
+ *
+ * LATE FEES: whatever the CONTRACT says. 10/25 (Nic):
+ *
+ *   "A trailer bill could possibly have late fees. It's an installment contract
+ *    that may carry its own late terms. I don't have any specific to these
+ *    contracts, but we need to have the capability for landlords. We provide
+ *    the tools to do the job, whatever their job is."
+ *
+ * So the bill is written late_fee_exempt only while the contract charges no
+ * fee (home_sale_contracts.late_fee_enabled, default FALSE — a fee nobody
+ * signed for is never charged). When it does, the contract's own stamped
+ * parameters govern, exactly as a lease's and a utility agreement's do
+ * (jobs/lateFees), and the percentage is figured on the installment itself
+ * because the bill has no rent on it.
+ */
+async function ownBillFor(
+  client: Client,
+  c: { id: string; unit_id: string; tenant_id: string; landlord_id: string },
+  billingMonth: string,
+): Promise<{ id: string; dueDate: string }> {
+  const existing = (await client.query<{ id: string; due_date: string }>(
+    `SELECT id, due_date::text AS due_date FROM invoices
+      WHERE home_sale_contract_id = $1 AND due_date = $2::date
+      FOR UPDATE`, [c.id, billingMonth])).rows[0]
+  if (existing) return { id: existing.id, dueDate: existing.due_date }
+
+  const invoiceNumber = await allocateInvoiceNumber(client, c.landlord_id, Number(billingMonth.slice(0, 4)))
+  const made = await client.query<{ id: string }>(
+    `INSERT INTO invoices (
+       landlord_id, tenant_id, lease_id, unit_id, home_sale_contract_id,
+       invoice_number, due_date, subtotal_rent, subtotal_fees, subtotal_utilities,
+       subtotal_home_payments, total_amount, late_fee_exempt
+     ) VALUES ($1, $2, NULL, $3, $4, $5, $6::date, 0, 0, 0, 0, 0,
+       -- Exempt only while the contract charges no late fee.
+       NOT COALESCE((SELECT hs.late_fee_enabled FROM home_sale_contracts hs WHERE hs.id = $4), FALSE))
+     -- The partial predicate is REQUIRED for Postgres to infer the index.
+     ON CONFLICT (home_sale_contract_id, due_date)
+       WHERE home_sale_contract_id IS NOT NULL
+       DO NOTHING
+     RETURNING id`,
+    [c.landlord_id, c.tenant_id, c.unit_id, c.id, invoiceNumber, billingMonth])
+  if (made.rows.length) return { id: made.rows[0].id, dueDate: billingMonth }
+
+  // Another writer got there first between the read and the insert. Its bill is
+  // the one bill for this month; the number reserved above is simply not used.
+  const raced = (await client.query<{ id: string; due_date: string }>(
+    `SELECT id, due_date::text AS due_date FROM invoices
+      WHERE home_sale_contract_id = $1 AND due_date = $2::date
+      FOR UPDATE`, [c.id, billingMonth])).rows[0]
+  if (!raced) throw new Error(`home sale: no bill for contract ${c.id} month ${billingMonth}`)
+  return { id: raced.id, dueDate: raced.due_date }
+}
+
+/**
+ * 10/25 (Nic): WHICH BILL IS THE LANDLORD'S CHOICE.
+ *
+ *   "Leave current properties set up as is. Let landlords choose how it gets
+ *    bundled."
+ *
+ * properties.home_payments_own_bill, default TRUE (separate — Nic's choice for
+ * Mountain View and Oak Park). FALSE bundles the installment onto the buyer's
+ * rent bill for that month, the way it rode one before today.
+ *
+ * SEPARATE ALWAYS WINS WHEN THERE IS NOTHING TO BUNDLE INTO. A buyer on work
+ * trade gets no rent bill (Lisa Scheeler), and a buyer who rents no space at
+ * this park never had one (the operator with a hundred homes in parks he does
+ * not own) — so a bundled property still gives those buyers their own bill,
+ * because the alternative is not billing them at all. That is the gap this
+ * replaces: the old two paths each assumed the other would catch such a buyer,
+ * and a buyer listed as a co-tenant was billed by neither.
+ *
+ * The buyer's bill for the month means: an active lease on this unit that the
+ * buyer is a resident on, with that month's bill still open. Any role on the
+ * lease, not just primary — the role was never the point.
+ */
+async function targetBillFor(
+  client: Client,
+  c: { id: string; unit_id: string; tenant_id: string; landlord_id: string; own_bill: boolean },
+  billingMonth: string,
+  /**
+   * The park's today. On a BUNDLED property whose rent bill for the month has
+   * not been written yet, the installment WAITS for it (null) rather than
+   * taking a bill of its own — the daily home-sale run is at 04:20 and the
+   * monthly bills are written at 07:00 local, so a fallback would beat the
+   * rent bill to it every month and the setting would never hold. Once the
+   * month is over the fallback does apply, so nothing is left unbilled when
+   * no rent bill ever came (a work-trade month, a lease that ended).
+   */
+  asOf: string,
+): Promise<{ id: string; dueDate: string; lease_id: string | null } | null> {
+  if (!c.own_bill) {
+    const rent = (await client.query<{ id: string; due_date: string; lease_id: string }>(
+      `SELECT i.id, i.due_date::text AS due_date, i.lease_id
+         FROM invoices i
+         JOIN leases l ON l.id = i.lease_id
+        WHERE i.status IN ('pending','partial')
+          AND NOT i.is_opening_balance
+          AND i.home_sale_contract_id IS NULL
+          AND date_trunc('month', i.due_date)::date = date_trunc('month', $3::date)::date
+          AND l.unit_id = $2 AND l.status = 'active'
+          AND (i.tenant_id = $1 OR i.tenant_id IS NULL)
+          AND EXISTS (SELECT 1 FROM v_lease_active_tenants v
+                       WHERE v.lease_id = l.id AND v.tenant_id = $1)
+        ORDER BY EXISTS (SELECT 1 FROM payments r WHERE r.invoice_id = i.id AND r.type = 'rent') DESC,
+                 i.due_date, i.id
+        LIMIT 1
+        FOR UPDATE OF i`, [c.tenant_id, c.unit_id, billingMonth])).rows[0]
+    if (rent) return { id: rent.id, dueDate: rent.due_date, lease_id: rent.lease_id }
+    // No rent bill of theirs for that month yet. Still inside the month, wait
+    // for it; past the month, fall through so the installment is billed
+    // somewhere rather than nowhere.
+    if (billingMonth.slice(0, 7) >= asOf.slice(0, 7)) return null
+  }
+  const own = await ownBillFor(client, c, billingMonth)
+  return { ...own, lease_id: null }
+}
+
+/**
+ * 10/25 — THE CHARGE KEEPS ITS LEASE.
+ *
+ * Only WHICH BILL an installment sits on changed today; the charge row still
+ * carries payments.lease_id, because the books, the rent roll, the deposit
+ * sweep, the bank-deposit match and the Outstanding page all read it. Three of
+ * them read it as a hard requirement:
+ *   - bankDepositCandidates: `AND p.lease_id IS NOT NULL` — a charge with no
+ *     lease is not offered when matching a bank deposit. Its own comment names
+ *     the case: "MH 21 at Country Acres owed rent $450, water $165 and a $200
+ *     home payment — exactly the $815 deposit; without the home payment the
+ *     deposit tied to nothing."
+ *   - depositReturn SWEEP_LINES_SQL: `WHERE p.lease_id IN <lease chain>` — an
+ *     unpaid installment with no lease is never deducted at move-out, so the
+ *     landlord refunds money the buyer still owes.
+ *   - openBalances groups a person's spaces by p.lease_id.
+ *
+ * home_sale_contracts.lease_id cannot answer this: it is context only (S651 —
+ * "a sale stands on its own"), and every contract the signing packet writes has
+ * none. Eight of the eleven live contracts have none while all eight buyers do
+ * rent the space. Until today the installment inherited the RENT bill's lease
+ * because it rode that bill, which is why all nine existing home_payment rows
+ * carry one; writing the contract's empty column instead would have quietly
+ * dropped it for those eight.
+ *
+ * So: the bundled bill's lease, else the contract's own if it names one, else
+ * the buyer's active lease on this unit — the same value the rent bill gave it.
+ * Null only when the buyer genuinely rents nothing here (the operator who owns
+ * homes in parks he does not own), which is what it has always been for them.
+ */
+async function leaseForCharge(
+  client: Client,
+  c: { unit_id: string; lease_id: string | null; tenant_id: string },
+  billLeaseId: string | null,
+): Promise<string | null> {
+  if (billLeaseId) return billLeaseId
+  if (c.lease_id) return c.lease_id
+  const own = (await client.query<{ id: string }>(
+    `SELECT l.id FROM leases l
+      WHERE l.unit_id = $1 AND l.status = 'active'
+        AND EXISTS (SELECT 1 FROM v_lease_active_tenants v
+                     WHERE v.lease_id = l.id AND v.tenant_id = $2)
+      ORDER BY l.start_date DESC, l.id
+      LIMIT 1`, [c.unit_id, c.tenant_id])).rows[0]
+  return own?.id ?? null
+}
+
+/**
+ * Bill ONE installment onto whichever bill the property's setting chooses.
+ * Returns null when it was already billed (the partial-unique index on
+ * payments.home_sale_installment_id makes a concurrent run a no-op), so an
+ * installment is charged at most once and the buyer is never double-charged.
+ */
+async function billInstallmentOnItsOwnBill(
+  client: Client,
+  c: { id: string; unit_id: string; lease_id: string | null; tenant_id: string; landlord_id: string; installments_total: number; own_bill: boolean },
+  d: { id: string; installment_number: number; amount: string | number; billing_month: string },
+  asOf: string,
+): Promise<{ invoiceId: string; dueDate: string; amount: number } | null> {
+  const bill = await targetBillFor(client, c, d.billing_month, asOf)
+  if (!bill) return null
+  const chargeLeaseId = await leaseForCharge(client, c, bill.lease_id)
+  const amount = Number(d.amount)
+  const ins = await client.query<{ id: string }>(
+    `INSERT INTO payments (
+       invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+       type, amount, status, due_date, entry_description, notes, home_sale_installment_id
+     ) VALUES ($1, $2, $3, $4, $5, 'home_payment', $6, 'pending', $7, 'HOMEPMT', $8, $9)
+     ON CONFLICT (home_sale_installment_id) WHERE home_sale_installment_id IS NOT NULL DO NOTHING
+     RETURNING id`,
+    [bill.id, c.unit_id, chargeLeaseId, c.tenant_id, c.landlord_id, amount.toFixed(2), bill.dueDate,
+     `Home payment ${d.installment_number} of ${c.installments_total}`, d.id])
+  if (!ins.rows.length) return null
+  await client.query(
+    `UPDATE home_sale_installments SET payment_id = $1 WHERE id = $2 AND payment_id IS NULL`,
+    [ins.rows[0].id, d.id])
+  await client.query(
+    `UPDATE invoices
+        SET subtotal_home_payments = COALESCE(subtotal_home_payments, 0) + $2,
+            total_amount           = total_amount + $2,
+            updated_at             = NOW()
+      WHERE id = $1`, [bill.id, amount.toFixed(2)])
+  return { invoiceId: bill.id, dueDate: bill.dueDate, amount }
+}
+
 async function attachDueInstallmentsIn(client: Client, contractId: string): Promise<{
   attached: AttachedInstallment[]; stampedOffPlatform: number; household: { tenantId: string; landlordId: string } | null
 }> {
@@ -617,12 +862,18 @@ async function attachDueInstallmentsIn(client: Client, contractId: string): Prom
   // 10/12: no lease link required. The contract's lease_id is context only
   // (S651 — a sale stands on its own), and every contract the packet signs is
   // written with none; this used to require one, so a sale signed from the
-  // packet could never land on the open bill.
+  // packet could never be billed at all.
   const c = (await client.query<any>(
-    `SELECT c.id, c.unit_id, c.tenant_id, c.landlord_id, c.installments_total,
+    `SELECT c.id, c.unit_id, c.lease_id, c.tenant_id, c.landlord_id, c.installments_total,
+            c.tracked_not_billed,
+            p.home_payments_own_bill AS own_bill,
             to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
-            -- "This month" is the park's month (S654), not the server's.
-            to_char(date_trunc('month', (NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date), 'YYYY-MM-DD') AS this_month
+            -- 10/25: the park's TODAY (S654: the park's clock, not the
+            -- server's). This was the 1st of the park's month, which meant an
+            -- installment dated any later day never came due in its own month
+            -- — Lisa Scheeler's falls on the 10th, so hers would have billed a
+            -- month late, every month, for the life of the contract.
+            to_char((NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, 'YYYY-MM-DD') AS today
        FROM home_sale_contracts c
        JOIN units u ON u.id = c.unit_id JOIN properties p ON p.id = u.property_id
       WHERE c.id = $1 AND c.status = 'active'`, [contractId])).rows[0]
@@ -649,75 +900,27 @@ async function attachDueInstallmentsIn(client: Client, contractId: string): Prom
         WHERE contract_id = $1 AND payment_id IS NULL AND settled_off_platform_at IS NULL
           AND billing_month < date_trunc('month', $2::date)::date`, [c.id, c.first_billing_cycle])).rowCount ?? 0
   }
+  // 10/25: a contract GAM tracks but does not bill has nothing to attach.
+  if (c.tracked_not_billed) {
+    if (stampedOffPlatform) await reconcileHomeSaleContract(c.id, client)
+    return { attached, stampedOffPlatform, household: { tenantId: c.tenant_id, landlordId: c.landlord_id } }
+  }
   const due = (await client.query<any>(
     `SELECT id, installment_number, amount::text AS amount, billing_month::text AS billing_month
        FROM home_sale_installments
       WHERE contract_id = $1 AND payment_id IS NULL AND settled_off_platform_at IS NULL
         AND billing_month <= $3::date
         AND ($2::date IS NULL OR billing_month >= date_trunc('month', $2::date)::date)
-      ORDER BY installment_number`, [c.id, c.first_billing_cycle, c.this_month])).rows
+      ORDER BY installment_number`, [c.id, c.first_billing_cycle, c.today])).rows
 
   for (const d of due) {
-    // The buyer's open bill for the installment's month: the bill of the
-    // ACTIVE lease on this unit where the buyer is the primary resident —
-    // the same rule the monthly run uses to put an installment on a rent bill
-    // (jobs/invoiceGeneration: same unit, the lease's primary is the buyer).
-    // Billed to the buyer, so never a sublessee's bill. The month's regular
-    // bill (the one with the rent on it) before any other bill that month.
-    //
-    // 10/12 (Nic): "open" means money is still OWED on it, not just a status.
-    // The bill's status counts only settled lines (fn_invoice_status_rollup),
-    // so a bill paid in full by bank transfer still reads 'pending' while the
-    // money clears. A line added to it then would be the one unpaid charge on
-    // a bill the tenant paid on time — late fees from the grace end, and a
-    // paid bill that grew a line. So: no bill with a payment still clearing,
-    // and only a bill with a charge (other than a late fee) still unpaid,
-    // which also passes over bills the status leaves open after they were
-    // fully paid (from the deposit, or with a returned or voided line). Never
-    // the opening-balance bill either (the old system's balance, usually
-    // exempt from late fees) — a current installment belongs on the month's
-    // own bill. Anything passed over here waits for the monthly run, which
-    // bills it on the next bill, as it does when the bill is already settled.
-    const inv = (await client.query<{ id: string; due_date: string; lease_id: string }>(
-      `SELECT i.id, i.due_date::text AS due_date, i.lease_id
-         FROM invoices i
-         JOIN leases l ON l.id = i.lease_id
-        WHERE i.status IN ('pending','partial')
-          AND NOT i.is_opening_balance
-          AND date_trunc('month', i.due_date)::date = $3::date
-          AND l.unit_id = $2 AND l.status = 'active'
-          AND (i.tenant_id = $1 OR i.tenant_id IS NULL)
-          AND NOT EXISTS (SELECT 1 FROM payments x WHERE x.invoice_id = i.id AND x.status = 'processing')
-          AND EXISTS (SELECT 1 FROM payments o
-                       WHERE o.invoice_id = i.id AND o.type <> 'late_fee' AND o.status IN ('pending','failed'))
-          AND EXISTS (SELECT 1 FROM v_lease_active_tenants v
-                       WHERE v.lease_id = l.id AND v.role = 'primary' AND v.tenant_id = $1)
-        ORDER BY EXISTS (SELECT 1 FROM payments r WHERE r.invoice_id = i.id AND r.type = 'rent') DESC,
-                 i.due_date, i.id
-        LIMIT 1
-        FOR UPDATE OF i`, [c.tenant_id, c.unit_id, d.billing_month])).rows[0]
-    if (!inv) continue
-    const amount = Number(d.amount)
-    const ins = await client.query<{ id: string }>(
-      `INSERT INTO payments (
-         invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-         type, amount, status, due_date, entry_description, notes, home_sale_installment_id
-       ) VALUES ($1,$2,$3,$4,$5,'home_payment',$6,'pending',$7,'HOMEPMT',$8,$9)
-       ON CONFLICT (home_sale_installment_id) WHERE home_sale_installment_id IS NOT NULL DO NOTHING
-       RETURNING id`,
-      [inv.id, c.unit_id, inv.lease_id, c.tenant_id, c.landlord_id, amount.toFixed(2), inv.due_date,
-       `Home payment ${d.installment_number} of ${c.installments_total}`, d.id])
-    if (!ins.rows.length) continue
-    await client.query(
-      `UPDATE home_sale_installments SET payment_id = $1 WHERE id = $2 AND payment_id IS NULL`,
-      [ins.rows[0].id, d.id])
-    await client.query(
-      `UPDATE invoices
-          SET subtotal_home_payments = COALESCE(subtotal_home_payments, 0) + $2,
-              total_amount = total_amount + $2,
-              updated_at = NOW()
-        WHERE id = $1`, [inv.id, amount.toFixed(2)])
-    attached.push({ installmentNumber: d.installment_number, amount, invoiceId: inv.id, dueDate: inv.due_date })
+    // 10/25: the property's setting picks the bill (targetBillFor). No
+    // primary-resident rule and no "a paid bill never grows a line" — on a
+    // separate property the installment is on nobody else's document, and on a
+    // bundled one it joins only a bill that is still open.
+    const put = await billInstallmentOnItsOwnBill(client, c, d, c.today)
+    if (!put) continue
+    attached.push({ installmentNumber: d.installment_number, amount: put.amount, invoiceId: put.invoiceId, dueDate: put.dueDate })
   }
   // A stamped month counts as paid, a line on a bill as billed.
   if (attached.length || stampedOffPlatform) await reconcileHomeSaleContract(c.id, client)
@@ -811,10 +1014,17 @@ export async function reconcileAllHomeSaleContracts(): Promise<void> {
  * installment (separate line from space rent, routes to the landlord/seller).
  * Idempotent: installment.payment_id is stamped once, so re-runs skip billed
  * rows. Auto-stops naturally when a contract has no more unbilled installments.
- * `asOfMonth` = 'YYYY-MM-01' (bill everything due on/before this cycle).
+ *
+ * `asOf` = 'YYYY-MM-DD', the park's today: bill everything due on or before it.
+ * 10/25: this was read as a MONTH ('YYYY-MM-01'), which silently assumed every
+ * schedule falls on the 1st. Lisa Scheeler's falls on the 10th, so every one of
+ * her installments would have billed a month late — 2026-10-10 is not <=
+ * 2026-10-01 — for the whole contract. A day is what the rule always meant:
+ * an installment bills once its own date has arrived.
+ *
  * Returns the number of installments billed.
  */
-export async function billDueHomeSaleInstallments(asOfMonth: string): Promise<number> {
+export async function billDueHomeSaleInstallments(asOf: string): Promise<number> {
   // 10/12 (Nic): "Retry every morning." A sale the landlord signed that did not
   // start on his signature is started first, so whatever of it is due bills
   // this morning with everything else. Its failure never stops the billing.
@@ -833,30 +1043,32 @@ export async function billDueHomeSaleInstallments(asOfMonth: string): Promise<nu
         AND i.billing_month < date_trunc('month', p.first_billing_cycle)::date`)
   const due = await query<any>(
     `SELECT i.id AS installment_id, i.installment_number, i.amount, i.billing_month::text AS billing_month,
-            c.id AS contract_id, c.unit_id, c.lease_id, c.tenant_id, c.landlord_id, c.installments_total
+            c.id AS contract_id, c.unit_id, c.lease_id, c.tenant_id, c.landlord_id, c.installments_total,
+            -- 10/25 (Nic): the landlord's choice, per property.
+            pr.home_payments_own_bill AS own_bill
        FROM home_sale_installments i
        JOIN home_sale_contracts c ON c.id = i.contract_id
+       JOIN units un ON un.id = c.unit_id
+       JOIN properties pr ON pr.id = un.property_id
       WHERE c.status = 'active'
         AND i.payment_id IS NULL
         AND i.settled_off_platform_at IS NULL
         AND i.billing_month <= $1::date
-        -- S654 (Nic): a buyer who rents the space on an active lease gets the
-        -- installment ON their rent invoice (jobs/invoiceGeneration), so the
-        -- bill, the email and the who-owes page all carry it. Only a buyer
-        -- with no lease here — the investor who owns homes in parks he does
-        -- not own — is billed standalone.
-        --
-        -- 10/12: only where the rent bill WILL carry it — the buyer is the
-        -- lease's PRIMARY, the rule jobs/invoiceGeneration uses to pick it up.
-        -- A buyer listed as a co-tenant was skipped here for being on the
-        -- lease and skipped there for not being its primary, so nothing ever
-        -- billed their home payment.
-        AND NOT EXISTS (
-          SELECT 1 FROM leases l
-          JOIN v_lease_active_tenants v ON v.lease_id = l.id AND v.role = 'primary'
-          WHERE l.unit_id = c.unit_id AND l.status = 'active' AND v.tenant_id = c.tenant_id)
+        -- 10/25 (Nic), Dominic Gonzalez's contract: "it is not going to go
+        -- billed through the property. It's not going to get invoiced through
+        -- the property. It's just going to be a ledger that keeps track." His
+        -- installment is the TRUST's money, so GAM bills nothing on it — it is
+        -- reminded (remindTrackedHomePayments) and marked paid by hand.
+        AND NOT c.tracked_not_billed
+        -- 10/25 (Nic): EVERY buyer is billed here, on the contract's own bill.
+        -- This used to skip a buyer who rented the space, because their
+        -- installment rode their rent invoice instead (jobs/invoiceGeneration)
+        -- — and whether it rode it turned on them being the lease's PRIMARY,
+        -- so a co-tenant buyer was skipped by both sides and never billed at
+        -- all. A trailer payment is its own bill now, so there is no second
+        -- path to defer to and nobody to miss.
       ORDER BY c.id, i.installment_number ASC`,
-    [asOfMonth])
+    [asOf])
 
   let billed = 0
   const touchedContracts = new Set<string>()
@@ -870,18 +1082,19 @@ export async function billDueHomeSaleInstallments(asOfMonth: string): Promise<nu
     const client = await getClient()
     try {
       await client.query('BEGIN')
-      const ins = await client.query<{ id: string }>(
-        `INSERT INTO payments
-           (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, notes,
-            home_sale_installment_id)
-         VALUES ($1,$2,$3,$4,'home_payment',$5,'pending','HOMEPMT',$6,$7,$8)
-         ON CONFLICT (home_sale_installment_id) WHERE home_sale_installment_id IS NOT NULL DO NOTHING
-         RETURNING id`,
-        [d.unit_id, d.lease_id, d.tenant_id, d.landlord_id, Number(d.amount).toFixed(2), d.billing_month,
-         `Home payment ${d.installment_number} of ${d.installments_total}`, d.installment_id])
-      if (ins.rows.length) {
-        await client.query(`UPDATE home_sale_installments SET payment_id=$1 WHERE id=$2 AND payment_id IS NULL`,
-          [ins.rows[0].id, d.installment_id])
+      // The bill carries the buyer's money, so take the household lock first,
+      // like every other writer of it — and like the mid-month attach does.
+      await lockHousehold(client, d.tenant_id, d.landlord_id)
+      const put = await billInstallmentOnItsOwnBill(
+        client,
+        { id: d.contract_id, unit_id: d.unit_id, lease_id: d.lease_id, tenant_id: d.tenant_id,
+          landlord_id: d.landlord_id, installments_total: d.installments_total,
+          own_bill: d.own_bill !== false },
+        { id: d.installment_id, installment_number: d.installment_number,
+          amount: d.amount, billing_month: d.billing_month },
+        asOf,
+      )
+      if (put) {
         billed++
         touchedContracts.add(d.contract_id)
       }
@@ -893,6 +1106,118 @@ export async function billDueHomeSaleInstallments(asOfMonth: string): Promise<nu
   }
   for (const cid of touchedContracts) await reconcileHomeSaleContract(cid)
   return billed
+}
+
+/**
+ * 10/25 (Nic) — THE REMINDER ON A CONTRACT GAM DOES NOT BILL.
+ *
+ *   "For now, with Dominic, we are going to send reminders about that contract
+ *    payment being due. But it is not going to go billed through the property.
+ *    It's not going to get invoiced through the property. It's just going to be
+ *    a ledger that keeps track and when that payment comes in, we will mark
+ *    that it was paid, but it stays off the books."
+ *
+ * There is no bill and no Pay Now here, so this notice IS the whole reminder:
+ * it says the amount, the date, and that the landlord collects it directly.
+ * Sending the buyer to a Payments page would be worse than saying nothing —
+ * the payment is not on it and never will be.
+ *
+ * Once per installment (reminded_at), so the nightly run reminds once and not
+ * every night. Stamped BEFORE the notice goes out: a reminder that fails is a
+ * reminder not sent twice, which is the right way round for email volume, and
+ * the ledger on the unit page shows what is due regardless.
+ *
+ * The landlord is deliberately not emailed. The money is theirs to collect and
+ * the ledger is on the unit page; a second email per month per contract buys
+ * nothing and GAM keeps its sending down. Easy to add if Nic wants it.
+ */
+export async function remindTrackedHomePayments(asOf: string): Promise<number> {
+  const due = await query<any>(
+    `SELECT i.id, i.installment_number, i.amount::text AS amount,
+            i.billing_month::text AS billing_month,
+            c.id AS contract_id, c.installments_total, c.landlord_id,
+            u.unit_number, pr.id AS property_id, pr.name AS property_name,
+            tu.id AS user_id, tu.email, tu.first_name,
+            COALESCE(NULLIF(btrim(l.business_name), ''), lu.first_name || ' ' || lu.last_name) AS landlord_name
+       FROM home_sale_installments i
+       JOIN home_sale_contracts c ON c.id = i.contract_id
+       JOIN units u  ON u.id = c.unit_id
+       JOIN properties pr ON pr.id = u.property_id
+       JOIN landlords l ON l.id = c.landlord_id
+       JOIN users lu ON lu.id = l.user_id
+       JOIN tenants t ON t.id = c.tenant_id
+       JOIN users tu ON tu.id = t.user_id
+      WHERE c.status = 'active'
+        AND c.tracked_not_billed
+        AND i.payment_id IS NULL
+        AND i.settled_off_platform_at IS NULL
+        AND i.reminded_at IS NULL
+        AND i.billing_month <= $1::date
+      ORDER BY c.id, i.installment_number`,
+    [asOf])
+
+  let sent = 0
+  for (const d of due) {
+    const stamped = await query(
+      `UPDATE home_sale_installments SET reminded_at = NOW()
+        WHERE id = $1 AND reminded_at IS NULL`, [d.id])
+    if ((stamped as any).length === 0 && (stamped as any).rowCount === 0) continue
+    const { createNotification } = await import('./notifications')
+    const { replyToProperty } = await import('./replyRouting')
+    const amount = `$${Number(d.amount).toFixed(2)}`
+    const when = d.billing_month
+    const where = [d.property_name, d.unit_number].filter(Boolean).join(' — ')
+    try {
+      await createNotification({
+        userId: d.user_id,
+        landlordId: d.landlord_id,
+        type: 'home_payment_due',
+        title: `Home payment due — ${amount}`,
+        body: `Your home payment of ${amount} for ${where} was due ${when} `
+            + `(payment ${d.installment_number} of ${d.installments_total}). `
+            + `${d.landlord_name ?? 'Your landlord'} collects this one directly, so it is not on your GAM bill `
+            + `and there is nothing to pay here — pay it the way you arranged, and it will be marked once it arrives.`,
+        sendEmail: true,
+        emailTo: d.email,
+        emailSubject: `Home payment due — ${amount}`,
+        // 10/5: a notice about somebody's home passes the property, so a reply
+        // reaches the people who run it rather than GAM.
+        replyTo: replyToProperty(d.property_id),
+      })
+      sent++
+    } catch (err) {
+      logger.error({ err, installmentId: d.id }, 'home sale: a tracked payment reminder did not go out')
+    }
+  }
+  return sent
+}
+
+/**
+ * 10/25 (Nic): "when that payment comes in, we will mark that it was paid, but
+ * it stays off the books." The mark is settled_off_platform_at — the same stamp
+ * GAM already uses for months paid before it started billing, which
+ * reconcileHomeSaleContract counts as paid, so payoff and handing the home over
+ * work unchanged. No invoice, no charge, no money through GAM.
+ */
+export async function markTrackedInstallmentPaid(
+  contractId: string, installmentNumber: number, paid: boolean,
+): Promise<{ installmentNumber: number; settled: boolean }> {
+  const row = await queryOne<{ id: string }>(
+    `SELECT i.id FROM home_sale_installments i
+       JOIN home_sale_contracts c ON c.id = i.contract_id
+      WHERE c.id = $1 AND c.tracked_not_billed AND i.installment_number = $2
+        AND i.payment_id IS NULL`,
+    [contractId, installmentNumber])
+  if (!row) {
+    throw new AppError(404,
+      'That payment is not one this contract tracks off the books — a payment GAM billed is marked on the bill itself.')
+  }
+  await query(
+    `UPDATE home_sale_installments
+        SET settled_off_platform_at = CASE WHEN $2::boolean THEN NOW() ELSE NULL END
+      WHERE id = $1`, [row.id, paid])
+  await reconcileHomeSaleContract(contractId)
+  return { installmentNumber, settled: paid }
 }
 
 /**

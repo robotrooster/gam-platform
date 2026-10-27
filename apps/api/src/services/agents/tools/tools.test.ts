@@ -1318,7 +1318,8 @@ describe('get_team (landlord, all-role roster)', () => {
       { name: 'Cy Wide', role: 'Bookkeeper', coverage: 'company-wide books (bank account, payouts, payroll)' },
     ])
     expect(res.members[2].coverage).not.toMatch(/payroll|bank/)   // Nora: no company-wide box
-    expect(res.pendingInvites[0]).toMatchObject({ email: 'new@x.dev', role: 'On-site Manager' })
+    // 10/25 (Nic): "Manager is not a word I would label with her permission set."
+    expect(res.pendingInvites[0]).toMatchObject({ email: 'new@x.dev', role: 'Front Desk' })
   })
 })
 

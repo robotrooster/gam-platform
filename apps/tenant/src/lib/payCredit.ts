@@ -62,6 +62,13 @@ export interface LeaseBill {
   /** Money owed now if the credit is saved (the old balance not included). */
   payIfSaved?:      number
   coversWholeBill?: boolean
+  /**
+   * 10/26 (Nic): this property does not let credit be saved up, so there is no
+   * question to ask — the credit goes on the bill and the tenant pays the rest.
+   * The server forces it either way (rentCharge); this is so the screen says
+   * what is happening instead of offering a button the server would refuse.
+   */
+  creditMustBeUsed?: boolean
   /** A bank payment on this bill bounced and is set to be tried again. Paying now replaces it. */
   scheduledRetries?: { nextRetryAt: string | null }[]
   /** Already paid and on its way (processing): clearing, not owed. */
@@ -116,6 +123,7 @@ export interface PayAllFigures {
   usableCredit:     number
   payIfUsed:        number
   coversWholeBill:  boolean
+  creditMustBeUsed?: boolean
   creditWaiting?:   number
   creditWaitingNote?: string | null
   /**
@@ -163,6 +171,7 @@ export function payAllView(bills: LeaseBill[]): LeaseBill[] {
       usableCredit: p.usableCredit,
       payIfUsed: p.payIfUsed,
       coversWholeBill: p.coversWholeBill,
+      creditMustBeUsed: p.creditMustBeUsed,
       creditWaiting: p.creditWaiting ?? 0,
       creditWaitingNote: p.creditWaitingNote ?? null,
       payAllAfter: order.slice(0, i),
@@ -196,11 +205,21 @@ export interface CreditOffer {
   coversWholeBill: boolean
   /** The old balance on these leases (credit never pays it, and neither answer includes it). */
   carried:         number
+  /**
+   * 10/26 (Nic): no bill in this set allows credit to be saved up, so the
+   * screen states that the credit is going on the bill instead of asking.
+   * Only when EVERY bill that HAS credit says so — a "Pay all" run spanning
+   * two properties, one of which allows saving, keeps the question rather than
+   * forcing one property's rule onto the other's bill.
+   */
+  mustUse:         boolean
 }
 
 /** The credit question for one bill, or for "Pay all" across several. */
 export function creditOffer(bills: LeaseBill[]): CreditOffer {
   let usable = 0, payIfUsed = 0, payIfSaved = 0, balance = 0, carried = 0
+  // Of the bills that actually have credit, how many forbid saving it up.
+  let withCredit = 0, forced = 0
   for (const l of payAllView(bills)) {
     const u = Math.max(0, l.usableCredit ?? 0)
     usable += u
@@ -208,12 +227,14 @@ export function creditOffer(bills: LeaseBill[]): CreditOffer {
     payIfSaved += requiredOf(l)
     balance += owedOf(l)
     carried += Math.max(0, l.carriedBalance ?? 0)
+    if (u > 0) { withCredit++; if (l.creditMustBeUsed === true) forced++ }
   }
   usable = roundCents(usable)
   payIfUsed = roundCents(payIfUsed)
   return {
     usable, payIfUsed, payIfSaved: roundCents(payIfSaved), balance: roundCents(balance), carried: roundCents(carried),
     coversWholeBill: usable > 0 && payIfUsed <= 0,
+    mustUse: usable > 0 && withCredit > 0 && forced === withCredit,
   }
 }
 

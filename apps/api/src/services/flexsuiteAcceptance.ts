@@ -6,7 +6,6 @@ import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { renderAcceptancePdf } from './flexsuitePdf'
 import { emailFlexsuiteEnrollment } from './email'
-import { FLEX_DEPOSIT_CUSTODY_FEE } from '@gam/shared'
 import { logger } from '../lib/logger'
 import { todayIn } from '../lib/timezone'
 
@@ -92,9 +91,12 @@ export async function renderFlexPayAcceptanceText(
     Bank_Name:              'Your verified bank account on file',
     Account_Last_4:         t.bank_last4 ?? '[Not on file]',
     Scheduled_Pull_Day:     String(ctx.pullDay),
-    // S562: the Subscription Terms hardcode the flat $25 fee in §3/§4 — there is
-    // no {{Selected_Monthly_Fee}} placeholder anymore. ctx.fee still flows into
-    // populatedContent below as the audit record of the fee accepted.
+    // 10/26: the fee is a service-tier price from the table, not a flat figure,
+    // so §3 and the signature block carry it as a placeholder again. (S562 had
+    // removed the old one when the fee was hardcoded at a flat $25 — a document
+    // must never state a price different from the one charged, in either
+    // direction.) ctx.fee stays in populatedContent as the audit record.
+    Monthly_Fee:            `$${ctx.fee.toFixed(2)}`,
     Signature_Date:         todayIn(t.timezone),
     Support_Phone_Number:   process.env.SUPPORT_PHONE_NUMBER || '[See support contact in app]',
     Tenant_Signature:       '[Click-accepted electronically; see audit record]',
@@ -102,8 +104,17 @@ export async function renderFlexPayAcceptanceText(
     Tenant_User_Agent:      ctx.userAgent || '[Not recorded]',
   }
 
+  const renderedText = substitute(template, vars)
+  // 10/26: substitute() turns ANY unresolved placeholder into "[Not Provided]".
+  // That is tolerable for a phone number and unacceptable for a price: a
+  // document a resident accepts must never say "Monthly Fee: [Not Provided]".
+  // So a price that did not resolve refuses to render at all.
+  if (!renderedText.includes(vars.Monthly_Fee as string)) {
+    throw new Error(
+      'FlexPay terms did not render the Monthly Fee — refusing to show terms with no price')
+  }
   return {
-    renderedText:     substitute(template, vars),
+    renderedText,
     populatedContent: { pullDay: ctx.pullDay, fee: ctx.fee, bankLast4: t.bank_last4 },
   }
 }
@@ -123,6 +134,12 @@ export interface FlexDepositAcceptanceContext {
   installmentCount:   number
   installments:       FlexDepositInstallment[]
   totalInstallmentAmount: number  // dollars (sum of all installment amounts = deposit total)
+  /**
+   * 10/26: the one-time service fee for this plan, from
+   * flexdeposit_fee_schedule — collected IN FULL with installment 1. Replaces
+   * the $3/month custody fee. Never part of the custody balance.
+   */
+  serviceFee:         number
   moveInDate:         string  // YYYY-MM-DD
   ip:                 string | null
   userAgent:          string | null
@@ -187,7 +204,12 @@ export async function renderFlexDepositAcceptanceText(
     Total_Installments:       String(ctx.installmentCount),
     Total_Installment_Amount: ctx.totalInstallmentAmount.toFixed(2),
     Deposit_Total:            ctx.totalInstallmentAmount.toFixed(2),
-    Custody_Fee:              FLEX_DEPOSIT_CUSTODY_FEE.toFixed(2),
+    // 10/26: the plan's one-time service fee. The agreement must state the
+    // price actually charged — see the guard below, which refuses to render a
+    // deposit agreement whose fee did not resolve.
+    Service_Fee:              ctx.serviceFee.toFixed(2),
+    First_Pull_Total:         (ctx.installments[0]?.amount != null
+                                ? ctx.installments[0].amount + ctx.serviceFee : ctx.serviceFee).toFixed(2),
     // S654: signed on the property's calendar, not UTC's.
     Signature_Date:           todayIn(t.timezone),
     Tenant_Signature:         '[Click-accepted electronically; see audit record]',
@@ -200,14 +222,33 @@ export async function renderFlexDepositAcceptanceText(
     vars[`Installment_${inst.number}_Amount`] = inst.amount.toFixed(2)
   }
 
+  const renderedText = substitute(trimmed, vars)
+  // 10/26: the agreement must never render with an unresolved price —
+  // substitute() turns any leftover placeholder into "[Not Provided]", which in
+  // a deposit agreement somebody ACCEPTS is worse than no agreement at all.
+  // Same guard as the FlexPay terms above.
+  if (!renderedText.includes(vars.Service_Fee as string)) {
+    throw new Error(
+      'FlexDeposit agreement did not render the Service Fee — refusing to show an agreement with no price')
+  }
   return {
-    renderedText: substitute(trimmed, vars),
+    renderedText,
     populatedContent: {
       depositId:              ctx.depositId,
       installmentCount:       ctx.installmentCount,
       installments:           ctx.installments,
       totalInstallmentAmount: ctx.totalInstallmentAmount,
-      custodyFeeMonthly:      FLEX_DEPOSIT_CUSTODY_FEE,
+      // 10/26: THE AUDIT RECORD OF WHAT THEY ACCEPTED.
+      //
+      // This used to store `custodyFeeMonthly: FLEX_DEPOSIT_CUSTODY_FEE` — the
+      // deprecated $3/month figure — and nothing about the real fee. So every
+      // acceptance written after the fee moved to the table would have stored
+      // evidence saying a monthly custody fee applied, contradicting the
+      // agreement text this same function rendered, while never recording the
+      // price the person actually agreed to pay. On a signed financial document
+      // that is the worst direction for a record to be wrong in.
+      serviceFee:             ctx.serviceFee,
+      firstPullTotal:         vars.First_Pull_Total,
       moveInDate:             ctx.moveInDate,
       bankLast4:              t.bank_last4,
     },
@@ -429,10 +470,11 @@ export async function renderReAcceptanceTerms(args: {
   const dep = await queryOne<{
     id: string; total_amount: string; installment_count: number;
     lease_id: string; start_date: string; rent_due_day: number;
-    installment_amount: string
+    installment_amount: string; flex_deposit_service_fee: string | null
   }>(
     `SELECT sd.id, sd.total_amount::text, sd.installment_count,
             sd.lease_id, sd.installment_amount::text,
+            sd.flex_deposit_service_fee::text,
             l.start_date::text, l.rent_due_day
        FROM security_deposits sd
        JOIN leases l ON l.id = sd.lease_id
@@ -465,6 +507,13 @@ export async function renderReAcceptanceTerms(args: {
   }))
   const totalInstallmentAmount = installments.reduce((s, x) => s + x.amount, 0)
 
+  // 10/26: the fee THIS plan was sold at, from the plan — never re-quoted.
+  // A plan with no stored fee cannot be re-rendered honestly, so it refuses
+  // rather than printing "[Not Provided]" where the price belongs.
+  if (dep.flex_deposit_service_fee == null) {
+    throw new AppError(409,
+      'This FlexDeposit plan has no service fee on record, so its agreement cannot be re-rendered.')
+  }
   return renderFlexDepositAcceptanceText({
     tenantId:               args.tenantId,
     userId:                 args.userId,
@@ -472,6 +521,7 @@ export async function renderReAcceptanceTerms(args: {
     installmentCount:       dep.installment_count,
     installments,
     totalInstallmentAmount,
+    serviceFee:             Number(dep.flex_deposit_service_fee),
     moveInDate:             dep.start_date.slice(0, 10),
     ip:                     args.ip,
     userAgent:              args.userAgent,

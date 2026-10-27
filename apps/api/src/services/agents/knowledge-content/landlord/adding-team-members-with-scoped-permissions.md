@@ -7,7 +7,7 @@ As your portfolio grows, you'll want help running it. GAM lets you invite team m
 You can add four kinds of team members:
 
 - Property Manager — your right hand for day-to-day operations: properties, units, tenants, leases, and team management when you grant it.
-- On-Site Manager — someone stationed at a property handling on-the-ground tasks.
+- Front Desk — the person working a counter at a property you assign them to: taking reservations, checking guests in and out, ringing sales on the register and reading meters. Not leases, not refunds, not property settings — you grant each ability and the ones you leave off stay off.
 - Maintenance — a worker who receives and works repair requests.
 - Bookkeeper — sees the money for the properties you tick for them (money in, money out, receipts and maintenance costs) and does the full bookkeeping on it: adding, correcting, removing and paying expenses and bills. Every bookkeeper works at the same level; there is no read-only setting. They never work a tenant's account (no rent payments, credits, late fees or refunds). The company's bank account, payouts and payroll are a separate "Company-wide" box you tick only if they should see them.
 

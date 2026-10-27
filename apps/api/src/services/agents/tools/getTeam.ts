@@ -8,6 +8,7 @@
  * maintenance workers); this answers "who's on my team / who has access?".
  */
 
+import { LANDLORD_ASSIGNABLE_ROLE_LABEL } from '@gam/shared'
 import { query } from '../../../db'
 import { keptIdsSql, coversAllSql, companyWideSql, formerSql } from '../../../lib/bookkeeperScope'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
@@ -28,12 +29,11 @@ interface MemberRow {
   monthly_report: boolean | null
 }
 
-const ROLE_LABEL: Record<string, string> = {
-  property_manager: 'Property Manager',
-  onsite_manager: 'On-site Manager',
-  maintenance: 'Maintenance',
-  bookkeeper: 'Bookkeeper',
-}
+// 10/25: this was a second copy of LANDLORD_ASSIGNABLE_ROLE_LABEL, and it had
+// already drifted — "On-site Manager" here against "On-Site Manager" in shared.
+// So renaming the role for Nic would have fixed every screen and left the
+// assistant still calling his front desk person a manager. One map now.
+const ROLE_LABEL: Record<string, string> = LANDLORD_ASSIGNABLE_ROLE_LABEL
 
 export const getTeam: AgentTool = {
   name: 'get_team',

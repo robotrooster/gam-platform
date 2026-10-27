@@ -16,7 +16,7 @@ import '@fontsource/inter/700.css'
 import '@fontsource/jetbrains-mono/400.css'
 import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
-import { installDatePickerAutoClose, humanize } from '@gam/shared'
+import { installDatePickerAutoClose, humanize, installPrintLightTheme } from '@gam/shared'
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { useState } from 'react'
@@ -165,6 +165,11 @@ export default function App() {
 }
 
 installDatePickerAutoClose()
+
+// 10/26 (Nic): a printed page is always the light theme, whatever the screen
+// is set to — he printed an eviction balance summary in dark mode and got a
+// solid black sheet. Installed once here; restores the viewer's theme after.
+installPrintLightTheme()
 
 // HMR guard: when Vite re-executes this entry module, calling createRoot on
 // the same container again STACKS a second mounted app under the first

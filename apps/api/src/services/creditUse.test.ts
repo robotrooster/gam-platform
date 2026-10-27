@@ -244,9 +244,26 @@ describe('which bills credit may pay', () => {
     }
   })
 
-  it('shelved 4: home payments are never paid by any credit', async () => {
+  /**
+   * 10/26 (Nic): "let their own overpayment pay a trailer payment." Kim Bowman
+   * paid $550 against $639.60; it settled rent, water and the late fee exactly,
+   * and the $10.40 left over became paid-ahead credit that could never reach
+   * the $100 home payment he still owed. His own money, against his own bill.
+   */
+  it("a tenant's OWN overpayment pays a home payment", async () => {
     const h = await house()
     await paidAhead(h, 500)
+    const home = await charge(h, { amount: 200, type: 'home_payment', entry: 'HOMEPMT' })
+    const q = await quote(h)
+    expect(q.plan.map(l => [l.creditKind, l.amount])).toEqual([['paid_ahead', 200]])
+    expect((await wholeBill(h)).settledIds).toEqual([home])
+    expect(await statusOf(home)).toBe('settled')
+  })
+
+  it('but credit the landlord ISSUED still never buys somebody a trailer', async () => {
+    // Hours worked and a goodwill credit are not the buyer's money, which is
+    // the same rule that keeps work trade off a home payment.
+    const h = await house()
     await issued(h, 500)
     await issued(h, 500, { leaseId: null })
     const home = await charge(h, { amount: 200, type: 'home_payment', entry: 'HOMEPMT' })
@@ -254,6 +271,17 @@ describe('which bills credit may pay', () => {
     expect(q.plan).toEqual([])
     expect(q.leases[0].bankPayableTotal).toBe(200)   // the desk may still take it
     expect((await wholeBill(h)).settledIds).toEqual([])
+    expect(await statusOf(home)).toBe('pending')
+  })
+
+  it("a home payment takes the tenant's own money even when it only covers part", async () => {
+    // Bowman's actual shape: $10.40 of change against a $100 line.
+    const h = await house()
+    await paidAhead(h, 10.40)
+    const home = await charge(h, { amount: 100, type: 'home_payment', entry: 'HOMEPMT' })
+    const q = await quote(h)
+    expect(q.plan.map(l => [l.creditKind, l.amount])).toEqual([['paid_ahead', 10.40]])
+    // Part of a line, the rest still owed — never a partial settle.
     expect(await statusOf(home)).toBe('pending')
   })
 

@@ -398,7 +398,12 @@ describe('enrollFlexPay', () => {
     })
     expect(r.ok).toBe(true)
     if (r.ok) {
-      expect(r.fee).toBe(25)  // S562: flat $25 regardless of pull day
+      // 10/26: priced from the table. This tenant has no open bill yet, so the
+      // basis is their LEASE RENT ($1,000 from seedLease) rather than zero —
+      // zero quotes the cheapest bracket and then charges more on the first
+      // real bill, and that figure goes into the terms they sign. $1,000 is the
+      // $1,000-1,499 bracket; pull day 10 is the 2nd benefit Wednesday.
+      expect(r.fee).toBe(28)
       expect(r.acceptanceId).toBe('acc_mock_id')
     }
     const { rows: [t] } = await db.query<any>(
@@ -406,7 +411,7 @@ describe('enrollFlexPay', () => {
               flexpay_enrolled_at FROM tenants WHERE id=$1`, [tenantId])
     expect(t.flexpay_enrolled).toBe(true)
     expect(t.flexpay_pull_day).toBe(10)
-    expect(Number(t.flexpay_monthly_fee)).toBe(25)
+    expect(Number(t.flexpay_monthly_fee)).toBe(28)
     expect(t.flexpay_enrolled_at).not.toBeNull()
     expect(recordAcceptanceMock).toHaveBeenCalledWith(expect.objectContaining({
       tenantId, userId, productType: 'flexpay',
@@ -584,12 +589,14 @@ describe('changeFlexPayPullDay', () => {
     const out = await changeFlexPayPullDay(tenantId, 20)
     expect(out.ok).toBe(true)
     expect(out.pullDay).toBe(20)
-    expect(out.fee).toBe(25)            // $5 + 20
+    // 10/26: moving the pull day CAN change the price, because the benefit
+    // Wednesday is part of it. Day 20 is the 3rd Wednesday on a $1,000 basis.
+    expect(out.fee).toBe(40)
     expect(out.effective).toBe('next_cycle')
     const { rows: [t] } = await db.query<any>(
       `SELECT flexpay_pull_day, flexpay_monthly_fee FROM tenants WHERE id=$1`, [tenantId])
     expect(t.flexpay_pull_day).toBe(20)
-    expect(Number(t.flexpay_monthly_fee)).toBe(25)
+    expect(Number(t.flexpay_monthly_fee)).toBe(40)
   })
 
   it('invalid pull day → rejected, no change', async () => {

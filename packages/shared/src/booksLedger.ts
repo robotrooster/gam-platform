@@ -970,6 +970,10 @@ export const LEDGER_EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   monthly_fee_accruals: "GAM's fee worked out; what the landlord owes posts through landlord_gam_charges (design H1)",
   platform_fee_config: CONFIGURATION,
   landlord_platform_fee_overrides: CONFIGURATION,
+  // 10/26: the FlexPay and FlexDeposit price grids. A price card, like the
+  // platform's own; what a tenant is actually charged posts from the charge.
+  flexpay_fee_schedule: CONFIGURATION,
+  flexdeposit_fee_schedule: CONFIGURATION,
   pm_monthly_fee_accruals: 'the PM company owner-statement layer, not a landlord posting source',
   user_balance_ledger: 'balances follow from allocation_splits and the payout records',
   ledger_derived_facts: 'a note on which stored facts were worked out, not money moved',

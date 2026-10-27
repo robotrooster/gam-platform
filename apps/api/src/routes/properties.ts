@@ -1843,6 +1843,16 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
           operator_owns_land      = COALESCE($17, operator_owns_land),
           lease_signing_email = CASE WHEN $18::boolean THEN $19 ELSE lease_signing_email END,
           lease_signing_name  = CASE WHEN $20::boolean THEN $21 ELSE lease_signing_name  END,
+          -- 10/25 (Nic): "Let landlords choose how it gets bundled." TRUE
+          -- (default) gives an installment (home/trailer) payment its own bill,
+          -- paid separately from the space rent; FALSE puts it on the rent bill.
+          home_payments_own_bill = COALESCE($23, home_payments_own_bill),
+          -- 10/26 (Nic): whether a tenant may keep account credit instead of
+          -- putting it on the bill they are paying. FALSE and the pay screen
+          -- never offers "Save it for later". Credit already lands on an open
+          -- balance by itself everywhere (10/15); this is only the payer's
+          -- option to hold it back.
+          credit_save_up_allowed = COALESCE($24, credit_save_up_allowed),
           updated_at  = NOW()
         WHERE id=$15 RETURNING *`,
         [name||null, street1||null, street2||null, city||null, state||null,
@@ -1862,7 +1872,13 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
          // purpose clears it; COALESCE could never clear a wrong suite line.
          // Not sent = left alone. storedAddressOf above reads it the same way,
          // so the duplicate check and the audit row see what is stored.
-         raw.street2 !== undefined]
+         raw.street2 !== undefined,
+         // $23 and after come AFTER $22, the street2-was-sent flag above. A new
+         // setting appends here; it never takes a number already in use, which
+         // would silently swap two columns' values.
+         typeof raw.homePaymentsOwnBill === 'boolean' ? raw.homePaymentsOwnBill : null,
+         // $24
+         typeof raw.creditSaveUpAllowed === 'boolean' ? raw.creditSaveUpAllowed : null]
       )).rows[0]
       // S649: a property that moved states is due in the new state's timezone.
       if (addressChangedState) {

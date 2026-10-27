@@ -32,7 +32,7 @@ import {
 
 const {
   isFlexChargeVisibleMock, getFlexChargeAccountsForTenantMock, disputeFlexChargeTransactionMock,
-  isFlexPayVisibleMock, getFlexPayEligibilityMock, calculateFlexPayFeeMock,
+  isFlexPayVisibleMock, getFlexPayEligibilityMock,
   enrollFlexPayMock, cancelFlexPayMock,
   isFlexDepositVisibleMock, getFlexDepositEligibilityMock,
   enrollFlexDepositMock, payAheadFlexDepositMock, cancelFlexDepositMock,
@@ -46,7 +46,6 @@ const {
   disputeFlexChargeTransactionMock:  vi.fn(async (..._a: any[]) => ({ ok: true, status: 'disputed' })),
   isFlexPayVisibleMock:              vi.fn(async () => true),
   getFlexPayEligibilityMock:         vi.fn(async (..._a: any[]) => ({ eligible: true, reasons: [] })),
-  calculateFlexPayFeeMock:           vi.fn((day: number) => 5 + day),
   enrollFlexPayMock:                 vi.fn<any[], Promise<{ ok: boolean; fee?: number; acceptanceId?: string; reason?: string }>>(
     async () => ({ ok: true, fee: 20, acceptanceId: 'acc_mock' })),
   cancelFlexPayMock:                 vi.fn(async (..._a: any[]) => undefined),
@@ -85,7 +84,6 @@ vi.mock('../services/flexpay', async (importOriginal) => {
     ...actual,
     isFlexPayVisible:      isFlexPayVisibleMock,
     getFlexPayEligibility: getFlexPayEligibilityMock,
-    calculateFlexPayFee:   calculateFlexPayFeeMock,
     enrollFlexPay:         enrollFlexPayMock,
     cancelFlexPay:         cancelFlexPayMock,
   }
@@ -144,7 +142,6 @@ beforeEach(async () => {
   disputeFlexChargeTransactionMock.mockClear(); disputeFlexChargeTransactionMock.mockResolvedValue({ ok: true, status: 'disputed' } as any)
   isFlexPayVisibleMock.mockClear(); isFlexPayVisibleMock.mockResolvedValue(true)
   getFlexPayEligibilityMock.mockClear(); getFlexPayEligibilityMock.mockResolvedValue({ eligible: true, reasons: [] } as any)
-  calculateFlexPayFeeMock.mockClear(); calculateFlexPayFeeMock.mockImplementation((day: number) => 5 + day)
   enrollFlexPayMock.mockClear(); enrollFlexPayMock.mockResolvedValue({ ok: true, fee: 20, acceptanceId: 'acc_mock' })
   cancelFlexPayMock.mockClear(); cancelFlexPayMock.mockResolvedValue(undefined as any)
   isFlexDepositVisibleMock.mockClear(); isFlexDepositVisibleMock.mockResolvedValue(true)
@@ -221,6 +218,18 @@ describe('FlexCharge — GET + dispute', () => {
   })
 })
 
+/**
+ * What the two priced FlexPay routes quote this fixture's tenant: $33.
+ *
+ * 10/26: both read the price from flexpay_fee_schedule (quoteFlexPayCycleFee /
+ * requireFlexPayCycleFee), not from the deprecated flat fee — so the real
+ * grid prices these two, and no mock stands in for it. seedTenantFixture's
+ * tenant has no open bill, so FlexPay would front $0, which is the
+ * $0-999.99 bracket; pull day 15 is the 3rd benefit Wednesday
+ * (benefitWednesdayForPullDay: 15-21 → 3). That cell of the grid is $33.
+ */
+const FEE_NO_BILL_WED_3 = 33
+
 describe('FlexPay — GET + enroll + terms + DELETE', () => {
   it('GET /flexpay visible=false → {visible:false}', async () => {
     const f = await seedTenantFixture()
@@ -245,7 +254,7 @@ describe('FlexPay — GET + enroll + terms + DELETE', () => {
     expect(res.body.data.visible).toBe(true)
     expect(res.body.data.flexpay_enrolled).toBe(true)
     expect(res.body.data.flexpay_pull_day).toBe(15)
-    expect(res.body.data.previewFee).toBe(20)  // calculateFlexPayFee(15) = 5+15
+    expect(res.body.data.previewFee).toBe(FEE_NO_BILL_WED_3)   // priced from the schedule table
     expect(res.body.data.eligibility).toMatchObject({ eligible: true })
   })
 
@@ -283,7 +292,7 @@ describe('FlexPay — GET + enroll + terms + DELETE', () => {
       .set('Authorization', `Bearer ${f.token}`)
     expect(ok.status).toBe(200)
     expect(ok.body.data).toMatchObject({
-      version: 'v1.0', pullDay: 15, fee: 20, renderedText: 'flexpay terms',
+      version: 'v1.0', pullDay: 15, fee: FEE_NO_BILL_WED_3, renderedText: 'flexpay terms',
     })
   })
 
@@ -453,14 +462,21 @@ describe('FlexDeposit — GET + enroll + terms + retry + DELETE', () => {
       .get('/api/tenants/flexdeposit/terms?installmentCount=7')
       .set('Authorization', `Bearer ${f.token}`)
     expect(bad.status).toBe(400)
-    expect(bad.body.error).toMatch(/installmentCount must be an integer 2\.\.6/)
+    expect(bad.body.error).toMatch(/Choose 2 payments or 4/)
+
+    // 10/26: and 3 is refused too, though it sits inside the old 2..6 range —
+    // FlexDeposit sells exactly two splits, so this is membership not a range.
+    const three = await request(buildApp())
+      .get('/api/tenants/flexdeposit/terms?installmentCount=3')
+      .set('Authorization', `Bearer ${f.token}`)
+    expect(three.status).toBe(400)
 
     const ok = await request(buildApp())
-      .get('/api/tenants/flexdeposit/terms?installmentCount=3')
+      .get('/api/tenants/flexdeposit/terms?installmentCount=4')
       .set('Authorization', `Bearer ${f.token}`)
     expect(ok.status).toBe(200)
     expect(ok.body.data).toMatchObject({
-      version: 'v1.0', installmentCount: 3, uncollectedAtMoveIn: 1000, renderedText: 'deposit terms',
+      version: 'v1.0', installmentCount: 4, uncollectedAtMoveIn: 1000, renderedText: 'deposit terms',
     })
   })
 

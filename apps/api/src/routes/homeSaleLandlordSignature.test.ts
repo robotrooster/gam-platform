@@ -122,6 +122,20 @@ async function seed(o: { firstPaymentOffset?: number; billStatus?: 'pending' | '
 const homeLines = (invoiceId: string) => query<any>(
   `SELECT amount::float AS amount, status, notes, lease_id, due_date::text AS due_date
      FROM payments WHERE invoice_id = $1 AND type = 'home_payment' ORDER BY notes`, [invoiceId])
+/**
+ * 10/25 (Nic): the trailer payment's own bill(s) for a unit's sale, and the
+ * lines on them. "Should trailer payments get their own invoice separately
+ * payable from lot rent? Yeah, let's do that."
+ */
+const ownBillLines = (unitId: string) => query<any>(
+  `SELECT p.amount::float AS amount, p.status, p.notes, p.lease_id, p.due_date::text AS due_date,
+          i.total_amount::float AS bill_total, i.subtotal_home_payments::float AS bill_home,
+          i.late_fee_exempt, i.lease_id AS bill_lease_id
+     FROM payments p
+     JOIN invoices i ON i.id = p.invoice_id
+     JOIN home_sale_contracts c ON c.id = i.home_sale_contract_id
+    WHERE c.unit_id = $1 AND p.type = 'home_payment'
+    ORDER BY p.notes`, [unitId])
 const bill = (invoiceId: string) => queryOne<any>(
   `SELECT total_amount::float AS total, subtotal_home_payments::float AS home, status FROM invoices WHERE id = $1`, [invoiceId])
 const sale = (unitId: string) => queryOne<any>(
@@ -131,7 +145,7 @@ const sale = (unitId: string) => queryOne<any>(
      FROM home_sale_contracts c WHERE unit_id = $1 AND status <> 'cancelled'`, [unitId])
 
 describe("10/12: the landlord's signature starts a home sale billing", () => {
-  it("puts this month's home payment on the buyer's open bill the moment the landlord signs — with no lease on the contract", async () => {
+  it("puts this month's home payment on a bill of its own the moment the landlord signs — with no lease on the contract", async () => {
     const s = await seed()
     const res = await request(buildApp()).post(`/api/esign/sign/${s.docId}`)
       .set('Authorization', `Bearer ${s.landlordToken}`).send({ fieldValues: [] })
@@ -144,10 +158,18 @@ describe("10/12: the landlord's signature starts a home sale billing", () => {
     expect(c.paid_outside).toBe(2)
     expect(c.installments_billed).toBe(3)
     expect(c.installments_paid).toBe(2)
-    expect(await homeLines(s.invoiceId)).toEqual([
-      { amount: 150, status: 'pending', notes: 'Home payment 3 of 12', lease_id: s.leaseId, due_date: s.thisMonth },
+    // 10/25: the rent bill is untouched; the trailer payment is its own bill.
+    expect(await homeLines(s.invoiceId)).toHaveLength(0)
+    expect(await bill(s.invoiceId)).toMatchObject({ total: 466.5, home: 0, status: 'pending' })
+    // The BILL belongs to no lease, but the CHARGE still carries the buyer's
+    // lease, resolved from the unit when the contract names none (which this
+    // one does not — S651: a sale stands on its own). The books, the deposit
+    // sweep and the bank-deposit match all read payments.lease_id, so only
+    // which bill it sits on changed, exactly as intended.
+    expect(await ownBillLines(s.unitId)).toEqual([
+      { amount: 150, status: 'pending', notes: 'Home payment 3 of 12', lease_id: s.leaseId, due_date: s.thisMonth,
+        bill_total: 150, bill_home: 150, late_fee_exempt: true, bill_lease_id: null },
     ])
-    expect(await bill(s.invoiceId)).toMatchObject({ total: 616.5, home: 150, status: 'pending' })
   })
 
   it('the buyer signing afterwards bills nothing twice', async () => {
@@ -161,24 +183,31 @@ describe("10/12: the landlord's signature starts a home sale billing", () => {
 
     const c = await sale(s.unitId)
     expect(c).toMatchObject({ status: 'active', installments: 12, installments_billed: 3 })
-    expect(await homeLines(s.invoiceId)).toHaveLength(1)
-    expect(await bill(s.invoiceId)).toMatchObject({ total: 616.5, home: 150 })
+    expect(await homeLines(s.invoiceId)).toHaveLength(0)
+    expect(await bill(s.invoiceId)).toMatchObject({ total: 466.5, home: 0 })
+    expect(await ownBillLines(s.unitId)).toHaveLength(1)
     const all = await query<any>(`SELECT 1 FROM payments WHERE type = 'home_payment'`)
     expect(all).toHaveLength(1)
   })
 
-  it('a bill already paid never grows a line — the monthly run bills it instead', async () => {
+  it('is billed even when the rent bill for the month is already paid', async () => {
+    // 10/25: a paid bill must never grow a line, which used to mean waiting for
+    // the monthly run. The trailer payment is on no rent bill now, so a settled
+    // rent bill neither grows nor delays anything.
     const s = await seed({ billStatus: 'settled' })
     await request(buildApp()).post(`/api/esign/sign/${s.docId}`)
       .set('Authorization', `Bearer ${s.landlordToken}`).send({ fieldValues: [] }).expect(200)
     expect((await sale(s.unitId)).status).toBe('active')
     expect(await homeLines(s.invoiceId)).toHaveLength(0)
     expect(await bill(s.invoiceId)).toMatchObject({ total: 466.5, status: 'settled' })
+    expect(await ownBillLines(s.unitId)).toMatchObject([
+      { amount: 150, notes: 'Home payment 3 of 12', bill_total: 150, late_fee_exempt: true },
+    ])
     const waiting = await query<any>(
       `SELECT i.installment_number FROM home_sale_installments i JOIN home_sale_contracts c ON c.id = i.contract_id
         WHERE c.unit_id = $1 AND i.payment_id IS NULL AND i.settled_off_platform_at IS NULL AND i.billing_month <= $2::date`,
       [s.unitId, s.thisMonth])
-    expect(waiting.map(w => w.installment_number)).toEqual([3])
+    expect(waiting).toHaveLength(0)
   })
 
   it('months still to come never bill early — the same rule a lease follows', async () => {
@@ -189,6 +218,8 @@ describe("10/12: the landlord's signature starts a home sale billing", () => {
     expect(c).toMatchObject({ status: 'active', installments: 12, paid_outside: 0, installments_billed: 0 })
     expect(await homeLines(s.invoiceId)).toHaveLength(0)
     expect(await bill(s.invoiceId)).toMatchObject({ total: 466.5, home: 0 })
+    // Nothing due yet, so not even a bill of its own was opened.
+    expect(await ownBillLines(s.unitId)).toHaveLength(0)
   })
 
   it("a buyer who belongs to another company waits for their own signature (S655)", async () => {
@@ -219,18 +250,22 @@ describe("10/12: the landlord's signature starts a home sale billing", () => {
 })
 
 /**
- * "A charge the tenant could not have seen cannot make them late." An
- * installment that joins a bill AFTER the bill went late never keeps it late:
- * the fee already on it stays as it was, and no new fee starts because of it.
+ * 10/25 (Nic): A TRAILER PAYMENT IS NEVER LATE-FEE'D, AND NEVER AFFECTS THE
+ * RENT BILL'S FEES.
+ *
+ * S652/10-12 had a careful rule for this: an installment that joined a rent
+ * bill AFTER the bill went late must not keep it late. That rule was needed
+ * because the installment rode the rent bill. It no longer does — it is its own
+ * bill, written late_fee_exempt — so the two questions are now simply separate:
+ * the rent bill's fees are whatever the rent alone makes them, and the trailer
+ * bill is never fined at all. A purchase agreement carries no late-fee terms,
+ * and billing is pure lease-stamp (S558), so there is nothing to fine under.
  */
-describe('a home payment added to a bill that is already late', () => {
+describe('late fees and the trailer payment', () => {
   async function lateBill() {
     const s = await seed()
     // The bill came due ten days ago; grace is 3 days; $50 on day 3, then $5 a
-    // day. The rent was paid on day 4. The water is still owed when the
-    // landlord signs — the bill is still open, so the home payment joins it —
-    // and is paid right after (settleTheRest): from then on the home payment
-    // is the only thing unpaid on the bill.
+    // day. The rent was paid on day 4; the water is still owed.
     const due = (await queryOne<{ d: string }>(`SELECT ((NOW() AT TIME ZONE $1)::date - 10)::text AS d`, [TZ]))!.d
     const month = due.slice(0, 7) + '-01'
     await db.query(`UPDATE properties SET first_billing_cycle = $2 WHERE id = (SELECT property_id FROM units WHERE id = $1)`, [s.unitId, month])
@@ -263,61 +298,70 @@ describe('a home payment added to a bill that is already late', () => {
       await c.query(`UPDATE home_sale_contracts SET purchase_document_id = $2 WHERE id = $1`, [k.id, s.docId])
       await c.query('COMMIT')
     } finally { c.release() }
-    return { ...s, due }
+    return { ...s, due, month }
   }
-  /** The tenant pays what was on the bill before the home payment joined it. */
+  /** The tenant pays what was on the rent bill. */
   const settleTheRest = (invoiceId: string) => db.query(
     `UPDATE payments SET status = 'settled', settled_at = NOW() - interval '6 days'
       WHERE invoice_id = $1 AND type NOT IN ('late_fee', 'home_payment') AND status <> 'settled'`, [invoiceId])
   const fees = (invoiceId: string) => query<any>(
     `SELECT amount::float AS amount, due_date::text AS due_date FROM payments
       WHERE invoice_id = $1 AND type = 'late_fee' ORDER BY due_date`, [invoiceId])
+  const ownBillId = (unitId: string, month: string) => queryOne<any>(
+    `SELECT i.id, i.late_fee_exempt FROM invoices i
+       JOIN home_sale_contracts c ON c.id = i.home_sale_contract_id
+      WHERE c.unit_id = $1 AND i.due_date = $2::date`, [unitId, month])
 
-  it('the late fee already on the bill stays as it is, and no new one starts', async () => {
+  it('the rent bill is untouched: its fee stays as it was and no new one starts', async () => {
     const s = await lateBill()
     const before = await fees(s.invoiceId)
     expect(before).toHaveLength(1)
 
     expect((await activateHomeSaleContract(s.docId)).activated).toBe(true)
-    expect(await homeLines(s.invoiceId)).toHaveLength(1)   // it did join the late bill
+    // It never joined the late bill at all.
+    expect(await homeLines(s.invoiceId)).toHaveLength(0)
     await settleTheRest(s.invoiceId)
 
     await generateLateFeesForInvoice(s.invoiceId)
     expect(await fees(s.invoiceId)).toEqual(before)
   })
 
-  it('without the rule the same line would have restarted the daily fee — a line written with the bill still counts', async () => {
+  it("the trailer bill is never fined, however long it sits unpaid", async () => {
     const s = await lateBill()
     await activateHomeSaleContract(s.docId)
-    // As if the monthly run had written it with the bill, before it was late.
+    const own = await ownBillId(s.unitId, s.month)
+    expect(own.late_fee_exempt).toBe(true)
+    // Backdate it well past any grace and run the fees at it directly.
+    await db.query(`UPDATE invoices SET due_date = $2::date - 10, created_at = $2::date - 13 WHERE id = $1`,
+      [own.id, s.due])
+    await db.query(`UPDATE payments SET due_date = $2::date - 10, created_at = $2::date - 13 WHERE invoice_id = $1`,
+      [own.id, s.due])
+    await generateLateFeesForInvoice(own.id)
+    expect(await fees(own.id)).toHaveLength(0)
+  })
+
+  it('the rent bill still accrues on its own unpaid rent — the trailer payment is simply not part of it', async () => {
+    const s = await lateBill()
+    await activateHomeSaleContract(s.docId)
+    // The rent itself is left unpaid: the fees run as they always did.
     await db.query(
-      `UPDATE payments SET created_at = $2::date - 3 WHERE invoice_id = $1 AND type = 'home_payment'`, [s.invoiceId, s.due])
-    await settleTheRest(s.invoiceId)
+      `UPDATE payments SET status = 'pending', settled_at = NULL
+        WHERE invoice_id = $1 AND type = 'rent'`, [s.invoiceId])
     await generateLateFeesForInvoice(s.invoiceId)
     const after = await fees(s.invoiceId)
     expect(after.length).toBeGreaterThan(1)
     expect(after.slice(1).every(f => f.amount === 5)).toBe(true)
   })
-
-  it('a bill the monthly run wrote late (a catch-up) carries its home payment like any other line', async () => {
-    const s = await lateBill()
-    await activateHomeSaleContract(s.docId)
-    // The run caught up two days after the grace ended and wrote the home
-    // payment with the bill, the same day. Nothing on it was added later.
-    await db.query(`UPDATE invoices SET created_at = $2::date + 5 WHERE id = $1`, [s.invoiceId, s.due])
-    await db.query(
-      `UPDATE payments SET created_at = $2::date + 5 WHERE invoice_id = $1 AND type = 'home_payment'`, [s.invoiceId, s.due])
-    await settleTheRest(s.invoiceId)
-    await generateLateFeesForInvoice(s.invoiceId)
-    expect((await fees(s.invoiceId)).length).toBeGreaterThan(1)
-  })
 })
 
 /**
- * 10/12 review: what counts as the buyer's OPEN bill when the landlord signs.
+ * 10/12 review asked which of the buyer's bills an installment joins. 10/25:
+ * none of them. It is always its own bill, so no bill of anybody else's — one
+ * still clearing, one already paid, the opening-balance bill — can be grown or
+ * can hold the installment up.
  */
-describe('which bill the home payment joins', () => {
-  it('not a bill paid in full by bank transfer that is still clearing — it waits for the monthly run', async () => {
+describe('no bill of anyone else\'s is ever joined or held up by it', () => {
+  it('a rent bill paid in full and still clearing neither grows nor delays it', async () => {
     const s = await seed()
     // The tenant paid the whole bill by ACH: in flight, so the bill still
     // reads 'pending' (only settled lines count toward its status).
@@ -331,14 +375,16 @@ describe('which bill the home payment joins', () => {
     expect((await sale(s.unitId)).status).toBe('active')
     expect(await homeLines(s.invoiceId)).toHaveLength(0)
     expect(await bill(s.invoiceId)).toMatchObject({ total: 466.5, home: 0 })
+    // Billed on its own bill right away; nothing is waiting for a monthly run.
+    expect(await ownBillLines(s.unitId)).toMatchObject([{ amount: 150, bill_total: 150 }])
     const waiting = await query<any>(
       `SELECT i.installment_number FROM home_sale_installments i JOIN home_sale_contracts c ON c.id = i.contract_id
         WHERE c.unit_id = $1 AND i.payment_id IS NULL AND i.settled_off_platform_at IS NULL AND i.billing_month <= $2::date`,
       [s.unitId, s.thisMonth])
-    expect(waiting.map(w => w.installment_number)).toEqual([3])
+    expect(waiting).toHaveLength(0)
   })
 
-  it("not the opening-balance bill, when the month's own bill is already paid", async () => {
+  it("the opening-balance bill is left alone, and so is the month's paid bill", async () => {
     const s = await seed({ billStatus: 'settled' })
     const opening = (await db.query<{ id: string }>(
       `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date,
@@ -355,6 +401,7 @@ describe('which bill the home payment joins', () => {
     expect(await homeLines(opening)).toHaveLength(0)
     expect(await homeLines(s.invoiceId)).toHaveLength(0)
     expect(await bill(opening)).toMatchObject({ total: 300, home: 0 })
+    expect(await ownBillLines(s.unitId)).toMatchObject([{ amount: 150, bill_total: 150 }])
   })
 })
 
@@ -382,8 +429,9 @@ describe('a second installment contract on a home whose sale is already billing'
     expect(res.body.error ?? res.body.message).toMatch(/already has an installment contract that is billing/)
 
     expect(await sale(s.unitId)).toEqual(first)
-    expect(await homeLines(s.invoiceId)).toEqual([
-      { amount: 150, status: 'pending', notes: 'Home payment 3 of 12', lease_id: s.leaseId, due_date: s.thisMonth },
+    expect(await homeLines(s.invoiceId)).toHaveLength(0)
+    expect(await ownBillLines(s.unitId)).toMatchObject([
+      { amount: 150, status: 'pending', notes: 'Home payment 3 of 12', due_date: s.thisMonth, bill_total: 150 },
     ])
     const contracts = await query<any>(`SELECT purchase_document_id FROM home_sale_contracts WHERE unit_id = $1`, [s.unitId])
     expect(contracts.map(k => k.purchase_document_id)).toEqual([s.docId])
@@ -401,7 +449,8 @@ describe('the same signature twice', () => {
       .set('Authorization', `Bearer ${s.landlordToken}`).send({ fieldValues: [] })))
     expect(both.map(r => r.status).sort()).toEqual([200, 400])
     expect(await sale(s.unitId)).toMatchObject({ status: 'active', installments: 12, installments_billed: 3 })
-    expect(await homeLines(s.invoiceId)).toHaveLength(1)
+    // Once: one bill for the month, one line on it, however many clicks landed.
+    expect(await ownBillLines(s.unitId)).toHaveLength(1)
     const alarms = await query<any>(
       `SELECT 1 FROM admin_notifications WHERE category IN ('home_sale_terms_failed', 'home_sale_activation_failed')`)
     expect(alarms).toHaveLength(0)

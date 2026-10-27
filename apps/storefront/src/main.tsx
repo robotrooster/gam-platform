@@ -16,7 +16,7 @@
  * to /inquiry and land as landlord notifications + property_inquiries.
  */
 // S540: self-hosted fonts — no render-blocking external stylesheet
-import { readBeatMs, typeBeatMs, readGapMs, noticeDelayMs, PAUSE_BEFORE_TYPING_MS, STAY_TERMS_LABEL, type StayTerms } from '@gam/shared'
+import { readBeatMs, typeBeatMs, readGapMs, noticeDelayMs, PAUSE_BEFORE_TYPING_MS, STAY_TERMS_LABEL, type StayTerms, installPrintLightTheme } from '@gam/shared'
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
 import '@fontsource/syne/800.css'
@@ -1246,5 +1246,10 @@ function PropertyChat({ slug, propertyName }: { slug: string; propertyName: stri
     </div>
   )
 }
+
+// 10/26 (Nic): a printed page is always the light theme, whatever the screen
+// is set to — he printed an eviction balance summary in dark mode and got a
+// solid black sheet. Installed once here; restores the viewer's theme after.
+installPrintLightTheme()
 
 ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>)

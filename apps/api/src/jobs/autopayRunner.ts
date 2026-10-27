@@ -155,23 +155,39 @@ export async function runAutopayForTimezone(
   const heldOver = heldOverMarker(cycle)
   const pullDays = opts.pullDays !== false
 
+  // 10/25 (Nic): AN ENROLLMENT IS FOR A LEASE *OR* FOR AN INSTALLMENT CONTRACT.
+  //
+  //   "Autopay needs to be toggled on or off per contract per person. If they
+  //    set up autopay on rent, that will not automatically set up autopay on
+  //    the trailer payments. They have to go in. The bank account's already
+  //    linked. It just needs to have a button... Dominic specifically cannot do
+  //    that because it goes to a different bank account."
+  //
+  // So the runner reads both kinds in one pass and charges each through the
+  // same code — a trailer enrollment is never implied by a rent one, and the
+  // bank account on each is the tenant's own choice.
   const candidates = await query<{
-    autopay_id: string; tenant_id: string; lease_id: string
+    autopay_id: string; tenant_id: string; lease_id: string | null; home_sale_contract_id: string | null
     pull_day: number | null; rent_due_day: number | null
     payment_method_id: string | null; stripe_customer_id: string | null
     use_credit: boolean; ach_suspended: boolean; last_run_cycle: string | null
   }>(
-    `SELECT a.id AS autopay_id, a.tenant_id, a.lease_id, a.pull_day,
-            l.rent_due_day, a.payment_method_id, t.stripe_customer_id,
+    `SELECT a.id AS autopay_id, a.tenant_id, a.lease_id, a.home_sale_contract_id, a.pull_day,
+            -- A trailer enrollment with no pull day of its own follows the day
+            -- its own installments fall on, not the rent's.
+            COALESCE(l.rent_due_day, EXTRACT(day FROM hs.start_month)::int) AS rent_due_day,
+            a.payment_method_id, t.stripe_customer_id,
             a.use_credit, (t.ach_suspended_at IS NOT NULL) AS ach_suspended,
             a.last_run_cycle::text AS last_run_cycle
        FROM tenant_autopay a
-       JOIN leases l   ON l.id = a.lease_id
-       JOIN units u    ON u.id = l.unit_id
+       LEFT JOIN leases l ON l.id = a.lease_id
+       LEFT JOIN home_sale_contracts hs ON hs.id = a.home_sale_contract_id
+       JOIN units u    ON u.id = COALESCE(l.unit_id, hs.unit_id)
        JOIN properties p ON p.id = u.property_id
        JOIN tenants t  ON t.id = a.tenant_id
       WHERE a.enabled
-        AND l.status = 'active'
+        AND (l.id IS NULL OR l.status = 'active')
+        AND (hs.id IS NULL OR hs.status = 'active')
         AND p.timezone = $1
         -- S655: FlexPay pays an enrolled tenant's bill; never pull it twice.
         AND NOT t.flexpay_enrolled
@@ -182,7 +198,11 @@ export async function runAutopayForTimezone(
   const due = candidates.filter(c =>
     c.last_run_cycle === heldOver || (pullDays && isPullDayToday(day, c.pull_day, c.rent_due_day)))
   // Held credit is said once per tenant per run, with the run's figure.
-  const runWaiting = await runCreditWaitingByTenant(due)
+  // Lease enrollments only: no credit ever pays a home payment
+  // (moneyPredicates CREDIT_INELIGIBLE_ENTRIES), so a trailer enrollment has
+  // no credit to be waiting on and must not be counted into the run's figure.
+  const runWaiting = await runCreditWaitingByTenant(
+    due.filter((c): c is typeof c & { lease_id: string } => c.lease_id != null))
   const waitingTold = new Set<string>()
 
   for (const c of due) {
@@ -322,7 +342,10 @@ export function waitingSentenceOnce(
 }
 
 interface AutopayCandidate {
-  tenant_id: string; lease_id: string
+  tenant_id: string
+  /** Exactly one of these two is set (tenant_autopay_one_owner). */
+  lease_id: string | null
+  home_sale_contract_id: string | null
   payment_method_id: string | null; stripe_customer_id: string | null
   use_credit: boolean; ach_suspended: boolean
 }
@@ -333,7 +356,10 @@ type AutopayAttempt =
   | { kind: 'held' }
   | { kind: 'charged'; charged: Awaited<ReturnType<typeof chargeLeaseBalance>>; method: { id: string; type: 'ach' | 'card' } | null; due: number }
 
-/** One quote-then-charge of a lease's bill. Throws what the charge throws. */
+/**
+ * One quote-then-charge of the bill this enrollment is for — a lease's, or
+ * (10/25) an installment contract's own. Throws what the charge throws.
+ */
 async function attemptAutopayCharge(c: AutopayCandidate): Promise<AutopayAttempt> {
   // A card payment nobody confirmed in time no longer holds the bill.
   try {
@@ -341,8 +367,10 @@ async function attemptAutopayCharge(c: AutopayCandidate): Promise<AutopayAttempt
   } catch (err) {
     logger.error({ err, leaseId: c.lease_id }, '[autopay] unconfirmed card release failed; looking at the holds directly')
   }
-  // One still in its window is waited on — never read as a paid bill.
-  if (await heldByUnconfirmedCard(c.lease_id)) return { kind: 'held' }
+  // One still in its window is waited on — never read as a paid bill. A
+  // trailer bill takes no card at all when its contract bars one, and no
+  // credit ever, so there is nothing to wait on there.
+  if (c.lease_id && await heldByUnconfirmedCard(c.lease_id)) return { kind: 'held' }
   // The live bill, right now, by the same arithmetic as Pay Now. S622:
   // never the carried-forward balance — arrears imported from a previous
   // system are paid down by the tenant, in an amount they choose; sweeping
@@ -350,7 +378,9 @@ async function attemptAutopayCharge(c: AutopayCandidate): Promise<AutopayAttempt
   // S654: a work-trade line is labor's to pay, never the bank's. What is
   // owed does not depend on the method (the fee is added at the charge).
   const quote = await quoteLeaseCharge({
-    tenantId: c.tenant_id, leaseId: c.lease_id,
+    tenantId: c.tenant_id,
+    leaseId: c.lease_id ?? undefined,
+    homeSaleContractId: c.home_sale_contract_id ?? undefined,
     useCredit: c.use_credit === true, paymentMethodType: 'ach',
   })
   if (quote.required.length === 0) return { kind: 'nothing_owed' }
@@ -368,7 +398,8 @@ async function attemptAutopayCharge(c: AutopayCandidate): Promise<AutopayAttempt
 
   const charged = await chargeLeaseBalance({
     tenantId:          c.tenant_id,
-    leaseId:           c.lease_id,
+    leaseId:           c.lease_id ?? undefined,
+    homeSaleContractId: c.home_sale_contract_id ?? undefined,
     amount:            due,
     // No method when the credit pays the whole bill: nothing is charged.
     paymentMethodId:   method?.id,
@@ -543,8 +574,10 @@ const PAYMENT_METHOD_ERROR_CODES = new Set([
  * eviction mode is read from the unit itself (chargeLeaseBalance refuses it
  * with a 409), so it never depends on an error's wording.
  */
-export async function classifyAutopayFailure(e: unknown, leaseId: string): Promise<AutopayFailureKind> {
-  const paused = await queryOne<{ payment_block: boolean | null }>(
+export async function classifyAutopayFailure(e: unknown, leaseId: string | null): Promise<AutopayFailureKind> {
+  // A trailer enrollment has no lease of its own (10/25), so there is no
+  // eviction hold on a lease to read; every other cause classifies the same.
+  const paused = leaseId == null ? null : await queryOne<{ payment_block: boolean | null }>(
     `SELECT u.payment_block FROM leases l JOIN units u ON u.id = l.unit_id WHERE l.id = $1`, [leaseId])
   if (paused?.payment_block) return 'payments_paused'
   if (e instanceof NoPaymentMethodError) return 'payment_method'
@@ -563,7 +596,7 @@ export async function classifyAutopayFailure(e: unknown, leaseId: string): Promi
  * the second failure in a row.
  */
 async function handleFailure(
-  c: { autopay_id: string; tenant_id: string; lease_id: string },
+  c: { autopay_id: string; tenant_id: string; lease_id: string | null; home_sale_contract_id?: string | null },
   e: unknown,
 ): Promise<void> {
   const message = e instanceof Error ? e.message : String(e)
@@ -613,7 +646,9 @@ async function handleFailure(
     await createAdminNotification({
       severity: 'warn',
       category: 'autopay_charge_error',
-      title:    `Autopay could not start a rent payment (lease ${c.lease_id})`,
+      title:    c.lease_id
+        ? `Autopay could not start a rent payment (lease ${c.lease_id})`
+        : `Autopay could not start a home payment (contract ${c.home_sale_contract_id ?? '—'})`,
       body:     message.slice(0, 1000),
       context:  { autopay_id: c.autopay_id, lease_id: c.lease_id, tenant_id: c.tenant_id, failures, disarming },
     })

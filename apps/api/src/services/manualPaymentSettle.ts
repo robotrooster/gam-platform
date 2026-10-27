@@ -448,6 +448,27 @@ export interface DeskQuote {
    * on. Off (the default): pay in full.
    */
   partialAllowed: boolean
+  /**
+   * 10/26 (Nic): the landlord turned OFF "let residents save credit for
+   * later" at every property the credit would pay on, so the desk does not
+   * get the Use/Save question — the credit goes on the bill and the screen
+   * says so.
+   *
+   *   "If the landlord chooses to let them save it up for later, then they
+   *    can have the choice to save it up for later. But if the landlord's
+   *    choice is to use it, they don't ever see anything except a statement."
+   *
+   * His point was that a resident paying CASH had no way to hold credit while
+   * a resident paying in the app did. The desk has always asked Use/Save
+   * (planTender's choose_credit stop), so the cash payer could hold it — but
+   * it asked regardless of the property setting, which is the real gap: at a
+   * property set to use the credit, the desk still offered Save.
+   *
+   * Scoped to the bills the credit would actually pay (creditPlan), not every
+   * row, and true only when EVERY one of them forbids saving — a household
+   * spanning two properties where one allows it keeps the question.
+   */
+  creditMustBeUsed: boolean
 }
 
 function toDeskRow(r: QuoteRow, unitId: string | null): DeskRow {
@@ -698,6 +719,20 @@ export async function deskQuote(
         WHERE p.id = ANY($1::uuid[])`, [rows.map(r => r.id)])
     partialAllowed = pa.rows[0]?.ok === true
   }
+  // 10/26 (Nic): the same per-property fold as partialAllowed, over the bills
+  // the credit would pay. No credit to place -> no question to suppress.
+  let creditMustBeUsed = false
+  const creditTargets = [...new Set(creditPlan.map(l => l.paymentId))]
+  if (creditTargets.length > 0) {
+    const cs = await client.query<{ ok: boolean | null }>(
+      `SELECT bool_and(NOT COALESCE(pr.credit_save_up_allowed, TRUE)) AS ok
+         FROM payments p
+         LEFT JOIN leases l      ON l.id = p.lease_id
+         LEFT JOIN units u       ON u.id = COALESCE(p.unit_id, l.unit_id)
+         LEFT JOIN properties pr ON pr.id = u.property_id
+        WHERE p.id = ANY($1::uuid[])`, [creditTargets])
+    creditMustBeUsed = cs.rows[0]?.ok === true
+  }
   const sum = (xs: DeskRow[]) => xs.reduce((s, r) => s + toCents(r.amount), 0)
   const applied = rows.reduce((s, r) => s + toCents(r.appliedCredit), 0)
   const usable = creditPlan.reduce((s, l) => s + toCents(l.amount), 0)
@@ -741,6 +776,7 @@ export async function deskQuote(
       l.scheduledRetries.length > 0 || l.pastStayEndRentIds.length > 0
       || l.rows.some(r => r.payable && toCents(r.heldOnRow) > 0)).map(l => l.leaseId),
     partialAllowed,
+    creditMustBeUsed,
   }
 }
 
@@ -1172,7 +1208,28 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   // ── The credit choice ───────────────────────────────────────────────────
   const usable = toCents(q.usableCredit)
   let useCredit = false
-  if (!input.neverUseCredit) {
+  // 10/26 (Nic): where the landlord turned saving off, there is no choice to
+  // make — the credit goes on the bill. Enforced here and not only in the
+  // window, so a desk screen left open from before the setting changed cannot
+  // still save it, and neverUseCredit cannot be used to route around it.
+  //
+  // neverUseCredit is NOT a Save answer and is not refused here. It is the
+  // posted-payment path (services/postPayment): money that arrived before
+  // there was a bill, which by S655 never spends credit and never asks about
+  // it. Refusing it would have broken posting a check at a property that
+  // turned saving off — the setting is about a payer's choice, not about
+  // forcing old money into every unrelated path.
+  if (usable > 0 && q.creditMustBeUsed && !input.neverUseCredit) {
+    if (input.creditToUse != null && toCents(input.creditToUse) === 0) {
+      throw new AppError(409,
+        `Credit goes on the balance at this property — it cannot be saved for later. `
+        + `Record this payment again and the ${money(usable)} of credit will be used on this bill.`)
+    }
+    if (input.creditToUse != null && toCents(input.creditToUse) !== usable) {
+      throw new AppError(409, `The credit available changed — it's now ${money(usable)}. Look at the bill again.`)
+    }
+    useCredit = true
+  } else if (!input.neverUseCredit) {
     if (usable > 0) {
       if (input.creditToUse == null) {
         throw new AppError(422,

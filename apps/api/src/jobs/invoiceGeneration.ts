@@ -40,6 +40,8 @@ interface ActiveLease {
   // invoice is late-fee exempt however long they took to sign.
   is_existing_tenancy?: boolean
   first_billing_cycle?: string | null
+  /** properties.home_payments_own_bill — FALSE bundles the trailer payment here. */
+  home_payments_own_bill?: boolean
   property_added_on?: string | null
   // S648: the landlord's answer for this property. Only TRUE waives.
   onboarding_late_fee_waiver?: boolean
@@ -103,7 +105,6 @@ interface InvoiceGenResult {
   feesInserted: number
   utilitiesInserted: number
   /** S654: home-sale installments that rode a rent invoice this run. */
-  homePaymentsInserted: number
   leasesProcessed: number
 }
 
@@ -313,6 +314,9 @@ const ACTIVE_LEASE_SELECT = `
            -- the DUE month. Country Acres was set to October; this job billed
            -- September on the 23rd and the late-fee job followed.
            to_char(p.first_billing_cycle, 'YYYY-MM-DD') AS first_billing_cycle,
+           -- 10/25 (Nic): "Let landlords choose how it gets bundled." FALSE =>
+           -- an installment (home/trailer) payment rides this bill.
+           p.home_payments_own_bill,
            to_char((COALESCE(p.onboarding_started_at, p.created_at)
                     AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, 'YYYY-MM-DD') AS property_added_on,
            l.move_in_first_month_rent::text AS move_in_first_month_rent,
@@ -529,7 +533,6 @@ async function runGeneration(
   let rentsInserted = 0
   let feesInserted = 0
   let utilitiesInserted = 0
-  let homePaymentsInserted = 0
 
   for (const lease of leases) {
     const renewal = isRenewalSuccessor(lease)
@@ -818,46 +821,28 @@ async function runGeneration(
       //   "If the base space rent for the property is $450 everywhere, John
       //    Sheptock's $200 trailer payment would make it $650."
       //
-      // A park-financed home sale bills its installment each month. Until now
-      // that was a standalone charge written by a 4:20 AM job: it was real, it
-      // was owed, and nothing else could see it — the rent invoice made at 5:00
-      // left it out, so the bill email headlined $489.60 for a household that
-      // owed $589.60, the landlord's who-owes page omitted it, and the tenant's
-      // Pay page showed a second box with no lease on it. Every rent-to-own
-      // resident at Country Acres read as "the home payment was skipped."
+      // 10/25 (Nic): A TRAILER PAYMENT IS NOT ON THE RENT BILL.
       //
-      // Same straggler semantics as a utility bill: anything due on or before
-      // this cycle rides it. The buyer must be THIS lease's primary (the
-      // contract names the tenant and the space). Charged at face value and
-      // kept out of the work-trade distribution — a purchase installment is not
-      // a cost of living there, and hours worked do not buy a trailer. The
-      // 4:20 job keeps billing standalone only for a buyer with no lease here
-      // (services/homeSale.ts). The property's first billing cycle is honored
-      // the same way that job honors it: earlier installments were paid outside
-      // GAM and are stamped so by that job, never billed here.
-      const homeInstallments = (sublease || !lease.tenant_id) ? [] : await query<{
-        id: string
-        amount: string
-        installment_number: number
-        installments_total: number
-        contract_id: string
-        landlord_id: string
-      }>(
-        `SELECT i.id, i.amount::text, i.installment_number, c.installments_total,
-                c.id AS contract_id, c.landlord_id
-           FROM home_sale_installments i
-           JOIN home_sale_contracts c ON c.id = i.contract_id
-          WHERE c.status = 'active'
-            AND c.unit_id = $1
-            AND c.tenant_id = $2
-            AND i.payment_id IS NULL
-            AND i.settled_off_platform_at IS NULL
-            AND i.billing_month <= date_trunc('month', $3::date)::date
-            AND ($4::date IS NULL OR i.billing_month >= date_trunc('month', $4::date)::date)
-          ORDER BY i.billing_month ASC, i.installment_number ASC`,
-        [lease.unit_id, lease.tenant_id, dueDate, lease.first_billing_cycle]
-      )
-      const touchedHomeContracts = new Set<string>()
+      //   "Should trailer payments get their own invoice separately payable
+      //    from lot rent? Yeah, let's do that, and they need to be clearly
+      //    labeled — I've had some people literally try to say, oh, I paid my
+      //    rent, and then it's like, no, that was the trailer payment, you have
+      //    the space rent too."
+      //
+      // S654 put the installment on this bill so that the bill email, the
+      // who-owes page and the Pay screen could all see it. They can — but it
+      // also made the trailer payment unpayable on its own, because rent is
+      // pay-in-full. A work-trade resident (Lisa Scheeler) gets no rent bill at
+      // all and so had nowhere to be billed, and a buyer whose trailer money
+      // belongs to a different book from their space rent (Dominic Gonzalez,
+      // whose installment is the trust's) cannot have the two on one document.
+      //
+      // Every installment is now billed on its contract's OWN bill, by
+      // services/homeSale (billInstallmentOnItsOwnBill) — the 4:20 run for the
+      // month's installment, and the mid-month attach when an agreement signs
+      // after the bill went out. Nothing here bills one, and this bill carries
+      // no home payment: subtotal_home_payments stays 0 on a lease bill.
+
 
       // S533: propane fill installments not yet billed whose cycle has
       // arrived. #1 billed immediately at the fill (payment_id set), so
@@ -893,7 +878,6 @@ async function runGeneration(
         rentsInserted++
         feesInserted += fees.length + oneOffCharges.length
         utilitiesInserted += utilityBills.length + propaneInstallments.length
-        homePaymentsInserted += homeInstallments.length
         continue
       }
 
@@ -1065,11 +1049,10 @@ async function runGeneration(
           + dist.propaneNets.reduce((s, n, i) => s + (suspendPropane(i) ? n : 0), 0))
         const WT_SUSPENDED_NOTE = 'Work trade — suspended while the hours are worked; settled at month close'
         const suspendedAt = new Date().toISOString()
-        // The home payment is owed at face value whatever the trade covers.
-        const homeTotalNum = round2(homeInstallments.reduce((s, h) => s + Number(h.amount), 0))
         // What the resident is asked for today. Subtotals stay gross; the
         // suspended lines are still on the document at their full value.
-        const owedTotalNum = round2(netTotalNum - suspendedTotalNum + homeTotalNum)
+        // 10/25: no home payment is on this bill, so none is added here.
+        const owedTotalNum = round2(netTotalNum - suspendedTotalNum)
 
         // Insert invoice — ON CONFLICT short-circuits whole cycle if already exists.
         // total_amount is NET of the work-trade credit; the credit + driving
@@ -1146,7 +1129,7 @@ async function runGeneration(
             invoiceNumber, dueDate,
             effectiveRentAmount, subtotalFeesStr, subtotalUtilitiesStr, owedTotalNum.toFixed(2),
             dist.creditApplied.toFixed(2), (wt ? wt.verifiedHours : 0).toFixed(2), wt ? wt.agreementId : null,
-            lateStartExempt, homeTotalNum.toFixed(2),
+            lateStartExempt, '0.00',
           ]
         )
 
@@ -1443,33 +1426,6 @@ async function runGeneration(
           utilitiesInserted++
         }
 
-        // S654: home-sale installments at face value, on this invoice. The
-        // partial-unique index on payments.home_sale_installment_id makes a
-        // race with the standalone job a no-op, so an installment bills once.
-        for (const h of homeInstallments) {
-          const hp = await client.query<{ id: string }>(
-            `INSERT INTO payments (
-               invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-               type, amount, status, due_date, entry_description, notes,
-               home_sale_installment_id
-             ) VALUES ($1, $2, $3, $4, $5, 'home_payment', $6, 'pending', $7, 'HOMEPMT', $8, $9)
-             ON CONFLICT (home_sale_installment_id) WHERE home_sale_installment_id IS NOT NULL DO NOTHING
-             RETURNING id`,
-            [
-              invoiceId, lease.unit_id, lease.id, effectiveTenantId, h.landlord_id,
-              Number(h.amount).toFixed(2), dueDate,
-              `Home payment ${h.installment_number} of ${h.installments_total}`,
-              h.id,
-            ]
-          )
-          if (hp.rows.length === 0) continue
-          await client.query(
-            `UPDATE home_sale_installments SET payment_id = $1 WHERE id = $2 AND payment_id IS NULL`,
-            [hp.rows[0].id, h.id]
-          )
-          touchedHomeContracts.add(h.contract_id)
-          homePaymentsInserted++
-        }
 
         // ── S655 (Nic, 10/2): THE WHOLE-BILL RULE, ONCE PER HOUSEHOLD ────────
         //
@@ -1531,12 +1487,24 @@ async function runGeneration(
         // Never throws: a receipt that fails to send costs nobody their bill.
         if (creditReceipts) await creditReceipts()
 
-        // S654: the contract's billed/paid counters, after the commit so a
-        // counter that fails to update never costs anyone their bill.
-        for (const cid of touchedHomeContracts) {
-          await reconcileHomeSaleContract(cid).catch(err =>
-            logger.error({ err, contractId: cid, invoiceId }, '[InvoiceGen] home-sale reconcile failed — invoice issued'))
+        // 10/25 (Nic): "Let landlords choose how it gets bundled." On a
+        // property that bundles, the installment belongs on the bill just
+        // written — the 04:20 home-sale run waits for it rather than taking a
+        // bill of its own (services/homeSale targetBillFor), so this is where
+        // it lands. ONE writer does the work, so there is no second path for a
+        // buyer to fall between: whatever this does not attach, the next
+        // morning's run bills once the month is over. After the commit, so a
+        // failure here never costs anybody their rent bill.
+        if (lease.home_payments_own_bill === false) {
+          try {
+            const { attachDueInstallmentsForUnitBuyer } = await import('../services/homeSale')
+            await attachDueInstallmentsForUnitBuyer(lease.unit_id, lease.tenant_id)
+          } catch (err) {
+            logger.error({ err, leaseId: lease.id, invoiceId },
+              '[InvoiceGen] home payment not attached to the bundled bill — the daily run will bill it')
+          }
         }
+
       } catch (e) {
         // Per-lease isolation: a single malformed lease (e.g. a pre-existing
         // orphan rent payment for this cycle that collides with
@@ -1558,7 +1526,6 @@ async function runGeneration(
     rentsInserted,
     feesInserted,
     utilitiesInserted,
-    homePaymentsInserted,
     leasesProcessed: leases.length,
   }
 }
@@ -1648,7 +1615,7 @@ export function registerInvoiceEngine(): void {
       try {
         const r = await generateInvoicesForTimezone(tz)
         if (r.invoicesInserted > 0 || r.rentsInserted > 0 || r.feesInserted > 0) {
-          logger.info({ tz, invoices: r.invoicesInserted, rents: r.rentsInserted, fees: r.feesInserted, homePayments: r.homePaymentsInserted }, '[InvoiceGen] invoices generated')
+          logger.info({ tz, invoices: r.invoicesInserted, rents: r.rentsInserted, fees: r.feesInserted }, '[InvoiceGen] invoices generated')
         }
       } catch (e) {
         logger.error({ err: e, tz }, '[InvoiceGen] error')

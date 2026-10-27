@@ -1492,9 +1492,26 @@ export async function buildOpenMonth(opts: {
       || Number(a.is_late_fee) - Number(z.is_late_fee) || a.label.localeCompare(z.label)
       || Number(cents(a.owed) > 0) - Number(cents(z.owed) > 0) || a.payment_id.localeCompare(z.payment_id))
     const base = charges.filter(l => BASE_TYPES.has(l.type))
-    const dueDate = (base[0] ?? charges[0])?.due_date ?? null
+    // 10/26 (Nic, Lisa Scheeler MH 01): the date on the pill is the oldest due
+    // date of what is OWED, never of a charge that is settled or suspended.
+    //
+    // Her space rent is due the 1st and her trailer payment the 10th. The rent
+    // is work trade, suspended on the 1st each month while she works the hours,
+    // so it owes nothing — but it was still the earliest base charge, so the
+    // card read "Due Oct 1" and would have turned red on the 2nd when the only
+    // thing she actually owes is not late until the 11th. A trailer payment
+    // does not sit on the rent's line for lateness, and this made it look like
+    // it did.
+    //
+    // Same rule openBalances.ts already follows for oldest_due_date: "a
+    // clearing payment never sets it when anything is owed". The fallbacks keep
+    // today's behavior for the statuses that do not render a date (paid,
+    // covered, vacant), where nothing is owed by definition.
+    const owedBase = base.filter(l => cents(l.owed) > 0)
+    const dueDate = (owedBase[0] ?? base[0] ?? charges[0])?.due_date ?? null
     const status: RentRollRowStatus = b.spaceOnly ? (b.inUse ? 'occupied' : 'vacant')
-      : rentRollStatusOf(m?.stamp ?? null, m?.days_past_grace ?? 0)
+      // 10/25: a month the work trade covered says "Covered", not "Paid".
+      : rentRollStatusOf(m?.stamp ?? null, m?.days_past_grace ?? 0, m?.work_trade_only === true)
     const days = m?.days_past_grace ?? 0
     const residents = b.spaceOnly ? [] : b.leaseId ? (byLease.get(b.leaseId) ?? []) : (byPerson.get(b.householdId ?? '') ?? [])
     const shown = pill(status, status === 'paid_late' || status === 'owes' ? days : 0, dueDate)
@@ -1613,6 +1630,12 @@ export function withoutWorkTrade(row: OpenMonthRow): OpenMonthRow {
     invoiced: dollars(Math.max(0, cents(row.invoiced) - cents(row.workTrade))),
     workTrade: 0,
     workTradeOnly: false,
+    // 10/25: and the pill says "Paid", not "Covered". S641 (Nic): "I don't want
+    // her to see the covered by work trade" — a status of Covered announces the
+    // very thing this strips out. Nothing is owed and no money is expected at
+    // the desk either way, which is all "Paid" claims here.
+    status: row.status === 'covered' ? 'paid' : row.status,
+    statusLabel: row.status === 'covered' ? RENT_ROLL_STATUS_LABEL.paid : row.statusLabel,
     methods: row.methods.filter(m => m !== WORK_TRADE_MARKER_LABEL),
     charges,
   }
@@ -1699,7 +1722,7 @@ function stayRow(
 
 /** One month's stamp on a history row (no bill that month: 'none'). */
 export function stampWire(month: string, m: HouseholdMonth | undefined): RentRollStamp {
-  const status = rentRollStatusOf(m?.stamp ?? null, m?.days_past_grace ?? 0)
+  const status = rentRollStatusOf(m?.stamp ?? null, m?.days_past_grace ?? 0, m?.work_trade_only === true)
   const days = status === 'paid_late' || status === 'owes' ? (m?.days_past_grace ?? 0) : 0
   return {
     month, ...pill(status, days, null), daysPastGrace: days,

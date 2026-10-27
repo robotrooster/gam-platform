@@ -183,8 +183,8 @@ export interface MonthStatus {
 }
 
 /** The Rent Roll's pill for a judged month (no bill: 'none'). */
-export function monthStatus(m: Pick<HouseholdMonth, 'stamp' | 'days_past_grace'> | undefined): MonthStatus {
-  const status = rentRollStatusOf(m?.stamp ?? null, m?.days_past_grace ?? 0)
+export function monthStatus(m: Pick<HouseholdMonth, 'stamp' | 'days_past_grace' | 'work_trade_only'> | undefined): MonthStatus {
+  const status = rentRollStatusOf(m?.stamp ?? null, m?.days_past_grace ?? 0, m?.work_trade_only === true)
   const days = status === 'paid_late' || status === 'owes' ? (m?.days_past_grace ?? 0) : 0
   return { status, status_label: rentRollStatusText({ status, daysPastGrace: days }), status_color: RENT_ROLL_STATUS_COLOR[status] }
 }

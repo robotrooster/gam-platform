@@ -59,19 +59,30 @@ describe('who GAM emails', () => {
     expect(await inAppCount(lisa)).toBe(1)       // but it is there when she looks
   })
 
-  // 10/25: the rule is onsite_manager ONLY. These roles still get email until
-  // Nic says otherwise — a third-party property manager or an outside
-  // accountant may work entirely by email, which is his call and not mine.
-  it('still emails a property manager, maintenance and business staff', async () => {
+  it('does not email maintenance or the bookkeeper either — they log in to look', async () => {
     const c = await db.connect()
     let landlordId: string
     try { ({ landlordId } = await seedLandlord(c)) } finally { c.release() }
-    for (const role of ['maintenance', 'property_manager', 'business_staff']) {
+    for (const role of ['maintenance', 'bookkeeper']) {
       sendMock.mockClear()
       const who = await personWithRole(role)
       await notify(who, landlordId!)
-      expect(sendMock, role).toHaveBeenCalledTimes(1)
+      expect(sendMock, role).not.toHaveBeenCalled()
+      expect(await inAppCount(who)).toBe(1)
     }
+  })
+
+  // 10/25 (Nic), the line: "The owner or property manager gets emailed about
+  // leases, about refunds, about anything that needs to be emailed." A property
+  // manager can be a third party running the place from somewhere else, so
+  // their inbox IS their desk.
+  it('still emails a property manager', async () => {
+    const c = await db.connect()
+    let landlordId: string
+    try { ({ landlordId } = await seedLandlord(c)) } finally { c.release() }
+    const pm = await personWithRole('property_manager')
+    await notify(pm, landlordId!)
+    expect(sendMock).toHaveBeenCalledTimes(1)
   })
 
   it('still emails the landlord — they are the one who must not miss it', async () => {

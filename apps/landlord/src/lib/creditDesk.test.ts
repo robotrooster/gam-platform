@@ -216,6 +216,57 @@ describe('the desk window: Use or Save (Nic, 10/2)', () => {
     expect(creditChoiceNeeded(quote())).toBe(false)
     expect(creditToUseFor(quote(), null)).toBeUndefined()
   })
+
+  // 10/26 (Nic): "if the landlord's choice is to use it, they don't ever see
+  // anything except a statement". His worry was the cash payer — the desk has
+  // always asked Use/Save, so a cash payer COULD hold credit, but it asked
+  // without regard to the property setting, so a property set to use the
+  // credit still offered Save.
+  describe('where the landlord turned saving off (creditMustBeUsed)', () => {
+    const forced = (over: Partial<DeskQuote> = {}) =>
+      quote({ rows: [row({ amount: 935.45 })], creditAvailable: 450, creditMustBeUsed: true, ...over })
+
+    it('asks nothing and records without an answer', () => {
+      const q = forced()
+      expect(creditChoiceNeeded(q)).toBe(false)
+      const p = planTender(q, tender({ tenderedCents: 48545 }))
+      expect(p.stop).toBeNull()
+      expect(p.body).toEqual({ method: 'cash', amountTendered: 485.45, creditToUse: 450 })
+    })
+
+    it('owes the bill MINUS the credit with no answer given — the figure the server will charge', () => {
+      // The bug this guards: reading "no question asked" as "credit saved"
+      // would show $935.45 owed while the server spent the credit.
+      expect(deskOwedCents(forced(), null)).toBe(48545)
+      expect(planTender(forced(), tender({ tenderedCents: 48545 })).creditUsedCents).toBe(45000)
+    })
+
+    it('still sends the credit figure, so a credit that moved is refused not spent', () => {
+      expect(creditToUseFor(forced(), null)).toBe(450)
+      expect(creditToUseFor(forced(), null, 44000)).toBe(440)
+    })
+
+    it('takes nothing when the credit covers the whole bill', () => {
+      const q = forced({ rows: [row({ amount: 400 })], creditAvailable: 450 })
+      const p = planTender(q, tender({ tenderedCents: null }))
+      expect(p.stop).toBeNull()
+      expect(p.owedCents).toBe(0)
+    })
+
+    it('leaves the question alone where saving is allowed', () => {
+      const q = quote({ rows: [row({ amount: 935.45 })], creditAvailable: 450, creditMustBeUsed: false })
+      expect(creditChoiceNeeded(q)).toBe(true)
+      expect(planTender(q, tender({ tenderedCents: 48545 })).stop).toBe('choose_credit')
+      expect(deskOwedCents(q, null)).toBe(93545)
+    })
+
+    it('no credit means no statement either', () => {
+      const q = quote({ creditAvailable: 0, creditMustBeUsed: true })
+      expect(creditChoiceNeeded(q)).toBe(false)
+      expect(creditToUseFor(q, null)).toBeUndefined()
+      expect(planTender(q, tender({ tenderedCents: Math.round(q.currentTotal * 100) })).creditUsedCents).toBe(0)
+    })
+  })
   it('Use owes exactly the bill minus the credit and sends the figure shown; Save owes the whole bill and sends 0', () => {
     const q = quote({ rows: [row({ amount: 935.45 })], creditAvailable: 450 })
     expect(deskOwedCents(q, 'use')).toBe(48545)
@@ -968,5 +1019,47 @@ describe('10/14 (Nic): the desk ticks the bills — each invoice is its own thin
     const q = quote({ rows: [], anchorOpen: false, bills })
     expect(postAnchor(q)).toBe('34sep-rent')
     expect(readerLeases(q).map(x => x.leaseId)).toEqual(['L34', 'L35'])
+  })
+})
+
+// 10/26 (Nic): "the platform needs to operate the same per setting, no matter
+// which angle you're coming in from." The card reader asks its own Use/Save
+// per space, separate from the cash window's, so it needed the same fix.
+describe('the card reader where the landlord turned saving off', () => {
+  const rq = (over: Record<string, unknown> = {}) => ({
+    outstanding: 935.45, usableCredit: 450, needsCreditChoice: false, useCredit: true,
+    creditUsed: 450, creditApplied: 450, oldBalance: 0, towardOldBalance: 0, paidAhead: 0,
+    balance: 485.45, cardFee: 0, total: 485.45, lineItems: [], creditMustBeUsed: true, ...over,
+  }) as any
+
+  it('is ready to send without an answer', () => {
+    expect(readerReady(rq(), null)).toEqual({ ready: true, reason: null })
+  })
+
+  it('still waits for an answer where saving is allowed', () => {
+    const r = readerReady(rq({ creditMustBeUsed: false, needsCreditChoice: true }), null)
+    expect(r.ready).toBe(false)
+    expect(r.reason).toContain('use their')
+  })
+
+  it('sends the credit figure with the charge so a moved credit is refused', () => {
+    // Nobody answered, but the figure shown still travels with the charge —
+    // otherwise a credit that changed between quote and tap would be spent at
+    // whatever it had become.
+    expect(readerChoiceParams(450, null, null, true)).toEqual({ useCredit: true, expectedCredit: 450 })
+    // Saving allowed and unanswered: nothing to send yet.
+    expect(readerChoiceParams(450, null, null, false)).toEqual({})
+    // No credit at all: nothing either way.
+    expect(readerChoiceParams(0, null, null, true)).toEqual({})
+  })
+
+  it('an explicit answer still wins where one was given', () => {
+    expect(readerChoiceParams(450, 'save', null, false)).toEqual({ useCredit: false, expectedCredit: 450 })
+    expect(readerChoiceParams(450, 'use', null, false)).toEqual({ useCredit: true, expectedCredit: 450 })
+  })
+
+  it('an old-balance amount rides along either way', () => {
+    expect(readerChoiceParams(450, null, 2000, true))
+      .toEqual({ useCredit: true, expectedCredit: 450, towardOldBalance: 20 })
   })
 })

@@ -70,19 +70,23 @@ export function emailTemplate(title: string, body: string, cta?: { label: string
  * Auth mail is unaffected because it never comes through here — verification,
  * password reset and 2FA are direct sends in services/email.
  *
- * SCOPED TO onsite_manager, deliberately. Lisa holds that role. Maintenance,
- * property managers, bookkeepers and business staff are NOT included — a
- * third-party property manager or an outside accountant may work entirely by
- * email, and which of them should go quiet is Nic's call. Each is one entry on
- * NO_EMAIL_ROLES when he says so.
+ * WHO ELSE: maintenance and the bookkeeper, added 10/25 for the same reason
+ * plus a second one — "we need to keep our resend count low". The owner and the
+ * property manager still get everything.
  */
-// 10/25: ONSITE MANAGER ONLY — the role Lisa actually holds, and the one Nic
-// described: somebody who works a shift at a counter and reads the screen while
-// they are there. I first wrote this as four roles on my own reading of "team
-// member" and he pulled me up on it: a property manager can be a third-party
-// management company's staff whose whole job runs by email, and maintenance and
-// business staff are his to decide on, not mine to assume.
-const NO_EMAIL_ROLES: readonly string[] = ['onsite_manager']
+// 10/25 (Nic): the front desk, maintenance and the bookkeeper. "They can log
+// into the portal to see any pertinent information to them. We need to keep our
+// resend count low."
+//
+// NOT property_manager, and that is the line: "The owner or property manager
+// gets emailed about leases, about refunds, about anything that needs to be
+// emailed." A property manager may be a third party running the place from
+// somewhere else, so their inbox IS their desk.
+//
+// Spelled as users_role_check allows — 'maintenance', not 'maintenance_worker'.
+// A role name that does not exist matches nobody and fails silently, which is
+// the worst way for a rule like this to be wrong.
+const NO_EMAIL_ROLES: readonly string[] = ['onsite_manager', 'maintenance', 'bookkeeper']
 
 /** Does this recipient read GAM on shift rather than in their inbox? */
 async function isTeamMember(userId: string): Promise<boolean> {

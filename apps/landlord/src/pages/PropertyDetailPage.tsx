@@ -242,6 +242,8 @@ export function PropertyDetailPage() {
       <CardFeePayerCard property={property} onSaved={() => { qc.invalidateQueries(['property', id]); qc.invalidateQueries('properties') }} />
       <PartialPaymentsCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <TenantsDepositAtBankCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <HomePaymentBillingCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <CreditSaveUpCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <AcceptsChecksCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <PropertyFeeScheduleSection propertyId={property.id}
         unitTypes={[...new Set((units as any[]).map(u => u.unitType).filter(Boolean))].sort()} />
@@ -813,12 +815,79 @@ export function PartialPaymentsCard({ property, onSaved }: { property: any; onSa
   )
 }
 
+// 10/25 (Nic): "Leave current properties set up as is. Let landlords choose how
+// it gets bundled." An installment (home/trailer) payment is its OWN bill by
+// default — paid separately from the space rent, which is what a buyer on work
+// trade and a buyer whose trailer money goes to a different account both need.
+// A landlord who would rather send one document per month turns it off.
+export function HomePaymentBillingCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (ownBill: boolean) => apiPatch(`/properties/${property.id}`, { homePaymentsOwnBill: ownBill }),
+    { onSuccess: onSaved, onError: () => toast.error('Could not save the home payment billing setting') })
+  // Missing on an older cached page reads as its default: separate.
+  const on = property.homePaymentsOwnBill !== false
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 700, color: 'var(--text-0)', marginBottom: 4, cursor: 'pointer' }}>
+        <input type="checkbox" checked={on} disabled={save.isLoading}
+          onChange={e => save.mutate(e.target.checked)} />
+        Bill home/trailer payments separately from rent
+      </label>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+        {on
+          ? 'On: a financed home or trailer payment gets its own bill each month, paid on its own. Nobody can pay it and think they covered their space rent, and a resident on work trade — who gets no rent bill — still gets billed for the home.'
+          : 'Off: the home or trailer payment rides the space-rent bill, so the month is one document and one payment. A buyer with no rent bill that month — on work trade, or renting no space here — still gets their own bill, because there is nothing to add it to.'}
+      </div>
+    </div>
+  )
+}
+
 // 10/6 (Nic): "Do you allow tenants to go into the bank and deposit their rent
 // for this unit or for this property? We don't do that here at Mountain View."
 // Default off. On: tenants may report a bank deposit, Record payment offers
 // "Bank deposit", and the bank feed matches each deposit to the tenant's bill
 // (the bank's date decides late fees). Off: none of those; the office's own
 // deposit slips still match.
+// 10/26 (Nic): "landlords can choose if people are allowed to save up credit
+// ahead of time... Blue wants to have his property set where any credit is
+// automatically applied against the thing. There's no saving it up."
+//
+// What this does NOT change: credit a resident already holds never sits while
+// they owe. It goes on their open balance by itself — at the bill run, again
+// right before any late fee (so credit that covers the bill stops the fee), and
+// again whenever a credit is issued. That is every property, and this setting
+// cannot turn it off.
+//
+// What it changes: the one place a resident can still hold credit back is the
+// pay screen, where credit that would pay part of what they are paying offers
+// "Use all $X" or "Save it for later". Off: that question is never asked — the
+// credit goes on the bill and they pay the rest.
+export function CreditSaveUpCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (allowed: boolean) => apiPatch(`/properties/${property.id}`, { creditSaveUpAllowed: allowed }),
+    { onSuccess: onSaved, onError: () => toast.error('Could not save the credit setting') })
+  // Missing on an older cached page reads as its default: saving is allowed.
+  const on = property.creditSaveUpAllowed !== false
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 700, color: 'var(--text-0)', marginBottom: 4, cursor: 'pointer' }}>
+        <input type="checkbox" checked={on} disabled={save.isLoading}
+          onChange={e => save.mutate(e.target.checked)} />
+        Let residents save credit for later
+      </label>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+        {on
+          ? 'On: when a resident pays and has credit that would cover part of the bill, they choose whether to use it now or keep it for a later month.'
+          : 'Off: a resident is never asked — their credit goes on the bill they are paying and they pay the rest.'}
+      </div>
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8, lineHeight: 1.5 }}>
+        Either way, credit on an account already goes onto an open balance by itself — oldest bill first,
+        and before any late fee, so credit that covers the bill prevents the fee.
+      </div>
+    </div>
+  )
+}
+
 export function TenantsDepositAtBankCard({ property, onSaved }: { property: any; onSaved: () => void }) {
   const save = useMutation(
     (allowed: boolean) => apiPatch(`/properties/${property.id}/tenants-deposit-at-bank`, { allowed }),

@@ -18,6 +18,9 @@ import { applyScreeningWaive, WAIVER_NOT_RECORDED_MESSAGE } from '../services/on
 import { landlordScopeIds } from '../lib/landlordScope'
 import { householdRowSql, tenantCompanies } from '../services/openBalances'
 import { chargeLabelColumnsSql, chargeLabel, chargeDetail } from '../services/invoiceNotice'
+// 10/26: FlexDeposit sells exactly two splits; the helper is the one place
+// that says which.
+import { isAllowedFlexDepositPaymentCount } from '@gam/shared'
 import {
   healthByHousehold, healthByLease, householdsOf, householdMonths, paymentHealth, addMonths, currentBillMonth, ALL_TIME_FROM,
   type PaymentHealth,
@@ -1402,6 +1405,72 @@ tenantsRouter.get('/flexpay/inquiry/proof-file', async (req: any, res, next) => 
   } catch (e) { next(e) }
 })
 
+// ── THE FIXED-INCOME BANNER (10/26, Nic) ─────────────────────
+//
+//   "Maybe the survey could just literally be in the banner, like pop up on
+//    their screen. Are you on fixed income? Yes or no? If yes, it takes them
+//    to the descriptor of FlexPay. If they click no, then boom, they're just
+//    flagged no, and it's done and over with right there without leaving the
+//    page."
+//
+// And on WHERE: never while they are setting a password or verifying an
+// email — "not a gatekeeping thing... We need to just ask it casually later
+// at like the first login when they're adding a payment method."
+//
+// So it is asked once, answered in place, and never blocks anything. A "no"
+// ends it for good; a "yes" sends them to the FlexPay explainer, which is
+// where the inquiry and the existing proof-of-income upload already live
+// (POST /flexpay/inquiry/proof) — this does not grow a second store for the
+// document.
+//
+// The answer is SELF-REPORTED and gates nothing. tenants.ssi_ssdi stays the
+// verified flag an admin sets after reviewing income, and remains the only
+// thing FlexPay enrollment reads: a tap on "Yes" must never qualify anybody.
+
+// GET /api/tenants/me/fixed-income-prompt — should the banner show?
+tenantsRouter.get('/me/fixed-income-prompt', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const t = await queryOne<{
+      fixed_income_self_reported: boolean | null
+      fixed_income_answered_at: string | null
+      ssi_ssdi: boolean | null
+      flexpay_enrolled: boolean
+    }>(`SELECT fixed_income_self_reported, fixed_income_answered_at, ssi_ssdi, flexpay_enrolled
+          FROM tenants WHERE id = $1`, [req.user!.profileId!])
+    if (!t) throw new AppError(404, 'No resident record')
+    const { isFeatureEnabled } = await import('../services/systemFeatures')
+    // Never ask about a product that is not being offered, never ask twice,
+    // and never ask somebody already enrolled or already verified.
+    const show = await isFeatureEnabled('flexpay_rollout_visible')
+      && t.fixed_income_answered_at === null
+      && !t.flexpay_enrolled
+      && t.ssi_ssdi !== true
+    res.json({ success: true, data: { show, answered: t.fixed_income_self_reported } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/tenants/me/fixed-income { onFixedIncome: boolean }
+tenantsRouter.post('/me/fixed-income', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const parsed = z.object({ onFixedIncome: z.boolean() }).safeParse(req.body ?? {})
+    if (!parsed.success) throw new AppError(400, 'Answer yes or no.')
+    const { onFixedIncome } = parsed.data
+    // First answer wins: re-answering would re-open a banner they closed.
+    const rows = await query<{ id: string }>(
+      `UPDATE tenants
+          SET fixed_income_self_reported = $2,
+              fixed_income_asked_at = COALESCE(fixed_income_asked_at, NOW()),
+              fixed_income_answered_at = NOW(),
+              updated_at = NOW()
+        WHERE id = $1 AND fixed_income_answered_at IS NULL
+        RETURNING id`, [req.user!.profileId!, onFixedIncome])
+    // Already answered: not an error, the banner is simply done.
+    res.json({ success: true, data: { recorded: rows.length > 0, onFixedIncome } })
+  } catch (e) { next(e) }
+})
+
 // GET /api/tenants/flex-visibility — S541: which Flex products the
 // tenant portal may surface. Per-product rollout flags drive the UI
 // (the old client-side LAUNCH_HIDDEN gate showed all-or-nothing);
@@ -1422,7 +1491,8 @@ tenantsRouter.get('/flex-visibility', async (req, res, next) => {
 // GET /api/tenants/flexpay — current enrollment + eligibility
 tenantsRouter.get('/flexpay', async (req, res, next) => {
   try {
-    const { isFlexPayVisible, isFlexPayEnrollmentOpen, getFlexPayEligibility, calculateFlexPayFee } = await import('../services/flexpay')
+    const { isFlexPayVisible, isFlexPayEnrollmentOpen, getFlexPayEligibility,
+            quoteFlexPayCycleFee, flexPayAmountToFront } = await import('../services/flexpay')
     const visible = await isFlexPayVisible()
     if (!visible) return res.json({ success: true, data: { visible: false } })
     // S544: survey mode — visible but not launched. Drives the
@@ -1476,7 +1546,15 @@ tenantsRouter.get('/flexpay', async (req, res, next) => {
         eligibility,
         inquiry,
         stateHold,
-        previewFee: row?.flexpay_pull_day ? calculateFlexPayFee(row.flexpay_pull_day) : null,
+        // 10/26: priced from the table on what FlexPay would actually front
+        // and their benefit Wednesday — never a flat figure, and null rather
+        // than a number when there is no bracket (a bill of $3,000 or more) or
+        // no open bill to price against.
+        previewFee: row?.flexpay_pull_day
+          ? await quoteFlexPayCycleFee(
+              await flexPayAmountToFront(req.user!.profileId!), row.flexpay_pull_day,
+              new Date().toISOString().slice(0, 10))
+          : null,
       },
     })
   } catch (e) { next(e) }
@@ -1583,14 +1661,19 @@ tenantsRouter.patch('/flexpay/pull-day', async (req, res, next) => {
 // same render fn that runs at acceptance, returned for display.
 tenantsRouter.get('/flexpay/terms', async (req, res, next) => {
   try {
-    const { calculateFlexPayFee } = await import('../services/flexpay')
+    const { requireFlexPayCycleFee, flexPayAmountToFront } = await import('../services/flexpay')
     const { renderFlexPayAcceptanceText, FLEXPAY_TEMPLATE_VERSION } =
       await import('../services/flexsuiteAcceptance')
     const pullDay = Number(req.query.pullDay)
     if (!Number.isInteger(pullDay) || pullDay < 1 || pullDay > 28) {
       throw new AppError(400, 'pullDay must be an integer 1..28')
     }
-    const fee = calculateFlexPayFee(pullDay)
+    // 10/26: the terms state the price they will actually be charged, from the
+    // table. A bill with no bracket refuses here rather than rendering terms
+    // around a price that does not exist.
+    const fee = await requireFlexPayCycleFee(
+      await flexPayAmountToFront(req.user!.profileId!), pullDay,
+      new Date().toISOString().slice(0, 10))
     const { renderedText } = await renderFlexPayAcceptanceText({
       tenantId:  req.user!.profileId!,
       userId:    req.user!.userId,
@@ -1802,8 +1885,9 @@ tenantsRouter.get('/flexdeposit/terms', async (req, res, next) => {
     const { renderFlexDepositAcceptanceText, FLEXDEPOSIT_TEMPLATE_VERSION } =
       await import('../services/flexsuiteAcceptance')
     const installmentCount = Number(req.query.installmentCount)
-    if (!Number.isInteger(installmentCount) || installmentCount < 2 || installmentCount > 6) {
-      throw new AppError(400, 'installmentCount must be an integer 2..6')
+    // 10/26: the two splits FlexDeposit sells, nothing between them.
+    if (!isAllowedFlexDepositPaymentCount(installmentCount)) {
+      throw new AppError(400, 'Choose 2 payments or 4 — those are the two FlexDeposit splits.')
     }
     const preview = await previewFlexDepositSchedule({
       tenantId: req.user!.profileId!,
@@ -1817,6 +1901,7 @@ tenantsRouter.get('/flexdeposit/terms', async (req, res, next) => {
       installmentCount,
       installments:           preview.schedule.installments,
       totalInstallmentAmount: preview.schedule.totalInstallmentAmount,
+      serviceFee:             preview.schedule.serviceFee,
       moveInDate:             preview.schedule.startDate,
       ip:                     null,
       userAgent:              null,

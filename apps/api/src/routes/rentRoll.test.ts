@@ -107,7 +107,7 @@ async function rent(p: { landlordId: string }, h: Hh, month: string, amount: num
 }
 
 interface BillLine {
-  type: 'rent' | 'utility' | 'late_fee'
+  type: 'rent' | 'utility' | 'late_fee' | 'home_payment'
   amount: number
   /** Day of the month it was paid in cash (settled); unset = still owed. */
   paidDay?: number
@@ -116,17 +116,23 @@ interface BillLine {
   /** Covered by work trade (still suspended this month). */
   workTrade?: boolean
   notes?: string
-  /** Day of the month a daily late fee is dated. */
+  /** Day of the month this line is due (default the 1st, with the bill). */
   day?: number
 }
 
-/** One bill due the 1st of `month`, written that day, with its lines (cash on the day paid). */
-async function bill(p: { landlordId: string }, h: Hh, month: string, lines: BillLine[]) {
+/**
+ * One bill due the 1st of `month` (or `dueDay`), written that day, with its
+ * lines (cash on the day paid). A charge line reports its BILL's due date, so a
+ * line due on another day needs its own bill — which is what a property billing
+ * home payments separately actually writes.
+ */
+async function bill(p: { landlordId: string }, h: Hh, month: string, lines: BillLine[], dueDay = 1) {
+  const due = `${month}-${String(dueDay).padStart(2, '0')}`
   const inv = (await db.query<{ id: string }>(
     `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status, created_at)
      VALUES ($1,$2,$3,$4,$5,$6::date,0,'pending',$6::date) RETURNING id`,
-    [p.landlordId, h.tenantId, h.leaseId, h.unitId, `INV-${randomUUID().slice(0, 8)}`, `${month}-01`])).rows[0].id
-  const ENTRY = { rent: 'RENT', utility: 'UTILITY', late_fee: 'LATEFEE' } as const
+    [p.landlordId, h.tenantId, h.leaseId, h.unitId, `INV-${randomUUID().slice(0, 8)}`, due])).rows[0].id
+  const ENTRY = { rent: 'RENT', utility: 'UTILITY', late_fee: 'LATEFEE', home_payment: 'HOMEPMT' } as const
   const ids: string[] = []
   for (const l of lines) {
     ids.push((await db.query<{ id: string }>(
@@ -136,7 +142,7 @@ async function bill(p: { landlordId: string }, h: Hh, month: string, lines: Bill
                CASE WHEN $13::int IS NULL THEN NULL ELSE ($12::date + ($13::int - 1) * interval '1 day' + interval '19 hours') END,
                CASE WHEN $13::int IS NULL THEN NULL ELSE 'cash' END, $14, CASE WHEN $15 THEN NOW() END) RETURNING id`,
       [inv, h.unitId, h.leaseId, h.tenantId, p.landlordId, l.type, l.amount, l.paidDay ? 'settled' : 'pending',
-       l.day ? `${month}-${String(l.day).padStart(2, '0')}` : `${month}-01`, ENTRY[l.type], l.notes ?? null, `${month}-01`,
+       l.day ? `${month}-${String(l.day).padStart(2, '0')}` : due, ENTRY[l.type], l.notes ?? null, due,
        l.paidDay ?? null, l.remainder === true, l.workTrade === true])).rows[0].id)
   }
   return { invoiceId: inv, ids }
@@ -208,6 +214,11 @@ describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
       { type: 'rent', amount: 295, remainder: true, notes: 'What is left of this bill after a part payment' },
     ])
     await bill(p, walt, THIS, [{ type: 'rent', amount: 495, workTrade: true }])
+    // Work-trade rent due the 1st (owes nothing) + a trailer payment due the
+    // 10th (the only thing owed) — the mixed-date household.
+    const lisa = await household(p, 'RV 21', 'Lisa Trailer')
+    await bill(p, lisa, THIS, [{ type: 'rent', amount: 495, workTrade: true }])
+    await bill(p, lisa, THIS, [{ type: 'home_payment', amount: 333.33 }], 10)
     // Someone at another park is never on this one.
     const other = await park('Oak Park Motel and RV', p)
     await rent(other, await household(other, 'MH 03', 'Josh Roby'), THIS, 440)
@@ -220,6 +231,7 @@ describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
     expect(d.rows.map((r: any) => [r.space, r.residents.map((x: any) => x.name).join(), r.status === 'vacant'])).toEqual([
       ['RV 1', 'Paula Partial', false],
       ['RV 2', 'Gerald Logue', false],
+      ['RV 21', 'Lisa Trailer', false],
       ['RV 3', '', true],
       ['RV 10', 'Penny Paid', false],
       ['RV 20', 'Walt Worktrade', false],
@@ -240,12 +252,24 @@ describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
     expect(row('RV 1')).toMatchObject({ invoiced: 495, paid: 200, owed: 295, methods: ['Cash'] })
     expect(row('RV 1').status).toBe(PAST_GRACE_NOW > 0 ? 'owes' : 'partial')
     expect(row('RV 1').charges.map((c: any) => [c.invoiced, c.owed])).toEqual([[200, 0], [295, 295]])
-    // Work trade covering the month: Paid, method "Work trade" — never paid money, never owed.
-    expect(row('RV 20')).toMatchObject({ status: 'paid', workTradeOnly: true, methods: ['Work trade'], workTrade: 495, paid: 0, owed: 0 })
+    // 10/25 (Nic): a month work trade covered says "Covered", not "Paid" —
+    // Lisa Scheeler read the green "Paid" as her trailer payment being paid.
+    // Method "Work trade"; never paid money, never owed.
+    expect(row('RV 20')).toMatchObject({ status: 'covered', statusLabel: 'Covered', statusColor: 'green', workTradeOnly: true, methods: ['Work trade'], workTrade: 495, paid: 0, owed: 0 })
     // An empty space: gray Vacant, nothing on it.
     expect(row('RV 3')).toMatchObject({ status: 'vacant', statusLabel: 'Vacant', leaseId: null, householdId: null, invoiced: 0, recordWith: null, payments: [], charges: [] })
+    // 10/26 (Nic, Lisa Scheeler MH 01): the date on the pill is the oldest due
+    // date of what is OWED. Her rent is work trade — suspended on the 1st, owes
+    // nothing — and her trailer payment is due the 10th, so the card read "Due
+    // Oct 1" and would have gone red on the 2nd for a bill not late until the
+    // 11th. Walt above has only the suspended rent, so he cannot catch this;
+    // it takes a household with BOTH.
+    expect(row('RV 21')).toMatchObject({
+      workTradeOnly: false, workTrade: 495, paid: 0, owed: 333.33, dueDate: `${THIS}-10`,
+    })
+    if (PAST_GRACE_NOW === 0) expect(row('RV 21').statusLabel).toBe(`Due ${MONTH_SHORT} 10`)
     // The owner gets the sums.
-    expect(d.totals).toMatchObject({ invoiced: 1980, paid: 695, workTrade: 495, owed: 790, owedEarlier: 0 })
+    expect(d.totals).toMatchObject({ invoiced: 2808.33, paid: 695, workTrade: 990, owed: 1123.33, owedEarlier: 0 })
   })
 
   it('two spaces on two leases are two households; one payment for both is on each row for its part', async () => {
@@ -475,8 +499,10 @@ describe('10/14 (Nic): the front desk ("View who owes") sees the open month, wit
     expect(row('RV 10')).toMatchObject({ invoiced: 495, paid: 495, owed: 0, status: 'paid', methods: ['Cash'] })
     // "the record payment like it does": the desk window opens on what is owed.
     expect(row('RV 2')).toMatchObject({ invoiced: 495, paid: 0, owed: 495, recordWith: geraldRent.paymentId })
-    // The hours' charges are not on her rows; what is owed is the same.
-    expect(row('RV 20')).toMatchObject({ invoiced: 0, paid: 0, owed: 0, workTrade: 0, workTradeOnly: false, methods: [], charges: [], status: 'paid' })
+    // The hours' charges are not on her rows; what is owed is the same. 10/25:
+    // and the pill still reads "Paid" here, never "Covered" — the word Covered
+    // would announce the work trade this view exists to leave out.
+    expect(row('RV 20')).toMatchObject({ invoiced: 0, paid: 0, owed: 0, workTrade: 0, workTradeOnly: false, methods: [], charges: [], status: 'paid', statusLabel: 'Paid' })
     expect(row('RV 21')).toMatchObject({ invoiced: 295, paid: 295, owed: 0, workTrade: 0, workTradeOnly: false, methods: ['Cash'] })
     expect(row('RV 21').charges.map((c: any) => [c.invoiced, c.paid, c.workTrade, c.howPaid])).toEqual([[295, 295, 0, 'Cash']])
     expect(JSON.stringify(d).toLowerCase()).not.toContain('work trade')
@@ -1134,13 +1160,15 @@ describe('GET /api/balances/rent-roll/history — the Rent Roll page', () => {
     // Nothing paid past grace.
     expect(stamp('Olive Owes', LAST)).toMatchObject({ status: 'owes', invoiced: 495, owed: 495 })
     expect(stamp('Olive Owes', addMonths(LAST, -1))).toMatchObject({ status: 'none', invoiced: 0 })
-    // GREEN: a month work trade covers in full.
-    expect(stamp('Walt Worktrade', LAST)).toMatchObject({ status: 'paid', workTrade: 495, paid: 0, owed: 0 })
+    // GREEN, and worded "Covered" (10/25): a month work trade covers in full.
+    expect(stamp('Walt Worktrade', LAST)).toMatchObject({ status: 'covered', workTrade: 495, paid: 0, owed: 0 })
     expect(row('Walt Worktrade').health).toMatchObject({ percent: 100, onTime: 1, counted: 1, workTrade: 1 })
     // "Oct: 3 late" — the month's counts.
     const counts = (month: string) => Object.fromEntries(d.monthCounts.find((c: any) => c.month === month).counts.map((c: any) => [c.status, c.households]))
-    expect(counts(LAST)).toEqual({ paid: 1, paid_late: 1, partial: 0, owes: 2, due: 0 })
-    expect(counts(addMonths(LAST, -1))).toEqual({ paid: 0, paid_late: 0, partial: 0, owes: 0, due: 0 })
+    // 10/25: Walt's month counts under 'covered' now, not 'paid' — work trade
+    // is not money in, and the month counts say which is which.
+    expect(counts(LAST)).toEqual({ paid: 0, covered: 1, paid_late: 1, partial: 0, owes: 2, due: 0 })
+    expect(counts(addMonths(LAST, -1))).toEqual({ paid: 0, covered: 0, paid_late: 0, partial: 0, owes: 0, due: 0 })
     expect(d.totals).toMatchObject({ invoiced: 2020, lateFees: 40, paid: 695, workTrade: 495, owed: 830 })
     expect(d.movedOutOwing).toEqual([])
   })
@@ -1206,12 +1234,13 @@ describe('GET /api/balances/rent-roll/history — the Rent Roll page', () => {
       expect(d.rows.reduce((s: number, r: any) => s + r[k], 0) + d.movedOutTotals[k], k).toBe(d.totals[k])
     }
     const counts = Object.fromEntries(d.monthCounts[0].counts.map((c: any) => [c.status, c.households]))
-    expect(counts).toEqual({ paid: 2, paid_late: 0, partial: 0, owes: 1, due: 0 })
+    // 10/25: 'covered' is its own bucket — work trade is not money in.
+    expect(counts).toEqual({ paid: 2, covered: 0, paid_late: 0, partial: 0, owes: 1, due: 0 })
     // A folder household billed outside the range adds nothing to it.
     const before = (await history(owner(p), p.propertyId, `from=${addMonths(LAST, -1)}&to=${addMonths(LAST, -1)}`)).body.data
     expect(before.movedOutOwing.map((m: any) => m.residents[0].name)).toEqual(['Owen Owes'])
     expect(Object.fromEntries(before.monthCounts[0].counts.map((c: any) => [c.status, c.households])))
-      .toEqual({ paid: 0, paid_late: 0, partial: 0, owes: 0, due: 0 })
+      .toEqual({ paid: 0, covered: 0, paid_late: 0, partial: 0, owes: 0, due: 0 })
     expect(before.totals).toMatchObject({ invoiced: 0, paid: 0, owed: 0 })
     expect(before.movedOutOwing[0].inRange).toEqual(zero)
     expect(before.movedOutTotals).toEqual(zero)
@@ -1438,7 +1467,7 @@ describe('GET /api/tenants/:id/payment-report', () => {
     expect(wr.work_trade).toMatchObject({ months_covered: 1, value_covered: 495 })
     expect(wr.health).toMatchObject({ percent: 100, work_trade: 1 })
     expect(wr.history[0]).toMatchObject({ label: 'Rent', how_paid: 'Work trade', owed: 0 })
-    expect(wr.how_late.months).toEqual([expect.objectContaining({ month: LAST, status: 'paid', days_past_grace: 0 })])
+    expect(wr.how_late.months).toEqual([expect.objectContaining({ month: LAST, status: 'covered', days_past_grace: 0 })])
   })
 
   it('a staff member locked to another property finds no history for a resident who never lived there', async () => {
@@ -1551,7 +1580,7 @@ describe('10/12 review: a month close\'s work trade', () => {
     expect(r.work_trade.by_charge).toEqual([{ label: 'Rent', amount: 460 }])
     const row = (await history(owner(p), p.propertyId, `from=${LAST}&to=${LAST}`)).body.data.rows[0]
     expect(row).toMatchObject({ invoiced: 460, workTrade: 460, owed: 0 })
-    expect(row.stamps[0]).toMatchObject({ status: 'paid', workTrade: 460 })
+    expect(row.stamps[0]).toMatchObject({ status: 'covered', workTrade: 460 })
   })
 
   // The Tenants list keeps the payment health from staff the profile keeps it from (S641).

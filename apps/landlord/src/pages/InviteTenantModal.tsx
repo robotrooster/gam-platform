@@ -7,7 +7,7 @@ import { SPACE_CARRYFORWARD_INVITE_QUESTION, SPACE_CARRYFORWARD_INVITE_DECLINED_
          SPACE_CARRYFORWARD_NO_LATE_FEE_NOTE, EXISTING_RESIDENT_ATTESTATION_TITLE,
          EXISTING_RESIDENT_MONEY_NOTE, EXISTING_RESIDENT_SKIPS_SCREENING_NOTE,
          EXISTING_RESIDENT_STILL_SCREENS_NOTE } from '@gam/shared'
-import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
+import { canInviteToUnit, canTakeOverUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
 import { reachedBy, unitInviteFallbackLine, screeningInviteLine, inviteResultTitle } from '../lib/inviteOutcome'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 // A 'YYYY-MM-DD' day as a person reads it. Parsed by parts, never new Date(s),
@@ -93,9 +93,63 @@ export function InviteTenantModal({ onClose }: Props) {
   const { data: allUnits = [] } = useQuery<any[]>('vacant-units', () => apiGet('/units'))
   // S629: the predicate moved to lib/inviteEligibility so the Tenant Onboarding
   // roster form applies exactly the same rule. Behavior here is unchanged.
+  /**
+   * One unit in the picker. `takeover` marks an occupied spot: same row, with
+   * who is sitting there and what choosing it means, so the two groups cannot
+   * be confused at a glance.
+   */
+  const unitRow = (u: any, takeover = false) => (
+    <div
+      key={u.id}
+      onClick={() => set('unitId', u.id)}
+      style={{
+        padding: '12px 14px', borderRadius: 10, cursor: 'pointer', transition: 'all .12s',
+        border: `1px solid ${form.unitId === u.id ? 'var(--gold)' : 'var(--border-0)'}`,
+        background: form.unitId === u.id ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
+        display: 'flex', alignItems: 'center', gap: 12,
+      }}
+    >
+      <div style={{
+        width: 36, height: 36, borderRadius: 8, flexShrink: 0,
+        background: form.unitId === u.id ? 'rgba(201,162,39,.15)' : 'var(--bg-3)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}>
+        <DoorOpen size={16} style={{ color: form.unitId === u.id ? 'var(--gold)' : 'var(--text-3)' }} />
+      </div>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)' }}>
+          Unit {u.unitNumber} <span style={{ fontSize: '.72rem', color: 'var(--text-3)', fontWeight: 400 }}>· {u.propertyName}</span>
+        </div>
+        <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 1 }}>
+          {takeover
+            ? <>Occupied{u.tenantFirst ? <> by {u.tenantFirst}</> : null} · taking over</>
+            : <>
+                {u.bedrooms === 0 ? 'Studio' : `${u.bedrooms}bd`} · {u.bathrooms}ba
+                {u.sqft ? ` · ${u.sqft.toLocaleString()} sqft` : ''}
+              </>}
+        </div>
+      </div>
+      <div style={{ textAlign: 'right', flexShrink: 0 }}>
+        <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.85rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(u.rentAmount)}</div>
+        <div style={{ fontSize: '.65rem', color: 'var(--text-3)' }}>/month</div>
+      </div>
+      {form.unitId === u.id && <Check size={16} style={{ color: 'var(--gold)', flexShrink: 0 }} />}
+    </div>
+  )
+
   const hiddenReasons = hiddenUnitReasons(allUnits as any[])
   const units = (allUnits as any[]).filter(canInviteToUnit)
-  const selectedUnit = (units as any[]).find(u => u.id === form.unitId)
+  // 10/26 (Nic): "that unit list only populates with vacancies. It doesn't
+  // populate with the ability to click on one that's occupied and then initiate
+  // that takeover process." An occupied spot is its OWN group below the
+  // vacancies, never mixed in — S613 hid them to stop one space being offered
+  // to two households, and an ordinary invite still must not land on one by
+  // accident. Choosing one is choosing a takeover (services/spotSuccession):
+  // the lease is drafted for that spot and fires on the REPLACEMENT'S
+  // signature, so the sitting resident keeps being billed until then.
+  const takeovers = (allUnits as any[]).filter(canTakeOverUnit)
+  const selectedUnit = [...(units as any[]), ...(takeovers as any[])].find(u => u.id === form.unitId)
+  const takingOver = !!selectedUnit && canTakeOverUnit(selectedUnit)
 
   // 10/19 (Nic, "Fix invite flag overridden in first 28 days"): which of the
   // three doors this space can offer.
@@ -522,14 +576,23 @@ export function InviteTenantModal({ onClose }: Props) {
             <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 16 }}>
               Assign {residents.length > 1
                 ? <strong style={{ color: 'var(--text-0)' }}>{residents.length} residents</strong>
-                : <strong style={{ color: 'var(--text-0)' }}>{residents[0].firstName}</strong>} to a vacant unit.
+                : <strong style={{ color: 'var(--text-0)' }}>{residents[0].firstName}</strong>}{' '}
+              {takeovers.length > 0 ? 'to a unit.' : 'to a vacant unit.'}
               {residents.length > 1 && ' They share one lease on it.'}
+              {takingOver && selectedUnit && (
+                <div style={{ color: 'var(--gold)', marginTop: 6 }}>
+                  Taking over Unit {selectedUnit.unitNumber}
+                  {selectedUnit.tenantFirst ? <> from {selectedUnit.tenantFirst}</> : null}. The spot turns
+                  over when this lease is signed — until then {selectedUnit.tenantFirst || 'the person living there'}{' '}
+                  keeps being billed.
+                </div>
+              )}
             </div>
 
-            {(units as any[]).length === 0 ? (
+            {(units as any[]).length === 0 && takeovers.length === 0 ? (
               <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--text-3)' }}>
                 <DoorOpen size={32} style={{ margin: '0 auto 8px', display: 'block', opacity: .4 }} />
-                  <div style={{ fontSize: '.82rem' }}>No vacant units available.</div>
+                  <div style={{ fontSize: '.82rem' }}>No units available.</div>
                 <div style={{ fontSize: '.75rem', marginTop: 4 }}>
                   {hiddenReasons.length
                     ? <>Every unit is spoken for — {hiddenReasons.join(', ')}.</>
@@ -538,46 +601,29 @@ export function InviteTenantModal({ onClose }: Props) {
               </div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 320, overflowY: 'auto' }}>
-                {(units as any[]).map((u: any) => (
-                  <div
-                    key={u.id}
-                    onClick={() => set('unitId', u.id)}
-                    style={{
-                      padding: '12px 14px', borderRadius: 10, cursor: 'pointer', transition: 'all .12s',
-                      border: `1px solid ${form.unitId === u.id ? 'var(--gold)' : 'var(--border-0)'}`,
-                      background: form.unitId === u.id ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
-                      display: 'flex', alignItems: 'center', gap: 12,
-                    }}
-                  >
-                    <div style={{
-                      width: 36, height: 36, borderRadius: 8, flexShrink: 0,
-                      background: form.unitId === u.id ? 'rgba(201,162,39,.15)' : 'var(--bg-3)',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    }}>
-                      <DoorOpen size={16} style={{ color: form.unitId === u.id ? 'var(--gold)' : 'var(--text-3)' }} />
+                {(units as any[]).map((u: any) => unitRow(u))}
+
+                {/* 10/26 (Nic): the occupied spots, apart and plainly named, so
+                    an ordinary invite cannot land on one by mistake. */}
+                {takeovers.length > 0 && (
+                  <>
+                    <div style={{ fontSize: '.7rem', fontWeight: 700, color: 'var(--text-3)',
+                                  textTransform: 'uppercase', letterSpacing: '.08em', marginTop: 8 }}>
+                      Taking over an occupied spot
                     </div>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)' }}>
-                        Unit {u.unitNumber} <span style={{ fontSize: '.72rem', color: 'var(--text-3)', fontWeight: 400 }}>· {u.propertyName}</span>
-                      </div>
-                      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 1 }}>
-                        {u.bedrooms === 0 ? 'Studio' : `${u.bedrooms}bd`} · {u.bathrooms}ba
-                        {u.sqft ? ` · ${u.sqft.toLocaleString()} sqft` : ''}
-                      </div>
+                    <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 2 }}>
+                      The person living there keeps being billed until this lease is signed. Nothing
+                      moves until then, and the two leases are never linked on paperwork.
                     </div>
-                    <div style={{ textAlign: 'right', flexShrink: 0 }}>
-                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.85rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(u.rentAmount)}</div>
-                      <div style={{ fontSize: '.65rem', color: 'var(--text-3)' }}>/month</div>
-                    </div>
-                    {form.unitId === u.id && <Check size={16} style={{ color: 'var(--gold)', flexShrink: 0 }} />}
-                  </div>
-                ))}
+                    {(takeovers as any[]).map((u: any) => unitRow(u, true))}
+                  </>
+                )}
               </div>
             )}
             {/* S613: nothing vanishes unexplained — the count of what was left
                 out sits under the list, the same way the meter unit picker
                 reports what it hid. */}
-            {units.length > 0 && hiddenReasons.length > 0 && (
+            {(units.length > 0 || takeovers.length > 0) && hiddenReasons.length > 0 && (
               <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 8 }}>
                 Not shown: {hiddenReasons.join(', ')}.
               </div>

@@ -35,10 +35,45 @@ export function canInviteToUnit(u: InvitableUnit): boolean {
     && !(Number(u.pendingInviteCount || 0) > 0)
 }
 
+/**
+ * 10/26 (Nic) — AN OCCUPIED SPOT CAN BE TAKEN OVER.
+ *
+ *   "When you approve the lease and then go to invite them to the unit, that
+ *    unit list only populates with vacancies. It doesn't populate with the
+ *    ability to click on one that's occupied and then initiate that takeover
+ *    process. So we need to do that."
+ *
+ * Country Acres MH 28 is the case the succession subsystem was built for
+ * (services/spotSuccession, 10/24): Susie McCoy is leaving and the Bowmans'
+ * daughter is taking the spot from November 1. The machinery fires off the
+ * REPLACEMENT'S signature — but a lease has to be drafted for that spot first,
+ * and that could not happen because the invite list showed only vacancies.
+ *
+ * WHY THIS IS NOT JUST UN-HIDING THEM. S613's reason for hiding occupied units
+ * was to stop one space being offered to two households by accident, which is a
+ * real thing that happened when thirty invites went out in a sitting. So a
+ * takeover is its OWN choice, shown apart and named as a takeover, and an
+ * ordinary invite still cannot land on an occupied unit. The "already invited"
+ * exclusion applies here as hard as it does there: a spot with an incoming
+ * lease already pending is NOT offered for takeover either, or two replacements
+ * get promised the same spot — exactly the bug, one layer up.
+ *
+ * An owner-occupied unit is still never offered: there is no tenancy to take
+ * over, and the owner is not a person being replaced.
+ */
+export function canTakeOverUnit(u: InvitableUnit): boolean {
+  return !!u.tenantId
+    && u.status !== 'owner_use'
+    && !(Number(u.pendingInviteCount || 0) > 0)
+}
+
 /** Why units are missing from the list, phrased for the line underneath it. */
 export function hiddenUnitReasons(all: ReadonlyArray<InvitableUnit>): string[] {
   const hidden = all.filter(u => !canInviteToUnit(u))
-  const occupied = hidden.filter(u => u.tenantId).length
+  // 10/26: an occupied unit that can be TAKEN OVER is offered, not hidden, so
+  // it is not counted as missing. Only one whose spot is already promised to an
+  // incoming lease is.
+  const occupied = hidden.filter(u => u.tenantId && !canTakeOverUnit(u)).length
   const invited = hidden.filter(u => !u.tenantId && Number(u.pendingInviteCount || 0) > 0).length
   const ownerUse = hidden.filter(u => !u.tenantId && u.status === 'owner_use').length
   return [

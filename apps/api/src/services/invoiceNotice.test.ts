@@ -25,7 +25,7 @@ vi.mock('./reversalRecovery', async (orig) => ({
   ...(await orig<Record<string, unknown>>()), decideReversalRecovery: vi.fn(async () => null),
 }))
 
-import { db } from '../db'
+import { db, query, queryOne } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant, seedLeaseTenant, seedUtilityMeter, seedUtilityBill } from '../test/dbHelpers'
 import { sendPendingInvoiceNotices, payNowLink, chargeLabel, chargeDetail, chargeLabelColumnsSql } from './invoiceNotice'
 import { handlePaymentReversal } from './paymentReversal'
@@ -114,6 +114,36 @@ async function seedInvoice(opts: {
 }
 
 const lastSend = () => (resendSendMock.mock.calls.at(-1) as any[])![0]
+
+// ── 10/26 (Nic): THE SUMMARY IS INVOICED, PAID, OWED ─────────────────────────
+//
+//   "It'll show total invoiced, total paid, total owed... maybe you just have
+//    it in the paid category, like '$10.40 paid ahead credit' or whatever. And
+//    then the owed is $10.40 less than what the bill is."
+//
+// Credit and work trade used to render as green DEDUCTIONS under the charges
+// with a bold "Still owed" beneath, which reads as a discount on the bill. It
+// is not a discount — it is their own money already gone against it — so each
+// is now a named PAID line between "Total invoiced" and the bold "Total owed"
+// ("Balance" once nothing is left). With nothing applied it is still the one
+// "Total due" / "Balance" line it always was.
+//
+// These are the labels as the email renders them: email.ts writes the em dash
+// as an entity, hence the &mdash;.
+const PAID_CREDIT_LABEL = 'Paid &mdash; paid-ahead credit'
+const PAID_WORK_TRADE_LABEL = 'Paid &mdash; work trade'
+
+const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+/** A row of that summary block: email.ts emits its label and figure as adjacent spans. */
+const summaryRow = (label: string, amount: string) =>
+  new RegExp(`<span>${escRe(label)}</span><span>${escRe(amount)}</span>`)
+/**
+ * A CHARGE line, at its own amount. The covered styling — a strike-through and
+ * a "— covered (…)" tag beside the name — is exactly what must NOT appear just
+ * because credit went against the line, so the amount span is matched bare.
+ */
+const chargeLine = (label: string, amount: string) =>
+  new RegExp(`<span>${escRe(label)}</span><span style="">${escRe(amount)}</span>`)
 
 describe('invoice notices', () => {
   it('announces a freshly generated invoice and stamps sent_at', async () => {
@@ -241,9 +271,35 @@ describe('invoice notices', () => {
     expect(r.sent).toBe(1)
 
     const mail = lastSend()
-    expect(mail.html).toContain('Work trade')
-    expect(mail.html).toContain('-$460.00')
+    // The whole month's rent was traded: it is invoiced, the trade is what PAID
+    // it, and the balance is zero. 10/26 — the trade sits in the paid category,
+    // so it is never a deduction that makes the bill look discounted.
+    expect(mail.html).toMatch(summaryRow('Total invoiced', '$460.00'))
+    expect(mail.html).toMatch(summaryRow(PAID_WORK_TRADE_LABEL, '$460.00'))
+    expect(mail.html).toMatch(summaryRow('Balance', '$0.00'))
+    expect(mail.html).not.toContain('-$460.00')
     expect(mail.subject).toContain('nothing due')
+    // The traded charge is not listed as owed, and nothing is owed at all.
+    expect(mail.html).not.toContain('>Rent<')
+    expect(mail.html).not.toContain('Total owed')
+  })
+
+  it('a bill with nothing left to say is never announced', async () => {
+    // 10/25: an installment (home/trailer) sale gets a bill of its own. Void
+    // the sale and that bill is left holding one VOIDED line, which nobody is
+    // sent — so the pass must not mail the buyer "nothing due" for a bill that
+    // no longer exists. Distinct from the work-trade month just above, which
+    // has no lines either but a real statement to make.
+    const s = await seedInvoice({ rent: 460 })
+    await query(
+      `UPDATE payments SET status = 'voided', voided_at = NOW(), void_reason = 'test'
+        WHERE invoice_id = $1`, [s.invoiceId])
+    const r = await sendPendingInvoiceNotices()
+    expect(r.sent).toBe(0)
+    expect(r.skippedCovered).toBe(1)
+    // Stamped as dealt with, so the next pass does not keep reconsidering it.
+    const inv = await queryOne<any>(`SELECT sent_at FROM invoices WHERE id = $1`, [s.invoiceId])
+    expect(inv.sent_at).not.toBeNull()
   })
 
   it('scopes to one timezone so each property is told at its own 7am', async () => {
@@ -292,7 +348,7 @@ describe('the full bill, with the credit Pay Now will offer beside it', () => {
     expect(lastSend().html).not.toContain('credit available')
   })
 
-  it('10/6 (Nic): credit already applied is one "Credit applied" figure under the lines, never a line tagged covered by it', async () => {
+  it('10/6 (Nic): credit already applied is one paid-ahead-credit figure under the lines, never a line tagged covered by it', async () => {
     const f = await seedInvoice({ rent: 589 })
     const inv = (await db.query(`SELECT lease_id, unit_id, landlord_id FROM invoices WHERE id=$1`, [f.invoiceId])).rows[0]
     // a $60 water line the bill run paid from paid-ahead money (credit_uses, applied)
@@ -313,15 +369,21 @@ describe('the full bill, with the credit Pay Now will offer beside it', () => {
     expect(r.sent).toBe(1)
     const mail = lastSend()
     expect(mail.subject).toContain('$589.00')            // the water is not owed
-    // The water is listed at what it is; the credit is one line under the charges.
+    // The water is listed at what it is — no tag, no strike-through — and the
+    // credit is ONE figure under the charges, never something done to the line.
     expect(mail.html).not.toContain('covered (paid with your account credit)')
-    expect(mail.html).toContain('Credit applied')
-    expect(mail.html).toContain('-$60.00')
-    expect(mail.html).toContain('Still owed')
+    expect(mail.html).toMatch(chargeLine('Water', '$60.00'))
+    expect(mail.html).not.toContain('text-decoration:line-through')
+    // 10/26: invoiced is the whole bill ($589 rent + the $60 water the credit
+    // paid), the credit is what PAID that $60, and $589 is what is left.
+    expect(mail.html).toMatch(summaryRow('Total invoiced', '$649.00'))
+    expect(mail.html).toMatch(summaryRow(PAID_CREDIT_LABEL, '$60.00'))
+    expect(mail.html).toMatch(summaryRow('Total owed', '$589.00'))
+    expect(mail.html).not.toContain('-$60.00')           // paid, not a discount
     expect(mail.html).not.toContain('covered by prepaid credit')
   })
 
-  it('10/6 (Nic): credit on PART of a line — the line at its amount, "Credit applied", and what is still owed', async () => {
+  it('10/6 (Nic): credit on PART of a line — the line at its amount, the credit paid against it, and what is still owed', async () => {
     // Marc Renspurger: $282.36 paid ahead on $300 rent leaves $17.64 owed.
     const f = await seedInvoice({ rent: 300 })
     const inv = (await db.query(`SELECT lease_id, unit_id, landlord_id FROM invoices WHERE id=$1`, [f.invoiceId])).rows[0]
@@ -337,9 +399,15 @@ describe('the full bill, with the credit Pay Now will offer beside it', () => {
     expect(r.sent).toBe(1)
     const mail = lastSend()
     expect(mail.subject).toContain('$17.64')
-    expect(mail.html).toContain('$300.00')
-    expect(mail.html).toContain('-$282.36')
-    expect(mail.html).toContain('Still owed')
+    // The rent line is never re-priced by the credit: $300.00, plain, and the
+    // bill is invoiced at the same $300.00.
+    expect(mail.html).toMatch(chargeLine('Rent', '$300.00'))
+    expect(mail.html).toMatch(summaryRow('Total invoiced', '$300.00'))
+    // The credit is stated on its own, as money already paid against it...
+    expect(mail.html).toMatch(summaryRow(PAID_CREDIT_LABEL, '$282.36'))
+    expect(mail.html).not.toContain('-$282.36')          // 10/26: paid, not netted off
+    // ...and the $17.64 left over is the bold figure.
+    expect(mail.html).toMatch(summaryRow('Total owed', '$17.64'))
     expect(mail.html).not.toContain('covered (')
   })
 

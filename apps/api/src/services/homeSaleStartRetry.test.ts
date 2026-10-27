@@ -123,7 +123,14 @@ async function waitingSale(o: {
 const state = async (s: { contractId: string; invoiceId: string }) => ({
   status: (await queryOne<any>(`SELECT status FROM home_sale_contracts WHERE id = $1`, [s.contractId]))!.status,
   installments: (await queryOne<any>(`SELECT COUNT(*)::int AS n FROM home_sale_installments WHERE contract_id = $1`, [s.contractId]))!.n,
-  homeLines: await query<any>(`SELECT amount::float AS amount, notes FROM payments WHERE invoice_id = $1 AND type = 'home_payment'`, [s.invoiceId]),
+  // 10/25 (Nic): the trailer payment is on the contract's OWN bill, never the
+  // rent bill. `bill` stays the rent bill, so these assertions say both things
+  // at once: what was billed, and that the rent bill did not change.
+  homeLines: await query<any>(
+    `SELECT p.amount::float AS amount, p.notes FROM payments p
+       JOIN invoices i ON i.id = p.invoice_id
+      WHERE i.home_sale_contract_id = $1 AND p.type = 'home_payment'
+      ORDER BY p.notes`, [s.contractId]),
   bill: await queryOne<any>(`SELECT total_amount::float AS total, subtotal_home_payments::float AS home FROM invoices WHERE id = $1`, [s.invoiceId]),
 })
 const notices = (landlordId: string) => query<any>(
@@ -132,14 +139,14 @@ const adminAlerts = (docId: string) => query<any>(
   `SELECT severity, category FROM admin_notifications WHERE context->>'document_id' = $1`, [docId])
 
 describe('the morning retry starts a sale the landlord signed that did not start', () => {
-  it('the daily home-sale run starts it and puts what is due on the open bill', async () => {
+  it("the daily home-sale run starts it and puts what is due on the sale's own bill", async () => {
     const s = await waitingSale()
     await billDueHomeSaleInstallments(s.thisMonth)
 
     expect(await state(s)).toEqual({
       status: 'active', installments: 60,
       homeLines: [{ amount: 100, notes: 'Home payment 3 of 60' }],
-      bill: { total: 566.5, home: 100 },
+      bill: { total: 466.5, home: 0 },
     })
   })
 

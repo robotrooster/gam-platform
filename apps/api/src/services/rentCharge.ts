@@ -82,7 +82,7 @@ import { logger } from '../lib/logger'
 import { computePlatformCut, createRentPlatformCharge } from './stripeConnect'
 import { createAdminNotification } from './adminNotifications'
 import { computeTenantGamOutstandingTotal } from './supersedence'
-import { payableRowSql, lockHousehold } from './moneyPredicates'
+import { payableRowSql, lockHousehold, notOnHomeSaleBillSql, homeSaleScopeRowSql } from './moneyPredicates'
 import {
   householdQuote, holdCredit, settleFromCredit, supersedeScheduledRetry,
   cancelSupersededIntents, buildCreditPlan, paidAheadDrawnByMonth,
@@ -126,9 +126,11 @@ export interface ChargeLeaseBalanceInput {
   tenantId:          string
   /** The ONE lease this charge settles. Resolve it before calling.
    *  S616: omit it and pass serviceAgreementId instead for a payer who has no
-   *  lease — the neighbor buying trash and electric. */
+   *  lease — the neighbor buying trash and electric.
+   *  10/25: or homeSaleContractId, for a trailer payment paid on its own. */
   leaseId?:          string
   serviceAgreementId?: string
+  homeSaleContractId?: string
   /** The money the payer chose to send (before any fee). Ignored with chargeEverything. */
   amount?:           number
   /** S654: absent for a card tapped on the counter reader — the reader is the method.
@@ -280,6 +282,14 @@ export interface ChargeLeaseBalanceResult {
   usableCredit:        number
   /** Credit this charge spends (0 when the payer saved it). */
   creditUsed:          number
+  /**
+   * 10/26 (Nic): the property this bill sits on turned OFF "let residents save
+   * credit for later", so there is no Use/Save question to put — the credit
+   * goes on the bill. Every surface that can take a payment reads this rather
+   * than asking: "the platform needs to operate the same per setting, no
+   * matter which angle you're coming in from."
+   */
+  creditMustBeUsed:    boolean
   /** Back-compat name for creditUsed (the reader screen). */
   creditNetted:        number
   /** Money that goes to the old balance. */
@@ -311,6 +321,14 @@ export type BalanceScope =
    *  electric. "Their trash and electric needs to be on one bill if they have
    *  more than one utility through this subsystem." One agreement is one bill. */
   | { kind: 'service'; serviceAgreementId: string }
+  /**
+   * 10/25 (Nic): an installment (home/trailer) sale's own bill. "Should trailer
+   * payments get their own invoice separately payable from lot rent? Yeah,
+   * let's do that." One contract's month is one bill, paid by itself: a buyer
+   * on work trade gets no rent bill to ride, and a buyer whose trailer money
+   * belongs to a different book from their space rent cannot share one.
+   */
+  | { kind: 'home_sale'; homeSaleContractId: string }
 
 /**
  * The tenant's payable rows on a scope (their own rows only), oldest first.
@@ -320,10 +338,19 @@ export type BalanceScope =
  */
 export async function fetchOutstandingRows(tenantId: string, scope: BalanceScope | string) {
   const sc: BalanceScope = typeof scope === 'string' ? { kind: 'lease', leaseId: scope } : scope
-  const scopeSql = sc.kind === 'lease'
-    ? `(p.lease_id = $2 OR p.invoice_id IN (SELECT id FROM invoices WHERE lease_id = $2))`
-    : `p.invoice_id IN (SELECT id FROM invoices WHERE service_agreement_id = $2)`
-  const scopeId = sc.kind === 'lease' ? sc.leaseId : sc.serviceAgreementId
+  const scopeSql =
+    sc.kind === 'lease'
+      // 10/25: a trailer payment sits on its own bill and is paid by itself, so
+      // it is never part of what this lease owes (notOnHomeSaleBillSql).
+      ? `(p.lease_id = $2 OR p.invoice_id IN (SELECT id FROM invoices WHERE lease_id = $2))
+         AND ${notOnHomeSaleBillSql('p')}`
+      : sc.kind === 'service'
+        ? `p.invoice_id IN (SELECT id FROM invoices WHERE service_agreement_id = $2)`
+        : homeSaleScopeRowSql('p', '$2')
+  const scopeId =
+    sc.kind === 'lease' ? sc.leaseId
+      : sc.kind === 'service' ? sc.serviceAgreementId
+        : sc.homeSaleContractId
   return query<any>(
     `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
             p.entry_description, p.invoice_id, p.lease_id, p.unit_id, p.landlord_id,
@@ -406,6 +433,8 @@ export const chargeLeaseBalanceSchema = z.object({
   paymentMethodId:   z.string().min(1).optional(),
   paymentMethodType: z.enum(['ach', 'card']).optional(),
   serviceAgreementId: z.string().uuid().optional(),
+  // 10/25 (Nic): a trailer payment's own bill, paid by itself.
+  homeSaleContractId: z.string().uuid().optional(),
   // S581 (Nic): ONE lease per charge. A tenant with two leases pays each as
   // its OWN charge with its OWN receipt: a bank shortfall fails only that
   // lease, the capped fee is charged per lease, and an eviction hold on one
@@ -519,6 +548,23 @@ export interface ChargeContext {
   connectReady: boolean
   achFeePayer: string | null
   cardFeePayer: string | null
+  /**
+   * 10/25 (Nic): this bill takes no card. "We need the ability to have the
+   * contract flagged as, you know, prevent credit card payments on that bill.
+   * That's an exposure where we would have to backtrack bookkeeping and stuff."
+   * Set from home_sale_contracts.card_payments_blocked on an installment
+   * contract's own bill; false on every lease and utility bill.
+   */
+  cardsBlocked: boolean
+  /**
+   * 10/26 (Nic): does this property let a tenant keep credit instead of
+   * putting it on the bill they are paying? FALSE and the pay screen's
+   * "Save it for later" is never offered — the credit goes on the bill.
+   * Credit already lands on an open balance by itself on every property
+   * (10/15); this governs only the payer's option to hold it back.
+   * properties.credit_save_up_allowed; TRUE where there is no property.
+   */
+  creditSaveUpAllowed: boolean
 }
 
 function fromQuoteRow(r: QuoteRow): ChargeRow {
@@ -538,7 +584,10 @@ function sortRows(rows: ChargeRow[]): ChargeRow[] {
   }))).map(x => byId.get(x.id)!)
 }
 
-async function loadContext(client: PoolClient, a: { tenantId: string; landlordId: string; unitId: string | null }): Promise<ChargeContext> {
+async function loadContext(
+  client: PoolClient,
+  a: { tenantId: string; landlordId: string; unitId: string | null; cardsBlocked?: boolean },
+): Promise<ChargeContext> {
   const r = (await client.query<any>(
     `SELECT u.id AS unit_id, u.property_id, COALESCE(u.payment_block, FALSE) AS payment_block,
             t.stripe_customer_id, (t.ach_suspended_at IS NOT NULL) AS ach_suspended,
@@ -546,12 +595,14 @@ async function loadContext(client: PoolClient, a: { tenantId: string; landlordId
             COALESCE(l.stripe_connect_account_id, lu.stripe_connect_account_id) AS connect_id,
             CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_charges_enabled   ELSE lu.connect_charges_enabled   END AS charges_enabled,
             CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_details_submitted ELSE lu.connect_details_submitted END AS details_submitted,
-            par.ach_fee_payer, par.card_fee_payer
+            par.ach_fee_payer, par.card_fee_payer,
+            pr.credit_save_up_allowed
        FROM tenants t
        JOIN landlords l ON l.id = $2
        JOIN users lu ON lu.id = l.user_id
        LEFT JOIN units u ON u.id = $3
        LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
+       LEFT JOIN properties pr ON pr.id = u.property_id
       WHERE t.id = $1`,
     [a.tenantId, a.landlordId, a.unitId])).rows[0]
   return {
@@ -564,6 +615,12 @@ async function loadContext(client: PoolClient, a: { tenantId: string; landlordId
     connectReady: !!r?.connect_id && r?.charges_enabled === true && r?.details_submitted === true,
     achFeePayer: r?.ach_fee_payer ?? null,
     cardFeePayer: r?.card_fee_payer ?? null,
+    cardsBlocked: a.cardsBlocked === true,
+    // Every bill tied to a unit reads that unit's property, so a service
+    // agreement's and an installment contract's bills follow the same setting
+    // as the rent. A bill with no unit at all keeps the choice, because there
+    // is no property that could have turned it off.
+    creditSaveUpAllowed: r?.credit_save_up_allowed !== false,
   }
 }
 
@@ -647,23 +704,33 @@ export async function planLeaseCharge(
     }
   }
 
-  // A service agreement (no lease): its invoices' payable rows billed to this
-  // payer. No credit pays them (credit pays only a lease's charges).
+  // A bill that is not a lease's — a utility-service agreement (S616), or an
+  // installment sale's own bill (10/25) — and its payable rows billed to this
+  // payer. No credit pays either: credit pays only a lease's charges, and a
+  // home payment was already credit-ineligible (CREDIT_INELIGIBLE_ENTRIES).
+  const ownerCol = scope.kind === 'service' ? 'service_agreement_id' : 'home_sale_contract_id'
+  const ownerTable = scope.kind === 'service' ? 'utility_service_agreements' : 'home_sale_contracts'
+  const ownerId = scope.kind === 'service' ? scope.serviceAgreementId : scope.homeSaleContractId
   const res = await client.query<any>(
     `SELECT p.id, p.amount::text AS amount, p.type, p.entry_description, p.due_date::text AS due_date,
             p.created_at, p.invoice_id, p.lease_id, p.landlord_id, p.revenue_owner, p.unit_id,
             (p.status = 'failed' AND p.next_retry_at IS NOT NULL) AS retry_scheduled
        FROM payments p
        JOIN invoices i ON i.id = p.invoice_id
-      WHERE i.service_agreement_id = $2 AND p.tenant_id = $1
+      WHERE i.${ownerCol} = $2 AND p.tenant_id = $1
         AND ${payableRowSql('p')}
       ORDER BY p.id
       ${opts.lock ? 'FOR UPDATE OF p' : ''}`,
-    [tenantId, scope.serviceAgreementId])
-  const agreement = (await client.query<{ landlord_id: string; unit_id: string }>(
-    `SELECT landlord_id, unit_id FROM utility_service_agreements WHERE id = $1`, [scope.serviceAgreementId])).rows[0]
+    [tenantId, ownerId])
+  // 10/25: an installment contract can refuse cards on its own bills; a
+  // utility agreement has no such flag, so it reads false.
+  const cardFlagSql = scope.kind === 'home_sale' ? 'card_payments_blocked' : 'FALSE AS card_payments_blocked'
+  const agreement = (await client.query<{ landlord_id: string; unit_id: string; card_payments_blocked: boolean }>(
+    `SELECT landlord_id, unit_id, ${cardFlagSql} FROM ${ownerTable} WHERE id = $1`, [ownerId])).rows[0]
   const landlordId = agreement?.landlord_id ?? res.rows[0]?.landlord_id
-  if (!landlordId) throw new AppError(404, 'Service agreement not found')
+  if (!landlordId) {
+    throw new AppError(404, scope.kind === 'service' ? 'Service agreement not found' : 'Home sale not found')
+  }
   const all: ChargeRow[] = res.rows.map((r: any) => ({
     id: r.id, amount: Number(r.amount), type: r.type, entryDescription: r.entry_description,
     dueDate: String(r.due_date).slice(0, 10), createdAt: new Date(r.created_at).toISOString(),
@@ -673,7 +740,10 @@ export async function planLeaseCharge(
   const required = sortRows(all.filter(r => !r.carried))
   const carried = sortRows(all.filter(r => r.carried))
   const sum = (xs: ChargeRow[]) => toDollars(xs.reduce((s, r) => s + toCents(r.amount), 0))
-  const ctx = await loadContext(client, { tenantId, landlordId, unitId: agreement?.unit_id ?? res.rows[0]?.unit_id ?? null })
+  const ctx = await loadContext(client, {
+    tenantId, landlordId, unitId: agreement?.unit_id ?? res.rows[0]?.unit_id ?? null,
+    cardsBlocked: agreement?.card_payments_blocked === true,
+  })
   return {
     scope, tenantId, landlordId, leaseId: null,
     required, carried,
@@ -1158,18 +1228,39 @@ export function landMoney(plan: LeaseChargePlan, a: { useCredit: boolean; moneyC
 }
 
 /**
+ * Which bill a charge settles. ONE bill per charge, always: a lease's, a
+ * utility-service agreement's (S616), or an installment sale's own (10/25).
+ * Exactly one must be named — a charge that could mean two bills is refused
+ * rather than guessed at, since each is its own charge and its own receipt
+ * (S581).
+ */
+export function balanceScopeOf(ids: {
+  leaseId?: string | null; serviceAgreementId?: string | null; homeSaleContractId?: string | null
+}): BalanceScope {
+  const named = [ids.leaseId, ids.serviceAgreementId, ids.homeSaleContractId].filter(Boolean)
+  if (named.length === 0) {
+    throw new AppError(400, 'A balance needs a lease, a service agreement or a home sale to settle.')
+  }
+  if (named.length > 1) {
+    throw new AppError(400, 'Pay one bill at a time: name the lease, the service agreement or the home sale, not more than one.')
+  }
+  if (ids.leaseId) return { kind: 'lease', leaseId: ids.leaseId }
+  if (ids.serviceAgreementId) return { kind: 'service', serviceAgreementId: ids.serviceAgreementId }
+  return { kind: 'home_sale', homeSaleContractId: ids.homeSaleContractId! }
+}
+
+/**
  * The read-only quote every screen and the autopay runner use.
  * `afterLeaseIds`: "Pay all" with "Use all" — the leases charged earlier in
  * the same run, in order (planLeaseCharge `after`). Leave it out for one bill.
  */
 export async function quoteLeaseCharge(opts: {
-  tenantId: string; leaseId?: string; serviceAgreementId?: string
+  tenantId: string; leaseId?: string; serviceAgreementId?: string; homeSaleContractId?: string
   useCredit?: boolean; paymentMethodType: 'ach' | 'card' | 'card_present'
   towardOldBalance?: number | null
   afterLeaseIds?: readonly string[]
 }): Promise<LeaseChargePlan & { landing: MoneyLanding; fee: number; passthrough: number; total: number }> {
-  const scope: BalanceScope = opts.leaseId ? { kind: 'lease', leaseId: opts.leaseId }
-    : { kind: 'service', serviceAgreementId: opts.serviceAgreementId! }
+  const scope = balanceScopeOf(opts)
   const client = await getClient()
   try {
     const plan = await planLeaseCharge(client, { tenantId: opts.tenantId, scope, after: opts.afterLeaseIds })
@@ -1219,9 +1310,17 @@ async function unpaidTenantPassthrough(
  * of any payment with money in it, and cash, check or money order free.
  */
 export function billMethodCosts(
-  ctx: Pick<ChargeContext, 'achFeePayer' | 'cardFeePayer'>, amount: number, passthrough: number,
+  ctx: Pick<ChargeContext, 'achFeePayer' | 'cardFeePayer'> & { cardsBlocked?: boolean },
+  amount: number, passthrough: number,
 ): PaymentMethodCost[] {
-  return paymentMethodCosts(amount).map((c) => {
+  return paymentMethodCosts(amount)
+    // 10/25 (Nic): a bill the contract bars cards on never offers one. Priced
+    // in one place so every screen that quotes the ways to pay drops it
+    // together — the charge itself refuses a card on such a bill regardless
+    // (chargeLeaseBalance), and a way to pay that would be refused must never
+    // be shown.
+    .filter((c) => !(ctx.cardsBlocked === true && c.method === 'card'))
+    .map((c) => {
     if (c.method === 'manual') return c
     const fee = amount > 0
       ? Math.round((feeFor(ctx, c.method, amount, null).tenantBorne + passthrough) * 100) / 100
@@ -1257,11 +1356,8 @@ function feeFor(
 // ─── The charge ──────────────────────────────────────────────────────────────
 
 export async function chargeLeaseBalance(input: ChargeLeaseBalanceInput): Promise<ChargeLeaseBalanceResult> {
-  const { tenantId, leaseId, serviceAgreementId, paymentMethodId, paymentMethodType } = input
-  if (!leaseId && !serviceAgreementId) {
-    throw new AppError(400, 'A balance needs either a lease or a service agreement to settle.')
-  }
-  const scope: BalanceScope = leaseId ? { kind: 'lease', leaseId } : { kind: 'service', serviceAgreementId: serviceAgreementId! }
+  const { tenantId, leaseId, serviceAgreementId, homeSaleContractId, paymentMethodId, paymentMethodType } = input
+  const scope = balanceScopeOf({ leaseId, serviceAgreementId, homeSaleContractId })
   const client = await getClient()
   let began = false
   try {
@@ -1271,10 +1367,14 @@ export async function chargeLeaseBalance(input: ChargeLeaseBalanceInput): Promis
       began = true
       // The household first, then every row by id (§1.5). A co-tenant, the
       // desk, a webhook or a second tab paying the same bill waits here.
-      const landlordId = scope.kind === 'lease'
-        ? (await client.query<{ landlord_id: string }>(`SELECT landlord_id FROM leases WHERE id = $1`, [scope.leaseId])).rows[0]?.landlord_id
-        : (await client.query<{ landlord_id: string }>(`SELECT landlord_id FROM utility_service_agreements WHERE id = $1`, [scope.serviceAgreementId])).rows[0]?.landlord_id
-      if (!landlordId) throw new AppError(404, scope.kind === 'lease' ? 'Lease not found' : 'Service agreement not found')
+      const owner = scope.kind === 'lease'
+        ? { table: 'leases', id: scope.leaseId, missing: 'Lease not found' }
+        : scope.kind === 'service'
+          ? { table: 'utility_service_agreements', id: scope.serviceAgreementId, missing: 'Service agreement not found' }
+          : { table: 'home_sale_contracts', id: scope.homeSaleContractId, missing: 'Home sale not found' }
+      const landlordId = (await client.query<{ landlord_id: string }>(
+        `SELECT landlord_id FROM ${owner.table} WHERE id = $1`, [owner.id])).rows[0]?.landlord_id
+      if (!landlordId) throw new AppError(404, owner.missing)
       await lockHousehold(client, tenantId, landlordId)
       // The counter reader: a capture that waited here behind a first click
       // on the same card finds that click's receipt — never a second booking
@@ -1297,11 +1397,37 @@ export async function chargeLeaseBalance(input: ChargeLeaseBalanceInput): Promis
     if (ctx.paymentBlock) {
       throw new AppError(409, 'This unit is in eviction mode — payments to the landlord are paused. Accepting one could reset the eviction timeline. Contact the landlord.')
     }
+    // 10/25 (Nic): a bill whose money belongs to another set of books takes no
+    // card — a chargeback on it would have to be unwound twice. Refused for
+    // every card, online or on the counter reader, and the pay screen is told
+    // so it never offers one (balance-context homeContracts.cardsBlocked).
+    if (ctx.cardsBlocked && (paymentMethodType === 'card' || paymentMethodType === 'card_present')) {
+      throw new AppError(409, 'This bill cannot be paid by card. Pay it by bank transfer, or by cash or check with the landlord.')
+    }
 
     // ── The credit choice (Nic, 10/2) ───────────────────────────────────────
     const usableCents = toCents(plan.usableCredit)
     let useCredit = false
-    if (usableCents > 0) {
+    // 10/26 (Nic): where the property does not allow saving credit up, there is
+    // no question to ask — the credit goes on the bill and the tenant pays the
+    // rest. An older screen that still shows the two buttons is refused rather
+    // than quietly charged the other figure, so the amount they confirmed is
+    // always the amount they are charged.
+    if (usableCents > 0 && !ctx.creditSaveUpAllowed) {
+      // Refused on a quote too, not only on the charge: a quote asking to save
+      // would otherwise come back with a confusing amount error, since the
+      // credit is counted as used whatever the answer said. A quote with NO
+      // answer is still fine — that is the screen asking what the bill is.
+      if (input.credit?.use === false) {
+        throw new AppError(409,
+          `Account credit goes on the balance at this property — it cannot be saved for later. `
+          + `Your ${money(usableCents)} of credit will be used on this bill.`)
+      }
+      useCredit = true
+      if (input.credit?.expected != null && toCents(input.credit.expected) !== usableCents) {
+        throw new CreditChangedError(usableCents)
+      }
+    } else if (usableCents > 0) {
       // A quote may be asked before the payer has chosen (it shows both
       // figures); a payment may not.
       if (!input.credit && !input.dryRun) {
@@ -1745,6 +1871,7 @@ function quoteResult(
     usableCredit: plan.usableCredit,
     creditUsed,
     creditNetted: creditUsed,
+    creditMustBeUsed: toCents(plan.usableCredit) > 0 && !plan.ctx.creditSaveUpAllowed,
     towardOldBalance: toDollars(land.toCarriedCents),
     coversWholeBill: plan.coversWholeBill,
     paidWithCredit: a.paidWithCredit,

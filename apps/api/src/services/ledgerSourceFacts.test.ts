@@ -72,6 +72,11 @@ const NOT_JOURNALED: Record<string, string> = {
   property_utility_rates: 'rate configuration',
   state_application_fee_caps: 'a rate table',
   state_deposit_interest_rates: 'a rate table',
+  // 10/26: re-pricing a bracket ADDS a row with a new effective_from and the
+  // old price keeps answering for the dates it covered, so the table carries
+  // its own history and never overwrites a price that was charged.
+  flexpay_fee_schedule: 'a rate table — re-pricing appends a row, never an update',
+  flexdeposit_fee_schedule: 'a rate table — re-pricing appends a row, never an update',
   scheduled_lease_changes: 'a change waiting to be made — the lease it makes is journaled',
   sublessee_invitations: 'an invitation (subleasing is shelved)',
   business_quote_lines: 'a quote — what is billed is copied to business_invoice_lines',

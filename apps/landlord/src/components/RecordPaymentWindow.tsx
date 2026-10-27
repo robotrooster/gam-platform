@@ -35,7 +35,7 @@ import { api, apiGet, apiPost } from '../lib/api'
 import { TAP_WINDOW_SECONDS } from '../lib/terminal'
 import {
   money, toCents, toDollars, parseAmount, dayWord, localToday,
-  creditChoiceNeeded, oldBalanceOwedCents, postAnchor, planTender, recordedMessage, lateFeeDeleteRefusalText,
+  creditChoiceNeeded, creditCoversBill, oldBalanceOwedCents, postAnchor, planTender, recordedMessage, lateFeeDeleteRefusalText,
   serverMessage, serverStatus, readerChoiceParams, readerQuoteQuery, readerReady, readerLeases,
   postConfirmQuestion, numberRequired, deskFigures, sameFigures, figuresMovedMessage, CREDIT_USE_RULE,
   chargeMonthsRange, readChargesById, CHARGE_PAGE_SIZE, withReaderTaken, readerFinishedMessage,
@@ -418,9 +418,11 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   }, [stale])   // eslint-disable-line react-hooks/exhaustive-deps
 
   // The credit pays the whole bill: nothing is taken, and no method is asked.
-  const creditOnly = !!quote && liveChoice === 'use' && creditChoiceNeeded(quote) && toCents(quote.owedIfUsed) === 0
+  // 10/26: creditCoversBill, not the Use answer — where the landlord turned
+  // saving off nobody answers, and the credit still pays the bill.
+  const creditOnly = !!quote && creditCoversBill(quote, liveChoice) && toCents(quote.owedIfUsed) === 0
   // 10/6 (Nic): the desk applies the credit alone, though it pays only part of the bill.
-  const creditOnlyPart = !!quote && liveChoice === 'use' && creditChoiceNeeded(quote) && toCents(quote.owedIfUsed) > 0
+  const creditOnlyPart = !!quote && creditCoversBill(quote, liveChoice) && toCents(quote.owedIfUsed) > 0
     && creditAlone && mode === null
   const method: ManualPaymentMethod | null = mode && mode !== 'reader' ? mode : ((creditOnly || creditOnlyPart) && mode === null ? 'cash' : null)
   const tenderedCents = creditOnlyPart ? 0 : parseAmount(tendered)
@@ -699,6 +701,28 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
               {/* ── Credit: beside the bill, used only when the desk says so.
                   The card reader asks its own Use / Save per space (fix round 2:
                   never the same question twice, one answer of which does nothing). ── */}
+              {/* 10/26 (Nic): "if the landlord's choice is to use it, they don't
+                  ever see anything except a statement". No question, no Change
+                  button — the credit is already on the bill below. */}
+              {quote.creditMustBeUsed === true && usable > 0 && mode !== 'reader' && (
+                <div className="cd-credit">
+                  <div className="cd-credit-head">
+                    Credit available <span className="mono">{money(quote.creditAvailable)}</span> — going on this bill
+                    {toCents(quote.creditOnFile) > usable && (
+                      <span className="cd-line-meta"> ({money(quote.creditOnFile)} on file)</span>
+                    )}
+                  </div>
+                  <div className="cd-stack">
+                    <div className="cd-chosen">
+                      <span>
+                        Using {money(quote.creditAvailable)} of credit — they owe{' '}
+                        <strong className="mono">{money(quote.owedIfUsed)}</strong>. This property puts credit on
+                        the next bill, so it is not held for later.
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
               {creditChoiceNeeded(quote) && mode !== 'reader' && (
                 <div className="cd-credit">
                   {/* 10/6 (Nic): credit is mentioned only when they have it, and only
@@ -1095,7 +1119,7 @@ function ReaderLeaseBlock({ anchorId, label, readerId, done, live, othersBusy = 
     // longer open, so the read is refused (a stray "no longer open" beside
     // "Taken." when the block comes back after Cash → Card, or "Read it again").
     { staleTime: 0, cacheTime: 0, retry: false, keepPreviousData: true, refetchOnWindowFocus: !locked, enabled: !done })
-  const choiceBody = () => readerChoiceParams(shownCredit, choice, oldCommitted)
+  const choiceBody = () => readerChoiceParams(shownCredit, choice, oldCommitted, quote?.creditMustBeUsed === true)
   // Fix round 2: the figures on screen belong to the CURRENT answers only. While
   // the quote for a new Use / Save answer or a new old-balance amount is on its
   // way (the previous one is kept on screen meanwhile), or an old-balance amount
@@ -1322,7 +1346,17 @@ function ReaderLeaseBlock({ anchorId, label, readerId, done, live, othersBusy = 
         <Message msg={{ kind: 'error', text: serverMessage(quoteError, 'The total could not be worked out.') }} />
       ) : quote ? (<>
         <div className="cd-line"><span>Owed on this space</span><span className="mono">{money(quote.outstanding)}</span></div>
-        {toCents(firstQuoteCredit) > 0 && (
+        {/* 10/26 (Nic): "the platform needs to operate the same per setting, no
+            matter which angle you're coming in from" — the reader states where
+            the credit went, the same as the cash window. */}
+        {toCents(firstQuoteCredit) > 0 && quote.creditMustBeUsed === true ? (
+          <div className="cd-chosen">
+            <span>
+              Using {money(firstQuoteCredit)} of credit — this property puts credit on the next
+              bill, so it is not held for later.
+            </span>
+          </div>
+        ) : toCents(firstQuoteCredit) > 0 && (
           choice === null ? (
             <div className="cd-credit">
               <div className="cd-credit-head">Credit available <span className="mono">{money(firstQuoteCredit)}</span></div>

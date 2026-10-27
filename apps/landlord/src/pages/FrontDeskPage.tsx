@@ -58,6 +58,17 @@ type Balance = {
   payLink?: { label: string; items: any[] } | null
   ticketId?: string | null
   ticket?: { note: string | null; items: any[] } | null
+  /**
+   * 10/25 (Nic): a home/trailer payment on a contract GAM tracks but never
+   * bills — the money belongs to another account (Dominic Gonzalez's goes to
+   * the trust). The desk COLLECTS it and marks it; it must never be rung up,
+   * and there is no charge behind it for anything to ring up.
+   */
+  collectOnly?: boolean
+  trackedPayment?: {
+    contractId: string; installmentNumber: number; installmentsTotal: number
+    dueOn: string; say: string; behind?: number
+  } | null
 }
 
 type Row = {
@@ -224,6 +235,19 @@ function classifyBalance(b: Balance, who: Who): { phase: PhaseId; say: string } 
            : 'They can pay the link, or ask the owner or a manager to settle it at the register.'),
     }
   }
+  // 10/25 (Nic): "collect-only, can't be rung up." Said before anything else,
+  // because the one way to get this wrong is to treat it as a GAM payment.
+  if (b.trackedPayment) {
+    const t = b.trackedPayment
+    return {
+      phase: overdue ? 'overdue' : 'due',
+      say: `${first} owes ${money(owed)} on their home payment${when ? `, due ${when}` : ''} `
+         + `(payment ${t.installmentNumber} of ${t.installmentsTotal}`
+         + `${(t.behind ?? 1) > 1 ? `, ${t.behind} behind` : ''}). `
+         + 'This is NOT a GAM payment — do not ring it up on the register. '
+         + 'Take it the way the landlord arranged, then press Mark paid.',
+    }
+  }
   if (b.ticketId) {
     return {
       phase: overdue ? 'overdue' : 'due',
@@ -240,6 +264,47 @@ function classifyBalance(b: Balance, who: Who): { phase: PhaseId; say: string } 
     phase: overdue ? 'overdue' : 'due',
     say: deskBalanceSentence({ first, owed, credit, when, overdue, partialOk: b.acceptPartialPayments === true }),
   }
+}
+
+/**
+ * 10/25 (Nic): the only thing the desk can do with a tracked home payment —
+ * say it arrived. "Collect-only, can't be rung up."
+ *
+ * There is no charge behind this line, so there is nothing for Record payment,
+ * the card reader or the register to act on even if somebody went looking. The
+ * one button marks the contract's ledger and writes no money anywhere, which is
+ * what keeps the trust's money off the park's books.
+ */
+function TrackedPaymentPanel({ tracked, onMarked }: {
+  tracked: NonNullable<Balance['trackedPayment']>
+  onMarked: () => void
+}) {
+  const [err, setErr] = useState<string | null>(null)
+  const [done, setDone] = useState(false)
+  const mark = useMutation(
+    () => apiPatch(`/home-sales/${tracked.contractId}/installments/mark`,
+      { installmentNumber: tracked.installmentNumber, paid: true }),
+    { onSuccess: () => { setErr(null); setDone(true); onMarked() },
+      onError: (e: any) => setErr(e?.response?.data?.message || 'Could not mark that. Try again.') })
+  return (
+    <div style={{ padding: 12 }}>
+      <div style={{ fontSize: '.8rem', color: 'var(--text-1)', lineHeight: 1.5, marginBottom: 10 }}>
+        <strong style={{ color: 'var(--gold)' }}>Not a GAM payment.</strong>{' '}
+        This one is collected for the owner and is not billed through the property.
+        Take it the way the owner arranged — <strong>do not ring it up on the register</strong> —
+        then press the button so it is on the record.
+      </div>
+      {done ? (
+        <span style={{ fontSize: '.78rem', color: 'var(--green)', fontWeight: 600 }}>✓ Marked as received</span>
+      ) : (
+        <button type="button" className="btn btn-primary btn-sm"
+          disabled={mark.isLoading} onClick={() => mark.mutate()}>
+          {mark.isLoading ? 'Marking…' : 'Mark paid'}
+        </button>
+      )}
+      {err && <div style={{ color: 'var(--red)', fontSize: '.75rem', marginTop: 8 }}>{err}</div>}
+    </div>
+  )
 }
 
 export function FrontDeskPage() {
@@ -831,13 +896,15 @@ export function FrontDeskPage() {
                       </div>
                       {open && b && (
                         <div style={{ background: 'rgba(255,255,255,.015)', borderRadius: 8, marginBottom: 10 }}>
-                          {b.payLinkId
-                            ? <PayLinkBreakdown id={b.payLinkId} link={b.payLink as any} propertyId={b.propertyId} />
-                            : b.ticketId
-                              ? <TicketBreakdown ticket={b.ticket as any} />
-                              : b.tenantId
-                                ? <InvoiceBreakdown tenantId={b.tenantId} />
-                                : null}
+                          {b.trackedPayment
+                            ? <TrackedPaymentPanel tracked={b.trackedPayment} onMarked={refetchOwed} />
+                            : b.payLinkId
+                              ? <PayLinkBreakdown id={b.payLinkId} link={b.payLink as any} propertyId={b.propertyId} />
+                              : b.ticketId
+                                ? <TicketBreakdown ticket={b.ticket as any} />
+                                : b.tenantId
+                                  ? <InvoiceBreakdown tenantId={b.tenantId} />
+                                  : null}
                         </div>
                       )}
                       </div>

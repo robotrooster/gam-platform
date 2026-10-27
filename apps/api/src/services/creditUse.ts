@@ -91,7 +91,7 @@ import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 import {
   payableRowSql, bankPayableRowSql, creditEligibleRowSql, creditEligibleRowForCreditSql, lockHousehold,
-  lockPaymentRowsById,
+  lockPaymentRowsById, notOnHomeSaleBillSql,
 } from './moneyPredicates'
 import { executeRentAllocation, ALLOCATABLE_PAYMENT_TYPES } from './allocation'
 import { afterRowsSettled } from './settleHooks'
@@ -117,6 +117,8 @@ export interface QuoteRow {
   leaseId: string | null
   /** The household lease whose bill this row is on: its own lease, else the lease whose invoice carries it. NULL: a charge with no lease. */
   scopeLeaseId: string | null
+  /** 10/26: this row may be paid by the tenant's OWN overpayment (adds a home payment). */
+  creditEligiblePaidAhead?: boolean
   invoiceId: string | null
   landlordId: string
   tenantId: string | null
@@ -415,6 +417,7 @@ interface RawRow {
   due_date: string; created_at: Date; billing_month: string; stripe_payment_intent_id: string | null
   next_retry_at: Date | null; scope_lease_id: string | null
   payable: boolean; bank_payable: boolean; credit_eligible: boolean; held_on_row: string; applied_on_row: string
+    credit_eligible_paid_ahead: boolean
   past_stay_end: boolean
   dispute_credits: Array<{ creditId: string; cap: string }> | null
 }
@@ -438,11 +441,25 @@ export async function householdQuote(client: PoolClient, opts: HouseholdQuoteOpt
             p.revenue_owner, p.status, p.amount::text AS amount, p.due_date::text AS due_date, p.created_at,
             to_char(date_trunc('month', COALESCE(inv.due_date, p.due_date)), 'YYYY-MM-DD') AS billing_month,
             p.stripe_payment_intent_id, p.next_retry_at,
-            CASE WHEN p.lease_id = ANY($3::uuid[]) THEN p.lease_id
+            -- 10/25 (Nic): a charge on an installment sale's own bill belongs
+            -- to NO lease here, even though its row still carries the buyer's
+            -- lease_id for the books. "Should trailer payments get their own
+            -- invoice separately payable from lot rent? Yeah, let's do that."
+            -- With no scope lease it lands in noLeaseRows — where a standalone
+            -- home payment already lived before S654 put it on the rent bill —
+            -- so the lease's own Pay Now never sweeps it up and the trailer
+            -- payment stays payable by itself.
+            CASE WHEN ${notOnHomeSaleBillSql('p')} IS FALSE THEN NULL
+                 WHEN p.lease_id = ANY($3::uuid[]) THEN p.lease_id
                  ELSE (SELECT hi.lease_id FROM hi WHERE hi.id = p.invoice_id) END AS scope_lease_id,
             ${payableRowSql('p')} AS payable,
             (${bankPayableRowSql('p')} AND p.landlord_id = $2) AS bank_payable,
             ${creditEligibleRowSql('p')} AS credit_eligible,
+            -- 10/26 (Nic): what the tenant's OWN overpayment may pay — the same
+            -- set plus a home/trailer payment. Kept apart from credit_eligible
+            -- so the "credit available" figure a tenant is shown never offers
+            -- ISSUED credit against a trailer payment the trigger would refuse.
+            ${creditEligibleRowSql('p', { paidAhead: true })} AS credit_eligible_paid_ahead,
             (SELECT COALESCE(SUM(u.amount), 0) FROM credit_uses u
               WHERE u.payment_id = p.id AND u.status = 'held')::text AS held_on_row,
             (SELECT COALESCE(SUM(u.amount), 0) FROM credit_uses u
@@ -494,6 +511,7 @@ export async function householdQuote(client: PoolClient, opts: HouseholdQuoteOpt
       id: r.id,
       leaseId: r.lease_id,
       scopeLeaseId: scope,
+      creditEligiblePaidAhead: r.credit_eligible_paid_ahead === true,
       invoiceId: r.invoice_id,
       landlordId: r.landlord_id,
       tenantId: r.tenant_id,
@@ -792,7 +810,10 @@ export interface BuildPlanInput {
  */
 export function buildCreditPlan(input: BuildPlanInput): CreditPlanLine[] {
   const eligible = sortRows(input.rows.filter(r =>
-    r.required && r.creditEligible && r.leaseId !== null
+    // 10/26 (Nic): a row the tenant's OWN overpayment may pay counts here too
+    // (a home/trailer payment). Which KIND of credit may actually land on it is
+    // decided per credit by mayPay below, and the trigger is the backstop.
+    r.required && (r.creditEligible || r.creditEligiblePaidAhead) && r.leaseId !== null
     // A row a scheduled retry still holds credit on takes no other use until
     // that retry is superseded (the trigger refuses it); only a payer paying
     // now may count it open.
@@ -825,8 +846,14 @@ export function buildCreditPlan(input: BuildPlanInput): CreditPlanLine[] {
     if (left <= 0) continue
     // decisions #48.7: a bill a dispute reopened takes only the paid-ahead
     // credit that same dispute gave back, up to what it gave back of it.
-    const mayPay = (r: QuoteRow) => (r.disputeCredits?.length ?? 0) === 0
-      || (c.kind === 'paid_ahead' && (r.disputeCredits ?? []).some(d => d.creditId === c.id))
+    const mayPay = (r: QuoteRow) =>
+      // 10/26 (Nic): "let their own overpayment pay a trailer payment." A row
+      // only the paid-ahead set admits (a home payment) takes paid-ahead credit
+      // and nothing else — hours worked and a goodwill credit do not buy
+      // somebody a trailer. Mirrors credit_uses_apply.
+      (r.creditEligible || c.kind === 'paid_ahead')
+      && ((r.disputeCredits?.length ?? 0) === 0
+          || (c.kind === 'paid_ahead' && (r.disputeCredits ?? []).some(d => d.creditId === c.id)))
     // 10/18: a credit the landlord gave sees the WHOLE household's bills, in
     // the one allocation order (`eligible` is sorted by due date across every
     // space), so it never reaches a later month on one space while an earlier

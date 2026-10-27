@@ -65,7 +65,7 @@ import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from 'react-query'
 import axios from 'axios'
-import { formatCurrency, applyCamelizeInterceptor, humanize, UNIT_STATUS_LABEL, MONEY_COLUMN_LABEL } from '@gam/shared'
+import { formatCurrency, applyCamelizeInterceptor, humanize, UNIT_STATUS_LABEL, MONEY_COLUMN_LABEL, installPrintLightTheme } from '@gam/shared'
 import { DialogHost } from './components/dialogs'
 import {
   rentRollVariance, rentPayers, loadErrorText,
@@ -971,6 +971,11 @@ function Root(){
     </QueryClientProvider>
   )
 }
+
+// 10/26 (Nic): a printed page is always the light theme, whatever the screen
+// is set to — he printed an eviction balance summary in dark mode and got a
+// solid black sheet. Installed once here; restores the viewer's theme after.
+installPrintLightTheme()
 
 // HMR guard: when Vite re-executes this entry module, calling createRoot on
 // the same container again STACKS a second mounted app under the first

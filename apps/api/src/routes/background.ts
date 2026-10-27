@@ -1,4 +1,4 @@
-import { Router } from 'express'
+import { Router, type RequestHandler } from 'express'
 import {
   emailNewBackgroundCheck,
   emailBackgroundDecision,
@@ -264,6 +264,64 @@ const idUpload = multer({
     else cb(new Error('JPEG PNG PDF only'))
   },
 })
+
+// ── PROOF-OF-INCOME UPLOAD STORAGE (10/26, Nic) ──────────────
+//
+//   "We don't have any way on the application for when people do the
+//    background check, we don't have any way for them to upload proof of
+//    income, right? We probably need to start adding that."
+//
+// He raised it while working out the FlexPay income survey, and it is needed
+// in BOTH places, so the uploader is generic: the applicant may attach proof
+// on the application, and the FlexPay eligibility survey attaches to the same
+// store rather than growing a second one.
+//
+// S636 CARE: the six-page intake that collected income and documents was
+// deliberately ripped out ("That link is still showing a six fucking page
+// process"), because none of it reached the screener. This does NOT put it
+// back. Proof of income is OPTIONAL, is one row on a step that already
+// exists, is never a gate on submitting, and is not sent to the screener —
+// Checkr collects what it needs on its own hosted flow. It exists so GAM can
+// answer its own question about fixed income later.
+//
+// Separate directory from id-documents so the per-row auth below can never
+// serve one as the other.
+const incomeDir = path.join(process.cwd(), 'uploads', 'income-documents')
+if (!fs.existsSync(incomeDir)) fs.mkdirSync(incomeDir, { recursive: true })
+const incomeUpload = multer({
+  storage: multer.diskStorage({
+    destination: incomeDir,
+    filename: (_req, file, cb) =>
+      cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (['image/jpeg', 'image/png', 'application/pdf'].includes(file.mimetype)) cb(null, true)
+    else cb(new Error('JPEG PNG PDF only'))
+  },
+})
+
+/**
+ * 10/26: a wrong file type or an oversized file is the PERSON's mistake, so it
+ * comes back 400 with words they can act on — not the 500 multer's thrown
+ * filter error produced, which told an applicant nothing and logged a fake
+ * server fault. Applies to both document uploads.
+ */
+function fileField(mw: RequestHandler, field: string): RequestHandler {
+  return (req, res, next) => mw(req, res, (err: any) => {
+    if (!err) return next()
+    if (err?.code === 'LIMIT_FILE_SIZE') {
+      return next(new AppError(400, 'That file is larger than 10MB. Try a photo or a smaller scan.'))
+    }
+    if (err?.code === 'LIMIT_UNEXPECTED_FILE') {
+      return next(new AppError(400, `Attach the file as "${field}".`))
+    }
+    if (typeof err?.message === 'string' && err.message.includes('JPEG PNG PDF')) {
+      return next(new AppError(400, 'That has to be a JPEG, a PNG or a PDF.'))
+    }
+    return next(err)
+  })
+}
 
 // ── HELPERS ──────────────────────────────────────────────────
 async function geocodeAddress(street1: string, city: string, state: string, zip: string): Promise<{ lat: string | null, lon: string | null }> {
@@ -1863,7 +1921,7 @@ backgroundRouter.post('/:id/cancel', requireAuth, async (req, res, next) => {
 })
 
 // ── ID FILE UPLOAD + AUTH-GATED DOWNLOAD ─────────────────────
-backgroundRouter.post('/upload-id', requireAuth, idUpload.single('file'), async (req: any, res: any, next: any) => {
+backgroundRouter.post('/upload-id', requireAuth, fileField(idUpload.single('file'), 'file'), async (req: any, res: any, next: any) => {
   try {
     if (!req.file) throw new AppError(400, 'No file')
     res.json({ success: true, data: { url: '/api/background/id-files/' + req.file.filename, filename: req.file.originalname } })
@@ -1883,6 +1941,42 @@ backgroundRouter.get('/id-files/:filename', requireAuth, async (req, res, next) 
     if (!owner) throw new AppError(404, 'Not found')
     const isApplicant = owner.user_id === req.user!.userId
     // S639: same — an account can own several companies.
+    const isLandlord = !!owner.landlord_id && landlordScopeIds(req.user!).includes(owner.landlord_id)
+    if (!isApplicant && !isLandlord) throw new AppError(403, 'Not authorized')
+    res.removeHeader('Content-Security-Policy')
+    res.removeHeader('Cross-Origin-Resource-Policy')
+    res.sendFile(fp)
+  } catch (e) { next(e) }
+})
+
+// ── PROOF-OF-INCOME FILE UPLOAD + AUTH-GATED DOWNLOAD ────────
+// 10/26 (Nic). Mirrors /upload-id exactly, including the per-row auth on the
+// way back out: a file is served only to the person it belongs to or the
+// company screening them. Nothing under uploads/ is ever public.
+backgroundRouter.post('/upload-income', requireAuth, fileField(incomeUpload.single('file'), 'file'),
+  async (req: any, res: any, next: any) => {
+    try {
+      if (!req.file) throw new AppError(400, 'No file')
+      res.json({ success: true, data: {
+        url: '/api/background/income-files/' + req.file.filename,
+        filename: req.file.originalname,
+      } })
+    } catch (e) { next(e) }
+  })
+
+backgroundRouter.get('/income-files/:filename', requireAuth, async (req, res, next) => {
+  try {
+    const fp = resolveUploadPath(incomeDir, req.params.filename)
+    if (!fp || !fs.existsSync(fp)) throw new AppError(404, 'Not found')
+    const url = '/api/background/income-files/' + req.params.filename
+    // income_document_urls is a jsonb ARRAY of urls, so ownership is a
+    // containment test rather than an equality one — the id-document check
+    // compares a single column and would silently match nothing here.
+    const owner = await queryOne<any>(
+      `SELECT user_id, landlord_id FROM background_checks
+        WHERE income_document_urls @> to_jsonb($1::text)`, [url])
+    if (!owner) throw new AppError(404, 'Not found')
+    const isApplicant = owner.user_id === req.user!.userId
     const isLandlord = !!owner.landlord_id && landlordScopeIds(req.user!).includes(owner.landlord_id)
     if (!isApplicant && !isLandlord) throw new AppError(403, 'Not authorized')
     res.removeHeader('Content-Security-Policy')

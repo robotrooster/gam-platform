@@ -326,6 +326,13 @@ const DELIBERATE = new Map(Object.entries({
     + 'address heard in a conversation is exactly the thing not to take dictation on — whoever fixes it '
     + 'should be looking at the list, reading the one that bounced, and typing the right one',
   'background POST /upload-id': 'an identity document is uploaded by the person, not the agent',
+  // 10/26: the same applicant, the same envelope. Optional proof of income
+  // attached to a screening application, served back only to them or the
+  // company screening them (the serve is a GET, so this guard never counts
+  // it — its identity-document twin, GET /id-files/:filename, is unnamed for
+  // the same reason).
+  'background POST /upload-income':
+    'proof of income is a file the applicant attaches themselves, the same act as the identity document above — a document in somebody\'s hand, not a thing an agent hands over on their behalf',
   'background POST /submit': 'the applicant enters their own SSN and identity details',
   'scopes POST /:roleType/invite': 'permissions and access are a hard stop in every profile',
   'scopes PATCH /:roleType/:userId/permissions': 'changing what somebody can see or do is a hard stop in every profile',
@@ -376,6 +383,19 @@ const DELIBERATE = new Map(Object.entries({
   'properties PATCH /:id/accepts-checks':
     'whether the front counter takes a check is a property\'s own answer about what it accepts as payment (10/23), set on the property screen beside the other payment settings; the register reads it to decide whether to offer a Check button and the sale route reads it again to refuse one either way',
   'landlords POST /me/pending-tenants/:intentId/document': 'the lease PDF is a file the landlord uploads',
+
+  // ── 10/26: "Are you on a fixed income?" ───────────────────────────────────
+  // One question on a banner in the resident's own portal, asked once and
+  // answered in place. Nic: "If yes, it takes them to the descriptor of
+  // FlexPay. If they click no, then boom, they're just flagged no." So the
+  // answer is a fact about somebody's income that routes them toward a money
+  // product, only they can know it, and the first answer is the one that
+  // sticks — re-answering is refused so a closed banner stays closed. An
+  // assistant recording it would be stating somebody's circumstances for
+  // them, which is the emergency-contact confirm rule exactly. The banner is
+  // one tap on the screen they are already looking at.
+  'tenants POST /me/fixed-income':
+    'the resident\'s own yes or no to "are you on a fixed income?", and a yes sends them to the FlexPay explainer. Only they can know the answer, so an assistant recording it manufactures a fact about somebody\'s income (the same reason a staff-side agent cannot confirm an emergency contact), and there is no correcting it after — the first answer is kept. One tap in their own portal.',
 
   // A SIGNATURE IS THE PERSON'S. The agent never signs, never declines a
   // signature, and never accepts terms on somebody's behalf — an acceptance
@@ -532,6 +552,24 @@ const DELIBERATE = new Map(Object.entries({
     'raises one of the landlord\'s own forms for a resident to sign, picked off the list on that resident\'s page that names who would sign each one (D9, 10/20). The call is named by two uuids in the body and nothing an agent can call returns a template id, so every one it made would carry an invented id and be refused — a registry that reads closed over a door that is a dead end. The agent draws up the papers it can name instead (draft_work_trade_addendum, draft_household_lease) and sends and voids what is drafted.',
   'esign POST /documents/addendum-terms/batch': 'the batch form of an action the agent already has one at a time',
   'homeSale POST /': 'creates a financed sale contract with an amortisation schedule — a lending instrument',
+  // 10/25 (Nic): the terms on a signed installment contract — whether it
+  // charges a late fee, and whether its bills take a card. Both are the
+  // landlord's own money decisions on a document somebody signed: turning fees
+  // on starts charging a resident money, and the card flag exists because
+  // Dominic Gonzalez's installment is the trust's and a chargeback on it would
+  // have to be unwound across two sets of books. An assistant changing either
+  // would be changing the terms of an agreement, which is the same rule that
+  // keeps an agent off signatures ([[gam-agent-never-signs-or-accepts-terms]]).
+  // 10/25 (Nic): marking a tracked installment paid. "When that payment comes
+  // in, we will mark that it was paid, but it stays off the books." Someone is
+  // saying money arrived that GAM never saw and can never check — there is no
+  // bill, no receipt and no bank record behind it, only the mark. An assistant
+  // pressing it writes off a payment nobody made, which is the done rule
+  // (propertyTaskList above) with money attached.
+  'homeSale PATCH /:id/installments/mark':
+    'records that an off-the-books home payment arrived, on a contract GAM tracks but does not bill. Nothing GAM can see confirms it — the mark IS the record — so it is a person saying they received the money, never an assistant.',
+  'homeSale PATCH /:id/terms':
+    'sets whether a signed installment contract charges a late fee and whether its bills take a card. Both change what a resident owes, or how money on an agreement somebody signed may be paid — a landlord\'s decision on a signed document, never an assistant\'s.',
 
   // FILE IMPORTS. A CSV is a file the landlord uploads and reviews; there is
   // nothing for an agent to supply and a bad import lands on hundreds of rows.

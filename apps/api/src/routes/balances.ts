@@ -181,6 +181,80 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
       out.push(row)
       everyone.push(row)
     }
+    // ── 10/25 (Nic): A TRACKED PAYMENT THE DESK COLLECTS BUT GAM NEVER TAKES ──
+    //
+    //   "Is that going to appear on the front desk person's list as like, hey,
+    //    collect this money?"  → yes, "collect-only, can't be rung up".
+    //
+    // Dominic Gonzalez's installment is the TRUST's money, not the park's, so
+    // GAM invoices nothing for it and nothing of it may reach the park's books
+    // (home_sale_contracts.tracked_not_billed). But he pays at the counter, and
+    // a desk that is never told cannot collect — so the line is here, and it is
+    // built to be impossible to ring up:
+    //
+    //   * there is no charge behind it at all, so no Record payment, no desk
+    //     quote, no card reader and no POS path can reach it — the same reason
+    //     a pay link above carries `record_with: []`;
+    //   * `collect_only: true` and the wording say outright that it is not a
+    //     GAM payment, so nobody tries;
+    //   * pressing it marks the ledger (PATCH /home-sales/:id/installments/mark)
+    //     and writes no money anywhere.
+    //
+    // It never counts toward the grand totals either: `everyone` is what those
+    // are summed over, and this is not money GAM is owed.
+    // ONE line per contract, the oldest payment still owed, and how many are
+    // behind it. A counter reads a person, not a list of months — eight lines
+    // for one resident is the kind of noise that gets a desk to guess.
+    const tracked = await query<any>(`
+      SELECT DISTINCT ON (c.id)
+             i.installment_number, i.amount::float AS amount,
+             i.billing_month::text AS due_on,
+             c.id AS contract_id, c.installments_total,
+             un.unit_number, pr.id AS property_id, pr.name AS property_name,
+             t.id AS tenant_id, usr.first_name, usr.last_name, usr.email, usr.phone,
+             (SELECT COUNT(*) FROM home_sale_installments b
+               WHERE b.contract_id = c.id AND b.payment_id IS NULL
+                 AND b.settled_off_platform_at IS NULL
+                 AND b.billing_month <= (NOW() AT TIME ZONE COALESCE(pr.timezone, 'America/Phoenix'))::date
+             )::int AS behind
+        FROM home_sale_installments i
+        JOIN home_sale_contracts c ON c.id = i.contract_id
+        JOIN units un ON un.id = c.unit_id
+        JOIN properties pr ON pr.id = un.property_id
+        JOIN tenants t ON t.id = c.tenant_id
+        JOIN users usr ON usr.id = t.user_id
+       WHERE c.status = 'active'
+         AND c.tracked_not_billed
+         AND i.payment_id IS NULL
+         AND i.settled_off_platform_at IS NULL
+         AND i.billing_month <= (NOW() AT TIME ZONE COALESCE(pr.timezone, 'America/Phoenix'))::date
+         AND c.landlord_id = ANY($1::uuid[])
+         AND ($2::uuid[] IS NULL OR pr.id = ANY($2::uuid[]))
+       ORDER BY c.id, i.billing_month`, [landlordIds, scopedIds])
+    for (const k of tracked) {
+      out.push({
+        tenant_id: k.tenant_id,
+        first_name: k.first_name, last_name: k.last_name,
+        phone: k.phone ?? null, email: k.email ?? null,
+        unit_number: k.unit_number,
+        property_id: k.property_id, property_ids: [k.property_id], property_name: k.property_name,
+        ...oneOff(Number(k.amount), k.due_on),
+        // No charge exists, so nothing here can be recorded as a payment.
+        record_with: [],
+        collect_only: true,
+        tracked_payment: {
+          contractId: k.contract_id,
+          installmentNumber: k.installment_number,
+          installmentsTotal: k.installments_total,
+          dueOn: k.due_on,
+          behind: k.behind,
+          say: 'Home payment — NOT a GAM payment. Take it the way the landlord arranged '
+             + 'and mark it here; do not ring it up on the register.'
+             + (k.behind > 1 ? ` ${k.behind} payments are behind; this marks the oldest.` : ''),
+        },
+      })
+    }
+
     out.sort((a, b) => Number(b.balance) - Number(a.balance))
     // decisions #25 (Nic, 10/3): "front desk / on-site staff never see a GRAND
     // TOTAL of what everyone owes. Only account owners and property managers

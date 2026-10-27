@@ -103,7 +103,14 @@ tenantAutopayRouter.get('/', async (req: any, res, next) => {
 })
 
 const putSchema = z.object({
-  leaseId: z.string().uuid(),
+  leaseId: z.string().uuid().optional(),
+  /**
+   * 10/25 (Nic): an installment (home/trailer) contract's own enrollment.
+   * "Autopay needs to be toggled on or off per contract per person. If they set
+   * up autopay on rent, that will not automatically set up autopay on the
+   * trailer payments. They have to go in." Exactly one of the two is named.
+   */
+  homeSaleContractId: z.string().uuid().optional(),
   enabled: z.boolean(),
   // NULL = charge on the day rent is due, the ordinary case. 1-28 otherwise:
   // past 28 a day does not exist in February, and a schedule that silently
@@ -126,7 +133,19 @@ tenantAutopayRouter.put('/', async (req: any, res, next) => {
     }
     const body = putSchema.parse(req.body)
     const tenantId = req.user!.profileId
-    await assertTenantOnLease(tenantId, body.leaseId)
+    if (!body.leaseId === !body.homeSaleContractId) {
+      throw new AppError(400, 'Name the lease or the home sale this autopay is for, not both and not neither.')
+    }
+    if (body.leaseId) {
+      await assertTenantOnLease(tenantId, body.leaseId)
+    } else {
+      // The buyer's own contract only, and only while it is still billing.
+      const own = await queryOne<{ id: string }>(
+        `SELECT id FROM home_sale_contracts
+          WHERE id = $1 AND tenant_id = $2 AND status = 'active'`,
+        [body.homeSaleContractId, tenantId])
+      if (!own) throw new AppError(404, 'Home sale not found')
+    }
 
     // If the tenant names a payment method it has to be theirs. Saved methods
     // live on the tenant's Stripe customer rather than in our tables, so the
@@ -159,11 +178,10 @@ tenantAutopayRouter.put('/', async (req: any, res, next) => {
 
     // Turning it back on clears a system disarm — the tenant has seen why it
     // stopped and is choosing to restart it, so the failure count starts over.
-    const row = await queryOne<any>(
-      `INSERT INTO tenant_autopay (tenant_id, lease_id, enabled, pull_day, payment_method_id, use_credit)
-       VALUES ($1, $2, $3, $4, $5, COALESCE($6::boolean, FALSE))
-       ON CONFLICT (lease_id) DO UPDATE
-          SET enabled              = EXCLUDED.enabled,
+    // 10/25: one enrollment per lease, or one per installment contract. Each
+    // has its own unique index, and ON CONFLICT must name the matching one, so
+    // the two owners take the same statement with a different target.
+    const SET = `SET enabled              = EXCLUDED.enabled,
               pull_day             = EXCLUDED.pull_day,
               payment_method_id    = EXCLUDED.payment_method_id,
               use_credit           = COALESCE($6::boolean, tenant_autopay.use_credit),
@@ -171,11 +189,21 @@ tenantAutopayRouter.put('/', async (req: any, res, next) => {
               disarmed_at          = CASE WHEN EXCLUDED.enabled THEN NULL ELSE tenant_autopay.disarmed_at END,
               disarmed_reason      = CASE WHEN EXCLUDED.enabled THEN NULL ELSE tenant_autopay.disarmed_reason END,
               last_error           = CASE WHEN EXCLUDED.enabled THEN NULL ELSE tenant_autopay.last_error END,
-              updated_at           = NOW()
-        WHERE tenant_autopay.tenant_id = $1
-       RETURNING id, enabled, pull_day, payment_method_id, use_credit`,
-      [tenantId, body.leaseId, body.enabled, body.pullDay ?? null, body.paymentMethodId ?? null,
-       body.useCredit ?? null])
+              updated_at           = NOW()`
+    const row = await queryOne<any>(
+      body.leaseId
+        ? `INSERT INTO tenant_autopay (tenant_id, lease_id, home_sale_contract_id, enabled, pull_day, payment_method_id, use_credit)
+           VALUES ($1, $2, NULL, $3, $4, $5, COALESCE($6::boolean, FALSE))
+           ON CONFLICT (lease_id) DO UPDATE ${SET}
+            WHERE tenant_autopay.tenant_id = $1
+           RETURNING id, enabled, pull_day, payment_method_id, use_credit`
+        : `INSERT INTO tenant_autopay (tenant_id, lease_id, home_sale_contract_id, enabled, pull_day, payment_method_id, use_credit)
+           VALUES ($1, NULL, $2, $3, $4, $5, COALESCE($6::boolean, FALSE))
+           ON CONFLICT (home_sale_contract_id) WHERE home_sale_contract_id IS NOT NULL DO UPDATE ${SET}
+            WHERE tenant_autopay.tenant_id = $1
+           RETURNING id, enabled, pull_day, payment_method_id, use_credit`,
+      [tenantId, body.leaseId ?? body.homeSaleContractId, body.enabled, body.pullDay ?? null,
+       body.paymentMethodId ?? null, body.useCredit ?? null])
     if (!row) throw new AppError(403, 'That autopay schedule belongs to another tenant.')
 
     res.json({ success: true, data: row })

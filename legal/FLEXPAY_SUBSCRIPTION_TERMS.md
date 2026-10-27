@@ -12,7 +12,7 @@ Template Version: 2.1
 > by Gold Asset Management LLC ("**GAM**"). FlexPay pays your
 > monthly bill to your Landlord on the last day of your grace
 > period, so the bill is paid on time, and GAM collects that
-> amount plus a flat $25.00 monthly fee from your bank account
+> amount plus the monthly fee for your service tier from your bank account
 > on the pull day you choose.
 >
 > **FlexPay is a subscription product. It is not a loan or
@@ -82,15 +82,26 @@ Subscriber may enroll, and stay enrolled, while all of the following are true:
 - no FlexDeposit installment plan of Subscriber's is still in progress; and
 - no FlexPay amount from an earlier month is still open as a GAM-side balance under Section 5.
 
-## 3. Monthly Subscription Fee — Flat $25
+## 3. Monthly Subscription Fee — Service Tier
 
-The FlexPay monthly subscription fee (the "**Monthly Fee**") is a **flat $25.00 per month**, charged for each month in which Subscriber is enrolled on a Monthly Bill's Cover Day — whether FlexPay pays a large bill, a small bill, or nothing that month.
+The FlexPay monthly subscription fee (the "**Monthly Fee**") is a **fixed price for Subscriber's service tier**, charged for each month in which Subscriber is enrolled on a Monthly Bill's Cover Day.
 
-- **Pull day:** day {{Scheduled_Pull_Day}} of the month, chosen by Subscriber from the 6th through the 28th. The 1st through the 5th are not offered. The 29th, 30th, and 31st are not available because not every month contains those days. The pull day is a **scheduling** choice only — Subscriber selects it to match the day Subscriber's income lands. It does **not** affect the fee.
+The tier is set by two things:
+
+1. **The size of the Monthly Bill being coordinated** — the total of the Covered Lines for that month, which includes rent and any utility or other lines billed with it; and
+2. **Which week of the month Subscriber's income arrives**, because that determines how far apart the Cover Day and the Scheduled Pull Date sit.
+
+Within a tier the price is a **fixed dollar amount**, not a percentage and not a rate applied to the Monthly Bill. It is **not** interest, **not** a finance charge, and **not** an origination, application, or processing fee of any kind. No such charge exists under these Terms. GAM makes no credit decision in enrolling Subscriber, and nothing in these Terms creates a debt owed by Subscriber to GAM.
+
+- **Pull day:** day {{Scheduled_Pull_Day}} of the month. The pull day matches the day Subscriber's income arrives; the 1st through the 5th are not offered, and the 29th, 30th, and 31st are not available because not every month contains those days.
 - **Scheduled Pull Date:** the first date on or after the Cover Day that falls on the pull day. When the pull day of the current month has already passed by the Cover Day, the Scheduled Pull Date falls in the following month.
-- **Monthly Fee:** a flat **$25.00**.
+- **Monthly Fee for this enrollment:** **{{Monthly_Fee}}**.
 
-**Changing the pull day.** Subscriber may change the pull day at any time through the in-platform FlexPay settings. The change takes effect for the next Monthly Bill; a collection already scheduled keeps its date. The Monthly Fee remains a flat $25.00 and does not change with the pull day.
+**FlexPay is not offered on a Monthly Bill of $3,000.00 or more.** There is no tier above that amount.
+
+**If the Monthly Bill changes.** Because the tier follows the size of the Monthly Bill, a month whose bill falls in a different tier is charged that tier's price. Subscriber is shown the price for the coming month with that month's bill, before the Scheduled Pull Date, and may cancel under Section 7 at any time.
+
+**Changing the pull day.** Subscriber may change the pull day at any time through the in-platform FlexPay settings. The change takes effect for the next Monthly Bill; a collection already scheduled keeps its date. Because the week Subscriber's income arrives is part of the tier, a change of pull day may change the tier, and Subscriber is shown the new price before it takes effect.
 
 **GAM reserves the right to revise the subscription fee prospectively** with thirty (30) days' notice by email and in-platform notification. Subscriber's continued use of FlexPay after the effective date of a pricing change constitutes acceptance of the revised pricing; if Subscriber does not agree to the revised pricing, Subscriber may cancel under Section 7 before the effective date.
 
@@ -115,10 +126,10 @@ If Subscriber's bank returns a debit under this Section 4 for **insufficient fun
 
 A debit returned because the **account is closed**, the account cannot be found, the account number is not valid, or the account holder told the bank the debit was not authorized is **never retried**.
 
-**The Monthly Fee does not change on a retry.** The fee is a flat $25.00 and is not recalculated by the retry date. Each retry collects:
+**The Monthly Fee does not change on a retry.** It is the price of Subscriber's tier for that month and is not recalculated by the retry date. Each retry collects:
 
 - **(a)** the amount FlexPay paid for that month (which does not change);
-- **(b)** the flat **$25.00** Monthly Fee for that month, not re-priced;
+- **(b)** the Monthly Fee for that month, **not re-priced**;
 - **(c)** the Stripe pass-through fee under Section 4.2 for every return of that collection so far — one after the first return, two after the second; and
 - **(d)** any other GAM-side balance applied first under Section 5.
 
@@ -205,7 +216,7 @@ To request a state-specific pro-rated refund, contact `support@goldassetmanageme
 
 The parties expressly agree and intend that these Subscription Terms create a subscription-services relationship only. **FlexPay is not, and shall not be construed as, a loan, an extension of consumer credit, a "credit transaction" under the Truth in Lending Act or Regulation Z, an extension of credit under the Equal Credit Opportunity Act or Regulation B, a consumer financial product or service under the Consumer Financial Protection Act, a debt under the Fair Debt Collection Practices Act, or a "loan" or "extension of credit" under any state consumer-finance, consumer-installment-loan, small-loan, or usury statute.**
 
-FlexPay's payment of the Covered Lines on the Cover Day is part of the payment-date coordination service, and GAM collects that amount on the Scheduled Pull Date under Subscriber's authorization in Section 4. It carries no interest and no finance charge. The Monthly Fee is the same flat $25.00 whether FlexPay pays a large bill, a small bill, or nothing in a month; it is consideration for the subscription service only. GAM makes no credit decision in enrolling Subscriber.
+FlexPay's payment of the Covered Lines on the Cover Day is part of the payment-date coordination service, and GAM collects that amount on the Scheduled Pull Date under Subscriber's authorization in Section 4. **It carries no interest, no finance charge, and no origination, application, or processing fee.** The Monthly Fee is the fixed price of a service tier under Section 3 — a single dollar amount for the tier, never a percentage of the Monthly Bill and never a charge that accrues with time — and it is consideration for the subscription service only. **GAM has no recourse against Subscriber:** if a collection and its retries do not clear, GAM does not accelerate, demand payment, sue, refer to collections, furnish to a consumer reporting agency, or threaten any of the foregoing; the amount is recovered only if and when Subscriber makes a later payment on the Platform, under Section 5. GAM makes no credit decision in enrolling Subscriber, and Subscriber owes GAM no debt under these Terms.
 
 If any FlexPay amount is not collected, GAM's sole and exclusive remedies are:
 
@@ -247,7 +258,7 @@ By electronically signing below, Subscriber **affirmatively consents** to:
 
 - These Subscription Terms in their entirety, including the express no-credit-extension paragraph in Section 9;
 - FlexPay paying Subscriber's Monthly Bill on the Cover Day under Section 2, and autopay being turned off;
-- The pull day selection in Section 3 (the 6th through the 28th) and the flat $25.00 monthly fee;
+- The pull day in Section 3 (the 6th through the 28th, matching the day Subscriber's income arrives) and the service-tier Monthly Fee set under that Section;
 - The ACH authorization in Section 4 for the amount FlexPay pays each month, the monthly fee, and pass-through fees, and the retries in Section 4.1;
 - The end of FlexPay and the waiting period in Section 4.3 when a collection cannot be made;
 - The auto-renewal of the FlexPay subscription as described in Section 6;
@@ -259,7 +270,7 @@ By electronically signing below, Subscriber **affirmatively consents** to:
 | **Subscriber electronic signature:** | {{Tenant_Signature}} |
 | **Subscriber printed name:** | {{Tenant_Full_Legal_Name}} |
 | **Pull day:** | day {{Scheduled_Pull_Day}} of the month |
-| **Monthly fee (flat, per § 3):** | $25.00 |
+| **Monthly fee (service tier, per § 3):** | {{Monthly_Fee}} |
 | **Effective Date:** | {{Signature_Date}} |
 | **IP address at signature:** | {{Tenant_IP_Address}} |
 | **User-agent at signature:** | {{Tenant_User_Agent}} |

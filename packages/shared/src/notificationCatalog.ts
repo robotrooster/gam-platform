@@ -231,6 +231,13 @@ export const NOTIFICATION_CATALOG_SOURCE = [
     when: 'A tenant-owned home sale begins on one of your spaces and its payments start.' },
   { type: 'home_sale_not_started', label: 'Home payments not started', group: 'money_out', audience: 'landlord',
     when: 'A home sale that was set up never started its payments.' },
+  // 10/25 (Nic), for a contract GAM tracks but does not bill: "we are going to
+  // send reminders about that contract payment being due. But it is not going
+  // to go billed through the property... it stays off the books." There is no
+  // invoice and no Pay Now for the buyer to be sent to, so this notice IS the
+  // whole reminder — it says the amount, the date and who to pay.
+  { type: 'home_payment_due', label: 'A home payment of yours is due', group: 'money_in', audience: 'tenant',
+    when: 'A payment on your home or trailer contract comes due, on a contract your landlord collects directly rather than billing through GAM.' },
   { type: 'books_month_close', label: 'The books were closed or reopened', group: 'money_out', audience: 'landlord',
     inAppOnly: true,
     when: 'Another owner of the company closes or reopens a month in the books.' },

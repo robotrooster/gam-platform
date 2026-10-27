@@ -17,7 +17,7 @@ import { useState } from 'react'
 import { useQueries, useQuery, useQueryClient } from 'react-query'
 import { paidByLabel, formatCurrency, humanize, humanizeEntryDescription, chargeLabel, PAYMENT_STATUS_LABEL, type PaymentStatus } from '@gam/shared'
 import { ReportBankDepositModal, ReportedDeposits, type WithdrawRefusal } from '../components/ReportBankDeposit'
-import { apiGet, apiPost } from '../lib/api'
+import { apiGet, apiPost, apiPut } from '../lib/api'
 import { owedOf, requiredOf, creditOffer, planCharges, roundCents, type LeaseBill } from '../lib/payCredit'
 import { utilityLine } from '../lib/utilityLine'
 import { AutopaySection } from './AutopayCard'
@@ -322,6 +322,24 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
       rows: { id: string; amount: number; dueDate: string; type: string; notes: string | null }[]
       methodCosts?: any
     }[]
+    // 10/25 (Nic): the trailer payment's own bill. "Should trailer payments get
+    // their own invoice separately payable from lot rent? Yeah, let's do that,
+    // and they need to be clearly labeled — I've had some people literally try
+    // to say, oh, I paid my rent, and then it's like, no, that was the trailer
+    // payment, you have the space rent too." One card per installment sale,
+    // paid by itself, saying what it is and how far through the contract it is.
+    homeContracts?: {
+      homeSaleContractId: string; outstanding: number
+      unitNumber: string; propertyName: string; dueDate: string
+      installmentsTotal: number; installmentsPaid: number; monthlyPayment: number
+      /** 10/25: the contract bars cards on this bill (its money is another book's). */
+      cardsBlocked?: boolean
+      /** 10/25: autopay on THIS contract — never implied by autopay on the rent. */
+      autopayOn?: boolean
+      autopayPullDay?: number | null
+      rows: { id: string; amount: number; dueDate: string; type: string; notes: string | null; label?: string | null }[]
+      methodCosts?: any
+    }[]
     // decisions.md #48.4: every card payment on the household's bills still
     // waiting on its card's bank (3-D Secure), in one list for this page.
     awaitingCardConfirmations?: AwaitingCardConfirmation[]
@@ -368,6 +386,7 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
   // Which bill a held card payment is on — named only when the page shows more than one.
   const awaitingWhere = (a: AwaitingCardConfirmation): string | null => {
     const bills = (balanceCtx?.leases?.length ?? 0) + (balanceCtx?.serviceAgreements?.length ?? 0)
+      + (balanceCtx?.homeContracts?.length ?? 0)
     if (bills < 2) return null
     const l = a.leaseId ? balanceCtx?.leases?.find((x) => x.leaseId === a.leaseId) : null
     if (l) return `${l.propertyName} · Unit ${l.unitNumber}`
@@ -407,9 +426,14 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
   // clock, so the pay-in-full rule that governs rent has nothing to protect
   // here — each bill is simply its own payable document.
   const serviceAgreements = balanceCtx?.serviceAgreements ?? []
+  const homeContracts = balanceCtx?.homeContracts ?? []
   // Someone with utility bills and no lease groups at all is a service-only
   // payer. A tenant who somehow had both would keep the rent-shaped page.
   const serviceOnlyPayer = serviceAgreements.length > 0 && (balanceCtx?.leases ?? []).length === 0
+  // 10/25: and a buyer who rents no space here — the investor who owns homes in
+  // parks he does not own — pays no rent either, so the page must not say so.
+  const homeOnlyPayer = homeContracts.length > 0 && serviceAgreements.length === 0
+    && (balanceCtx?.leases ?? []).length === 0
   // S616: everything outstanding on the agreement in ONE charge — one Stripe
   // transaction, one processing fee. Paying each utility separately would
   // charge the fee twice for one month at one address.
@@ -422,6 +446,38 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
         kind:      'utility',
         sendAmountInBody: true,
         serviceAgreementId: b.serviceAgreementId,
+      },
+    })
+  }
+
+  // 10/25 (Nic): autopay on a trailer payment is its OWN decision. Enrolling
+  // rent never enrolls this, and turning this on never touches the rent.
+  const [homeAutopayBusy, setHomeAutopayBusy] = useState<string | null>(null)
+  const setHomeAutopay = async (b: any) => {
+    setHomeAutopayBusy(b.homeSaleContractId)
+    try {
+      await apiPut('/autopay', {
+        homeSaleContractId: b.homeSaleContractId,
+        enabled: !b.autopayOn,
+        // The day its own installments fall on, unless they pick another.
+        pullDay: b.autopayPullDay ?? null,
+      })
+      await refetchAll()
+    } finally {
+      setHomeAutopayBusy(null)
+    }
+  }
+
+  // 10/25: the trailer bill, paid by itself. Never with the space rent.
+  const openPayHomeContract = (b: any) => {
+    setPayTarget({
+      target: {
+        amount:    Math.round(Number(b.outstanding) * 100) / 100,
+        endpoint:  '/payments/pay-balance',
+        subheader: 'your home payment — this does not pay your space rent',
+        kind:      'home',
+        sendAmountInBody: true,
+        homeSaleContractId: b.homeSaleContractId,
       },
     })
   }
@@ -529,9 +585,11 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
         <div>
           {/* S615: a utility-service payer pays no rent, so the subtitle would
               be describing somebody else's account. */}
-          <h1 className="pt">{serviceOnlyPayer ? 'Billing' : 'Payments'}</h1>
+          <h1 className="pt">{serviceOnlyPayer || homeOnlyPayer ? 'Billing' : 'Payments'}</h1>
           <p className="ps">
-            {serviceOnlyPayer ? 'Pay your utility bill and view history' : 'Pay rent and view history'}
+            {serviceOnlyPayer ? 'Pay your utility bill and view history'
+              : homeOnlyPayer ? 'Pay your home payment and view history'
+              : 'Pay rent and view history'}
           </p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
@@ -841,6 +899,67 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
             <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
               <button className="btn btn-p" onClick={() => openPayServiceAgreement(b)}>
                 Pay {formatCurrency(b.outstanding)}
+              </button>
+            </div>
+          </div>
+        </div>
+      ))}
+
+      {/* 10/25 (Nic): one card per installment sale — the trailer payment, on
+          its own bill, with its own Pay. It says in plain words that paying it
+          does not pay the space rent, because that is exactly the mix-up this
+          replaces: "I've had some people literally try to say, oh, I paid my
+          rent, and then it's like, no, that was the trailer payment, you have
+          the space rent too." */}
+      {homeContracts.map((b: any) => (
+        <div key={b.homeSaleContractId} className="card" style={{ padding: 16, marginTop: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+            <div style={{ flex: 1, minWidth: 240 }}>
+              <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 4 }}>
+                Home payment — {b.unitNumber}, {b.propertyName}
+              </div>
+              <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.4rem', color: 'var(--t0)' }}>
+                {formatCurrency(b.outstanding)}
+              </div>
+              <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 2 }}>Due {b.dueDate}</div>
+              <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 2 }}>
+                This is for the home itself. It does not pay your space rent.
+              </div>
+              {b.installmentsTotal > 0 && (
+                <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 2 }}>
+                  Payment {Math.min(b.installmentsPaid + 1, b.installmentsTotal)} of {b.installmentsTotal}
+                </div>
+              )}
+              {/* 10/25 (Nic): "we need to be able to stop payments for cards for
+                  certain invoices" — said plainly, not discovered at the till. */}
+              {b.cardsBlocked && (
+                <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 2 }}>
+                  This one is paid by bank transfer, cash or check — not by card.
+                </div>
+              )}
+              <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {b.rows.map((l: any) => (
+                  <div key={l.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: '.78rem' }}>
+                    <span style={{ color: 'var(--t2)' }}>{l.label || 'Home payment'}</span>
+                    <span className="mono" style={{ color: 'var(--t1)' }}>{formatCurrency(l.amount)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8 }}>
+              <button className="btn btn-p" onClick={() => openPayHomeContract(b)}>
+                Pay {formatCurrency(b.outstanding)}
+              </button>
+              {/* 10/25 (Nic): "Autopay needs to be toggled on or off per
+                  contract per person. If they set up autopay on rent, that will
+                  not automatically set up autopay on the trailer payments. They
+                  have to go in. The bank account's already linked. It just
+                  needs to have a button." */}
+              <button
+                className="btn btn-s btn-sm"
+                disabled={homeAutopayBusy === b.homeSaleContractId}
+                onClick={() => setHomeAutopay(b)}>
+                {b.autopayOn ? 'Turn off automatic payments' : 'Pay this automatically each month'}
               </button>
             </div>
           </div>

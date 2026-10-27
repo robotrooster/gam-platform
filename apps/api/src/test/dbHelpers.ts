@@ -50,7 +50,7 @@ const CLEANUP_KEEPS: readonly string[] = [
   'state_tax_registrations', 'flexpay_blocked_states',
   // What things cost, and how a score is computed.
   'platform_processing_rates', 'stripe_processing_costs', 'deposit_pool_yield_rates',
-  'credit_score_formulas',
+  'credit_score_formulas', 'flexpay_fee_schedule', 'flexdeposit_fee_schedule',
   // What the agents and the documents are made of.
   'agent_knowledge_chunks', 'disclosure_library_documents', 'disclosure_library_fields',
   'document_sleeves', 'library_coverage_items', 'platform_announcements', 'sales_calendar_feed',

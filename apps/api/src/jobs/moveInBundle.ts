@@ -488,9 +488,11 @@ export async function generateMoveInInvoice(
     let firstInstallmentAmount = 0
     let flexDepositActive = false
     let flexDepositSecurityDepositId: string | null = null
+    let flexDepositServiceFee = 0
     if (depositFee && inputs.tenant_id) {
-      const fdRow = await client.query<{ id: string; flex_deposit_enabled: boolean; first_amount: string | null; portability_status: string }>(
+      const fdRow = await client.query<{ id: string; flex_deposit_enabled: boolean; first_amount: string | null; portability_status: string; service_fee: string | null }>(
         `SELECT sd.id, sd.flex_deposit_enabled, sd.portability_status,
+                sd.flex_deposit_service_fee::text AS service_fee,
                 (SELECT amount::text FROM flex_deposit_installments
                   WHERE security_deposit_id = sd.id AND installment_number = 1) AS first_amount
            FROM security_deposits sd
@@ -506,6 +508,8 @@ export async function generateMoveInInvoice(
       } else if (fdRow.rows[0]?.flex_deposit_enabled && fdRow.rows[0]?.first_amount) {
         flexDepositActive = true
         flexDepositSecurityDepositId = fdRow.rows[0].id
+        // 10/26 (Nic): the WHOLE service fee rides installment 1.
+        flexDepositServiceFee = Math.round(Number(fdRow.rows[0].service_fee ?? 0) * 100) / 100
         firstInstallmentAmount = Number(fdRow.rows[0].first_amount)
         // Invoice deposit line disappears; landlord doesn't see
         // anything deposit-related on this invoice.
@@ -726,6 +730,38 @@ export async function generateMoveInInvoice(
         ]
       )
       flexDepositInstallment1PaymentId = inst1.rows[0].id
+    }
+
+    // ── 10/26 (Nic): GAM'S FLEXDEPOSIT FEE, IN FULL, WITH INSTALLMENT 1 ──────
+    //
+    //   "I would say the entire fee is paid up front along with the first
+    //    installment portion... We get our fee at the first payment, and that
+    //    way whether we have to give any shortfall to the landlord, we've at
+    //    least collected our fee."
+    //
+    // A SEPARATE row from installment 1 on purpose. Installment 1 is type
+    // 'deposit' and funds the resident's own custody balance, which comes back
+    // to them at move-out. This is GAM's revenue (type 'fee', revenue_owner
+    // 'gam', entry 'FLEXDEP'), so it must never land in collected_amount or be
+    // returned. One row each is what keeps the deposit return honest.
+    //
+    // invoice_id stays NULL, like installment 1: the landlord's move-in invoice
+    // excludes the whole FlexDeposit arrangement, and this is tenant-side only.
+    //
+    // Guarded on > 0 so a plan written before the fee existed charges nothing
+    // rather than a zero-amount row.
+    if (flexDepositActive && flexDepositServiceFee > 0) {
+      await client.query(
+        `INSERT INTO payments (
+           unit_id, lease_id, tenant_id, landlord_id,
+           type, amount, status, due_date, entry_description, revenue_owner, notes
+         ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', $6, 'FLEXDEP', 'gam', $7)`,
+        [
+          inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
+          flexDepositServiceFee.toFixed(2), invoiceDueDate,
+          `FlexDeposit service fee (deposit ${flexDepositSecurityDepositId})`,
+        ]
+      )
     }
 
     // ── S634: UTILITIES ALREADY METERED RIDE THE FIRST INVOICE ───────────────

@@ -105,13 +105,16 @@ export interface PayTarget {
   amount:    number
   endpoint:  string  // e.g. '/payments/pay-balance'
   subheader: string  // displayed under the amount in the modal
-  kind:      'rent' | 'utility'
+  kind:      'rent' | 'utility' | 'home'
   // S537: pay-balance sends the tenant-chosen amount in the body (FIFO
   // application server-side). Per-row endpoints ignore it.
   sendAmountInBody?: boolean
   /** S616: a payer with no lease settling their utility bill — every utility on
    *  the agreement, in one charge. */
   serviceAgreementId?: string
+  /** 10/25 (Nic): an installment (home/trailer) sale's own bill, paid by itself
+   *  — never together with the space rent. */
+  homeSaleContractId?: string
   // S581: pay-balance scopes the charge to one lease (each lease is its own
   // ACH/card charge + receipt). Sent when paying a specific lease's balance.
   leaseId?: string
@@ -756,13 +759,18 @@ export function PayNowModal({
   // place with the figures as they are now.
   const leaseIds = target.batch?.length ? target.batch.map((b) => b.leaseId)
     : target.leaseId ? [target.leaseId] : []
-  const isLeaseBill = leaseIds.length > 0 && !target.serviceAgreementId
+  const isLeaseBill = leaseIds.length > 0 && !target.serviceAgreementId && !target.homeSaleContractId
   const { data: ctx, isFetching: billFetching, refetch: readBillAgain } =
     useQuery<{
       leases?: LeaseBill[]; readStartedAt?: number
       serviceAgreements?: { serviceAgreementId: string; awaitingConfirmation?: AwaitingCardConfirmation[] }[]
+      homeContracts?: { homeSaleContractId: string; awaitingConfirmation?: AwaitingCardConfirmation[] }[]
     }>(
-      'balance-context', () => readBalanceContext(), { enabled: isLeaseBill })
+      // 10/25: read for a utility or trailer bill too. This was lease-only, so
+      // a card still waiting on its bank on one of those bills was never found
+      // below and the modal never offered Confirm or Cancel for it.
+      'balance-context', () => readBalanceContext(),
+      { enabled: isLeaseBill || !!target.serviceAgreementId || !!target.homeSaleContractId })
   // After a failed payment, Pay stays off until a read of the bill that
   // started at or after this moment has landed: a charge whose answer was lost
   // may have gone through, and only the server's bill can say what is still
@@ -848,7 +856,11 @@ export function PayNowModal({
   // The credit figure the answer was given against: a bill re-read with another
   // figure asks again.
   const [answeredAt, setAnsweredAt] = useState<number | null>(null)
-  const chosen: CreditMode | null = creditAsked && mode && answeredAt === offer.usable ? mode : null
+  // 10/26 (Nic): where the property does not allow saving credit up there is
+  // nothing to answer — the credit is used. Set here rather than at each use so
+  // the quote, the amount box and the charge all see one answer.
+  const chosen: CreditMode | null = creditAsked && offer.mustUse ? 'use'
+    : creditAsked && mode && answeredAt === offer.usable ? mode : null
 
   // S609: what the tenant is actually paying. Starts at their balance — the
   // common case is still "pay what I owe" and that must stay one click. Typing
@@ -912,7 +924,7 @@ export function PayNowModal({
   const [quoteTry, setQuoteTry] = useState(0)
   const quoteKey = JSON.stringify([selectedType, loadingBill, chosen, creditAsked, offer.coversWholeBill,
     lines.map((x) => [x.leaseId, x.amount, !!x.useCredit, x.creditOnly, (x.afterLeaseIds ?? []).join(',')]),
-    isLeaseBill ? null : amount, target.serviceAgreementId ?? null])
+    isLeaseBill ? null : amount, target.serviceAgreementId ?? null, target.homeSaleContractId ?? null])
   const quoteAskable = (() => {
     const askable = isLeaseBill ? lines.filter((x) => !x.creditOnly) : []
     const waitingOnAnswer = creditAsked && !chosen && !offer.coversWholeBill
@@ -936,7 +948,8 @@ export function PayNowModal({
       // and the charge are the same figures.
       ? askable.map((x) => ({ leaseId: x.leaseId, amount: x.amount, useCredit: x.useCredit === true,
           ...(x.afterLeaseIds?.length ? { afterLeaseIds: x.afterLeaseIds } : {}) }))
-      : [{ amount, leaseId: target.leaseId, serviceAgreementId: target.serviceAgreementId }]
+      : [{ amount, leaseId: target.leaseId, serviceAgreementId: target.serviceAgreementId,
+           homeSaleContractId: target.homeSaleContractId }]
     const all = Promise.all(bodies.map((b) => ask(b)))
     // With a card chosen, the same charges by bank — priced by the server too
     // (the property's fee payer and any tenant-payer platform fee), so "Pay by
@@ -1087,6 +1100,7 @@ export function PayNowModal({
         ...(target.sendAmountInBody ? { amount } : {}),
         ...(target.leaseId ? { leaseId: target.leaseId } : {}),
         ...(target.serviceAgreementId ? { serviceAgreementId: target.serviceAgreementId } : {}),
+        ...(target.homeSaleContractId ? { homeSaleContractId: target.homeSaleContractId } : {}),
         ...(selectedType === 'card' ? { confirmOnScreen: true } : {}),
       })
       // S534 (Nic): no propane-priority disclosure here — warning the
@@ -1126,7 +1140,9 @@ export function PayNowModal({
     ? leaseIds.flatMap((id) => ctx.leases!.find((l) => l.leaseId === id)?.awaitingConfirmation ?? [])
     : target.serviceAgreementId
       ? (ctx?.serviceAgreements ?? []).find((a) => a.serviceAgreementId === target.serviceAgreementId)?.awaitingConfirmation ?? []
-      : []
+      : target.homeSaleContractId
+        ? (ctx?.homeContracts ?? []).find((h) => h.homeSaleContractId === target.homeSaleContractId)?.awaitingConfirmation ?? []
+        : []
 
   // "Pay with credit — nothing charged": the credit pays every bill; the
   // answer is "use", given against the figure on screen.
@@ -1282,7 +1298,7 @@ export function PayNowModal({
         </div>
       )}
 
-      {creditAsked && !success && !offer.coversWholeBill && !chosen && (
+      {creditAsked && !success && !offer.coversWholeBill && !chosen && !offer.mustUse && (
         <div style={{ border: '1px solid var(--b1)', borderRadius: 8, padding: '12px 14px', marginBottom: 12 }}>
           <div style={{ fontSize: '.85rem', color: 'var(--t1)', marginBottom: 10, lineHeight: 1.5 }}>
             {creditSentence(offer.usable, onFile, several)}{restText ? ` ${restText}` : ''}
@@ -1315,12 +1331,16 @@ export function PayNowModal({
           padding: '8px 12px', border: '1px solid var(--b1)', borderRadius: 8, fontSize: '.8rem', color: 'var(--t1)' }}>
           <span style={{ lineHeight: 1.45 }}>
             {chosen === 'use'
-              ? <>Using your {formatCurrency(offer.usable)} credit — you pay {formatCurrency(offer.payIfUsed)}.</>
+              ? <>Using your {formatCurrency(offer.usable)} credit — you pay {formatCurrency(offer.payIfUsed)}.
+                  {offer.mustUse && <> Credit goes on your balance here, so it isn&apos;t held for later.</>}</>
               : <>Saving your {formatCurrency(offer.usable)} credit for later — you pay the whole bill.</>}
           </span>
-          <button className="btn btn-g btn-sm" disabled={submitting} onClick={() => { setMode(null); setAnsweredAt(null); setError(null) }}>
-            Change
-          </button>
+          {/* Nothing to change where the property allows no other answer. */}
+          {!offer.mustUse && (
+            <button className="btn btn-g btn-sm" disabled={submitting} onClick={() => { setMode(null); setAnsweredAt(null); setError(null) }}>
+              Change
+            </button>
+          )}
         </div>
       )}
 
@@ -1565,7 +1585,9 @@ export function PayNowModal({
           {quote && quoteReady && !success && (
             <div style={{ border: '1px solid var(--b1)', borderRadius: 8, padding: '10px 12px', marginBottom: 10, fontSize: '.82rem' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--t2)' }}>
-                <span>{target.kind === 'utility' ? 'Utility bill' : chosen === 'use' ? 'Rent, after your credit' : 'Rent'}</span>
+                <span>{target.kind === 'utility' ? 'Utility bill'
+                  : target.kind === 'home' ? 'Home payment'
+                  : chosen === 'use' ? 'Rent, after your credit' : 'Rent'}</span>
                 <span>{formatCurrency(quote.base)}</span>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--t2)', marginTop: 4 }}>
@@ -1633,7 +1655,9 @@ function authorizationCopy(
   selectedType: 'ach' | 'card' | null,
   kind: PayTarget['kind'],
 ): string {
-  const subject = kind === 'utility' ? 'utility bill' : 'payment'
+  // 10/25: a trailer bill says what it is, so nobody authorizes a "payment"
+  // and thinks they covered their rent with it.
+  const subject = kind === 'utility' ? 'utility bill' : kind === 'home' ? 'home payment' : 'payment'
   if (selectedType === 'card') {
     return `By clicking Pay you authorize a one-time charge to the selected card for the total shown above (${subject} + card processing fee).`
   }

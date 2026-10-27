@@ -132,6 +132,80 @@ async function applyMigrationsNotYetInSchema(target: Client): Promise<void> {
   }
 }
 
+
+/**
+ * 10/26 — THE PRICE CARDS ARE REFERENCE DATA, SO THE SUITE GETS THEM.
+ *
+ * schema.sql is a schema-only dump, so flexpay_fee_schedule and
+ * flexdeposit_fee_schedule arrive EMPTY. That matters now that the Flex fees
+ * are READ from those tables instead of being constants: a quote against an
+ * empty schedule finds no bracket, and the services correctly REFUSE rather
+ * than charge zero — which turned every FlexPay cover test into a refusal.
+ *
+ * Refusing is the right production behavior (a missing price must never become
+ * a free one), so the fix belongs here: production always has these rows, and
+ * dbHelpers already treats both tables as catalogs it never truncates
+ * (CLEANUP_KEEPS).
+ *
+ * WHY THE FINAL GRID IS SPELLED OUT RATHER THAN REPLAYED FROM THE MIGRATIONS.
+ * The first attempt ran the price-card migrations in order. That cannot work:
+ * schema.sql is the END state, so its CHECK already allows only 2 and 4
+ * payments, and the earliest migration's insert of a 3-payment row is refused
+ * before the later migration that narrows the CHECK ever runs. Historical
+ * migrations are not replayable onto a current schema when they write rows a
+ * later one outlaws.
+ *
+ * So these are the grids as they stand. They are not a second source of truth:
+ * services/flexFees.test.ts asserts these exact figures against the numbers
+ * Nic set, so a production re-price that does not reach this seed fails there
+ * rather than passing quietly.
+ *
+ * effective_from is 2020-01-01 for the same reason production's is — the first
+ * schedule has no predecessor, and a schedule dated later than the bill being
+ * priced resolves to no price at all.
+ */
+async function seedFlexPriceCards(target: Client): Promise<void> {
+  // The note MUST begin "10/26" — migration 20261027100000 restates both grids
+  // and identifies the rows it replaces by `note LIKE '10/26%'`. A seed note
+  // outside that pattern makes its DELETE match nothing, and its INSERT then
+  // collides with these rows on ux_flexpay_fee_bracket the moment the
+  // migration chain is replayed (posPropaneProduct.test.ts applies every
+  // migration twice). Keeping the prefix is what lets that migration stay
+  // untouched — an applied migration is never edited.
+  await target.query('RESET search_path')
+  await target.query(`
+    INSERT INTO flexpay_fee_schedule (rent_min, rent_max, benefit_wednesday, fee, effective_from, note)
+    SELECT v.rent_min, v.rent_max, w.wed,
+           CASE w.wed WHEN 2 THEN 23 + 5 * v.n WHEN 3 THEN 33 + 7 * v.n ELSE 43 + 9 * v.n END,
+           DATE '2020-01-01', '10/26 test seed — the grid as agreed'
+      FROM (VALUES (0, 0.00::numeric, 1000.00::numeric), (1, 1000.00, 1500.00),
+                   (2, 1500.00, 2000.00), (3, 2000.00, 2500.00), (4, 2500.00, 3000.00)
+           ) AS v(n, rent_min, rent_max)
+     CROSS JOIN (VALUES (2), (3), (4)) AS w(wed)
+     WHERE NOT EXISTS (SELECT 1 FROM flexpay_fee_schedule)`)
+  await target.query(`
+    INSERT INTO flexdeposit_fee_schedule (deposit_min, deposit_max, payments, fee, effective_from, note)
+    SELECT v.deposit_min, v.deposit_max, p.payments,
+           CASE p.payments WHEN 2 THEN v.two ELSE v.four END,
+           DATE '2020-01-01', '10/26 test seed — the grid as agreed'
+      FROM (VALUES (   0.00::numeric, 1000.00::numeric,  48::numeric,  67::numeric),
+                   (1000.00,          1500.00,           67,           93),
+                   (1500.00,          2000.00,           86,          120),
+                   (2000.00,          2500.00,          105,          147),
+                   (2500.00,          3000.00,          124,          173)
+           ) AS v(deposit_min, deposit_max, two, four)
+     CROSS JOIN (VALUES (2), (4)) AS p(payments)
+     WHERE NOT EXISTS (SELECT 1 FROM flexdeposit_fee_schedule)`)
+  const n = await target.query<{ fp: string; fd: string }>(
+    `SELECT (SELECT COUNT(*) FROM flexpay_fee_schedule) AS fp,
+            (SELECT COUNT(*) FROM flexdeposit_fee_schedule) AS fd`)
+  if (Number(n.rows[0].fp) !== 15 || Number(n.rows[0].fd) !== 10) {
+    throw new Error(
+      `Flex price cards seeded wrong: ${n.rows[0].fp} FlexPay rows (want 15), `
+      + `${n.rows[0].fd} FlexDeposit rows (want 10)`)
+  }
+}
+
 /**
  * 10/17 — HOW MANY WORKER DATABASES THIS RUN NEEDS.
  *
@@ -227,6 +301,7 @@ export async function setup(ctx?: { config?: any }): Promise<void> {
   try {
     await target.query(schemaSql)
     await applyMigrationsNotYetInSchema(target)
+    await seedFlexPriceCards(target)
   } finally {
     await target.end()
   }
