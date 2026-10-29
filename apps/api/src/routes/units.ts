@@ -5,11 +5,13 @@ import { db, query, queryOne, getClient } from '../db'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope, userHasPerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
+import { healthByHousehold, householdsOf } from '../services/householdMonths'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { canonicalUnitNumber, UNIT_TYPE_PREFIX, BOOKING_STATUSES, BOOKING_STATUS_LABEL, SUB_PERMISSION_LABEL, PERMISSION_CATALOG, type BookingStatus } from '@gam/shared'
 import { STAY_TERMS, STAY_SCREENING_NIGHTS, stayHeldWords, type StayTerms } from '@gam/shared'
+import { stayDepositAsk, STAY_DEPOSIT_ASK_REFUSAL } from '@gam/shared'
 import { centsWords, NEVER_MOVED_IN_NOTE, NEVER_MOVED_IN_REASON } from '../lib/unwindIssuedLease'
-import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, leaseTypesForUnitType, isShortStayByNature, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
+import { UTILITY_TYPES, UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, isRigTooLongForSite, MAX_RIG_LENGTH_FT, SHORT_STAY_LOCKED_UNIT_TYPES, leaseTypesForUnitType, isShortStayByNature, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE, type StayConflict } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
@@ -20,6 +22,7 @@ import { recordBookingEvent, recordBookingChange } from '../services/bookingEven
 import {
   stayNeeds, markScreeningRequired, chooseStayTerms, draftLeaseFromStay, syncStayUtilityAgreement, checkInBlock,
   continuousStayNights, canAttestReturningGuest, attestReturningGuest, planStayGuestAccount,
+  screeningFeeToCarry,
   RETURNING_GUEST_NOT_ALLOWED, type StayNeeds, type CheckInBlock,
 } from '../services/stayTerms'
 import {
@@ -28,7 +31,15 @@ import {
   type StayWorkTradeTerms,
 } from '../services/stayWorkTrade'
 import { unitPendingReads } from '../services/utilityReadingRuns'
-import { syncLeaseWithBookingDates } from '../services/bookingLeaseBilling'
+import {
+  syncLeaseWithBookingDates, pastEndAttemptedCharges, stayShortenedChoiceIn, recordStayShortenedChoice,
+  type PastEndAttempted,
+} from '../services/bookingLeaseBilling'
+import { type StayShortenedChargeChoice } from '@gam/shared'
+import {
+  shortenedChoicesFor, assertMayAnswerShortened,
+  mayScheduleAndTakePayments, SCHEDULE_AND_PAYMENT_LABELS,
+} from '../lib/stayShortenedVoid'
 import { bookedDayBeforeEarlyCheckOut, checkOutChangeRefusal, onCheckOutUndone, afterPatchEarlyCheckOut, refundNeedsRetrySql, healLeaseEnds } from '../services/earlyCheckOut'
 import { scheduleStayPrice, stayExtensionQuote, extendStayByMonth, SCREENING_LINE_NAME, type StayExtension } from '../services/registerStay'
 import { assertLateFeeDecision } from '../services/lateFeePolicy'
@@ -102,18 +113,11 @@ unitsRouter.get('/', async (req, res, next) => {
         vuo.primary_last_name AS tenant_last,
         vuo.primary_email AS tenant_email,
         vuo.tenant_count,
-        -- S652 (Nic): payment health on the list, not two clicks deep. Charges
-        -- due before today; paid = settled, or covered by work trade (hours
-        -- paid it, "there was no payment to be made, so how could they be at
-        -- zero percent"). NULL until there is a bill to judge by.
-        (SELECT CASE WHEN COUNT(*) = 0 THEN NULL
-                     ELSE ROUND(100.0 * COUNT(*) FILTER (WHERE p.status IN ('settled','paid_via_deposit') OR p.work_trade_suspended_at IS NOT NULL) / COUNT(*))
-                END
-           FROM payments p
-          WHERE p.tenant_id = vuo.primary_tenant_id
-            AND p.type IN ('rent','utility','fee','home_payment')
-            AND p.due_date < CURRENT_DATE
-            AND p.status IN ('pending','failed','settled','paid_via_deposit','returned')) AS payment_health,
+        -- 10/12 (Nic): "lease rent (from the LEASE, not the unit listing)".
+        -- The rent the active lease bills — the Tenants list shows it beside
+        -- the Rent Roll, which reads the same lease (RV 33 lists at $589; its
+        -- lease bills $495). rent_amount stays the space's listed price.
+        (SELECT al.rent_amount FROM leases al WHERE al.id = vuo.active_lease_id) AS lease_rent_amount,
         -- S554 (button-sweep bug #10): the admin-ops Units panel reads
         -- achVerified for the primary tenant's ACH badge; without this the
         -- field was always undefined and the badge stuck on "Pending".
@@ -197,6 +201,34 @@ unitsRouter.get('/', async (req, res, next) => {
       WHERE 1=1 ${landlordFilter} ${propertyFilter} ${staffScopeFilter} ${retiredFilter}
       ORDER BY p.name, u.unit_number
     `, params)
+    // S652 (Nic): payment health on the list, not two clicks deep. 10/12 (Nic):
+    // "Payment health = ONE definition everywhere, per HOUSEHOLD per BILL
+    // MONTH" — the household's months paid on time since it joined GAM (all
+    // time, services/householdMonths), the figure the profile, the Rent Roll and
+    // the tenant's own screen show. It used to be paid rows ÷ rows due, which
+    // never checked a date (Gerald Logue: 25% here, 6% on his profile, 0% on
+    // his own screen; 1 of 2 months, 50%, under the one definition). NULL
+    // until a month is judged. Scoped to the viewer's companies and properties.
+    //
+    // 10/12: only to a viewer who may see payment histories — the owner, GAM
+    // admin, or staff with "View all payments" or the books — the same rule
+    // the profile keeps (routes/tenants seesPayments; S641: "I don't want her
+    // to see ... the payment histories"). Anyone else reads "—".
+    const seesHealth = isAdmin || userHasPerm(req.user, 'payments.view_all', 'books.view')
+    const primaries = [...new Set(units.map((u: any) => u.tenant_id).filter(Boolean))] as string[]
+    if (primaries.length && seesHealth) {
+      const healthLandlords = isAdmin ? [...new Set(units.map((u: any) => u.landlord_id))] as string[] : callerScope
+      const households = await householdsOf(primaries, healthLandlords, scopedPropertyIds)
+      const health = await healthByHousehold({
+        landlordIds: healthLandlords, propertyIds: scopedPropertyIds,
+        householdIds: [...new Set(households.values())],
+      })
+      for (const u of units as any[]) {
+        u.payment_health = u.tenant_id ? (health.get(households.get(u.tenant_id) ?? u.tenant_id)?.percent ?? null) : null
+      }
+    } else {
+      for (const u of units as any[]) u.payment_health = null
+    }
     res.json({ success: true, data: units })
   } catch (e) { next(e) }
 })
@@ -488,36 +520,12 @@ function screeningFeeRouteBody(needs: StayNeeds, hasEmail: boolean) {
 const fmtMoney = (n: number) => `$${(Math.round(n * 100) / 100).toFixed(2)}`
 
 /**
- * Is the background check's fee already on its way for this continuous stay —
- * on an open register ticket or an unpaid pay link of any stay in it (R7), or
- * already paid? Then a longer stay is not sent a second fee (M3): one fee per
- * stay, never two.
+ * 10/20 (review): "is this stay's check fee already out, and what is left to
+ * ask for" moved to services/stayTerms screeningFeeToCarry, which is where the
+ * rest of the long-stay rules live. This file had three near-copies of the
+ * question and the confirmation had none, so one reservation could be quoted
+ * two different amounts of money — see the note on screeningFeeToCarry.
  */
-async function screeningFeeAlreadyCarried(bookingIds: string[]): Promise<boolean> {
-  if (!bookingIds.length) return false
-  const carried = await queryOne<{ x: number }>(
-    `SELECT 1 AS x FROM pos_open_tickets t
-      WHERE t.booking_id = ANY($1::uuid[]) AND t.status = 'open'
-        AND EXISTS (SELECT 1 FROM jsonb_array_elements(
-                      CASE WHEN jsonb_typeof(t.items) = 'array' THEN t.items ELSE '[]'::jsonb END) i
-                     WHERE i->>'${SCREENING_FEE_LINE_FLAG}' = 'true')
-     UNION ALL
-     SELECT 1 AS x FROM pos_pay_links l
-      WHERE l.status = 'open'
-        AND EXISTS (SELECT 1 FROM jsonb_array_elements(
-                      CASE WHEN jsonb_typeof(l.items) = 'array' THEN l.items ELSE '[]'::jsonb END) i
-                     WHERE i->>'${SCREENING_FEE_LINE_FLAG}' = 'true'
-                       -- a deposit link names the stay on the link; a link for
-                       -- the check alone (createScreeningFeeLink) names it on its line.
-                       AND (l.booking_id = ANY($1::uuid[])
-                            OR (l.booking_id IS NULL AND i->>'bookingId' = ANY($1::text[]))))
-     UNION ALL
-     -- already paid for this continuous stay: nothing more to carry.
-     SELECT 1 AS x FROM screening_prepayments sp
-      WHERE sp.booking_id = ANY($1::uuid[]) AND sp.status <> 'void'
-     LIMIT 1`, [bookingIds])
-  return !!carried
-}
 
 /** The answer to the R2 question in a request body, or null. A value that is not one is refused in words. */
 function stayTermsIn(raw: unknown): StayTerms | null {
@@ -542,6 +550,130 @@ export const SCREENING_FEE_LINE_FLAG = 'screening'
 export function screeningFeeTicketLine(amount: number): Record<string, unknown> {
   return { id: null, name: SCREENING_LINE_NAME, qty: 1, price: amount, tax: 0, [SCREENING_FEE_LINE_FLAG]: true }
 }
+
+/**
+ * A permission's name as the Team page shows it, read from the catalog, so
+ * every refusal below names the toggle the person is actually missing.
+ */
+const permissionLabel = (key: string, fallback: string): string => PERMISSION_CATALOG
+  .flatMap(g => g.sections.flatMap(s => s.items))
+  .find(i => i.key === key)?.label ?? fallback
+
+/**
+ * 10/18 (Nic) — THE ONE WAY A RESERVATION'S DEPOSIT LINK IS MADE AND EMAILED.
+ *
+ *   "yeah, let's add a button so that we can collect deposits from people that
+ *    haven't done it for their stays."
+ *
+ * Two doors reach this: the reservation form at the moment a stay is booked
+ * (sendDepositLink), and the schedule's "Ask for the deposit" button on a stay
+ * that was taken without one. Both ask for the SAME number — the deposit the
+ * booking site would have quoted for these nights on this site — because a
+ * guest who phones and a guest who books online are buying the same thing
+ * (services/propertyBooking quoteStayDeposit).
+ *
+ * The background check's fee rides on the link as its own fixed line the payer
+ * cannot take off (10/5, R8/A2) — the server's figure, never the guest's — and
+ * a $0 deposit with a fee still makes a link, for the fee alone.
+ *
+ * `nothingOwed` is read from the AMOUNTS, not from the absence of a link: a
+ * null link also comes back when the deposit on this reservation was already
+ * claimed by an earlier link (createBookingDepositLink claims
+ * `deposit_amount IS NULL`), and reading the null would tell the desk a guest
+ * owes no deposit while one is outstanding.
+ *
+ * The stamp is what the schedule reads to say the guest HAS been asked, and
+ * what paces a second press (the route below).
+ */
+async function sendStayDepositLink(args: {
+  bookingId: string; landlordId: string; propertyId: string; unitId: string
+  checkIn: string; checkOut: string
+  guestName: string | null; guestEmail: string
+  /** 10/6: a work trade covering rent leaves only the check's fee to send. */
+  rentTraded: boolean
+  screeningFee: number | null
+  byUserId: string | null
+  /**
+   * 10/18 (review): the price THIS reservation was taken at, for a site with no
+   * rate on it anywhere — a stay the counter priced by hand. Without it the
+   * quote comes back $0 and the desk is told the park asks no deposit
+   * (services/propertyBooking quoteStayDeposit).
+   */
+  bookedTotal: number | null
+}): Promise<{
+  link: { id: string; url: string } | null
+  amount: number
+  nothingOwed: boolean
+  /** Did the guest really get the email? A send that failed is not an ask. */
+  emailed: boolean
+}> {
+  const { quoteStayDeposit } = await import('../services/propertyBooking')
+  const amount = args.rentTraded ? 0
+    : await quoteStayDeposit(args.unitId, args.checkIn, args.checkOut, { bookedTotal: args.bookedTotal })
+  const { createBookingDepositLink } = await import('./posPayLinks')
+  const link = await createBookingDepositLink({
+    bookingId: args.bookingId, landlordId: args.landlordId, propertyId: args.propertyId,
+    amount, guestName: args.guestName, guestEmail: args.guestEmail,
+    ...(args.screeningFee ? { screeningFee: args.screeningFee } : {}),
+  })
+  if (link) {
+    // WHICH LINK IS THIS RESERVATION'S DEPOSIT — written always, because a
+    // reservation can carry other links that ask for other money (the one that
+    // created it from the register, an "Add a month" link, the arrival-day
+    // balance link). 10/18 (review): without this the button handed back a
+    // link for the WHOLE stay and called it the deposit, so the figure read
+    // down the phone was five times the deposit and the deposit was never
+    // asked for.
+    //
+    // The "asked" stamp is written only when the email really went out: a send
+    // that failed is not an ask, and recording one would tell the schedule a
+    // guest was emailed who never was — the very thing the stamp exists to
+    // stop ("so nobody asks the same person four times").
+    //
+    // Best-effort either way: the link is out, and a reservation the schedule
+    // cannot say "asked" about beats one the guest never got.
+    await query(
+      `UPDATE unit_bookings
+          SET deposit_pay_link_id = $2,
+              deposit_link_sent_at = CASE WHEN $4::boolean THEN NOW() ELSE deposit_link_sent_at END,
+              deposit_link_sent_by = CASE WHEN $4::boolean THEN $3 ELSE deposit_link_sent_by END,
+              updated_at = NOW()
+        WHERE id = $1`, [args.bookingId, link.id, args.byUserId, link.emailed])
+      .catch((err) => logger.error({ err, bookingId: args.bookingId }, '[booking] deposit link sent-stamp failed'))
+  }
+  return {
+    link, amount, emailed: !!link?.emailed,
+    nothingOwed: !(amount > 0) && !(Number(args.screeningFee) > 0),
+  }
+}
+
+/**
+ * 10/18 — WHO MAY ASK A GUEST FOR THEIR DEPOSIT.
+ *
+ * The same pair the shortened-stay void asks for (10/14, Nic: "anyone who can
+ * schedule reservations and take payments") — a reservation permission AND a
+ * way to take payments — and for the same reason: this is putting money on a
+ * reservation. Somebody who can only look at the schedule does not email a
+ * guest a bill, and somebody who takes payments all day but cannot touch a
+ * reservation has no business changing what one is holding.
+ *
+ * The RULE itself lives in lib/stayShortenedVoid (mayScheduleAndTakePayments)
+ * so there is one answer to "that pair" — 10/18 (review): this file had copied
+ * it, owner roles and all, so the next change to who counts as an owner would
+ * have reached the shortened-stay void and not this.
+ *
+ * The route asks the rule ITSELF instead of standing behind a permission gate,
+ * so that EVERYBODY short of the pair hears which boxes they are missing. The
+ * gate answered "Insufficient permissions" to a clerk who takes payments all
+ * day but holds no reservation box — half the people this refusal is written
+ * for. The names come from the permissions catalog, so they match the toggles
+ * on the Team page.
+ */
+const DEPOSIT_LINK_REFUSAL =
+  `Asking a guest for their deposit needs "${SCHEDULE_AND_PAYMENT_LABELS.create}" `
+  + `or "${SCHEDULE_AND_PAYMENT_LABELS.edit}", together with `
+  + `"${SCHEDULE_AND_PAYMENT_LABELS.record}" or "${SCHEDULE_AND_PAYMENT_LABELS.ring}". `
+  + 'Ask someone who has both, or take the deposit at the register. Nothing was sent.'
 
 /** The lease drafted from this stay that still runs (pending or active), if any. */
 async function stayLeaseOf(bookingId: string): Promise<{ id: string; status: string; openEnded: boolean } | null> {
@@ -642,19 +774,19 @@ const screeningPendingBody = (block: CheckInBlock) => ({
 // "Check guests in" / "Check guests out" for the act itself is checked before.
 // The edit permission's name is read from the permissions catalog, so the
 // words match the toggle on the Team page.
-const EDIT_RESERVATION_LABEL = PERMISSION_CATALOG
-  .flatMap(g => g.sections.flatMap(s => s.items))
-  .find(i => i.key === 'schedule.edit_reservation')?.label ?? 'Edit / move / cancel reservations'
+const EDIT_RESERVATION_LABEL = permissionLabel('schedule.edit_reservation', 'Edit / move / cancel reservations')
 
 function deskOnlyRefusal(
   booking: {
     status: string; notes: string | null; guest_name: string | null; guest_email: string | null
     guest_phone: string | null; required_site_layout: string | null; required_amp_service: string | null
+    rig_length_ft: number | null
     locked_to_unit: boolean | null; avoided_unit_ids: string[] | null
   },
   sent: {
     status: unknown; notes: unknown; guestName: unknown; guestEmail: unknown; guestPhone: unknown
-    requiredSiteLayout: unknown; requiredAmpService: unknown; lockedToUnit: unknown; avoidedIn: string[] | null
+    requiredSiteLayout: unknown; requiredAmpService: unknown; rigLengthFt: unknown
+    lockedToUnit: unknown; avoidedIn: string[] | null
     checkInChanged: boolean; checkOutChanged: boolean; unitChanged: boolean; toCheckOut: boolean
   },
 ): string | null {
@@ -671,7 +803,11 @@ function deskOnlyRefusal(
   // (Blank notes leave the notes as they are.)
   if (sent.notes && differs(sent.notes, booking.notes)) parts.push('notes')
   if (differs(sent.requiredSiteLayout, booking.required_site_layout)
-      || differs(sent.requiredAmpService, booking.required_amp_service)) parts.push('site needs')
+      || differs(sent.requiredAmpService, booking.required_amp_service)
+      // 10/24: the rig's length is a site need like the others — it decides
+      // which pads the stay may sit on. (undefined = not sent; differs() also
+      // treats an explicit clear as "not sent", same as the two above.)
+      || differs(sent.rigLengthFt, booking.rig_length_ft)) parts.push('site needs')
   if (typeof sent.lockedToUnit === 'boolean' && sent.lockedToUnit !== (booking.locked_to_unit === true)) {
     parts.push('lock to the site')
   }
@@ -891,6 +1027,111 @@ export function avoidedSiteWords(guestName: string | null | undefined, unitNumbe
   return `${who} asked not to be on ${unitNumber}. Move them there anyway?`
 }
 
+// ── 10/20 (Nic, his own catch): MOVING A STAY OFF THE SPACE IT WAS PROMISED ──
+//
+//   "They may have already gotten a confirmation on a space number. Our system
+//    with compression and expansion is going to kind of screw that up if they
+//    think they're locked to a specific site already."
+//
+// unit_bookings.lock_reason says WHY a stay cannot be moved off its site, and
+// the two reasons that exist both mean the same dangerous thing: a space NUMBER
+// is already in the guest's hands. This third value is what a hand move leaves
+// behind, so no screen afterwards calls the new site promised. See the
+// migration of the same name.
+const MOVED_OFF_PROMISED_SITE = 'moved_off_promised_site'
+/**
+ * The two reasons that mean somebody told the guest a space number. The same
+ * two the migration's CHECK allows beside the third one, and the only two a
+ * hand move rewrites.
+ */
+const PROMISED_LOCK_REASONS = ['promised_before_gam', 'promised_at_the_counter']
+
+/** Why this stay is pinned to its site, in the clause the refusal reads out. */
+function lockHeldBecause(lockReason: string | null | undefined): string {
+  if (lockReason === 'promised_before_gam') return 'was promised this space before GAM, in the old system'
+  if (lockReason === 'promised_at_the_counter') return 'was promised this space at the desk'
+  if (lockReason === MOVED_OFF_PROMISED_SITE) return 'was already moved here by hand, off the space they were promised'
+  return 'is pinned to this space by hand'
+}
+
+/**
+ * The question asked before a person moves a LOCKED stay to another site.
+ *
+ * It is one question, not a warning, and it carries the three things the
+ * person pressing needs: that a space number is already in this guest's hands,
+ * which space it is, and what GAM will do about it. A rig arriving to find
+ * somebody parked on its site is the failure the lock exists to prevent, and
+ * the only thing standing between the two is whether the guest hears about the
+ * move — so the question says plainly whether GAM can tell them.
+ */
+export function lockedSiteWords(o: {
+  guestName: string | null | undefined
+  lockReason: string | null | undefined
+  fromUnitNumber: string
+  toUnitNumber: string
+  canEmailGuest: boolean
+}): string {
+  const who = o.guestName && o.guestName.trim() ? o.guestName.trim() : 'This guest'
+  const tell = o.canEmailGuest
+    ? `We will email them that their site is now ${o.toUnitNumber}.`
+    : 'We have no email address for them, so somebody has to call them — GAM cannot tell them.'
+  return `${who} ${lockHeldBecause(o.lockReason)}, so ${o.fromUnitNumber} is the number they have. `
+    + `Moving them to ${o.toUnitNumber} means ${o.fromUnitNumber} is no longer theirs. ${tell} `
+    + 'Move them anyway?'
+}
+
+/**
+ * The whole refusal, as both the places that raise it send it: the early one
+ * that answers before a transaction is opened, and the one inside the save that
+ * catches a stay pinned while this move was already on its way.
+ */
+export function lockedSiteBody(o: {
+  guestName: string | null | undefined
+  lockReason: string | null | undefined
+  fromUnitNumber: string | null | undefined
+  toUnitNumber: string
+  canEmailGuest: boolean
+}) {
+  return {
+    success: false as const,
+    code: 'locked_site' as const,
+    error: lockedSiteWords({ ...o, fromUnitNumber: o.fromUnitNumber || 'its site' }),
+    unitNumber: o.toUnitNumber,
+    fromUnitNumber: o.fromUnitNumber ?? null,
+    lockReason: o.lockReason ?? null,
+    // The confirm says what the move does; this is the same fact in a field,
+    // so the screen never has to parse the sentence for it.
+    willEmailGuest: o.canEmailGuest,
+  }
+}
+
+/**
+ * What the save says it did, once the move has gone through. The desk pressed
+ * a confirm that promised the guest would be emailed; this is the sentence
+ * that says it happened — or that nothing went out and a call is owed.
+ */
+export function lockedSiteMovedWords(o: {
+  guestName: string | null | undefined
+  fromUnitNumber: string
+  toUnitNumber: string
+  told: 'emailed' | 'no_address' | 'send_failed'
+  emailedTo?: string | null
+  /** True when the stay had been promised a space, so its reason was rewritten. */
+  wasPromised: boolean
+}): string {
+  const who = o.guestName && o.guestName.trim() ? o.guestName.trim() : 'This guest'
+  const stillHas = `${who} still has ${o.fromUnitNumber} — ring them.`
+  const tell = o.told === 'emailed'
+    ? `We emailed ${o.emailedTo} their new site.`
+    : o.told === 'no_address'
+      ? `Nothing was emailed: there is no address on this reservation, so ${stillHas}`
+      : `The email did not go out, so ${stillHas}`
+  return `${who} moved from ${o.fromUnitNumber} to ${o.toUnitNumber}. ${tell}`
+    + (o.wasPromised
+      ? ` ${o.toUnitNumber} is not a space anybody promised them, and the reservation says so now.`
+      : ` The stay is still pinned to its site, now ${o.toUnitNumber}.`)
+}
+
 // S653: the avoid list is body-supplied ids. Keep only units that exist at the
 // property the stay is at — a stray id from another park (or another landlord)
 // is dropped, never stored.
@@ -915,6 +1156,11 @@ unitsRouter.get('/available', async (req, res, next) => {
       excludeBookingId:   z.string().uuid().nullish(),
       requiredSiteLayout: z.enum(RV_SITE_LAYOUTS as unknown as [string, ...string[]]).nullish(),
       requiredAmpService: z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).nullish(),
+      // 10/24 (Nic): "somebody's got a 37 foot camper. They can't go in the
+      // small sites, right?" A rig length on the ask drops every pad too short
+      // for it out of the picker, so the counter is never offered a site the
+      // trailer does not fit on.
+      rigLengthFt:        z.coerce.number().int().positive().max(MAX_RIG_LENGTH_FT).nullish(),
       propertyId:         z.string().uuid().nullish(),
     }).parse(req.query)
     // S633: the account's companies, not one. Availability spans the portfolio.
@@ -947,7 +1193,8 @@ unitsRouter.get('/available', async (req, res, next) => {
     })
     const data = rows.filter(u =>
       !isSiteLayoutMismatch(q.requiredSiteLayout, u.rv_site_layout) &&
-      !isAmpServiceMismatch(q.requiredAmpService, u.rv_amp_service))
+      !isAmpServiceMismatch(q.requiredAmpService, u.rv_amp_service) &&
+      !isRigTooLongForSite(q.rigLengthFt, u.rv_max_rig_length_ft))
     res.json({ success: true, data })
   } catch (e) { next(e) }
 })
@@ -1075,6 +1322,11 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       securityDeposit: z.number().min(0).optional(),
       rvSiteLayout:    z.enum(RV_SITE_LAYOUTS as unknown as [string, ...string[]]).optional(),
       rvAmpService:    z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).optional(),
+      // 10/24 (Nic): the longest rig this pad takes, in feet. Blank means the
+      // park has not measured it and every rig fits (isRigTooLongForSite reads
+      // a missing limit as a fit), so no existing park changes until somebody
+      // fills it in. Inherited from the site class when the class states one.
+      rvMaxRigLengthFt: z.number().int().positive().max(MAX_RIG_LENGTH_FT).nullable().optional(),
       // S550: who owns the dwelling — drives the inspection checklist
       // (site-only for tenant-owned MH/RV vs full interior). Only meaningful
       // for rv_spot / mobile_home; defaulted below.
@@ -1186,6 +1438,11 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
     const bathrooms = body.bathrooms ?? num(sub?.bathrooms) ?? 1
     // RV sub-type fields only apply to rv_spot units; storage size to storage.
     const rvLayout = unitType === 'rv_spot' ? (body.rvSiteLayout ?? sub?.rv_site_layout ?? 'none') : 'none'
+    // 10/24: same inheritance as the layout and the amps — the request wins, the
+    // site class fills in, and a space that is not an RV pad has no rig limit.
+    const rvMaxRig = unitType === 'rv_spot'
+      ? (body.rvMaxRigLengthFt ?? sub?.rv_max_rig_length_ft ?? null)
+      : null
     const rvAmp    = unitType === 'rv_spot' ? (body.rvAmpService ?? sub?.rv_amp_service ?? 'none') : 'none'
     const storageSize = unitType === 'storage' ? (body.storageSize?.trim() || sub?.storage_size || null) : null
     // Same rule for short-stay rates — the subtype describes the space, it does
@@ -1282,10 +1539,10 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       const leaseTypesAllowed = leaseTypesForUnitType(unitType, !!body.isBookable)
       const [unit] = await query<any>(`
         INSERT INTO units (property_id, landlord_id, unit_number, building, unit_type, bedrooms, bathrooms, sqft,
-                           rent_amount, security_deposit, rv_site_layout, rv_amp_service,
+                           rent_amount, security_deposit, rv_site_layout, rv_amp_service, rv_max_rig_length_ft,
                            nightly_rate, weekly_rate, monthly_rate, storage_size, subtype_id, status,
                            is_bookable, lease_types_allowed, dwelling_ownership, lot_rent_amount, is_multi_level, is_ada_accessible, floor_level, living_areas, features, owner_household_size, occupancy_mode)
-        VALUES ($1,$2,$3,$28,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+        VALUES ($1,$2,$3,$28,$4,$5,$6,$7,$8,$9,$10,$11,$29,$12,$13,$14,$15,$16,$17,
                 $18, $19::text[], $20, $21, $22, $23, $24, $25, $26::jsonb, $27,
                 -- S558: new unit inherits the property's default occupancy mode
                 -- (a seed, not a governing setting — the unit owns it after).
@@ -1301,7 +1558,9 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
          body.ownerHouseholdSize ?? 1,
          // $28 — the building. Trimmed to NULL so blank and absent are the
          // same thing; the unique index treats them as one.
-         (body.building ?? null) ? String(body.building).trim() || null : null]
+         (body.building ?? null) ? String(body.building).trim() || null : null,
+         // $29 — the pad's rig limit, resolved above.
+         rvMaxRig]
       )
       // S630: link EVERY selected subtype. units.subtype_id above holds the
       // first one for readers not yet moved over; unit_subtype_links is the
@@ -1529,6 +1788,10 @@ export const UNIT_CLONE_COPIED = [
   'monthly_rate', 'is_bookable', 'lease_types_allowed', 'check_in_time',
   'check_out_time', 'amenities', 'unit_description', 'min_stay_nights',
   'max_stay_nights', 'import_extra_data', 'rv_site_layout', 'rv_amp_service',
+  // 10/24: how long a rig the pad takes is a fact about the GROUND, and a
+  // retire-and-replace is the same ground under a new record — so it copies,
+  // beside the layout and the amps it belongs with.
+  'rv_max_rig_length_ft',
   'storage_size', 'subtype_id', 'dwelling_ownership', 'occupancy_mode',
   'lot_rent_amount', 'is_multi_level', 'is_ada_accessible', 'floor_level',
   'features', 'living_areas',
@@ -1773,6 +2036,16 @@ unitsRouter.patch('/:id/status', requirePerm('units.set_status'), async (req, re
     if (unit.status === 'suspended') {
       throw new AppError(400, 'This unit is in eviction mode. Turn eviction mode off to change its status')
     }
+    // 10/12 (Nic): 'utility_service' is in the shared status list now (it
+    // matches the database). A service point is made by setting up a utility
+    // service agreement (routes/utilityServiceAgreements), never by hand, and
+    // it can never hold a lease — so neither direction is a status change here.
+    if (status === 'utility_service') {
+      throw new AppError(400, 'A utility service space is created by setting up a utility service agreement, not by changing its status')
+    }
+    if (unit.status === 'utility_service') {
+      throw new AppError(400, 'This space is a utility service point. Manage it from its utility service agreement')
+    }
     // S604: 'owner_use' means the OWNER occupies it — no lease, no rent. A unit
     // with a live lease has a tenant in it, so the two states are mutually
     // exclusive. Enforced rather than documented: without this a landlord could
@@ -1912,7 +2185,7 @@ unitsRouter.get('/:id/economics', async (req, res, next) => {
 unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (req, res, next) => {
   try {
     const { unitType, nightlyRate, weeklyRate, monthlyRate, minStayNights, maxStayNights,
-            checkInTime, checkOutTime, amenities, unitDescription, isBookable, rvSiteLayout, rvAmpService,
+            checkInTime, checkOutTime, amenities, unitDescription, isBookable, rvSiteLayout, rvAmpService, rvMaxRigLengthFt,
             dwellingOwnership, occupancyMode, lotRentAmount, isMultiLevel, isAdaAccessible } = req.body
 
     if (rvSiteLayout != null && !RV_SITE_LAYOUTS.includes(rvSiteLayout)) {
@@ -1927,6 +2200,21 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
     }
     if (rvAmpService != null && !RV_AMP_SERVICES.includes(rvAmpService)) {
       throw new AppError(400, `Invalid rvAmpService '${rvAmpService}'`)
+    }
+    // 10/24 (Nic): the longest rig this pad takes. Refused in plain words here
+    // rather than reaching units_rv_max_rig_length_sane and coming back as a
+    // 500. Absent leaves it alone; an explicit null clears the limit (they
+    // re-measured and the pad takes anything).
+    let rigLimitSet: number | null | undefined = undefined
+    if (rvMaxRigLengthFt !== undefined) {
+      if (rvMaxRigLengthFt === null || rvMaxRigLengthFt === '') rigLimitSet = null
+      else {
+        const n = Number(rvMaxRigLengthFt)
+        if (!Number.isInteger(n) || n <= 0 || n > MAX_RIG_LENGTH_FT) {
+          throw new AppError(400, `A site's rig limit is a whole number of feet between 1 and ${MAX_RIG_LENGTH_FT}.`)
+        }
+        rigLimitSet = n
+      }
     }
 
     const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
@@ -1953,6 +2241,10 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
       amenities=$10, unit_description=$11, is_bookable=$12,
       rv_site_layout=COALESCE($14,rv_site_layout),
       rv_amp_service=COALESCE($15,rv_amp_service),
+      -- 10/24: absent leaves the limit alone; $22 says the save meant to touch
+      -- it, so an explicit clear actually clears instead of being swallowed by
+      -- COALESCE the way a null layout is.
+      rv_max_rig_length_ft = CASE WHEN $22::boolean THEN $21::int ELSE rv_max_rig_length_ft END,
       dwelling_ownership=COALESCE($16,dwelling_ownership),
       occupancy_mode=COALESCE($17,occupancy_mode),
       lot_rent_amount=COALESCE($18,lot_rent_amount),
@@ -1966,7 +2258,8 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
        dwellingOwnership ?? null, occupancyMode ?? null,
        lotRentAmount == null ? null : Number(lotRentAmount),
        typeof isMultiLevel === 'boolean' ? isMultiLevel : null,
-       typeof isAdaAccessible === 'boolean' ? isAdaAccessible : null])
+       typeof isAdaAccessible === 'boolean' ? isAdaAccessible : null,
+       rigLimitSet ?? null, rigLimitSet !== undefined])
 
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
@@ -2355,6 +2648,10 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       source:      z.string().nullish(),
       requiredSiteLayout: z.enum(RV_SITE_LAYOUTS as unknown as [string, ...string[]]).nullish(),
       requiredAmpService: z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).nullish(),
+      // 10/24 (Nic): how long the rig is. The pad's own limit lives on the
+      // unit (rv_max_rig_length_ft); this is the trailer that has to fit on
+      // it, and it travels with the stay so every later move re-checks it.
+      rigLengthFt: z.coerce.number().int().positive().max(MAX_RIG_LENGTH_FT).nullish(),
       // S652 (Nic): pin this stay to this exact site, or let the nightly
       // compression move it to an equivalent one. Movable is the default — the
       // lock is for when the counter promised somebody that particular space.
@@ -2460,6 +2757,11 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     const needs = await stayNeeds({
       landlordId: unit.landlord_id, propertyId: unit.property_id,
       tenantId: body.tenantId ?? null, email: body.guestEmail ?? null,
+      // 10/20 (review): who the desk says this is. A returning guest is
+      // derived from GAM's own record of their stays, and an address alone is
+      // a mailbox a couple shares — the name is what says which of them booked
+      // (services/stayTerms samePersonName).
+      guestName: body.guestName ?? null,
       checkIn: body.checkIn, checkOut: body.checkOut, stayTerms: stayTermsGiven,
       returning: returningGuest, offerReturning: canAttestReturningGuest(req.user),
     })
@@ -2474,8 +2776,8 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // a stay confirmed straight onto the schedule (screeningFeeRouteBody).
     // One fee per continuous stay (M3): a back-to-back leg whose ticket or link
     // already carries it (or that already paid it) is not charged it again.
-    const feeDue = needs.screening === 'fee_due' && (needs.screeningFee?.amount ?? 0) > 0
-      && !(needs.chain.bookingIds.length && await screeningFeeAlreadyCarried(needs.chain.bookingIds).catch(() => false))
+    const screeningFeeOwed = await screeningFeeToCarry(needs)
+    const feeDue = screeningFeeOwed != null
     if (feeDue && !wantsDeposit && !wantsRegister) {
       return void res.status(409).json(screeningFeeRouteBody(needs, !!body.guestEmail))
     }
@@ -2565,12 +2867,14 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
           (unit_id, landlord_id, tenant_id, guest_name, guest_email, guest_phone,
            lease_type, check_in, check_out, nights, nightly_rate, weekly_rate,
            total_amount, platform_fee, notes, source, required_site_layout, required_amp_service,
+           rig_length_ft,
            locked_to_unit, status, hold_expires_at, avoided_unit_ids, booked_check_out)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NULL,$21::uuid[],$9) RETURNING *`,
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,NULL,$22::uuid[],$9) RETURNING *`,
           [unit.id, unit.landlord_id, body.tenantId ?? null, body.guestName ?? null, body.guestEmail ?? null,
            body.guestPhone ?? null, body.leaseType, body.checkIn, body.checkOut, nights,
            body.nightlyRate ?? unit.nightly_rate ?? null, body.weeklyRate ?? unit.weekly_rate ?? null,
            total, platformFee, body.notes ?? null, body.source ?? 'direct', body.requiredSiteLayout ?? 'none', body.requiredAmpService ?? 'none',
+           body.rigLengthFt ?? null,
            body.lockedToUnit === true, bookingStatus, avoided])).rows[0]
         // 10/6 (Nic): the landlord's "Returning guest" (who and when), counted
         // against the property's allowance under its lock — and the stay's work
@@ -2627,8 +2931,9 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // 10/6 (review): the guest's way into their account, for the work trade.
     await sendStayWorkTradeInvite(booking.id, wtInvite)
     // R8: nothing on file → the check's fee rides on the payment this stay is
-    // handed to below (the schedule takes no money itself).
-    const screeningFee = feeDue && needs.screeningFee ? needs.screeningFee.amount : null
+    // handed to below (the schedule takes no money itself). The same figure the
+    // refusal above quoted, because it is the same answer, asked once.
+    const screeningFee = screeningFeeOwed
 
     // Booking guests with no GAM account get a stay-assistant link by email
     // (a host can also issue a QR from the booking). Best-effort — a missing
@@ -2645,22 +2950,32 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // deposit is the one the booking site would have quoted for these nights on
     // this site — a guest who phones and a guest who books online are buying
     // the same thing and are told the same number.
-    let depositLink: { id: string; url: string } | null = null
+    let depositLink: { id: string; url: string; emailed: boolean } | null = null
+    // 10/17 (Nic): no link went out because this property asks no deposit on
+    // this stay — not because sending one failed. Read below.
+    let depositNothingOwed = false
     if (wantsDeposit && routedToPay) {
       try {
-        const { quoteStayDeposit } = await import('../services/propertyBooking')
-        // 10/6: a work trade covering rent leaves only the check's fee to send.
-        const depositAmount = rentTraded ? 0 : await quoteStayDeposit(unit.id, body.checkIn, body.checkOut)
-        const { createBookingDepositLink } = await import('./posPayLinks')
-        // 10/5 (R8, A2): the background check's fee goes on the link as its own
-        // fixed line (`screeningFee`, the server's figure) — a $0 deposit still
-        // makes a link for the fee alone; the link records the prepaid
-        // screening when it is paid (routes/posPayLinks).
-        depositLink = await createBookingDepositLink({
+        // 10/18: ONE function makes a reservation's deposit link, here and on
+        // the schedule's own button (sendStayDepositLink).
+        const sent = await sendStayDepositLink({
           bookingId: booking.id, landlordId: unit.landlord_id, propertyId: unit.property_id,
-          amount: depositAmount, guestName: booking.guest_name, guestEmail: booking.guest_email,
-          ...(screeningFee ? { screeningFee } : {}),
+          unitId: unit.id, checkIn: body.checkIn, checkOut: body.checkOut,
+          guestName: booking.guest_name, guestEmail: booking.guest_email,
+          rentTraded, screeningFee, byUserId: req.user!.userId,
+          // 10/18 (review): the price this reservation was just taken at, for a
+          // site with no rate on it — what the deposit is a percentage of.
+          bookedTotal: total,
         })
+        // 10/18 (review): the screen is told whether the guest really got the
+        // email, so a send that broke never reads as "Emailed to …".
+        depositLink = sent.link ? { ...sent.link, emailed: sent.emailed } : null
+        // 10/17 (Nic): nothing to ask the guest for is not a failure — a park
+        // that takes no deposit on a stay like this, with no background check
+        // to collect either, never had a link to send. The screen has to tell
+        // that apart from a send that broke, or it reports "no link went out"
+        // as an error on a park that deliberately takes none.
+        depositNothingOwed = sent.nothingOwed
       } catch (err) {
         // The reservation is real and on the board; only the link failed. Say
         // so on the response rather than rolling back a site the counter has
@@ -2733,12 +3048,258 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       // 10/6: what the details will say.
       returningGuest: needs.screening === 'returning',
       workTrade: workTrade ? { coveredCharges: workTrade.coveredCharges, trusted: workTrade.trusted, rentTraded } : null,
+      // 10/17 (Nic): a deposit link was asked for and there was nothing to ask
+      // the guest for — this property takes no deposit on a stay like this. The
+      // schedule says that instead of reporting a failure (SchedulePage
+      // sayPayRouteDone).
+      depositNothingOwed,
     }
     res.status(201).json({ success: true, data: { ...booking, depositLink, registerTicketId, stay } })
   } catch (e) { next(e) }
 })
 
-// GET /api/units/:id/returning-guest?email=&checkIn=&checkOut=&bookingId= —
+// POST /api/units/:id/bookings/:bookingId/deposit-link
+//
+// 10/18 (Nic) — ASK A RESERVATION THAT IS ALREADY ON THE SCHEDULE FOR ITS DEPOSIT.
+//
+//   "yeah, let's add a button so that we can collect deposits from people that
+//    haven't done it for their stays."
+//
+// Until now a deposit link could only go out at the ONE moment a reservation
+// was made (the route above, sendDepositLink). Every reservation taken without
+// one — the phone calls, the soft holds somebody wrote down — had no way to be
+// asked afterwards, so the desk could never turn a soft hold into a locked-in
+// one, which is the only thing that stops a paying guest taking the site
+// (S652, services/holdDisplacement).
+//
+// It asks for the same number, through the same function the reservation form
+// uses (sendStayDepositLink). There is no second way of making a link.
+//
+// PRESSING IT TWICE DOES NOT COST THE GUEST A SECOND EMAIL OR A SECOND LINK.
+// A link already out for this reservation is handed back as it is — the desk is
+// usually mid-phone-call and wants the URL, not another send — named for what
+// it ASKS FOR, because a reservation can already be carrying a link for the
+// whole stay or for a month added to it, and reading one of those out as "the
+// deposit" quotes the guest the wrong number. When there is nothing to hand
+// back but one went out minutes ago, it is refused for the hour, the way the
+// lease signing Remind button paces itself (routes/esign /documents/:id/remind:
+// "was reminded within the last hour").
+//
+// AND AFTER THAT HOUR IT ASKS AGAIN. A deposit link the guest's card declined
+// on, which the clerk then closed, leaves nothing out — so a fresh link goes,
+// at today's quote. That is the whole point of the button: "people that haven't
+// done it for their stays" includes everybody one card failure later.
+//
+// A deposit paid against the link locks the reservation in. Nothing here does
+// that: it is the rule that already exists — a stay with deposit_paid_at is
+// never displaced, and paying a link stamps it (routes/posPayLinks
+// settleLinkBooking) — and the test for this route proves it rather than
+// repeating it.
+unitsRouter.post('/:id/bookings/:bookingId/deposit-link', async (req, res, next) => {
+  try {
+    const booking = await queryOne<any>(
+      `SELECT b.id, b.unit_id, b.landlord_id, b.tenant_id, b.status, b.guest_name, b.guest_email,
+              to_char(b.check_in, 'YYYY-MM-DD') AS check_in, to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+              COALESCE(b.total_amount, 0)::float AS total_amount,
+              b.deposit_paid_at, b.balance_paid_at, b.pos_transaction_id,
+              b.deposit_pay_link_id, b.deposit_link_sent_at, b.hold_expires_at,
+              u.property_id, u.unit_number
+         FROM unit_bookings b JOIN units u ON u.id = b.unit_id
+        WHERE b.id = $1 AND b.unit_id = $2`, [req.params.bookingId, req.params.id])
+    if (!booking) throw new AppError(404, 'Booking not found')
+    if (!canManageLandlordResource(req.user, booking.landlord_id)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, booking.property_id)
+    // The pair, in plain words rather than "Insufficient permissions" — asked
+    // here, not at the door, so everybody short of it hears which boxes.
+    if (!mayScheduleAndTakePayments(req.user)) throw new AppError(403, DEPOSIT_LINK_REFUSAL)
+    const guest = booking.guest_name || 'This guest'
+
+    // Already paid, no email to send to, or not holding a site any more —
+    // the one rule the schedule offers the button by (@gam/shared stayDepositAsk).
+    const ask = stayDepositAsk({
+      status: booking.status, depositPaidAt: booking.deposit_paid_at,
+      balancePaidAt: booking.balance_paid_at, posTransactionId: booking.pos_transaction_id,
+      guestEmail: booking.guest_email,
+    })
+    if (ask !== 'ask') throw new AppError(409, STAY_DEPOSIT_ASK_REFUSAL[ask])
+
+    // 10/18 (review): A BOOKING-SITE CHECKOUT HOLD IS NOT A RESERVATION THE
+    // DESK TOOK. `hold_expires_at` is written by the booking site alone
+    // (services/propertyBooking bookStay — a counter reservation deliberately
+    // has none, "nobody's reservation quietly evaporates"), and it means the
+    // guest is on the website's own card page right now, being asked for this
+    // same deposit. Asking again from here is a second way to pay one stay,
+    // and it would reprice the deposit the website's checkout was built with.
+    if (booking.hold_expires_at) {
+      const stillPaying = new Date(booking.hold_expires_at).getTime() > Date.now()
+      throw new AppError(409, stillPaying
+        ? `${guest} is paying for this reservation on the booking site right now. Give them a few minutes — `
+          + 'if they do not finish, the site is let go. Nothing was sent.'
+        : `${guest} never finished paying on the booking site, so this reservation is being let go. `
+          + 'Take the reservation again on the schedule if they still want the site. Nothing was sent.')
+    }
+
+    // S652: this stay is already written up at the till. Ringing that ticket up
+    // takes its money, so a link beside it is two open ways to pay one
+    // reservation — which is how a guest pays twice.
+    const ticket = await queryOne<{ id: string }>(
+      `SELECT id FROM pos_open_tickets WHERE booking_id = $1 AND status = 'open' LIMIT 1`, [booking.id])
+    if (ticket) throw new AppError(409,
+      `${guest} is already written up at the register for site ${booking.unit_number}. `
+      + 'Ring that ticket up to take the money, or void it first. Nothing was sent.')
+
+    // ── WHAT IS ALREADY OUT FOR THIS RESERVATION ──────────────────────────
+    //
+    // A reservation can carry more than one link in its life, and they ask for
+    // DIFFERENT MONEY: the link that created it from the register's Send link
+    // (the whole stay), an "Add a month" link (that month), the arrival-day
+    // balance link (what is left), and its deposit link. 10/18 (review): this
+    // used to take "any open link that is not the balance one" for the deposit
+    // link, so a week held by an unpaid $286 pay link handed that URL back and
+    // called it the guest's $57 deposit — five times the figure, read down the
+    // phone as the deposit, and the deposit never asked for at all.
+    //
+    // So the deposit link is the one that was MADE as the deposit
+    // (deposit_pay_link_id). Anything else that is still open is handed back as
+    // what it actually is — the desk wants the URL mid-phone-call either way —
+    // and nothing new is emailed beside it.
+    //
+    // An EXPIRED link is not out: the public card page refuses it with a closed
+    // page (routes/posPayLinks), so a lapsed 14-day link must not be handed
+    // back as something a guest can pay (the same test the left-owed notice
+    // uses, `expires_at IS NULL OR expires_at > NOW()`). A link for the
+    // background check alone (createScreeningFeeLink, a stay whose site costs
+    // nothing) names the stay on its line rather than on the link.
+    const linksOut = () => query<{ id: string; token: string; total: number; label: string; never_expires: boolean }>(
+      `SELECT id, token, total::float AS total, label, (expires_at IS NULL) AS never_expires
+         FROM pos_pay_links
+        WHERE status = 'open' AND kind = 'one_time' AND landlord_id = $2
+          AND (expires_at IS NULL OR expires_at > NOW())
+          AND (booking_id = $1 OR (booking_id IS NULL AND items @> $3::jsonb))
+        ORDER BY created_at`,
+      [booking.id, booking.landlord_id,
+       JSON.stringify([{ [SCREENING_FEE_LINE_FLAG]: true, bookingId: booking.id }])])
+    const handBack = async (open: { id: string; token: string; total: number; label: string; never_expires: boolean },
+                            isDeposit: boolean) => {
+      const { payLinkUrl } = await import('./posPayLinks')
+      res.json({ success: true, data: {
+        link: {
+          id: open.id, url: payLinkUrl(open.token), label: open.label,
+          amount: Number(open.total), isDeposit, neverExpires: open.never_expires,
+        },
+        sentTo: booking.guest_email, guestName: booking.guest_name,
+        emailedNow: false,
+        // 10/18 (review): its deposit link is out but no ask was ever recorded
+        // — the email failed when it was made. The window must not then say
+        // "already emailed": nobody was. The desk reads the URL out, or sends
+        // it again from Pay Links.
+        emailFailed: isDeposit && !booking.deposit_link_sent_at,
+      } })
+    }
+    const outNow = async () => {
+      const out = await linksOut()
+      const mine = out.find(l => l.id === booking.deposit_pay_link_id)
+      // Its own deposit link first; otherwise the oldest other one out.
+      return mine ? { link: mine, isDeposit: true } : out.length ? { link: out[0], isDeposit: false } : null
+    }
+    const already = await outNow()
+    if (already) { await handBack(already.link, already.isDeposit); return }
+
+    // Nothing to hand back and one went out minutes ago: the link was closed,
+    // or the guest is on its card page right now. Either way a second email
+    // inside the hour is noise (routes/esign remind).
+    if (booking.deposit_link_sent_at
+        && Date.now() - new Date(booking.deposit_link_sent_at).getTime() < 60 * 60 * 1000) {
+      throw new AppError(429,
+        `${guest} was emailed a deposit link within the last hour. Give them a little time, `
+        + 'or take the deposit at the register. Nothing was sent.')
+    }
+
+    // ── A DEPOSIT THAT WAS ASKED FOR AND NOBODY PAID ──────────────────────
+    //
+    // 10/18 (review): the link maker claims the reservation on
+    // `deposit_amount IS NULL`, and a card that declines leaves that claim
+    // behind when the clerk closes the link. The second ask then answered "sent
+    // earlier and is no longer waiting" FOREVER, and pointed at two doors of
+    // which only the register works — to exactly the people Nic asked the
+    // button for, one card failure later.
+    //
+    // So with nothing paid and nothing out, the claim is let go and the
+    // reservation is asked again at today's quote. Nothing paid is what makes
+    // this safe: the amount is only what was ASKED for, and every reader of it
+    // (the register's reservationDue, the arrival-day run) reads it against a
+    // deposit that was stamped paid.
+    await query(
+      `UPDATE unit_bookings
+          SET deposit_amount = NULL, deposit_pay_link_id = NULL, updated_at = NOW()
+        WHERE id = $1 AND deposit_amount IS NOT NULL
+          AND deposit_paid_at IS NULL AND balance_paid_at IS NULL AND pos_transaction_id IS NULL
+          AND hold_expires_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM pos_pay_links l
+             WHERE l.booking_id = unit_bookings.id AND l.kind = 'one_time' AND l.status = 'open'
+               AND (l.expires_at IS NULL OR l.expires_at > NOW()))`, [booking.id])
+
+    // 10/5 (R8/A2): the background check's fee rides on the link when the stay
+    // needs one and nothing is on file — and only when nothing else of this
+    // continuous stay already carries it, or has already paid it. One fee per
+    // stay, never two.
+    const needs = await stayNeeds({
+      landlordId: booking.landlord_id, propertyId: booking.property_id, bookingId: booking.id,
+      tenantId: booking.tenant_id, email: booking.guest_email,
+      checkIn: booking.check_in, checkOut: booking.check_out,
+    })
+    // 10/18 (review): a check already paid for on this stay is not due again —
+    // and a link for it would come back null, which reads as a failure.
+    // screeningFeeToCarry asks that too, over the same stays.
+    const screeningFee = await screeningFeeToCarry(needs, booking.id)
+
+    const sent = await sendStayDepositLink({
+      bookingId: booking.id, landlordId: booking.landlord_id, propertyId: booking.property_id,
+      unitId: booking.unit_id, checkIn: booking.check_in, checkOut: booking.check_out,
+      guestName: booking.guest_name, guestEmail: booking.guest_email,
+      // 10/6: a work trade covering the site leaves only the check's fee to ask for.
+      rentTraded: await stayRentCovered(booking.id), screeningFee,
+      // 10/18 (review): a site with no rate was priced by hand when it was
+      // taken; that price is what the deposit is a percentage of.
+      bookedTotal: booking.total_amount,
+      byUserId: req.user!.userId,
+    })
+    // 10/17 (Nic): a park that takes no deposit on a stay like this has nothing
+    // to ask for — said as the fact it is, not as a send that broke.
+    if (sent.nothingOwed) throw new AppError(409,
+      `${guest} owes no deposit on this stay, so there is nothing to ask them for. `
+      + 'The site is still held for them. Nothing was sent.')
+    // Something IS owed and no link came back: another clerk pressed in the
+    // same second and claimed the deposit (createBookingDepositLink claims
+    // `deposit_amount IS NULL`). Their link is the one that is out, so look
+    // again and hand that back rather than blaming a link the guest can pay.
+    if (!sent.link) {
+      const raced = await outNow()
+      if (raced) { await handBack(raced.link, raced.isDeposit); return }
+      throw new AppError(409,
+        `Somebody else asked ${guest} for this deposit a second ago. `
+        + 'Close this and open the reservation again to read their link. Nothing was sent.')
+    }
+
+    res.status(201).json({ success: true, data: {
+      link: {
+        id: sent.link.id, url: sent.link.url, isDeposit: true,
+        label: screeningFee ? 'Reservation deposit and background check' : 'Reservation deposit',
+        amount: Math.round((sent.amount + (screeningFee ?? 0)) * 100) / 100, neverExpires: true,
+      },
+      sentTo: booking.guest_email, guestName: booking.guest_name,
+      // 10/18 (review): the truth about the email. A send that failed leaves
+      // the link open and payable — the desk reads the URL out, or sends it
+      // again from Pay Links — but it is not an ask, so it is not recorded as
+      // one and the screen does not claim the guest was emailed.
+      emailedNow: sent.emailed, emailFailed: !sent.emailed,
+      amount: sent.amount, screeningFee,
+    } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/units/:id/returning-guest?email=&name=&checkIn=&checkOut=&bookingId= —
 // 10/6 (Nic): what the reservation form shows beside the background check for
 // a stay on this site: does it need one (22+ continuous nights, nothing on
 // file), and may "Returning guest — they've stayed with us before" be used —
@@ -2757,10 +3318,15 @@ unitsRouter.get('/:id/returning-guest', requirePerm('schedule.create_reservation
     if (!checkIn || !checkOut || checkOut <= checkIn) throw new AppError(400, 'Pick the arrival and leaving days first.')
     const email = typeof req.query.email === 'string' && req.query.email.trim() ? req.query.email.trim() : null
     const bookingId = typeof req.query.bookingId === 'string' && /^[0-9a-f-]{36}$/i.test(req.query.bookingId) ? req.query.bookingId : null
+    // 10/20 (review): the name the form has typed in so far. A derived
+    // returning guest is their address AND their name (services/stayTerms
+    // samePersonName), so without it this preview reads the fee as due on a
+    // guest the save then waives — pessimistic, never the other way round.
+    const name = typeof req.query.name === 'string' && req.query.name.trim() ? req.query.name.trim() : null
     const offered = canAttestReturningGuest(req.user)
     const needs = await stayNeeds({
-      landlordId: unit.landlord_id, propertyId: unit.property_id, bookingId, email, checkIn, checkOut,
-      offerReturning: offered,
+      landlordId: unit.landlord_id, propertyId: unit.property_id, bookingId, email, guestName: name,
+      checkIn, checkOut, offerReturning: offered,
     })
     res.json({ success: true, data: {
       nights: needs.nights,
@@ -3002,7 +3568,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
   // anywhere after the move puts them back (catch, below); the commit empties it.
   let relocated: RelocatedStay[] = []
   try {
-    const { status, notes, checkIn, checkOut, unitId, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService, lockedToUnit } = req.body
+    const { status, notes, checkIn, checkOut, unitId, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService, rigLengthFt, lockedToUnit } = req.body
     // S653: an avoid list on an edit replaces the whole list (null/absent = unchanged).
     const avoidedIn: string[] | null = Array.isArray(req.body.avoidedUnitIds)
       ? req.body.avoidedUnitIds.filter((x: any) => typeof x === 'string').slice(0, 50) : null
@@ -3011,6 +3577,20 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     }
     if (requiredAmpService != null && !RV_AMP_SERVICES.includes(requiredAmpService)) {
       throw new AppError(400, `Invalid requiredAmpService '${requiredAmpService}'`)
+    }
+    // 10/24 (Nic): the rig's length, refused in words rather than reaching the
+    // column's CHECK and coming back as a 500. Absent means "leave it alone";
+    // an explicit null clears it (they measured it and it was a car).
+    let rigLenSet: number | null | undefined = undefined
+    if (rigLengthFt !== undefined) {
+      if (rigLengthFt === null || rigLengthFt === '') rigLenSet = null
+      else {
+        const n = Number(rigLengthFt)
+        if (!Number.isInteger(n) || n <= 0 || n > MAX_RIG_LENGTH_FT) {
+          throw new AppError(400, `A rig length is a whole number of feet between 1 and ${MAX_RIG_LENGTH_FT}.`)
+        }
+        rigLenSet = n
+      }
     }
     // S655 (Step 6 fix round): a status the schedule does not have is refused
     // in words, with nothing written. It used to reach the database and come
@@ -3032,8 +3612,11 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     }
     // Property-locked workers may only edit reservations at their properties.
     // The property's time zone decides what "today" is for an early check-out.
+    // 10/20: the site's number as well — a move off a locked site names the
+    // space the guest already has in its refusal, and the move's own history
+    // event names both spaces.
     const bookingUnit = await queryOne<any>(
-      `SELECT u.property_id, p.timezone
+      `SELECT u.property_id, u.unit_number, p.timezone
          FROM units u JOIN properties p ON p.id = u.property_id
         WHERE u.id=$1`, [booking.unit_id])
     await assertPropertyInScope(req.user, bookingUnit?.property_id)
@@ -3100,7 +3683,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // written.
     if (!userHasPerm(req.user, 'schedule.edit_reservation')) {
       const refusal = deskOnlyRefusal(booking, {
-        status, notes, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService, lockedToUnit,
+        status, notes, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService, rigLengthFt, lockedToUnit,
         avoidedIn, checkInChanged, checkOutChanged, unitChanged, toCheckOut,
       })
       if (refusal) throw new AppError(403, refusal)
@@ -3539,6 +4122,31 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     const keepsEarlyCheckOut = !!early && !checkOutChanged && !checkOutMoved && !checkOutRestored
 
     let newUnitId = unitId || booking.unit_id
+
+    // ── 10/20 (Nic): WHAT A CONFIRMED HAND MOVE OFF A LOCKED SITE LEAVES ─────
+    //
+    // The refusal above has been answered (overrideLocked), so this move is a
+    // person's deliberate choice. Two things follow from it.
+    //
+    // The stay stays LOCKED. It was pinned because its space was not the
+    // board's to pick, and the desk has now picked this one for them by hand —
+    // compression has even less business shuffling them off it than before.
+    //
+    // But the REASON can no longer say "promised", because nobody promised
+    // this space. Keeping the old sentence is how the panel ended up reading
+    // "Locked to RV 09 — Promised this space before GAM" about a space nobody
+    // ever mentioned, and the one fact that mattered — that the number in the
+    // guest's hand is now wrong — went off the screen. Clearing it to NULL
+    // reads "Locked to this space by hand", which is true and useless: it
+    // erases the promise, and GAM never erases. So it becomes the third
+    // reason, which keeps both halves (migration
+    // 20261022140000_a_hand_moved_stay_stops_claiming_it_was_promised).
+    //
+    // Both of those are decided from the stay's OWN ROW inside the save, with
+    // the row locked — not from the read at the top of this handler. Pinning a
+    // stay is one UPDATE on one column and changes nothing stayChangedSince
+    // looks at, so the read at the top can be stale by the time the write runs.
+
     // Every date in this handler is plain 'YYYY-MM-DD' text — the request's day
     // or the stored day read as text above. pg hands DATE columns back as JS
     // Dates, and the stay pricing slices its dates: a
@@ -3549,6 +4157,41 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // Every stay keeps at least one night — the same rule booking creation holds.
     if ((checkInChanged || checkOutChanged) && dayDiff(newCheckIn, newCheckOut) < 1) {
       throw new AppError(400, 'Check-out has to be at least one day after check-in.')
+    }
+
+    // ── 10/12 (Nic, G6): A SHORTER STAY PAST RENT A PAYMENT WAS TRIED ON ──────
+    //
+    // Unpaid rent on nights the new end takes away is taken off — but rent a
+    // payment was tried on (a declined card, a returned bank pull), or that
+    // another record points at, used to stay owed with GAM told to "decide
+    // with the landlord". Nic: the LANDLORD CHOOSES, at this moment — take
+    // those charges off (anything already paid on them goes back to the guest
+    // as credit), or keep them owed. Asked before anything is saved
+    // ('stay_shortened_attempted', the charges and the two choices in the
+    // body), and sent again with `pastEndAttempted`; the answer is written with
+    // the save and the lease sync after it carries it out. The assistant never
+    // answers it (it makes no money decision about a stay): it passes the
+    // words on, and the desk answers on the schedule.
+    let shortenedAsk: PastEndAttempted | null = null
+    let shortenedChoice: StayShortenedChargeChoice | null = null
+    if (!keepsEarlyCheckOut && (checkOutChanged || checkOutMoved) && newCheckOut < booking.check_out_day) {
+      shortenedAsk = await pastEndAttemptedCharges(booking.id, newCheckOut)
+      if (shortenedAsk) {
+        shortenedChoice = stayShortenedChoiceIn(req.body?.pastEndAttempted)
+        // 10/13 evening (Nic): "anyone who can schedule reservations and take
+        // payments can cancel. refund is separate permission."
+        // (lib/stayShortenedVoid). Anybody else is offered
+        // "Keep them owed" only, and a 'void' they send is refused here,
+        // before anything is written.
+        if (!shortenedChoice) {
+          const offer = shortenedChoicesFor(req.user)
+          return void res.status(409).json({
+            success: false, code: 'stay_shortened_attempted', error: shortenedAsk.words,
+            charges: shortenedAsk.lines, choices: offer.choices, voidRefused: offer.voidRefused,
+          })
+        }
+        assertMayAnswerShortened(req.user, shortenedChoice)
+      }
     }
 
     // 10/5 (Nic, R2/R6): what a longer stay needs is asked below, once the
@@ -3645,6 +4288,36 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
             unitNumber: targetUnit.unit_number,
           })
         }
+
+        // ── 10/20 (Nic, his own catch): A LOCKED STAY MOVES BY HAND, NEVER
+        // QUIETLY
+        //
+        //   "They may have already gotten a confirmation on a space number. Our
+        //    system with compression and expansion is going to kind of screw
+        //    that up if they think they're locked to a specific site already."
+        //
+        // locked_to_unit is what stops that, and every path GAM drives honors
+        // it: compression (services/scheduleCompression), the extension
+        // relocations, out-of-order repacking, an unpaid hold moved aside for a
+        // payer. A PERSON is not one of those paths. The landlord knows things
+        // the board cannot — the guest agreed to another space on the phone,
+        // the site flooded, the rig turned out too long — so the move is
+        // allowed and this is deliberately not a refusal with no way through.
+        //
+        // What it may not be is SILENT, because the cost of silence is a rig
+        // pulling in to find somebody parked on the space in its confirmation.
+        // So the first send is refused with the promise named and what GAM will
+        // do about it; the second, carrying overrideLocked, goes through. The
+        // screen is not the guard: a stale page that never knew the stay was
+        // locked, and a hand-made call, get the same answer and the same
+        // second press.
+        if (booking.locked_to_unit === true && req.body?.overrideLocked !== true) {
+          return void res.status(409).json(lockedSiteBody({
+            guestName: booking.guest_name, lockReason: booking.lock_reason,
+            fromUnitNumber: bookingUnit?.unit_number, toUnitNumber: targetUnit.unit_number,
+            canEmailGuest: !!((typeof guestEmail === 'string' && guestEmail.trim()) || booking.guest_email),
+          }))
+        }
       }
 
       // Shared predicate (services/unitAvailability): bookings + active
@@ -3686,6 +4359,9 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
         const hasLease = !!(await stayLeaseOf(booking.id))
         stayAsk = await stayNeeds({
           landlordId: booking.landlord_id, propertyId: targetUnit.property_id, bookingId: booking.id,
+          // 10/20 (review): a save that corrects the guest's name is asked
+          // under the corrected one; otherwise the stay's own answers.
+          guestName: typeof guestName === 'string' && guestName.trim() ? guestName : null,
           checkIn: newCheckIn, checkOut: newCheckOut,
           stayTerms: stayTermsGiven ?? (hasLease ? 'lease' : null),
           returning: returningGuest && !hasLease, offerReturning: canAttestReturningGuest(req.user),
@@ -3730,7 +4406,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
           // fits. Their site was already revealed, but this move is their
           // own choice: extend-and-relocate beats no-extension.
           const candidates = await query<any>(`
-            SELECT id, unit_number, rv_site_layout, rv_amp_service
+            SELECT id, unit_number, rv_site_layout, rv_amp_service, rv_max_rig_length_ft
               FROM units
              WHERE property_id = $1 AND id != $2
                AND is_bookable = TRUE
@@ -3739,6 +4415,9 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
           const compatible = candidates.filter((c: any) =>
             !isSiteLayoutMismatch(booking.required_site_layout, c.rv_site_layout) &&
             !isAmpServiceMismatch(booking.required_amp_service, c.rv_amp_service) &&
+            // 10/24 (Nic): the extending guest's own move is still a move. A
+            // 37-foot trailer does not go on a 30-foot pad to make room.
+            !isRigTooLongForSite(booking.rig_length_ft, c.rv_max_rig_length_ft) &&
             // S653; 10/6 (review): the list this same save stores — a site
             // added to the avoid list in the edit that lengthens the stay is
             // already avoided here.
@@ -3775,6 +4454,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     if (returningGuest && !stayAsk && SITE_HOLDING_STATUSES.includes(status || booking.status)) {
       returningNow = await stayNeeds({
         landlordId: booking.landlord_id, propertyId: targetUnit?.property_id ?? bookingUnit!.property_id, bookingId: booking.id,
+        guestName: typeof guestName === 'string' && guestName.trim() ? guestName : null,
         checkIn: newCheckIn, checkOut: newCheckOut, returning: true,
       })
     }
@@ -3943,8 +4623,20 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // in / Checked out is written to the stay's history inside the save
     // (below), so the after-commit history diff leaves it out.
     let statusRecordedInSave = false
+    // 10/20 (Nic): a hand move off a locked site writes its own 'moved' event
+    // inside the save — both space numbers, and the promise it breaks — so the
+    // after-commit diff must not add a second, wordless one on top of it.
+    let moveRecordedInSave = false
     let changedBySomeoneElse = false
     let screeningBlockedInSave: CheckInBlock | null = null
+    // 10/20 (Nic): the stay was pinned to its site while this move was already
+    // on its way — the refusal the save itself found, answered after the
+    // rollback (below) in the same words the early one uses.
+    let lockedInSave: { lockReason: string | null } | null = null
+    // 10/20 (Nic): whether the stay was pinned to its site, and why, read
+    // inside the save with its row locked. The refusal, the history event and
+    // the guest's email all go by this rather than the read at the top.
+    let pinnedBeforeSave: { locked_to_unit: boolean; lock_reason: string | null } | null = null
     let failure: unknown = null
     // 10/3 (review, fix pass 2): a write the database ended to break a
     // deadlock did nothing, so it runs again from the top, like a reservation
@@ -3957,7 +4649,10 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       leaseClosedOnCancel = null
       stopAfterCancel = []
       statusRecordedInSave = false
+      moveRecordedInSave = false
       screeningBlockedInSave = null
+      lockedInSave = null
+      pinnedBeforeSave = null
       const tx = await getClient()
       try {
         await tx.query('BEGIN')
@@ -3996,6 +4691,23 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
         if (bringsBackClosedStay) {
           const closedNow = await closedLeaseOfStay(booking.id, tx)
           if (closedNow) throw new AppError(409, closedStayRefusal(guest, booking.status as 'cancelled' | 'no_show', closedNow.billZeroed))
+        }
+        // 10/20 (Nic): whether the stay is pinned to its site, read here, with
+        // its row locked. Pinning one is a single UPDATE on a single column —
+        // the Lock to site button, or the import's own write — which changes
+        // nothing stayChangedSince looks at, so the read at the top of this
+        // handler can be stale by now. A stay pinned while this move was on its
+        // way used to be moved anyway: nobody asked, and the panel went
+        // straight back to claiming the new space was promised. What this read
+        // says is what the refusal, the history event and the guest's email all
+        // go by.
+        if (unitChanged) {
+          pinnedBeforeSave = (await tx.query<{ locked_to_unit: boolean; lock_reason: string | null }>(
+            `SELECT locked_to_unit, lock_reason FROM unit_bookings WHERE id = $1`, [booking.id])).rows[0] ?? null
+          if (pinnedBeforeSave?.locked_to_unit === true && req.body?.overrideLocked !== true) {
+            lockedInSave = { lockReason: pinnedBeforeSave.lock_reason }
+            throw new AppError(409, 'This reservation is pinned to its site.')
+          }
         }
         if (siteClaims.length) {
           await lockSitesForStays(tx, claimedSites)
@@ -4147,7 +4859,22 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
               platform_fee=COALESCE($12,platform_fee),
               required_site_layout=COALESCE($13,required_site_layout),
               required_amp_service=COALESCE($14,required_amp_service),
+              -- 10/24 (Nic): absent leaves the length alone; $23 says the save
+              -- meant to touch it, so an explicit clear actually clears.
+              rig_length_ft = CASE WHEN $23::boolean THEN $22::int ELSE rig_length_ft END,
               locked_to_unit=COALESCE($15,locked_to_unit),
+              -- 10/20 (Nic): a confirmed hand move off a promised space stops
+              -- the stay claiming the new one was promised. Read off the row
+              -- itself ($19 is only "the caller asked for another site"): these
+              -- SET expressions see the values as they are NOW, under the row's
+              -- lock, so the rewrite cannot disagree with what the stay says. A
+              -- lock with no promise behind it (a snowbird the landlord pinned)
+              -- keeps its reason, because "pinned here by hand" is still
+              -- exactly what it is.
+              lock_reason = CASE
+                WHEN $19::boolean AND locked_to_unit AND unit_id <> $3
+                     AND lock_reason = ANY($20::text[]) THEN $21
+                ELSE lock_reason END,
               avoided_unit_ids=COALESCE($16::uuid[],avoided_unit_ids),
               -- 10/3 (decisions #33): the length the stay is sold for. A
               -- deliberate change of the check-out ($17) is a new length. An
@@ -4180,7 +4907,42 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
            avoidedFinal,
            checkOutChanged || endsLease ? newCheckOut : null,
            checkOutMoved ? (bookedForEvent ?? booking.check_out_day) : checkOutRestored ? checkOutRestored.to : null,
+           unitChanged, PROMISED_LOCK_REASONS, MOVED_OFF_PROMISED_SITE,
+           rigLenSet ?? null, rigLenSet !== undefined,
           ])).rows[0]
+
+        // ── 10/20 (Nic): THE MOVE OFF A PROMISED SPACE IS ITS OWN RECORD ─────
+        //
+        // The generic diff after the commit writes "Dale Carter moved to
+        // another unit" and two ids, which is no use to the person asked three
+        // weeks later why Dale is not on 14. This one names both spaces and the
+        // promise, and it is written WITH the save — the stay and the reason it
+        // no longer calls itself promised land together or not at all.
+        if (pinnedBeforeSave?.locked_to_unit === true && updated.unit_id !== booking.unit_id) {
+          const who = booking.guest_name || 'Guest'
+          const toSite = targetUnit?.unit_number ?? 'another site'
+          const fromSite = bookingUnit?.unit_number ?? 'its site'
+          // True whenever the reservation now says nobody promised this space —
+          // rewritten by this save, or by an earlier hand move.
+          const movedOffPromisedSite = updated.lock_reason === MOVED_OFF_PROMISED_SITE
+          await recordBookingEvent({
+            client: tx, bookingId: booking.id, unitId: updated.unit_id,
+            landlordId: booking.landlord_id, actorUserId: req.user!.userId,
+            eventType: 'moved',
+            summary: movedOffPromisedSite
+              ? `${who} moved by hand from ${fromSite} to ${toSite} — ${fromSite} is the space they were promised, `
+                + `so ${toSite} is no longer recorded as promised`
+              : `${who} moved by hand from ${fromSite} to ${toSite} — the stay was pinned to ${fromSite}`,
+            detail: {
+              from_unit_id: booking.unit_id, to_unit_id: updated.unit_id,
+              from_unit_number: fromSite, to_unit_number: toSite,
+              locked_to_unit: true, lock_reason_before: pinnedBeforeSave.lock_reason ?? null,
+              lock_reason_after: updated.lock_reason ?? null,
+              moved_by_hand: true,
+            },
+          })
+          moveRecordedInSave = true
+        }
 
         if (checkOutMoved || checkOutRestored) {
           const from = { check_in: booking.check_in_day, check_out: booking.check_out_day }
@@ -4323,10 +5085,31 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       }
       return void res.status(409).json(screeningPendingBody(screeningBlockedInSave))
     }
+    // 10/20 (Nic): pinned while this move was on its way. Same question, same
+    // words, and the second send (overrideLocked) still carries it through.
+    if (failure && lockedInSave) {
+      if (relocated.length) {
+        const moved = relocated
+        relocated = []
+        await putRelocatedBack(moved)
+      }
+      return void res.status(409).json(lockedSiteBody({
+        guestName: booking.guest_name, lockReason: lockedInSave.lockReason,
+        fromUnitNumber: bookingUnit?.unit_number,
+        toUnitNumber: targetUnit?.unit_number ?? 'the new site',
+        canEmailGuest: !!((typeof guestEmail === 'string' && guestEmail.trim()) || booking.guest_email),
+      }))
+    }
     // Still deadlocked after every try: nothing was written. (The catch below
     // puts back a reservation an extension moved for this save.)
     if (isDeadlock(failure)) throw new AppError(409, SAVED_AT_THE_SAME_MOMENT)
     if (failure) throw failure
+
+    // 10/12 (G6): the landlord's answer for rent a payment was tried on, for
+    // the lease sync below (and an early check-out's lease end) to carry out.
+    if (shortenedAsk && shortenedChoice) {
+      await recordStayShortenedChoice({ bookingId: booking.id, asked: shortenedAsk, choice: shortenedChoice, chosenBy: req.user!.userId })
+    }
 
     // The save is final, so a reservation the extension moved for it stays
     // moved — unless the extending guest went to another site after all (the
@@ -4374,10 +5157,8 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // collected.
     let screeningFeeLink: { id: string; url: string } | null = null
     let screeningFeeUncollected = false
-    const feeNow = stayAsk && stayAsk.screening === 'fee_due' ? stayAsk.screeningFee?.amount ?? 0 : 0
-    if (stayAsk && feeNow > 0 && SITE_HOLDING_STATUSES.includes(updated.status)
-        && !(await screeningFeeAlreadyCarried(stayAsk.chain.bookingIds.length ? stayAsk.chain.bookingIds : [booking.id])
-          .catch(() => false))) {
+    const feeNow = stayAsk ? await screeningFeeToCarry(stayAsk, booking.id) : null
+    if (stayAsk && feeNow && SITE_HOLDING_STATUSES.includes(updated.status)) {
       const to = (typeof updated.guest_email === 'string' && updated.guest_email.trim()) || stayAsk.chain.email
       if (!to) {
         screeningFeeUncollected = true
@@ -4438,8 +5219,11 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       const datesBefore = keepsEarlyCheckOut && checkInChanged
         ? { ...booking, check_in: updated.check_in, check_out: updated.check_out }
         : booking
-      // A status change the save already wrote (above) is not diffed again.
-      const before = statusRecordedInSave ? { ...datesBefore, status: updated.status } : datesBefore
+      // A status change the save already wrote (above) is not diffed again —
+      // nor the hand move off a locked site, which wrote its own 'moved' event
+      // with both space numbers in it (10/20).
+      const statusBefore = statusRecordedInSave ? { ...datesBefore, status: updated.status } : datesBefore
+      const before = moveRecordedInSave ? { ...statusBefore, unit_id: updated.unit_id } : statusBefore
       recordBookingChange(before, updated, req.user!.userId).catch(err =>
         logger.error({ err, bookingId: booking.id }, '[booking] change event record failed'))
     }
@@ -4514,8 +5298,61 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // (services/agents/portalDispatch), and today the agent is the one way a
     // stay is checked out. Only the ones that are set, so a plain edit's row
     // reads exactly as before.
+    // ── 10/20 (Nic): THE GUEST HEARS IT FROM US, NOT FROM A RIG ON THEIR SITE
+    //
+    // emailBookingSiteChanged exists so a moved guest "hears it from us before
+    // they arrive and find somebody else parked there" (S652), and until today
+    // only GAM's own hold displacement ever sent it. A desk move off a LOCKED
+    // site is the same news to the same person — and it is the one move where
+    // GAM knows for a fact that a space number is already in the guest's hands,
+    // because that is what the lock means. An unlocked stay compression
+    // shuffles has told the guest nothing yet; this one has. So the email goes
+    // out here too: one message, at the moment the number went stale.
+    //
+    // It is not a tick box. The desk read "We will email them that their site
+    // is now RV 09" before it pressed, so pressing IS the choice. A desk that
+    // has just rung the guest loses nothing by an email that agrees with the
+    // call; a desk that has NOT rung them is the entire reason this exists, and
+    // asking would let that one click past. Where there is no address nothing
+    // is invented — the save says a phone call is owed, in those words.
+    let siteMovedNote: string | null = null
+    if (pinnedBeforeSave?.locked_to_unit === true && updated.unit_id !== booking.unit_id) {
+      const fromSite = bookingUnit?.unit_number ?? 'their old site'
+      const toSite = targetUnit?.unit_number ?? 'their new site'
+      const to = (typeof updated.guest_email === 'string' && updated.guest_email.trim()) || null
+      const propertyId = targetUnit?.property_id ?? bookingUnit!.property_id
+      let told: 'emailed' | 'no_address' | 'send_failed' = 'no_address'
+      if (to) {
+        // The move is already committed, so nothing in here may fail the save:
+        // a park name that cannot be read, or a mail client that will not load,
+        // would otherwise answer 500 for a stay that really did move, and the
+        // desk would try again. It says the email did not go out instead, which
+        // is the truth and names the step that follows (ring them).
+        try {
+          const prop = await queryOne<{ name: string }>(`SELECT name FROM properties WHERE id = $1`, [propertyId])
+          const { emailBookingSiteChanged } = await import('../services/email')
+          await emailBookingSiteChanged(
+            to, updated.guest_name ?? null, prop?.name ?? 'the property', fromSite, toSite,
+            // 10/5: replies reach the people who run this property (services/replyRouting).
+            { landlordId: booking.landlord_id, replyTo: { kind: 'property', propertyId } },
+          )
+          told = 'emailed'
+        } catch (err) {
+          logger.error({ err, bookingId: booking.id }, '[booking] a hand-moved guest could not be emailed their new site')
+          told = 'send_failed'
+        }
+      }
+      siteMovedNote = lockedSiteMovedWords({
+        guestName: updated.guest_name, fromUnitNumber: fromSite, toUnitNumber: toSite,
+        told, emailedTo: to, wasPromised: updated.lock_reason === MOVED_OFF_PROMISED_SITE,
+      })
+    }
+
     const notices = {
       ...(extendedGuestMovedTo ? { extendedGuestMovedTo } : {}),
+      // 10/20 (Nic): a locked stay moved by hand — what became of the space
+      // number the guest already had, and whether GAM has told them.
+      ...(siteMovedNote ? { siteMoved: siteMovedNote } : {}),
       ...(checkOutMoved ? { checkOutMoved } : {}),
       ...(checkOutRestored ? { checkOutRestored } : {}),
       ...(leaseNote ? { leaseNote } : {}),
@@ -4685,9 +5522,7 @@ unitsRouter.post('/:id/bookings/:bookingId/add-month', requirePerm('schedule.edi
 
     // One fee per continuous stay (M3): not when an open ticket or unpaid link
     // of the stay already carries it, or it is already paid.
-    const screeningFee = needs.screening === 'fee_due' && needs.screeningFee
-      && !(await screeningFeeAlreadyCarried(needs.chain.bookingIds.length ? needs.chain.bookingIds : [booking.id]).catch(() => false))
-      ? needs.screeningFee.amount : null
+    const screeningFee = await screeningFeeToCarry(needs, booking.id)
     let ticketId: string | null = null
     // 10/6 (review): closes the card pages of links whose check fee came off (returning guest).
     let returningAfterCommit: (() => Promise<void>) | null = null
@@ -4872,6 +5707,10 @@ unitsRouter.get('/schedule/master', requirePerm(
       SELECT u.id, u.unit_number, u.unit_type, u.status, u.rent_amount,
         u.nightly_rate, u.weekly_rate, u.monthly_rate, u.is_bookable, u.lease_types_allowed,
         u.rv_site_layout, u.rv_amp_service,
+        -- 10/24: the pad's rig limit. The schedule's reservation flow compares a
+        -- guest's rig length against it (rvMismatchReasons) — left out of this
+        -- list the comparison reads undefined and silently never warns.
+        u.rv_max_rig_length_ft,
         u.check_in_time, u.check_out_time, u.amenities, u.unit_description,
         p.id as property_id, p.name as property_name,
         p.nightly_rate as property_nightly_rate, p.weekly_rate as property_weekly_rate,
@@ -4889,11 +5728,11 @@ unitsRouter.get('/schedule/master', requirePerm(
       -- S650 (Nic): RV spots at the top — they turn over the most — and mobile
       -- homes at the bottom; everything else between. Numbers sort as numbers
       -- (RV 2 before RV 10), not as text.
+      -- 10/15 (Nic): the column's own collation sorts digit runs as numbers
+      -- (MH 3.5 before MH 11), so the hand-rolled split is gone — it read
+      -- 'MH 3.5' as 3 and tied it with MH 3.
       ORDER BY CASE u.unit_type WHEN 'rv_spot' THEN 0 WHEN 'mobile_home' THEN 2 ELSE 1 END,
-               u.unit_type, p.name,
-               substring(u.unit_number from '^\\D*'),
-               NULLIF(substring(u.unit_number from '\\d+'), '')::numeric NULLS LAST,
-               u.unit_number`,
+               u.unit_type, p.name, u.unit_number`,
       unitType ? [callerLandlordIds, scopedIds, oneProperty, unitType]
                : [callerLandlordIds, scopedIds, oneProperty])
 
@@ -4969,7 +5808,7 @@ unitsRouter.get('/schedule/master', requirePerm(
     // on the space it happened in, ending the day they left it.
     const leases = await query<any>(`
       SELECT l.*, u.unit_number, u.unit_type, p.name as property_name,
-        vlat.first_name, vlat.last_name, vlat.email, vlat.phone,
+        vlat.tenant_id, vlat.first_name, vlat.last_name, vlat.email, vlat.phone,
         h.unit_id AS unit_id,
         GREATEST(l.start_date, h.effective_from) AS start_date,
         -- the stretch on a space they LEFT ends the day before the move, so
@@ -4985,7 +5824,10 @@ unitsRouter.get('/schedule/master', requirePerm(
       LEFT JOIN LATERAL (
         -- S527 W-55: email/phone too — the schedule detail popup shows the
         -- same contact fields for leases as for reservations.
-        SELECT first_name, last_name, email, phone
+        -- 10/24: tenant_id too, so the board can mark the bars of people whose
+        -- stated stay is nearly up (services/stayFollowUps keys on the tenant).
+        -- Without it the schedule had a name and no id to match on.
+        SELECT tenant_id, first_name, last_name, email, phone
         FROM v_lease_active_tenants
         WHERE lease_id = l.id AND role = 'primary'
         LIMIT 1

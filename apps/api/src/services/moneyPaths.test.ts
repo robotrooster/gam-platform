@@ -81,7 +81,7 @@ vi.mock('./stripeConnect', async (orig) => ({
 import { processingFeeFor } from '@gam/shared'
 import { db, getClient } from '../db'
 import { webhooksRouter } from '../routes/webhooks'
-import { cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedAllocationRule } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedAllocationRule, setEffectiveProcessingRate } from '../test/dbHelpers'
 import { generateInvoices } from '../jobs/invoiceGeneration'
 import { generateLateFeesForInvoice } from '../jobs/lateFees'
 import { runAutopayForTimezone } from '../jobs/autopayRunner'
@@ -93,7 +93,7 @@ import { chargeLeaseBalance } from './rentCharge'
 import * as stripeConnect from './stripeConnect'
 import { createPaidAhead, createIssuedCredit, runWholeBillCheckAfterCommit } from './creditUse'
 import { confirmDepositMatch, undoDepositMatch } from './bankDepositConfirm'
-import { autoSettleByAmount } from './bankFeed'
+import { reconcileDeposits } from './bankFeed'
 import { checkMoneyInvariants } from '../scripts/oct3_money_invariants_check'
 
 // ─── harness ────────────────────────────────────────────────────────────────
@@ -236,13 +236,17 @@ async function desk(h: H, anchorId: string, o: Partial<Parameters<typeof settleM
 const ACH_FEE = processingFeeFor({ amount: 100, paymentMethod: 'ach' })
 
 beforeAll(async () => {
-  for (const [method, flat, pct, sflat, spct] of [['ach', 6, 0, 0, 0.5], ['card', 0.55, 3.5, 0.26, 0.7]] as const) {
-    await db.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-       SELECT $1, $2, $3, $4, $5
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = $1 AND effective_until IS NULL)`,
-      [method, flat, pct, sflat, spct])
+  // 10/17: the rate this file's figures are worked out on, STATED rather than
+  // seeded-if-missing: one row is open per method and cleanupAllSchema leaves the
+  // rate card alone, so an insert-if-missing took whatever an earlier file left.
+  for (const [paymentMethod, flat, pct, sflat, spct] of
+       [['ach', 6, 0, 0, 0.5], ['card', 0.55, 3.5, 0.26, 0.7]] as const) {
+    await setEffectiveProcessingRate(db, {
+      paymentMethod,
+      customerFacingFlat: flat, customerFacingPercent: pct,
+      stripeCostFlat: sflat, stripeCostPercent: spct,
+      notes: 'moneyPaths.test.ts rate',
+    })
   }
 })
 
@@ -560,20 +564,24 @@ describe('the bank', () => {
     await invariantsHold('bank match short')
   })
 
-  it('auto-settle by amount, then Undo: the whole bill to the cent settles by itself and Undo puts every row back', async () => {
+  // 10/14 (Nic, answer 16): "no guessing" — the whole bill to the cent no
+  // longer settles by itself; the person confirms it (the deposit review picks it).
+  it('the whole bill to the cent waits for a person; confirmed, then Undo: every row goes back', async () => {
     const h = await household()
     const rent = await bill(h, { amount: 460, due: '2026-09-01' })
     const water = await bill(h, { type: 'utility', amount: 12.34, due: '2026-09-01' })
     const txn = await bankRow(h, 472.34)
-    expect(await autoSettleByAmount(h.landlordId)).toBe(1)
+    await reconcileDeposits(h.landlordId)
+    expect((await rowsOf([rent, water])).map((x: any) => x.status)).toEqual(['pending', 'pending'])
+    await confirmDepositMatch({ bankTransactionId: txn, chargeIds: [rent, water], method: 'cash', confirmedByUserId: h.landlordUserId })
     expect((await rowsOf([rent, water])).map((x: any) => x.status)).toEqual(['settled', 'settled'])
-    await invariantsHold('auto-settled')
+    await invariantsHold('confirmed')
 
     const u = await undoDepositMatch({ bankTransactionId: txn, landlordId: h.landlordId, undoneBy: h.landlordUserId })
     expect(u).toBeTruthy()
     expect((await rowsOf([rent, water])).map((x: any) => x.status)).toEqual(['pending', 'pending'])
     expect((await db.query(`SELECT status FROM bank_transactions WHERE id = $1`, [txn])).rows[0].status).toBe('needs_review')
-    await invariantsHold('auto-settle undone')
+    await invariantsHold('confirm undone')
   })
 })
 
@@ -608,6 +616,9 @@ describe('the whole-bill rule', () => {
     const h = await household()
     await generateInvoices(new Date('2026-08-01T15:00:00Z'))
     const inv = (await db.query<{ id: string }>(`SELECT id FROM invoices WHERE lease_id = $1 AND due_date = '2026-08-01'`, [h.leaseId])).rows[0]
+    // 10/12 (Nic): the run wrote it on August 1st (replayed today, it is
+    // stamped today — and a bill written after its due date counts from then).
+    await db.query(`UPDATE invoices SET created_at = '2026-08-01T15:00:00Z' WHERE id = $1`, [inv.id])
     // A goodwill credit for the whole bill lands after the bill went out —
     // created straight on the table, so the after-commit check has not run.
     await db.query(

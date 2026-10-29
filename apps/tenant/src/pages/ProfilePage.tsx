@@ -2,7 +2,8 @@ import { useState, useEffect, useRef } from 'react'
 import { useUrlTab } from '../lib/useUrlTab'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { User, Check, AlertCircle } from 'lucide-react'
-import { isCriticalNotificationType, PASSWORD_MIN_LEN } from '@gam/shared'
+import { PASSWORD_MIN_LEN } from '@gam/shared'
+import { NotificationPreferences } from '../../../../packages/shared-ui/NotificationPreferences'
 
 import axios from 'axios'
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -19,13 +20,18 @@ function putReq(path: string, body: any) { return api.put(path, body).then(r => 
 // 401, but the pass still works, so it is NOT one of these.
 const SESSION_ENDED = /password was changed|session|token|unauthenticated/i
 
-const NOTIF_TYPES = [
-  { type:'payment_failed',              label:'Payment Failed',         desc:'When your rent payment fails' },
-  { type:'maintenance_updated',         label:'Maintenance Updates',    desc:'Status changes on your requests' },
-  { type:'lease_expiring',              label:'Lease Expiry',           desc:'Reminders as your lease end date approaches' },
-  { type:'bulk_message',                label:'Landlord Messages',      desc:'Announcements from your landlord' },
-  { type:'maintenance_building_notice', label:'Building Notices',       desc:'Maintenance affecting multiple units' },
-]
+/**
+ * 10/14 afternoon (Nic): the tenant's birthday as words ("April 23, 1980"),
+ * read off the date at the start of what the server sends ('1980-04-23', or a
+ * timestamp starting with it) — never moved a day by the viewer's time zone.
+ * Empty when none is on file.
+ */
+function birthdayWords(raw: unknown): string {
+  const m = typeof raw === 'string' ? /^(\d{4})-(\d{2})-(\d{2})/.exec(raw) : null
+  if (!m) return ''
+  return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]))
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+}
 
 export function ProfilePage() {
   const qc = useQueryClient()
@@ -48,7 +54,6 @@ export function ProfilePage() {
   const [showEmailWarn, setShowEmailWarn] = useState(false)
 
   const { data: me } = useQuery('tenant-me-profile', () => get<any>('/tenants/me'))
-  const { data: notifPrefs = [] } = useQuery<any[]>('notif-prefs-tenant', () => get<any[]>('/notifications/preferences'))
 
   useEffect(() => {
     if (me) {
@@ -82,11 +87,6 @@ export function ProfilePage() {
         }, 1500)
       }
     } }
-  )
-
-  const prefMut = useMutation(
-    (data: any) => patchReq('/notifications/preferences', data),
-    { onSuccess: () => { qc.invalidateQueries('notif-prefs-tenant'); setSaved('pref'); setTimeout(() => setSaved(''), 2000) } }
   )
 
   // A password change ends every session minted before it — including the one
@@ -125,25 +125,6 @@ export function ProfilePage() {
   // Email 2FA is mandatory for every tenant, always. Codes go to the login
   // email. This is informational only — it can't be turned off.
   const { data: twoFa } = useQuery('tenant-2fa-status', () => get<any>('/auth/email-otp/status'))
-
-  const getPref = (type: string, channel: 'email'|'in_app') => {
-    const p = (notifPrefs as any[]).find((x: any) => x.type === type)
-    if (!p) return true
-    return channel === 'email' ? p.emailEnabled : p.inAppEnabled
-  }
-
-  // S554 (button-sweep bug #4): the API PATCH requires camelCase
-  // emailEnabled/inAppEnabled (requests are NOT camelized — only responses
-  // are). This previously sent snake_case keys → silent 400, no pref ever
-  // saved (rows are only created by this PATCH, so the toggle was dead).
-  const togglePref = (type: string, channel: 'email'|'in_app', val: boolean) => {
-    const p = (notifPrefs as any[]).find((x: any) => x.type === type) || {}
-    prefMut.mutate({
-      type,
-      emailEnabled: channel === 'email'  ? val : (p.emailEnabled ?? true),
-      inAppEnabled: channel === 'in_app' ? val : (p.inAppEnabled ?? true),
-    })
-  }
 
   const s = (_label: string, color = 'var(--text-3)') => ({
     fontSize:'.72rem' as const, fontWeight:600 as const, color, textTransform:'uppercase' as const, letterSpacing:'.06em' as const, display:'block' as const, marginBottom:5
@@ -186,6 +167,17 @@ export function ProfilePage() {
           <div style={{ fontSize:'.68rem', color:'var(--text-3)', marginBottom:14, padding:'6px 10px', background:'rgba(201,162,39,.06)', border:'1px solid rgba(201,162,39,.15)', borderRadius:6 }}>
             🔒 Legal name is locked after registration. Contact your landlord if a correction is needed.
           </div>
+          {/* 10/14 afternoon (Nic): "Tenant profile shows the birthday
+              read-only, 'ask your landlord to fix it'." Only the landlord can
+              fix a birthday (copied off the signed lease; the happy-birthday
+              email reads it) — nothing here changes it. */}
+          <div style={{ marginBottom:14 }}>
+            <label style={s('Birthday')}>Birthday</label>
+            <div style={{ padding:'9px 12px', background:'var(--bg-3)', border:'1px solid var(--border-0)', borderRadius:8, fontSize:'.85rem', color:'var(--text-2)' }}>{birthdayWords(me?.dateOfBirth) || '—'}</div>
+            <div style={{ fontSize:'.68rem', color:'var(--text-3)', marginTop:6 }}>
+              🔒 Your landlord keeps your birthday on file. If it is wrong, ask your landlord to fix it.
+            </div>
+          </div>
           <div style={{ marginBottom:12 }}>
             <label style={s('Email')}>Email</label>
             <input className="input" type="email" value={email} onChange={e => setEmail(e.target.value)} style={{ width:'100%' }} />
@@ -205,35 +197,18 @@ export function ProfilePage() {
 
       {tab === 'notifications' && (
         <div>
-          <div style={{ fontSize:'.78rem', color:'var(--text-3)', marginBottom:16 }}>Choose how you receive each type of notification.</div>
-          <div style={{ background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:10, overflow:'hidden' }}>
-            <div style={{ display:'grid', gridTemplateColumns:'1fr auto auto auto', gap:0 }}>
-              <div style={{ padding:'10px 16px', fontSize:'.68rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', borderBottom:'1px solid var(--border-0)' }}>Notification</div>
-              {['In-App','Email'].map(h => (
-                <div key={h} style={{ padding:'10px 16px', fontSize:'.68rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', borderBottom:'1px solid var(--border-0)', textAlign:'center' }}>{h}</div>
-              ))}
-              {NOTIF_TYPES.map((n, i) => (
-                <>
-                  <div key={n.type+'l'} style={{ padding:'12px 16px', borderBottom: i<NOTIF_TYPES.length-1?'1px solid var(--border-0)':'none' }}>
-                    <div style={{ fontSize:'.82rem', fontWeight:600, color:'var(--text-0)' }}>{n.label}</div>
-                    <div style={{ fontSize:'.68rem', color:'var(--text-3)' }}>{n.desc}</div>
-                  </div>
-                  {(['in_app','email'] as const).map(ch => (
-                    <div key={n.type+ch} style={{ padding:'12px 16px', textAlign:'center', borderBottom: i<NOTIF_TYPES.length-1?'1px solid var(--border-0)':'none', display:'flex', alignItems:'center', justifyContent:'center' }}>
-                      {ch === 'in_app'
-                        ? <span title="In-app notifications are always on" style={{ color:'var(--green)', fontSize:'.85rem' }}>✓</span>
-                        : isCriticalNotificationType(n.type)
-                          // S570 (Nic): critical alerts (e.g. failed payment) always email — can't be turned off.
-                          ? <span title="This alert is too important to turn off — it's always emailed." style={{ color:'var(--green)', fontSize:'.85rem' }}>✓</span>
-                          : <input type="checkbox" checked={getPref(n.type, ch)} onChange={e => togglePref(n.type, ch, e.target.checked)} style={{ width:16, height:16, cursor:'pointer' }} />
-                      }
-                    </div>
-                  ))}
-                </>
-              ))}
-            </div>
-          </div>
-          {saved==='pref' && <div style={{ marginTop:10, fontSize:'.78rem', color:'var(--green)', display:'flex', alignItems:'center', gap:4 }}><Check size={12} /> Preferences saved</div>}
+          {/* 10/20 (Nic): this tab used to be its own six-row list, and the
+              tenant portal had a second fifteen-row one at /notification-prefs.
+              Both are the same component now, rendering every type GAM can send
+              a resident off the one catalog in @gam/shared. */}
+          <NotificationPreferences
+            audience="tenant"
+            queryKey="notif-prefs-tenant"
+            api={{
+              get:   (url) => get<any[]>(url),
+              patch: (url, body) => patchReq(url, body),
+            }}
+          />
         </div>
       )}
 

@@ -7,17 +7,18 @@
  * the lease (dates follow, no-longer-owed pending rent drops, overpaid
  * rent banks as a lease_prepaid_credit).
  */
-import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import { backfillInvoices } from './invoiceGeneration'
 import { generateMoveInInvoice } from './moveInBundle'
 import {
   bookingRentForDueDate, syncLeaseWithBookingDates, bankShortenedStayOverpayment, bankShortenedStaysAfterSettle,
-  STAY_SHORTENED_CREDIT_NOTE,
+  STAY_SHORTENED_CREDIT_NOTE, STAY_SHORTENED_RENT_VOID_REASON,
 } from '../services/bookingLeaseBilling'
 import { applyCredit, applyHeldForRemittance, holdCredit, householdQuote, settleWholeBillIfCovered } from '../services/creditUse'
 import { incomeTotals } from '../services/incomeBasis'
@@ -35,11 +36,9 @@ import { todayIn } from '../lib/timezone'
 
 beforeEach(async () => { await cleanupAllSchema(); stripeCancel.mockClear() })
 
-// The ACH rate seedStack adds when none is active; removed when the file ends.
+// The ACH rate seedStack states. It stays open after the file ends — every file
+// states its own now, so there is nothing to tidy up and no row to delete.
 const SUITE_RATE_NOTE = 'bookingLeaseBilling.test suite rate'
-afterAll(async () => {
-  await db.query(`DELETE FROM platform_processing_rates WHERE notes = $1`, [SUITE_RATE_NOTE])
-})
 
 // Stay used throughout: Aug 10 2026 → Jan 28 2027 (exclusive), $950/mo.
 // Schedule: Aug 10→Sep 1 22n $696.67 · Sep/Oct/Nov/Dec flat $950 · Jan 1→28 27n $855.
@@ -58,19 +57,17 @@ async function seedStack(opts: { bookingSourced?: boolean } = {}) {
     // actually be booked — the release refuses to settle a tenant's bill with
     // money it cannot hand over. So the property needs a payout configuration.
     await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
-    // Rates are reference data cleanupAllSchema leaves alone. Seed one only
-    // when no ACH rate is active, tagged, and removed in afterAll: left behind,
-    // this flat $6 row became the active ACH rate for every suite after this
-    // one (webhooks.test seeds its 1% rate with ON CONFLICT DO NOTHING), and
-    // their fee expectations passed or failed by file order.
-    await client.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent,
-          stripe_cost_flat, stripe_cost_percent, notes)
-       SELECT 'ach', 6, 0, 0, 0.5, $1
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates
-                           WHERE payment_method = 'ach' AND effective_until IS NULL)`,
-      [SUITE_RATE_NOTE])
+    // Rates are reference data cleanupAllSchema leaves alone, and only one row is
+    // open per method, so this used to insert only when no ACH rate was active —
+    // and then this flat $6 row WAS the active ACH rate for every file after this
+    // one (webhooks.test seeded its 1% rate with ON CONFLICT DO NOTHING), whose
+    // fee expectations passed or failed by file order. It is stated outright now.
+    await setEffectiveProcessingRate(client, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 6, customerFacingPercent: 0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: SUITE_RATE_NOTE,
+    })
     const unitId = await seedUnit(client, { propertyId, landlordId })
     const leaseId = await seedLease(client, { unitId, landlordId, rentAmount: RENT, startDate: START })
     await seedLeaseTenant(client, { leaseId, tenantId })
@@ -105,12 +102,23 @@ async function atDate<T>(ymd: string, fn: () => Promise<T>): Promise<T> {
   try { return await fn() } finally { vi.useRealTimers() }
 }
 
+/** The lease's live rent rows by due date (10/12: a voided row is a record, not rent). */
 async function rentByDueDate(leaseId: string): Promise<Record<string, number>> {
   const rows = await db.query<any>(
     `SELECT to_char(due_date, 'YYYY-MM-DD') AS d, amount::numeric AS a
-       FROM payments WHERE lease_id=$1 AND type='rent' ORDER BY due_date`, [leaseId])
+       FROM payments WHERE lease_id=$1 AND type='rent' AND status <> 'voided' ORDER BY due_date`, [leaseId])
   const out: Record<string, number> = {}
   for (const r of rows.rows) out[r.d] = Number(r.a)
+  return out
+}
+
+/** 10/12 (Nic): rent the new dates no longer owe is voided as a record, never deleted — by due date, with why. */
+async function voidedRentByDueDate(leaseId: string): Promise<Record<string, { amount: number; reason: string | null }>> {
+  const rows = await db.query<any>(
+    `SELECT to_char(due_date, 'YYYY-MM-DD') AS d, amount::numeric AS a, void_reason
+       FROM payments WHERE lease_id=$1 AND type='rent' AND status = 'voided' ORDER BY due_date`, [leaseId])
+  const out: Record<string, { amount: number; reason: string | null }> = {}
+  for (const r of rows.rows) out[r.d] = { amount: Number(r.a), reason: r.void_reason }
   return out
 }
 
@@ -199,6 +207,9 @@ describe('Master Schedule → lease sync', () => {
     const rents = await rentByDueDate(s.leaseId)
     expect(rents['2026-10-01']).toBeUndefined()
     expect(rents['2026-09-01']).toBe(950)
+    // …kept as a voided record at its amount, with why (10/12: never deleted).
+    expect(await voidedRentByDueDate(s.leaseId)).toEqual({
+      '2026-10-01': { amount: 950, reason: STAY_SHORTENED_RENT_VOID_REASON } })
 
     // Owed now: 674.19 (arrival, 22n × 950/31) + 19n × 950/30 (September) = 601.67 → 1275.86.
     // Settled 1646.67 → credit 370.81, banked for the final bill.
@@ -502,12 +513,14 @@ describe('Master Schedule → lease sync', () => {
     expect(l.rows[0].e).toBe('2026-09-20')
     expect(await rentByDueDate(s.leaseId)).toMatchObject({ '2026-10-01': 950 })
     expect((await rentByDueDate(s.leaseId))['2026-11-01']).toBeUndefined()      // the plain one went
-    expect((await db.query(`SELECT 1 FROM payments WHERE id=$1`, [nov])).rowCount).toBe(0)
+    // 10/12 (Nic): voided as a record, never deleted; the one a record points at is untouched.
+    expect((await db.query(`SELECT status FROM payments WHERE id=$1`, [nov])).rows[0].status).toBe('voided')
+    expect((await db.query(`SELECT status FROM payments WHERE id=$1`, [oct])).rows[0].status).toBe('pending')
     const credit = await db.query<any>(`SELECT amount_original::float AS a FROM lease_prepaid_credits WHERE lease_id=$1`, [s.leaseId])
     expect(credit.rows).toEqual([{ a: 370.81 }])
     const admin = (await db.query<any>(`SELECT body FROM admin_notifications WHERE category='stay_shortened_rent_kept'`)).rows
     expect(admin).toHaveLength(1)
-    expect(admin[0].body).toContain('the delete was refused')
+    expect(admin[0].body).toContain('it could not be voided')
   })
 
   // S655 review (round 2): the kept row and the banked credit worked against
@@ -695,7 +708,8 @@ describe('Master Schedule → lease sync', () => {
     expect(octRow.a).toBe(429.03)
     expect(octRow.status).toBe('pending')
     expect(octRow.notes).toBe('Stay now ends October 15, 2026: rent for this date changed from $950.00 to $429.03')
-    expect((await db.query(`SELECT 1 FROM payments WHERE id=$1`, [nov])).rowCount).toBe(0)
+    // 10/12 (Nic): voided as a record, never deleted.
+    expect((await db.query(`SELECT status FROM payments WHERE id=$1`, [nov])).rows[0].status).toBe('voided')
     // Both bills follow their rent; each keeps its water.
     expect(await invoiceTotals(octInv)).toEqual({ rent: 429.03, utilities: 40, total: 469.03 })
     expect(await invoiceTotals(novInv)).toEqual({ rent: 0, utilities: 35, total: 35 })
@@ -763,9 +777,16 @@ describe('Master Schedule → lease sync', () => {
     expect(stripeCancel).toHaveBeenCalledWith('pi_oct_only')
     expect((await db.query<any>(`SELECT amount::float AS a, status, next_retry_at FROM payments WHERE id=$1`, [oct])).rows[0])
       .toEqual({ a: 429.03, status: 'failed', next_retry_at: null })
-    expect((await db.query<any>(`SELECT status, release_reason FROM credit_uses`)).rows)
-      .toEqual([{ status: 'released', release_reason: 'superseded' }])
-    expect(Number((await db.query<any>(`SELECT amount_remaining FROM tenant_credits WHERE id=$1`, [tc])).rows[0].amount_remaining)).toBe(50)
+    // The pull's hold is given back first (superseded). 10/15 (Nic): the
+    // freed $50 then goes straight on the re-priced month — "money gets
+    // applied to the most outstanding balance first" — so the row keeps $50 of
+    // credit and money owes $379.03 of the $429.03.
+    expect((await db.query<any>(`SELECT status, release_reason FROM credit_uses ORDER BY held_at`)).rows)
+      .toEqual([
+        { status: 'released', release_reason: 'superseded' },
+        { status: 'applied', release_reason: null },
+      ])
+    expect(Number((await db.query<any>(`SELECT amount_remaining FROM tenant_credits WHERE id=$1`, [tc])).rows[0].amount_remaining)).toBe(0)
     // The tenant: why, the new amount, and Pay now.
     const userId = (await db.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [s.tenantId])).rows[0].user_id
     const tn = (await db.query<any>(`SELECT body, data FROM notifications WHERE user_id=$1 AND type='stay_shortened_retry_canceled'`, [userId])).rows
@@ -1078,9 +1099,16 @@ describe('Master Schedule → lease sync', () => {
       // Put back to January 28: November is billed whole now; December on is the run's.
       await db.query(`UPDATE unit_bookings SET check_out=$2, nights=171 WHERE id=$1`, [s.bookingId, END])
       await syncLeaseWithBookingDates(s.bookingId!)
+      // 10/12 (Nic): the November rent the mistake took off stays as a voided
+      // record beside the new bill — and no longer holds the month's one rent
+      // slot (ux_payments_unit_rent_due_date_active), so November bills again.
       const nov = (await db.query<any>(
-        `SELECT amount::float AS a, status, is_remainder, notes FROM payments WHERE lease_id=$1 AND type='rent' AND due_date='2026-11-01'`, [s.leaseId])).rows
-      expect(nov).toEqual([{ a: 950, status: 'pending', is_remainder: false, notes: 'Stay now ends January 28, 2027: rent for November 2026' }])
+        `SELECT amount::float AS a, status, is_remainder, notes FROM payments WHERE lease_id=$1 AND type='rent' AND due_date='2026-11-01'
+          ORDER BY created_at, id`, [s.leaseId])).rows
+      expect(nov).toEqual([
+        { a: 950, status: 'voided', is_remainder: false, notes: null },
+        { a: 950, status: 'pending', is_remainder: false, notes: 'Stay now ends January 28, 2027: rent for November 2026' },
+      ])
       expect((await db.query(`SELECT 1 FROM payments WHERE lease_id=$1 AND due_date > '2026-11-01'`, [s.leaseId])).rowCount).toBe(0)
       expect((await db.query(`SELECT 1 FROM lease_prepaid_credits WHERE lease_id=$1`, [s.leaseId])).rowCount).toBe(0)
       const ll = (await db.query<any>(`SELECT body FROM notifications WHERE type='booking_lease_sync' AND landlord_id=$1 ORDER BY created_at DESC LIMIT 1`, [s.landlordId])).rows
@@ -1337,8 +1365,13 @@ describe('Master Schedule → lease sync', () => {
     // The guest leaves August 15: 5 nights × 950/31 = $153.23 — the deposit covers it.
     await db.query(`UPDATE unit_bookings SET check_out='2026-08-15', nights=5 WHERE id=$1`, [s.bookingId])
     await syncLeaseWithBookingDates(s.bookingId!)
-    expect((await db.query(`SELECT 1 FROM payments WHERE id=$1`, [arrival])).rowCount).toBe(0)
-    expect((await db.query(`SELECT 1 FROM invoices WHERE id=$1`, [inv])).rowCount).toBe(0)     // an empty shell goes too
+    // 10/12 (Nic): the arrival bill's rent is voided as a record (never
+    // deleted); its bill, left with nothing live on it, is voided and kept too
+    // (G7), its voided line still on it — and it gives the lease's date back.
+    expect((await db.query(`SELECT status, invoice_id FROM payments WHERE id=$1`, [arrival])).rows)
+      .toEqual([{ status: 'voided', invoice_id: inv }])
+    expect((await db.query(`SELECT status, lease_id, voided_from_lease_id FROM invoices WHERE id=$1`, [inv])).rows)
+      .toEqual([{ status: 'void', lease_id: null, voided_from_lease_id: s.leaseId }])
     // $500 paid − $153.23 owed = $346.77, banked as money paid ahead.
     const credit = await db.query<any>(`SELECT amount_original::float AS a, funded_by FROM lease_prepaid_credits WHERE lease_id=$1`, [s.leaseId])
     expect(credit.rows).toEqual([{ a: 346.77, funded_by: 'reclassified' }])
@@ -1579,10 +1612,11 @@ describe('landlord credit on nights a shortened stay no longer has', () => {
 
     await shortenTo(s, '2026-10-01')
 
-    // October's rent is not owed any more: the credit came back and the bill went.
-    expect((await db.query(`SELECT 1 FROM payments WHERE id=$1`, [oct])).rowCount).toBe(0)
+    // October's rent is not owed any more: the credit came back and the bill
+    // went (10/12: voided as a record — the given-back use keeps its target).
+    expect((await db.query(`SELECT status FROM payments WHERE id=$1`, [oct])).rows[0].status).toBe('voided')
     expect((await uses())[0]).toEqual(
-      { status: 'released', release_reason: 'stay_shortened', payment_id: null, amount: 100, source: 'desk', spent_on_record: true })
+      { status: 'released', release_reason: 'stay_shortened', payment_id: oct, amount: 100, source: 'desk', spent_on_record: true })
     expect(await invoiceTotals(octInv)).toEqual({ rent: 0, total: 40 })
     // Nothing stuck on the account, nothing for GAM to clear, nothing banked.
     expect((await db.query(`SELECT 1 FROM admin_notifications WHERE category='stay_shortened_rent_kept'`)).rowCount).toBe(0)
@@ -2012,8 +2046,11 @@ describe('the credit record for rent a longer stay bills', () => {
       await c.query('COMMIT')
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
   }
+  // 10/12 (Nic): "one mark per invoice" — the live mark of the bill this row is
+  // on (a longer stay's extra rent on no invoice is a bill of its own here).
   const markFor = async (paymentId: string) => (await db.query<any>(
-    `SELECT event_type, network_visibility, event_data FROM credit_events WHERE event_data->>'payment_id' = $1`,
+    `SELECT event_type, network_visibility, event_data FROM credit_events
+      WHERE event_data->>'mark_basis' = 'invoice' AND superseded_by IS NULL AND (event_data->'payment_ids') ? $1`,
     [paymentId])).rows
 
   it('a longer-stay bill paid the day it is billed is on time on the credit record (the rest of the month)', async () => {
@@ -2027,7 +2064,8 @@ describe('the credit record for rent a longer stay bills', () => {
     expect(marks).toHaveLength(1)
     expect(marks[0].event_type).toBe('payment_received_on_time')
     expect(marks[0].network_visibility).toBe('visible_to_current_landlord')
-    expect(marks[0].event_data).toMatchObject({ due_date: '2026-10-01', billed_on: '2026-10-10' })
+    // Lateness counts from the day it was written: its grace runs to Oct 14, the 15th is late.
+    expect(marks[0].event_data).toMatchObject({ due_date: '2026-10-01', first_late_day: '2026-10-15' })
   })
 
   it('a longer-stay bill paid the day it is billed is on time on the credit record (a whole month written after the catch-up window)', async () => {
@@ -2041,7 +2079,7 @@ describe('the credit record for rent a longer stay bills', () => {
     const marks = await markFor(billed[0].id)
     expect(marks).toHaveLength(1)
     expect(marks[0].event_type).toBe('payment_received_on_time')
-    expect(marks[0].event_data).toMatchObject({ due_date: '2026-11-01', billed_on: '2026-12-10' })
+    expect(marks[0].event_data).toMatchObject({ due_date: '2026-11-01', first_late_day: '2026-12-15' })
   })
 
   it('a longer-stay bill paid long after it was billed is still late', async () => {
@@ -2171,6 +2209,80 @@ describe('S548 pull-out meter read prompt', () => {
     expect(second.prompted).toBe(0)
   })
 
+  // ── 10/25 (Nic) — A READ THAT WAS TAKEN IS NOT A READ THAT IS DUE ─────────
+  //
+  //   "That flow of checking people out at the front desk, when we input his
+  //    meter read, it did not transfer it to the meter reads on the meter
+  //    reading tab... I'm getting two notifications for the same spot that's
+  //    already done and over with."
+  //
+  // It HAD transferred — Patrick Neuman, RV 06, 39999 on 10/23, move_out_final —
+  // and the rollback rule he asked for then held it, because 40000 → 39999 is
+  // within a digit. The read correctly stays outstanding (a dropped digit must
+  // not make the walk look done, 10/20), but the notice said there was "no
+  // closing read", which is why he thought the register had lost it.
+  it('says a held read is waiting on the landlord, not that no read was taken', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    await db.query(`UPDATE leases SET end_date = CURRENT_DATE - 2 WHERE id=$1`, [s.leaseId])
+    const client = await getClient()
+    let meterId: string
+    try {
+      await client.query('BEGIN')
+      meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    // The desk took the closing read and GAM is holding the figure.
+    await db.query(
+      `INSERT INTO utility_meter_readings (meter_id, reading_date, billing_cycle_month, reading_value, reason, needs_review, review_note, created_by_user_id)
+       VALUES ($1, CURRENT_DATE - 1, date_trunc('month', CURRENT_DATE)::date, 39999, 'move_out_final', TRUE, 'within a digit of the one before', $2)`,
+      [meterId!, s.userId])
+
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+    const n = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(n.rows.length).toBeGreaterThanOrEqual(1)
+    const { title, body } = n.rows[0]
+    // The title no longer claims a read is due when one was taken.
+    expect(title).toMatch(/waiting on you/i)
+    expect(title).not.toMatch(/still due/i)
+    // And the body says what to actually DO — settle a figure, not walk a meter.
+    expect(body).toMatch(/was taken and is waiting on you/i)
+    expect(body).toMatch(/Readings to double-check/)
+    expect(body).not.toMatch(/no closing read/i)
+  })
+
+  it('a spot with a settled read drops off, while an unread one still says due', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    await db.query(`UPDATE leases SET end_date = CURRENT_DATE - 2 WHERE id=$1`, [s.leaseId])
+    const client = await getClient()
+    let meterId: string
+    try {
+      await client.query('BEGIN')
+      meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    // Unread: the old wording still applies, because nobody has been to the meter.
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+    const due = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(due.rows[0].body).toMatch(/no closing read/i)
+
+    // Settled: it stops being chased at all.
+    await db.query(`DELETE FROM notifications WHERE type='moveout_meter_reads_due'`)
+    await db.query(
+      `INSERT INTO utility_meter_readings (meter_id, reading_date, billing_cycle_month, reading_value, reason, needs_review, created_by_user_id)
+       VALUES ($1, CURRENT_DATE - 1, date_trunc('month', CURRENT_DATE)::date, 41000, 'move_out_final', FALSE, $2)`, [meterId!, s.userId])
+    expect((await promptMoveOutMeterReads()).prompted).toBe(0)
+  })
+
   it('no submeter on the departing site → no prompt', async () => {
     const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
     const s = await seedStack()
@@ -2178,6 +2290,247 @@ describe('S548 pull-out meter read prompt', () => {
     const r = await promptMoveOutMeterReads()
     expect(r.prompted).toBe(0)
   })
+
+  // 10/18 (Nic): "if there was a final bill and somebody moved out, the system
+  // did not alert us to do a meter read. Um, speaking of that, my RV spaces 10
+  // and 11, Victor Cardoza and Nemesio Rivera, they paid for a month. They both
+  // left early, so I need to get those meter reads."
+  //
+  // Leaving early used to make a departure invisible twice over: the stay is
+  // already checked out, and its check-out date has moved back to the day they
+  // drove off. Asking "who leaves today" found nobody, on the only day it asked.
+  it('guest who left EARLY is prompted, and stays prompted until the read lands', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    // Paid stay, lease draft never signed — the stay is the whole story.
+    await db.query(`UPDATE leases SET status='pending' WHERE id=$1`, [s.leaseId])
+    // Booked out to January; drove off 3 days ago, so the stay closed that day.
+    await db.query(
+      `UPDATE unit_bookings SET status='checked_out', check_out=CURRENT_DATE - 3 WHERE id=$1`,
+      [s.bookingId])
+    const client = await getClient()
+    let meterId: string
+    try {
+      await client.query('BEGIN')
+      meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const first = await promptMoveOutMeterReads()
+    expect(first.prompted).toBe(1)
+    const n = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(n.rows).toHaveLength(1)
+    expect(n.rows[0].title).toContain('Closing meter reads still due')
+    expect(n.rows[0].body).toContain('already left with no closing read')
+    expect(n.rows[0].body).toContain('Sched Guest')
+
+    // Same morning, second cron tick → no duplicate.
+    expect((await promptMoveOutMeterReads()).prompted).toBe(0)
+
+    // Next morning and still no read → asked again. The row stays where it is
+    // and the clock moves instead, so the one-per-day guard is being asked
+    // about YESTERDAY's notice, which is what happens in production.
+    await db.query(
+      `UPDATE notifications SET created_at = created_at - INTERVAL '1 day'
+        WHERE type='moveout_meter_reads_due'`)
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+  })
+
+  it('lease that ended days ago with no closing read is prompted', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    await db.query(`UPDATE leases SET end_date=CURRENT_DATE - 5, status='expired' WHERE id=$1`, [s.leaseId])
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+    const unit = await db.query<any>(`SELECT unit_number FROM units WHERE id=$1`, [s.unitId])
+    const n = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(n.rows[0].title).toContain('Closing meter reads still due')
+    expect(n.rows[0].body).toContain(unit.rows[0].unit_number)
+  })
+
+  // The read is the ONLY thing that stops this notice — otherwise it goes out
+  // every morning for 60 days. So one test watches it stop: asked for while the
+  // read is missing, silent once the read is in.
+  it('closing read entered → prompt stops', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    await db.query(`UPDATE leases SET end_date=CURRENT_DATE - 5, status='expired' WHERE id=$1`, [s.leaseId])
+    const client = await getClient()
+    let meterId: string
+    try {
+      await client.query('BEGIN')
+      meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    // No read yet → asked for.
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+
+    // Read taken on the day they left — that read closes them out. (Yesterday's
+    // notice is out of the way so the per-day guard is not what answers.)
+    await db.query(`DELETE FROM notifications WHERE type='moveout_meter_reads_due'`)
+    await db.query(
+      `INSERT INTO utility_meter_readings
+         (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)
+       VALUES ($1, CURRENT_DATE - 5, 10400, date_trunc('month', CURRENT_DATE)::date, $2, 'move_out_final')`,
+      [meterId!, s.userId])
+
+    expect((await promptMoveOutMeterReads()).prompted).toBe(0)
+  })
+  // 10/18 (Nic): the same loss through the other door out of a lease. Writing
+  // down a leaving day moves the lease's end date; paying the fee to get out
+  // early does not — it stamps the day it ended and leaves the end date where
+  // it was. A household that bought its way out of a lease running to next
+  // August was invisible until next August, and the next rig pulled onto the
+  // spot on an unread meter.
+  it('lease ended early with its end date untouched is prompted, and the next check-in is blocked', async () => {
+    const { promptMoveOutMeterReads, getReadsDue, unitPendingReads } =
+      await import('../services/utilityReadingRuns')
+    const s = await seedStack({ bookingSourced: false })   // no stay behind it: the lease is the whole story
+    // Exactly what the buy-out does (services/leaseTermination.ts): end date
+    // stays in January 2027.
+    await db.query(
+      `UPDATE leases SET status='terminated', terminated_at = NOW() - INTERVAL '3 days' WHERE id=$1`,
+      [s.leaseId])
+    const client = await getClient()
+    let meterId: string
+    try {
+      await client.query('BEGIN')
+      meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query(
+        `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+         VALUES ($1, 'electric', TRUE)`, [s.leaseId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const unit = await db.query<any>(`SELECT unit_number FROM units WHERE id=$1`, [s.unitId])
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+    const n = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(n.rows[0].title).toContain('Closing meter reads still due')
+    expect(n.rows[0].body).toContain('already left with no closing read')
+    expect(n.rows[0].body).toContain(unit.rows[0].unit_number)
+    expect(n.rows[0].body).toContain('Test Tenant')
+
+    // The front desk's own list and the check-in block see the same departure —
+    // and it bills the household that left, not the next arrival.
+    const due = await getReadsDue(s.propertyId)
+    expect(due).toHaveLength(1)
+    expect(due[0].meter_id).toBe(meterId!)
+    expect(due[0].reason).toBe('move_out_final')
+    const pending = await unitPendingReads(s.unitId)
+    expect(pending).toHaveLength(1)
+    expect(pending[0].reason).toBe('move_out_final')
+    expect(pending[0].lease_id).toBe(s.leaseId)
+  })
+
+  // Mountain View RV 01 and RV 09: a draft thrown away, and a lease ended
+  // before its start day. Nobody was ever on the spot, so there is no closing
+  // read to take and no reason to ask for one every morning.
+  it('a lease ended before anybody lived under it is not a departure', async () => {
+    const { promptMoveOutMeterReads, unitPendingReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack({ bookingSourced: false })
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    // Thrown away: terminated with no day stamped at all.
+    await db.query(`UPDATE leases SET status='terminated', terminated_at=NULL WHERE id=$1`, [s.leaseId])
+    expect((await promptMoveOutMeterReads()).prompted).toBe(0)
+    expect(await unitPendingReads(s.unitId)).toHaveLength(0)
+
+    // Ended the day before it would have started.
+    await db.query(
+      `UPDATE leases SET start_date = CURRENT_DATE - 2, terminated_at = (CURRENT_DATE - 3)::timestamptz
+        WHERE id=$1`, [s.leaseId])
+    expect((await promptMoveOutMeterReads()).prompted).toBe(0)
+    expect(await unitPendingReads(s.unitId)).toHaveLength(0)
+  })
+
+  // One spot, two departures: a guest who left two weeks ago with no read, and
+  // the household driving off this morning. One walk reads the one meter, so
+  // the notice carries one line for the spot — and it has to be TODAY's line.
+  // Naming the guest from two weeks ago and dropping "read it at checkout" is
+  // how the read gets missed on the one day it can still be taken at the pole.
+  it('an older unread departure does not silence the pull-out happening today', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    await db.query(
+      `UPDATE unit_bookings SET status='checked_out', check_out=CURRENT_DATE - 14 WHERE id=$1`,
+      [s.bookingId])
+    await db.query(`UPDATE leases SET end_date=CURRENT_DATE, status='active' WHERE id=$1`, [s.leaseId])
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+    const n = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(n.rows[0].title).toContain('Pull-out meter reads due today')
+    expect(n.rows[0].body).toContain('pulling out today')
+    expect(n.rows[0].body).toContain('Test Tenant')
+    expect(n.rows[0].body).not.toContain('Sched Guest')
+  })
+
+  // A rig still parked out front whose stay nobody has checked out yet. The
+  // read is still due, but the email must not tell the landlord and every
+  // staffer on the property that somebody left when they have not.
+  it('a stay past checkout that nobody has checked out is not reported as having left', async () => {
+    const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+    const s = await seedStack()
+    await db.query(`UPDATE leases SET status='pending' WHERE id=$1`, [s.leaseId])
+    await db.query(
+      `UPDATE unit_bookings SET status='checked_in', check_out=CURRENT_DATE - 1 WHERE id=$1`,
+      [s.bookingId])
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const meterId = await seedUtilityMeter(client, { propertyId: s.propertyId, utilityType: 'electric' })
+      await client.query(
+        `INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [meterId, s.unitId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    expect((await promptMoveOutMeterReads()).prompted).toBe(1)
+    const n = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE type='moveout_meter_reads_due' AND landlord_id=$1`,
+      [s.landlordId])
+    expect(n.rows[0].body).toContain('past checkout and not checked out yet')
+    expect(n.rows[0].body).toContain('due out')
+    expect(n.rows[0].body).not.toContain('already left')
+    expect(n.rows[0].body).toContain('Sched Guest')
+  })
+
 })
 
 describe('S548 move-out walkthrough scheduling', () => {

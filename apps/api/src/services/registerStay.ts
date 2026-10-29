@@ -114,7 +114,10 @@ export type StayUnit = keyof typeof STAY_RATE_COLUMN
  * (memory: gam-out-of-order-sites)
  */
 export async function siteIsFree(
-  client: PoolClient, unitId: string, checkIn: string, checkOut: string,
+  // 10/17: query-only, so the same test runs outside a transaction — picking a
+  // site for a pay link (services/propertyBooking chooseFreeSite) asks it of
+  // the pool before any lock is taken.
+  client: Pick<PoolClient, 'query'>, unitId: string, checkIn: string, checkOut: string,
 ): Promise<boolean> {
   const clash = await client.query(
     `SELECT 1 WHERE
@@ -325,10 +328,18 @@ export interface ReservationDue {
   /** decisions #15: the deposit due now on a long stay (null for any other). */
   depositDue: number | null
   /**
-   * 10/3 (decisions #21): the property's short-term lodging tax, as a percent
-   * (properties.short_term_tax_rate) — the rate the schedule prices a stay
-   * under 30 nights with (priceStay). Its price has the tax in it; a
-   * sale that takes it records that part as tax (stayTaxRate, taxInside).
+   * 10/3 (decisions #21): the short-term lodging tax, as a percent — the rate
+   * the schedule prices a stay under 30 nights with (priceStay). Its price has
+   * the tax in it; a sale that takes it records that part as tax (stayTaxRate,
+   * taxInside).
+   *
+   * 10/17 (Nic, one home for a tax rate): THE RATE THIS STAY WAS PRICED AT —
+   * unit_bookings.stay_tax_rate, stamped when it was priced — falling back to
+   * the property's rate today (properties.short_term_tax_rate, which now
+   * follows the company's named "Lodging tax") for a stay priced before
+   * stamping began. So a deposit taken in September and the arrival-day
+   * balance taken in October record the SAME rate, and changing the named tax
+   * never re-rates a stay already sold ("never reprice history").
    */
   taxPct: number
   /** The stay's own rates (the site's, else the property's) — for working out the tax rate inside its price (stayTaxRate). */
@@ -406,7 +417,7 @@ export async function reservationDue(
             COALESCE(b.total_amount, 0)::float AS total, b.deposit_amount::float AS deposit_amount,
             (b.deposit_paid_at IS NOT NULL) AS deposit_paid, (b.balance_paid_at IS NOT NULL) AS balance_paid,
             (b.displaced_at IS NOT NULL AND b.displaced_from_unit IS NOT DISTINCT FROM b.unit_id) AS displaced,
-            b.balance_pay_link_id, b.stay_terms,
+            b.balance_pay_link_id, b.stay_terms, b.stay_tax_rate::float AS stay_tax_rate,
             p.booking_deposit_pct, p.booking_monthly_deposit, p.short_term_tax_rate,
             COALESCE(u.nightly_rate, p.nightly_rate)::float AS nightly_rate,
             COALESCE(u.weekly_rate, p.weekly_rate)::float AS weekly_rate,
@@ -455,7 +466,14 @@ export async function reservationDue(
     balancePayLinkId: r.balance_pay_link_id ?? null,
     leaseBillsRest,
     depositDue,
-    taxPct: Number(r.short_term_tax_rate || 0),
+    // 10/17 (Nic, "never reprice history"): the rate THIS stay was priced at
+    // (stamped on the booking), and only the property's rate today for a stay
+    // priced before stamping began.
+    // (× 100 on a float lands at 6.6000000000000005 — the percent is rounded
+    // to the two places the property's own column holds.)
+    taxPct: r.stay_tax_rate != null
+      ? Math.round(Number(r.stay_tax_rate) * 10000) / 100
+      : Number(r.short_term_tax_rate || 0),
     rates: { nightly: r.nightly_rate ?? null, weekly: r.weekly_rate ?? null, monthly: r.monthly_rate ?? null },
     monthStay: r.month_stay === true,
   }
@@ -473,6 +491,12 @@ export async function reservationDue(
  * before 10/6 (by length, prorated) whose price is not what priceStay gives
  * now carries the tax it was priced with then — every stay under 30 nights,
  * unless only a monthly rate priced it.
+ *
+ * 10/17 (Nic, one home for a tax rate): `taxPct` is the stay's OWN rate where
+ * it has one (reservationDue reads unit_bookings.stay_tax_rate), so this
+ * reprices nothing when the company changes its named "Lodging tax" — and for
+ * a stay being priced now it is the property's rate, which follows that one
+ * named tax and cannot be left behind by a second screen.
  */
 export function stayTaxRate(rates: { nightly: number | null; weekly: number | null; monthly: number | null },
                             taxPct: number, nights: number, at?: { checkIn: string; total?: number | null; monthStay?: boolean }): number {

@@ -1,6 +1,6 @@
 import type { PoolClient } from 'pg'
 import { query, getClient } from '../db'
-import { getSubjectChain } from './creditLedger'
+import { getSubjectChain, CHAIN_RESTART_EVENT } from './creditLedger'
 
 // ============================================================
 // Credit stats service — Session B.
@@ -38,6 +38,19 @@ const PAYMENT_TIERS = new Set([
   'payment_skipped',
 ])
 
+/**
+ * 10/12 (Nic): "the payment history should be a health percentage. one mark
+ * per invoice." The payment history is the BILL marks (services/creditBillMarks:
+ * event_data.mark_basis 'invoice', one per household bill, rated by the
+ * payment-health rule). A per-line mark written before 10/12 that the rebuild
+ * has not replaced yet (scripts/oct12_rerate_late_marks) is not part of it:
+ * it is only counted, as line_marks_not_replaced.
+ */
+const BILL_MARK_BASIS = 'invoice'
+function isBillMark(e: ChainEvent): boolean {
+  return PAYMENT_TIERS.has(e.event_type) && (e.event_data as { mark_basis?: unknown } | null)?.mark_basis === BILL_MARK_BASIS
+}
+
 export interface SubjectStats {
   payment_stats: Record<string, unknown>
   property_stats: Record<string, unknown>
@@ -54,10 +67,11 @@ export function computeStats(events: ChainEvent[]): SubjectStats {
   const cutoff12mo = now - 365 * day
   const cutoff90d = now - 90 * day
 
-  const inPaymentSet = active.filter((e) => PAYMENT_TIERS.has(e.event_type))
+  const bills = active.filter(isBillMark)
+  const lineMarks = active.filter((e) => PAYMENT_TIERS.has(e.event_type) && !isBillMark(e))
 
   return {
-    payment_stats: paymentStats(inPaymentSet, cutoff12mo, cutoff90d),
+    payment_stats: { ...paymentStats(bills, cutoff12mo, cutoff90d), line_marks_not_replaced: lineMarks.length },
     property_stats: dimensionRollup(active, 'property_care'),
     tenancy_stats: tenancyStats(active),
     community_stats: dimensionRollup(active, 'community_fit'),
@@ -66,17 +80,44 @@ export function computeStats(events: ChainEvent[]): SubjectStats {
   }
 }
 
+/** A bill mark's bill day (its due date), else when it happened: the windows and the streak run by bill. */
+function billTime(e: ChainEvent): number {
+  const due = (e.event_data as { due_date?: unknown } | null)?.due_date
+  const t = typeof due === 'string' ? Date.parse(`${due.slice(0, 10)}T12:00:00Z`) : NaN
+  return Number.isFinite(t) ? t : new Date(e.occurred_at).getTime()
+}
+
+/**
+ * The payment-health figure from the bill marks (10/12, Nic): bills paid on
+ * time ÷ bills judged, as a whole percent — every bill since the tenant's first
+ * on GAM. The same rule and rounding as the Rent Roll's payment health
+ * (services/householdMonths paymentHealth), counted per bill.
+ */
+export function billHealth(bills: readonly ChainEvent[]): {
+  percent: number | null; on_time: number; counted: number; paid_late: number; partial: number
+  outstanding: number; label: string
+} {
+  const counted = bills.length
+  const onTime = bills.filter((e) => e.event_type === 'payment_received_on_time' || e.event_type === 'payment_received_late_grace').length
+  const percent = counted ? Math.round((onTime / counted) * 100) : null
+  return {
+    percent,
+    on_time: onTime,
+    counted,
+    paid_late: bills.filter((e) => e.event_type.startsWith('payment_received_late_') && e.event_type !== 'payment_received_late_grace').length,
+    partial: bills.filter((e) => e.event_type === 'payment_partial').length,
+    outstanding: bills.filter((e) => e.event_type === 'payment_skipped').length,
+    label: percent === null ? 'No bills to judge yet'
+      : `${percent}%, ${onTime} of ${counted} bill${counted === 1 ? '' : 's'} on time`,
+  }
+}
+
 function paymentStats(
-  payments: ChainEvent[],
+  bills: ChainEvent[],
   cutoff12mo: number,
   cutoff90d: number,
 ): Record<string, unknown> {
-  const slice = (cutoffMs: number) =>
-    payments.filter((e) => new Date(e.occurred_at).getTime() >= cutoffMs)
-
-  const all = payments
-  const r12 = slice(cutoff12mo)
-  const r90 = slice(cutoff90d)
+  const slice = (cutoffMs: number) => bills.filter((e) => billTime(e) >= cutoffMs)
 
   const buildSlice = (rows: ChainEvent[]) => {
     if (rows.length === 0) return { total_events: 0 }
@@ -85,14 +126,15 @@ function paymentStats(
       counts[r.event_type] = (counts[r.event_type] ?? 0) + 1
     }
     const total = rows.length
-    const onTime = counts['payment_received_on_time'] ?? 0
-    const grace = counts['payment_received_late_grace'] ?? 0
+    // A bill paid by its last grace day is on time (one rule: no "within
+    // grace" tier on a bill); a per-line "within grace" mark never reaches here.
+    const onTime = (counts['payment_received_on_time'] ?? 0) + (counts['payment_received_late_grace'] ?? 0)
     return {
       total_events: total,
       on_time_count: onTime,
       on_time_pct: pct(onTime, total),
-      within_grace_count: onTime + grace,
-      within_grace_pct: pct(onTime + grace, total),
+      within_grace_count: onTime,
+      within_grace_pct: pct(onTime, total),
       late_minor_count: counts['payment_received_late_minor'] ?? 0,
       late_major_count: counts['payment_received_late_major'] ?? 0,
       late_severe_count: counts['payment_received_late_severe'] ?? 0,
@@ -102,38 +144,32 @@ function paymentStats(
     }
   }
 
-  const streak = computeOnTimeStreak(payments)
+  const streak = computeOnTimeStreak(bills)
 
   return {
-    lifetime: buildSlice(all),
-    rolling_12mo: buildSlice(r12),
-    rolling_90d: buildSlice(r90),
+    basis: 'bill',
+    health: billHealth(bills),
+    lifetime: buildSlice(bills),
+    rolling_12mo: buildSlice(slice(cutoff12mo)),
+    rolling_90d: buildSlice(slice(cutoff90d)),
     longest_on_time_streak_count: streak.longest,
     current_on_time_streak_count: streak.current,
   }
 }
 
-function computeOnTimeStreak(payments: ChainEvent[]): {
+/** Bills paid on time in a row, oldest bill first: the longest run, and the run up to the newest bill. */
+function computeOnTimeStreak(bills: ChainEvent[]): {
   longest: number
   current: number
 } {
-  const sorted = [...payments].sort(
-    (a, b) =>
-      new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime(),
-  )
+  const sorted = [...bills].sort((a, b) => billTime(a) - billTime(b) || a.id.localeCompare(b.id))
   let longest = 0
   let current = 0
-  let runningCurrent = 0
   for (const p of sorted) {
-    if (
-      p.event_type === 'payment_received_on_time' ||
-      p.event_type === 'payment_received_late_grace'
-    ) {
-      runningCurrent += 1
-      if (runningCurrent > longest) longest = runningCurrent
-      current = runningCurrent
+    if (p.event_type === 'payment_received_on_time' || p.event_type === 'payment_received_late_grace') {
+      current += 1
+      if (current > longest) longest = current
     } else {
-      runningCurrent = 0
       current = 0
     }
   }
@@ -223,11 +259,15 @@ export async function refreshAllSubjectStats(): Promise<{
   processed: number
   errors: { subjectId: string; error: string }[]
 }> {
+  // 10/13: a chain restart is not history (getSubjectChain leaves it out):
+  // a subject whose only live event is a restart has nothing to count.
   const subjects = await query<{ id: string }>(
     `SELECT DISTINCT s.id
        FROM credit_subjects s
        JOIN credit_events e ON e.subject_id = s.id
-      WHERE e.superseded_by IS NULL`,
+      WHERE e.superseded_by IS NULL
+        AND e.event_type <> $1`,
+    [CHAIN_RESTART_EVENT],
   )
 
   const errors: { subjectId: string; error: string }[] = []

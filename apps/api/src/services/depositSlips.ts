@@ -22,11 +22,14 @@
 //     bill equals it, or more than one slip fits; then it waits for a person.
 //     (Those checks live in services/bankFeed.reconcileDeposits, which runs
 //     every automatic step in the plan's order.)
-//   * No slip, but the bank row equals EVERYTHING collected and not yet
-//     banked: it matches without a slip (GAM writes an 'inferred' slip so the
-//     record looks the same). Otherwise exactly ONE combination of what was
-//     collected in the INFERRED_WINDOW_DAYS before it matches; anything else
-//     waits, with the closest combination proposed for a person to accept.
+//   * No slip: GAM works out what the bank row may be — EVERYTHING collected
+//     and not yet banked, or exactly ONE combination of what was collected in
+//     the INFERRED_WINDOW_DAYS before it — and proposes it for a person to
+//     accept ("Make a bank deposit"). 10/14 (Nic): "if gam 100 percent knows
+//     who that money came from it can file it but no guessing" — a
+//     combination that happens to add up is never matched by itself any more
+//     (it used to be, as an 'inferred' slip; those already made keep that
+//     source).
 //   * A slip the bank has not shown after SLIP_MATCH_BUSINESS_DAYS business
 //     days is flagged ("not seen at the bank").
 //
@@ -742,32 +745,6 @@ export async function matchSlipByHand(
     client.release()
   }
   return (await listSlips(landlordId, { slipIds: [slipId] }))[0]
-}
-
-/**
- * GAM worked out what a bank row was (everything not yet banked, or the only
- * combination that adds up): write it down as an 'inferred' slip and match it.
- */
-export async function matchInferredBatch(
-  client: PoolClient,
-  o: { landlordId: string; transactionId: string; postedDate: string; items: CashItem[] },
-): Promise<string> {
-  const props = [...new Set(o.items.map(i => i.propertyId).filter((x): x is string => !!x))]
-  const totalCents = o.items.reduce((s, i) => s + i.amountCents, 0)
-  const slipId = (await client.query<{ id: string }>(
-    `INSERT INTO bank_deposit_slips (landlord_id, property_id, deposit_date, total, source, status)
-     VALUES ($1, $2, $3::date, $4, 'inferred', 'open') RETURNING id`,
-    [o.landlordId, props.length === 1 ? props[0] : null, o.postedDate, toDollars(totalCents).toFixed(2)])).rows[0].id
-  for (const it of o.items) {
-    await client.query(
-      `INSERT INTO bank_deposit_slip_items (slip_id, remittance_id, pos_transaction_id, amount) VALUES ($1, $2, $3, $4)`,
-      [slipId, it.kind === 'receipt' ? it.id : null, it.kind === 'register_sale' ? it.id : null,
-       toDollars(it.amountCents).toFixed(2)])
-  }
-  await matchSlipToDeposit(client, {
-    slipId, transactionId: o.transactionId, landlordId: o.landlordId, matchedBy: null, inferred: true,
-  })
-  return slipId
 }
 
 /**

@@ -673,6 +673,18 @@ describe('processAutoPayouts — one payout per Stripe account', () => {
     expect(res.candidatesScanned).toBe(1)
     expect(res.payoutsFired).toBe(1)
     expect(reconcileMock).toHaveBeenCalledWith('acct_shared')
+    // 10/12 (Nic, ledger P0): it carries both companies' money, so it names
+    // neither — never the first company on the account.
+    const rows = await db.query(`SELECT landlord_id, stripe_account_id FROM disbursements`)
+    expect(rows.rows).toEqual([{ landlord_id: null, stripe_account_id: 'acct_shared' }])
+  })
+
+  it('10/12: one company paying into the login\'s account — the payout is that company\'s', async () => {
+    const userId = await seedConnectReadyLandlord('acct_single')
+    const { rows: [ll] } = await db.query<{ id: string }>(`SELECT id FROM landlords WHERE user_id = $1`, [userId])
+    await processAutoPayouts(TUESDAY)
+    const rows = await db.query(`SELECT landlord_id FROM disbursements`)
+    expect(rows.rows).toEqual([{ landlord_id: ll.id }])
   })
 
   it('a recent payout to one account never holds back the other', async () => {

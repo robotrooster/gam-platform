@@ -465,13 +465,31 @@ export async function writeRowReversal(
     newPaymentId = (await client.query<{ id: string }>(
       `INSERT INTO payments
          (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
-          entry_description, due_date, invoice_id, notes, reversal_id, revenue_owner, lease_fee_id, is_remainder)
+          entry_description, due_date, invoice_id, notes, reversal_id, revenue_owner, lease_fee_id, is_remainder,
+          -- 10/19 (Nic): a reopened carried space-rent balance is still the same
+          -- claim. Without the link the claim would read as paid off while the
+          -- bank has taken the money back, and the departing resident's record
+          -- would say settled on a day nothing settled.
+          space_carryforward_id)
        VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$8::date,$9,$10,$11,$12,$13,
-               $5 = 'rent' AND EXISTS (
+               ($5 = 'rent' AND EXISTS (
                  SELECT 1 FROM payments q
                   WHERE q.type = 'rent' AND NOT q.is_remainder AND q.id <> $14::uuid AND q.due_date = $8::date
                     AND ((q.lease_id = $2::uuid AND q.status IN ('pending', 'processing', 'settled'))
-                         OR (q.unit_id = $1::uuid AND q.status NOT IN ('failed', 'returned')))))
+                         -- 10/12: the rows ux_payments_unit_rent_due_date_active
+                         -- holds the month for (a voided row does not).
+                         OR (q.unit_id = $1::uuid AND q.status NOT IN ('failed', 'returned', 'voided')))))
+               -- 10/19 (Nic): a reopened CARRIED space-rent balance is never the
+               -- claim's original charge — the close-out wrote that one, once, and
+               -- ux_payments_one_space_carryforward_charge holds that slot for it
+               -- for good. This row is the money owed again, which is the same
+               -- thing a part payment's leftover is, so it carries the same flag
+               -- and stays outside the one-charge rule. Without it the reopen
+               -- collided with the row it replaces (or, on a bounced part
+               -- payment, with the settled slice beside it) and the whole
+               -- reversal rolled back with the bank's money already gone.
+               OR (SELECT q3.space_carryforward_id FROM payments q3 WHERE q3.id = $14::uuid) IS NOT NULL,
+               (SELECT q2.space_carryforward_id FROM payments q2 WHERE q2.id = $14::uuid))
        RETURNING id`,
       [r.unit_id, r.lease_id, r.tenant_id, r.landlord_id, r.type, toDollars(owedAgain).toFixed(2),
        r.entry_description, r.due_date, r.invoice_id, reopenedNotes(r.notes), reversalId,
@@ -578,6 +596,7 @@ async function settleLandlordSide(
   if (unpaid - fromLedger > 0) {
     await recordHeldItem({
       landlordId: a.row.landlord_id, sourceType: 'dispute', sourceId: untouchedShareSource(a.reversalId),
+      property: { paymentId: a.row.id },  // 10/12 (Nic, ledger P1): the disputed payment's space
       amount: toDollars(unpaid - fromLedger),
       description: 'Your share of a payment that was partly taken back: the part the tenant still paid',
     }, client)
@@ -586,6 +605,7 @@ async function settleLandlordSide(
     await recordHeldItem({
       landlordId: a.row.landlord_id, sourceType: 'dispute', sourceId: withheldShareSource(a.reversalId),
       amount: -toDollars(fromEarlier),
+      property: { paymentId: a.row.id },  // 10/12 (Nic, ledger P1)
       description: 'A payment taken back: held back from your share of it that was still to be paid',
     }, client)
   }
@@ -734,8 +754,15 @@ async function depositAskFigures(
             COALESCE((SELECT SUM(h.amount) FROM held_payout_items h JOIN payment_reversals pr
                         ON h.source_id = 'owner_share_returned:' || pr.id::text
                        WHERE h.source_type = 'dispute' AND ${liveReversalSql('pr')} AND ${ofMoveOut}), 0)::text AS returned_d,
-            EXISTS (SELECT 1 FROM admin_notifications n
-                     WHERE n.category = ANY($3::text[]) AND n.context->>'deposit_return_id' = dr.id::text) AS not_sent
+            -- 10/12 (Nic, ledger P0 review): a transfer on record as made
+            -- (platform_transfer_intents, 'deposit_settlement') is sent, even
+            -- when an earlier try raised the not-sent notice and a retry then
+            -- went through. Otherwise the notice decides, as before.
+            (NOT EXISTS (SELECT 1 FROM platform_transfer_intents ti
+                          WHERE ti.purpose = 'deposit_settlement' AND ti.deposit_return_id = dr.id
+                            AND ti.status = 'transferred')
+             AND EXISTS (SELECT 1 FROM admin_notifications n
+                          WHERE n.category = ANY($3::text[]) AND n.context->>'deposit_return_id' = dr.id::text)) AS not_sent
        FROM deposit_returns dr LEFT JOIN security_deposits sd ON sd.id = dr.security_deposit_id
       WHERE dr.id = $1`, [f.draft_id, a.reversalId, [...ESCROW_TRANSFER_NOT_SENT]])).rows[0]
   const takenCum = toCents(f.taken_before) + a.lostCents
@@ -802,6 +829,7 @@ async function settleDepositKeptSide(
   await recordHeldItem({
     landlordId: a.row.landlord_id, sourceType: 'dispute', sourceId: withheldShareSource(a.reversalId),
     amount: -toDollars(x), description: await depositLineWords(client, a.row.id, 'back'),
+    property: { paymentId: a.row.id },  // 10/12 (Nic, ledger P1): the deposit payment's space
   }, client)
   return x
 }
@@ -874,6 +902,7 @@ export async function topUpDepositKeptAsk(client: PoolClient, paymentId: string)
   const wrote = await recordHeldItem({
     landlordId: head.landlord_id, sourceType: 'dispute',
     sourceId: `${withheldShareSource(head.rec_id)}:more:${askedSoFar + x}`,
+    property: { paymentId },  // 10/12 (Nic, ledger P1): the deposit payment's space
     amount: -toDollars(x), description: await depositLineWords(client, paymentId, 'back'),
   }, client)
   if (!wrote) return 0
@@ -1873,6 +1902,7 @@ export async function undoWonDispute(input: WonDisputeInput): Promise<WonDispute
         if (give > 0) {
           const wrote = await recordHeldItem({
             landlordId: r.landlord_id, sourceType: 'dispute', sourceId: wonShareSource(r.id), amount: toDollars(give),
+            property: { reversalId: r.id },  // 10/12 (Nic, ledger P1): the disputed payment's space
             description: r.p_type === 'deposit'
               ? await depositLineWords(client, r.payment_id, 'won')
               : 'A disputed payment came back — the card company decided for us — so your share of it is paid to you again',
@@ -2045,6 +2075,8 @@ export async function undoWonDispute(input: WonDisputeInput): Promise<WonDispute
         if (c <= 0) continue
         const wrote = await recordHeldItem({
           landlordId: k.landlord_id, sourceType: 'dispute', sourceId: wonDisputeFeeReturnSourceId(pi, k.landlord_id),
+          // 10/12 (Nic, ledger P1 review): the fee line's own property rule — the one the reports read.
+          property: { disputeFeeLine: wonDisputeFeeReturnSourceId(pi, k.landlord_id) },
           amount: toDollars(c),
           description: 'The card fee taken off your payout for a disputed payment, given back: the card company decided the dispute for us',
         }, client)
@@ -2779,6 +2811,8 @@ async function chargeKeptStripeFee(
     if (p.cents <= 0) continue
     const recorded = await recordHeldItem({
       landlordId: p.id, sourceType: 'dispute', sourceId: `stripe_fee_kept:${a.pi}:${p.id}`,
+      // 10/12 (Nic, ledger P1 review): the fee line's own property rule — the one the reports read.
+      property: { disputeFeeLine: `stripe_fee_kept:${a.pi}:${p.id}` },
       amount: -toDollars(p.cents),
       description: rule === 'landlord_bears_whole_fee'
         ? `The ${a.reversalType === 'card_dispute' ? 'card' : 'bank'} fee on a ${what}: it went back to the payer with the payment, so it comes off your payout`
@@ -2966,6 +3000,7 @@ export async function undoTenantPaidResolution(client: PoolClient, reversalId: s
           WHERE p.id = $1`, [rec.payment_id])).rows[0]
       await recordHeldItem({
         landlordId: rec.landlord_id, sourceType: 'dispute', sourceId: `${refillBackSource(reversalId)}:${fam.backs}`,
+        property: { reversalId },  // 10/12 (Nic, ledger P1): the reopened deposit charge's space
         amount: toDollars(fam.charged),
         description: `Move-out at ${w?.unit_number ?? 'the space'}: the in-person payment of ${w?.tenant_name ?? 'the tenant'}'s reopened deposit charge ` +
           `was taken off the bill, so the $${toDollars(fam.charged).toFixed(2)} taken off your payout for it is given back`,
@@ -3116,6 +3151,7 @@ export async function resolveReversalOnTenantPayment(
           await recordHeldItem({
             landlordId: rev.landlord_id, sourceType: 'dispute',
             sourceId: fam.lines === 0 ? refillShareSource(reversalId) : `${refillShareSource(reversalId)}:${fam.lines}`,
+            property: { reversalId },  // 10/12 (Nic, ledger P1): the reopened deposit charge's space
             amount: -toDollars(more), description: await depositLineWords(client, dep.payment_id, 'refill', more),
           }, client)
         }
@@ -3134,6 +3170,7 @@ export async function resolveReversalOnTenantPayment(
       await recordHeldItem({
         landlordId: rev.landlord_id, sourceType: 'dispute', sourceId: returnedShareSource(reversalId),
         amount: toDollars(asked), description: await depositLineWords(client, dep.payment_id, 'returned'),
+        property: { reversalId },  // 10/12 (Nic, ledger P1): the reopened deposit charge's space
       }, client)
     }
     await client.query(
@@ -3190,6 +3227,7 @@ export async function resolveReversalOnTenantPayment(
       await recordHeldItem({
         landlordId: rev.landlord_id, sourceType: 'dispute', sourceId: returnedShareSource(reversalId),
         amount: toDollars(back),
+        property: { reversalId },  // 10/12 (Nic, ledger P1): the disputed payment's space
         description: 'Your share held back after a payment was taken back, paid now: the tenant paid it again',
       }, client)
     }

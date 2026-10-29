@@ -30,25 +30,36 @@ async function household(c: PoolClient): Promise<Household> {
   return { landlordId: ll.landlordId, tenantId, unitId, leaseId }
 }
 
-// Rent is unique per lease and due date, so each row gets its own day. Settled
-// rows are paid at 15:00 UTC on their due day (8 am in Phoenix): on time.
+// Rent is unique per lease and due date, so each row gets its own day — and
+// (10/12, "one mark per invoice") its own bill, unless it is put on one.
+// Settled rows are paid at 15:00 UTC on their due day (8 am in Phoenix): on time.
 let dueSeq = 0
-async function settled(c: PoolClient, f: Household, o: { type?: string; entry?: string; status?: string; intent?: string; reversalId?: string } = {}) {
-  const due = new Date(Date.UTC(2026, 9, 1) + (dueSeq++) * 86_400_000).toISOString().slice(0, 10)
+async function settled(c: PoolClient, f: Household, o: {
+  type?: string; entry?: string; status?: string; intent?: string; reversalId?: string; invoiceId?: string; due?: string
+} = {}) {
+  const due = o.due ?? new Date(Date.UTC(2026, 9, 1) + (dueSeq++) * 86_400_000).toISOString().slice(0, 10)
+  const invoiceId = o.invoiceId ?? (await c.query<{ id: string }>(
+    `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6::date,460,'pending',$6::date - 5) RETURNING id`,
+    [f.landlordId, f.tenantId, f.leaseId, f.unitId, `INV-${due}-${dueSeq}-${Math.random().toString(36).slice(2, 8)}`, due])).rows[0].id
   const r = await c.query<{ id: string }>(
-    `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description,
-                           due_date, settled_at, stripe_payment_intent_id, reversal_id)
-     VALUES ($1,$2,$3,$4,$5,460,$6,$7,$10::date,
-             CASE WHEN $6 = 'settled' THEN ($10::date + time '15:00') AT TIME ZONE 'UTC' END,$8,$9) RETURNING id`,
+    `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description,
+                           due_date, settled_at, stripe_payment_intent_id, reversal_id, created_at)
+     VALUES ($11,$1,$2,$3,$4,$5,460,$6,$7,$10::date,
+             CASE WHEN $6 = 'settled' THEN ($10::date + time '15:00') AT TIME ZONE 'UTC' END,$8,$9,$10::date - 5) RETURNING id`,
     [f.unitId, f.leaseId, f.tenantId, f.landlordId, o.type ?? 'rent', o.status ?? 'settled',
-     o.entry ?? 'RENT', o.intent ?? null, o.reversalId ?? null, due])
+     o.entry ?? 'RENT', o.intent ?? null, o.reversalId ?? null, due, invoiceId])
   return r.rows[0].id
 }
 
+/** The live bill marks on the bills these rows are on (one per bill), by bill due date. */
 async function marks(c: PoolClient, paymentIds: string[]) {
   const r = await c.query(
-    `SELECT event_data->>'payment_id' AS payment_id, event_type, attestation_source, attestation_evidence
-       FROM credit_events WHERE event_data->>'payment_id' = ANY($1) ORDER BY event_data->>'payment_type'`,
+    `SELECT e.id, p.id::text AS payment_id, e.event_type, e.attestation_source, e.attestation_evidence
+       FROM credit_events e
+       JOIN payments p ON p.invoice_id::text = e.event_data->>'invoice_id'
+      WHERE p.id = ANY($1::uuid[]) AND e.event_data->>'mark_basis' = 'invoice' AND e.superseded_by IS NULL
+      ORDER BY e.event_data->>'due_date', p.id`,
     [paymentIds])
   return r.rows
 }
@@ -58,7 +69,7 @@ afterAll(async () => { await cleanupAllSchema() })
 beforeEach(() => { sendPaymentReceipt.mockClear() })
 
 describe('S655 afterRowsSettled', () => {
-  it("the first settled rent starts the landlord's billing and each rent and utility row gets its payment mark", async () => {
+  it("the first settled rent starts the landlord's billing and each bill gets its ONE payment mark (a late fee alone is no bill's mark)", async () => {
     await withRollback(async c => {
       const f = await household(c)
       const rent = await settled(c, f)
@@ -75,25 +86,45 @@ describe('S655 afterRowsSettled', () => {
       const live = await c.query(`SELECT billing_starts_at FROM landlords WHERE id = $1`, [f.landlordId])
       expect(live.rows[0].billing_starts_at).not.toBeNull()
       const m = await marks(c, [rent, water, late])
+      // 10/12: derived from the bill's own records, not from the caller's attestation.
       expect(m.map(r => [r.payment_id, r.event_type, r.attestation_source])).toEqual([
-        [rent, 'payment_received_on_time', 'landlord_self_reported_with_evidence'],
-        [water, 'payment_received_on_time', 'landlord_self_reported_with_evidence'],
+        [rent, 'payment_received_on_time', 'system_derived'],
+        [water, 'payment_received_on_time', 'system_derived'],
       ])
-      expect(m[0].attestation_evidence).toEqual({ manual_method: 'cash', reference: null })
+      expect(m[0].attestation_evidence.payment_ids).toEqual([rent])
     })
   })
 
-  it('a reopened row starts nothing and gets no fresh payment mark', async () => {
+  it('rent and utility on one bill settled together: one mark for the bill', async () => {
+    await withRollback(async c => {
+      const f = await household(c)
+      const rent = await settled(c, f)
+      const inv = (await c.query<{ invoice_id: string }>(`SELECT invoice_id FROM payments WHERE id = $1`, [rent])).rows[0].invoice_id
+      const due = (await c.query<{ d: string }>(`SELECT due_date::text AS d FROM payments WHERE id = $1`, [rent])).rows[0].d
+      const water = await settled(c, f, { type: 'utility', entry: 'UTILITY', invoiceId: inv, due })
+      const out = await afterRowsSettled(c, [rent, water], { attestationSource: 'stripe_attested', receipt: null })
+      expect(out.eventsEmitted).toBe(1)
+      const m = await marks(c, [rent])
+      expect(m).toHaveLength(1)
+      expect([...m[0].attestation_evidence.payment_ids].sort()).toEqual([rent, water].sort())
+    })
+  })
+
+  it('a reopened row starts nothing; its bill is judged on its own records (paid again on its due day: on time)', async () => {
     await withRollback(async c => {
       const f = await household(c)
       const original = await settled(c, f, { status: 'returned' })
+      const inv = (await c.query<{ invoice_id: string; d: string }>(
+        `SELECT invoice_id, due_date::text AS d FROM payments WHERE id = $1`, [original])).rows[0]
       const reversal = (await c.query<{ id: string }>(
         `INSERT INTO payment_reversals (payment_id, reversal_type, reversed_amount, stripe_event_id, raw_event)
          VALUES ($1,'card_dispute',460,'evt_hook','{}'::jsonb) RETURNING id`, [original])).rows[0].id
-      const repaid = await settled(c, f, { reversalId: reversal })
+      const repaid = await settled(c, f, { reversalId: reversal, invoiceId: inv.invoice_id, due: inv.d })
       const out = await afterRowsSettled(c, [repaid], { attestationSource: 'stripe_attested', receipt: { method: 'card' } })
-      expect(out).toMatchObject({ billingActivated: 0, eventsEmitted: 0, settledIds: [repaid] })
-      expect(await marks(c, [repaid])).toEqual([])
+      expect(out).toMatchObject({ billingActivated: 0, eventsEmitted: 1, settledIds: [repaid] })
+      // The 'returned' original is left out of the bill; the reopened row carries it.
+      expect((await marks(c, [repaid])).map(m => [m.event_type, m.attestation_evidence.payment_ids]))
+        .toEqual([['payment_received_on_time', [repaid]]])
     })
   })
 
@@ -111,10 +142,10 @@ describe('S655 afterRowsSettled', () => {
       const m = await marks(c, [rent, water])
       expect(m.map(r => r.payment_id).sort()).toEqual([rent, water].sort())
 
-      // Whatever the first mark says (a late mark, a desk attestation), it stands.
+      // Replayed again (whatever the caller says now): the bills' marks stand, nothing is written.
       const again = await afterRowsSettled(c, [rent, water], { attestationSource: 'landlord_self_reported_with_evidence', receipt: null })
       expect(again).toMatchObject({ eventsEmitted: 0, alreadyMarked: [rent, water].sort() })
-      expect((await marks(c, [rent, water])).map(r => r.attestation_source)).toEqual(['stripe_attested', 'stripe_attested'])
+      expect((await marks(c, [rent, water])).map(r => r.id)).toEqual(m.map(r => r.id))
     })
   })
 
@@ -128,8 +159,7 @@ describe('S655 afterRowsSettled', () => {
 
       // undoDepositMatch: the line is owed again and its mark is withdrawn
       // (a mark pointing at itself, reason attestation_invalidated).
-      const first = (await c.query<{ id: string }>(
-        `SELECT id FROM credit_events WHERE event_data->>'payment_id' = $1`, [rent])).rows[0].id
+      const first = (await marks(c, [rent]))[0].id
       await supersedeEvent(c, first, first, 'attestation_invalidated')
       await c.query(`UPDATE payments SET status = 'pending', settled_at = NULL WHERE id = $1`, [rent])
 
@@ -138,12 +168,10 @@ describe('S655 afterRowsSettled', () => {
       const paid = await afterRowsSettled(c, [rent], { attestationSource: 'stripe_attested', receipt: null })
       expect(paid).toMatchObject({ eventsEmitted: 1, alreadyMarked: [] })
 
-      const live = await c.query(
-        `SELECT id, event_type FROM credit_events
-          WHERE event_data->>'payment_id' = $1 AND superseded_by IS NULL`, [rent])
-      expect(live.rows).toHaveLength(1)
-      expect(live.rows[0].id).not.toBe(first)
-      expect(live.rows[0].event_type).toBe('payment_received_on_time')
+      const live = await marks(c, [rent])
+      expect(live).toHaveLength(1)
+      expect(live[0].id).not.toBe(first)
+      expect(live[0].event_type).toBe('payment_received_on_time')
 
       // A replay after that still adds nothing.
       const replay = await afterRowsSettled(c, [rent], { attestationSource: 'stripe_attested', receipt: null })
@@ -193,7 +221,10 @@ describe('S655 afterRowsSettled', () => {
     })
   })
 
-  it('only a Stripe settle cites its intent; a row paid by credit never cites an old one', async () => {
+  // 10/12: a bill's mark is derived from the bill's records — it cites the bill
+  // and its lines, never a payment intent (an old, failed intent on a row the
+  // desk or credit paid cannot leak onto it).
+  it('a bill mark cites its bill and lines, never a payment intent', async () => {
     await withRollback(async c => {
       const f = await household(c)
       const byCard = await settled(c, f, { intent: 'pi_card' })
@@ -201,9 +232,11 @@ describe('S655 afterRowsSettled', () => {
       await afterRowsSettled(c, [byCard], { attestationSource: 'stripe_attested', receipt: null })
       await afterRowsSettled(c, [byCredit], { attestationSource: 'gam_workflow_auto', receipt: null })
       const m = Object.fromEntries((await marks(c, [byCard, byCredit])).map(r => [r.payment_id, r]))
-      expect(m[byCard].attestation_evidence).toEqual({ stripe_payment_intent_id: 'pi_card' })
-      expect(m[byCredit].attestation_source).toBe('gam_workflow_auto')
-      expect(m[byCredit].attestation_evidence).toEqual({})
+      for (const id of [byCard, byCredit]) {
+        expect(m[id].attestation_source).toBe('system_derived')
+        expect(m[id].attestation_evidence.payment_ids).toEqual([id])
+        expect(JSON.stringify(m[id].attestation_evidence)).not.toContain('pi_')
+      }
     })
   })
 

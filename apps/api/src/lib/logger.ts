@@ -137,6 +137,51 @@ type LooseLogger = {
 
 export const logger: LooseLogger = pinoLogger as unknown as LooseLogger
 
+/**
+ * 10/13 (Nic): "the invite link counts as proof of email" — a new team member
+ * who creates an account from the link is signed straight in (routes/scopes.ts,
+ * the accept). So since that answer, a live team-invitation token is a full
+ * sign-in for whoever holds it, for 24 hours. The token rides the path
+ * (/api/invitations/<token> and /api/invitations/<token>/accept), and every
+ * request line and every refused write was logged with its path, into files
+ * that are never deleted (S652, above). The path is written with the token
+ * replaced by ":token"; the method, status, time and request id stay, and the
+ * invitation's own events (platform_events: viewed, accepted) still say which
+ * one. Matched without regard to case, as Express routes it.
+ */
+const SECRET_IN_PATH: RegExp[] = [
+  /^(\/api\/invitations\/)[^/?#]+/i,
+]
+
+/** A request path as it may be written to the log: secrets in the path replaced. */
+export function redactLoggedUrl(url: string | undefined): string | undefined {
+  if (!url) return url
+  return SECRET_IN_PATH.reduce((out, re) => out.replace(re, '$1:token'), url)
+}
+
+/**
+ * pino-http's serializers (exported for logger.test.ts). pino-http hands `req`
+ * here already reduced by pino-std-serializers, so `url` is the full original
+ * path, mount prefix included. The per-request child logger (`req.log`) carries
+ * this same `req`, so every line it writes goes through here too.
+ */
+export const httpLogSerializers = {
+  req: (req: any) => ({
+    id:     req.id,
+    method: req.method,
+    url:    redactLoggedUrl(req.url),
+    // 10/15 (Nic), after a day spent asking which computer recorded two cash
+    // payments: "yes lets record devices so if a problem happens we can
+    // solve." Every request line now says where it came from.
+    ip:     req.raw?.ip ?? req.ip ?? undefined,
+    device: typeof req.headers?.['user-agent'] === 'string'
+      ? String(req.headers['user-agent']).slice(0, 180) : undefined,
+  }),
+  res: (res: any) => ({
+    statusCode: res.statusCode,
+  }),
+}
+
 // pino-http: per-request child logger + auto-summary on response end.
 // `genReqId` lets us either trust an upstream tracing header
 // (X-Request-Id) or mint our own UUID; either way the same id rides
@@ -157,15 +202,7 @@ export const httpLogger: HttpLogger = pinoHttp({
     if (res.statusCode >= 400) return 'warn'
     return 'info'
   },
-  // Trim the auto-summary to fields ops actually scan for.
-  serializers: {
-    req: (req) => ({
-      id:     req.id,
-      method: req.method,
-      url:    req.url,
-    }),
-    res: (res) => ({
-      statusCode: res.statusCode,
-    }),
-  },
+  // Trim the auto-summary to fields ops actually scan for (10/13: with
+  // secrets in the path replaced — redactLoggedUrl above).
+  serializers: httpLogSerializers,
 })

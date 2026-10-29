@@ -46,6 +46,7 @@ import {
 
 import { booksRouter } from './books'
 import { errorHandler } from '../middleware/errorHandler'
+import { expectNoFigures } from '../test/noLeaks'
 
 function buildApp() {
   const app = express()
@@ -101,9 +102,11 @@ async function seedPortfolio(): Promise<PortfolioFixture> {
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1, 'x', 'bookkeeper', 'Bk', 'A', TRUE) RETURNING id`,
       [`bk-${randomUUID()}@test.dev`])
+    // 10/11: every property ticked by hand. 10/12 (Nic): the company's Books
+    // reports are the company-wide box's, ticked for them.
     await client.query(
-      `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level)
-       VALUES ($1, $2, 'read_write')`, [bk.rows[0].id, aId])
+      `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level, property_ids, company_wide)
+       VALUES ($1, $2, 'read_write', $3, TRUE)`, [bk.rows[0].id, aId, [propAId]])
     // Seed one account of each type on landlord A so reports have rows.
     const acctRows = await client.query<{ id: string; type: string }>(
       `INSERT INTO books_accounts (landlord_id, code, name, type) VALUES
@@ -226,10 +229,12 @@ describe('GET /reports/pl', () => {
 describe('GET /reports/balance-sheet', () => {
   it('groups by asset/liability/equity; balances flag uses Assets = Liab + Equity', async () => {
     const f = await seedPortfolio()
-    // Manually set balances: 1000 asset, 400 liability, 600 equity → balanced.
+    // 10/11: balances are STORED as debits minus credits (what every posting
+    // writes), so a $400 liability and $600 of equity are stored as -400 and
+    // -600; the sheet shows each in its normal sign.
     await db.query(`UPDATE books_accounts SET balance=1000 WHERE id=$1`, [f.acctAssetA])
-    await db.query(`UPDATE books_accounts SET balance=400  WHERE id=$1`, [f.acctLiabilityA])
-    await db.query(`UPDATE books_accounts SET balance=600  WHERE id=$1`, [f.acctEquityA])
+    await db.query(`UPDATE books_accounts SET balance=-400 WHERE id=$1`, [f.acctLiabilityA])
+    await db.query(`UPDATE books_accounts SET balance=-600 WHERE id=$1`, [f.acctEquityA])
     const res = await request(buildApp())
       .get('/api/books/reports/balance-sheet')
       .set('Authorization', `Bearer ${f.landlordAToken}`)
@@ -243,7 +248,7 @@ describe('GET /reports/balance-sheet', () => {
   it('out-of-balance: balances=false', async () => {
     const f = await seedPortfolio()
     await db.query(`UPDATE books_accounts SET balance=1000 WHERE id=$1`, [f.acctAssetA])
-    await db.query(`UPDATE books_accounts SET balance=900  WHERE id=$1`, [f.acctLiabilityA])
+    await db.query(`UPDATE books_accounts SET balance=-900 WHERE id=$1`, [f.acctLiabilityA])
     // equity stays 0 → 1000 ≠ 900 + 0
     const res = await request(buildApp())
       .get('/api/books/reports/balance-sheet')
@@ -281,9 +286,15 @@ describe('GET /reports/cash-flow', () => {
       .set('Authorization', `Bearer ${f.landlordAToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.operating.inflows.rentCollected).toBe(1500)
-    expect(res.body.data.operating.inflows.otherIncome).toBe(200)
+    // 10/12 (Nic, L5): a landlord company's Books transactions move onto the
+    // one record the moment they are written (migration 20261014180300's
+    // window) — the money in is other income, the money out an expense paid
+    // that day — so they count on those lines, once, never on the old ones.
+    expect(res.body.data.operating.inflows.otherIncome).toBe(0)
+    expect(res.body.data.operating.inflows.filedOtherIncome).toBe(200)
     expect(res.body.data.operating.inflows.total).toBe(1700)
-    expect(res.body.data.operating.outflows.expenses).toBe(100)
+    expect(res.body.data.operating.outflows.expenses).toBe(0)
+    expect(res.body.data.operating.outflows.enteredExpenses).toBe(100)
     expect(res.body.data.operating.net).toBe(1600)  // 1700 - 100
     expect(res.body.data.netCashFlow).toBe(1600)  // no disbursements
   })
@@ -304,16 +315,29 @@ describe('GET /reports/cash-flow', () => {
   // range — or today, on the default range — dropped out of the outflows.
   it('a bill paid on the last day of the range counts; one paid the next day does not', async () => {
     const f = await seedPortfolio()
-    await db.query(
+    // 10/11: money out for bills is read from each payment's own row and day
+    // (books_bill_payments).
+    const bills = await db.query<{ id: string; description: string }>(
       `INSERT INTO books_bills (landlord_id, date, description, amount, amount_paid, status, paid_at) VALUES
         ($1, '2026-09-15', 'paid on the 30th', 400, 400, 'paid', '2026-09-30T15:00:00-07:00'),
-        ($1, '2026-09-15', 'paid on Oct 1',    90,  90,  'paid', '2026-10-01T09:00:00-07:00')`,
+        ($1, '2026-09-15', 'paid on Oct 1',    90,  90,  'paid', '2026-10-01T09:00:00-07:00')
+       RETURNING id, description`,
       [f.landlordAId])
+    const idOf = (d: string) => bills.rows.find(b => b.description === d)!.id
+    await db.query(
+      `INSERT INTO books_bill_payments (bill_id, landlord_id, paid_on, amount) VALUES
+        ($1, $3, '2026-09-30', 400),
+        ($2, $3, '2026-10-01', 90)`,
+      [idOf('paid on the 30th'), idOf('paid on Oct 1'), f.landlordAId])
     const res = await request(buildApp())
       .get('/api/books/reports/cash-flow?startDate=2026-09-01&endDate=2026-09-30')
       .set('Authorization', `Bearer ${f.landlordAToken}`)
     expect(res.status).toBe(200)
-    expect(res.body.data.operating.outflows.bills).toBe(400)
+    // 10/12 (Nic, L5; review): a landlord company's bill moves onto Expenses
+    // as it is written, and its payments with it, each on its own day — so
+    // Cash Flow counts it there, by the day it was paid, never twice.
+    expect(res.body.data.operating.outflows.bills).toBe(0)
+    expect(res.body.data.operating.outflows.enteredExpenses).toBe(400)
   })
 })
 
@@ -365,25 +389,34 @@ describe('GET /reports/owner-statements', () => {
 // ───────────────────────────────────────────────────────────────────
 
 describe('GET /tax/summary', () => {
-  it('rolls up YTD payroll + 1099 contractors + employees + filingDeadlines', async () => {
+  // 10/12 (Nic): "contractors get a 1099 box and their payments add up per
+  // calendar year" — the 1099 list is every vendor with the 1099 box paid in
+  // the year (the payments on its expenses), with that year's threshold.
+  it('rolls up YTD payroll + 1099 vendors (their payments in the year) + employees + filingDeadlines', async () => {
     const f = await seedPortfolio()
-    // Seed a contractor at $700 ytd (over $600 threshold for 1099).
-    await db.query(
-      `INSERT INTO books_contractors (landlord_id, first_name, last_name, ytd_paid, w9_on_file)
-       VALUES ($1, 'Joe', 'Plumber', 700, TRUE)`,
-      [f.landlordAId])
-    // And one under threshold — should NOT appear.
-    await db.query(
-      `INSERT INTO books_contractors (landlord_id, first_name, last_name, ytd_paid)
-       VALUES ($1, 'Lo', 'NoFile', 500)`,
-      [f.landlordAId])
+    const vendor = async (name: string, is1099: boolean) => (await db.query<{ id: string }>(
+      `INSERT INTO books_vendors (landlord_id, name, vendor_type, is_1099, w9_on_file)
+       VALUES ($1, $2, $3, $4, TRUE) RETURNING id`, [f.landlordAId, name, is1099 ? 'contractor' : 'utility', is1099])).rows[0].id
+    const pay = async (vendorId: string, amount: number, day: string) => {
+      const e = (await db.query<{ id: string }>(
+        `INSERT INTO landlord_expenses (landlord_id, category, amount, expense_date, vendor_id, payments_tracked)
+         VALUES ($1, 'repairs', $2, $3, $4, TRUE) RETURNING id`, [f.landlordAId, amount, day, vendorId])).rows[0].id
+      await db.query(
+        `INSERT INTO landlord_expense_payments (expense_id, landlord_id, paid_on, amount, method, source)
+         VALUES ($1, $2, $3, $4, 'check', 'payment')`, [e, f.landlordAId, day, amount])
+    }
+    const joe = await vendor('Joe Plumber', true)
+    await pay(joe, 2500, '2026-03-01')
+    await pay(await vendor('City Water', false), 900, '2026-03-01')       // no 1099 box: never listed
+    await pay(await vendor('Lo NoFile', true), 500, '2025-06-01')          // paid in another year
     const res = await request(buildApp())
       .get(`/api/books/tax/summary?year=2026`)
       .set('Authorization', `Bearer ${f.landlordAToken}`)
     expect(res.status).toBe(200)
     expect(Number(res.body.data.year)).toBe(2026)
+    expect(res.body.data.contractors1099Threshold).toBe(2000)
     expect(res.body.data.contractors1099).toHaveLength(1)
-    expect(res.body.data.contractors1099[0].first_name).toBe('Joe')
+    expect(res.body.data.contractors1099[0]).toMatchObject({ vendor_id: joe, name: 'Joe Plumber', reportable: 2500, needs_1099: true, w9_on_file: true })
     expect(Array.isArray(res.body.data.filingDeadlines)).toBe(true)
   })
 })
@@ -405,17 +438,39 @@ describe('GET /rent-roll', () => {
     expect(res.body.data.totalExpected).toBe(1500)
   })
 
-  // 10/11 (Nic): "maybe not even necessarily people's names." The rent roll is
-  // one row per tenant, so it is no longer a bookkeeper's (S387 had fixed it
-  // showing them an EMPTY roll; now it is refused in words). Money in by type
-  // is the Income page (routes/financials).
-  it('a bookkeeper with X-Client-Id is refused the rent roll (it names every tenant)', async () => {
+  // 10/11 (Nic): tenant NAMES are allowed wherever bookkeeping needs them, so
+  // the rent roll is a bookkeeper's again — with the tenant's contact and
+  // payment-account details left out (Books responses are not run through the
+  // person scrub, so the route leaves them out itself).
+  it('a bookkeeper with X-Client-Id sees the rent roll with names, and no email, phone, ACH or On-Time Pay', async () => {
     const f = await seedPortfolio()
+    const c = await db.connect()
+    try {
+      const lease = await seedLease(c, { unitId: f.unitAId, landlordId: f.landlordAId, rentAmount: 1500 })
+      await seedLeaseTenant(c, { leaseId: lease, tenantId: f.tenantAId })
+    } finally { c.release() }
+    const owner = await request(buildApp())
+      .get('/api/books/rent-roll')
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
     const res = await request(buildApp())
       .get('/api/books/rent-roll')
       .set('Authorization', `Bearer ${f.bkAToken}`)
       .set('X-Client-Id', f.landlordAId)
-    expect(res.status).toBe(403)
+    expect(res.status).toBe(200)
+    expect(res.body.data.units).toHaveLength(1)
+    const row = res.body.data.units[0]
+    expect(row.property_name).toBe('Test Property')
+    expect(Number(row.rent_amount)).toBe(1500)
+    // The tenant's name is what the owner sees; contact and account details are gone.
+    expect(owner.body.data.units[0].tenant_first).toBe('Test')
+    expect(owner.body.data.units[0].tenant_email).toMatch(/@/)
+    expect(row.tenant_first).toBe('Test')
+    expect(row.tenant_last).toBe('Tenant')
+    for (const k of ['tenant_email', 'ach_verified', 'on_time_pay_enrolled', 'on_time_pay_active']) {
+      expect(row).not.toHaveProperty(k)
+    }
+    expect(JSON.stringify(res.body)).not.toMatch(/@/)
+    expect(res.body.data.totalExpected).toBe(owner.body.data.totalExpected)
   })
 
   it('admin sees rent roll across all landlords', async () => {
@@ -577,9 +632,14 @@ describe('S655: Books money in, by the day it arrived', () => {
       .set('Authorization', `Bearer ${f.landlordAToken}`)).body.data
     expect(pl.gamRentIncome).toBe(920)
     expect(pl.meta.basis.basis).toBe('received')
-    const billed = (await request(buildApp()).get('/api/books/reports/pl?startDate=2026-10-01&endDate=2026-10-31&basis=billed')
+    // 10/12 (Nic): no switch — a stale ?basis= is ignored; October's bill is
+    // Charged, beside the $0 that arrived in October (it was paid ahead in September).
+    const oct2 = (await request(buildApp()).get('/api/books/reports/pl?startDate=2026-10-01&endDate=2026-10-31&basis=billed')
       .set('Authorization', `Bearer ${f.landlordAToken}`)).body.data
-    expect(billed.gamRentIncome).toBe(460)
+    expect(oct2.meta.basis.basis).toBe('received')
+    expect(oct2.gamRentIncome).toBe(0)
+    expect(oct2.gamPL.view).toMatchObject({ received: 0, charged: 460, owed: 0 })
+    expect(oct2.gamPL.nets.received).toBe(Math.round((0 - oct2.gamPL.expenses.total) * 100) / 100)
   })
 
   it('rent roll ignores paid future months', async () => {
@@ -593,17 +653,21 @@ describe('S655: Books money in, by the day it arrived', () => {
        VALUES ($1,$2,$3,'rent',1500,'settled','RENT',$4::date,now()),
               ($1,$2,$3,'rent',1500,'settled','RENT',$5::date,now())`,
       [f.unitAId, f.tenantAId, f.landlordAId, d, next])
+    // 10/12 (Nic): Received, Charged and Owed side by side; a stale ?basis= is ignored.
     for (const basis of ['received', 'billed']) {
       const res = await request(buildApp()).get(`/api/books/rent-roll?basis=${basis}`)
         .set('Authorization', `Bearer ${f.landlordAToken}`)
       expect(res.status).toBe(200)
       expect(Number(res.body.data.units[0].collected_mtd)).toBe(1500)
+      expect(Number(res.body.data.units[0].charged_mtd)).toBe(1500)
+      expect(Number(res.body.data.units[0].owed_mtd)).toBe(0)
       expect(res.body.data.totalCollected).toBe(1500)
-      expect(res.body.data.meta.basis.basis).toBe(basis)
+      expect(res.body.data).toMatchObject({ totalReceived: 1500, totalCharged: 1500, totalOwed: 0 })
+      expect(res.body.data.meta.basis.basis).toBe('received')
     }
   })
 
-  it('owner statements follow the switch: a bill paid late counts where the basis puts it', async () => {
+  it('owner statements: Received by the day it arrived, Charged in the month it was due — side by side', async () => {
     const f = await seedPortfolio()
     // August's rent paid Sept 2.
     await db.query(
@@ -615,9 +679,13 @@ describe('S655: Books money in, by the day it arrived', () => {
       .set('Authorization', `Bearer ${f.landlordAToken}`)).body
     expect((await st('received', '2026-09-01', '2026-09-30')).data[0].totalCollected).toBe(1500)
     expect((await st('received', '2026-08-01', '2026-08-31')).data[0].totalCollected).toBe(0)
-    const billedAug = await st('billed', '2026-08-01', '2026-08-31')
-    expect(billedAug.data[0].totalCollected).toBe(1500)
-    expect(billedAug.meta.basis.label).toBe('Money billed')
+    // 10/12 (Nic): no switch — a stale ?basis= is ignored; August's bill is Charged in August.
+    const aug = await st('billed', '2026-08-01', '2026-08-31')
+    expect(aug.data[0]).toMatchObject({ totalCollected: 0, totalReceived: 0, totalCharged: 1500, totalOwed: 0 })
+    expect(aug.data[0].properties.find((p: any) => Number(p.charged) === 1500)).toBeTruthy()
+    expect(aug.meta.basis.label).toBe('Money received')
+    const sep = await st('received', '2026-09-01', '2026-09-30')
+    expect(sep.data[0]).toMatchObject({ totalReceived: 1500, totalCharged: 0 })
   })
 
   // A move-out on Oct 15: $200 of rent swept to the $400 deposit and $100 of
@@ -789,7 +857,7 @@ describe('S655: Books and a team member assigned to some properties (gam-audienc
       const refused = await pm(path)
       expect(refused.status).toBe(403)
       expect(refused.body.error).toMatch(/covers the whole company.*Ask the owner/)
-      expect(JSON.stringify(refused.body)).not.toMatch(/700|1000/)
+      expectNoFigures(refused.body, [700, 1000])
     }
     // The rent roll: park 2's unit and money only — no park-1 unit, tenant or email.
     const roll = (await pm('/api/books/rent-roll')).body.data

@@ -22,7 +22,7 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync, readdirSync, statSync } from 'fs'
 import { join } from 'path'
-import { PROCESSING_FEES, CARD_DECLINE_FEE, INCOME_BASIS_LABEL } from '@gam/shared'
+import { PROCESSING_FEES, CARD_DECLINE_FEE, INCOME_BASIS_LABEL, MONEY_COLUMNS, MONEY_COLUMN_LABEL } from '@gam/shared'
 
 const ROOT = join(__dirname, 'knowledge-content')
 
@@ -229,10 +229,13 @@ describe('S655 credit is described the way it works', () => {
     expect(article('tenant/how-payments-are-applied.md')).toMatch(/Saved credit doesn't stop a late fee unless it covers the whole bill/)
   })
 
-  it('the profit-and-loss article names both bases in the screens\' own words and never counts a credit as income', () => {
+  it('the profit-and-loss article names the three columns in the screens\' own words, no switch, and never counts a credit as income', () => {
     const text = article('landlord/expenses-and-your-profit-and-loss.md')
-    expect(text).toContain(`**${INCOME_BASIS_LABEL.received}**`)
-    expect(text).toContain(`**${INCOME_BASIS_LABEL.billed}**`)
+    // 10/12 (Nic): no Money received / Money billed switch anywhere — Received,
+    // Charged and Owed side by side, Received first (MONEY_COLUMNS).
+    for (const k of MONEY_COLUMNS) expect(text).toContain(`**${MONEY_COLUMN_LABEL[k]}**`)
+    expect(text).not.toContain(INCOME_BASIS_LABEL.billed)
+    expect(text).toMatch(/There is no switch/)
     expect(text).toMatch(/a credit you give is never income/i)
     // Money received is the day the money arrived (owner correction, 10/2).
     expect(text).toMatch(/counts money on the day it arrived/)
@@ -243,20 +246,29 @@ describe('S655 credit is described the way it works', () => {
     expect(article('tenant/updating-your-payment-method.md')).toMatch(/Adding a bank account never removes the one you already have/)
   })
 
-  it('names both deposits GAM settles by itself — a confirmed report and an unreported whole bill — and the Undo', () => {
-    // bankFeed.decideDeposit: 'declared' (a report the bank confirms) and
-    // 'auto_settle' (bankDepositMatch.isAutoSettleable: exactly one tenant's
-    // whole bill, nothing rival). Both write bank_transactions.auto_settle_undo,
-    // and bankDepositConfirm.undoDepositMatch undoes either from the Bank feed.
+  it('says no tenant deposit settles rent by itself — a report, a whole bill, a payout the memo does not name — with the Undo', () => {
+    // bankFeed.decideDeposit, 10/14 (Nic, answer 16 confirmed: "Exact matches
+    // file themselves (GAM payouts, front-desk-logged deposits for the exact
+    // amount); anything that would be a guess asks"): a tenant's report, a whole
+    // bill to the cent, a named check, the office's cash worked out, a payer
+    // filed before and a payout whose memo does not name GAM are all picked or
+    // offered for a person to confirm. bankDepositConfirm.undoDepositMatch undoes a match.
     const text = article('landlord/matching-cash-deposits-to-rent.md')
+    expect(text).not.toMatch(/There are two cases GAM settles without asking/)
     expect(text).not.toMatch(/There is one case GAM settles without asking/)
-    expect(text).toMatch(/There are two cases GAM settles without asking/)
-    expect(text).toMatch(/The tenant reported the deposit themselves, the bank confirms it/)
-    expect(text).toMatch(/A deposit equal to the cent to everything one tenant owes you/)
-    expect(text).toMatch(/no other deposit of the same amount came in within a few days/)
-    expect(text).toMatch(/A payout from a payment company that happens to match is never taken as rent/)
-    expect(text).toMatch(/The tenant and you are both told/)
+    expect(text).toMatch(/GAM never settles a tenant's rent from a bank deposit without asking — \*\*not even when the tenant reported it\.\*\*/)
+    expect(text).toMatch(/their report is picked for you on the review: one press confirms it/)
+    expect(text).toMatch(/an amount that happens to match is never taken as rent by itself/)
+    expect(text).toMatch(/its own payouts when your bank's line names GAM/)
     expect(text).toMatch(/press \*\*Undo this match\*\* on the deposit under \*\*Bank → Bank feed\*\*/)
+    // 10/14 (Nic, answer 15): a check returned out of a matched deposit, by
+    // itself only when certain; otherwise the owner picks it, and either is undone.
+    expect(text).toMatch(/GAM takes that check back by itself: the bills it paid are owed again/)
+    expect(text).toMatch(/pick the check with \*\*This one bounced\*\*/)
+    expect(text).toMatch(/A card chargeback or an ACH return is never read as a bounced check/)
+    for (const path of ['tenant/paying-rent.md', 'tenant/checking-what-you-owe.md']) {
+      expect(article(path), path).not.toMatch(/we apply it automatically when the deposit shows up/)
+    }
   })
 
   it('a bank a payment is still clearing from, or is set to be tried again from, is never said to be removable', () => {
@@ -265,5 +277,59 @@ describe('S655 credit is described the way it works', () => {
     expect(text).toMatch(/A bank can't be removed while a payment from it is still clearing \(about 4 business days\) or is set to be tried again from it — even if another bank is verified/)
     // onlyVerifiedBankBlock: FlexPay keeps the only verified bank too (decisions #34(a)(b)).
     expect(text).toMatch(/only verified bank[^.]*\. The same goes while you're on FlexPay or a FlexPay payment is still owed/)
+  })
+})
+
+/**
+ * 10/20 (Nic): "There should be no state law warnings anywhere in the system.
+ * At least not right now. Just hide all that stuff."
+ *
+ * The articles were the one state-law surface no test could reach. They are
+ * ingested into agent_knowledge_chunks, which the test DB keeps between runs
+ * (CLEANUP_KEEPS in test/dbHelpers), so a sentence promising a warning sits in
+ * the retrieval corpus and every suite still passes. The landlord entry-request
+ * article promised exactly that -- "GAM surfaces general warnings" -- in the
+ * area the warning had just been taken out of, which is two wrong answers in
+ * one sentence: a landlord waits for a banner that will never appear, and GAM
+ * has volunteered that it holds a view on his notice period.
+ *
+ * Switching the warnings back on is one row and no deploy, so this guards the
+ * CLAIM, not the flag: an article may say what the law depends on and tell the
+ * reader to go read it, and must not say GAM reads it for them.
+ */
+describe('the knowledge base never promises a state-law warning', () => {
+  const LAW = /\b(local|state)\s+(law|laws|rule|rules)\b|\bstatut/i
+  /** GAM as the one doing the warning/flagging/comparing -- not "check your
+   *  local laws", which is the reader's job and stays. */
+  const GAM_WEIGHS_IN = new RegExp(
+    [
+      String.raw`\b(GAM|we)\b[^.]{0,80}?\b(warns?|warning|warnings|flags?|flagged|alerts?|surfaces?)\b`,
+      String.raw`\b(GAM|we)\b[^.]{0,80}?\b(checks?|compares?|measures?)\b[^.]{0,40}?\bagainst\b`,
+      String.raw`\b(warns?|warning|warnings|flags?|alerts?)\b[^.]{0,40}?\byour (local|state)\b`,
+    ].join('|'),
+    'i',
+  )
+
+  it('no article says GAM warns, flags or weighs anything against local or state law', () => {
+    const offenders = ARTICLES.flatMap((a) =>
+      a.text.split(/(?<=[.!?])\s+|\n/)
+        .map((s) => s.trim())
+        .filter((s) => LAW.test(s) && GAM_WEIGHS_IN.test(s))
+        .map((s) => `${a.path}: ${s.slice(0, 140)}`))
+    expect(offenders, offenders.join('\n')).toEqual([])
+  })
+
+  it('would catch the sentence that was there, so this is not a regex that passes on anything', () => {
+    const was = 'How much notice is required, and your rights around entry, depend on your local law \u2014 GAM surfaces general warnings, but check your local rules for your property.'
+    expect(LAW.test(was) && GAM_WEIGHS_IN.test(was)).toBe(true)
+  })
+
+  it('still tells a landlord the entry-notice period is his local law to read', () => {
+    // The inverse risk: scrubbing the sentence until the article stops saying
+    // the thing that IS true, and the agent answers an entry-notice question
+    // with nothing at all.
+    const text = ARTICLES.find((a) => a.path === 'landlord/entry-requests-and-notice.md')!.text
+    expect(text).toMatch(/depend on your local law/)
+    expect(text).toMatch(/leaves the law itself to you/)
   })
 })

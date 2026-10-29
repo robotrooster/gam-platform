@@ -34,10 +34,9 @@
 //   await after.afterCommit()
 
 import type { PoolClient } from 'pg'
-import { CREDIT_EVENT_TYPES } from '@gam/shared'
 import type { CreditAttestationSource } from '@gam/shared'
 import { activateBillingForSettledPayments } from './billingActivation'
-import { emitPaymentSettledEvent } from './creditLedgerEmitters'
+import { syncBillMarksAfterSettle, billKeysOfPayments } from './creditLedgerEmitters'
 import type { ReceiptOpts } from './paymentReceipt'
 import { logger } from '../lib/logger'
 
@@ -59,9 +58,9 @@ export interface AfterRowsSettledContext {
   receipt: Omit<ReceiptOpts, 'paymentIds'> | null
   /**
    * 10/5 (Nic): rows the caller paid only IN PART (a part payment recorded at
-   * the desk; the rest stays open on its own row). They settle, but carry no
-   * on-time or late mark: a bill's mark is for the day it is paid in full,
-   * which is when its rest is paid.
+   * the desk; the rest stays open on its own row). 10/12: no longer read — the
+   * bill's one mark comes from its records (a bill part paid is judged a
+   * partly-paid bill, and only once past grace); kept so callers need not change.
    */
   partPaidIds?: readonly string[]
   /**
@@ -76,6 +75,10 @@ export interface AfterRowsSettledContext {
    * to just waive the late fee and still show that they paid late."
    */
   bankValidated?: boolean
+  // 10/12: attestationSource and attestationEvidence are no longer read for
+  // the payment history: a bill's mark is derived from its records
+  // ('system_derived'). bankValidated still is: the bank's day is the rows'
+  // settled day before the match writes its allocation rows.
 }
 
 export interface AfterRowsSettledResult {
@@ -83,16 +86,18 @@ export interface AfterRowsSettledResult {
   settledIds: string[]
   /** Landlords whose billing this settle started (10/5: their first money through GAM, any kind). */
   billingActivated: number
-  /** payment_received_* marks written (rent and utility rows, reopened rows excluded). */
+  /** 10/12: bill marks written (one per bill whose mark was written or corrected). */
   eventsEmitted: number
-  /** Rows passed in that already carried their payment mark (a replay); none was written again. */
+  /** 10/12: rows on bills whose mark was already right (a replay, a bill not judged yet); nothing written for them. */
   alreadyMarked: string[]
-  /** Call once after COMMIT: sends the receipt. Never throws. Not calling it means no receipt. */
+  /**
+   * Call once after COMMIT: sends the receipt, and (10/12, GAM Books ledger)
+   * posts this settle to the books right away instead of at the next minute's
+   * drain. Never throws. Not calling it means no receipt; the books still post
+   * within the minute.
+   */
   afterCommit: () => Promise<void>
 }
-
-/** The payment-history marks a settled rent or utility row can carry (one per row). */
-const PAYMENT_MARK_TYPES: readonly string[] = CREDIT_EVENT_TYPES.filter(t => t.startsWith('payment_received_'))
 
 /**
  * Run the post-settle steps for rows the caller just settled in this
@@ -103,17 +108,12 @@ const PAYMENT_MARK_TYPES: readonly string[] = CREDIT_EVENT_TYPES.filter(t => t.s
  *      doesn't have free onboarding"). Reopened rows are skipped: their
  *      landlord went live when the original row settled. So is a row paid
  *      wholly by account credit (no new money). Starts a landlord only once.
- *   2. emitPaymentSettledEvent for each rent and utility row with a tenant: the
- *      on-time / late mark (S652), on the property's calendar, with the
- *      attestation the caller names. Reopened rows (paid again after a dispute
- *      or return) are skipped: a re-payment is not a fresh on-time signal. A
- *      row that already carries a mark is skipped too (a replay), whatever
- *      became of that mark since: a mark an admin later corrected stays
- *      corrected. 10/6 (Nic): a row whose bill has a late fee on it is
- *      marked LATE, from the day this runs (the day GAM recorded it), onboarding
- *      month or not — except a row a matched BANK LINE paid
- *      (ctx.bankValidated): it counts from the bank's day, and only a late fee
- *      charged by that day makes it late.
+ *   2. the payment history (10/12, Nic: "one mark per invoice"): the bills
+ *      the rows are on are judged by the payment-health rule and each bill's
+ *      one mark brought to it (services/creditBillMarks). A replay writes
+ *      nothing (the bill's mark is already right); a mark an admin corrected
+ *      after a dispute stays corrected. The rule reads the bill's records:
+ *      the attestation the caller names is no longer used for it.
  *   3. the receipt, queued for afterCommit().
  * Ids that are not settled (or do not exist) are ignored and logged. The rows
  * are locked, so two replays of one settle cannot both find no mark.
@@ -154,94 +154,54 @@ export async function afterRowsSettled(
   // 10/5 (Nic): "money movement is the end of onboarding" — every type.
   const billingActivated = await activateBillingForSettledPayments(client, fresh.map(r => r.id))
 
-  const partPaid = new Set(ctx.partPaidIds ?? [])
-  const markable = fresh.filter(r => r.tenant_id && r.due_date && (r.type === 'rent' || r.type === 'utility')
-    && !partPaid.has(r.id))
-  // Each of the row's marks is followed to the end of its correction chain
-  // (superseded_by). The row is marked unless every chain ends in a mark
-  // withdrawn as no longer vouched for (it points at itself,
-  // 'attestation_invalidated' — an undone bank match): then the line paid
-  // again earns its own mark. A chain ending in a live mark, or in one an
-  // admin corrected away, still counts (a corrected mark stays corrected).
-  const marked = new Set(markable.length === 0 ? [] : (await client.query<{ payment_id: string }>(
-    `WITH RECURSIVE chain AS (
-       SELECT e.id AS cur, e.superseded_by, e.superseded_reason, e.event_data->>'payment_id' AS payment_id, 0 AS hops
-         FROM credit_events e
-        WHERE e.event_type = ANY($1::text[])
-          AND e.event_data->>'payment_id' = ANY($2::text[])
-       UNION ALL
-       SELECT n.id, n.superseded_by, n.superseded_reason, c.payment_id, c.hops + 1
-         FROM chain c JOIN credit_events n ON n.id = c.superseded_by
-        WHERE c.superseded_by IS NOT NULL AND c.superseded_by <> c.cur AND c.hops < 20
-     )
-     SELECT DISTINCT payment_id FROM chain
-      WHERE superseded_by IS NULL
-         OR (superseded_by = cur AND superseded_reason IS DISTINCT FROM 'attestation_invalidated')`,
-    [PAYMENT_MARK_TYPES, markable.map(r => r.id)])).rows.map(r => r.payment_id))
-  const alreadyMarked = markable.filter(r => marked.has(r.id)).map(r => r.id)
-  if (alreadyMarked.length > 0) {
-    logger.warn({ alreadyMarked }, '[afterRowsSettled] rows already carry their payment mark; not marked again')
-  }
-
-  // 10/6 (Nic): "the late payment still shows on their payment history" — no
-  // exceptions. A bill with a late fee on it (charged and not deleted: one
-  // credited because the money turns out to have been in the bank still
-  // counts) gets a LATE mark for its rent and utility, counted from the day
-  // the payment was recorded or confirmed in GAM, never from an earlier date
-  // the record carries (a bank deposit's date) — whether or not the tenant
-  // reported it first, onboarding month or not (creditLedgerEmitters). Only the
-  // landlord deleting the late fee, in the onboarding month, lifts it
-  // (services/lateFeeDelete → reRateMarksWithoutLateFee).
-  const toMark = markable.filter(r => !marked.has(r.id))
-  // 10/6: bank-validated — only a fee charged on or before the day the bank
-  // shows the money (the row's settled day, on the property's calendar) was
-  // owed; one charged after it was never owed (taken off, or refunded as
-  // credit when it was already paid) and says nothing about lateness.
-  const withLateFee = new Set(toMark.length === 0 ? [] : (await client.query<{ id: string }>(
-    `SELECT p.id FROM payments p
-       LEFT JOIN units u ON u.id = p.unit_id
-       LEFT JOIN properties pr ON pr.id = u.property_id
-      WHERE p.id = ANY($1::uuid[]) AND p.invoice_id IS NOT NULL
-        AND EXISTS (SELECT 1 FROM payments f
-                     WHERE f.invoice_id = p.invoice_id AND f.type = 'late_fee'
-                       AND f.amount > 0 AND f.status <> 'voided'
-                       AND (NOT $2::boolean
-                            OR f.due_date <= (COALESCE(p.settled_at, now()) AT TIME ZONE COALESCE(pr.timezone, 'America/Phoenix'))::date))`,
-    [toMark.map(r => r.id), ctx.bankValidated === true])).rows.map(r => r.id))
-  const recordedAt = new Date()
-
-  let eventsEmitted = 0
-  for (const r of markable) {
-    if (marked.has(r.id) || !r.tenant_id || !r.due_date || (r.type !== 'rent' && r.type !== 'utility')) continue
-    const settledAt = r.settled_at ? new Date(r.settled_at) : recordedAt
-    const lateFeeOnBill = withLateFee.has(r.id)
-    // Logged by hand: late from the day GAM recorded it. Bank-validated: from the bank's day.
-    const forced = lateFeeOnBill && !ctx.bankValidated && settledAt < recordedAt
-    await emitPaymentSettledEvent(client, {
-      tenantId:              r.tenant_id,
-      paymentId:             r.id,
-      paymentType:           r.type,
-      amount:                r.amount,
-      dueDate:               r.due_date,
-      settledAt:             forced ? recordedAt : settledAt,
-      lateFeeOnBill,
-      moneyPaidAt:           forced ? settledAt : null,
-      bankValidated:         ctx.bankValidated === true,
-      graceDays:             r.late_fee_grace_days,
-      // Only a Stripe settle vouches with its intent; a row an old, failed
-      // intent once touched must not cite it when the desk or credit paid it.
-      stripePaymentIntentId: ctx.attestationSource === 'stripe_attested' ? r.stripe_payment_intent_id : null,
-      propertyTz:            r.property_tz,
-      attestationSource:     ctx.attestationSource,
-      attestationEvidence:   ctx.attestationEvidence,
-    })
-    eventsEmitted++
-  }
+  // 10/12 (Nic): "the payment history should be a health percentage. one mark
+  // per invoice." The rows' BILLS are judged — once, together — by the
+  // payment-health rule, and each bill's one mark brought to what the rule
+  // gives it (creditLedgerEmitters.syncBillMarksAfterSettle →
+  // services/creditBillMarks), in this transaction: the mark moves with the
+  // money. Every settled row counts, whatever its kind, a part payment and a
+  // reopened row included — the bill's own records decide (a part payment past
+  // grace is a partly-paid bill; a re-payment after a bounce is that bill paid
+  // late or on time). A replay finds its bill's mark already right and writes
+  // nothing. The day each line counts from, the onboarding month, a bank
+  // match, a late fee on the bill — 10/6: a line logged by hand after a late
+  // fee was charged counts from the day GAM recorded it, a bank line's day
+  // decides when one is matched — all live in that rule now.
+  const changes = await syncBillMarksAfterSettle(client, rows.map(r => r.id), { bankValidated: ctx.bankValidated === true })
+  const eventsEmitted = changes.filter(c => c.eventId !== null).length
+  const changedBills = new Set(changes.map(c => c.billKey))
+  const billOf = rows.length === 0 ? new Map<string, string>() : await billKeysOfPayments(client, rows.map(r => r.id))
+  const alreadyMarked = [...billOf].filter(([, k]) => !changedBills.has(k)).map(([id]) => id).sort()
 
   const settledIds = rows.map(r => r.id)
   const receipt = ctx.receipt
+
+  // 10/12 (Nic, ledger L1): the books post "within a minute" of the money
+  // event. The minute drain always gets there; once this settle commits, the
+  // kick posts its sources at once (gam-ledger-design-2026-10-12 §3). It needs
+  // this transaction's id, read here — but only while the ledger posts anything
+  // at all: dark (no projector registered) means no extra query in the money
+  // transaction. A load failure only skips the kick.
+  let ledgerXid: string | null = null
+  if (settledIds.length > 0) {
+    let posting = false
+    try {
+      posting = (await import('./ledgerEngine')).registeredLedgerSourceTypes().length > 0
+    } catch { /* the minute drain posts it */ }
+    if (posting) {
+      ledgerXid = (await client.query<{ xid: string }>(`SELECT pg_current_xact_id()::text AS xid`)).rows[0]?.xid ?? null
+    }
+  }
+
   let sent = false
+  let kicked = false
   const afterCommit = async (): Promise<void> => {
+    if (ledgerXid && !kicked) {
+      kicked = true
+      const xid = ledgerXid
+      // Not awaited: the books never hold up the caller's response.
+      void import('./ledgerEngine').then(m => m.kickLedgerAfterCommit(xid)).catch(() => {})
+    }
     if (sent || !receipt || settledIds.length === 0) return
     sent = true
     try {

@@ -7,11 +7,13 @@ import {
   FLEXPAY_PULL_MAX_RETRIES,
   PAYMENT_ENTRY_DESCRIPTION_LABELS,
   PLATFORM_FEES,
+  benefitWednesdayForPullDay,
   UTILITY_TYPE_LABEL,
   type PaymentEntryDescription,
   type UtilityType,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
+import { AppError } from '../middleware/errorHandler'
 import { isFeatureEnabled } from './systemFeatures'
 import { getStripe } from '../lib/stripe'
 import { createRentPlatformCharge } from './stripeConnect'
@@ -37,6 +39,7 @@ import { recordPlatformRevenue } from './platformRevenue'
 import { extractReturnCode, decideRetry, bankRefusedDebit } from './achRetry'
 import { logger } from '../lib/logger'
 import { dateIn, monthStartOf } from '../lib/timezone'
+import { graceDaysSql } from './lateness'
 
 // ============================================================
 // FlexPay — tenant-paid payment-scheduling subscription.
@@ -175,7 +178,6 @@ export const FLEXPAY_REHAB_CLEAN_PULLS = 12
  * tenant at cost with no markup (FlexPay terms § 4.2). One source: the terms.
  */
 export const FLEXPAY_ACH_RETURN_FEE = FLEXPAY_RETURNED_PULL_FEE
-export const FLEXPAY_DEFAULT_GRACE_DAYS = 5  // when lease.late_fee_grace_days is NULL (same as lateFees.ts)
 /** Runs that may fail to create the pull intent before the advance is defaulted. */
 export const FLEXPAY_MAX_PULL_CREATE_ATTEMPTS = 3
 /**
@@ -311,6 +313,92 @@ const FORBIDDEN_DAY_REASON =
  * `pullDay` is still validated (1..28, a real scheduling choice), but the
  * price never depends on it.
  */
+/**
+ * THE FEE COMES FROM THE PRICE TABLE (10/26, Nic: "you need to make the live
+ * feed according to the table. But you need to not show the table.").
+ *
+ * It is priced on TWO things: how much GAM is actually fronting this cycle,
+ * and which benefit Wednesday the resident's money lands on. Utilities billed
+ * back ride the bill, so the amount fronted is the whole bill and not just the
+ * rent — that is the money that is out, and it is what GAM is paid for.
+ *
+ * NO COVERAGE AT OR ABOVE $3,000: there is no bracket up there, so this
+ * returns null. A null is an ERROR for the caller to surface, NEVER a zero —
+ * "not offered" must not degrade into "free". Every caller here throws on it.
+ *
+ * Replaces the flat $25 (FLEXPAY_MONTHLY_FEE), which stays exported only for
+ * the historical advances already written against it.
+ */
+export async function quoteFlexPayCycleFee(
+  amountFronted: number, pullDay: number, asOf: string,
+): Promise<number | null> {
+  if (!Number.isInteger(pullDay) || pullDay < 1 || pullDay > FLEXPAY_MAX_PULL_DAY) {
+    throw new Error(`pullDay must be an integer 1..${FLEXPAY_MAX_PULL_DAY}`)
+  }
+  const wed = benefitWednesdayForPullDay(pullDay)
+  if (wed === null) return null
+  const { quoteFlexPayFee } = await import('./flexFees')
+  const q = await quoteFlexPayFee(amountFronted, wed, asOf)
+  return q ? q.fee : null
+}
+
+/**
+ * What FlexPay would front for this resident if a cover ran now: every open
+ * bill line it covers, across their active leases. Used to PRICE the quote and
+ * the terms preview, so the figure a resident is shown is the same figure the
+ * charge will use (coverLineSql is the cover's own predicate).
+ *
+ * 0 when they have no open bill — the caller decides what to say; there is no
+ * price for a bill that does not exist.
+ */
+export async function flexPayAmountToFront(tenantId: string): Promise<number> {
+  const rows = await query<{ total: string }>(
+    `SELECT COALESCE(SUM(p.amount), 0)::text AS total
+       FROM payments p
+       JOIN invoices i ON i.id = p.invoice_id
+       JOIN leases l ON l.id = i.lease_id
+      WHERE i.tenant_id = $1
+        AND l.status = 'active'
+        AND ${coverLineSql('p')}`,
+    [tenantId])
+  const open = round2(Number(rows[0]?.total ?? 0))
+  if (open > 0) return open
+
+  // 10/26: NO OPEN BILL YET — PRICE OFF THE RENT, NOT OFF ZERO.
+  //
+  // Somebody enrolls between bills, so there is often nothing open to measure.
+  // Zero fronted falls into the cheapest bracket, which quoted them the floor
+  // price and then charged a higher one the first time a real bill was
+  // covered — and that figure went into the Subscription Terms they SIGNED.
+  //
+  // Their lease rent is the honest stand-in: it is the bulk of what FlexPay
+  // will front, it is a real number about them, and it never understates the
+  // way zero does. The monthly charge is still priced on what is actually
+  // fronted that cycle (utilities included), which is why § 3 of the terms
+  // says the tier follows the size of the bill.
+  const rent = await query<{ rent: string }>(
+    `SELECT COALESCE(MAX(l.rent_amount), 0)::text AS rent
+       FROM leases l
+       JOIN lease_tenants lt ON lt.lease_id = l.id
+      WHERE lt.tenant_id = $1 AND l.status = 'active'`,
+    [tenantId])
+  return round2(Number(rent[0]?.rent ?? 0))
+}
+
+/** The same, refusing instead of returning null — for the paths that charge. */
+export async function requireFlexPayCycleFee(
+  amountFronted: number, pullDay: number, asOf: string,
+): Promise<number> {
+  const fee = await quoteFlexPayCycleFee(amountFronted, pullDay, asOf)
+  if (fee === null) {
+    throw new AppError(409,
+      `FlexPay is not offered on a bill of ${money(amountFronted)}. `
+      + `It covers bills under $3,000.`)
+  }
+  return fee
+}
+
+/** @deprecated 10/26 — the flat $25. Use requireFlexPayCycleFee. */
 export function calculateFlexPayFee(pullDay: number): number {
   if (!Number.isInteger(pullDay) || pullDay < 1 || pullDay > FLEXPAY_MAX_PULL_DAY) {
     throw new Error(`pullDay must be an integer 1..${FLEXPAY_MAX_PULL_DAY}`)
@@ -509,6 +597,7 @@ export async function getFlexPayEligibility(tenantId: string): Promise<FlexPayEl
       WHERE tenant_id = $1
         AND flex_deposit_enabled = TRUE
         AND flex_deposit_plan_status = 'active'
+        AND status <> 'voided'
       LIMIT 1`,
     [tenantId],
   )
@@ -596,7 +685,15 @@ export async function enrollFlexPay(args: {
     return { ok: false, reason: flexPayBlockerReasons(elig).join(' ') }
   }
 
-  const fee = calculateFlexPayFee(args.pullDay)
+  // 10/26: the price from the TABLE, on what FlexPay would front for this
+  // resident and the benefit Wednesday their pull day falls in. The terms they
+  // accept must state the price they will actually be charged — this used to
+  // render the flat $25 while GET /flexpay/terms previewed the grid price, so
+  // a resident could read one figure and sign another. A bill with no bracket
+  // refuses the enrollment rather than signing a price that does not exist.
+  const fee = await requireFlexPayCycleFee(
+    await flexPayAmountToFront(args.tenantId), args.pullDay,
+    new Date().toISOString().slice(0, 10))
 
   // Render the populated Subscription Terms BEFORE opening the tx so
   // any data-lookup failure aborts early without holding row locks.
@@ -726,10 +823,16 @@ export interface ChangePullDayResult {
  */
 export async function changeFlexPayPullDay(tenantId: string, newPullDay: number): Promise<ChangePullDayResult> {
   if (!await isFlexPayVisible()) return { ok: false, reason: 'FlexPay is not enabled on this platform' }
-  // Validates the 1..28 integer range (throws otherwise) and gives the new fee.
+  // 10/26: moving the pull day CAN change the price, because the benefit
+  // Wednesday is part of it — the comment above used to say the day never
+  // changes the price, which was true of the flat $25 and is not true now.
+  // Validates the 1..28 range (throws otherwise) and prices the new day.
   let fee: number
-  try { fee = calculateFlexPayFee(newPullDay) }
-  catch (e: any) { return { ok: false, reason: e?.message ?? 'Invalid pull day' } }
+  try {
+    fee = await requireFlexPayCycleFee(
+      await flexPayAmountToFront(tenantId), newPullDay,
+      new Date().toISOString().slice(0, 10))
+  } catch (e: any) { return { ok: false, reason: e?.message ?? 'Invalid pull day' } }
   if (!isAllowedFlexPayPullDay(newPullDay)) return { ok: false, reason: FORBIDDEN_DAY_REASON }
 
   const updated = await query<{ id: string }>(
@@ -819,7 +922,13 @@ export async function coverFlexPayCycle(now: Date = new Date()): Promise<CoverRe
   }
   if (!(await isFlexPayVisible())) return out
 
-  // Grace is the late-fee engine's own: COALESCE(lease grace, 5). The opening
+  // Grace is the late-fee engine's own: the lease's, else the property's,
+  // else 5 (10/12, Nic: "Grace = lease, else property, else 5 — the only
+  // chain"), read from services/lateness so there is one definition and no
+  // second copy of the default here. Reading lease-else-5 here while the
+  // engine read the property's meant a park with a grace under 5 fined a
+  // FlexPay tenant before FlexPay paid the rent — the one thing FlexPay
+  // exists to prevent. The opening
   // balance invoice of a landlord's old system is not a monthly bill.
   const rows = await query<CoverCandidate>(
     `SELECT t.id AS tenant_id, t.flexpay_pull_day AS pull_day,
@@ -835,12 +944,12 @@ export async function coverFlexPayCycle(now: Date = new Date()): Promise<CoverRe
        JOIN units u          ON u.id = l.unit_id
        JOIN properties p     ON p.id = u.property_id
        CROSS JOIN LATERAL (
-         SELECT ($2::timestamptz AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date AS today_local,
-                (i.due_date + COALESCE(l.late_fee_grace_days, $1) - 1)::date AS last_grace_day
+         SELECT ($1::timestamptz AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date AS today_local,
+                (i.due_date + ${graceDaysSql('l', 'p')} - 1)::date AS last_grace_day
        ) day
       WHERE t.flexpay_enrolled = TRUE
         AND t.flexpay_pull_day IS NOT NULL
-        AND day.last_grace_day BETWEEN day.today_local - $3::int AND day.today_local
+        AND day.last_grace_day BETWEEN day.today_local - $2::int AND day.today_local
         AND (day.last_grace_day = day.today_local
              OR (-- A catch-up: enrolled before that day began, and nothing made
                  -- for this bill yet — no advance for the cycle, or (a second
@@ -849,7 +958,7 @@ export async function coverFlexPayCycle(now: Date = new Date()): Promise<CoverRe
                  ${promisedAndUncoveredSql('t', 'i', 'p', 'day.last_grace_day')}))
         AND (SELECT COUNT(*) FROM (${flexPayCountedLeasesSql('t.id')}) counted) = 1
       ORDER BY t.id, i.due_date, i.id`,
-    [FLEXPAY_DEFAULT_GRACE_DAYS, now, FLEXPAY_COVER_CATCHUP_DAYS],
+    [now, FLEXPAY_COVER_CATCHUP_DAYS],
   )
 
   // One advance per (tenant, cycle): a tenant whose current and new lease both
@@ -945,17 +1054,17 @@ async function alertMissedCovers(now: Date): Promise<number> {
          JOIN units u          ON u.id = l.unit_id
          JOIN properties p     ON p.id = u.property_id
          CROSS JOIN LATERAL (
-           SELECT ($2::timestamptz AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date AS today_local,
-                  (i.due_date + COALESCE(l.late_fee_grace_days, $1) - 1)::date AS last_grace_day
+           SELECT ($1::timestamptz AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date AS today_local,
+                  (i.due_date + ${graceDaysSql('l', 'p')} - 1)::date AS last_grace_day
          ) day
         WHERE t.flexpay_enrolled = TRUE
           AND t.flexpay_pull_day IS NOT NULL
-          AND day.last_grace_day = day.today_local - ($3::int + 1)
+          AND day.last_grace_day = day.today_local - ($2::int + 1)
           AND ${promisedAndUncoveredSql('t', 'i', 'p', 'day.last_grace_day')}
           AND (SELECT COUNT(*) FROM (${flexPayCountedLeasesSql('t.id')}) counted) = 1
           AND EXISTS (SELECT 1 FROM payments cp WHERE cp.invoice_id = i.id AND ${coverLineSql('cp')})
         ORDER BY t.id, i.due_date, i.id`,
-      [FLEXPAY_DEFAULT_GRACE_DAYS, now, FLEXPAY_COVER_CATCHUP_DAYS])
+      [now, FLEXPAY_COVER_CATCHUP_DAYS])
     for (const m of missed) {
       const open = round2(Number(m.open_lines))
       const lateFees = round2(Number(m.late_fees))
@@ -1294,16 +1403,21 @@ async function coverOneCycle(group: CoverCandidate[]): Promise<CoverOutcome> {
           : lines.length === 0
             ? `Cover ${coverDay}: the bill was already paid; only the monthly fee is taken.`
             : `Cover ${coverDay}: paid ${lines.length} bill line(s), $${covered.toFixed(2)}.`) + lateNote
+        // 10/26: the fee for THIS cycle, from the price table, on what is
+        // actually being fronted (`covered` — the whole bill, utilities and
+        // all) and the benefit Wednesday the pull day falls in. A bill with no
+        // bracket refuses the cover rather than fronting it for nothing.
+        const cycleFee = await requireFlexPayCycleFee(covered, t.flexpay_pull_day, coverDay)
         const ins = await client.query<{ id: string }>(
           `INSERT INTO flexpay_advances (
              cycle_month, tenant_id, landlord_id, unit_id, lease_id,
-             rent_amount, tenant_fee_amount, pull_day, status, fronted_at,
+             rent_amount, tenant_fee_amount, subscription_fee, pull_day, status, fronted_at,
              invoice_id, pull_date, notes
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'fronted', NOW(), $9, $10, $11)
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, 'fronted', NOW(), $9, $10, $11)
            ON CONFLICT (cycle_month, tenant_id) DO NOTHING
            RETURNING id`,
           [cycle, head.tenant_id, head.landlord_id, head.unit_id, head.lease_id,
-           covered, FLEXPAY_MONTHLY_FEE, t.flexpay_pull_day,
+           covered, cycleFee, t.flexpay_pull_day,
            head.invoice_id, pullDate, notes])
         if (ins.rows.length === 0) {
           await client.query('ROLLBACK')
@@ -1402,9 +1516,11 @@ async function coverOneCycle(group: CoverCandidate[]): Promise<CoverOutcome> {
             AND NOT (p.id = ANY($2::uuid[]))
           ORDER BY ${allocationOrderSql('p')}`,
         [invoiceIds, leftoverIds])).rows)
+      // 10/12: a voided line (owed by nobody, decisions #48.5) is a record on
+      // the bill, not a line of it.
       wholeBillSettled = (await client.query(
         `SELECT 1 FROM payments p
-          WHERE p.invoice_id = ANY($1::uuid[]) AND p.type <> 'late_fee' AND p.status <> 'settled'
+          WHERE p.invoice_id = ANY($1::uuid[]) AND p.type <> 'late_fee' AND p.status NOT IN ('settled', 'voided')
           LIMIT 1`,
         [invoiceIds])).rowCount === 0
 
@@ -1467,11 +1583,16 @@ async function coverOneCycle(group: CoverCandidate[]): Promise<CoverOutcome> {
       `The line is settled and held on the platform, so the tenant's bill is paid. The landlord's share of this ${m.type} line could not be booked: ${m.error}. Fix the cause and book the share, or the landlord is not paid for it.`,
       { payment_id: m.id, type: m.type, flexpay_advance_id: advanceId })
   }
-  if (late) await alertLateCover(head, invoiceIds, advanceId, covered, pullDate, lateFeesPaidByGam)
+  // 10/26: the fee the tenant is actually being charged this cycle, read back
+  // from the advance — the notices must quote the same number the pull takes.
+  const chargedFee = Number((await queryOne<{ f: string | null }>(
+    `SELECT subscription_fee::text AS f FROM flexpay_advances WHERE id = $1`, [advanceId]))?.f ?? 0)
+  if (late) await alertLateCover(head, invoiceIds, advanceId, covered, pullDate, chargedFee, lateFeesPaidByGam)
   if (settledIds.length > 0) await notifyLandlordsRentCollected(settledIds)
   await notifyTenantOfCover({
     tenantId: head.tenant_id, cycle, covered, collectTotal, pullDate, dueDate: head.due_date, late,
     addedToEarlier, stillDue, retryLeftovers, wholeBillSettled, lateFeesPaidByGam,
+    cycleFee: chargedFee,
   })
 
   return settledIds.length > 0
@@ -1654,15 +1775,17 @@ async function payLateFeesGamCaused(
  * pull day, even when the tenant had paid the bill themselves meanwhile
  * (Nic 10/2: a month already paid still takes the $25). Never throws.
  */
+// 10/26: the fee in this text is the CYCLE's fee, passed in — quoting the old
+// flat constant told the tenant one number and charged another.
 async function alertLateCover(
   head: CoverCandidate, invoiceIds: string[], advanceId: string, covered: number, pullDate: string,
-  paidByGam: DueLine[] = [],
+  cycleFee: number, paidByGam: DueLine[] = [],
 ): Promise<void> {
   try {
     const fees = await queryOne<{ n: number; total: string }>(
       `SELECT COUNT(*)::int AS n, COALESCE(SUM(amount), 0)::text AS total
          FROM payments
-        WHERE invoice_id = ANY($1::uuid[]) AND type = 'late_fee' AND status <> 'returned'`,
+        WHERE invoice_id = ANY($1::uuid[]) AND type = 'late_fee' AND status NOT IN ('returned', 'voided')`,
       [invoiceIds])
     const gamPaid = round2(paidByGam.reduce((s, l) => s + l.amount, 0))
     const lateFees = round2(Number(fees?.total ?? 0) - gamPaid)
@@ -1678,10 +1801,10 @@ async function alertLateCover(
       (lateFees > 0
         ? `A late fee of $${lateFees.toFixed(2)} on the bill stands as the tenant's: another line on it was also late. Review it with the landlord. `
         : gamPaid > 0 ? '' : 'No late fee was charged on it. ') +
-      `The tenant will still be charged the ${money(FLEXPAY_MONTHLY_FEE)} monthly fee for this month on ${pullDate}.`,
+      `The tenant will still be charged the ${money(cycleFee)} monthly fee for this month on ${pullDate}.`,
       { tenant_id: head.tenant_id, invoice_ids: invoiceIds, advance_id: advanceId,
         last_grace_day: head.last_grace_day, covered_on: head.today_local, late_fees: lateFees,
-        late_fees_paid_by_gam: gamPaid, monthly_fee: FLEXPAY_MONTHLY_FEE, pull_date: pullDate })
+        late_fees_paid_by_gam: gamPaid, monthly_fee: cycleFee, pull_date: pullDate })
   } catch (e) {
     logger.error({ err: e, tenant_id: head.tenant_id }, '[flexpay][cover] late-cover alert failed')
   }
@@ -1708,6 +1831,8 @@ async function notifyTenantOfCover(o: {
   tenantId: string; cycle: string; covered: number; collectTotal: number; pullDate: string; dueDate: string
   late: boolean; addedToEarlier: boolean; stillDue: DueLine[]; retryLeftovers: DueLine[]; wholeBillSettled: boolean
   lateFeesPaidByGam?: DueLine[]
+  /** 10/26: this cycle's fee from the table — never the old flat constant. */
+  cycleFee: number
 }): Promise<void> {
   try {
     const who = await queryOne<{ user_id: string; email: string | null }>(
@@ -1715,7 +1840,7 @@ async function notifyTenantOfCover(o: {
     if (!who) return
     const month = sayMonth(o.dueDate)
     const pull = sayDay(o.pullDate)
-    const fee = money(FLEXPAY_MONTHLY_FEE)
+    const fee = money(o.cycleFee)
     const parts: string[] = []
     if (o.covered > 0) {
       const which = o.addedToEarlier ? `your bill due ${sayDay(o.dueDate)}` : `your ${month} bill`
@@ -2613,21 +2738,23 @@ async function afterGamFirstRouting(paymentId: string, tenantId: string, r: Appl
           { statement_id: t.ref_id, paid_via_payment_id: paymentId, amount: t.amount })
         continue
       }
-      await getStripe().transfers.create(
-        {
-          amount:      Math.round(t.amount * 100),
-          currency:    'usd',
-          destination: t.destination_connect_account,
-          description: `FlexCharge merchant payout (supersedence) — statement ${t.ref_id}`,
-          metadata: {
-            gam_purpose:             'flexcharge_merchant_payout',
-            gam_statement_id:        t.ref_id,
-            gam_via_supersedence:    'true',
-            gam_paid_via_payment_id: paymentId,
-          },
+      // 10/12 (Nic, ledger P0): recorded before Stripe is asked, under the
+      // webhook's own key (routes/webhooks afterSucceededCommit).
+      const { fireRecordedDirectTransfer } = await import('./landlordPassthrough')
+      await fireRecordedDirectTransfer({
+        purpose:                     'flexcharge_merchant',
+        destinationConnectAccountId: t.destination_connect_account,
+        amount:                      t.amount,
+        flexchargeStatementId:       t.ref_id,
+        idempotencyKey:              `flexcharge_payout_super_${t.ref_id}`,
+        description:                 `FlexCharge merchant payout (supersedence) — statement ${t.ref_id}`,
+        metadata: {
+          gam_purpose:             'flexcharge_merchant_payout',
+          gam_statement_id:        t.ref_id,
+          gam_via_supersedence:    'true',
+          gam_paid_via_payment_id: paymentId,
         },
-        { idempotencyKey: `flexcharge_payout_super_${t.ref_id}` },
-      )
+      })
     } catch (e) {
       logger.error({ err: e, statement_id: t.ref_id, paid_via_payment_id: paymentId }, '[flexpay][pull] supersedence merchant transfer failed')
       await alertAdmin('warn', 'flexcharge_merchant_transfer_failed_supersedence',
@@ -3057,17 +3184,32 @@ export async function bookFlexPayFee(advanceId: string, client?: PoolClient): Pr
   const exec = async (sql: string, params: unknown[]) =>
     client ? (await client.query(sql, params)).rows : query<any>(sql, params as any[])
   const [adv] = await exec(
-    `SELECT a.tenant_fee_amount::text AS fee, a.cycle_month::text AS cycle, u.property_id
+    `SELECT a.tenant_fee_amount::text AS fee, a.subscription_fee::text AS subscription_fee,
+            a.cycle_month::text AS cycle, u.property_id
        FROM flexpay_advances a LEFT JOIN units u ON u.id = a.unit_id
-      WHERE a.id = $1`, [advanceId]) as Array<{ fee: string; cycle: string; property_id: string | null }>
+      WHERE a.id = $1`, [advanceId]) as Array<{
+        fee: string; subscription_fee: string | null; cycle: string; property_id: string | null }>
   if (!adv) return
   const book = await flexPayFeeOnBook(advanceId, exec)
   if (book.net > 0.005) return
   await recordPlatformRevenue({
     type:          'flexpay_subscription',
-    // The monthly fee only. A returned-pull or dispute fee is Stripe's cost
-    // passed on at cost, never GAM earnings.
-    amount:        Math.min(Number(adv.fee), FLEXPAY_MONTHLY_FEE),
+    // The month's SUBSCRIPTION fee only — the figure the cycle was priced at,
+    // stamped on the advance when it was covered. A returned-pull or dispute
+    // fee is Stripe's cost passed on at cost, never GAM earnings, and those
+    // are added to tenant_fee_amount afterward.
+    //
+    // 10/26: this used to be Math.min(adv.fee, FLEXPAY_MONTHLY_FEE) — the
+    // clamp was how the book separated the two while the fee was a flat $25.
+    // Once pricing moved to the table it silently under-booked every cycle
+    // priced above $25 ($40 charged, $25 booked). Reading the stamped figure
+    // cannot drift that way, whatever the grid does next.
+    //
+    // Falls back to the clamp for an advance written before the column
+    // existed, which is exactly what it was booked at then.
+    amount:        adv.subscription_fee != null
+      ? Number(adv.subscription_fee)
+      : Math.min(Number(adv.fee), FLEXPAY_MONTHLY_FEE),
     referenceId:   advanceId,
     referenceType: book.bookings === 0 ? 'flexpay_advance' : `flexpay_advance_rebooked_${book.bookings}`,
     propertyId:    adv.property_id,

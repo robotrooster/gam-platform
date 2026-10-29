@@ -69,10 +69,20 @@ describe('agent profile registry', () => {
     for (const p of CS) {
       expect(p.systemPrompt).toContain('Never invent facts')
       expect(p.systemPrompt).toContain('Hard stops')
-      // Law posture: GAM may flag OBJECTIVE figure mismatches but gives no
-      // legal advice/interpretation, and points to an attorney.
-      expect(p.systemPrompt).toContain('not legal advice or interpretation')
-      expect(p.systemPrompt).toContain('consult a licensed attorney')
+      // Law posture, 10/20 (Nic): "There should be no state law warnings
+      // anywhere in the system. At least not right now. Just hide all that
+      // stuff." The prompt gives no legal advice, no interpretation and now no
+      // COMPARISON either, and the attorney in their state is who tells them
+      // where they stand.
+      expect(p.systemPrompt).toContain('not legal advice, interpretation or comparison')
+      expect(p.systemPrompt).toContain('NEVER MEASURE THEIR NUMBER AGAINST THE LAW')
+      expect(p.systemPrompt).toContain('a licensed attorney in their state')
+      // The retired license, which named the warning and showed it as the
+      // example to copy. A prompt that permits this sentence reissues the
+      // warning in chat no matter what the pages do, because the figure comes
+      // back inside the statute text the retrieval tools still return.
+      expect(p.systemPrompt).not.toContain('You may state an objective mismatch')
+      expect(p.systemPrompt).not.toMatch(/above the \$\d+\/day figure in the statute/)
     }
   })
 

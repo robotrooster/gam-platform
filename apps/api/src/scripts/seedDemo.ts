@@ -112,12 +112,23 @@ async function main() {
       return r.rows[0].id as string
     }
     const sunset = await prop('Sunset Palms RV Resort', '4400 E Main St', 'Mesa', '85205', {
+      // 10/17 (Nic, one home for a tax rate): short_term_tax_rate is DERIVED —
+      // it follows the demo park's named "Lodging tax" (added below), so the
+      // demo shows the same one home every landlord gets. Seeded here only so
+      // the park has its rate before the tax row lands; the trigger then keeps
+      // the two in step.
       nightly_rate: 55, weekly_rate: 320, monthly_rate: 900, short_term_tax_rate: 12,
       unit_types: '{rv_spot,storage}',
       // W-20 (S531): public booking site live in the demo — guests book by
       // SITE TYPE; the system assigns the unit and reveals it morning-of.
       public_booking_enabled: true, booking_slug: 'sunset-palms', booking_deposit_pct: 25,
     })
+    // 10/17 (Nic): the park's lodging tax, in its ONE home — the company's own
+    // named taxes. Ticked "charged on a stay here", so the park's stay
+    // percentage follows it and every door prices a stay with this one rate.
+    await c.query(
+      `INSERT INTO pos_tax_rates (landlord_id, property_id, name, rate, tax_type, applies_to, on_stays)
+       VALUES ($1, $2, 'Lodging tax', 0.12, 'sales', '{}'::text[], TRUE)`, [LL, sunset])
     const oak = await prop('Oak Street Apartments', '2210 N Oak St', 'Phoenix', '85004', {
       unit_types: '{apartment}',
     })

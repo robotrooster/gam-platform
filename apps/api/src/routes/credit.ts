@@ -44,7 +44,9 @@ import { logger } from '../lib/logger'
 //   - Integrity (Merkle anchors / verifyChain):read-only public-ish
 //                                              (cryptographic proofs;
 //                                              expose them so tampering
-//                                              is detectable by anyone)
+//                                              is detectable by anyone;
+//                                              a chain restart's note is
+//                                              admin-only, 10/13)
 //
 // canViewSubject() implements the v1 visibility filter. It walks the
 // requester's relationship to the subject and decides which
@@ -869,7 +871,12 @@ creditRouter.get('/integrity/verify/:subjectId', async (req, res, next) => {
     const allowed = await canViewSubject(req, selector)
     if (allowed.length === 0) throw new AppError(403, 'No visibility for this subject')
 
-    const result = await verifyChain(req.params.subjectId)
+    // 10/13 (Nic): "Restart note: ADMIN ONLY." A restarted chain's note goes
+    // to an admin or super_admin alone (verifyChain decides by the role) —
+    // never to a tenant or a landlord, the subject itself included. Everyone
+    // canViewSubject lets in still gets the proof: whole or not, each restart
+    // and the break it explains.
+    const result = await verifyChain(req.params.subjectId, { readerRole: req.user!.role })
     res.json({ success: true, data: result })
   } catch (e) {
     next(e)

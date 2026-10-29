@@ -477,11 +477,14 @@ const LEASE_UNTOUCHED = {
 // owes $1,548.39 on the calendar schedule, so November's unpaid rent goes and
 // the $1,451.61 already paid past Oct 2 is banked as money paid ahead (it then
 // gets the refund choices on the schedule's Check out window).
+// 10/12 (Nic): November's unpaid rent is voided as a record, never deleted —
+// it stays, owed by nobody.
 const LEASE_ENDED_TODAY = {
   lease: { status: 'active', end_date: PHOENIX_TODAY },
   rent: [
     { status: 'settled', due: '2026-09-01' },
     { status: 'settled', due: '2026-10-01' },
+    { status: 'voided', due: '2026-11-01' },
   ],
   banked: [{ amount: '1451.61', voided: false }],
 }
@@ -493,6 +496,7 @@ const LEASE_PUT_BACK = {
   rent: [
     { status: 'settled', due: '2026-09-01' },
     { status: 'settled', due: '2026-10-01' },
+    { status: 'voided', due: '2026-11-01' },
   ],
   banked: [{ amount: '1451.61', voided: true }],
 }
@@ -1441,9 +1445,10 @@ describe('PATCH /api/units/:id/bookings/:bookingId — early check-out (S655)', 
     expect(out.body.leaseNote).toBeNull()
     await settle()
     expect(await leaseMoney(leaseId)).toEqual(LEASE_ENDED_TODAY)
+    // 10/12 (Nic): November's rent is voided as a record, never deleted.
     const november = await db.query(
-      `SELECT 1 FROM payments WHERE lease_id = $1 AND due_date = '2026-11-01'`, [leaseId])
-    expect(november.rows).toHaveLength(0)
+      `SELECT status FROM payments WHERE lease_id = $1 AND due_date = '2026-11-01'`, [leaseId])
+    expect(november.rows).toEqual([{ status: 'voided' }])
     // The stay's own total is left as booked — the lease bills the stay.
     expect(await stayRow(stay)).toMatchObject({ status: 'checked_out', check_out: PHOENIX_TODAY, total_amount: '4500.00' })
 

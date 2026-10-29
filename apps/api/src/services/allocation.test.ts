@@ -13,6 +13,7 @@
 
 import { randomUUID } from 'crypto'
 import { describe, it, expect, beforeAll } from 'vitest'
+import type { PoolClient } from 'pg'
 import { db } from '../db'
 import { executeRentAllocation } from './allocation'
 import {
@@ -22,56 +23,36 @@ import {
   seedAllocationRule, seedRentPayment,
   seedUserBankAccount, seedPmCompany, seedPmFeePlan,
   attachPmToProperty,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 
 beforeAll(async () => {
-  // Processing rates are a global singleton, so seed once outside the
-  // per-test transaction. Subsequent tests reuse the same rate rows.
-  // Matches the GAM pricing model (ACH 1.0% customer-facing, 0.5%
-  // stripe cost) — the spread is GAM's banking margin.
+  // Every expectation in this file is worked out on these two rates (ACH 1.0%
+  // customer-facing on a 0.5% Stripe cost — the spread is GAM's banking margin
+  // — and card 3.25% + $0.30), so the file STATES them: whatever is open for
+  // each method is retired and these become the open rows.
   //
-  // INSERT ... WHERE NOT EXISTS guards against the partial unique
-  // index `ux_platform_processing_rates_active_per_method`: only one
-  // active row per payment_method (effective_until IS NULL). The
-  // webhooks suite seeds the same rates in beforeEach, so if it ran
-  // first this beforeAll would otherwise blow up on duplicate insert.
+  // Only one row is open per method (ux_platform_processing_rates_active_per_method)
+  // and cleanupAllSchema leaves the rate card alone, so this used to be an
+  // insert-if-missing plus a hand-written retire-everything-that-is-not-these
+  // UPDATE, and the file passed or failed depending on which suite the run
+  // happened to start with. Rates are a singleton, so this is done once, here,
+  // outside the per-test transaction; the tests that need a different rate
+  // state their own inside their own rolled-back transaction.
   const client = await db.connect()
   try {
-    // Every expectation below is worked out on these two rates, so a rate
-    // another suite left active (bookingLeaseBilling seeds a flat $6 ACH row
-    // the same way) is retired first. Without this the file passed or failed
-    // depending on which suite the run happened to start with.
-    await client.query(
-      `UPDATE platform_processing_rates SET effective_until = now()
-        WHERE effective_until IS NULL AND effective_from < now()
-          AND NOT (
-            (payment_method = 'ach' AND customer_facing_flat = 0 AND customer_facing_percent = 1.0
-              AND stripe_cost_flat = 0 AND stripe_cost_percent = 0.5)
-            OR (payment_method = 'card' AND customer_facing_flat = 0.30 AND customer_facing_percent = 3.25
-              AND stripe_cost_flat = 0.30 AND stripe_cost_percent = 2.9))
-              OR (effective_until IS NULL AND effective_from < now()
-                  AND (customer_facing_cap IS NOT NULL OR stripe_cost_cap IS NOT NULL))`
-    )
-    await client.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent,
-          stripe_cost_flat, stripe_cost_percent)
-       SELECT 'ach', 0, 1.0, 0, 0.5
-        WHERE NOT EXISTS (
-          SELECT 1 FROM platform_processing_rates
-           WHERE payment_method='ach' AND effective_until IS NULL
-        )`
-    )
-    await client.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent,
-          stripe_cost_flat, stripe_cost_percent)
-       SELECT 'card', 0.30, 3.25, 0.30, 2.9
-        WHERE NOT EXISTS (
-          SELECT 1 FROM platform_processing_rates
-           WHERE payment_method='card' AND effective_until IS NULL
-        )`
-    )
+    await setEffectiveProcessingRate(client, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 0, customerFacingPercent: 1.0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: 'allocation.test.ts ACH rate',
+    })
+    await setEffectiveProcessingRate(client, {
+      paymentMethod: 'card',
+      customerFacingFlat: 0.30, customerFacingPercent: 3.25,
+      stripeCostFlat: 0.30, stripeCostPercent: 2.9,
+      notes: 'allocation.test.ts card rate',
+    })
   } finally {
     client.release()
   }
@@ -717,11 +698,14 @@ describe('executeRentAllocation — PM company cut', () => {
     })
   })
 
-  it('PM contracted with bank routing missing: 409', async () => {
+  // 10/12 (Nic): the legacy catalog bank no longer takes new rows, so a PM
+  // company has none. Its cut is booked to its active owner and paid to the
+  // company's Stripe Connect account. Only a company with neither throws.
+  it('PM contracted with no catalog bank AND no active owner: 409', async () => {
     await withRollback(async (client) => {
       const { userId: ownerUserId, landlordId } = await seedLandlord(client)
       const tenantId = await seedTenant(client)
-      // PM company with NO bank_account_id — leave it null
+      // PM company with NO bank_account_id and no pm_staff owner
       const res = await client.query<{ id: string }>(
         `INSERT INTO pm_companies (name) VALUES ('no-bank PM') RETURNING id`
       )
@@ -740,7 +724,49 @@ describe('executeRentAllocation — PM company cut', () => {
       })
 
       await expect(executeRentAllocation(client, paymentId, 'ach'))
-        .rejects.toThrow(/no bank routing/i)
+        .rejects.toThrow(/no active owner/i)
+    })
+  })
+
+  it('PM contracted with no catalog bank: the cut is booked to the company’s active owner', async () => {
+    await withRollback(async (client) => {
+      const { userId: ownerUserId, landlordId } = await seedLandlord(client)
+      const tenantId = await seedTenant(client)
+      const { userId: pmOwnerUserId } = await seedLandlord(
+        client, { email: `pm-owner-${randomUUID()}@test.dev` }
+      )
+      const res = await client.query<{ id: string }>(
+        `INSERT INTO pm_companies (name, stripe_connect_account_id, connect_payouts_enabled, connect_details_submitted)
+         VALUES ('Connect-only PM', 'acct_pm_test', TRUE, TRUE) RETURNING id`
+      )
+      const pmCompanyId = res.rows[0].id
+      await client.query(
+        `INSERT INTO pm_staff (pm_company_id, user_id, role, status, joined_at)
+         VALUES ($1, $2, 'owner', 'active', NOW())`, [pmCompanyId, pmOwnerUserId])
+      const pmFeePlanId = await seedPmFeePlan(client, {
+        pmCompanyId, feeType: 'percent_of_rent', percent: 10,
+      })
+      const propertyId = await seedProperty(client, {
+        landlordId, ownerUserId, managedByUserId: ownerUserId,
+      })
+      await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
+      await attachPmToProperty(client, { propertyId, pmCompanyId, pmFeePlanId })
+      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
+      const paymentId = await seedPaidRent(client, {
+        unitId, tenantId, landlordId, amount: 1000,
+      })
+
+      await executeRentAllocation(client, paymentId, 'ach')
+
+      const pm = await client.query(
+        `SELECT user_id, amount::text AS amount, bank_account_id FROM user_balance_ledger
+          WHERE reference_id=$1 AND type='allocation_pm_company_fee'`,
+        [paymentId]
+      )
+      expect(pm.rows).toHaveLength(1)
+      expect(pm.rows[0].user_id).toBe(pmOwnerUserId)
+      expect(pm.rows[0].amount).toBe('100.00')
+      expect(pm.rows[0].bank_account_id).toBeNull()
     })
   })
 })
@@ -782,15 +808,15 @@ describe('executeRentAllocation — one charge covering multiple rows (S603)', (
     return r.rows[0].id
   }
 
-  async function useFlatAchRate(client: any) {
-    await client.query(
-      `UPDATE platform_processing_rates SET effective_until = now()
-        WHERE payment_method='ach' AND effective_until IS NULL`)
-    await client.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent, customer_facing_cap,
-          stripe_cost_flat, stripe_cost_percent, stripe_cost_cap)
-       VALUES ('ach', 6.00, 0, 6.00, 0, 0.5, 3.00)`)
+  /** The flat $6 bank schedule (cost 0.5%, cap $3), stated inside the test. */
+  async function useFlatAchRate(client: PoolClient) {
+    await setEffectiveProcessingRate(client, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 6.00, customerFacingPercent: 0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      customerFacingCap: 6.00, stripeCostCap: 3.00,
+      notes: 'allocation.test.ts flat ACH rate',
+    })
   }
 
   it('books the flat fee ONCE across the charge, not once per row', async () => {
@@ -1027,9 +1053,18 @@ describe('executeRentAllocation — credit on the row (S655)', () => {
       const alert = await client.query(`SELECT body FROM admin_notifications WHERE category = 'allocation_fees_exceed_held'`)
       expect(alert.rowCount).toBe(1)
       expect(alert.rows[0].body).toMatch(/\$65\.00 was not covered/)
+      // 10/12 (Nic, L18): the $65 GAM could not pay the manager is a real
+      // unpaid bill on the landlord's Expenses, under Management, tied to the split.
+      const billOf = () => client.query(
+        `SELECT e.amount::text AS amount, c.system_key, (b.unpaid)::text AS unpaid
+           FROM landlord_expenses e JOIN allocation_splits s ON s.id = e.allocation_split_id
+           JOIN books_categories c ON c.id = e.category_id JOIN v_expense_balance b ON b.expense_id = e.id
+          WHERE s.payment_id = $1 AND e.status = 'active'`, [pay])
+      expect((await billOf()).rows).toEqual([{ amount: '65.00', system_key: 'management', unpaid: '65.00' }])
       // Re-running is a no-op (the $0 owner share marks it allocated).
       await executeRentAllocation(client, pay, 'ach', { feeAlreadyCollected: true })
       expect((await ledger(client, pay, 'allocation_manager_fee')).n).toBe(1)
+      expect((await billOf()).rowCount).toBe(1)
     })
   })
 
@@ -1105,12 +1140,13 @@ describe('executeRentAllocation — credit on the row (S655)', () => {
   it('a charge whose landlord rows were all paid by credit books its fee once (bank, landlord pays the fee)', async () => {
     await withRollback(async (client) => {
       // The flat $6 ACH schedule, so a doubled fee is plain to see.
-      await client.query(`UPDATE platform_processing_rates SET effective_until = now() WHERE payment_method = 'ach' AND effective_until IS NULL`)
-      await client.query(
-        `INSERT INTO platform_processing_rates
-           (payment_method, customer_facing_flat, customer_facing_percent, customer_facing_cap,
-            stripe_cost_flat, stripe_cost_percent, stripe_cost_cap)
-         VALUES ('ach', 6.00, 0, 6.00, 0, 0.5, 3.00)`)
+      await setEffectiveProcessingRate(client, {
+        paymentMethod: 'ach',
+        customerFacingFlat: 6.00, customerFacingPercent: 0,
+        stripeCostFlat: 0, stripeCostPercent: 0.5,
+        customerFacingCap: 6.00, stripeCostCap: 3.00,
+        notes: 'allocation.test.ts flat ACH rate',
+      })
       const f = await fx(client, { feePayer: 'landlord' })
       const r = await creditPaidChargeWithGamFee(client, f, 'ach')
       expect(r.owner).toBe(494)          // $500 GAM holds, less ONE $6 fee
@@ -1121,11 +1157,12 @@ describe('executeRentAllocation — credit on the row (S655)', () => {
 
   it('a charge whose landlord rows were all paid by credit books its fee once (card)', async () => {
     await withRollback(async (client) => {
-      await client.query(`UPDATE platform_processing_rates SET effective_until = now() WHERE payment_method = 'card' AND effective_until IS NULL`)
-      await client.query(
-        `INSERT INTO platform_processing_rates
-           (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-         VALUES ('card', 0.30, 3.25, 0.30, 2.9)`)
+      await setEffectiveProcessingRate(client, {
+        paymentMethod: 'card',
+        customerFacingFlat: 0.30, customerFacingPercent: 3.25,
+        stripeCostFlat: 0.30, stripeCostPercent: 2.9,
+        notes: 'allocation.test.ts card rate',
+      })
       const f = await fx(client, { feePayer: 'landlord' })
       const r = await creditPaidChargeWithGamFee(client, f, 'card')
       // Card test rate 3.25% + $0.30 on the $4 that moved: $0.43, once.
@@ -1142,12 +1179,13 @@ describe('executeRentAllocation — credit on the row (S655)', () => {
   // absorbing it).
   it('a charge whose credit-paid rows are split GAM-held / landlord-held books its fee once on the GAM-held row', async () => {
     await withRollback(async (client) => {
-      await client.query(`UPDATE platform_processing_rates SET effective_until = now() WHERE payment_method = 'ach' AND effective_until IS NULL`)
-      await client.query(
-        `INSERT INTO platform_processing_rates
-           (payment_method, customer_facing_flat, customer_facing_percent, customer_facing_cap,
-            stripe_cost_flat, stripe_cost_percent, stripe_cost_cap)
-         VALUES ('ach', 6.00, 0, 6.00, 0, 0.5, 3.00)`)
+      await setEffectiveProcessingRate(client, {
+        paymentMethod: 'ach',
+        customerFacingFlat: 6.00, customerFacingPercent: 0,
+        stripeCostFlat: 0, stripeCostPercent: 0.5,
+        customerFacingCap: 6.00, stripeCostCap: 3.00,
+        notes: 'allocation.test.ts flat ACH rate',
+      })
       const f = await fx(client, { feePayer: 'landlord' })
       // Ids chosen so the landlord-held row (water) sorts LAST.
       const rent = `10000000-0000-4000-8000-${randomUUID().slice(-12)}`
@@ -1307,12 +1345,13 @@ describe('executeRentAllocation — credit on the row (S655)', () => {
 
   it('a row no money paid carries no processing fee, even when the caller forgets to say so', async () => {
     await withRollback(async (client) => {
-      await client.query(`UPDATE platform_processing_rates SET effective_until = now() WHERE payment_method = 'ach' AND effective_until IS NULL`)
-      await client.query(
-        `INSERT INTO platform_processing_rates
-           (payment_method, customer_facing_flat, customer_facing_percent, customer_facing_cap,
-            stripe_cost_flat, stripe_cost_percent, stripe_cost_cap)
-         VALUES ('ach', 6.00, 0, 6.00, 0, 0.5, 3.00)`)
+      await setEffectiveProcessingRate(client, {
+        paymentMethod: 'ach',
+        customerFacingFlat: 6.00, customerFacingPercent: 0,
+        stripeCostFlat: 0, stripeCostPercent: 0.5,
+        customerFacingCap: 6.00, stripeCostCap: 3.00,
+        notes: 'allocation.test.ts flat ACH rate',
+      })
       const f = await fx(client, { feePayer: 'landlord' })
       const pay = await rentRow(client, f)
       await use(client, f, pay, { prepaid: await paidAhead(client, f, 460, 'gam') }, 460)

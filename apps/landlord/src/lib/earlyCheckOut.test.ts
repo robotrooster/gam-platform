@@ -102,6 +102,63 @@ describe('after the press', () => {
     expect(waitLine(quote({ canRefund: false, waitsForRefund: 'It waits.' }))).toBe('It waits.')
     expect(waitLine(quote())).toBeNull()
   })
+  // 10/18 (Nic): "if the landlord does refunds at all at that property." At a
+  // park that does not, the server asks no question — so the window shows the
+  // sentence that says why, and the only button is Check out.
+  it('says plainly when the property does not give money back', () => {
+    const noMoneyBack = 'Jane Doe paid $60.00 more than the nights they stayed are worth, but this property does not '
+      + 'give money back when a guest leaves early \u2014 so nothing goes back and the price as booked, $480.00, stands. '
+      + "Check them out and the stay closes. The property's settings are where that changes."
+    const q = quote({ question: 'none', choices: [], unused: 0, maxRefund: 0, noRefunds: noMoneyBack })
+    expect(waitLine(q)).toBe(noMoneyBack)
+    // One button, and it checks them out — nothing to pick.
+    expect(canConfirm(q, null, '')).toBe(true)
+    expect(confirmLabel(q, null, '')).toBe('Check out Jane Doe')
+    // Opened again after they are out: the sentence stays, the button closes.
+    const after = quote({ ...q, checkedOut: true, noRefunds: noMoneyBack })
+    expect(waitLine(after)).toBe(noMoneyBack)
+    expect(canConfirm(after, null, '')).toBe(false)
+    expect(confirmLabel(after, null, '')).toBe('Close')
+  })
+  it('a park that DOES give money back is unchanged: the choices speak for themselves', () => {
+    expect(waitLine(quote({ noRefunds: null }))).toBeNull()
+    expect(waitLine(quote())).toBeNull()
+  })
+  /**
+   * 10/19 (review): a question asked BEFORE the landlord answered No is still
+   * open, so the owner must be able to clear it. The window shows the real
+   * figure, the one answer this park honors, and the sentence saying why — the
+   * server sends question 'overpaid' with maxRefund 0 for exactly this.
+   */
+  it('a question already open at a park that gives no money back can still be answered', () => {
+    const noMoneyBack = 'Jane Doe paid $60.00 more than the nights they stayed are worth, but this property does not '
+      + 'give money back when a guest leaves early \u2014 so nothing goes back and the price as booked, $480.00, stands. '
+      + '$180.00 of that price is still owed and stays on the stay after they are checked out. '
+      + "The property's settings are where that changes."
+    const q = quote({
+      checkedOut: true, question: 'overpaid', unused: 60, maxRefund: 0, noRefunds: noMoneyBack,
+      choices: [{ choice: 'no_refund', label: 'No refund (keep the price as booked)',
+                  result: 'Nothing goes back, and they still owe $180.00' }],
+      decision: { id: 'd1', status: 'pending', choice: null, choiceLabel: null, leftOn: '2026-10-02',
+                  decidedBy: null, decidedAt: null, refundTotal: 0, priceAfter: null, parts: [] },
+    })
+    // The figure the owner reads is the real one, never $0.00.
+    expect(q.unused).toBe(60)
+    expect(waitLine(q)).toBe(noMoneyBack)
+    // No answer picked yet: no button. Pick the one answer and there is one.
+    expect(canConfirm(q, null, '')).toBe(false)
+    expect(canConfirm(q, 'no_refund', '')).toBe(true)
+    expect(confirmLabel(q, 'no_refund', '')).toBe('No refund')
+    // The answers this park does not honor are not offerable, even by hand.
+    expect(canConfirm(q, 'refund_unused', '')).toBe(false)
+    expect(canConfirm(q, 'refund_other', '300')).toBe(false)
+  })
+  it('a clerk who cannot issue refunds reads the amount that is really waiting', () => {
+    const q = quote({ checkedOut: true, question: 'overpaid', unused: 60, maxRefund: 0, canRefund: false,
+      choices: [], waitsForRefund: 'Jane Doe paid $60.00 more than the nights they stayed are worth. …' })
+    expect(waitLine(q)).toContain('$60.00')
+    expect(canConfirm(q, null, '')).toBe(false)
+  })
   it('says a price choice waits for someone who can check guests out, and offers no button for it', () => {
     const owes = quote({ question: 'owes', choices: [], checkedOut: true, canCheckOut: false, waitsForCheckOut: 'Only someone with "Check guests out" can choose.' })
     expect(waitLine(owes)).toBe('Only someone with "Check guests out" can choose.')

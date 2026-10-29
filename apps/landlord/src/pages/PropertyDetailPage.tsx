@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from 'react-query'
-import { humanize, dueDayLabel, PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT, feeChoiceFromPayer, PARTIAL_PAYMENTS_LAW_NOTE, TENANTS_DEPOSIT_AT_BANK_LABEL, TENANTS_DEPOSIT_AT_BANK_HINT, type ProcessingFeeChoice } from '@gam/shared'
+import { humanize, dueDayLabel, PROCESSING_FEE_CHOICES, PROCESSING_FEE_CHOICE_LABEL, PROCESSING_FEE_CHOICE_HINT, feeChoiceFromPayer, PARTIAL_PAYMENTS_LAW_NOTE, TENANTS_DEPOSIT_AT_BANK_LABEL, TENANTS_DEPOSIT_AT_BANK_HINT, EARLY_DEPARTURE_REFUNDS_QUESTION, EARLY_DEPARTURE_REFUNDS_HINT, MID_MONTH_PRORATION_QUESTION, MID_MONTH_PRORATION_HINT, ACCEPTS_CHECKS_QUESTION, ACCEPTS_CHECKS_HINT, type ProcessingFeeChoice } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
 import { toast } from '../components/dialogs'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck, UserPlus, AlertTriangle } from 'lucide-react'
@@ -17,6 +17,7 @@ import { PropertyLateFeeSection } from './PropertyLateFeeSection'
 import { PropertyFeeScheduleSection } from './PropertyFeeScheduleSection'
 import { PropertyLeaseSigningSection } from './PropertyLeaseSigningSection'
 import { PropertyOfficeEmailSection } from './PropertyOfficeEmailSection'
+import { PropertyPaperBillsSection } from './PropertyPaperBillsSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 import { UtilityMetersPage } from './UtilityMetersPage'
@@ -24,6 +25,7 @@ import { AmenitiesPage } from './AmenitiesPage'
 import { InventoryPage } from './InventoryPage'
 import { MaintenancePage } from './MaintenancePage'
 import { PropertyOwnershipTab } from './PropertyOwnershipTab'
+import { PropertyTaskListTab } from './PropertyTaskListTab'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const STATUS_COLORS: Record<string,string> = {
@@ -53,6 +55,20 @@ const TABS = [
   { key: 'amenities', label: 'Amenities' },
   { key: 'inventory', label: 'Equipment' },
   { key: 'maintenance', label: 'Maintenance' },
+  // 10/20 (Nic, relaying Blu): the park's own checklist, and it sits BESIDE
+  // Maintenance rather than inside it. Nic asked where it should live and said
+  // per-property, on the property page; Blu's words were that it runs "in
+  // parallel to maintenance, sitting outside of it though". A sub-tab under
+  // Maintenance would read as a kind of work order, which is the one thing it
+  // is not.
+  { key: 'tasks', label: 'Task List' },
+  // 10/21 (Nic): "we also need a way for maybe maintenance people or work trade
+  // people to put in sort of a collected shopping cart pool of, hey, we need to
+  // buy some new paint brushes and new trash bags… that way he doesn't have text
+  // messages from like 5 or 6 different people." Beside the task list and not
+  // inside it, because the write rule is the opposite one: anybody working the
+  // park adds a line here, and only the owner ticks it bought.
+  { key: 'supplies', label: 'Supplies' },
   { key: 'ownership', label: 'Ownership' },
 ] as const
 type TabKey = typeof TABS[number]['key']
@@ -176,6 +192,10 @@ export function PropertyDetailPage() {
           POS resale stock, which is a different table entirely. */}
       {tab === 'inventory' && <InventoryPage embeddedPropertyId={id!} />}
       {tab === 'maintenance' && <MaintenancePage embeddedPropertyId={id!} />}
+      {/* 10/20 (Blu, via Nic): jobs around the park for whoever is working
+          here. Deliberately not a work-order queue — see PropertyTaskListTab. */}
+      {tab === 'tasks' && <PropertyTaskListTab propertyId={id!} />}
+      {tab === 'supplies' && <PropertyTaskListTab propertyId={id!} kind="supply" />}
       {/* S605 (Nic): selling the property, gated on every owner confirming. */}
       {tab === 'ownership' && <PropertyOwnershipTab propertyId={id!} propertyName={property.name} />}
 
@@ -219,12 +239,17 @@ export function PropertyDetailPage() {
             terms are identical for all tenants. */}
       <PropertyLateFeeSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <MoveInCollectionCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <DepartureRulesCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <CardFeePayerCard property={property} onSaved={() => { qc.invalidateQueries(['property', id]); qc.invalidateQueries('properties') }} />
       <PartialPaymentsCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <TenantsDepositAtBankCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <HomePaymentBillingCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <CreditSaveUpCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <AcceptsChecksCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <PropertyFeeScheduleSection propertyId={property.id}
         unitTypes={[...new Set((units as any[]).map(u => u.unitType).filter(Boolean))].sort()} />
       <PropertyOfficeEmailSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <PropertyPaperBillsSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       {isOwner && <PropertyLeaseSigningSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />}
       {/* S558: the security-deposit multiplier is a LEASE term (set on the
             lease template, deposit = rent × template.deposit_months), not a
@@ -792,12 +817,79 @@ export function PartialPaymentsCard({ property, onSaved }: { property: any; onSa
   )
 }
 
+// 10/25 (Nic): "Leave current properties set up as is. Let landlords choose how
+// it gets bundled." An installment (home/trailer) payment is its OWN bill by
+// default — paid separately from the space rent, which is what a buyer on work
+// trade and a buyer whose trailer money goes to a different account both need.
+// A landlord who would rather send one document per month turns it off.
+export function HomePaymentBillingCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (ownBill: boolean) => apiPatch(`/properties/${property.id}`, { homePaymentsOwnBill: ownBill }),
+    { onSuccess: onSaved, onError: () => toast.error('Could not save the home payment billing setting') })
+  // Missing on an older cached page reads as its default: separate.
+  const on = property.homePaymentsOwnBill !== false
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 700, color: 'var(--text-0)', marginBottom: 4, cursor: 'pointer' }}>
+        <input type="checkbox" checked={on} disabled={save.isLoading}
+          onChange={e => save.mutate(e.target.checked)} />
+        Bill home/trailer payments separately from rent
+      </label>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+        {on
+          ? 'On: a financed home or trailer payment gets its own bill each month, paid on its own. Nobody can pay it and think they covered their space rent, and a resident on work trade — who gets no rent bill — still gets billed for the home.'
+          : 'Off: the home or trailer payment rides the space-rent bill, so the month is one document and one payment. A buyer with no rent bill that month — on work trade, or renting no space here — still gets their own bill, because there is nothing to add it to.'}
+      </div>
+    </div>
+  )
+}
+
 // 10/6 (Nic): "Do you allow tenants to go into the bank and deposit their rent
 // for this unit or for this property? We don't do that here at Mountain View."
 // Default off. On: tenants may report a bank deposit, Record payment offers
 // "Bank deposit", and the bank feed matches each deposit to the tenant's bill
 // (the bank's date decides late fees). Off: none of those; the office's own
 // deposit slips still match.
+// 10/26 (Nic): "landlords can choose if people are allowed to save up credit
+// ahead of time... Blue wants to have his property set where any credit is
+// automatically applied against the thing. There's no saving it up."
+//
+// What this does NOT change: credit a resident already holds never sits while
+// they owe. It goes on their open balance by itself — at the bill run, again
+// right before any late fee (so credit that covers the bill stops the fee), and
+// again whenever a credit is issued. That is every property, and this setting
+// cannot turn it off.
+//
+// What it changes: the one place a resident can still hold credit back is the
+// pay screen, where credit that would pay part of what they are paying offers
+// "Use all $X" or "Save it for later". Off: that question is never asked — the
+// credit goes on the bill and they pay the rest.
+export function CreditSaveUpCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (allowed: boolean) => apiPatch(`/properties/${property.id}`, { creditSaveUpAllowed: allowed }),
+    { onSuccess: onSaved, onError: () => toast.error('Could not save the credit setting') })
+  // Missing on an older cached page reads as its default: saving is allowed.
+  const on = property.creditSaveUpAllowed !== false
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 700, color: 'var(--text-0)', marginBottom: 4, cursor: 'pointer' }}>
+        <input type="checkbox" checked={on} disabled={save.isLoading}
+          onChange={e => save.mutate(e.target.checked)} />
+        Let residents save credit for later
+      </label>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+        {on
+          ? 'On: when a resident pays and has credit that would cover part of the bill, they choose whether to use it now or keep it for a later month.'
+          : 'Off: a resident is never asked — their credit goes on the bill they are paying and they pay the rest.'}
+      </div>
+      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8, lineHeight: 1.5 }}>
+        Either way, credit on an account already goes onto an open balance by itself — oldest bill first,
+        and before any late fee, so credit that covers the bill prevents the fee.
+      </div>
+    </div>
+  )
+}
+
 export function TenantsDepositAtBankCard({ property, onSaved }: { property: any; onSaved: () => void }) {
   const save = useMutation(
     (allowed: boolean) => apiPatch(`/properties/${property.id}/tenants-deposit-at-bank`, { allowed }),
@@ -811,6 +903,96 @@ export function TenantsDepositAtBankCard({ property, onSaved }: { property: any;
         {TENANTS_DEPOSIT_AT_BANK_LABEL}
       </label>
       <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5 }}>{TENANTS_DEPOSIT_AT_BANK_HINT}</div>
+    </div>
+  )
+}
+
+// 10/18 (Nic): WHAT HAPPENS WHEN SOMEBODY LEAVES EARLY — TWO ANSWERS, PER PROPERTY.
+//   "refunds are pro rated to the next price down. people pay for a week they
+//    stay 4 days. the 4 day rate against the weekly rate is the difference for
+//    the refund if the landlord does refunds at all at that property. the only
+//    way it is different is for longer term people for rent pro ration. moving
+//    in or out at the middle of a month and also only if the landlord allows
+//    the pro rate. these should all be property level settings."
+// Both read as questions a landlord answers, not as flags. Both default to Yes
+// — the way every property already works — so a landlord who never opens this
+// card sees no change; a missing answer from an older cached page reads Yes too.
+export function DepartureRulesCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (b: { refundsEarlyDeparture?: boolean; proratesMidMonth?: boolean }) =>
+      apiPatch(`/properties/${property.id}/departure-rules`, b),
+    // 10/19 (review): say what the server said. It has a plain sentence for the
+    // one case this can really fail in — GAM part-way through an update, where
+    // the answer cannot be stored yet — and "Could not save that answer" sent
+    // the landlord back to press the same button again with nothing to go on.
+    { onSuccess: onSaved,
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save that answer') })
+  const refunds = property.earlyDepartureRefunds !== false
+  const prorates = property.proratesMidMonthRent !== false
+  const busy = save.isLoading
+  const YesNo = ({ on, onPick }: { on: boolean; onPick: (v: boolean) => void }) => (
+    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+      <button className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+        onClick={() => !on && onPick(true)}>Yes</button>
+      <button className={`btn btn-sm ${!on ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+        onClick={() => on && onPick(false)}>No</button>
+    </div>
+  )
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>When someone leaves early</div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 14 }}>
+        Applies to check-outs and move-outs from now on. A refund already sent and a month already
+        billed are not revisited.
+      </div>
+
+      <div style={{ fontSize: '.8rem', color: 'var(--text-1)', fontWeight: 600, marginBottom: 6 }}>
+        {EARLY_DEPARTURE_REFUNDS_QUESTION}
+      </div>
+      <YesNo on={refunds} onPick={v => save.mutate({ refundsEarlyDeparture: v })} />
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginTop: 8, marginBottom: 16 }}>
+        {EARLY_DEPARTURE_REFUNDS_HINT[refunds ? 'yes' : 'no']}
+      </div>
+
+      <div style={{ fontSize: '.8rem', color: 'var(--text-1)', fontWeight: 600, marginBottom: 6 }}>
+        {MID_MONTH_PRORATION_QUESTION}
+      </div>
+      <YesNo on={prorates} onPick={v => save.mutate({ proratesMidMonth: v })} />
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginTop: 8 }}>
+        {MID_MONTH_PRORATION_HINT[prorates ? 'yes' : 'no']}
+      </div>
+    </div>
+  )
+}
+
+// 10/23 (Nic) — DOES THIS PROPERTY TAKE A CHECK AT THE COUNTER?
+//   "we need to add a button to record check payments. That also needs to be
+//    turned on or off if a property chooses to accept checks. A lot of places
+//    don't accept them."
+// A question, like the departure rules, and Yes by default: every property
+// already takes a check on an invoice, so a landlord who never opens this card
+// sees no change, and a missing answer from an older cached page reads Yes too.
+export function AcceptsChecksCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const save = useMutation(
+    (accepted: boolean) => apiPatch(`/properties/${property.id}/accepts-checks`, { accepted }),
+    { onSuccess: onSaved,
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save that answer') })
+  const on = property.acceptsChecks !== false
+  const busy = save.isLoading
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
+      <div style={{ fontSize: '.8rem', color: 'var(--text-1)', fontWeight: 600, marginBottom: 6 }}>
+        {ACCEPTS_CHECKS_QUESTION}
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className={`btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+          onClick={() => !on && save.mutate(true)}>Yes</button>
+        <button className={`btn btn-sm ${!on ? 'btn-primary' : 'btn-ghost'}`} disabled={busy}
+          onClick={() => on && save.mutate(false)}>No</button>
+      </div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginTop: 8 }}>
+        {ACCEPTS_CHECKS_HINT[on ? 'yes' : 'no']}
+      </div>
     </div>
   )
 }

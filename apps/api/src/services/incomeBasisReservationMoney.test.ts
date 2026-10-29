@@ -20,10 +20,11 @@
  * Fix pass of 10/4: two shortenings of one stay, on the same real paths — each
  *   credit comes off its own month, and the second never rewrites the first.
  */
-import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import { incomeTotals, categoryTotals, incomeEvents } from './incomeBasis'
 import {
@@ -43,8 +44,10 @@ vi.mock('../lib/stripe', async (orig) => ({
 }))
 
 beforeEach(cleanupAllSchema)
+// The rate this file's figures are worked out on. It stays open after the file
+// ends: every file states its own now (10/17), so there is nothing to take back
+// — and a rate row is retired, never deleted.
 const RATE_NOTE = 'incomeBasisReservationMoney test rate'
-afterAll(async () => { await db.query(`DELETE FROM platform_processing_rates WHERE notes = $1`, [RATE_NOTE]) })
 
 const cents = (n: number) => Math.round(n * 100) / 100
 const lastDay = (m: string) => new Date(Date.UTC(Number(m.slice(0, 4)), Number(m.slice(5)), 0)).toISOString().slice(0, 10)
@@ -71,12 +74,19 @@ async function reservationLease(o: {
     const tenantId = await seedTenant(c)
     const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
     await seedAllocationRule(c, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
-    await c.query(
-      `INSERT INTO platform_processing_rates (payment_method, customer_facing_flat, customer_facing_percent,
-                                              stripe_cost_flat, stripe_cost_percent, notes)
-       SELECT 'ach', 6, 0, 0, 0.5, $1
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'ach' AND effective_until IS NULL)`,
-      [RATE_NOTE])
+    // 10/17: this used to insert the $6 flat ACH rate only if no ACH rate was
+    // already open. Only one can be open at a time and cleanupAllSchema leaves
+    // the rate card alone, so when an earlier file had opened its own ACH rate
+    // (webhooks seeds 1.0% / 0.5%) this did nothing and every figure below was
+    // worked out against that file's rate instead of the $6 flat these numbers
+    // were derived from. It is why the file went red inside deploy.sh on 10/16
+    // and passed on its own. The rate is now stated outright.
+    await setEffectiveProcessingRate(c, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 6, customerFacingPercent: 0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: RATE_NOTE,
+    })
     const unitId = await seedUnit(c, { propertyId, landlordId, rentAmount: o.rent })
     const leaseId = await seedLease(c, { unitId, landlordId, rentAmount: o.rent, startDate: o.start })
     await seedLeaseTenant(c, { leaseId, tenantId })

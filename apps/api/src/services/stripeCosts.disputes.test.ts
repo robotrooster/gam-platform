@@ -42,6 +42,7 @@ import { webhooksRouter } from '../routes/webhooks'
 import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedAllocationRule, seedLease, seedLeaseTenant,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import {
   disputeFeeReturnedOnWinCents, loadPlatformBalanceBook, marginForMonth, splitPlatformBalance, wonChargebackReturnSourceId, wonDisputeFeeReturnSourceId, type PlatformStripeLive,
@@ -74,7 +75,17 @@ async function stripeCharges(id: string, txnType: string, category: string, amou
      VALUES ($1, $2, $3, $4, NOW())`, [id, txnType, category, amount])
   onBalance -= c2(amount)
 }
-const check = async () => splitPlatformBalance(await loadPlatformBalanceBook(), liveNow())
+/**
+ * 10/12 (Nic, A3): every check here also proves the bridge (earnings ledger →
+ * GAM's own) ends exactly where the check ends — its leftover is the check's
+ * difference, to the cent, whatever the dispute or move-out did.
+ */
+const check = async () => {
+  const split = splitPlatformBalance(await loadPlatformBalanceBook(), liveNow())
+  expect(split.reconciliation?.bridge).toBeTruthy()
+  expect(split.reconciliation?.bridge?.leftover).toBe(split.reconciliation?.gap)
+  return split
+}
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -84,11 +95,14 @@ beforeEach(async () => {
   process.env.STRIPE_SECRET_KEY = 'sk_test_mocked'
   process.env.STRIPE_WEBHOOK_SECRET = 'whsec_mocked'
   // Card: 3.5% + $0.55 to the payer on top; Stripe's cost for the book, 1% + $0.26.
-  await db.query(`DELETE FROM platform_processing_rates WHERE payment_method = 'card'`)
-  await db.query(
-    `INSERT INTO platform_processing_rates
-       (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-     VALUES ('card', 0.55, 3.5, 0.26, 1.0)`)
+  // STATED rather than deleted-and-reinserted: a rate row is effective-dated and
+  // is retired, never removed, and what an earlier file left open is irrelevant.
+  await setEffectiveProcessingRate(db, {
+    paymentMethod: 'card',
+    customerFacingFlat: 0.55, customerFacingPercent: 3.5,
+    stripeCostFlat: 0.26, stripeCostPercent: 1.0,
+    notes: 'stripeCosts.disputes.test.ts card rate',
+  })
   onBalance = 0
 })
 
@@ -114,9 +128,14 @@ async function household(): Promise<H> {
 /** The landlord's next rent is due within the netting window (or not): the dispute recovery nets from it, or pulls. */
 async function nextRentDue(h: H, soon: boolean) {
   await db.query(
+    // 10/15: a due day is 1-28 (leases_rent_due_day_range), because the 29th
+    // does not exist every month. "Two weeks out" was written as today + 14
+    // days, which on the 15th of a month asks for the 29th and the insert is
+    // refused — the suite failed on the date, not on the code. Stepped round
+    // the 28-day cycle instead, which is the furthest from today it can be.
     `UPDATE leases SET rent_due_day = CASE WHEN $2
         THEN EXTRACT(DAY FROM (NOW() AT TIME ZONE 'America/Phoenix'))::int
-        ELSE EXTRACT(DAY FROM (NOW() AT TIME ZONE 'America/Phoenix') + interval '14 days')::int END
+        ELSE ((EXTRACT(DAY FROM (NOW() AT TIME ZONE 'America/Phoenix'))::int - 1 + 14) % 28) + 1 END
       WHERE id = $1`, [h.leaseId, soon])
 }
 

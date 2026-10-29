@@ -12,7 +12,7 @@
  */
 import { describe, it, expect, beforeEach, beforeAll } from 'vitest'
 import { db, query } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, deleteBookingsForTest } from '../test/dbHelpers'
 import { checkOutFor, nightsBetween, createStayBooking, siteIsFree, bookingLeaseTypeFor, reservationDue, priceStayBySchedule, stayTaxRate, taxInside,
   wholeStayPrice, priceWholeStay, leaseDepositFor, stayExtensionQuote, extendStayByMonth, undoStayExtension, payTowardStay } from './registerStay'
 
@@ -353,10 +353,10 @@ describe('adding a month to the stay here now', () => {
   it('is refused for a stay with a lease, an unpaid one, or one that still owes', async () => {
     await expect(stayExtensionQuote(db, { landlordId, propertyId, bookingId: await paidStay({ terms: 'lease' }) }))
       .rejects.toThrow(/has a lease — the lease holds the site/)
-    await query(`DELETE FROM unit_bookings`)
+    await deleteBookingsForTest()
     await expect(stayExtensionQuote(db, { landlordId, propertyId, bookingId: await paidStay({ status: 'tentative' }) }))
       .rejects.toThrow(/not paid yet/)
-    await query(`DELETE FROM unit_bookings`)
+    await deleteBookingsForTest()
     const owes = await paidStay({ balancePaid: false })
     await query(`UPDATE unit_bookings SET deposit_amount = 400 WHERE id = $1`, [owes])
     await expect(stayExtensionQuote(db, { landlordId, propertyId, bookingId: owes })).rejects.toThrow(/still owes \$500\.00/)

@@ -11,9 +11,11 @@
  * Its own file: allocation.test.ts has another writer this round.
  */
 import { describe, it, expect } from 'vitest'
+import type { PoolClient } from 'pg'
 import { executeRentAllocation } from './allocation'
 import {
   withRollback, seedLandlord, seedTenant, seedProperty, seedUnit, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 
 interface Fx { landlordId: string; propertyId: string; unitId: string; tenantId: string; leaseId: string }
@@ -32,14 +34,20 @@ async function fx(client: any, o: { feePayer: 'tenant' | 'landlord'; noRule?: bo
 }
 
 /** The test rates, set inside the rolled-back test: card 3.25% + $0.30 (cost 2.9% + $0.30); bank the flat $6 (cost 0.5%, cap $3). */
-async function rates(client: any) {
-  await client.query(`UPDATE platform_processing_rates SET effective_until = now() WHERE effective_until IS NULL`)
-  await client.query(
-    `INSERT INTO platform_processing_rates
-       (payment_method, customer_facing_flat, customer_facing_percent, customer_facing_cap,
-        stripe_cost_flat, stripe_cost_percent, stripe_cost_cap)
-     VALUES ('card', 0.30, 3.25, NULL, 0.30, 2.9, NULL),
-            ('ach', 6.00, 0, 6.00, 0, 0.5, 3.00)`)
+async function rates(client: PoolClient) {
+  await setEffectiveProcessingRate(client, {
+    paymentMethod: 'card',
+    customerFacingFlat: 0.30, customerFacingPercent: 3.25,
+    stripeCostFlat: 0.30, stripeCostPercent: 2.9,
+    notes: 'allocation fee test card rate',
+  })
+  await setEffectiveProcessingRate(client, {
+    paymentMethod: 'ach',
+    customerFacingFlat: 6.00, customerFacingPercent: 0,
+    stripeCostFlat: 0, stripeCostPercent: 0.5,
+    customerFacingCap: 6.00, stripeCostCap: 3.00,
+    notes: 'allocation fee test ACH rate',
+  })
 }
 
 async function row(client: any, f: Fx, a: { type: string; amount: number; entry: string; owner?: 'landlord' | 'gam' }): Promise<string> {

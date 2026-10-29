@@ -55,7 +55,7 @@ import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import { camelCaseKeys } from '../lib/caseConversion'
 import { errorHandler } from '../middleware/errorHandler'
 import { posRouter } from './pos'
-import { posPayLinksRouter, finalizePayLink, payLinkCharge, createScreeningFeeLink, createBookingDepositLink } from './posPayLinks'
+import { posPayLinksRouter, finalizePayLink, payLinkCharge, screeningLineTotal, createScreeningFeeLink, createBookingDepositLink } from './posPayLinks'
 import { stayNeeds } from '../services/stayTerms'
 import { reservationDue, SCREENING_LINE_NAME } from '../services/registerStay'
 import { incomeEvents } from '../services/incomeBasis'
@@ -242,8 +242,13 @@ describe('Add a month at the register (R6)', () => {
 describe('a stay sent on a pay link', () => {
   const sendLink = (f: F, body: any) => request(app()).post('/api/pos/pay-links').set(auth(f))
     .send({ propertyId: f.propertyId, kind: 'one_time', customer: { name: 'Dale Carter', email: 'dale@t.dev' }, ...body })
+  // 10/21 (Nic): Stripe is charged what the server asked for, and a background
+  // check line takes no card fee on top of it — so the simulated payment has to
+  // leave the check out of the fee the same way the server does, or finalize
+  // reads it as the wrong amount.
   const paidOnline = (link: any, pi: string) => finalizePayLink({
-    id: link.last_checkout_session_id ?? 'cs_any', amount_total: Math.round(payLinkCharge(Number(link.total)).charged * 100), payment_intent: pi,
+    id: link.last_checkout_session_id ?? 'cs_any',
+    amount_total: Math.round(payLinkCharge(Number(link.total), 'customer', screeningLineTotal(link)).charged * 100), payment_intent: pi,
     metadata: { gam_pay_link_id: link.id, gam_landlord_id: link.landlord_id ?? link.landlordId },
     customer_details: { name: 'Dale Carter', email: 'dale@t.dev' },
   })
@@ -255,7 +260,9 @@ describe('a stay sent on a pay link', () => {
     expect(sent.status, JSON.stringify(sent.body)).toBe(201)
     expect(Number(sent.body.data.total)).toBe(Math.round((440 + fee) * 100) / 100)
     const link = (await query<any>(`SELECT * FROM pos_pay_links WHERE id = $1`, [sent.body.data.id]))[0]
-    expect(link.label).toBe('RV site — monthly — 30 nights at site RV 01 (Jun 1 → Jul 1)')
+    // 10/17 (Nic): the guest reads this label, so it names no site — "no site
+    // details given to the customer until morning of arrival."
+    expect(link.label).toBe('RV site — monthly — 30 nights (Jun 1 → Jul 1)')
     expect(link.items.find((l: any) => l.screening)).toMatchObject({ id: null, name: SCREENING_LINE_NAME, price: fee, qty: 1 })
     expect(await reservationDue(db, link.booking_id)).toMatchObject({ total: 440, owed: 440, leaseBillsRest: false })
 
@@ -468,7 +475,8 @@ describe('links the schedule sends for the background check (A2)', () => {
        RETURNING id`, [f.sites[0], f.landlordId]))[0].id
   }
   const paidOnline = (link: any, pi: string) => finalizePayLink({
-    id: 'cs_any', amount_total: Math.round(payLinkCharge(Number(link.total)).charged * 100), payment_intent: pi,
+    id: 'cs_any',
+    amount_total: Math.round(payLinkCharge(Number(link.total), 'customer', screeningLineTotal(link)).charged * 100), payment_intent: pi,
     metadata: { gam_pay_link_id: link.id, gam_landlord_id: link.landlord_id }, customer_details: { name: 'Dale Carter', email: 'dale@t.dev' },
   })
 
@@ -478,7 +486,10 @@ describe('links the schedule sends for the background check (A2)', () => {
     expect(await createScreeningFeeLink({ bookingId: b, landlordId: f.landlordId, propertyId: f.propertyId, amount: 0, guestName: 'Dale', guestEmail: 'dale@t.dev' })).toBeNull()
     const one = await createScreeningFeeLink({ bookingId: b, landlordId: f.landlordId, propertyId: f.propertyId, amount: 42.94, guestName: 'Dale', guestEmail: 'Dale@T.dev' })
     const again = await createScreeningFeeLink({ bookingId: b, landlordId: f.landlordId, propertyId: f.propertyId, amount: 42.94, guestName: 'Dale', guestEmail: 'dale@t.dev' })
-    expect(again).toEqual(one)
+    // The same link back — and `emailed` false on it, because nothing was sent
+    // a second time (10/18: the caller must not record a fresh ask on an old
+    // link).
+    expect(again).toEqual({ ...one!, emailed: false })
     expect(h.emailPayLinkMock).toHaveBeenCalledTimes(1)
     expect(h.emailPayLinkMock.mock.calls[0][0]).toMatchObject({ to: 'dale@t.dev', amount: 42.94, neverExpires: true })
     expect(h.emailPayLinkMock.mock.calls[0][0].note).toMatch(/background check is required/)

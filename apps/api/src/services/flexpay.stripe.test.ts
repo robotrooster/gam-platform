@@ -6,6 +6,11 @@
  * updated to match the code (fronting, retry schedule); landlord paid on the
  * normal Tuesday batch."
  *
+ * 10/26: the monthly fee Nic's quote above calls "$25" is now read from the
+ * flexpay_fee_schedule grid, priced per cycle on what GAM fronts and on the
+ * tenant's benefit Wednesday. FIXTURE_FEE below is the cell this file's
+ * household lands in; nothing here may assume the grid is flat.
+ *
  * The Stripe SDK (customer, payment-method, search and update calls) and the
  * stripeConnect create helper are mocked; everything else — the cover's
  * settle, the owner share, the household lock, the pull row, the advance state
@@ -17,7 +22,7 @@
  *     called off) and never late fees, carried balances, GAM rows, money in
  *     flight, a security deposit, a home payment allocation cannot split yet,
  *     or a line reopened after a dispute; owner share with no fee;
- *     platform_held; $25-only months; the single-lease rule and its successor
+ *     platform_held; fee-only months; the single-lease rule and its successor
  *     carve-out; OTP dedup; idempotent re-runs; notices with no FlexPay wording;
  *     a missed day caught up (worded as late, admin told), for three days, only
  *     for a tenant enrolled before that day; a failed cover alerts the same day.
@@ -27,8 +32,8 @@
  *     verified bank (the default when it is one), never a card or a bank still
  *     verifying; written off only on a run that knows nothing was created; an
  *     adopted intent that already succeeded (merchant payouts after commit).
- *   repriceFlexPayRetryPayment — the covered amount + $25 + $4 per bounce.
- *   reconcileSettledFlexPayPayment — reconciled once, $25 booked once.
+ *   repriceFlexPayRetryPayment — the covered amount + the cycle's fee + $4 per bounce.
+ *   reconcileSettledFlexPayPayment — reconciled once, the fee booked once.
  *   handleFlexPayPaymentNsf — any terminal failure defaults; a scheduled retry
  *     changes nothing; a second counted write-off bans for good (recovered ones
  *     count, GAM-side ones never do, nor make a returner).
@@ -122,6 +127,7 @@ import {
   seedLandlord, seedTenant, seedProperty, seedUnit,
   seedLease, seedLeaseTenant, seedAllocationRule,
   seedUtilityMeter, seedUtilityBill,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 
 const stripeMocks: {
@@ -158,11 +164,15 @@ const at = (ymd: string) => new Date(`${ymd}T12:00:00Z`)   // 5 am Phoenix that 
 beforeEach(async () => {
   await cleanupAllSchema()
   await db.query(`DELETE FROM platform_revenue_ledger`)
-  await db.query(
-    `INSERT INTO platform_processing_rates
-       (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-     SELECT 'ach', 0, 1.0, 0, 0.5
-      WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method='ach' AND effective_until IS NULL)`)
+  // 10/17: the rate this file's figures are worked out on, STATED rather than
+  // seeded-if-missing: one row is open per method and cleanupAllSchema leaves the
+  // rate card alone, so an insert-if-missing took whatever an earlier file left.
+  await setEffectiveProcessingRate(db, {
+    paymentMethod: 'ach',
+    customerFacingFlat: 0, customerFacingPercent: 1.0,
+    stripeCostFlat: 0, stripeCostPercent: 0.5,
+    notes: 'flexpay.stripe.test.ts ACH rate',
+  })
   stripeMocks.customersRetrieve.mockReset()
   stripeMocks.customersRetrieve.mockResolvedValue({
     id: 'cus_default', invoice_settings: { default_payment_method: 'pm_default' }, default_source: null,
@@ -190,6 +200,49 @@ async function enablePlatform(): Promise<void> {
 }
 
 // ─── fixtures ──────────────────────────────────────────────────
+
+/**
+ * What one cycle of FlexPay costs THIS file's household: $40.
+ *
+ * The fee is not a flat $25 any more (10/26). requireFlexPayCycleFee reads it
+ * from flexpay_fee_schedule, priced on how much GAM actually fronts that cycle
+ * crossed with the benefit Wednesday the tenant's pull day falls in. For
+ * seedHousehold that is the whole October bill — $1,000 rent + $60 water =
+ * FIXTURE_BILL, which sits in the $1,000-1,499.99 bracket — on pull day 20,
+ * which is the 3rd benefit Wednesday (benefitWednesdayForPullDay: 15-21 → 3).
+ * The grid's price for that cell is $40.
+ *
+ * Every figure below is derived from these two, so the next re-price moves one
+ * line. A test that deliberately fronts a different amount, or sets another
+ * pull day, prices its own cell of the grid and says which one — the grid is
+ * not flat, and the fixture's price is not a stand-in for "the FlexPay fee".
+ *
+ * The advance remembers it: flexpay_advances.subscription_fee is stamped with
+ * this price at cover and never changed afterward, so it is what GAM books as
+ * revenue and what the cover's notices quote. tenant_fee_amount starts at the
+ * same figure but grows with pass-through return and dispute costs, which are
+ * never GAM earnings.
+ *
+ * FLEXPAY_MONTHLY_FEE (the deprecated flat $25) is NOT this figure: it is the
+ * enrollment-time snapshot seedHousehold writes to tenants.flexpay_monthly_fee,
+ * and the figure bookFlexPayFee falls back to for an advance carrying no
+ * subscription_fee — every historical advance this file inserts by hand.
+ */
+const FIXTURE_BILL = 1060
+const FIXTURE_FEE  = 40
+/** What the pull collects when nothing has bounced. */
+const FIXTURE_PULL = FIXTURE_BILL + FIXTURE_FEE
+/**
+ * The price when the bill was already paid and GAM fronts nothing: $0 fronted
+ * is the $0-999.99 bracket, still on the 3rd Wednesday — $33. A month with
+ * nothing to front still takes that cycle's fee.
+ */
+const FEE_NOTHING_FRONTED = 33
+
+/** A dollar figure as the tenant notices write it: usd(1100) → "$1,100.00". */
+const usd = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+/** The same, escaped for a notice-copy regex. */
+const usdRe = (n: number) => usd(n).replace(/[$.]/g, c => `\\${c}`)
 
 interface Household {
   tenantId:       string
@@ -313,7 +366,10 @@ describe('coverFlexPayCycle — FlexPay pays the whole monthly bill', () => {
 
     expect(adv).toMatchObject({ status: 'fronted', invoice_id: h.invoiceId, pull_day: 20, pull_attempts: 0 })
     expect(Number(adv.rent_amount)).toBe(1060)
-    expect(Number(adv.tenant_fee_amount)).toBe(25)
+    expect(Number(adv.tenant_fee_amount)).toBe(FIXTURE_FEE)
+    // The price the cycle was priced at, stamped and never changed: what GAM
+    // books and what the notices quote. tenant_fee_amount grows past it later.
+    expect(Number(adv.subscription_fee)).toBe(FIXTURE_FEE)
     expect(adv.pull_date_s).toBe('2026-10-20')
 
     // Pull day: the GAM row is written FIRST, then Stripe is asked once.
@@ -331,18 +387,19 @@ describe('coverFlexPayCycle — FlexPay pays the whole monthly bill', () => {
     expect(createRentPlatformChargeMock).toHaveBeenCalledTimes(1)
     const charge = createRentPlatformChargeMock.mock.calls[0][0]
     expect(charge).toMatchObject({
-      amount: 1085, stripeCustomerId: 'cus_flexpay_test', paymentMethodId: 'pm_default',
+      amount: FIXTURE_PULL, stripeCustomerId: 'cus_flexpay_test', paymentMethodId: 'pm_default',
       paymentMethodTypes: ['us_bank_account'], entryDescription: 'FLEXPAY',
       idempotencyKey: `flexpay_pull_${seenAtCreate.id}`,
     })
     expect(charge.metadata).toMatchObject({ gam_purpose: 'flexpay_pull', gam_payment_id: seenAtCreate.id,
-                                            gam_advance_id: adv.id, gam_covered: '1060', gam_fee: '25' })
+                                            gam_advance_id: adv.id, gam_covered: String(FIXTURE_BILL),
+                                            gam_fee: String(FIXTURE_FEE) })
 
     const rows = await pullRowOf(adv.id)
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({ type: 'fee', revenue_owner: 'gam', entry_description: 'FLEXPAY',
                                     status: 'processing', stripe_payment_intent_id: 'pi_pull_1', invoice_id: null })
-    expect(Number(rows[0].amount)).toBe(1085)
+    expect(Number(rows[0].amount)).toBe(FIXTURE_PULL)
     const [pulled] = await advanceOf(h.tenantId)
     expect(pulled.status).toBe('pulled')
     expect(pulled.rent_payment_id).toBe(rows[0].id)
@@ -357,7 +414,7 @@ describe('coverFlexPayCycle — FlexPay pays the whole monthly bill', () => {
     expect(createRentPlatformChargeMock).toHaveBeenCalledTimes(1)
   })
 
-  it('a month already paid still pulls $25 only', async () => {
+  it('a month already paid still pulls the monthly fee only', async () => {
     await enablePlatform()
     const h = await seedHousehold()
     await db.query(`UPDATE payments SET status = 'settled', settled_at = NOW(), manual_method = 'cash'
@@ -367,17 +424,22 @@ describe('coverFlexPayCycle — FlexPay pays the whole monthly bill', () => {
     expect(r).toMatchObject({ bills_covered: 0, paid_already: 1, amount_covered: 0 })
     const [adv] = await advanceOf(h.tenantId)
     expect(Number(adv.rent_amount)).toBe(0)
+    expect(Number(adv.subscription_fee)).toBe(FEE_NOTHING_FRONTED)
     expect(adv.notes).toMatch(/already paid/)
     expect((await payment(h.rentId)).flexpay_advance_id).toBeNull()
-    // The tenant is told the $25 is coming, and nothing else is.
+    // The tenant is told the fee is coming, and nothing else is — at the price
+    // this cycle was stamped with, which is the nothing-fronted bracket's.
     const notes = await db.query<any>(`SELECT body FROM notifications WHERE user_id = $1`, [h.tenantUserId])
     expect(notes.rows.map((n: any) => n.body)).toEqual([
-      'Your October bill was already paid, so FlexPay paid nothing this month. On October 20, GAM collects the $25.00 monthly fee from your bank account.',
+      'Your October bill was already paid, so FlexPay paid nothing this month. ' +
+      `On October 20, GAM collects the ${usd(FEE_NOTHING_FRONTED)} monthly fee from your bank account.`,
     ])
 
     await processFlexPayPullDay(at('2026-10-20'))
-    expect(createRentPlatformChargeMock.mock.calls[0][0].amount).toBe(25)
-    expect(Number((await pullRowOf(adv.id))[0].amount)).toBe(25)
+    // Nothing is fronted, so the price is the $0-999.99 bracket's, not the
+    // fixture's: the fee is priced on what GAM fronts.
+    expect(createRentPlatformChargeMock.mock.calls[0][0].amount).toBe(FEE_NOTHING_FRONTED)
+    expect(Number((await pullRowOf(adv.id))[0].amount)).toBe(FEE_NOTHING_FRONTED)
   })
 
   it('never pays a late fee already charged, a carried balance, GAM\'s own row or a line whose money is moving', async () => {
@@ -561,7 +623,8 @@ describe('coverFlexPayCycle — FlexPay pays the whole monthly bill', () => {
     const [adv] = await advanceOf(h.tenantId)
     expect(Number(adv.rent_amount)).toBe(1000)
     await processFlexPayPullDay(at('2026-10-20'))
-    expect(createRentPlatformChargeMock.mock.calls[0][0].amount).toBe(1025)
+    // $1,000 fronted is the same $1,000-1,499.99 bracket as the fixture's bill.
+    expect(createRentPlatformChargeMock.mock.calls[0][0].amount).toBe(1000 + FIXTURE_FEE)
 
     const [n] = (await tenantNotices(h.tenantUserId)).filter((x: any) => x.type === 'flexpay_bill_covered')
     expect(n.body).toContain('Still due on this bill: Water $40.00 and Fee $30.00.')
@@ -630,8 +693,9 @@ describe('coverFlexPayCycle — FlexPay pays the whole monthly bill', () => {
     const alert = (await db.query<any>(`SELECT * FROM admin_notifications WHERE category = 'flexpay_cover_late'`)).rows
     expect(alert).toHaveLength(1)
     expect(alert[0].body).toContain('A late fee of $50.00 was charged on the bill in between because of this GAM-side delay; GAM paid it for the tenant')
-    expect(alert[0].body).toContain('The tenant will still be charged the $25.00 monthly fee for this month on 2026-10-20.')
-    expect(alert[0].context).toMatchObject({ last_grace_day: '2026-10-05', covered_on: '2026-10-06', late_fees: 0, late_fees_paid_by_gam: 50 })
+    expect(alert[0].body).toContain(`The tenant will still be charged the ${usd(FIXTURE_FEE)} monthly fee for this month on 2026-10-20.`)
+    expect(alert[0].context).toMatchObject({ last_grace_day: '2026-10-05', covered_on: '2026-10-06', late_fees: 0,
+                                             late_fees_paid_by_gam: 50, monthly_fee: FIXTURE_FEE })
 
     // The next day's run finds the cycle done.
     expect((await coverFlexPayCycle(new Date('2026-10-07T10:00:00Z'))).candidates_scanned).toBe(0)
@@ -764,6 +828,28 @@ describe('coverFlexPayCycle — FlexPay pays the whole monthly bill', () => {
     expect((await advanceOf(b.tenantId))).toHaveLength(1)
   })
 
+  // 10/12 (Nic): "Grace = lease, else property, else 5 — the only chain." The
+  // late-fee engine fines a lease with no grace of its own on the park's
+  // grace, so the cover has to land by that grace's last day — lease-else-5
+  // paid a 3-day park's bill two days after its late fee.
+  it('a lease with no grace is covered on the property\'s last grace day; a lease grace still wins', async () => {
+    await enablePlatform()
+    const a = await seedHousehold({ graceDays: null })
+    const b = await seedHousehold({ graceDays: 5 })
+    await db.query(`UPDATE properties SET late_fee_grace_days = 3 WHERE id = ANY($1::uuid[])`,
+      [[a.propertyId, b.propertyId]])
+    // Oct 2, 3 am Phoenix: inside the park's 3 days (the 1st to the 3rd).
+    expect((await coverFlexPayCycle(new Date('2026-10-02T10:00:00Z'))).candidates_scanned).toBe(0)
+    // Oct 3, 3 am Phoenix: the park's last grace day — a is paid, on time; b's
+    // own 5 days run to the 5th, so it waits.
+    const r = await coverFlexPayCycle(new Date('2026-10-03T10:00:00Z'))
+    expect(r).toMatchObject({ candidates_scanned: 1, bills_covered: 1 })
+    expect((await payment(a.rentId)).notes).toBe('Paid on time')
+    expect(await advanceOf(b.tenantId)).toHaveLength(0)
+    expect((await coverFlexPayCycle(COVER_NOW)).bills_covered).toBe(1)
+    expect(await advanceOf(b.tenantId)).toHaveLength(1)
+  })
+
   it('a re-run the same day is a no-op', async () => {
     await enablePlatform()
     const h = await seedHousehold()
@@ -783,7 +869,7 @@ describe('coverFlexPayCycle — FlexPay pays the whole monthly bill', () => {
     expect((await payment(h.rentId)).status).toBe('pending')
   })
 
-  it('a tenant on two leases is paused: no cover and no $25', async () => {
+  it('a tenant on two leases is paused: no cover and no fee', async () => {
     await enablePlatform()
     const h = await seedHousehold()
     const c = await db.connect()
@@ -871,7 +957,7 @@ describe('coverFlexPayCycle — FlexPay pays the whole monthly bill', () => {
     await db.query(`UPDATE tenants SET ach_suspended_at = NOW() WHERE id = $1`, [h.tenantId])
     const r = await coverFlexPayCycle(COVER_NOW)
     expect(r).toMatchObject({ candidates_scanned: 1, bills_covered: 0, paid_already: 0, ended_bank_stopped: 1, errors: 0 })
-    expect(await advanceOf(h.tenantId)).toHaveLength(0)            // nothing fronted, no $25
+    expect(await advanceOf(h.tenantId)).toHaveLength(0)            // nothing fronted, no fee
     expect((await db.query<any>(`SELECT flexpay_enrolled FROM tenants WHERE id = $1`, [h.tenantId])).rows[0].flexpay_enrolled)
       .toBe(false)
     const notes = (await tenantNotices(h.tenantUserId)).filter((n: any) => n.type === 'flexpay_ended')
@@ -1003,7 +1089,7 @@ describe('coverFlexPayCycle — FlexPay pays the whole monthly bill', () => {
     expect(a.context).toMatchObject({ open_amount: 0 })
   })
 
-  it('OTP already paid the landlord this cycle → FlexPay pays nothing and takes only the $25', async () => {
+  it('OTP already paid the landlord this cycle → FlexPay pays nothing and takes only the monthly fee', async () => {
     await enablePlatform()
     const h = await seedHousehold()
     await db.query(
@@ -1035,7 +1121,8 @@ describe('coverFlexPayCycle — FlexPay pays the whole monthly bill', () => {
     expect(tenantNotes.rows).toHaveLength(1)
     expect(tenantNotes.rows[0].type).toBe('flexpay_bill_covered')
     expect(tenantNotes.rows[0].body).toMatch(/FlexPay paid your October bill of \$1,060\.00/)
-    expect(tenantNotes.rows[0].body).toMatch(/On October 20, GAM collects \$1,060\.00 plus the \$25\.00 monthly fee/)
+    expect(tenantNotes.rows[0].body).toMatch(new RegExp(
+      `On October 20, GAM collects ${usdRe(FIXTURE_BILL)} plus the ${usdRe(FIXTURE_FEE)} monthly fee`))
     expect(tenantNotes.rows[0].body).not.toMatch(/repay|owe|loan|borrow/i)
   })
 })
@@ -1104,7 +1191,7 @@ describe('processFlexPayPullDay — GAM collects on the pull day', () => {
     const r = await processFlexPayPullDay(at('2026-10-20'))
     expect(r).toMatchObject({ candidates_scanned: 1, pulls_initiated: 1, errors: 0 })
     expect(createRentPlatformChargeMock).toHaveBeenCalledTimes(1)
-    expect(createRentPlatformChargeMock.mock.calls[0][0].amount).toBe(1085)
+    expect(createRentPlatformChargeMock.mock.calls[0][0].amount).toBe(FIXTURE_PULL)
     expect((await advanceOf(h.tenantId))[0]).toMatchObject({ id: adv.id, status: 'pulled' })
 
     // Nothing new is fronted while hidden: another tenant's bill at its last
@@ -1142,7 +1229,7 @@ describe('processFlexPayPullDay — GAM collects on the pull day', () => {
     expect(ended).toHaveLength(1)
     expect(ended[0].body).toMatch(new RegExp(
       '^GAM could not collect your FlexPay payment for your October bill because there is no verified bank account on your account to collect from, so your FlexPay has ended\\. ' +
-      '\\$1,085\\.00 from FlexPay is still open with GAM\\. It is taken first from the next payment you make through GAM\\. ' +
+      `${usdRe(FIXTURE_PULL)} from FlexPay is still open with GAM\\. It is taken first from the next payment you make through GAM\\. ` +
       'You can join FlexPay again on [A-Z][a-z]+ \\d{1,2}, \\d{4}, once that amount is collected\\. Your next bill is yours to pay\\. ' +
       'Autopay is off\\. You can turn it on in Payments so your bills are paid on time\\.$'))
     // A second run finds nothing to do.
@@ -1319,7 +1406,7 @@ describe('processFlexPayPullDay — GAM collects on the pull day', () => {
     expect(row).toMatchObject({ status: 'settled', stripe_payment_intent_id: 'pi_done' })
     expect((await advanceOf(adv.tenant_id))[0].status).toBe('reconciled')
     const fee = await db.query<any>(`SELECT amount FROM platform_revenue_ledger WHERE type = 'flexpay_subscription'`)
-    expect(fee.rows.map((x: any) => Number(x.amount))).toEqual([25])
+    expect(fee.rows.map((x: any) => Number(x.amount))).toEqual([FIXTURE_FEE])
   })
 
   it('carries any other GAM balance on the same pull (GAM-first routing)', async () => {
@@ -1332,7 +1419,7 @@ describe('processFlexPayPullDay — GAM collects on the pull day', () => {
       [h.tenantId, h.landlordId, h.unitId, h.leaseId])
     await processFlexPayPullDay(at('2026-10-20'))
     const [row] = await pullRowOf(adv.id)
-    expect(Number(row.amount)).toBe(1085 + 465)
+    expect(Number(row.amount)).toBe(FIXTURE_PULL + 465)
     expect(Number(row.gam_supersedence_amount)).toBe(465)
   })
 })
@@ -1420,24 +1507,25 @@ describe('repriceFlexPayRetryPayment — the retry reprice uses the covered amou
     return { h, adv, row }
   }
 
-  it('the first retry collects the covered amount + $25 + one returned-pull fee', async () => {
+  it('the first retry collects the covered amount + the cycle\'s fee + one returned-pull fee', async () => {
     const { adv, row } = await pulledThenBounced(1)
     await repriceFlexPayRetryPayment(row.id)
-    const expected = 1060 + 25 + FLEXPAY_ACH_RETURN_FEE
+    const expected = FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE
     const [piId, args] = stripeMocks.paymentIntentsUpdate.mock.calls[0]
     expect(piId).toBe('pi_repx')
     expect(args.amount).toBe(Math.round(expected * 100))
-    expect(args.metadata).toMatchObject({ gam_covered: '1060', gam_fee: '25', gam_returned_pull_fees: '4', gam_retry: '1',
+    expect(args.metadata).toMatchObject({ gam_covered: String(FIXTURE_BILL), gam_fee: String(FIXTURE_FEE),
+                                          gam_returned_pull_fees: '4', gam_retry: '1',
                                           gam_payment_id: row.id, gam_advance_id: adv.id })
     expect(Number((await payment(row.id)).amount)).toBe(expected)
-    // The $25 is the fee and stays the fee: a retry never re-prices it (S562).
-    expect(Number((await advanceOf(adv.tenant_id))[0].tenant_fee_amount)).toBe(25)
+    // The cycle's price is the fee and stays the fee: a retry never re-prices it.
+    expect(Number((await advanceOf(adv.tenant_id))[0].tenant_fee_amount)).toBe(FIXTURE_FEE)
   })
 
   it('the second retry passes on both bounces at cost', async () => {
     const { row } = await pulledThenBounced(2)
     await repriceFlexPayRetryPayment(row.id)
-    expect(Number((await payment(row.id)).amount)).toBe(1060 + 25 + 2 * FLEXPAY_ACH_RETURN_FEE)
+    expect(Number((await payment(row.id)).amount)).toBe(FIXTURE_PULL + 2 * FLEXPAY_ACH_RETURN_FEE)
   })
 
   it('no-op when the payment is not a FlexPay pull', async () => {
@@ -1459,7 +1547,7 @@ describe('reconcileSettledFlexPayPayment', () => {
     return { h, adv, row }
   }
 
-  it('the pull settling reconciles the advance and books the $25 once', async () => {
+  it('the pull settling reconciles the advance and books the fee once', async () => {
     const { adv, row } = await pulled()
     await db.query(`UPDATE payments SET status = 'settled', settled_at = NOW() WHERE id = $1`, [row.id])
     await reconcileSettledFlexPayPayment(row.id)
@@ -1469,7 +1557,11 @@ describe('reconcileSettledFlexPayPayment', () => {
     expect(a.reconciled_at).not.toBeNull()
     const fee = await db.query<any>(
       `SELECT amount, reference_id, reference_type FROM platform_revenue_ledger WHERE type = 'flexpay_subscription'`)
-    expect(fee.rows).toEqual([{ amount: '25.00', reference_id: adv.id, reference_type: 'flexpay_advance' }])
+    // The whole subscription fee, from the advance's stamped price — not a
+    // figure inferred from a ceiling, which is what used to under-book a cycle
+    // priced above the old flat $25.
+    expect(fee.rows).toEqual([{ amount: FIXTURE_FEE.toFixed(2), reference_id: adv.id,
+                               reference_type: 'flexpay_advance' }])
   })
 
   it('inside the caller\'s transaction it commits or rolls back with it', async () => {
@@ -1516,7 +1608,7 @@ describe('handleFlexPayPaymentNsf — any terminal failure', () => {
     const [a] = await advanceOf(h.tenantId)
     expect(a).toMatchObject({ status: 'defaulted', default_reason: FLEXPAY_DEFAULT_REASONS.pullNotCollected })
     // The one bounce Stripe charged GAM for joins what is written off.
-    expect(Number(a.tenant_fee_amount)).toBe(25 + FLEXPAY_ACH_RETURN_FEE)
+    expect(Number(a.tenant_fee_amount)).toBe(FIXTURE_FEE + FLEXPAY_ACH_RETURN_FEE)
     const t = (await db.query<any>(
       `SELECT flexpay_enrolled, flexpay_disqualified_until, flexpay_disqualified_reason FROM tenants WHERE id = $1`,
       [h.tenantId])).rows[0]
@@ -1533,14 +1625,18 @@ describe('handleFlexPayPaymentNsf — any terminal failure', () => {
     await handleFlexPayPaymentNsf(row.id)
     const [a] = await advanceOf(h.tenantId)
     expect(a.status).toBe('defaulted')
-    expect(Number(a.tenant_fee_amount)).toBe(25 + 3 * FLEXPAY_ACH_RETURN_FEE)
+    expect(Number(a.tenant_fee_amount)).toBe(FIXTURE_FEE + 3 * FLEXPAY_ACH_RETURN_FEE)
+    const writtenOff = FIXTURE_PULL + 3 * FLEXPAY_ACH_RETURN_FEE
     const alert = (await db.query<any>(`SELECT body, context FROM admin_notifications WHERE category = 'flexpay_advance_defaulted'`)).rows[0]
-    expect(alert.body).toContain('$1097.00 is written off, including $12.00 of returned-pull fees passed on at cost')
-    expect(alert.context).toMatchObject({ written_off: 1097, returned_pull_fees: 12 })
-    // Only the $25 is ever booked as earnings, whatever the advance carries.
+    expect(alert.body).toContain(`$${writtenOff.toFixed(2)} is written off, including $${(3 * FLEXPAY_ACH_RETURN_FEE).toFixed(2)} of returned-pull fees passed on at cost`)
+    expect(alert.context).toMatchObject({ written_off: writtenOff, returned_pull_fees: 3 * FLEXPAY_ACH_RETURN_FEE })
+    // Only the subscription fee is ever booked as earnings, whatever the advance
+    // carries: the three returned-pull fees are Stripe's cost passed on, so they
+    // are on tenant_fee_amount and never on the stamped price the book reads.
+    expect(Number(a.subscription_fee)).toBe(FIXTURE_FEE)
     await bookFlexPayFee(a.id)
     const fee = await db.query<any>(`SELECT amount FROM platform_revenue_ledger WHERE type = 'flexpay_subscription'`)
-    expect(fee.rows.map((x: any) => Number(x.amount))).toEqual([25])
+    expect(fee.rows.map((x: any) => Number(x.amount))).toEqual([FIXTURE_FEE])
   })
 
   it('a failure with a retry still scheduled changes nothing', async () => {
@@ -1612,13 +1708,13 @@ describe('handleFlexPayPaymentNsf — any terminal failure', () => {
     // bounce stays counted on the row (the same collection): never folded into
     // the advance.
     expect(a).toMatchObject({ status: 'fronted', default_reason: null })
-    expect(Number(a.tenant_fee_amount)).toBe(25)
+    expect(Number(a.tenant_fee_amount)).toBe(FIXTURE_FEE)
     const again = await payment(row.id)
     expect(again).toMatchObject({ status: 'pending', stripe_payment_intent_id: null, next_retry_at: null, retry_count: 1,
                                   return_reason: FLEXPAY_PULL_REQUEUED_REASON })
-    // What GAM collects: the bill FlexPay paid, the $25, the one bounce's fee
+    // What GAM collects: the bill FlexPay paid, the cycle's fee, the one bounce's fee
     // — and the earlier written-off advance ($465) rides along (GAM-first routing).
-    expect(Number(again.amount)).toBe(1060 + 25 + FLEXPAY_ACH_RETURN_FEE + 465)
+    expect(Number(again.amount)).toBe(FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE + 465)
     expect(Number(again.gam_supersedence_amount)).toBe(465)
     const t = (await db.query<any>(
       `SELECT flexpay_enrolled, flexpay_permanently_banned, flexpay_disqualified_until FROM tenants WHERE id = $1`,
@@ -1635,7 +1731,7 @@ describe('handleFlexPayPaymentNsf — any terminal failure', () => {
     expect((await pullRowOf(adv.id))[0].stripe_payment_intent_id).toBe('pi_again')
     const lastCall = createRentPlatformChargeMock.mock.calls[createRentPlatformChargeMock.mock.calls.length - 1] as any[]
     expect(lastCall[0].idempotencyKey).toMatch(new RegExp(`^flexpay_pull_${row.id}_\\d+$`))
-    expect(lastCall[0].amount).toBe(1060 + 25 + FLEXPAY_ACH_RETURN_FEE + 465)
+    expect(lastCall[0].amount).toBe(FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE + 465)
   })
 
   it('a collection made again keeps its bank returns counted: after two returns, a return on the try made again is the last try, with each return\'s fee written off once', async () => {
@@ -1646,12 +1742,12 @@ describe('handleFlexPayPaymentNsf — any terminal failure', () => {
     // The same collection: its two returns stay counted (the bank sees it at
     // most three times in all), and the try collects both returns' fees.
     expect(again).toMatchObject({ status: 'pending', retry_count: 2, stripe_payment_intent_id: null })
-    expect(Number(again.amount)).toBe(1060 + 25 + 2 * FLEXPAY_ACH_RETURN_FEE)
-    expect(Number((await advanceOf(h.tenantId))[0].tenant_fee_amount)).toBe(25)
+    expect(Number(again.amount)).toBe(FIXTURE_PULL + 2 * FLEXPAY_ACH_RETURN_FEE)
+    expect(Number((await advanceOf(h.tenantId))[0].tenant_fee_amount)).toBe(FIXTURE_FEE)
     createRentPlatformChargeMock.mockResolvedValueOnce({ id: 'pi_third_try', status: 'processing' })
     expect((await processFlexPayPullDay(at('2026-10-24'))).pulls_initiated).toBe(1)
     const lastCall = createRentPlatformChargeMock.mock.calls[createRentPlatformChargeMock.mock.calls.length - 1] as any[]
-    expect(lastCall[0].amount).toBe(1060 + 25 + 2 * FLEXPAY_ACH_RETURN_FEE)
+    expect(lastCall[0].amount).toBe(FIXTURE_PULL + 2 * FLEXPAY_ACH_RETURN_FEE)
     // The bank returns it a third time: no retry is left, so it is the last
     // try failing — the tenant's — and the three returns' fees join what is
     // written off, once each.
@@ -1659,7 +1755,7 @@ describe('handleFlexPayPaymentNsf — any terminal failure', () => {
     await handleFlexPayPaymentNsf(row.id)
     const [a] = await advanceOf(h.tenantId)
     expect(a).toMatchObject({ status: 'defaulted', default_reason: FLEXPAY_DEFAULT_REASONS.pullNotCollected })
-    expect(Number(a.tenant_fee_amount)).toBe(25 + 3 * FLEXPAY_ACH_RETURN_FEE)
+    expect(Number(a.tenant_fee_amount)).toBe(FIXTURE_FEE + 3 * FLEXPAY_ACH_RETURN_FEE)
   })
 
   it('a collection that keeps failing on GAM\'s side is held for a person after the cap, never pulled again', async () => {
@@ -1720,12 +1816,13 @@ describe('handleFlexPayPaymentNsf — any terminal failure', () => {
     expect(ended[0].title).toBe('Your FlexPay has ended')
     expect(ended[0].body).toMatch(new RegExp(
       '^GAM could not collect your FlexPay payment for your October bill on its last try, so your FlexPay has ended\\. ' +
-      '\\$1,089\\.00 from FlexPay is still open with GAM\\. It is taken first from the next payment you make through GAM\\. ' +
+      `${usdRe(FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE)} from FlexPay is still open with GAM\\. It is taken first from the next payment you make through GAM\\. ` +
       'You can join FlexPay again on [A-Z][a-z]+ \\d{1,2}, \\d{4}, once that amount is collected\\. ' +
       'Your next bill is yours to pay\\. Autopay is off\\. You can turn it on in Payments so your bills are paid on time\\.$'))
     expect(ended[0].body).not.toMatch(/repay|\bowe|loan|borrow|debt/i)
     expect(ended[0].action_url).toBe('/payments')
-    expect(ended[0].data).toMatchObject({ why: 'not_collected', still_open: 1089, rejoin_never: false })
+    expect(ended[0].data).toMatchObject({ why: 'not_collected',
+                                          still_open: FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE, rejoin_never: false })
   })
 
   it('a tenant with autopay on is not told autopay is off; a second write-off says FlexPay is gone for good', async () => {
@@ -1951,11 +2048,14 @@ describe('a second bill in the same month', () => {
     expect(notes[1].title).toBe('FlexPay paid your bill due October 10')
     expect(notes[1].body).toBe(
       'FlexPay paid your bill due October 10 of $500.00 to your landlord on time, so it gets no late fee. ' +
-      'On October 20, GAM collects $1,560.00, everything FlexPay paid this month, plus the $25.00 monthly fee from your bank account.')
+      `On October 20, GAM collects ${usd(1560)}, everything FlexPay paid this month, `
+      + `plus the ${usd(FIXTURE_FEE)} monthly fee from your bank account.`)
 
-    // The pull collects both bills and the $25 once.
+    // The pull collects both bills and the cycle's one fee. The fee was priced
+    // when the first cover ran, on that bill alone ($1,060 → $40); a second bill
+    // added to the same advance raises what is collected, never the price.
     await processFlexPayPullDay(at('2026-10-20'))
-    expect(createRentPlatformChargeMock.mock.calls[0][0].amount).toBe(1585)
+    expect(createRentPlatformChargeMock.mock.calls[0][0].amount).toBe(1560 + FIXTURE_FEE)
     // A re-run of either day changes nothing.
     expect((await coverFlexPayCycle(new Date('2026-10-14T10:00:00Z'))).bills_covered).toBe(0)
     expect(Number((await advanceOf(h.tenantId))[0].rent_amount)).toBe(1560)
@@ -2031,8 +2131,8 @@ describe('the cover tells the tenant what is still due', () => {
     await coverFlexPayCycle(COVER_NOW)
     const [n] = await tenantNotices(h.tenantUserId)
     expect(n.body).toBe(
-      'FlexPay paid your October bill of $1,060.00 to your landlord on time. ' +
-      'On October 20, GAM collects $1,060.00 plus the $25.00 monthly fee from your bank account. ' +
+      `FlexPay paid your October bill of ${usd(FIXTURE_BILL)} to your landlord on time. ` +
+      `On October 20, GAM collects ${usd(FIXTURE_BILL)} plus the ${usd(FIXTURE_FEE)} monthly fee from your bank account. ` +
       'Still due on this bill: Security deposit $200.00. ' +
       'Pay what is still due on the Payments page today; your landlord\'s late fee can apply to a bill still open after today.')
     expect(n.body).not.toMatch(/no late fee|repay|owe|loan|borrow/i)
@@ -2103,7 +2203,7 @@ describe('the cover tells the tenant what is still due', () => {
     expect(Number((await ownerShares(h.rentId))[0].amount)).toBe(1000)
   })
 
-  it('a late catch-up of a bill the tenant already paid still tells the admin the $25 is taken on the pull date', async () => {
+  it('a late catch-up of a bill the tenant already paid still tells the admin the fee is taken on the pull date', async () => {
     await enablePlatform()
     const h = await seedHousehold()
     await db.query(`UPDATE payments SET status = 'settled', settled_at = NOW(), manual_method = 'cash'
@@ -2113,8 +2213,11 @@ describe('the cover tells the tenant what is still due', () => {
     const alert = (await db.query<any>(`SELECT * FROM admin_notifications WHERE category = 'flexpay_cover_late'`)).rows
     expect(alert).toHaveLength(1)
     expect(alert[0].body).toContain('the bill had been paid another way, so FlexPay paid nothing')
-    expect(alert[0].body).toContain('The tenant will still be charged the $25.00 monthly fee for this month on 2026-10-20.')
-    expect(alert[0].context).toMatchObject({ monthly_fee: 25, pull_date: '2026-10-20' })
+    // Nothing was fronted, so the cycle was priced in the nothing-fronted
+    // bracket, and the alert quotes that — not the fixture's $40.
+    expect(alert[0].body).toContain(
+      `The tenant will still be charged the ${usd(FEE_NOTHING_FRONTED)} monthly fee for this month on 2026-10-20.`)
+    expect(alert[0].context).toMatchObject({ monthly_fee: FEE_NOTHING_FRONTED, pull_date: '2026-10-20' })
   })
 })
 
@@ -2166,16 +2269,18 @@ describe('the pull: an unknown outcome and an intent GAM finds already failed', 
     expect((await db.query<any>(`SELECT flexpay_enrolled FROM tenants WHERE id = $1`, [h.tenantId])).rows[0].flexpay_enrolled).toBe(true)
     const notes = (await tenantNotices(h.tenantUserId)).filter((n: any) => n.type === 'flexpay_pull_retry')
     expect(notes).toHaveLength(1)
-    expect(notes[0].body).toMatch(/^GAM's FlexPay collection of \$1,085\.00 from your bank account did not go through\. GAM tries again on /)
-    expect(notes[0].body).toContain(' and collects $1,089.00. That includes $4.00, the fee GAM is charged when a bank sends a payment back, passed on at cost.')
+    expect(notes[0].body).toMatch(new RegExp(
+      `^GAM's FlexPay collection of ${usdRe(FIXTURE_PULL)} from your bank account did not go through\\. GAM tries again on `))
+    expect(notes[0].body).toContain(` and collects ${usd(FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE)}. That includes ${usd(FLEXPAY_ACH_RETURN_FEE)}, the fee GAM is charged when a bank sends a payment back, passed on at cost.`)
     expect(notes[0].body).not.toMatch(/repay|owe|loan|borrow/i)
-    expect(notes[0].data).toMatchObject({ failed_amount: 1085, retry_amount: 1089, bounces: 1 })
+    expect(notes[0].data).toMatchObject({ failed_amount: FIXTURE_PULL,
+                                          retry_amount: FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE, bounces: 1 })
     expect(await emailsFor(notes[0].id)).toHaveLength(1)
 
     // The retry pulls exactly what the notice said: the reprice after the retry run claims it.
     await db.query(`UPDATE payments SET retry_count = 1 WHERE id = $1`, [row.id])
     await repriceFlexPayRetryPayment(row.id)
-    expect(Number((await payment(row.id)).amount)).toBe(1089)
+    expect(Number((await payment(row.id)).amount)).toBe(FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE)
   })
 
   it('a notice for a second bounce states what the second retry pulls: both returned-pull fees, the same figure the reprice sets', async () => {
@@ -2185,22 +2290,24 @@ describe('the pull: an unknown outcome and an intent GAM finds already failed', 
     // The first retry already fired (and was repriced) and bounced too.
     await db.query(`UPDATE payments SET retry_count = 1 WHERE id = $1`, [row.id])
     await repriceFlexPayRetryPayment(row.id)
-    expect(Number((await payment(row.id)).amount)).toBe(1089)
+    expect(Number((await payment(row.id)).amount)).toBe(FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE)
     await db.query(`UPDATE payments SET status = 'failed', next_retry_at = NOW() + interval '3 days' WHERE id = $1`, [row.id])
 
     await notifyTenantPullRetry(row.id, '2026-10-27')
     const [n] = (await tenantNotices(h.tenantUserId)).filter((x: any) => x.type === 'flexpay_pull_retry')
     expect(n.title).toBe('FlexPay: GAM tries your bank again on October 27')
     expect(n.body).toBe(
-      'GAM\'s FlexPay collection of $1,089.00 from your bank account did not go through. ' +
-      'GAM tries again on October 27 and collects $1,093.00. ' +
-      'That includes $8.00: $4.00 for each of the 2 times your bank sent this payment back, the fee GAM is charged, passed on at cost. ' +
+      `GAM's FlexPay collection of ${usd(FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE)} from your bank account did not go through. ` +
+      `GAM tries again on October 27 and collects ${usd(FIXTURE_PULL + 2 * FLEXPAY_ACH_RETURN_FEE)}. ` +
+      `That includes ${usd(2 * FLEXPAY_ACH_RETURN_FEE)}: ${usd(FLEXPAY_ACH_RETURN_FEE)} for each of the 2 times your bank sent this payment back, the fee GAM is charged, passed on at cost. ` +
       'Please have the money in the account by then.')
-    expect(n.data).toMatchObject({ failed_amount: 1089, retry_amount: 1093, bounces: 2, returned_pull_fees: 8 })
+    expect(n.data).toMatchObject({ failed_amount: FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE,
+                                   retry_amount: FIXTURE_PULL + 2 * FLEXPAY_ACH_RETURN_FEE,
+                                   bounces: 2, returned_pull_fees: 2 * FLEXPAY_ACH_RETURN_FEE })
 
     await db.query(`UPDATE payments SET retry_count = 2 WHERE id = $1`, [row.id])
     await repriceFlexPayRetryPayment(row.id)
-    expect(Number((await payment(row.id)).amount)).toBe(1093)
+    expect(Number((await payment(row.id)).amount)).toBe(FIXTURE_PULL + 2 * FLEXPAY_ACH_RETURN_FEE)
   })
 
   it('an adopted intent that bounced for good writes the advance off as the tenant\'s', async () => {
@@ -2210,7 +2317,7 @@ describe('the pull: an unknown outcome and an intent GAM finds already failed', 
     expect((await pullRowOf(adv.id))[0]).toMatchObject({ status: 'failed', return_code: 'R02', next_retry_at: null })
     const [a] = await advanceOf(h.tenantId)
     expect(a).toMatchObject({ status: 'defaulted', default_reason: FLEXPAY_DEFAULT_REASONS.pullNotCollected })
-    expect(Number(a.tenant_fee_amount)).toBe(25 + FLEXPAY_ACH_RETURN_FEE)
+    expect(Number(a.tenant_fee_amount)).toBe(FIXTURE_FEE + FLEXPAY_ACH_RETURN_FEE)
     const t = (await db.query<any>(`SELECT flexpay_disqualified_until FROM tenants WHERE id = $1`, [h.tenantId])).rows[0]
     expect(t.flexpay_disqualified_until).not.toBeNull()
   })
@@ -2221,7 +2328,7 @@ describe('the pull: an unknown outcome and an intent GAM finds already failed', 
                   last_payment_error: { type: 'invalid_request_error', code: 'payment_intent_mandate_invalid' } })
     const [a] = await advanceOf(h.tenantId)
     expect(a).toMatchObject({ status: 'fronted', default_reason: null })
-    expect(Number(a.tenant_fee_amount)).toBe(25)
+    expect(Number(a.tenant_fee_amount)).toBe(FIXTURE_FEE)
     expect((await pullRowOf(adv.id))[0]).toMatchObject({ status: 'pending', stripe_payment_intent_id: null, return_reason: FLEXPAY_PULL_REQUEUED_REASON })
     const t = (await db.query<any>(
       `SELECT flexpay_enrolled, flexpay_disqualified_until, flexpay_permanently_banned FROM tenants WHERE id = $1`,
@@ -2238,7 +2345,7 @@ describe('the pull: an unknown outcome and an intent GAM finds already failed', 
     expect(row.return_reason).not.toBe(FLEXPAY_PULL_REQUEUED_REASON)
     const [a] = await advanceOf(h.tenantId)
     expect(a).toMatchObject({ status: 'defaulted', default_reason: FLEXPAY_DEFAULT_REASONS.pullNotCollected })
-    expect(Number(a.tenant_fee_amount)).toBe(25 + FLEXPAY_ACH_RETURN_FEE)
+    expect(Number(a.tenant_fee_amount)).toBe(FIXTURE_FEE + FLEXPAY_ACH_RETURN_FEE)
     expect((await db.query(`SELECT 1 FROM admin_notifications WHERE category = 'flexpay_pull_gam_side'`)).rowCount).toBe(0)
   })
 
@@ -2273,8 +2380,8 @@ describe('handleFlexPayPaymentNsf — a write-off GAM caused adds no bounce it d
     await handleFlexPayPaymentNsf(row.id, undefined, { gamSide: true })
     const [a] = await advanceOf(h.tenantId)
     expect(a.status).toBe('fronted')
-    expect(Number(a.tenant_fee_amount)).toBe(25)
-    expect(Number((await payment(row.id)).amount)).toBe(1085)
+    expect(Number(a.tenant_fee_amount)).toBe(FIXTURE_FEE)
+    expect(Number((await payment(row.id)).amount)).toBe(FIXTURE_PULL)
   })
 })
 
@@ -2292,14 +2399,22 @@ describe('handleFlexPayPullReversed — a settled pull taken back by the bank', 
     await reconcileSettledFlexPayPayment(row.id)
     return { h, adv, row }
   }
+  /**
+   * What the advance carries once the bank has taken the pull back: the
+   * cycle's fee, the one bounce before it cleared, and the $15 Stripe keeps on
+   * the dispute. Both pass-throughs are at cost; GAM keeps none of them.
+   */
+  const TAKEN_BACK_FEES = FIXTURE_FEE + FLEXPAY_ACH_RETURN_FEE + 15
+  /** And what is therefore still open with GAM: the bill plus those. */
+  const TAKEN_BACK_OPEN = FIXTURE_BILL + TAKEN_BACK_FEES
   const feeBook = async () => (await db.query<any>(
     `SELECT type, amount::float AS amount, reference_type FROM platform_revenue_ledger
       WHERE type IN ('flexpay_subscription', 'adjustment') ORDER BY created_at, id`)).rows
 
-  it('a disputed FlexPay pull re-defaults the advance, reverses the $25 and is recovered once by GAM-first routing', async () => {
+  it('a disputed FlexPay pull re-defaults the advance, reverses the fee and is recovered once by GAM-first routing', async () => {
     const { h, adv, row } = await settledPull({ retryCount: 1 })
     expect((await advanceOf(h.tenantId))[0].status).toBe('reconciled')
-    expect(await feeBook()).toEqual([{ type: 'flexpay_subscription', amount: 25, reference_type: 'flexpay_advance' }])
+    expect(await feeBook()).toEqual([{ type: 'flexpay_subscription', amount: FIXTURE_FEE, reference_type: 'flexpay_advance' }])
 
     // The bank took the pull back 40 days on; Stripe kept a $15 dispute fee.
     expect(await handleFlexPayPullReversed(row.id, undefined, { reversalFee: 15 })).toMatchObject({ reversed: true })
@@ -2307,11 +2422,14 @@ describe('handleFlexPayPullReversed — a settled pull taken back by the bank', 
     const [a] = await advanceOf(h.tenantId)
     expect(a).toMatchObject({ status: 'defaulted', default_reason: FLEXPAY_DEFAULT_REASONS.pullNotCollected, reconciled_at: null })
     expect(a.defaulted_at).not.toBeNull()
-    // $25 + one bounce before it cleared ($4) + Stripe's $15: GAM keeps no fee.
-    expect(Number(a.tenant_fee_amount)).toBe(44)
+    // The cycle's fee + one bounce before it cleared ($4) + Stripe's $15: GAM
+    // keeps no fee. The book only ever held the subscription fee, so the
+    // reversal takes exactly that back off it — the two pass-throughs were
+    // never earnings to reverse.
+    expect(Number(a.tenant_fee_amount)).toBe(TAKEN_BACK_FEES)
     expect(await feeBook()).toEqual([
-      { type: 'flexpay_subscription', amount: 25, reference_type: 'flexpay_advance' },
-      { type: 'adjustment', amount: -25, reference_type: 'flexpay_advance_reversal' },
+      { type: 'flexpay_subscription', amount: FIXTURE_FEE, reference_type: 'flexpay_advance' },
+      { type: 'adjustment', amount: -FIXTURE_FEE, reference_type: 'flexpay_advance_reversal' },
     ])
     // The tenant's mark, as for any write-off at their bank: the rejoin wait.
     const t = (await db.query<any>(
@@ -2322,24 +2440,26 @@ describe('handleFlexPayPullReversed — a settled pull taken back by the bank', 
     const alert = (await db.query<any>(`SELECT * FROM admin_notifications WHERE category = 'flexpay_pull_taken_back'`)).rows
     expect(alert).toHaveLength(1)
     expect(alert[0].severity).toBe('critical')
-    expect(alert[0].body).toContain('$1104.00, including $19.00 of Stripe fees passed on at cost')
+    expect(alert[0].body).toContain(`$${TAKEN_BACK_OPEN.toFixed(2)}, including $${(FLEXPAY_ACH_RETURN_FEE + 15).toFixed(2)} of Stripe fees passed on at cost`)
     // The pull row carries the stamp that makes this happen once.
     expect((await payment(row.id)).return_reason).toBe(FLEXPAY_PULL_TAKEN_BACK_REASON)
     // The tenant is told, in plain words.
     const ended = (await tenantNotices(h.tenantUserId)).filter((n: any) => n.type === 'flexpay_ended')
     expect(ended).toHaveLength(1)
-    expect(ended[0].body).toMatch(/^Your bank took back the FlexPay payment GAM collected for your October bill, so your FlexPay has ended\. \$1,104\.00 from FlexPay is still open with GAM\./)
+    expect(ended[0].body).toMatch(new RegExp(
+      '^Your bank took back the FlexPay payment GAM collected for your October bill, so your FlexPay has ended\\. ' +
+      `${usdRe(TAKEN_BACK_OPEN)} from FlexPay is still open with GAM\\.`))
     expect(ended[0].body).not.toMatch(/repay|\bowe|loan|borrow|debt/i)
 
     // A redelivered dispute changes nothing.
     expect(await handleFlexPayPullReversed(row.id, undefined, { reversalFee: 15 })).toMatchObject({ reversed: false })
-    expect(Number((await advanceOf(h.tenantId))[0].tenant_fee_amount)).toBe(44)
+    expect(Number((await advanceOf(h.tenantId))[0].tenant_fee_amount)).toBe(TAKEN_BACK_FEES)
     expect(await feeBook()).toHaveLength(2)
 
     // GAM-first routing recovers the whole of it, once.
     const { computeTenantGamOutstanding, applyTenantSupersedence } = await import('./supersedence')
     expect(await computeTenantGamOutstanding(h.tenantId)).toEqual([
-      expect.objectContaining({ source: 'flexpay_advance', ref_id: adv.id, amount: 1104 })])
+      expect.objectContaining({ source: 'flexpay_advance', ref_id: adv.id, amount: TAKEN_BACK_OPEN })])
     const later = async (boost: number, due: string) => (await db.query<{ id: string }>(
       `INSERT INTO payments (landlord_id, tenant_id, lease_id, unit_id, type, amount, status, entry_description,
                              due_date, gam_supersedence_amount)
@@ -2350,30 +2470,33 @@ describe('handleFlexPayPullReversed — a settled pull taken back by the bank', 
       try { await c.query('BEGIN'); const r = await applyTenantSupersedence(c, id); await c.query('COMMIT'); return r }
       finally { c.release() }
     }
-    expect(await apply(await later(1104, '2026-11-01'))).toMatchObject({ amount_distributed: 1104, amount_residual: 0 })
-    expect(await apply(await later(1104, '2026-12-01'))).toMatchObject({ amount_distributed: 0, amount_residual: 1104 })
+    expect(await apply(await later(TAKEN_BACK_OPEN, '2026-11-01')))
+      .toMatchObject({ amount_distributed: TAKEN_BACK_OPEN, amount_residual: 0 })
+    expect(await apply(await later(TAKEN_BACK_OPEN, '2026-12-01')))
+      .toMatchObject({ amount_distributed: 0, amount_residual: TAKEN_BACK_OPEN })
     expect((await advanceOf(h.tenantId))[0].status).toBe('reconciled')
 
-    // Recovered, the $25 is booked again — once.
+    // Recovered, the fee is booked again — once.
     await bookFlexPayFee(adv.id)
     await bookFlexPayFee(adv.id)
     const book = await feeBook()
     expect(book).toHaveLength(3)
-    expect(book[2]).toEqual({ type: 'flexpay_subscription', amount: 25, reference_type: 'flexpay_advance_rebooked_1' })
-    expect(book.reduce((s: number, r: any) => s + r.amount, 0)).toBe(25)
+    expect(book[2]).toEqual({ type: 'flexpay_subscription', amount: FIXTURE_FEE,
+                              reference_type: 'flexpay_advance_rebooked_1' })
+    expect(book.reduce((s: number, r: any) => s + r.amount, 0)).toBe(FIXTURE_FEE)
   })
 
   it('a dispute redelivered after GAM-first recovery changes nothing: no second fee, no second reversal, GAM balance 0', async () => {
     const { h, adv, row } = await settledPull({ retryCount: 1 })
     expect(await handleFlexPayPullReversed(row.id, undefined, { reversalFee: 15 })).toMatchObject({ reversed: true })
 
-    // GAM-first routing recovers the $1,104 from the tenant's next payment;
-    // the recovery books the $25 again (services/supersedence).
+    // GAM-first routing recovers the whole open amount from the tenant's next payment;
+    // the recovery books the fee again (services/supersedence).
     const { computeTenantGamOutstanding, applyTenantSupersedence } = await import('./supersedence')
     const { rows: [later] } = await db.query<{ id: string }>(
       `INSERT INTO payments (landlord_id, tenant_id, lease_id, unit_id, type, amount, status, entry_description,
                              due_date, gam_supersedence_amount)
-       VALUES ($1, $2, $3, $4, 'rent', 1000, 'settled', 'RENT', '2026-11-01', 1104) RETURNING id`,
+       VALUES ($1, $2, $3, $4, 'rent', 1000, 'settled', 'RENT', '2026-11-01', ${TAKEN_BACK_OPEN}) RETURNING id`,
       [h.landlordId, h.tenantId, h.leaseId, h.unitId])
     const c = await db.connect()
     try { await c.query('BEGIN'); await applyTenantSupersedence(c, later.id); await c.query('COMMIT') }
@@ -2381,16 +2504,16 @@ describe('handleFlexPayPullReversed — a settled pull taken back by the bank', 
     expect((await advanceOf(h.tenantId))[0].status).toBe('reconciled')
     const bookAfterRecovery = await feeBook()
     expect(bookAfterRecovery).toEqual([
-      { type: 'flexpay_subscription', amount: 25, reference_type: 'flexpay_advance' },
-      { type: 'adjustment', amount: -25, reference_type: 'flexpay_advance_reversal' },
-      { type: 'flexpay_subscription', amount: 25, reference_type: 'flexpay_advance_rebooked_1' },
+      { type: 'flexpay_subscription', amount: FIXTURE_FEE, reference_type: 'flexpay_advance' },
+      { type: 'adjustment', amount: -FIXTURE_FEE, reference_type: 'flexpay_advance_reversal' },
+      { type: 'flexpay_subscription', amount: FIXTURE_FEE, reference_type: 'flexpay_advance_rebooked_1' },
     ])
 
     // Stripe redelivers the dispute (or a late return arrives for the same pull).
     expect(await handleFlexPayPullReversed(row.id, undefined, { reversalFee: 15 })).toMatchObject({ reversed: false })
     const [a] = await advanceOf(h.tenantId)
     expect(a).toMatchObject({ id: adv.id, status: 'reconciled' })
-    expect(Number(a.tenant_fee_amount)).toBe(44)                 // no second dispute fee
+    expect(Number(a.tenant_fee_amount)).toBe(TAKEN_BACK_FEES)    // no second dispute fee
     expect(await feeBook()).toEqual(bookAfterRecovery)           // no second reversal
     expect(await computeTenantGamOutstanding(h.tenantId)).toEqual([])   // GAM balance 0
     expect((await db.query(`SELECT 1 FROM admin_notifications WHERE category = 'flexpay_pull_taken_back'`)).rowCount).toBe(1)
@@ -2404,7 +2527,7 @@ describe('handleFlexPayPullReversed — a settled pull taken back by the bank', 
     const { rows: [later] } = await db.query<{ id: string }>(
       `INSERT INTO payments (landlord_id, tenant_id, lease_id, unit_id, type, amount, status, entry_description,
                              due_date, gam_supersedence_amount)
-       VALUES ($1, $2, $3, $4, 'rent', 1000, 'settled', 'RENT', '2026-11-01', 1104) RETURNING id`,
+       VALUES ($1, $2, $3, $4, 'rent', 1000, 'settled', 'RENT', '2026-11-01', ${TAKEN_BACK_OPEN}) RETURNING id`,
       [h.landlordId, h.tenantId, h.leaseId, h.unitId])
     const c = await db.connect()
     try { await c.query('BEGIN'); await applyTenantSupersedence(c, later.id); await c.query('COMMIT') }
@@ -2419,7 +2542,7 @@ describe('handleFlexPayPullReversed — a settled pull taken back by the bank', 
     expect(await handleFlexPayPullReversed(row.id, undefined, { reversalFee: 15 })).toMatchObject({ reversed: false })
     const [a] = await advanceOf(h.tenantId)
     expect(a).toMatchObject({ id: adv.id, status: 'reconciled' })
-    expect(Number(a.tenant_fee_amount)).toBe(44)                 // the $15 dispute fee once, not twice
+    expect(Number(a.tenant_fee_amount)).toBe(TAKEN_BACK_FEES)    // the $15 dispute fee once, not twice
     expect(await feeBook()).toEqual(bookAfterRecovery)           // no second reversal
     expect(await computeTenantGamOutstanding(h.tenantId)).toEqual([])   // never taken from the tenant again
     expect((await db.query(`SELECT 1 FROM admin_notifications WHERE category = 'flexpay_pull_taken_back'`)).rowCount).toBe(1)
@@ -2439,7 +2562,7 @@ describe('handleFlexPayPullReversed — a settled pull taken back by the bank', 
     const { rows: [later] } = await db.query<{ id: string }>(
       `INSERT INTO payments (landlord_id, tenant_id, lease_id, unit_id, type, amount, status, entry_description,
                              due_date, gam_supersedence_amount)
-       VALUES ($1, $2, $3, $4, 'rent', 1000, 'settled', 'RENT', '2026-11-01', 1089) RETURNING id`,
+       VALUES ($1, $2, $3, $4, 'rent', 1000, 'settled', 'RENT', '2026-11-01', ${FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE}) RETURNING id`,
       [h.landlordId, h.tenantId, h.leaseId, h.unitId])
     const { applyTenantSupersedence } = await import('./supersedence')
     const c = await db.connect()
@@ -2481,7 +2604,7 @@ describe('handleFlexPayPullReversed — a settled pull taken back by the bank', 
   })
 
   it('a pull taken back that had recovered an earlier written-off advance writes that one off again, and names any other GAM balance it paid', async () => {
-    const { h, row } = await settledPull()
+    const { h, adv, row } = await settledPull()
     const { rows: [earlier] } = await db.query<{ id: string }>(
       `INSERT INTO flexpay_advances (cycle_month, tenant_id, landlord_id, unit_id, lease_id,
                                      rent_amount, tenant_fee_amount, pull_day, status, defaulted_at, default_reason, reconciled_at)
@@ -2499,9 +2622,16 @@ describe('handleFlexPayPullReversed — a settled pull taken back by the bank', 
     await handleFlexPayPullReversed(row.id)
     const e = (await db.query<any>(`SELECT status, reconciled_at FROM flexpay_advances WHERE id = $1`, [earlier.id])).rows[0]
     expect(e).toMatchObject({ status: 'defaulted', reconciled_at: null })
+    // Each advance's own booked figure comes off, once each. They differ: this
+    // cycle was priced from the table and booked at FIXTURE_FEE, while `earlier`
+    // is seeded by hand with no subscription_fee, so it was booked at
+    // bookFlexPayFee's fallback — the pre-10/26 clamp on its $25 fee. Keyed by
+    // advance rather than ordered, because the ledger's order here is uuid order.
     const reversals = (await db.query<any>(
-      `SELECT reference_id, amount::float AS amount FROM platform_revenue_ledger WHERE type = 'adjustment' ORDER BY reference_id`)).rows
-    expect(reversals.map((r: any) => r.amount)).toEqual([-25, -25])
+      `SELECT reference_id, amount::float AS amount FROM platform_revenue_ledger WHERE type = 'adjustment'`)).rows
+    expect(reversals).toHaveLength(2)
+    expect(Object.fromEntries(reversals.map((r: any) => [r.reference_id, r.amount])))
+      .toEqual({ [adv.id]: -FIXTURE_FEE, [earlier.id]: -25 })
     const alert = (await db.query<any>(`SELECT body, context FROM admin_notifications WHERE category = 'flexpay_pull_taken_back'`)).rows[0]
     expect(alert.context.also_written_off).toEqual([earlier.id])
     // Named in plain words, never by the routing's source code.
@@ -2703,16 +2833,17 @@ describe('adoptFlexPayPullIntent — a pull intent whose id never reached its ro
     return { h, adv, row }
   }
   const md = (row: any, adv: any) => ({ gam_purpose: 'flexpay_pull', gam_payment_id: row.id, gam_advance_id: adv.id,
-                                        gam_tenant_id: adv.tenant_id, gam_covered: '1060', gam_fee: '25' })
+                                        gam_tenant_id: adv.tenant_id, gam_covered: String(FIXTURE_BILL),
+                                        gam_fee: String(FIXTURE_FEE) })
 
-  it('an orphan FlexPay success settles the pull row its metadata names, reconciles the advance and books the $25, and creates no tenant credit', async () => {
+  it('an orphan FlexPay success settles the pull row its metadata names, reconciles the advance and books the fee, and creates no tenant credit', async () => {
     const { h, adv, row } = await lostReply()
     const r = await adoptFlexPayPullIntent({ id: 'pi_orphan_ok', status: 'succeeded', metadata: md(row, adv) })
     expect(r).toBe('recorded')
     expect(await payment(row.id)).toMatchObject({ status: 'settled', stripe_payment_intent_id: 'pi_orphan_ok' })
     expect((await advanceOf(h.tenantId))[0].status).toBe('reconciled')
     const fee = await db.query<any>(`SELECT amount FROM platform_revenue_ledger WHERE type = 'flexpay_subscription'`)
-    expect(fee.rows.map((x: any) => Number(x.amount))).toEqual([25])
+    expect(fee.rows.map((x: any) => Number(x.amount))).toEqual([FIXTURE_FEE])
     // Never the tenant's money: no paid-ahead credit, no issued credit, no remittance.
     expect((await db.query(`SELECT 1 FROM lease_prepaid_credits WHERE tenant_id = $1`, [h.tenantId])).rowCount).toBe(0)
     expect((await db.query(`SELECT 1 FROM tenant_credits WHERE tenant_id = $1`, [h.tenantId])).rowCount).toBe(0)
@@ -2736,7 +2867,8 @@ describe('adoptFlexPayPullIntent — a pull intent whose id never reached its ro
     expect(await payment(row.id)).toMatchObject({ status: 'failed', return_code: 'R01', stripe_payment_intent_id: 'pi_orphan_short' })
     expect((await advanceOf(h.tenantId))[0].status).toBe('pulled')
     const [n] = (await tenantNotices(h.tenantUserId)).filter((x: any) => x.type === 'flexpay_pull_retry')
-    expect(n.data).toMatchObject({ failed_amount: 1085, retry_amount: 1089 })
+    expect(n.data).toMatchObject({ failed_amount: FIXTURE_PULL,
+                                   retry_amount: FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE })
   })
 
   it('an intent that is not a FlexPay pull, names a row of another advance, or names a row already carrying another intent changes nothing; the last two alert', async () => {
@@ -2874,7 +3006,7 @@ describe('Step 10 — FlexPay\'s failure rules and joining again', () => {
     return { h, adv, row }
   }
 
-  it('a pull written off as never made whose intent succeeded after all is recovered: recorded, reconciled, $25 booked, never collected twice', async () => {
+  it('a pull written off as never made whose intent succeeded after all is recovered: recorded, reconciled, the fee booked, never collected twice', async () => {
     const { h, adv, row } = await writtenOffPull()
     const out = await adoptFlexPayPullIntent({ id: 'pi_was_made', status: 'succeeded',
       metadata: { gam_purpose: 'flexpay_pull', gam_payment_id: row.id, gam_advance_id: adv.id } } as any)
@@ -2882,7 +3014,7 @@ describe('Step 10 — FlexPay\'s failure rules and joining again', () => {
     expect(await payment(row.id)).toMatchObject({ status: 'settled', stripe_payment_intent_id: 'pi_was_made' })
     expect((await advanceOf(h.tenantId))[0].status).toBe('reconciled')
     const fee = await db.query<any>(`SELECT amount::float AS a FROM platform_revenue_ledger WHERE reference_id = $1 AND type = 'flexpay_subscription'`, [adv.id])
-    expect(fee.rows).toEqual([{ a: 25 }])
+    expect(fee.rows).toEqual([{ a: FIXTURE_FEE }])
     // Nothing of it is a GAM-side balance any more: GAM-first routing never takes it again.
     expect((await db.query(`SELECT 1 FROM flexpay_advances WHERE tenant_id = $1 AND status = 'defaulted'`, [h.tenantId])).rowCount).toBe(0)
     expect((await db.query(`SELECT 1 FROM admin_notifications WHERE category = 'flexpay_pull_intent_unmatched'`)).rowCount).toBe(1)

@@ -14,7 +14,7 @@
  * Late fees are never set per lease (anti-discrimination — identical
  * terms for every tenant of a unit class). The unit's type resolves the
  * policy automatically, the same way it pulls the matching lease
- * template. This is the ONE resolver both consumers use:
+ * template. This is the ONE resolver every consumer uses:
  *   - document creation (esign createDocumentRecord) stamps the resolved
  *     policy into every drafted lease/renewal → the signed lease snapshot
  *     is the billing source (lease-is-law), so existing leases keep their
@@ -23,6 +23,16 @@
  *     policy popup states the exact fee-start day.
  *   - the late-fee billing cron, which caps every charge at the current
  *     policy (tenant-favorable minimum — see jobs/lateFees.ts).
+ *   - 10/20: a utility service agreement, stamped at creation. It is the
+ *     instrument for billing a space's utilities with no lease behind it, so
+ *     it carries its own late-fee terms and takes them from HERE — the same
+ *     policy a lease would be drafted with. BOTH doors that mint one read this
+ *     resolver: the landlord adding a serviced space next door
+ *     (routes/utilityServiceAgreements) and the register selling a stay of 30+
+ *     nights (services/stayTerms createStayAgreement). They used to copy the
+ *     figures off the property row, which held a $15 flat fee nobody ever
+ *     chose; the stay door is the one that actually stamped it onto the two
+ *     live agreements.
  *
  * Resolution: the (property, unit_type) row, gated by the property's
  * late_fee_enabled master toggle; null when the class has no fee
@@ -148,4 +158,71 @@ export function lateFeePolicyToPrefills(p: ResolvedLateFeePolicy): Record<string
       String(Number(p.late_fee_cap_amount))
   }
   return pv
+}
+
+/**
+ * The resolved policy as the columns a utility service agreement stamps.
+ *
+ * 10/20 (Nic), told the agreement was inheriting its late fee from the dead
+ * property columns: "Yeah, fucking fix it."
+ *
+ * One place says what a stamped late fee looks like, so the route that writes
+ * an agreement and the test that reads one cannot disagree about it.
+ *
+ * A NULL policy — this unit class has no late fee, the property's master
+ * switch is off, or nobody has recorded a policy for the class — stamps NO
+ * FEE: the switch off and every figure empty. It never falls back to a figure
+ * nobody chose; that invented $15 is the exact mistake being undone here.
+ * `initialType` is the one value that cannot be empty
+ * (utility_service_agreements.late_fee_initial_type is NOT NULL), and a type
+ * with no amount behind it is inert — the late-fee engine writes nothing
+ * unless late_fee_enabled is true AND an initial amount is present
+ * (jobs/lateFees qualifyingInvoicesSql).
+ */
+export interface LateFeeAgreementStamp {
+  enabled: boolean
+  graceDays: number | null
+  initialAmount: string | null
+  initialType: 'flat' | 'percent_of_rent'
+  accrualAmount: string | null
+  accrualType: 'flat' | 'percent_of_rent' | null
+  accrualPeriod: 'daily' | 'weekly' | 'monthly' | null
+  /** Where a daily accrual counts from. The agreement column defaults to
+   *  'grace_end', so the policy's own answer is stamped explicitly — Nic's
+   *  parks accrue from the due date itself, and taking the column default
+   *  would quietly start the $5/day five days late. */
+  accrualFrom: 'grace_end' | 'due_date' | 'due_date_inclusive'
+  capAmount: string | null
+  capType: 'flat' | 'percent_of_rent' | null
+}
+
+export function lateFeePolicyToAgreementStamp(
+  p: ResolvedLateFeePolicy | null,
+): LateFeeAgreementStamp {
+  if (!p) {
+    return {
+      enabled: false,
+      graceDays: null,
+      initialAmount: null,
+      initialType: 'flat',
+      accrualAmount: null,
+      accrualType: null,
+      accrualPeriod: null,
+      accrualFrom: 'grace_end',
+      capAmount: null,
+      capType: null,
+    }
+  }
+  return {
+    enabled: true,
+    graceDays: p.late_fee_grace_days,
+    initialAmount: p.late_fee_initial_amount,
+    initialType: p.late_fee_initial_type,
+    accrualAmount: p.late_fee_accrual_amount,
+    accrualType: p.late_fee_accrual_type,
+    accrualPeriod: p.late_fee_accrual_period,
+    accrualFrom: p.late_fee_accrual_from,
+    capAmount: p.late_fee_cap_amount,
+    capType: p.late_fee_cap_type,
+  }
 }

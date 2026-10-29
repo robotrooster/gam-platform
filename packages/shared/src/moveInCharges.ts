@@ -205,11 +205,37 @@ export interface MoveInDefaults { firstMonthRent: number; proration: number }
  *  - New tenant moving in on the due day: the month's rent, no proration.
  *  - New tenant mid-month: the proration; plus the next full month only where
  *    the property collects it up front.
+ *
+ * 10/18 (Nic): "the only way it is different is for longer term people for rent
+ * pro ration. MOVING IN OR OUT at the middle of a month and also only if the
+ * landlord allows the pro rate. these should all be property level settings."
+ * So `proratesMidMonth: false` (properties.prorates_mid_month_rent) is the
+ * move-IN half of that answer, and the half this function owns: a whole month
+ * is a whole month, nothing cut into days.
+ *
+ * WHICH LINE THE WHOLE MONTH LANDS ON, and why it is not the obvious one. The
+ * stretch being charged is still "the move-in day up to the next due date" —
+ * that is what the proration line IS — so at a park that does not cut months
+ * that line carries the whole month, and `firstMonthRent` keeps meaning exactly
+ * what it means everywhere else: the NEXT full period, collected up front only
+ * where the property does that. Putting the whole month on `firstMonthRent`
+ * instead would read better on the page and bill wrong: invoiceGeneration's
+ * paidNextAtMoveIn takes any firstMonthRent on a mid-month lease as the next
+ * due date already paid and skips it, so a resident moving in October 15 would
+ * pay one month and get November free. This way the money matches the move-OUT
+ * mirror (finalMonthRentOnMoveOut: the whole month containing their last day):
+ * in on the 15th, the whole month they moved into; out on the 15th, the whole
+ * month they moved out of; the November bill arrives on the 1st as usual.
  */
 export function moveInDefaults(opts: {
   rent: number; startIso: string | null; existingTenancy: boolean; collectsNextPeriod: boolean
   /** S648: the lease's due day (default the 1st) and the property's rule. */
   dueDay?: number; mode?: RentDueMode | string
+  /**
+   * 10/18 (Nic): does this property prorate rent when a resident moves in or
+   * out mid-month? Left out means yes — what every property has always done.
+   */
+  proratesMidMonth?: boolean
 }): MoveInDefaults {
   const rent = Number(opts.rent) || 0
   const dueDay = opts.dueDay ?? 1
@@ -222,7 +248,9 @@ export function moveInDefaults(opts: {
   }
   return {
     firstMonthRent: opts.collectsNextPeriod ? roundHalfEvenCents(rent) : 0,
-    proration: prorateMoveInRent(rent, opts.startIso!, dueDay),
+    proration: opts.proratesMidMonth === false
+      ? roundHalfEvenCents(rent)
+      : prorateMoveInRent(rent, opts.startIso!, dueDay),
   }
 }
 

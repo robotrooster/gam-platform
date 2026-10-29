@@ -204,3 +204,100 @@ describe('GET /api/background/pool/search — proximity ordering', () => {
     expect(res.body.data[0].proximity_rank).toBe(4)
   })
 })
+
+/**
+ * ── 10/20: THE RENTER POOL'S NOTICE HONORS THE ANSWER TOO ───────────────────
+ *
+ * 'match_interest' was the one notification type the API emitted that was in
+ * NEITHER the catalog NOR the retired list, so it had no switch on any settings
+ * page and no way for a pool member to decline it. It got there by writing a
+ * SECOND notification table — tenant_notifications — which the completeness
+ * scanner never looked at (its regex only read `INSERT INTO notifications`),
+ * and by ignoring in_app_enabled, which no other notification does.
+ *
+ * It is in the catalog now, the scanner reads both tables, and the write below
+ * asks the same question createNotification asks: a missing row means on, an
+ * explicit FALSE means off.
+ */
+describe('a renter-pool member who switched the interest notice off', () => {
+  async function reachOut(poolId: string, token: string) {
+    return request(buildApp())
+      .post(`/api/background/pool/${poolId}/reach-out`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ message: 'We have a space that fits you' })
+  }
+
+  async function landlordToken() {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      await c.query('COMMIT')
+      const { rows } = await db.query<{ email: string }>(`SELECT email FROM users WHERE id = $1`, [userId])
+      return {
+        landlordId,
+        token: sign({
+          userId, role: 'landlord', email: rows[0]!.email, profileId: landlordId,
+          landlordIds: [landlordId], permissions: {},
+        }),
+      }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  const poolUserOf = async (poolId: string) =>
+    (await db.query<{ user_id: string }>(
+      `SELECT user_id FROM application_pool WHERE id = $1`, [poolId])).rows[0]!.user_id
+
+  it('gets the in-app notice when they have answered nothing', async () => {
+    const ll = await landlordToken()
+    const poolId = await seedPoolEntry(ll.landlordId, { city: 'Mesa', state: 'AZ', zip: '85201' })
+    const res = await reachOut(poolId, ll.token)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const { rows } = await db.query(
+      `SELECT type FROM tenant_notifications WHERE user_id = $1`, [await poolUserOf(poolId)])
+    expect(rows.map((r: any) => r.type)).toEqual(['match_interest'])
+  })
+
+  it('gets no in-app notice once they have switched it off', async () => {
+    const ll = await landlordToken()
+    const poolId = await seedPoolEntry(ll.landlordId, { city: 'Mesa', state: 'AZ', zip: '85202' })
+    const userId = await poolUserOf(poolId)
+    await db.query(
+      `INSERT INTO notification_preferences (user_id, type, email_enabled, in_app_enabled)
+       VALUES ($1, 'match_interest', FALSE, FALSE)`, [userId])
+
+    const res = await reachOut(poolId, ll.token)
+    // The reach-out itself still succeeds — the match request is a real record
+    // the landlord made. Only the notice to the member is declined.
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const notices = await db.query(
+      `SELECT 1 FROM tenant_notifications WHERE user_id = $1`, [userId])
+    expect(notices.rows).toEqual([])
+    const matches = await db.query(
+      `SELECT 1 FROM pool_match_requests WHERE pool_entry_id = $1`, [poolId])
+    expect(matches.rows.length).toBe(1)
+  })
+
+  it('and the email beside it is declined by the same answer', async () => {
+    const ll = await landlordToken()
+    const poolId = await seedPoolEntry(ll.landlordId, { city: 'Mesa', state: 'AZ', zip: '85203' })
+    const userId = await poolUserOf(poolId)
+    await db.query(
+      `INSERT INTO notification_preferences (user_id, type, email_enabled, in_app_enabled)
+       VALUES ($1, 'match_interest', FALSE, TRUE)`, [userId])
+    const { rows: who } = await db.query<{ email: string }>(
+      `SELECT email FROM users WHERE id = $1`, [userId])
+
+    expect((await reachOut(poolId, ll.token)).status).toBe(200)
+    const { rows } = await db.query<{ error_message: string | null }>(
+      `SELECT error_message FROM email_send_log
+        WHERE lower(to_email) = lower($1) AND category = 'pool_match_interest'
+        ORDER BY created_at DESC LIMIT 1`, [who[0]!.email])
+    expect(rows[0], 'the send must still be recorded').toBeTruthy()
+    expect(rows[0]!.error_message ?? '').toContain('switched this one off')
+    // In-app was left on, so the portal row is there — "nothing is thrown away".
+    const notices = await db.query(
+      `SELECT 1 FROM tenant_notifications WHERE user_id = $1`, [userId])
+    expect(notices.rows.length).toBe(1)
+  })
+})

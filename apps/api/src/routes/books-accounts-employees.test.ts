@@ -35,6 +35,8 @@
  *     re-stamps access_level from the live scope row onto
  *     req.user.permissions, so a revoked / downgraded scope takes
  *     effect immediately instead of being stuck on the JWT.
+ *     10/12 (Nic): one level — the row decides whether they keep the
+ *     client; access_level no longer narrows what they may do.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
@@ -43,7 +45,7 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 
 import { booksRouter } from './books'
 import { errorHandler } from '../middleware/errorHandler'
@@ -92,9 +94,12 @@ async function seedPortfolio(): Promise<PortfolioFixture> {
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1, 'x', 'bookkeeper', 'Book', 'A', TRUE) RETURNING id`,
       [`bka-${randomUUID()}@test.dev`])
+    // 10/11: a bookkeeper keeps the properties ticked for them — A's one park.
+    // 10/12 (Nic): the Books ledger is the company-wide box's, ticked for them.
+    const parkA = await seedProperty(client, { landlordId: landlordAId, ownerUserId: landlordAUserId, managedByUserId: landlordAUserId })
     await client.query(
-      `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level) VALUES ($1, $2, 'read_write')`,
-      [bkA.rows[0].id, landlordAId])
+      `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level, property_ids, company_wide) VALUES ($1, $2, 'read_write', $3, TRUE)`,
+      [bkA.rows[0].id, landlordAId, [parkA]])
     // Bookkeeper user with NO scope rows.
     const bkU = await client.query<{ id: string }>(
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
@@ -175,19 +180,31 @@ describe('bookkeeper scope validation — S383 fix', () => {
     expect(res.body.data[0].name).toBe('A Bank')
   })
 
-  it('bookkeeper JWT claims read_write but live scope is read_only → middleware re-stamps; writes blocked', async () => {
+  // 10/12 (Nic, ledger decision 2): "Full bookkeeping … One level, no
+  // per-bookkeeper switch." The live scope row still decides — but only
+  // whether they keep this client at all, never a read-only level.
+  it('10/12 one level: a live row that says read_only still writes; a removed row stops writes on the next request', async () => {
     const f = await seedPortfolio()
-    // Downgrade bkA's scope to read_only on the live row.
     await db.query(
       `UPDATE bookkeeper_scopes SET access_level='read_only' WHERE user_id=$1 AND landlord_id=$2`,
       [f.bkAUserId, f.landlordAId])
-    // bkAToken (NOT bkAReadOnly) still claims read_write in its JWT.
+    // bkAReadOnly's pass says read_only too: neither decides.
     const res = await request(buildApp())
+      .post('/api/books/accounts')
+      .set('Authorization', `Bearer ${f.bkAReadOnly}`)
+      .set('X-Client-Id', f.landlordAId)
+      .send({ code: '9999', name: 'Written by the bookkeeper', type: 'asset' })
+    expect(res.status).not.toBe(403)
+    expect(res.status).toBeLessThan(300)
+    expect((await db.query(`SELECT 1 FROM books_accounts WHERE landlord_id = $1 AND code = '9999'`, [f.landlordAId])).rowCount).toBe(1)
+    // The owner removes them: the very next write is refused, whatever the pass says.
+    await db.query(`DELETE FROM bookkeeper_scopes WHERE user_id=$1 AND landlord_id=$2`, [f.bkAUserId, f.landlordAId])
+    const after = await request(buildApp())
       .post('/api/books/accounts')
       .set('Authorization', `Bearer ${f.bkAToken}`)
       .set('X-Client-Id', f.landlordAId)
-      .send({ code: '9999', name: 'Should not write', type: 'asset' })
-    expect(res.status).toBe(403)
+      .send({ code: '9998', name: 'Should not write', type: 'asset' })
+    expect(after.status).toBe(403)
   })
 })
 
@@ -236,7 +253,8 @@ describe('POST /accounts', () => {
       .set('Authorization', `Bearer ${f.landlordAToken}`)
       .send({ name: 'Missing Code' })
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/required/i)
+    // 10/11: said plainly ("Enter an account code.").
+    expect(res.body.error).toMatch(/account code/i)
   })
 
   it('duplicate code per landlord → 409', async () => {
@@ -384,6 +402,8 @@ describe('POST /employees', () => {
     title:               'Property Manager',
     department:          'Operations',
     startDate:           '2026-01-15',
+    // 10/14 (Nic): where the employee's pay goes, set once.
+    payPlace:            'company',
   })
 
   it('happy: creates employee with all required fields', async () => {
@@ -397,6 +417,22 @@ describe('POST /employees', () => {
     expect(Number(res.body.data.state_withholding_pct)).toBe(2.5)
     expect(res.body.data.landlord_id).toBe(f.landlordAId)
     expect(res.body.data.pay_frequency).toBe('biweekly')
+  })
+
+  it('10/11: a phone with an extension past the column size is refused in words, not "value too long"', async () => {
+    const f = await seedPortfolio()
+    const res = await request(buildApp())
+      .post('/api/books/employees')
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .send({ ...happyPayload(), phone: '(602) 555-1234 ext. 12' })
+    expect(res.status).toBe(400)
+    expect(JSON.stringify(res.body)).toContain('A phone number is 20 characters at most.')
+    const emp = (await request(buildApp()).post('/api/books/employees')
+      .set('Authorization', `Bearer ${f.landlordAToken}`).send(happyPayload())).body.data
+    const edit = await request(buildApp()).patch(`/api/books/employees/${emp.id}`)
+      .set('Authorization', `Bearer ${f.landlordAToken}`).send({ title: 'x'.repeat(101) })
+    expect(edit.status).toBe(400)
+    expect(edit.body.error).toBe('A title is 100 characters at most.')
   })
 
   it('legacy azWithholdingPct accepted in place of stateWithholdingPct', async () => {
@@ -556,5 +592,95 @@ describe('PATCH /employees/:id', () => {
     expect(res.body.data.title).toBe('Lead')
     expect(res.body.data.department).toBe('maintenance')  // preserved
     expect(res.body.data.first_name).toBe('Ann')          // preserved
+  })
+})
+
+describe('10/14 (Nic): where an employee\'s pay goes — set once on the employee', () => {
+  const propertyOf = async (landlordId: string) => {
+    const owner = (await db.query<{ user_id: string }>(`SELECT user_id FROM landlords WHERE id = $1`, [landlordId])).rows[0].user_id
+    return seedProperty(db as any, { landlordId, ownerUserId: owner, managedByUserId: owner })
+  }
+  const body = {
+    firstName: 'Ann', lastName: 'Smith', email: 'ann.place@employer.test', phone: '5555550100', address: '100 Main St',
+    ssnLast4: '1234', payType: 'salary', payRate: 55000, payFrequency: 'biweekly', filingStatus: 'single',
+    federalAllowances: 0, stateWithholdingPct: 0, title: 'Manager', department: 'Ops', startDate: '2026-01-15',
+  }
+
+  it('a new employee says where their pay goes; nothing is chosen for them; another company\'s property is refused', async () => {
+    const f = await seedPortfolio()
+    const send = (b: object) => request(buildApp()).post('/api/books/employees').set('Authorization', `Bearer ${f.landlordAToken}`).send(b)
+    const none = await send(body)
+    expect(none.status).toBe(400)
+    expect(none.body.error).toBe('Choose where this employee\'s pay goes: the one property they work at, or company level if they work at several.')
+    expect((await send({ ...body, payPlace: 'property' })).body.error).toBe('Choose the property this employee works at.')
+    expect((await send({ ...body, payPlace: 'property', payPropertyId: await propertyOf(f.landlordBId) })).status).toBe(404)
+    const pA = await propertyOf(f.landlordAId)
+    const ok = await send({ ...body, payPlace: 'property', payPropertyId: pA })
+    expect(ok.status).toBe(201)
+    expect(ok.body.data).toMatchObject({ pay_place: 'property', pay_property_id: pA, pay_place_set_by: f.landlordAUserId })
+    const list = await request(buildApp()).get('/api/books/employees').set('Authorization', `Bearer ${f.landlordAToken}`)
+    expect(list.body.data.find((e: any) => e.id === ok.body.data.id).pay_property_name).toBeTruthy()
+  })
+
+  it('an employee with none gets one (a bookkeeper may set it); the same answer again is fine; a bookkeeper\'s different one is refused and nothing changes', async () => {
+    const f = await seedPortfolio()
+    const id = (await db.query<{ id: string }>(
+      `INSERT INTO books_employees (landlord_id, first_name, last_name, pay_type, pay_rate) VALUES ($1, 'Old', 'Hand', 'salary', 50000) RETURNING id`,
+      [f.landlordAId])).rows[0].id
+    const patch = (b: object, token = f.bkAToken) => request(buildApp()).patch(`/api/books/employees/${id}`)
+      .set('Authorization', `Bearer ${token}`).set('X-Client-Id', f.landlordAId).send(b)
+    expect((await patch({ payPlace: 'company' })).status).toBe(200)
+    expect((await db.query(`SELECT pay_place_set_by FROM books_employees WHERE id = $1`, [id])).rows[0].pay_place_set_by).toBe(f.bkAUserId)
+    expect((await patch({ payPlace: 'company', payPropertyId: null })).status).toBe(200)
+    const moved = await patch({ payPlace: 'property', payPropertyId: await propertyOf(f.landlordAId), title: 'Lead' })
+    expect(moved.status).toBe(403)
+    expect(moved.body.error).toBe('This employee\'s pay goes to company level. Only the owner can change where an employee\'s pay goes.')
+    // A place is changed, never taken away — by anyone.
+    const cleared = await patch({ payPlace: null, payPropertyId: null }, f.landlordAToken)
+    expect(cleared.status).toBe(409)
+    expect(cleared.body.error).toBe('Choose where this employee\'s pay goes: the one property they work at, or company level if they work at several.')
+    // Nothing of the refused form was saved (one transaction).
+    const row = (await db.query(`SELECT pay_place, pay_property_id, title FROM books_employees WHERE id = $1`, [id])).rows[0]
+    expect(row).toEqual({ pay_place: 'company', pay_property_id: null, title: null })
+  })
+
+  it('10/14 afternoon: the owner changes it — only future paychecks follow: a draft run\'s paycheck moves, an approved run stays as it posted', async () => {
+    const f = await seedPortfolio()
+    const pA = await propertyOf(f.landlordAId)
+    const pA2 = await propertyOf(f.landlordAId)
+    const id = (await db.query<{ id: string }>(
+      `INSERT INTO books_employees (landlord_id, first_name, last_name, pay_type, pay_rate, pay_place, pay_property_id, pay_place_set_at)
+       VALUES ($1, 'Moving', 'Worker', 'hourly', 20, 'property', $2, NOW()) RETURNING id`, [f.landlordAId, pA])).rows[0].id
+    const run = async (status: 'draft' | 'approved', payDate: string) => {
+      const r = (await db.query<{ id: string }>(
+        `INSERT INTO payroll_runs (landlord_id, period_start, period_end, pay_date, pay_frequency, status, approved_at)
+         VALUES ($1, $2::date - 13, $2::date, $2::date, 'biweekly', $3::varchar, CASE WHEN $3::varchar = 'approved' THEN NOW() END) RETURNING id`,
+        [f.landlordAId, payDate, status])).rows[0].id
+      const line = (await db.query<{ id: string }>(
+        `INSERT INTO payroll_run_lines (run_id, employee_id, pay_type, gross_pay, net_pay, pay_place, pay_property_id)
+         VALUES ($1, $2, 'hourly', 1600, 1600, 'property', $3) RETURNING id`, [r, id, pA])).rows[0].id
+      return line
+    }
+    const posted = await run('approved', '2026-09-30')
+    const next = await run('draft', '2026-10-14')
+    const placeOf = async (lineId: string) =>
+      (await db.query(`SELECT pay_place, pay_property_id FROM payroll_run_lines WHERE id = $1`, [lineId])).rows[0]
+
+    const res = await request(buildApp()).patch(`/api/books/employees/${id}`)
+      .set('Authorization', `Bearer ${f.landlordAToken}`).send({ payPlace: 'property', payPropertyId: pA2 })
+    expect(res.status).toBe(200)
+    expect(res.body.data).toMatchObject({ pay_place: 'property', pay_property_id: pA2, pay_place_set_by: f.landlordAUserId })
+    expect(await placeOf(next)).toEqual({ pay_place: 'property', pay_property_id: pA2 })
+    expect(await placeOf(posted)).toEqual({ pay_place: 'property', pay_property_id: pA })
+
+    // The person works at several properties now: company level.
+    expect((await request(buildApp()).patch(`/api/books/employees/${id}`)
+      .set('Authorization', `Bearer ${f.landlordAToken}`).send({ payPlace: 'company' })).status).toBe(200)
+    expect(await placeOf(next)).toEqual({ pay_place: 'company', pay_property_id: null })
+    expect(await placeOf(posted)).toEqual({ pay_place: 'property', pay_property_id: pA })
+    // Another company's property is still refused, for the owner too.
+    expect((await request(buildApp()).patch(`/api/books/employees/${id}`)
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .send({ payPlace: 'property', payPropertyId: await propertyOf(f.landlordBId) })).status).toBe(404)
   })
 })

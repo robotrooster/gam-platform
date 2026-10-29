@@ -42,7 +42,7 @@ const midMonth = new Date('2026-09-16T18:00:00Z')
 describe('business monthly fee collection', () => {
   it('nets the fee from held money instead of debiting the business', async () => {
     const { businessId, accrualId } = await seedBusinessWithFee()
-    await recordHeldItem({ businessId, sourceType: 'business_pos_sale', sourceId: 'tx_fee', amount: 40 })
+    await recordHeldItem({ businessId, sourceType: 'business_pos_sale', sourceId: 'tx_fee', amount: 40, property: { propertyId: null } })
     const r = await processBusinessMonthlyFees(midMonth)
     expect(r.collected).toBe(1)
     expect(chargesCreate).not.toHaveBeenCalled()
@@ -61,7 +61,7 @@ describe('business monthly fee collection', () => {
 
   it('falls back to a debit when GAM holds too little', async () => {
     const { businessId, accrualId } = await seedBusinessWithFee()
-    await recordHeldItem({ businessId, sourceType: 'business_pos_sale', sourceId: 'tx_small', amount: 4 })
+    await recordHeldItem({ businessId, sourceType: 'business_pos_sale', sourceId: 'tx_small', amount: 4, property: { propertyId: null } })
     await processBusinessMonthlyFees(midMonth)
     expect(chargesCreate).toHaveBeenCalledTimes(1)
     const { rows: [a] } = await db.query<any>(`SELECT status, stripe_charge_id FROM business_platform_fee_accruals WHERE id = $1`, [accrualId])

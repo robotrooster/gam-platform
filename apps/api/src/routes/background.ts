@@ -1,4 +1,4 @@
-import { Router } from 'express'
+import { Router, type RequestHandler } from 'express'
 import {
   emailNewBackgroundCheck,
   emailBackgroundDecision,
@@ -11,7 +11,7 @@ import { findStayConflict } from '../services/unitAvailability'
 import { getProvider } from '../services/backgroundProvider'
 import { getPoolIntakeShell, isPoolIntakeLandlord } from '../services/poolIntake'
 import { landlordForRequest, landlordScopeIds, resolveLandlordTarget, landlordIdForUnit } from '../lib/landlordScope'
-import { PROCESSING_FEES, SCREENING_VALID_INTERVAL_SQL } from '@gam/shared'
+import { PROCESSING_FEES, SCREENING_VALID_INTERVAL_SQL, type BookingStatus } from '@gam/shared'
 import { refundBackgroundCheckPayment } from '../services/backgroundRefund'
 import { db, query, queryOne, getClient } from '../db'
 import type { PoolClient } from 'pg'
@@ -21,8 +21,6 @@ import { storage, sendStoredFile, uploadKeyFromStored, newStoredFilename } from 
 import { recordScreeningEarnings } from '../services/platformRevenue'
 import crypto from 'crypto'
 import multer from 'multer'
-import path from 'path'
-import fs from 'fs'
 import Stripe from 'stripe'
 import { logger } from '../lib/logger'
 import { stripeSecretKeyOrNull } from '../lib/stripe'
@@ -80,16 +78,51 @@ const IV_LENGTH = 16
 // S561 landlord-billed model (Checkr call 7/27):
 //   SCREENING_CHECKR_COST_USD = GAM's actual cost per report from Checkr.
 //     Checkr Tenant "Essential" ($34.99: financials + rental history +
-//     background + credit score) + Identity-Protection add-on ($2.95: live
-//     ID scan / biometric liveness, always-on) = $37.94. Checkr Tenant prices
+//     background + credit score) + Identity Intelligence add-on ($3.95: live
+//     ID scan / biometric liveness, always-on) = $38.94. Checkr Tenant prices
 //     this FLAT (unlike the employment product's variable county pass-throughs),
 //     so a module constant is correct; if Checkr ever bills a variable/taxed
 //     amount, swap this for the invoiced actual (see accrual note in /submit).
+//
+//   10/21 (Nic, reading Checkr's own pricing page and his September receipts):
+//     the ID scan is $3.95, not the $2.95 this constant was built on, so the
+//     number here was a dollar light. The receipts also proved the add-on had
+//     never actually been ordered — five applicants paid for a live ID scan
+//     that never ran (see backgroundProvider.initiate). Both halves are fixed:
+//     the add-on is now ordered, and the cost it is priced from is the real one.
+//
+//     10/24 — AND THE ADD-ON IS ORDERED BY THIS REQUEST, NOT BY THE DASHBOARD.
+//     This used to say the opposite: that Checkr carries the scan only as a
+//     per-PROPERTY toggle, so every new park needed it switched on by hand or
+//     its first applicant screened without the scan they paid for. Heather
+//     Miller's order settled it the other way. Country Acres did not exist in
+//     Checkr until HER order created it, so the toggle cannot have been on when
+//     it was placed (Nic turned it on afterwards) — and the scan ran anyway. It
+//     is `add_on_products` in the order body below that buys it.
+//
+//     Three things agree, which is why this is stated rather than guessed:
+//     identity_verification came back on her report and on none of the five
+//     before it; her invoice is $2.95 more than theirs; and hers is the only
+//     report carrying the selfie and the licence image, which is what the
+//     product actually produces. Nic: "on Heather, I can see a selfie and the
+//     actual picture of her driver's license. None of the other people have
+//     selfies and driver's license info on there."
+//
+//     WHAT CHECKR BILLED, versus what they advertise: the invoice delta is
+//     $2.95; their signed-in pricing page says $3.95. The constant below stays
+//     at $3.95 on Nic's call (10/24): "If they're only charging us $295, we're
+//     still gonna have our, let's still leave it at $395 in case they ever
+//     raise the price. And for now, we'll just consider it an extra dollar
+//     profit for the platform." So this number is deliberately a dollar above
+//     the current invoice — do not "correct" it to $2.95.
+//
+//     `checkr_id_scan_missing` still fires on a report with no identity
+//     product at all, which is the case worth knowing about.
 //   SCREENING_GAM_MARGIN_USD = GAM's flat margin per report ($5).
-//   Landlord is charged cost + margin ($42.94), netted from disbursement — NOT
+//   Landlord is charged cost + margin ($43.94), netted from disbursement — NOT
 //   charged to the applicant, and NOT run through card processing (the landlord
 //   never makes a payment; it's a receivable, per gam-checkr-billing-model).
-const SCREENING_CHECKR_COST_USD = parseFloat(process.env.SCREENING_CHECKR_COST_USD || '37.94')
+const SCREENING_CHECKR_COST_USD = parseFloat(process.env.SCREENING_CHECKR_COST_USD || '38.94')
 const SCREENING_GAM_MARGIN_USD = parseFloat(process.env.SCREENING_GAM_MARGIN_USD || '5')
 
 // S564/S565: renter-pool applicants pay for their OWN portable screen — one
@@ -222,6 +255,59 @@ const idUpload = multer({
     else cb(new Error('JPEG PNG PDF only'))
   },
 })
+
+// ── PROOF-OF-INCOME UPLOAD STORAGE (10/26, Nic) ──────────────
+//
+//   "We don't have any way on the application for when people do the
+//    background check, we don't have any way for them to upload proof of
+//    income, right? We probably need to start adding that."
+//
+// He raised it while working out the FlexPay income survey, and it is needed
+// in BOTH places, so the uploader is generic: the applicant may attach proof
+// on the application, and the FlexPay eligibility survey attaches to the same
+// store rather than growing a second one.
+//
+// S636 CARE: the six-page intake that collected income and documents was
+// deliberately ripped out ("That link is still showing a six fucking page
+// process"), because none of it reached the screener. This does NOT put it
+// back. Proof of income is OPTIONAL, is one row on a step that already
+// exists, is never a gate on submitting, and is not sent to the screener —
+// Checkr collects what it needs on its own hosted flow. It exists so GAM can
+// answer its own question about fixed income later.
+//
+// Separate directory from id-documents so the per-row auth below can never
+// serve one as the other.
+// A1: memory-staged, storage.save under income-documents/, like idUpload.
+const incomeUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (['image/jpeg', 'image/png', 'application/pdf'].includes(file.mimetype)) cb(null, true)
+    else cb(new Error('JPEG PNG PDF only'))
+  },
+})
+
+/**
+ * 10/26: a wrong file type or an oversized file is the PERSON's mistake, so it
+ * comes back 400 with words they can act on — not the 500 multer's thrown
+ * filter error produced, which told an applicant nothing and logged a fake
+ * server fault. Applies to both document uploads.
+ */
+function fileField(mw: RequestHandler, field: string): RequestHandler {
+  return (req, res, next) => mw(req, res, (err: any) => {
+    if (!err) return next()
+    if (err?.code === 'LIMIT_FILE_SIZE') {
+      return next(new AppError(400, 'That file is larger than 10MB. Try a photo or a smaller scan.'))
+    }
+    if (err?.code === 'LIMIT_UNEXPECTED_FILE') {
+      return next(new AppError(400, `Attach the file as "${field}".`))
+    }
+    if (typeof err?.message === 'string' && err.message.includes('JPEG PNG PDF')) {
+      return next(new AppError(400, 'That has to be a JPEG, a PNG or a PDF.'))
+    }
+    return next(err)
+  })
+}
 
 // ── HELPERS ──────────────────────────────────────────────────
 async function geocodeAddress(street1: string, city: string, state: string, zip: string): Promise<{ lat: string | null, lon: string | null }> {
@@ -803,7 +889,12 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     // Not for the renter pool (no company yet). Never blocks the screening.
     if (!isSpeculative && effectiveLandlordId && tenant?.id) {
       const { applicantRegisterRecord } = await import('../services/posPeople')
-      await applicantRegisterRecord(db, effectiveLandlordId, tenant.id, { firstName, lastName })
+      // 10/20 (review): the book is the company's OWN account, not the caller's
+      // — the caller here is the APPLICANT, and an applicant is not the desk
+      // (services/registerBook accountAsCaller).
+      const { accountAsCaller } = await import('../services/registerBook')
+      await applicantRegisterRecord(db, effectiveLandlordId, tenant.id, { firstName, lastName },
+                                   await accountAsCaller(effectiveLandlordId, query))
         .catch((err: unknown) => logger.warn({ err, checkId: check?.id }, '[background] could not add the applicant to the register'))
     }
 
@@ -824,19 +915,29 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     // again. The response waits for the booking, so no cancel can come first.
     await (async () => {
       const priced = await screeningIntakeFee(state)
-      await recordScreeningEarnings(prepaid
-        ? {
-            backgroundCheckId: check!.id,
-            gamMarginUsd: priced.gamFee,
-            processingChargedUsd: 0,
-            totalChargedUsd: Number(prepaid.amount),
-          }
-        : {
-            backgroundCheckId: check!.id,
-            gamMarginUsd: priced.gamFee,
-            processingChargedUsd: priced.processing,
-            totalChargedUsd: amountChargedUsd ?? priced.total,
-          })
+      // 10/21 (Nic): a check is ONE price now (stayTerms, screeningFee.amount)
+      // and a screening line never takes a card fee on top, so there is no
+      // separate processing charge on a screening to book any more. What GAM
+      // keeps is simply everything that is not Checkr's invoice: the $5 margin
+      // plus the processing that is already inside the price. On a card that
+      // covers Stripe's cut; where nobody swiped a card — cash at the counter,
+      // or a landlord eating it out of a payout — it is GAM's, which is the
+      // "little extra markup on our end" that keeps the price the same for
+      // everybody.
+      //
+      // Figured on what was actually COLLECTED, not on today's list price: a
+      // prepayment taken at the counter weeks ago was collected at whatever a
+      // check cost that day, and Checkr's invoice is the same either way. GAM
+      // keeps the remainder, whatever it happens to be.
+      const gamKeepsOf = (collected: number) =>
+        Math.round(Math.max(0, collected - priced.screening) * 100) / 100
+      const collected = prepaid ? Number(prepaid.amount) : (amountChargedUsd ?? priced.total)
+      await recordScreeningEarnings({
+        backgroundCheckId: check!.id,
+        gamMarginUsd: gamKeepsOf(collected),
+        processingChargedUsd: 0,
+        totalChargedUsd: collected,
+      })
     })().catch(err => logger.error({ err, checkId: check?.id }, '[background] could not book the screening earnings'))
 
     // Risk score (intake-fraud only — disposable email, SSN patterns, IP velocity, prior denials)
@@ -1052,10 +1153,107 @@ backgroundRouter.patch('/notifications/:id/read', requireAuth, async (req, res, 
 })
 
 // ── LANDLORD: LIST + DETAIL ──────────────────────────────────
+// ── BACKGROUND CHECKS PAID FOR AND WAITING ON THE GUEST ──────────────────────
+//
+// 10/21 (Nic): "if it goes to a typoed folder or bounces, how would the tenant
+// sign in to complete the check if they can't sign in with a typoed email?
+// Because they would need the two-factor authentication anyway, right? And then
+// nothing shows the desk it's waiting. Yeah, we need a way to resend it."
+//
+// He is right, and the hole was worse than a missing button. A check paid for
+// at the counter is found again BY THE EMAIL THE STAY WAS SOLD TO. Every GAM
+// account is created with email 2FA on and login needs a verified address, so
+// a guest whose address was mistyped cannot sign in to the inbox the code goes
+// to — and if they sign up with their REAL address instead, the paid check does
+// not match them and they are asked to pay a second time. Their money was
+// simply stuck, and the only trace was a line in a log file.
+//
+// So this is two things, not one: somewhere the desk can SEE what is paid and
+// waiting, and a resend that can CORRECT the address before it sends. Fixing
+// the address moves the check to the new one, which is the whole point — the
+// old one was never reachable.
+backgroundRouter.get('/waiting', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
+  try {
+    const scope = landlordScopeIds((req as any).user)
+    if (!scope.length) return res.json({ success: true, data: [] })
+    const propertyId = typeof req.query.propertyId === 'string' && UUID_RE.test(req.query.propertyId)
+      ? req.query.propertyId : null
+    const rows = await query<any>(`
+      SELECT sp.id, sp.amount::float AS amount, sp.source, sp.created_at,
+             sp.email, sp.booking_id, sp.landlord_id,
+             COALESCE(sp.property_id, bu.property_id) AS property_id,
+             COALESCE(p.name, bp.name) AS property_name,
+             b.guest_name, b.guest_email,
+             to_char(b.check_in, 'YYYY-MM-DD')  AS check_in,
+             to_char(b.check_out, 'YYYY-MM-DD') AS check_out,
+             bu.unit_number,
+             tu.email AS tenant_email,
+             -- Who the link would reach right now, by the same rule that sends
+             -- it (services/stayTerms emailPrepaidScreeningLink).
+             COALESCE(sp.email, tu.email, b.guest_email) AS sends_to
+        FROM screening_prepayments sp
+        LEFT JOIN tenants t        ON t.id  = sp.tenant_id
+        LEFT JOIN users tu         ON tu.id = t.user_id
+        LEFT JOIN unit_bookings b  ON b.id  = sp.booking_id
+        LEFT JOIN units bu         ON bu.id = b.unit_id
+        LEFT JOIN properties bp    ON bp.id = bu.property_id
+        LEFT JOIN properties p     ON p.id  = sp.property_id
+       WHERE sp.status = 'unused'
+         AND sp.landlord_id = ANY($1::uuid[])
+         AND ($2::uuid IS NULL OR COALESCE(sp.property_id, bu.property_id) = $2)
+       ORDER BY sp.created_at`, [scope, propertyId])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+backgroundRouter.post('/waiting/:id/resend', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
+  try {
+    if (!UUID_RE.test(req.params.id)) throw new AppError(404, 'That paid background check is not on this account any more.')
+    const scope = landlordScopeIds((req as any).user)
+    const sp = scope.length ? await queryOne<{ id: string; status: string; email: string | null }>(
+      `SELECT id, status, email FROM screening_prepayments
+        WHERE id = $1 AND landlord_id = ANY($2::uuid[])`, [req.params.id, scope]) : null
+    if (!sp) throw new AppError(404, 'That paid background check is not on this account any more.')
+    if (sp.status !== 'unused') {
+      throw new AppError(409, sp.status === 'used'
+        ? 'They have already done this background check — there is nothing left to send.'
+        : 'That background check was taken back, so there is no link to send.')
+    }
+
+    // Correcting the address is the point of the button, not a side effect:
+    // the old one is why nobody could reach them.
+    const raw = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
+    if (raw) {
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(raw)) {
+        throw new AppError(400, 'That does not look like an email address — check it and press Send again.')
+      }
+      if (raw !== (sp.email || '').toLowerCase()) {
+        await query(`UPDATE screening_prepayments SET email = $2 WHERE id = $1`, [sp.id, raw])
+        logger.info({ prepaymentId: sp.id, from: sp.email, to: raw, by: (req as any).user.userId },
+          '[background] the email on a paid background check was corrected before resending')
+      }
+    }
+
+    const { emailPrepaidScreeningLink } = await import('../services/stayTerms')
+    const { sentTo } = await emailPrepaidScreeningLink(sp.id)
+    if (!sentTo) {
+      throw new AppError(400, 'There is no email address on this background check to send the link to — type theirs in and press Send again.')
+    }
+    res.json({ success: true, data: { sentTo } })
+  } catch (e) { next(e) }
+})
+
 backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
   try {
     const checks = await query<any>(`
       SELECT bc.id, bc.status, bc.first_name, bc.last_name, bc.ssn_last4, bc.date_of_birth,
+        -- 10/19 (Nic): "I can't choose my property on the background check page.
+        -- I can't go to the Oak Park ones, I guess." The list is account-wide,
+        -- so it mixes Mountain View RV Park Ranch LLC and Oak Park Motel and RV
+        -- LLC in one undifferentiated run of names. Which COMPANY a screening
+        -- belongs to was never sent, so the page had nothing to narrow by; the
+        -- property it belongs to comes back below as property_id.
+        bc.landlord_id,
         bc.street1, bc.city, bc.state, bc.zip,
         bc.employment_status, bc.employer_name, bc.employer_phone, bc.monthly_income,
         bc.prev_landlord_name, bc.prev_landlord_phone, bc.prev_landlord_email,
@@ -1098,7 +1296,9 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
         -- guest's approval clears check-in; it is not waiting on a lease.
         st.booking_id AS stay_booking_id, st.stay_terms,
         st.check_in AS stay_check_in, st.check_out AS stay_check_out,
-        st.lease_id AS stay_lease_id
+        -- Whether that stay is behind them. The page prints it; it does not
+        -- work it out from the browser's own clock.
+        st.stay_over, st.lease_id AS stay_lease_id
       FROM background_checks bc
       JOIN users u ON u.id = bc.user_id
       LEFT JOIN LATERAL (${stayForCheckSql('bc', 'u.email')}) st ON TRUE
@@ -1205,34 +1405,108 @@ backgroundRouter.get('/:id', requireAuth, requirePerm('tenants.run_background_ch
 // The stay a check was run for, as a LATERAL subquery on `bc` (the check) and
 // `userEmail` (the applicant's email):
 //   · the stay whose prepaid screening this check used, whatever its status; or
-//   · a live stay of this person at this account that needs screening, on the
-//     site the check names — or, for a check naming no site, one made before
-//     the check was.
+//   · a stay of this person at this account that needs screening, on the site
+//     the check names — or, for a check naming no site, at the park it names,
+//     having begun by the week after they screened and not having ended before
+//     they screened (the three tests are spelled out below).
 // A check run for a different site (the guest applying for a lease elsewhere)
 // is not the stay's.
+//
+// ── 10/19 (Nic): A STAY THAT IS OVER IS STILL THEIR STAY ───────────────────
+//
+// "I just want the background checks because they were approved and I had the
+//  people here for a month. I want them off of the list of doing something with
+//  them. I don't want to click not moving in for now because they did move in
+//  and then they left. So what the hell is the right situation for that?"
+//
+// There is no button to click, and there should not be: a check that found its
+// stay is already filed as done. The match was just too narrow to find one.
+// Victor Cardoza (RV 10) and Nemesio Rivera (RV 11) came to Mountain View on
+// 10-04, stayed 14 nights and checked out 10-18, and their approved checks sat
+// on his attention list asking which space the two of them were taking.
+//
+// It missed them twice over. Their bookings had gone to 'checked_out', which was
+// not on the status list — so a stay stopped counting the moment it finished,
+// which is backwards: a stay that ran to the end is the strongest evidence the
+// screening was for it. And they were walk-ups who screened at the counter
+// before a site was picked, so their checks named no unit and fell to a
+// created_at test that required the booking to EXIST BEFORE the check. Their
+// bookings were written two days after they screened. That ordering says
+// nothing about whose stay it is — screening first and booking minutes later is
+// the normal counter sequence — so it is gone.
+//
+// What replaces it keeps the match tight rather than loosening it. A check that
+// names no space has to clear three tests, and all three are about the stay
+// itself rather than about which row was typed first:
+//
+//   · the park. The check must NAME one (a QR scan carries a park even when it
+//     carries no space) and the stay must be at it. A check carrying neither a
+//     space nor a park — a hand-keyed counter screening with no scan, no invite
+//     and no prior application — matches no stay here at all, because "anywhere
+//     this person ever stayed" spans every company on the account, so a month
+//     at Mountain View would file an Oak Park screening as done.
+//   · the stay had not already ended. check_out is the DEPARTURE day, not a
+//     night (10-04 → 10-18 is 14 nights), so a stay whose check-out IS the day
+//     they screened is over: somebody screening the afternoon they leave is
+//     starting something new. Without this a guest's old finished stay would
+//     quietly clear the NEW check they run years later wanting a lease.
+//   · the stay had started, or was about to. Nothing else bounds the FUTURE,
+//     and a screening taken to get a LEASE must not be swallowed by whatever
+//     stay that person takes next (every stay over three weeks needs screening,
+//     so there is always a candidate). Anastacio Erreguin screened on 09-04 and
+//     is still waiting on a space; park him on a site for a month and his
+//     screening would file itself as done and the lease button would 409.
+//
+// A stay booked further ahead than that window carried its screening fee on the
+// sale that booked it, so its check is joined to it by the prepayment above —
+// by the receipt, not by a date — and none of this applies to it.
+const STAY_HAPPENED_STATUSES: BookingStatus[] = ['tentative', 'confirmed', 'checked_in', 'checked_out']
+// 'cancelled' and 'no_show' are deliberately NOT here. Those stays did not
+// happen, so nothing was screened for — the applicant still needs a space and
+// the check still needs somebody to act on it.
+
+// How long before a stay begins the counter screens for it: a walk-up screens
+// the day they pull in or in the days just before. Deliberately short. Too wide
+// and a later stay claims a lease screening (the silent failure above); too
+// narrow and the check simply stays on the attention list, where the landlord
+// can still draft the lease, set it aside, or check the guest in from the
+// schedule — a visible state, not a wrong one.
+const STAY_SCREENED_AHEAD_DAYS = 7
 const stayForCheckSql = (bc: string, userEmail: string) => `
   SELECT sb.id AS booking_id, sb.unit_id, sb.stay_terms,
          sb.check_in::text AS check_in, sb.check_out::text AS check_out,
+         -- 10/19 (Nic): "they did move in and then they left." Whether that
+         -- stay has run its course is answered HERE, off the database's own
+         -- date, and sent to the page. It used to be worked out in the browser
+         -- from the viewer's clock, so a manager looking from a laptop set to
+         -- another timezone could be told a guest's stay was finished and
+         -- nothing was waiting on them hours before the guest had even left.
+         (sb.check_out <= CURRENT_DATE) AS stay_over,
          -- A8: the stay's own draft lease, when the stay chose one.
          (SELECT sl.id FROM leases sl
            WHERE sl.source_booking_id = sb.id AND sl.status IN ('pending', 'active')
            ORDER BY sl.created_at DESC LIMIT 1) AS lease_id
     FROM unit_bookings sb
+    LEFT JOIN units sbu ON sbu.id = sb.unit_id
    WHERE sb.landlord_id IN (SELECT public.account_companies(${bc}.landlord_id))
      AND (EXISTS (SELECT 1 FROM screening_prepayments sp
                    WHERE sp.used_by_check_id = ${bc}.id AND sp.booking_id = sb.id)
           OR (sb.screening_required
-              AND sb.status IN ('tentative', 'confirmed', 'checked_in')
+              AND sb.status IN (${STAY_HAPPENED_STATUSES.map(s => `'${s}'`).join(', ')})
               AND (sb.tenant_id IN (SELECT t.id FROM tenants t WHERE t.user_id = ${bc}.user_id)
                    OR (sb.guest_email IS NOT NULL AND LOWER(sb.guest_email) = LOWER(${userEmail})))
+              AND sb.check_out > ${bc}.created_at::date
+              AND sb.check_in <= ${bc}.created_at::date + ${STAY_SCREENED_AHEAD_DAYS}
               AND (sb.unit_id = ${bc}.unit_id
-                   OR (${bc}.unit_id IS NULL AND sb.created_at <= ${bc}.created_at))))
+                   -- A check naming no park matches nothing here: a NULL
+                   -- property compares to nothing, which is the intent.
+                   OR (${bc}.unit_id IS NULL AND sbu.property_id = ${bc}.property_id))))
    ORDER BY EXISTS (SELECT 1 FROM screening_prepayments sp
                      WHERE sp.used_by_check_id = ${bc}.id AND sp.booking_id = sb.id) DESC,
             sb.check_in DESC
    LIMIT 1`
 
-interface CheckStay { booking_id: string; unit_id: string; stay_terms: string | null; check_in: string; check_out: string; lease_id: string | null }
+interface CheckStay { booking_id: string; unit_id: string; stay_terms: string | null; check_in: string; check_out: string; stay_over: boolean; lease_id: string | null }
 
 /** What a decision on a stay guest's check answers with: the stay, cleared, and its own lease when it chose one. */
 const stayAnswer = (st: CheckStay) => ({
@@ -1266,8 +1540,28 @@ async function draftLeaseForApprovedCheck(check: any, scope: string[], bodyUnitI
     // node-postgres hands DATE back as a Date object; format it as a day, not
     // via String() ("Thu Oct 01 …" is not a date the drafter can read).
     startDate: ymd(check.desired_move_in),
-    termMonths: check.desired_term_months ? Number(check.desired_term_months) : null,
-    monthToMonth: !!check.desired_month_to_month,
+    // ── 10/24 (Nic, DIRECTIVE) — WHAT AN APPLICANT SAYS IS A NOTE, NOT A TERM ──
+    //
+    //   "Every single lease on both of my properties is month to month... I
+    //    guarantee you that I did not type January 31st into the lease."
+    //   "The 3 months becomes a note, not a contract term, and every drafted
+    //    lease starts month to month with no end date."
+    //
+    // desired_term_months is the applicant's own answer to "how long do you
+    // want to stay" on the screening form — a guess, typed by somebody who has
+    // not seen the place yet. It used to be handed to the drafter as the LEASE
+    // TERM, which computed a hard end date (computeLeaseEnd snaps to month-end)
+    // and silently set lease_type = 'fixed_term'. James Fenton said "3 months"
+    // on 10/5 and got a binding lease ending 2027-01-31 on RV 15 — in the
+    // park's busiest month — which nothing on the lease screen disclosed, and
+    // which the nightly job would then have expired and freed the space for.
+    //
+    // Nic's rule: a lease holds the space until somebody actually leaves, and
+    // paying ahead is the only other way to lock a space out. So the term is
+    // NOT passed. The answer is not thrown away either — it stays on the
+    // background check, which is where the follow-up prompt reads it from.
+    termMonths: null,
+    monthToMonth: true,
     actorUserId,
   })
   // A walk-up's pick is remembered on the check so a second click needs no pick.
@@ -1613,7 +1907,7 @@ backgroundRouter.post('/:id/cancel', requireAuth, async (req, res, next) => {
 })
 
 // ── ID FILE UPLOAD + AUTH-GATED DOWNLOAD ─────────────────────
-backgroundRouter.post('/upload-id', requireAuth, idUpload.single('file'), async (req: any, res: any, next: any) => {
+backgroundRouter.post('/upload-id', requireAuth, fileField(idUpload.single('file'), 'file'), async (req: any, res: any, next: any) => {
   try {
     if (!req.file) throw new AppError(400, 'No file')
     const storedName = newStoredFilename(req.file.originalname)
@@ -1635,6 +1929,42 @@ backgroundRouter.get('/id-files/:filename', requireAuth, async (req, res, next) 
     if (!owner) throw new AppError(404, 'Not found')
     const isApplicant = owner.user_id === req.user!.userId
     // S639: same — an account can own several companies.
+    const isLandlord = !!owner.landlord_id && landlordScopeIds(req.user!).includes(owner.landlord_id)
+    if (!isApplicant && !isLandlord) throw new AppError(403, 'Not authorized')
+    await sendStoredFile(res, key, { stripEmbedBlockers: true })
+  } catch (e) { next(e) }
+})
+
+// ── PROOF-OF-INCOME FILE UPLOAD + AUTH-GATED DOWNLOAD ────────
+// 10/26 (Nic). Mirrors /upload-id exactly, including the per-row auth on the
+// way back out: a file is served only to the person it belongs to or the
+// company screening them. Nothing under uploads/ is ever public.
+backgroundRouter.post('/upload-income', requireAuth, fileField(incomeUpload.single('file'), 'file'),
+  async (req: any, res: any, next: any) => {
+    try {
+      if (!req.file) throw new AppError(400, 'No file')
+      const storedName = newStoredFilename(req.file.originalname)
+      await storage.save(`income-documents/${storedName}`, req.file.buffer)
+      res.json({ success: true, data: {
+        url: '/api/background/income-files/' + storedName,
+        filename: req.file.originalname,
+      } })
+    } catch (e) { next(e) }
+  })
+
+backgroundRouter.get('/income-files/:filename', requireAuth, async (req, res, next) => {
+  try {
+    const key = uploadKeyFromStored('income-documents', req.params.filename)
+    if (!key) throw new AppError(404, 'Not found')
+    const url = '/api/background/income-files/' + req.params.filename
+    // income_document_urls is a jsonb ARRAY of urls, so ownership is a
+    // containment test rather than an equality one — the id-document check
+    // compares a single column and would silently match nothing here.
+    const owner = await queryOne<any>(
+      `SELECT user_id, landlord_id FROM background_checks
+        WHERE income_document_urls @> to_jsonb($1::text)`, [url])
+    if (!owner) throw new AppError(404, 'Not found')
+    const isApplicant = owner.user_id === req.user!.userId
     const isLandlord = !!owner.landlord_id && landlordScopeIds(req.user!).includes(owner.landlord_id)
     if (!isApplicant && !isLandlord) throw new AppError(403, 'Not authorized')
     await sendStoredFile(res, key, { stripEmbedBlockers: true })
@@ -2057,9 +2387,21 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
       [poolMatchLandlordId]
     )
 
+    // 10/20: 'match_interest' is written to tenant_notifications — a SECOND
+    // notification table the renter-pool portal reads — and it ignored
+    // in_app_enabled, which no other notification does. The type had no entry
+    // in the catalog or the retired list either, so there was no switch for it
+    // on any settings page and no way for a pool member to decline it. It is in
+    // the catalog now (residents, resident page) and the email beside this goes
+    // through the same answer (emailCategories: pool_match_interest). The
+    // WHERE NOT EXISTS is the same reading createNotification uses: a missing
+    // row means on, an explicit FALSE means off.
     await query(`
       INSERT INTO tenant_notifications (user_id, type, title, body, data)
-      VALUES ($1, 'match_interest', 'A landlord is interested in you', $2, $3)`,
+      SELECT $1, 'match_interest', 'A landlord is interested in you', $2, $3
+       WHERE NOT EXISTS (SELECT 1 FROM notification_preferences
+                          WHERE user_id = $1 AND type = 'match_interest'
+                            AND in_app_enabled = FALSE)`,
       [
         entry.user_id,
         `${landlordUser?.first_name || ''} ${landlordUser?.last_name || ''}`.trim() +

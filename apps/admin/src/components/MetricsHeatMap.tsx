@@ -1,0 +1,1602 @@
+/**
+ * 10/12 (Nic): the Metrics page heat map.
+ *
+ * "toggleable at the state and county levels. darker colors for more units in
+ * that area. toggleable between a heat map for units and money."
+ *
+ * The numbers come from GET /admin/metrics (`map`, services/platformMetrics):
+ * per state and per county (Census FIPS codes), units = the "Spaces under
+ * management" tile and money = the "Rent logged through GAM" tile, by place.
+ * What the server could not place is listed under the map with the reason —
+ * nothing is placed by a guess, and nothing is quietly left off.
+ *
+ * The shapes are the Census county boundaries in the us-atlas package, already
+ * projected to a 975×610 picture (Albers USA, with Alaska and Hawaii inset).
+ * They are bundled into this app as their own chunk and loaded the first time
+ * the map is shown — never fetched from a CDN. The server places properties
+ * in the same edition of the same shapes, so every county code it sends has a
+ * shape here. The territories (Puerto Rico and the rest) are not in the drawn
+ * picture; a territory with units or rent is named under the map instead.
+ *
+ * 10/12 (Nic, H1): "heat map Units: TOGGLE BOTH (occupied/billed vs all
+ * spaces)". The Units view shows either the spaces occupied this month as GAM
+ * bills them (`occupied`: a lease, a month stay, owner use or a utility
+ * arrangement — the Overview's Active Units count) or every space under
+ * management (`units`). H2 (Nic: "brightest = most (OK)"): unchanged.
+ *
+ * "Darker for more": the color runs from faint to strong gold. In the light
+ * theme strong is a deep, dark gold; on the dark theme strong is full gold —
+ * the strongest color that page has (a near-black "most" would vanish into
+ * the dark page). 10/12 (Nic) review: so the caption says "the stronger the
+ * gold", which is true on both themes. The scale is square-root so one big
+ * park does not wash every smaller place out to nothing; the exact number is
+ * on hover or tap, and every place with a number is in the list beside the
+ * map, which a keyboard or a screen reader reaches.
+ *
+ * 10/12 (Nic) review: each place is painted one solid color, the gold mixed
+ * into the card's own background (heat()), and the color key is painted the
+ * same way from the same strengths — so a place and its number in the key are
+ * the same color, on either theme.
+ *
+ * 10/13 (Nic): more levels and a globe. "Toggle levels for cities,
+ * congressional districts, state legislative districts (senate and house),
+ * and ZIP codes", beside state and county; and "a 3D globe ... click and drag
+ * to rotate the earth ... zooming in and out ... Still like the line art that
+ * it is. I like that grayscale kind of stuff", with a toggle back to the flat
+ * map. Each level's numbers come from the same endpoint (`map.levels`,
+ * services/platformMetricsGeo) and add up to the tiles the same way; each has
+ * its own "Not on this map" list. Cities, state legislative districts and ZIP
+ * codes come one Census file per state — tens of thousands of them nationwide
+ * — and 10/18 (Nic) the page loads a file for every state GAM has data in and
+ * merges them, with "Every state" there for looking beyond GAM's footprint.
+ * Their shapes are Census boundary files the API serves behind admin login,
+ * never from an outside site; the flat map now projects the longitude /
+ * latitude edition of us-atlas exactly as its own Albers file was drawn, so
+ * the flat map, the globe and the server all use one file. The globe is
+ * MetricsGlobe; the shapes and the math are in metricsMapGeo.
+ *
+ * 10/14: the globe is its own chunk, loaded the first time it is shown, so the
+ * flat map never pays for it (loadGlobe).
+ *
+ * 10/17: so is the land around the United States, which the globe turns over —
+ * fetched from the API the first time the globe is shown (loadWorld).
+ *
+ * 10/17 (Nic): THE REST OF THE WORLD, and two overlays.
+ *
+ * The level menu is in two groups now. "That's only pertinent to the United
+ * States for now. Just break the rest of the countries down by states or
+ * province and then possibly cities as well or counties, if they have counties
+ * within those provinces." So: countries, their states and provinces, and —
+ * for the 199 countries that have a level below their provinces — that
+ * country's counties or districts, from a file per country the way a state's
+ * cities are. Voting districts stay United States only. A property lands on a
+ * world level by its map location alone: GAM holds a U.S. state on an address,
+ * never a country, so there is nothing on an address to place one by, and one
+ * with no map location is named under the map as always. The shapes are
+ * Natural Earth and geoBoundaries, served by the API behind admin login;
+ * geoBoundaries is CC BY 4.0 and the credit line under the map says so
+ * whenever that level is drawn (METRICS_MAP_LEVEL_CREDIT).
+ *
+ * SATURATION — "overlay against census data and say, hey, look, we're in Santa
+ * Cruz County and we are responsible for 30% of the population or 60% of the
+ * total rental units ... so we can target areas that have room to grow.
+ * Whereas if we're already highly saturated ... we may not want to have any
+ * more marketing dollars spent there." The color becomes GAM's share of the
+ * area's own market, so the strongest gold is where GAM is most saturated and
+ * the faint places are the room to grow. Three denominators, each its own view
+ * — "show all. because we are doing short term rentals as well as living
+ * situations. its not only regular rentals. toggle each view/metric": renter-
+ * occupied homes, all housing units, total population. The numerator is shown
+ * BOTH ways side by side (every space on GAM, and the spaces occupied this
+ * month); the Occupied / All spaces toggle picks which one the color follows.
+ * The numbers are American Community Survey five-year estimates, fetched once
+ * per level the first time the overlay is turned on (services/platformCensus).
+ * The caption says in words what the percentage on screen is a percentage of.
+ *
+ * CONCENTRATION — "an overlay to show what areas GAM is heavily concentrated
+ * in and how those voting districts kind of line up, and see where we can
+ * focus." Over the congressional and state legislative districts (Nic: United
+ * States only). The color is that district's share of every space GAM has
+ * placed at that level — a share of GAM, not a share of the district, which
+ * the caption says outright so it is never read as saturation.
+ *
+ * 10/18 (Nic): NO STATE TO PICK, AND THE VIEW STAYS PUT.
+ *
+ * "When I change it to the city view, I have to then select between Arizona
+ * and Illinois. I can't just see them all in the city breakdown, like all
+ * every state." So every level is one picture of the whole United States (or
+ * the whole earth): the fine levels load a file per state GAM has data in and
+ * merge them (loadLayerGroups), and the only choice left is whether to go
+ * beyond GAM's footprint to every state there is — on demand, because that is
+ * 3.1 MB of cities or 4.1 MB of ZIP codes, and the map says while it loads. A
+ * state whose file will not load is named under the map; the others still draw.
+ *
+ * "I would like to see about not having the map reset every time I change a
+ * setting. I'd like it to stay — if I zoom in on a certain depth or whatever.
+ * Changing between state and county view leaves it the same." So the card
+ * holds ONE view — where the middle is and how far in it is (MapView) — and
+ * every setting reads it: the level, units or money, occupied or all spaces,
+ * the saturation denominator, the overlays. Both pictures honor it, so the
+ * flat map / globe toggle keeps the middle and the depth as closely as the
+ * two projections allow instead of snapping home. The flat map zooms and pans
+ * for that reason: it is how a state gets looked at closely now that no level
+ * redraws the frame around one.
+ *
+ * 10/18 (Nic, correcting that same day): "if I click a row in the list, it
+ * should snap to it. That's fine. It's just when I'm moving the globe and I
+ * toggle the settings, the filters of the map that I'm looking at, that I
+ * don't want it to move. But clicking the row, if I want to see that, should
+ * snap to that area." So the rule is about what moved it: a SETTING or a
+ * FILTER never moves the view, and a deliberate click on a row moves BOTH
+ * pictures to that area (pickFromList). Reset is still the way home.
+ *
+ * 10/18 (Nic): THREE MORE THINGS.
+ *
+ * THE WINDOW — "I just like the actual counties to be clickable and have it
+ * pull up in a separate little window... if I click on Santa Cruz County in
+ * Arizona, I'd like it to pull up a little window and say, hey, at the last
+ * census this many people lived in this county, people renting on GAM are a
+ * certain percentage of the total population." A pick (on either picture, or
+ * from the list) opens a window over the map with that area's name in plain
+ * words, the three census counts, GAM's own numbers, GAM's share of each of
+ * the three counts BOTH ways — the same saturation maths the overlay colors by
+ * (sharePercent), never a second one — and how the area voted. Where a level
+ * or an area has none of something, it says so instead of showing a blank or
+ * a zero. Opening it moves nothing.
+ *
+ * HOW AN AREA VOTES — "the overlay to show which way those certain districts
+ * vote, and where our strong areas tend to be in Democratic areas or
+ * Republican areas, for the landlord onboarding process and total unit count."
+ * The `lean` overlay colors each area by the contest on screen on a diverging
+ * red/blue scale, with GAM's own spaces marked in gold on top of it and one
+ * sentence beside the list splitting GAM's spaces by which side led. It is a
+ * general election layer, not a presidential one — Nic also asked for "mayor
+ * data, governor data, city council data, voting on public policy" — so the
+ * file holds CONTESTS and the overlay offers whichever ones a level has
+ * (services/platformElections). ONLY COUNTIES ARE EXACT: at every other level
+ * the overlay says plainly that no result is published, because a district
+ * margin worked out from county votes would be a number nobody reported.
+ *
+ * THE GLOBE'S DIVISIONS are in MetricsGlobe: the same country borders and
+ * provinces the flat map draws, every state and province boundary in one light
+ * gray-blue (Nic's decision), fetched the first time the globe is shown.
+ */
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react'
+import type { AxiosInstance } from 'axios'
+import type { MultiLineString } from 'geojson'
+import {
+  CENSUS_BASIS_SLOT, censusCountsNothing, censusNoRowHere, censusNotAtLevel,
+  formatCurrency, formatShare, hasCensus, hasConcentration, hasElections,
+  isMetricsWorldLevel, leanNoResult, leanNotAtLevel, leanStateGap, marginMoveText, marginText,
+  METRICS_CENSUS_BASES, METRICS_CENSUS_BASIS_LABEL, METRICS_CENSUS_BASIS_MEANING, METRICS_CENSUS_BASIS_NOUN,
+  METRICS_CENSUS_OVER_MEANING,
+  METRICS_CONCENTRATION_MEANING, METRICS_LEAN_FULL, METRICS_LEAN_MEANING,
+  METRICS_MAP_COUNTRY_LEVELS, METRICS_MAP_LEVELS, METRICS_MAP_LEVEL_CREDIT,
+  METRICS_MAP_LEVEL_LABEL, METRICS_MAP_LEVEL_NOUN, METRICS_MAP_LEVEL_PLURAL, METRICS_MAP_MEASURES,
+  METRICS_MAP_MEASURE_LABEL, METRICS_MAP_STATE_LEVELS, METRICS_MAP_WORLD_LEVELS, METRICS_MAP_WORLD_NOTE,
+  METRICS_SATURATION_FULL, METRICS_WINDOW_CENSUS, METRICS_WINDOW_GAM, METRICS_WINDOW_SHARE,
+  METRICS_WINDOW_VOTES, offersLean, sharePercent,
+  type MetricsBoundaryLayer, type MetricsCensusBasis, type MetricsElectionFile,
+  type MetricsMapLevel, type MetricsMapMeasure,
+} from '@gam/shared'
+import {
+  DOT_RADIUS, H, HOME_VIEW, LEAN_KEY_STEPS, W, atDepth, dotNeeded, flatLook, flatNational, flatPan,
+  flatWorld, flatZoom,
+  globeViewOf, heat, homeView, layerKey, leanColor, loadCensus, loadElections, loadLayer, loadLayerGroups,
+  loadUsAtlas, loadWorld,
+  nationalProjection, strength, viewOfArea, viewOfGlobe, worldProjection, zoomBy,
+  type CensusLevel, type FlatPicture, type FlatShape, type GeoArea, type GlobeView, type LayerShapes,
+  type MapView, type UsAtlas, type WorldLand,
+} from './metricsMapGeo'
+import type { MetricsGlobe as MetricsGlobeView } from './MetricsGlobe'
+
+export interface MapArea { fips: string; name: string; units: number; occupied?: number; money: number; properties: number }
+export interface MapMissing {
+  reason: string
+  label: string
+  offStateMap: boolean
+  properties: number
+  units: number
+  /** 10/12 (Nic, H1): of `units`, occupied this month as GAM bills them. */
+  occupied?: number
+  money: number
+}
+/** 10/13 (Nic): one city, district or ZIP code (services/platformMetricsGeo), with the state it is drawn with. */
+export interface LevelArea extends MapArea {
+  state: string
+  stateFips: string
+  /** 10/17 (Nic): for an area outside the United States, the country it is in and that country's name. */
+  country?: string
+  countryName?: string
+}
+export interface LevelMissing { reason: string; label: string; properties: number; units: number; occupied?: number; money: number }
+export interface PlatformMapData {
+  states: Array<MapArea & { abbr: string }>
+  counties: Array<MapArea & { state: string }>
+  missing: MapMissing[]
+  /**
+   * 10/13 (Nic): cities, congressional / state senate / state house districts,
+   * ZIP codes. 10/17 (Nic): and the rest of the world — countries, their states
+   * and provinces, and the counties or districts of the countries that have them.
+   */
+  levels?: Partial<Record<MetricsBoundaryLayer, {
+    areas: LevelArea[]
+    missing: LevelMissing[]
+    /** The states (FIPS) GAM has data in at this level — the states drawn by default. */
+    states: string[]
+    /** 10/17 (Nic): and the countries, for a level whose files come one per country. */
+    countries?: string[]
+    /**
+     * 10/18 (Nic): every state (or country) these files cover, for the "Every
+     * state" choice — "I can't just see them all". An API that does not send
+     * it yet simply does not offer that choice.
+     */
+    allStates?: string[]
+    allCountries?: string[]
+  }>>
+}
+
+type Level = MetricsMapLevel
+/** 10/13 (Nic): "a toggle back to the flat map". */
+type View = 'flat' | 'globe'
+/** 10/17 (Nic): Units, Money, and the two overlays — saturation and concentration. */
+type Measure = MetricsMapMeasure
+/** 10/12 (Nic, H1): which spaces the Units view counts. */
+type Spaces = 'occupied' | 'all'
+/** The number a place is colored by. */
+type Field = 'units' | 'occupied' | 'money'
+/** A place in the list: its numbers and the state (or country) it is drawn with. */
+type Listed = MapArea & { stateFips: string; country?: string; countryName?: string }
+/**
+ * 10/18 (Nic): how much of a level whose files come one per state (or country)
+ * to draw. Every state GAM has data in, which is the map he wants by default —
+ * "I can't just see them all in the city breakdown, like all every state" — or
+ * every state there is, for looking beyond GAM's footprint.
+ */
+type Scope = 'data' | 'all'
+
+const count = (n: number) => Math.round(n).toLocaleString('en-US')
+const unitsText = (n: number) => `${count(n)} ${n === 1 ? 'unit' : 'units'}`
+const occupiedText = (n: number) => `${count(n)} occupied ${n === 1 ? 'unit' : 'units'}`
+const valueText = (field: Field, n: number) =>
+  field === 'money' ? formatCurrency(n) : field === 'occupied' ? occupiedText(n) : unitsText(n)
+/** A place's number for a field; an API that does not send `occupied` yet reads as none. */
+const valueOf = (a: { units: number; occupied?: number; money: number }, field: Field) => Number(a[field] ?? 0)
+const propertiesText = (n: number) => `${count(n)} ${n === 1 ? 'property' : 'properties'}`
+/** 10/17 (review): GAM's own side of a saturation share, in words that hold when it is the bigger number. */
+const spacesText = (n: number) => `${count(n)} ${n === 1 ? 'space' : 'spaces'}`
+const capitalized = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
+
+/** How many places the side list shows before "Show all". */
+const TOP = 8
+
+/** The globe, its own chunk; a failed load is forgotten so "Try again" really tries again. */
+type Globe = typeof MetricsGlobeView
+let globePromise: Promise<Globe> | null = null
+function loadGlobe(): Promise<Globe> {
+  if (!globePromise) {
+    globePromise = import('./MetricsGlobe')
+      .then(m => m.MetricsGlobe)
+      .catch(e => { globePromise = null; throw e })
+  }
+  return globePromise
+}
+
+/** Each flat picture is drawn once per page load (thousands of paths), then reused. */
+const flatCache = new WeakMap<object, Map<string, FlatPicture | null>>()
+function cachedFlat(owner: object, key: string, make: () => FlatPicture | null): FlatPicture | null {
+  let m = flatCache.get(owner)
+  if (!m) { m = new Map(); flatCache.set(owner, m) }
+  if (!m.has(key)) m.set(key, make())
+  return m.get(key) ?? null
+}
+
+/**
+ * An area's color. Gold is always GAM's own number; in the lean overlay the
+ * color is the area's VOTE (a diverging red/blue scale) and GAM's number is
+ * the gold marker on top of it, so the two scales are never read as one.
+ * 10/18 (Nic): an area with no result published is left uncolored, never
+ * colored as if it were even.
+ */
+const areaFill = (id: string, shade: Map<string, number>, lean: Map<string, number> | null): string => {
+  if (!lean) return heat(shade.get(id) ?? 0)
+  const margin = lean.get(id)
+  return margin == null ? 'var(--heat-none)' : leanColor(margin)
+}
+
+/** The colored areas. Memoized: hovering re-draws only the outline on top, not ~3,100 counties. */
+const AreaLayer = React.memo(function AreaLayer({ shapes, shade, lean }: {
+  shapes: FlatShape[]; shade: Map<string, number>; lean: Map<string, number> | null
+}) {
+  return (
+    <g>
+      {shapes.map(s => (s.d
+        ? <path key={s.id} d={s.d} data-fips={s.id} style={{ fill: areaFill(s.id, shade, lean) }}/>
+        : null))}
+    </g>
+  )
+})
+
+function Toggle<T extends string>({ label, value, options, onChange }: {
+  label: string; value: T; options: Array<{ value: T; label: string }>; onChange: (v: T) => void
+}) {
+  return (
+    <div className="mhm-seg" role="group" aria-label={label}>
+      {options.map(o => (
+        <button key={o.value} type="button" aria-pressed={o.value === value}
+          className={o.value === value ? 'on' : ''} onClick={() => onChange(o.value)}>{o.label}</button>
+      ))}
+    </div>
+  )
+}
+
+export function MetricsHeatMap({ data, api }: { data: PlatformMapData | null | undefined; api?: AxiosInstance }) {
+  const [view, setView] = useState<View>('flat')
+  const [level, setLevel] = useState<Level>('state')
+  // 10/18 (Nic): no state to pick any more — every state GAM has data in is
+  // on the map. This is only how far past GAM's footprint to go, and it is a
+  // setting like any other: changing the level keeps it.
+  const [scope, setScope] = useState<Scope>('data')
+  const [chosenMeasure, setMeasure] = useState<Measure>('units')
+  const [spaces, setSpaces] = useState<Spaces>('occupied')
+  // 10/17 (Nic): which census number the saturation overlay divides by.
+  const [basis, setBasis] = useState<MetricsCensusBasis>('renter')
+  // 10/17 (Nic): the saturation overlay needs census numbers for this level,
+  // and the concentration overlay is the voting districts only — a level that
+  // has neither simply does not offer it, and his pick comes back when he
+  // returns to a level that does.
+  // 10/18 (Nic): the lean overlay is offered at every level of the United
+  // States, including the ones with no results published — he asked for the
+  // districts, and the honest answer there is the overlay saying so on screen
+  // rather than the choice quietly not being there (offersLean).
+  const measures = useMemo(() => METRICS_MAP_MEASURES.filter(m =>
+    m === 'saturation' ? hasCensus(level)
+      : m === 'concentration' ? hasConcentration(level)
+        : m === 'lean' ? offersLean(level) : true), [level])
+  const measure: Measure = measures.includes(chosenMeasure) ? chosenMeasure : 'units'
+  const share = measure === 'saturation' || measure === 'concentration'
+  const field: Field = measure === 'money' ? 'money' : spaces === 'occupied' ? 'occupied' : 'units'
+  const [us, setUs] = useState<UsAtlas | null>(null)
+  const [usFailed, setUsFailed] = useState(false)
+  const [layer, setLayer] = useState<LayerShapes | null>(null)
+  const [layerFailed, setLayerFailed] = useState(false)
+  // 10/17 (Nic): the country shapes, for the world's levels — the lines under
+  // the provinces and the districts.
+  const [countryLayer, setCountryLayer] = useState<LayerShapes | null>(null)
+  // 10/18 (Nic): and the provinces, for the globe's own division lines.
+  const [provinceLayer, setProvinceLayer] = useState<LayerShapes | null>(null)
+  // 10/17 (Nic): this level's census numbers, fetched the first time the
+  // saturation overlay is turned on for it.
+  const [census, setCensus] = useState<CensusLevel | null>(null)
+  const [censusFailed, setCensusFailed] = useState(false)
+  // 10/18 (Nic): this level's election results, for the lean overlay and for
+  // the window a click opens. Fetched the first time either asks for them.
+  const [votes, setVotes] = useState<MetricsElectionFile | null>(null)
+  const [votesFailed, setVotesFailed] = useState(false)
+  /** Which contest the color shows — the newest until he picks another. */
+  const [chosenContest, setContest] = useState<string | null>(null)
+  const [attempt, setAttempt] = useState(0)
+  const [GlobeView, setGlobeView] = useState<Globe | null>(null)
+  const [globeFailed, setGlobeFailed] = useState(false)
+  // 10/17: the land around the United States, for the globe only.
+  const [world, setWorld] = useState<WorldLand | null>(null)
+  const [hover, setHover] = useState<{ fips: string; x: number; y: number } | null>(null)
+  const [selected, setSelected] = useState<string | null>(null)
+  // 10/12 (Nic) review: the side list is the keyboard and screen-reader way to
+  // every place's number, so it can show all of them, not only the top eight.
+  const [showAll, setShowAll] = useState(false)
+  /**
+   * 10/18 (Nic): where the map is looking — "I'd like it to stay". ONE view
+   * for the flat map and the globe, held here so that nothing below (the
+   * level, the measure, the overlays, the picture itself) can reset it. The
+   * only things that move it are turning, dragging, zooming, picking a place
+   * from the list, and Reset.
+   */
+  const [viewAt, setViewAt] = useState<MapView>(HOME_VIEW)
+  const boxRef = useRef<HTMLDivElement>(null)
+  const listId = useId()
+
+  useEffect(() => {
+    let live = true
+    setUsFailed(false)
+    loadUsAtlas().then(s => { if (live) setUs(s) }).catch(() => { if (live) setUsFailed(true) })
+    return () => { live = false }
+  }, [attempt])
+
+  // The globe's code loads the first time it is asked for.
+  useEffect(() => {
+    if (view !== 'globe' || GlobeView) return
+    let live = true
+    setGlobeFailed(false)
+    loadGlobe().then(g => { if (live) setGlobeView(() => g) }).catch(() => { if (live) setGlobeFailed(true) })
+    return () => { live = false }
+  }, [view, GlobeView, attempt])
+
+  // 10/17: the land around the United States, fetched the first time the globe
+  // is shown — the flat map of the United States never shows it, so it never
+  // pays for it. If it cannot be fetched the globe draws without it: the
+  // numbers on it are the page's point, and none of them are in this file.
+  useEffect(() => {
+    if (view !== 'globe' || !api || world) return
+    let live = true
+    loadWorld(api).then(w => { if (live) setWorld(w) }).catch(() => {})
+    return () => { live = false }
+  }, [view, api, world, attempt])
+
+  // A pick belongs to one level; switching levels starts clean.
+  useEffect(() => { setSelected(null); setHover(null) }, [level])
+
+  // 10/18 (Nic): the window a pick opens closes on Escape, like every other
+  // window in the product. It is not a modal — the map stays usable behind it.
+  useEffect(() => {
+    if (!selected) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setSelected(null) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [selected])
+
+  const boundary: MetricsBoundaryLayer | null = level === 'state' || level === 'county' ? null : level
+  /** A level whose Census files come one per state (cities, ZIP codes, the two chambers). */
+  const perState = !!boundary && METRICS_MAP_STATE_LEVELS.includes(boundary)
+  // 10/17 (Nic): the world's own levels — placed by map location, drawn on the
+  // whole earth.
+  const worldLevel = isMetricsWorldLevel(level)
+  /** 10/17 (Nic): and the level below a province, whose files come one per country. */
+  const perCountry = !!boundary && METRICS_MAP_COUNTRY_LEVELS.includes(boundary)
+  const levelData = boundary ? data?.levels?.[boundary] : undefined
+
+  const areas: Listed[] = useMemo(() => {
+    if (level === 'state') return (data?.states ?? []).map(a => ({ ...a, stateFips: a.fips }))
+    if (level === 'county') return (data?.counties ?? []).map(a => ({ ...a, stateFips: a.fips.slice(0, 2) }))
+    return levelData?.areas ?? []
+  }, [data, level, levelData])
+
+  /**
+   * 10/18 (Nic): the states (or countries) whose files this level is drawn
+   * from. By default every one GAM has data in there — "I can't just see them
+   * all in the city breakdown, like all every state" — and on the "Every
+   * state" choice every one the Census files cover. Null for a level that
+   * comes in one file for the lot, which needs no merging at all.
+   */
+  const perGroup = perState || perCountry
+  const dataGroups = useMemo(() => (perState ? levelData?.states ?? []
+    : perCountry ? levelData?.countries ?? [] : []), [perState, perCountry, levelData])
+  const allGroups = useMemo(() => (perState ? levelData?.allStates ?? []
+    : perCountry ? levelData?.allCountries ?? [] : []), [perState, perCountry, levelData])
+  /** "Every state" is offered only when the API has said which states there are. */
+  const canShowAllGroups = perGroup && allGroups.length > 0
+  const groups = useMemo(() => {
+    if (!perGroup) return null
+    return scope === 'all' && canShowAllGroups ? allGroups : dataGroups
+  }, [perGroup, scope, canShowAllGroups, allGroups, dataGroups])
+  /** Every state at once is megabytes of shapes, so the map says while it loads. */
+  const loadingEverything = scope === 'all' && canShowAllGroups
+
+  // The level's shapes from the API (behind admin login): a file per state (or
+  // country), merged; or the one national file a level comes in.
+  //
+  // 10/18 (Nic): `groups` is depended on as a string, because a new array of
+  // the same states must not re-fetch — and `loadLayerGroups` keeps each file
+  // its own fetch, so moving from GAM's states to every state downloads only
+  // the ones it did not have.
+  const groupsKey = groups ? groups.join(',') : ''
+  useEffect(() => {
+    setLayer(null)
+    setLayerFailed(false)
+    if (!boundary || (perGroup && !groups?.length)) return
+    if (!api) { setLayerFailed(true); return }
+    let live = true
+    loadLayerGroups(api, boundary, groups)
+      .then(l => { if (live) setLayer(l) })
+      .catch(() => { if (live) setLayerFailed(true) })
+    return () => { live = false }
+  }, [api, boundary, perGroup, groupsKey, attempt])
+
+  // 10/17 (Nic): the country shapes, for the world's levels — the lines under
+  // the provinces and the districts. The country level draws them as its own
+  // areas, so it needs no second copy.
+  //
+  // 10/18 (Nic): THE GLOBE WANTS THEM TOO, at every level. "The globe draws
+  // only the United States ... nothing else on Earth has any division at all."
+  // So the same country file the flat map draws is fetched the first time the
+  // globe is shown, and the provinces beside it (below). A failure here must
+  // not take the map down: the globe draws the land it has from the world file
+  // and the lines simply do not appear.
+  const wantWorldLines = view === 'globe'
+  useEffect(() => {
+    if ((!worldLevel && !wantWorldLines) || level === 'country' || !api) return
+    let live = true
+    loadLayer(api, 'country', null)
+      .then(l => { if (live) setCountryLayer(l) })
+      .catch(() => { if (live && worldLevel) setLayerFailed(true) })
+    return () => { live = false }
+  }, [worldLevel, wantWorldLines, level, api, attempt])
+
+  // 10/18 (Nic): and the provinces — "give the globe the same country borders
+  // and provinces the flat map draws". One file for the whole world, shared
+  // with the states-and-provinces level, so opening that level afterwards
+  // costs nothing.
+  useEffect(() => {
+    if (!wantWorldLines || level === 'adm1' || !api || provinceLayer) return
+    let live = true
+    loadLayer(api, 'adm1', null)
+      .then(l => { if (live) setProvinceLayer(l) })
+      .catch(() => {})
+    return () => { live = false }
+  }, [wantWorldLines, level, api, provinceLayer, attempt])
+
+  /**
+   * 10/18 (Nic): who wants the two extra files, and when. The saturation
+   * overlay wants the census numbers for its color; the lean overlay wants the
+   * election results for its color; and the window a click opens wants both,
+   * in whatever view he is in — "a little window and say, hey, at the last
+   * census this many people lived in this county". A level that has neither
+   * fetches neither and says so in words.
+   */
+  const wantCensus = hasCensus(level) && (measure === 'saturation' || !!selected)
+  const wantVotes = hasElections(level) && (measure === 'lean' || !!selected)
+
+  // 10/17 (Nic): this level's census numbers, the first time the saturation
+  // overlay asks for them. Nothing else on the page waits on them.
+  //
+  // 10/17 (review): the flag is cleared BEFORE the guard, the way the sibling
+  // effects above do it. It used to be cleared after, so one failed fetch left
+  // it set for the rest of the page's life: switching back to Units replaced
+  // the whole map — Units, Money and all — with "could not be drawn", and Try
+  // again returned at the guard without ever clearing it. Only a reload did.
+  //
+  // 10/18 (Nic): the window a click opens reads them too — "at the last census
+  // this many people lived in this county" — so they are fetched when
+  // something is picked, whichever view is on screen. Still never before:
+  // opening the page on Units downloads nothing of this.
+  useEffect(() => {
+    setCensusFailed(false)
+    if (!wantCensus || census?.level === level) return
+    if (!api) { setCensusFailed(true); return }
+    let live = true
+    loadCensus(api, level)
+      .then(c => { if (live) setCensus(c) })
+      .catch(() => { if (live) setCensusFailed(true) })
+    return () => { live = false }
+  }, [wantCensus, level, api, census, attempt])
+
+  /**
+   * 10/18 (Nic): this level's election results — the lean overlay's color, and
+   * the window's "how it votes". Fetched once per level, the first time either
+   * one asks, and only for a level that has them: counties are the only level
+   * these are published by, and every other level says so instead.
+   */
+  useEffect(() => {
+    setVotesFailed(false)
+    if (!wantVotes || votes?.level === level) return
+    if (!api) { setVotesFailed(true); return }
+    let live = true
+    loadElections(api, level)
+      .then(v => { if (live) setVotes(v) })
+      .catch(() => { if (live) setVotesFailed(true) })
+    return () => { live = false }
+  }, [wantVotes, level, api, votes, attempt])
+
+  /** The shapes in hand are this level's, drawn from the files it asked for. */
+  const layerReady = !boundary
+    || (!!layer && layer.level === boundary && layerKey(layer.level, layer.groups) === layerKey(boundary, groups ?? []))
+  // 10/17 (Nic): the world's provinces and districts also wait on the country
+  // shapes they are drawn over, and the saturation overlay on its census numbers.
+  const worldReady = !worldLevel || level === 'country' || !!countryLayer
+  const censusReady = measure !== 'saturation' || (!!census && census.level === level)
+  // 10/18 (Nic): the lean overlay waits on its own file, and only where there
+  // is one — a level with no results published draws at once and says so.
+  const votesReady = measure !== 'lean' || !hasElections(level) || (!!votes && votes.level === level)
+  const ready = !!us && layerReady && worldReady && censusReady && votesReady
+  const geoAreas: GeoArea[] = useMemo(() => (!us || !layerReady ? []
+    : level === 'state' ? us.states : level === 'county' ? us.counties : layer?.areas ?? []), [us, layerReady, level, layer])
+  /**
+   * 10/18 (Nic): one picture per level, and the same frame for every level of
+   * the United States — so changing the level never changes the frame under
+   * the view. The world's levels are the whole earth, GAM's own the whole
+   * country, and a state is looked at closely by zooming in (flatLook).
+   */
+  const flat = useMemo((): FlatPicture | null => {
+    if (view !== 'flat' || !us || !layerReady || !worldReady) return null
+    if (level === 'state' || level === 'county') return cachedFlat(us, level, () => flatNational(us, level))
+    if (!layer) return null
+    if (worldLevel) return cachedFlat(layer, level, () => flatWorld(layer, countryLayer))
+    return cachedFlat(layer, level, () => flatNational(us, level, layer))
+  }, [view, us, layerReady, worldReady, worldLevel, level, layer, countryLayer])
+  const globeBorders: MultiLineString | null = !us ? null
+    : level === 'county' ? us.countyBorders : boundary && layer ? layer.borders : null
+
+  /**
+   * 10/18 (Nic): where this level's picture opens — the lower 48, or the whole
+   * earth at a world level. It is the thing `depth` is a multiple of, so one
+   * kept view means the same thing on either picture, and it no longer changes
+   * with the state or country on screen, because there is no longer one.
+   */
+  const home: GlobeView = useMemo(() => homeView(worldLevel), [worldLevel])
+  /** The flat picture's own frame, for turning a drag or a zoom into a view. */
+  const flatProjection = useMemo(() => (worldLevel ? worldProjection() : nationalProjection()), [worldLevel])
+  const look = useMemo(() => flatLook(flatProjection, viewAt), [flatProjection, viewAt])
+  /** The same kept view, as the globe takes it. */
+  const globeTarget = useMemo(() => globeViewOf(viewAt, home), [viewAt, home])
+
+  const byFips = useMemo(() => new Map(areas.map(a => [a.fips, a])), [areas])
+
+  /**
+   * 10/17 (Nic): the number the color stands for. Units and Money are the
+   * place's own count; the two overlays are percentages of different wholes —
+   * saturation is GAM's share of THAT AREA's market (census), concentration is
+   * that area's share of EVERYTHING GAM has placed on this map.
+   */
+  const placedTotal = useMemo(() => {
+    const t = { units: 0, occupied: 0, money: 0 }
+    for (const a of areas) { t.units += a.units; t.occupied += Number(a.occupied ?? 0); t.money += a.money }
+    return t
+  }, [areas])
+  /** An area's census denominator for the view on screen, or 0 when the Census has none for it. */
+  const denominatorOf = (fips: string): number => Number(census?.areas?.[fips]?.[CENSUS_BASIS_SLOT[basis]] ?? 0)
+  const shareOf = (a: { units: number; occupied?: number; money: number }, which: Field, fips: string): number =>
+    measure === 'saturation' ? sharePercent(valueOf(a, which), denominatorOf(fips))
+      : sharePercent(valueOf(a, which), placedTotal[which])
+  const shown = (a: Listed): number => (share ? shareOf(a, field, a.fips) : valueOf(a, field))
+  const shownText = (v: number) => (share ? formatShare(v) : valueText(field, v))
+
+  const max = useMemo(() => Math.max(0, ...areas.map(shown)), [areas, field, measure, basis, census, placedTotal])
+  /**
+   * 10/17 (review): the top of the color scale. For a count it is the biggest
+   * number on screen. For saturation it stops at 100% — as many spaces as the
+   * Census counts in that area — because a park in a Census place of 47
+   * renter-occupied homes reads 211%, and running the whole scale up to that
+   * one washed every other area out to a faint smudge. The number itself is
+   * never clipped: the hover, the list and the key all say 211%.
+   */
+  const scaleTop = measure === 'saturation' ? Math.min(max, METRICS_SATURATION_FULL) : max
+  const shade = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const a of areas) { const o = strength(shown(a), scaleTop); if (o > 0) m.set(a.fips, o) }
+    return m
+  }, [areas, field, measure, basis, census, placedTotal, scaleTop])
+  const shapeName = useMemo(() => new Map(geoAreas.map(a => [a.id, a.name])), [geoAreas])
+
+  /**
+   * 10/18 (Nic): THE CONTESTS. The file holds one entry per contest — an
+   * office and a year, with its two sides named — because Nic asked for more
+   * than the presidency: "I don't only want presidential stuff, I want mayor
+   * data, governor data, city council data, voting on public policy." The
+   * newest is what the color shows until he picks another, and a contest he
+   * picked that the next level does not have simply falls back to its newest.
+   */
+  const contests = votes?.level === level ? votes.contests : []
+  const contest = contests.find(c => c.id === chosenContest) ?? contests[0] ?? null
+  /** An area's result in the contest on screen, or in a named one. */
+  const resultOf = (fips: string, id: string | undefined = contest?.id) =>
+    (id ? votes?.areas?.[fips]?.[id] : undefined)
+  /**
+   * Every area's margin in the contest on screen — the whole country, not only
+   * where GAM is, because that is the point of the overlay. An area with no
+   * result published is left out and drawn with no color at all.
+   */
+  const lean = useMemo(() => {
+    if (measure !== 'lean') return null
+    // 10/18 (Nic): at a level with no results published the overlay colors
+    // NOTHING — it does not quietly fall back to the gold map, which would
+    // look like an answer. GAM's own spaces are still marked over it, and the
+    // caption says where the results are published.
+    if (!hasElections(level)) return new Map<string, number>()
+    if (!contest || votes?.level !== level) return null
+    const m = new Map<string, number>()
+    for (const [code, got] of Object.entries(votes.areas)) {
+      const r = got[contest.id]
+      if (r && Number.isFinite(r.m)) m.set(code, r.m)
+    }
+    return m
+  }, [measure, contest, votes, level])
+
+  const stateNameOf = (fips: string) => us?.stateName.get(fips) ?? data?.states.find(s => s.fips === fips)?.name ?? fips
+  const countryNameOf = (code: string) => countryLayer?.areas.find(a => a.id === code)?.name
+    ?? areas.find(a => a.country === code)?.countryName ?? code
+  const placeName = (fips: string): string => {
+    const a = byFips.get(fips)
+    const name = a?.name || shapeName.get(fips) || fips
+    if (level === 'state' || level === 'country') return name
+    // 10/17 (Nic): outside the United States a place reads with its country —
+    // "Entre Ríos, Argentina" — and inside it with its state.
+    if (worldLevel) {
+      const c = a?.country ?? layer?.country.get(fips)?.code
+      return c ? `${name}, ${countryNameOf(c)}` : name
+    }
+    // A territory has no shape on the flat map; the server's own state list names it.
+    // 10/18 (Nic): a city, county or district code starts with its state, so a
+    // shape GAM has no number for still reads with its state. A ZIP code does
+    // not — "ZIP 85362" says nothing about Arizona — so that one reads alone.
+    const st = a?.stateFips || fips.slice(0, 2)
+    return us?.stateName.has(st) ? `${name}, ${stateNameOf(st)}` : name
+  }
+
+  // Places with a number that the picture on screen has no shape for: the
+  // territories on the flat map (Albers USA leaves them out; the globe has them).
+  const drawnIds = useMemo(() => (flat ? new Set(flat.areas.filter(s => s.d).map(s => s.id))
+    : view === 'globe' && ready ? new Set(geoAreas.map(a => a.id)) : null), [flat, view, ready, geoAreas])
+  const undrawn = drawnIds ? areas.filter(a => valueOf(a, field) !== 0 && !drawnIds.has(a.fips)) : []
+  const missing: Array<MapMissing | LevelMissing> = (level === 'state' ? (data?.missing ?? []).filter(x => x.offStateMap)
+    : level === 'county' ? data?.missing ?? [] : levelData?.missing ?? [])
+    .filter(x => valueOf(x, field) !== 0)
+  const rankedAll = useMemo(
+    () => areas.filter(a => shown(a) > 0).sort((a, b) => shown(b) - shown(a)),
+    [areas, field, measure, basis, census, placedTotal])
+  const ranked = showAll ? rankedAll : rankedAll.slice(0, TOP)
+  /**
+   * 10/17 (review): the areas GAM IS in that the Census counts nothing in.
+   *
+   * There is no share to draw for them, so they have no color and they are not
+   * in the ranked list — and nothing under the map named them either, so a
+   * real city with a hundred spaces simply vanished when the overlay came on.
+   * Amado, Arizona is one: 41 people, 41 housing units, no renter-occupied
+   * home in the survey at all. 3,343 of the 32,325 Census places and 2,727 of
+   * the 33,772 ZIP areas are like that, so this is GAM's market, not an edge.
+   * They are named with the reason instead.
+   */
+  const noCensus = useMemo(() => (measure !== 'saturation' || !census ? []
+    : areas.filter(a => valueOf(a, field) > 0 && !(denominatorOf(a.fips) > 0))
+      .sort((a, b) => valueOf(b, field) - valueOf(a, field))),
+  [measure, census, areas, field, basis])
+  /**
+   * 10/18 (Nic): "where our strong areas tend to be in Democratic areas or
+   * Republican areas". GAM's own number split by which side led the area it
+   * sits in — one sentence beside the list, in the contest's own words.
+   */
+  const leanSplit = useMemo(() => {
+    if (measure !== 'lean' || !lean) return null
+    const t = { total: 0, right: 0, left: 0, even: 0, none: 0 }
+    for (const a of areas) {
+      const v = valueOf(a, field)
+      if (!(v > 0)) continue
+      t.total += v
+      const m = lean.get(a.fips)
+      if (m == null) t.none += v
+      else if (Math.abs(m) < 0.05) t.even += v
+      else if (m > 0) t.right += v
+      else t.left += v
+    }
+    return t
+  }, [measure, lean, areas, field])
+
+  const noun = METRICS_MAP_LEVEL_NOUN[level]
+  const plural = METRICS_MAP_LEVEL_PLURAL[level]
+  const what = field === 'money' ? 'rent' : field === 'occupied' ? 'occupied units' : 'units'
+  /**
+   * 10/18 (Nic): ONLY COUNTIES ARE EXACT. At a level with no results published
+   * the overlay says so in words and draws no color — "a made-up district
+   * margin is worse than none".
+   */
+  const leanUnavailable = measure === 'lean' && !hasElections(level)
+  const leanNote = leanUnavailable ? leanNotAtLevel(noun, plural) : ''
+  // 10/18 (Nic): every area at this level is on the one map now, so "nothing
+  // here" and "nothing anywhere" are the same question.
+  //
+  // In the lean overlay the color is the area's vote, so the map is worth
+  // looking at with no GAM units on it at all; what makes it empty there is
+  // having no result to draw.
+  const nothingOnMap = measure === 'lean' ? !lean?.size : areas.every(a => !(shown(a) > 0))
+  // 10/12 (Nic) review: no `map` at all (an API that does not send it yet) is
+  // not an empty map — it must not say "no units" beside tiles with real totals.
+  const unavailable = data == null || (!!boundary && !levelData)
+  // The pill over the map says the short of it; the caption above carries the
+  // whole sentence, including where the results ARE published.
+  const emptyText = leanUnavailable ? `No election results are published by ${noun} yet.`
+    : unavailable
+      ? 'Map numbers are not available yet.'
+    // There are numbers, but none could be placed on this map (named below).
+    : missing.some(x => valueOf(x, field) > 0)
+      ? `No ${what} could be placed on the ${noun} map — see below.`
+      // 10/17 (Nic): there are spaces, but no percentage to draw — the Census
+      // counts nothing in any area GAM is in at this level.
+      : share && areas.some(a => valueOf(a, field) > 0)
+        ? measure === 'saturation'
+          ? `The Census counts no ${METRICS_CENSUS_BASIS_NOUN[basis]} in any ${noun} GAM is in.`
+          : `No ${what} could be placed on the ${noun} map.`
+        : field === 'money' ? 'No rent has been logged yet.'
+          : field === 'occupied' ? 'No units are occupied this month.' : 'No units under management yet.'
+  // 10/12 (Nic) review: the color key, painted from the same strengths as the
+  // map — the faint end is the smallest place's own color, the full end the
+  // biggest's, and the steps between are even steps in value.
+  // 10/17 (review): the full end is the scale's top, which for saturation is
+  // 100% however far past it the biggest area goes (scaleTop).
+  // 10/18 (Nic): every area at this level is on the one map now, so the key
+  // runs over all of them — there is no state on screen to narrow them to.
+  const onMapRanked = areas.filter(a => shown(a) > 0)
+  const lowest = onMapRanked.length ? Math.min(...onMapRanked.map(shown)) : 0
+  const keySteps = lowest > 0 && lowest < scaleTop
+    ? [0, 1, 2, 3, 4].map(i => lowest + ((scaleTop - lowest) * i) / 4) : [scaleTop]
+
+  const focus = hover?.fips ?? selected
+  const focusShape = focus && flat ? flat.areas.find(s => s.id === focus && s.d) : undefined
+
+  const fipsAt = (e: React.SyntheticEvent) => (e.target as Element).getAttribute?.('data-fips') ?? null
+  // Hover is for a mouse only: a tap on a phone also sends pointer moves, and
+  // the tap's own pick (named under the map) is the answer there.
+  const onMove = (e: React.PointerEvent) => {
+    if (e.pointerType !== 'mouse') return
+    const fips = fipsAt(e)
+    const box = boxRef.current?.getBoundingClientRect()
+    if (!fips || !box) { setHover(null); return }
+    setHover({ fips, x: e.clientX - box.left, y: e.clientY - box.top })
+  }
+  const onTap = (e: React.MouseEvent) => {
+    const fips = fipsAt(e)
+    setSelected(cur => (fips && fips !== cur ? fips : null))
+  }
+  /**
+   * A place picked from the list — on the globe and, 10/18 (Nic, correcting
+   * the morning's pass), on the flat map too: "if I click a row in the list,
+   * it should snap to it. That's fine. It's just when I'm moving the globe and
+   * I toggle the settings, the filters of the map that I'm looking at, that I
+   * don't want it to move. But clicking the row, if I want to see that, should
+   * snap to that area."
+   *
+   * So the rule is about WHAT moved the view, not which picture it is: a
+   * setting or a filter never moves it, and a deliberate click on a row is
+   * navigation and moves both. The pick is outlined and named either way, and
+   * clicking the same row again lets it go without moving anything.
+   */
+  const pickFromList = (a: Listed) => {
+    const next = selected === a.fips ? null : a.fips
+    setSelected(next)
+    if (!next) return
+    const shape = geoAreas.find(g => g.id === a.fips)
+    if (shape) setViewAt(viewOfArea(shape.feature, home))
+  }
+
+  /**
+   * 10/18 (Nic): zoom and pan on the flat map — "if I zoom in on a certain
+   * depth or whatever". It is one transform over the drawn picture, which is
+   * why the lines stay hairline (non-scaling-stroke) and the shapes never have
+   * to be re-drawn to look at a state closely.
+   *
+   * Dragging is for a mouse: on a phone the browser's own pinch and scroll
+   * stay in charge of the page (touch-action), and the buttons below do the
+   * zooming. A drag that goes nowhere is still a tap, so picking a place by
+   * clicking it works as before (TAP_SLOP).
+   */
+  const TAP_SLOP = 4
+  const drag = useRef<{ id: number; x: number; y: number; travel: number; held: boolean } | null>(null)
+  /** Screen pixels → the frame's own units (the picture is scaled to fit its box). */
+  const frameScale = () => W / (boxRef.current?.clientWidth || W)
+  const onFlatDown = (e: React.PointerEvent) => {
+    if (e.pointerType !== 'mouse' || e.button !== 0) return
+    drag.current = { id: e.pointerId, x: e.clientX, y: e.clientY, travel: 0, held: false }
+  }
+  const onFlatMove = (e: React.PointerEvent) => {
+    const d = drag.current
+    if (!d || d.id !== e.pointerId) { onMove(e); return }
+    const dx = e.clientX - d.x
+    const dy = e.clientY - d.y
+    d.travel += Math.abs(dx) + Math.abs(dy)
+    d.x = e.clientX; d.y = e.clientY
+    if (d.travel < TAP_SLOP) return
+    // Once it is a drag and not a click, the pointer is held: letting go
+    // outside the map must still end the drag, or the next move over the map
+    // would go on panning with no button down. Held only after the slop, so a
+    // click still reaches the shape under it.
+    if (!d.held) { d.held = true; (e.currentTarget as Element).setPointerCapture?.(e.pointerId) }
+    const s = frameScale()
+    setHover(null)
+    setViewAt(v => flatPan(flatProjection, v, dx * s, dy * s))
+  }
+  const onFlatUp = (e: React.PointerEvent) => {
+    const d = drag.current
+    drag.current = null
+    if (d && d.id === e.pointerId && d.travel < TAP_SLOP) onTap(e)
+  }
+
+  /**
+   * Scroll to zoom, about the pointer. A wheel listener that stops the page
+   * scrolling under it cannot be passive, and React's own onWheel is — so this
+   * one is attached by hand, exactly as the globe's is.
+   */
+  const svgRef = useRef<SVGSVGElement>(null)
+  useEffect(() => {
+    const svg = svgRef.current
+    if (view !== 'flat' || !svg) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const box = svg.getBoundingClientRect()
+      const s = W / (box.width || W)
+      const about: [number, number] = [(e.clientX - box.left) * s, (e.clientY - box.top) * s]
+      setViewAt(v => flatZoom(flatProjection, v, Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0018)), about))
+    }
+    svg.addEventListener('wheel', onWheel, { passive: false })
+    return () => svg.removeEventListener('wheel', onWheel)
+  }, [view, flat, flatProjection])
+
+  /** The zoom and Reset buttons, which both pictures share. */
+  const zoomView = (factor: number) => setViewAt(v => {
+    if (view !== 'globe') return flatZoom(flatProjection, v, factor)
+    // The globe has its own limits, so the depth follows what it will really
+    // do rather than running past them and taking presses to come back.
+    const next = zoomBy(globeViewOf(v, home), factor)
+    return { center: v.center, depth: atDepth(next.zoom / home.zoom) }
+  })
+  const resetView = () => setViewAt(HOME_VIEW)
+
+  /**
+   * The same by keyboard as the globe has: the arrows move the map, + and −
+   * zoom, 0 goes home. The side list is still the way to every number.
+   */
+  const onFlatKeyDown = (e: React.KeyboardEvent) => {
+    const step = 60 * frameScale()
+    const keys: Record<string, () => void> = {
+      ArrowLeft: () => setViewAt(v => flatPan(flatProjection, v, step, 0)),
+      ArrowRight: () => setViewAt(v => flatPan(flatProjection, v, -step, 0)),
+      ArrowUp: () => setViewAt(v => flatPan(flatProjection, v, 0, step)),
+      ArrowDown: () => setViewAt(v => flatPan(flatProjection, v, 0, -step)),
+      '+': () => zoomView(1.4), '=': () => zoomView(1.4),
+      '-': () => zoomView(1 / 1.4), _: () => zoomView(1 / 1.4),
+      '0': () => resetView(),
+    }
+    const act = keys[e.key]
+    if (act) { e.preventDefault(); act() }
+  }
+
+  /**
+   * 10/17 (Nic): what the color on screen means, in words — the caption, the
+   * picture's own description, and the sentence that says plainly what a
+   * percentage is a percentage of.
+   */
+  const measureWord = measure === 'saturation'
+    ? `GAM's share of the ${METRICS_CENSUS_BASIS_NOUN[basis]} the Census counts in each ${noun}`
+    : measure === 'concentration'
+      ? `each ${noun}'s share of every space GAM has placed at this level`
+      // 10/18 (Nic): the lean overlay's color is the area's own vote, named by
+      // the contest it actually was — never "politics" in the abstract.
+      : measure === 'lean'
+        ? (contest ? contest.label.toLowerCase() : `how each ${noun} voted`)
+        : field === 'money' ? 'rent logged through GAM (all time)'
+          : field === 'occupied' ? 'units occupied this month, counted the way GAM bills them' : 'units under management'
+  const meaning = measure === 'saturation' ? METRICS_CENSUS_BASIS_MEANING[basis]
+    : measure === 'concentration' ? METRICS_CONCENTRATION_MEANING : ''
+  /**
+   * 10/17 (review): a share over 100% is real — a park is routinely bigger
+   * than its whole Census place — so when one is on screen the caption says
+   * what it means instead of leaving a number that looks like a mistake.
+   */
+  const anyOver = measure === 'saturation' && areas.some(a => shown(a) > METRICS_SATURATION_FULL)
+
+  const readout = (fips: string) => {
+    const a = byFips.get(fips)
+    const out = {
+      name: placeName(fips),
+      value: a && valueOf(a, field) !== 0 ? valueText(field, valueOf(a, field))
+        : field === 'money' ? 'No rent logged' : field === 'occupied' ? 'None occupied' : 'No units',
+      sub: a && a.properties > 0 ? propertiesText(a.properties) : '',
+      /** 10/17 (Nic): the share, and the two numbers it came from, spelled out. */
+      share: '',
+      /** 10/17 (Nic): the numerator BOTH ways, side by side — every space, and occupied spaces. */
+      both: '',
+    }
+    // 10/18 (Nic): in the lean view the hover says how the area voted, beside
+    // GAM's own number — the color is the vote, so the number behind it has to
+    // be readable without opening the window.
+    if (measure === 'lean') {
+      const r = contest ? resultOf(fips) : undefined
+      out.share = r && contest ? marginText(r.m, contest.right, contest.left)
+        : hasElections(level) ? 'No result published' : ''
+      return out
+    }
+    if (!share || !a) return out
+    out.value = shownText(shown(a))
+    if (measure === 'saturation') {
+      const d = denominatorOf(fips)
+      // 10/17 (review): "99 of 47 renter-occupied homes here" is nonsense, and
+      // a park in a small Census place reads exactly that. One wording that is
+      // true either way round: the spaces GAM has, beside the Census's count.
+      out.share = d > 0
+        ? `${spacesText(valueOf(a, field))} where the Census counts ${count(d)} ${METRICS_CENSUS_BASIS_NOUN[basis]}`
+        : censusCountsNothing(METRICS_CENSUS_BASIS_NOUN[basis])
+      out.both = d > 0
+        ? `All spaces ${formatShare(shareOf(a, 'units', fips))} · Occupied ${formatShare(shareOf(a, 'occupied', fips))}`
+        : ''
+    } else {
+      out.share = `${count(valueOf(a, field))} of GAM's ${count(placedTotal[field])} at this level`
+      out.both = `All spaces ${formatShare(shareOf(a, 'units', fips))} · Occupied ${formatShare(shareOf(a, 'occupied', fips))}`
+    }
+    return out
+  }
+  const tip = hover ? readout(hover.fips) : null
+  const pinned = !hover && selected ? readout(selected) : null
+  const boxWidth = boxRef.current?.clientWidth ?? W
+  // 10/17 (review): a census fetch only stops the overlay that reads it — the
+  // globe's own failure is scoped the same way on this line. Units and Money
+  // need no census numbers and must not go down with them.
+  const failed = usFailed || layerFailed || (measure === 'saturation' && censusFailed)
+    || (measure === 'lean' && votesFailed)
+    || (view === 'globe' && globeFailed)
+  /** 10/18 (Nic): the states (or countries) whose shapes would not load, by name. */
+  const layerFailedGroups = (layerReady && layer ? layer.failed : [])
+    .map(g => (perCountry ? countryNameOf(g) : stateNameOf(g)))
+  const where = worldLevel ? 'the world' : 'the United States'
+  const picture = `${view === 'globe' ? 'Globe' : 'Map'} of ${where} by ${noun}, colored by ${measureWord}`
+  /**
+   * 10/18 (Nic): the two words for how much of the map is drawn. "Where GAM
+   * is" names the states (or countries) by count, because that is the number
+   * he was being made to choose between one at a time.
+   */
+  const groupWord = perCountry ? { one: 'country', many: 'countries' } : { one: 'state', many: 'states' }
+  const scopeLabel = (s: Scope) => (s === 'all' ? `Every ${groupWord.one}`
+    : `Where GAM is (${count(dataGroups.length)} ${dataGroups.length === 1 ? groupWord.one : groupWord.many})`)
+  /** 10/17 (Nic): the level menu in two groups — the United States, and the rest of the world. */
+  const usLevels = METRICS_MAP_LEVELS.filter(l => !isMetricsWorldLevel(l))
+
+  return (
+    <div className="card mhm" style={{ marginBottom: 16 }}>
+      <div className="mhm-head">
+        <div className="ct" style={{ marginBottom: 0 }}>Heat map</div>
+        <div className="mhm-controls">
+          <Toggle label="Flat map or globe" value={view} onChange={v => { setView(v); setHover(null) }}
+            options={[{ value: 'flat', label: 'Flat map' }, { value: 'globe', label: 'Globe' }]}/>
+          <select className="mhm-select" aria-label="Map level" value={level}
+            onChange={e => { setLevel(e.target.value as Level); setShowAll(false) }}>
+            <optgroup label="United States">
+              {usLevels.map(l => <option key={l} value={l}>{METRICS_MAP_LEVEL_LABEL[l]}</option>)}
+            </optgroup>
+            {/* 10/17 (Nic): "break the rest of the countries down by states or
+                province and then possibly cities as well or counties". Voting
+                districts stay United States only — they are in the group above. */}
+            <optgroup label="Worldwide">
+              {METRICS_MAP_WORLD_LEVELS.map(l => <option key={l} value={l}>{METRICS_MAP_LEVEL_LABEL[l]}</option>)}
+            </optgroup>
+          </select>
+          {/* 10/18 (Nic): "I can't just see them all in the city breakdown,
+              like all every state." There is no state to pick any more: every
+              state GAM has data in is drawn. This only says whether to go
+              beyond that, and it keeps its own answer across levels. */}
+          {canShowAllGroups && (
+            <select className="mhm-select"
+              aria-label={perCountry ? 'Countries on the map' : 'States on the map'} value={scope}
+              onChange={e => { setScope(e.target.value as Scope); setHover(null) }}>
+              {(['data', 'all'] as Scope[]).map(s => <option key={s} value={s}>{scopeLabel(s)}</option>)}
+            </select>
+          )}
+          <Toggle label="What the color shows" value={measure} onChange={setMeasure}
+            options={measures.map(m => ({ value: m, label: METRICS_MAP_MEASURE_LABEL[m] }))}/>
+          {measure !== 'money' && (
+            <Toggle label="Which units" value={spaces} onChange={setSpaces}
+              options={[{ value: 'occupied', label: 'Occupied (billed)' }, { value: 'all', label: 'All spaces' }]}/>
+          )}
+          {/* 10/17 (Nic): "show all. because we are doing short term rentals as
+              well as living situations. its not only regular rentals. toggle
+              each view/metric" — each denominator is its own view. */}
+          {measure === 'saturation' && (
+            <Toggle label="Share of what" value={basis} onChange={setBasis}
+              options={METRICS_CENSUS_BASES.map(b => ({ value: b, label: METRICS_CENSUS_BASIS_LABEL[b] }))}/>
+          )}
+          {/* 10/18 (Nic): which contest the color shows. "I want the data at
+              every level that we can get it" — so this is a list of whatever
+              contests the level has, named by what they were, and a governor's
+              race or a ballot measure appears here the day its file does. */}
+          {measure === 'lean' && contests.length > 1 && (
+            <select className="mhm-select" aria-label="Which contest" value={contest?.id ?? ''}
+              onChange={e => setContest(e.target.value)}>
+              {contests.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
+            </select>
+          )}
+        </div>
+      </div>
+      <div className="ks" style={{ margin: '4px 0 12px' }}>
+        {/* 10/18 (Nic): the lean overlay's color is not gold and not GAM's —
+            it is the area's own vote — so it says its own sentence instead. */}
+        {measure === 'lean'
+          ? (leanNote || `The color is ${measureWord}. ${METRICS_LEAN_MEANING}`)
+          : <>The stronger the gold, the more {measureWord}.</>}
+        {meaning && ` ${meaning}`}
+        {/* 10/17 (review): a share past 100% and the world's own coastline
+            rule are both said here, rather than left to be puzzled over. */}
+        {anyOver && ` ${METRICS_CENSUS_OVER_MEANING}`}
+        {worldLevel && ` ${METRICS_MAP_WORLD_NOTE}`}
+        {/* 10/18 (Nic): which states are on the map, now that they all are. */}
+        {perGroup && ` ${capitalized(plural)} are drawn for ${scope === 'all' && canShowAllGroups
+          ? `every ${groupWord.one}` : `every ${groupWord.one} GAM has data in`}; zoom in to look at one closely.`}
+      </div>
+
+      <div className="mhm-body">
+        <div>
+          <div className="mhm-map" ref={boxRef} onPointerLeave={() => setHover(null)}>
+            {failed ? (
+              <div className="mhm-msg">
+                <div>The map could not be drawn just now.</div>
+                <button type="button" className="btn btn-primary btn-sm" onClick={() => setAttempt(n => n + 1)}>Try again</button>
+              </div>
+            ) : boundary && (unavailable || (perGroup && !groups?.length)) ? (
+              // Nothing to draw: an API that does not send this level yet, or
+              // no state (or country) that has a file to draw. 10/18 (Nic):
+              // GAM being in none of them is not the end of the map — every
+              // state is a choice away, so the message says so.
+              <div className="mhm-msg">{unavailable ? emptyText
+                : canShowAllGroups
+                  ? `GAM is in no ${groupWord.one} with ${plural} yet — choose "Every ${groupWord.one}" to see them all.`
+                  : `No ${plural} can be drawn just now.`}</div>
+            ) : !ready || !us || (view === 'globe' && !GlobeView) ? (
+              // 10/18 (Nic): every state at once is megabytes of shapes — it
+              // says what it is doing rather than sitting on "Drawing the map".
+              <div className="mhm-msg">
+                <span className="spinner"/>
+                {loadingEverything && !layerReady
+                  ? ` Loading every ${groupWord.one}'s ${plural} — this one is big…`
+                  : ' Drawing the map…'}
+              </div>
+            ) : view === 'flat' && !flat ? (
+              // 10/17: everything is in hand and the flat picture still cannot
+              // be drawn. Say so, rather than leaving an empty box with no
+              // explanation.
+              <div className="mhm-msg">{`No ${plural} can be drawn flat just now — the globe draws them.`}</div>
+            ) : (
+              <>
+                {/* 10/18 (Nic): the globe draws the same country borders and
+                    provinces the flat map does, and the lean overlay's colors.
+                    At the country or province level those shapes ARE the
+                    level's own, already drawn, so they are not handed over a
+                    second time. */}
+                {view === 'globe' && GlobeView ? (
+                  <GlobeView us={us} world={world} areas={geoAreas} borders={globeBorders} shade={shade}
+                    lean={lean} focus={focus}
+                    stateLines={!worldLevel}
+                    countries={countryLayer}
+                    provinces={level === 'adm1' ? null : provinceLayer}
+                    view={globeTarget} onView={g => setViewAt(viewOfGlobe(g, home))} onHome={resetView}
+                    label={picture} describedBy={listId}
+                    onHover={(fips, x, y) => setHover(fips ? { fips, x, y } : null)}
+                    onPick={fips => setSelected(cur => (fips && fips !== cur ? fips : null))}/>
+                ) : flat ? (
+                  // A picture to a screen reader; every number in it is in the list beside it.
+                  <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} role="img" aria-label={picture} aria-describedby={listId}
+                    onPointerDown={onFlatDown} onPointerMove={onFlatMove} onPointerUp={onFlatUp}
+                    onPointerCancel={() => { drag.current = null }} onKeyDown={onFlatKeyDown} tabIndex={0}>
+                    {/* 10/18 (Nic): the zoom and the pan, as one transform over
+                        the whole picture — "if I zoom in on a certain depth or
+                        whatever". The lines keep their hairline width through
+                        it (non-scaling-stroke), and the markers their size. */}
+                    <g transform={`translate(${look.x} ${look.y}) scale(${look.k})`}>
+                      {flat.context && <path d={flat.context} className="mhm-context-line" vectorEffect="non-scaling-stroke"/>}
+                      <AreaLayer shapes={flat.areas} shade={shade} lean={lean}/>
+                      {flat.borders && <path d={flat.borders} className={level === 'county' ? 'mhm-county-line' : 'mhm-area-line'} vectorEffect="non-scaling-stroke"/>}
+                      {flat.states && <path d={flat.states} className="mhm-state-line" vectorEffect="non-scaling-stroke"/>}
+                      {flat.nation && <path d={flat.nation} className="mhm-nation-line" vectorEffect="non-scaling-stroke"/>}
+                      {/* A place with a number that is too small to see gets a
+                          marker in its own color — until it has been zoomed in
+                          on far enough to see the place itself. */}
+                      {flat.areas.map(s => {
+                        const o = shade.get(s.id)
+                        if (!o) return null
+                        // 10/18 (Nic): in the lean overlay the area's color is
+                        // its vote, so EVERY area GAM is in is marked whatever
+                        // its size — that marker is the only thing saying
+                        // "GAM is here" over it. Everywhere else a marker
+                        // stands in for a shape too small to see.
+                        const at = lean ? s.at : dotNeeded(s, look.k) ? s.dot : undefined
+                        if (!at) return null
+                        return (
+                          <circle key={`dot-${s.id}`} cx={at[0]} cy={at[1]} r={DOT_RADIUS / look.k} data-fips={s.id}
+                            className={`mhm-dot${focus === s.id ? ' on' : ''}`} style={{ fill: heat(o) }}/>
+                        )
+                      })}
+                      {focusShape && <path d={focusShape.d} className="mhm-focus" vectorEffect="non-scaling-stroke"/>}
+                    </g>
+                  </svg>
+                ) : null}
+                {/* 10/18 (Nic): the zoom and Reset controls, the same on both
+                    pictures now that both read the one view. Reset is the only
+                    thing on the card that moves the view back home. */}
+                <div className="mhm-tools">
+                  <button type="button" className="btn btn-primary btn-sm" aria-label="Zoom in" onClick={() => zoomView(1.5)}>+</button>
+                  <button type="button" className="btn btn-primary btn-sm" aria-label="Zoom out" onClick={() => zoomView(1 / 1.5)}>−</button>
+                  <button type="button" className="btn btn-primary btn-sm" onClick={resetView}>Reset</button>
+                </div>
+                {nothingOnMap && (
+                  <div className="mhm-empty">
+                    <span>{emptyText}</span>
+                  </div>
+                )}
+                {/* 10/18 (Nic): THE WINDOW. "I just like the actual counties to be
+                    clickable and have it pull up in a separate little window...
+                    if I click on Santa Cruz County in Arizona, I'd like it to
+                    pull up a little window and say, hey, at the last census
+                    this many people lived in this county, people renting on GAM
+                    are a certain percentage of the total population."
+
+                    It opens over the map for whatever is picked — a click on
+                    the map, a tap on the globe, or a row in the list — and it
+                    closes without moving the map. Every number in it is a
+                    number this card already knows how to work out: the three
+                    census counts, GAM's own, the same saturation share as the
+                    overlay (sharePercent, both ways), and how the area voted.
+                    An area that has none of a thing says so in words. */}
+                {selected && (
+                  <div className="mhm-window" role="dialog"
+                    aria-label={`${placeName(selected)}, the numbers for this ${noun}`}>
+                    <div className="mhm-window-head">
+                      <div className="mhm-window-name">{placeName(selected)}</div>
+                      <button type="button" className="btn btn-ghost btn-sm"
+                        onClick={() => setSelected(null)}>Close</button>
+                    </div>
+
+                    <div className="kl mhm-window-kl">{METRICS_WINDOW_GAM}</div>
+                    {(() => {
+                      const a = byFips.get(selected)
+                      if (!a) return <div className="ks">GAM has no spaces here.</div>
+                      return (
+                        <div className="mhm-window-lines">
+                          <div>{spacesText(a.units)} under management</div>
+                          <div>{occupiedText(Number(a.occupied ?? 0))} this month</div>
+                          <div>{formatCurrency(a.money)} rent logged through GAM</div>
+                          <div>{propertiesText(a.properties)}</div>
+                        </div>
+                      )
+                    })()}
+
+                    <div className="kl mhm-window-kl">{METRICS_WINDOW_CENSUS}</div>
+                    {(() => {
+                      if (!hasCensus(level)) return <div className="ks">{censusNotAtLevel(noun)}</div>
+                      if (censusFailed) return <div className="ks">The census numbers could not be loaded just now.</div>
+                      if (census?.level !== level) return <div className="ks">Loading the census numbers…</div>
+                      const counts = census.areas?.[selected]
+                      if (!counts) return <div className="ks">{censusNoRowHere(noun)}</div>
+                      const a = byFips.get(selected)
+                      const missingOne = METRICS_CENSUS_BASES.find(b => !(Number(counts[CENSUS_BASIS_SLOT[b]]) > 0))
+                      return (
+                        <>
+                          <table className="mhm-window-table">
+                            <thead>
+                              <tr>
+                                <th scope="col">Counted here</th>
+                                <th scope="col">How many</th>
+                                <th scope="col">{METRICS_WINDOW_SHARE}<span>all spaces · occupied</span></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {METRICS_CENSUS_BASES.map(b => {
+                                const denominator = Number(counts[CENSUS_BASIS_SLOT[b]] ?? 0)
+                                return (
+                                  <tr key={b}>
+                                    <th scope="row">{METRICS_CENSUS_BASIS_NOUN[b]}</th>
+                                    <td className="mono">{count(denominator)}</td>
+                                    <td className="mono">{a && denominator > 0
+                                      ? `${formatShare(sharePercent(a.units, denominator))} · ${formatShare(sharePercent(Number(a.occupied ?? 0), denominator))}`
+                                      : '—'}</td>
+                                  </tr>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                          {missingOne && (
+                            <div className="ks">{censusCountsNothing(METRICS_CENSUS_BASIS_NOUN[missingOne])}</div>
+                          )}
+                        </>
+                      )
+                    })()}
+
+                    <div className="kl mhm-window-kl">{METRICS_WINDOW_VOTES}</div>
+                    {(() => {
+                      if (!hasElections(level)) return <div className="ks">{leanNotAtLevel(noun, plural)}</div>
+                      if (votesFailed) return <div className="ks">The election results could not be loaded just now.</div>
+                      if (votes?.level !== level) return <div className="ks">Loading the election results…</div>
+                      // 10/18 (Nic): "with 2020 and 2016 available so the swing
+                      // can be read" — every contest the level has, newest
+                      // first, and the move between the oldest and the newest
+                      // of the same kind of contest.
+                      const mine = contests.filter(c => resultOf(selected, c.id))
+                      const newest = mine[0]
+                      const oldest = [...mine].reverse().find(c => newest && c.office === newest.office && c.id !== newest.id)
+                      return (
+                        <div className="mhm-window-lines">
+                          {contests.map(c => {
+                            const r = resultOf(selected, c.id)
+                            const gap = c.gaps?.[selected.slice(0, 2)]
+                            return (
+                              <div key={c.id}>
+                                <strong>{c.label}</strong>
+                                {' · '}
+                                {r ? marginText(r.m, c.right, c.left)
+                                  : gap ? leanStateGap(stateNameOf(selected.slice(0, 2)), gap.why)
+                                    : leanNoResult(noun)}
+                                {r && r.t ? (
+                                  <div className="ks">
+                                    {`${c.right} ${count(r.r ?? 0)} · ${c.left} ${count(r.l ?? 0)} of ${count(r.t)} votes cast`}
+                                  </div>
+                                ) : null}
+                              </div>
+                            )
+                          })}
+                          {newest && oldest && (
+                            <div className="ks">{marginMoveText(resultOf(selected, oldest.id)!.m,
+                              resultOf(selected, newest.id)!.m, newest.right, newest.left, String(oldest.year))}</div>
+                          )}
+                        </div>
+                      )
+                    })()}
+                  </div>
+                )}
+                {tip && hover && (
+                  <div className="mhm-tip" style={{
+                    left: Math.min(hover.x + 14, Math.max(0, boxWidth - 200)),
+                    top: hover.y + 14,
+                  }}>
+                    <div className="mhm-tip-name">{tip.name}</div>
+                    <div className="mhm-tip-value">{tip.value}</div>
+                    {/* 10/17 (Nic): the share, what it is a share of, and the
+                        numerator both ways — every space, and occupied spaces. */}
+                    {tip.share && <div className="mhm-tip-sub">{tip.share}</div>}
+                    {tip.both && <div className="mhm-tip-sub">{tip.both}</div>}
+                    {tip.sub && <div className="mhm-tip-sub">{tip.sub}</div>}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          {/* Tapped on a phone (no hover there): the pick stays named under the map. */}
+          <div className="mhm-readout" aria-live="polite">
+            {pinned ? <><strong>{pinned.name}</strong> · {pinned.value}
+                {pinned.share ? ` · ${pinned.share}` : ''}
+                {pinned.both ? ` · ${pinned.both}` : ''}
+                {pinned.sub ? ` · ${pinned.sub}` : ''}</>
+              : <span style={{ color: 'var(--t3)' }}>
+                Hover or tap a {noun} to see its number, or pick one from the list.
+                {/* 10/18 (Nic): the flat map moves now too, so it says how. */}
+                {view === 'globe'
+                  ? ' Drag to turn the globe; scroll or pinch to zoom.'
+                  : ' Drag to move the map; scroll to zoom.'}
+              </span>}
+          </div>
+
+          {/* 10/18 (Nic): the lean overlay's own key — a diverging red/blue
+              scale, labeled honestly by the contest's two sides, with the gold
+              marker explained beside it so the two scales are never read as
+              one. "Even" is the middle; the ends are 60 points or more, where
+              the color stops gaining (METRICS_LEAN_FULL). */}
+          {ready && measure === 'lean' && contest && !nothingOnMap ? (
+            <div className="mhm-legend" aria-label="Color key">
+              <span className="mhm-key mono">{marginText(-METRICS_LEAN_FULL, contest.right, contest.left)} or more</span>
+              <span className="mhm-key">
+                <span className="mhm-ramp">
+                  {LEAN_KEY_STEPS.map(m => <span key={m} style={{ background: leanColor(m) }}/>)}
+                </span>
+              </span>
+              <span className="mhm-key mono">{marginText(METRICS_LEAN_FULL, contest.right, contest.left)} or more</span>
+              <span className="mhm-key" style={{ color: 'var(--t3)' }}>Even in the middle</span>
+              <span className="mhm-key">
+                <span className="mhm-swatch" style={{ background: heat(1), borderRadius: '50%' }}/>
+                Where GAM has spaces
+              </span>
+            </div>
+          ) : ready && !nothingOnMap && (
+            <div className="mhm-legend" aria-label="Color key">
+              <span className="mhm-key"><span className="mhm-swatch" style={{ background: 'var(--heat-none)' }}/>None</span>
+              <span className="mhm-key">
+                <span className="mhm-ramp">
+                  {keySteps.map((v, i) => <span key={i} style={{ background: heat(strength(v, scaleTop)) }}/>)}
+                </span>
+              </span>
+              {keySteps.length > 1 && <>
+                <span className="mhm-key mono">{shownText(lowest)}</span>
+                <span style={{ color: 'var(--t3)' }}>to</span>
+              </>}
+              {/* 10/17 (review): the full end of the ramp is the scale's top.
+                  When something on screen is past it (over 100% saturated),
+                  the key says so instead of naming one area's own number. */}
+              <span className="mhm-key mono">{shownText(scaleTop)}{max > scaleTop ? ' or more' : ''}</span>
+            </div>
+          )}
+
+          {/* 10/17 (Nic): "Credit geoBoundaries on the map (CC BY 4.0)" — the
+              line says where the shapes on screen came from, whichever level
+              that is, and the census edition when the overlay is reading it. */}
+          <div className="ks mhm-credit">
+            {METRICS_MAP_LEVEL_CREDIT[level]}
+            {measure === 'saturation' && census ? ` Numbers: ${census.edition}` : ''}
+            {/* 10/18 (Nic): "credit the source under the map the way
+                geoBoundaries is credited" — the contest's own source line. */}
+            {measure === 'lean' && contest ? ` Votes: ${contest.source}.` : ''}
+          </div>
+        </div>
+
+        <div className="mhm-side" id={listId}>
+          <div className="kl">
+            {showAll || rankedAll.length <= TOP ? capitalized(plural) : `Top ${plural}`}
+          </div>
+          {/* 10/17 (Nic): the list is the keyboard and screen-reader way to
+              every number, so it says what its percentages are of. */}
+          {share && (
+            <div className="ks" style={{ marginBottom: 4 }}>
+              {measure === 'saturation'
+                ? `Share of ${METRICS_CENSUS_BASIS_NOUN[basis]} — all spaces · occupied`
+                : 'Share of every space GAM has placed at this level — all spaces · occupied'}
+            </div>
+          )}
+          {/* 10/18 (Nic): "where our strong areas tend to be in Democratic
+              areas or Republican areas" — GAM's own spaces split by which side
+              led the area they sit in, in that contest's own words. */}
+          {measure === 'lean' && contest && leanSplit && leanSplit.total > 0 && (
+            <div className="ks" style={{ marginBottom: 4 }}>
+              {`Of the ${valueText(field, leanSplit.total)} GAM has at this level, `}
+              {`${formatShare(sharePercent(leanSplit.right, leanSplit.total))} sit where ${contest.right} led and `}
+              {`${formatShare(sharePercent(leanSplit.left, leanSplit.total))} where ${contest.left} led`}
+              {leanSplit.even > 0 ? `, ${formatShare(sharePercent(leanSplit.even, leanSplit.total))} where it was even` : ''}
+              {leanSplit.none > 0 ? `, and ${formatShare(sharePercent(leanSplit.none, leanSplit.total))} where no result is published` : ''}
+              {`. Ranked by ${what}.`}
+            </div>
+          )}
+          {ranked.length === 0
+            ? <div style={{ color: 'var(--t3)', fontSize: '.78rem' }}>{emptyText}</div>
+            : ranked.map(a => (
+              <button key={a.fips} type="button" aria-pressed={selected === a.fips}
+                className={`mhm-row${selected === a.fips ? ' on' : ''}`}
+                onClick={() => pickFromList(a)}>
+                <span className="mhm-row-name">{placeName(a.fips)}</span>
+                {/* 10/18 (Nic): in the lean view each row carries BOTH — GAM's
+                    own number, which the list is ranked by, and how that area
+                    voted, which is what he is reading it against. */}
+                {measure === 'lean' ? (
+                  <span className="mhm-row-value mono two">
+                    <span>{valueText(field, valueOf(a, field))}</span>
+                    <span className="mhm-row-lean">{(() => {
+                      const r = resultOf(a.fips)
+                      return r && contest ? marginText(r.m, contest.right, contest.left) : 'No result'
+                    })()}</span>
+                  </span>
+                ) : (
+                  <span className="mhm-row-value mono">{share
+                    ? `${formatShare(shareOf(a, 'units', a.fips))} · ${formatShare(shareOf(a, 'occupied', a.fips))}`
+                    : valueText(field, valueOf(a, field))}</span>
+                )}
+              </button>
+            ))}
+          {rankedAll.length > TOP && (
+            <button type="button" className="btn btn-primary btn-sm mhm-more" aria-expanded={showAll}
+              onClick={() => setShowAll(v => !v)}>
+              {showAll ? `Show the top ${TOP}` : `Show all ${count(rankedAll.length)} ${plural}`}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {(missing.length > 0 || undrawn.length > 0) && (
+        <div className="mhm-missing">
+          <div className="kl" style={{ marginBottom: 4 }}>Not on this map</div>
+          {missing.map(x => (
+            <div key={x.reason} className="ks">
+              {x.properties > 0 ? `${propertiesText(x.properties)} · ` : ''}{valueText(field, valueOf(x, field))} — {x.label}
+            </div>
+          ))}
+          {undrawn.map(a => (
+            <div key={a.fips} className="ks">
+              {placeName(a.fips)} · {valueText(field, valueOf(a, field))} — {view === 'flat' && !worldLevel
+                ? 'outside the flat map (U.S. territories are drawn on the globe)'
+                : 'no shape for it on this map'}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 10/18 (Nic): a state (or country) whose shapes would not load. Every
+          other one is still drawn — one file failing must never blank the map
+          — and its numbers are still in the list beside it and in the tiles
+          above, so this says what is missing from the PICTURE and nothing more. */}
+      {layerFailedGroups.length > 0 && (
+        <div className="mhm-missing">
+          <div className="kl" style={{ marginBottom: 4 }}>Shapes that could not be loaded</div>
+          <div className="ks">
+            {layerFailedGroups.join(', ')} — {layerFailedGroups.length === 1 ? 'its' : 'their'} {plural} are
+            not drawn. Every other {groupWord.one} is, and these numbers are still in the list beside the map.
+          </div>
+          <button type="button" className="btn btn-primary btn-sm mhm-more" onClick={() => setAttempt(n => n + 1)}>Try again</button>
+        </div>
+      )}
+
+      {/* 10/17 (review): the areas GAM is in that the Census counts nothing
+          in. They have no share, so they have no color and they are not in the
+          list beside the map — and before this they were nowhere at all, which
+          read as "GAM is not there". Amado, Arizona is one of them. */}
+      {noCensus.length > 0 && (
+        <div className="mhm-missing">
+          <div className="kl" style={{ marginBottom: 4 }}>No Census count here</div>
+          <div className="ks" style={{ marginBottom: 4 }}>
+            {censusCountsNothing(METRICS_CENSUS_BASIS_NOUN[basis])}
+            {` Each of these ${plural} is drawn with no color, and its spaces are still counted in the tiles above.`}
+          </div>
+          {noCensus.map(a => (
+            <div key={a.fips} className="ks">
+              {placeName(a.fips)} · {valueText(field, valueOf(a, field))}
+              {a.properties > 0 ? ` · ${propertiesText(a.properties)}` : ''}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <style>{`
+        .mhm { --heat-hi: var(--gold); --heat-base: var(--bg2); --heat-none: var(--bg3); }
+        :root[data-theme="light"] .mhm { --heat-hi: var(--gold-ink, #7a5f0f); }
+        .mhm-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+        .mhm-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+        .mhm-seg { display: inline-flex; border: 1px solid var(--b1); border-radius: 7px; overflow: hidden; }
+        .mhm-seg button { background: transparent; border: none; color: var(--t3); font-size: .72rem; font-weight: 600; padding: 5px 12px; cursor: pointer; }
+        .mhm-seg button + button { border-left: 1px solid var(--b1); }
+        .mhm-seg button.on { background: var(--bg4); color: var(--t0); }
+        .mhm-seg button:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
+        .mhm-select { background: var(--bg3); border: 1px solid var(--b1); border-radius: 7px; color: var(--t0); font-size: .72rem; font-weight: 600; padding: 5px 8px; max-width: 100%; }
+        .mhm-select:focus-visible { outline: 2px solid var(--gold); outline-offset: 1px; }
+        .mhm-body { display: grid; grid-template-columns: minmax(0, 3fr) minmax(200px, 1fr); gap: 16px; align-items: start; }
+        @media (max-width: 900px) { .mhm-body { grid-template-columns: minmax(0, 1fr); } }
+        .mhm-map { position: relative; width: 100%; aspect-ratio: ${W} / ${H}; }
+        /* 10/18 (Nic): the flat map is dragged with a mouse; a phone keeps
+           the browser's own scroll and pinch (touch-action), so a finger
+           never traps the page — the zoom buttons are the way there. */
+        .mhm-map svg { display: block; width: 100%; height: 100%; cursor: grab; touch-action: manipulation; }
+        .mhm-map svg:active { cursor: grabbing; }
+        .mhm-map svg:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+        .mhm-globe { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; border-radius: 8px; }
+        .mhm-globe:active { cursor: grabbing; }
+        .mhm-globe:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+        .mhm-tools { position: absolute; right: 8px; bottom: 8px; display: flex; gap: 6px; z-index: 1; }
+        .mhm-tools .btn { min-width: 32px; }
+        .mhm-county-line { fill: none; stroke: var(--bg2); stroke-width: .35px; stroke-opacity: .7; pointer-events: none; }
+        .mhm-area-line { fill: none; stroke: var(--bg2); stroke-width: .5px; stroke-opacity: .8; pointer-events: none; }
+        .mhm-context-line { fill: none; stroke: var(--b1); stroke-width: .5px; pointer-events: none; }
+        .mhm-state-line { fill: none; stroke: var(--bg2); stroke-width: 1px; pointer-events: none; }
+        .mhm-nation-line { fill: none; stroke: var(--b2); stroke-width: 1px; pointer-events: none; }
+        .mhm-focus { fill: none; stroke: var(--t0); stroke-width: 1.6px; pointer-events: none; }
+        .mhm-dot { stroke: var(--t1); stroke-width: 1px; vector-effect: non-scaling-stroke; }
+        .mhm-dot.on { stroke: var(--t0); stroke-width: 2px; }
+        .mhm-msg, .mhm-empty { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 10px; align-items: center; justify-content: center; text-align: center; color: var(--t3); font-size: .8rem; padding: 12px; }
+        .mhm-msg { flex-direction: row; flex-wrap: wrap; background: var(--bg3); border-radius: 8px; }
+        .mhm-empty { pointer-events: none; color: var(--t1); }
+        .mhm-empty span { background: var(--bg2); border: 1px solid var(--b1); border-radius: 6px; padding: 4px 10px; max-width: 90%; }
+        .mhm-tip { position: absolute; pointer-events: none; background: var(--bg2); border: 1px solid var(--b2); border-radius: 8px; padding: 7px 10px; font-size: .74rem; color: var(--t1); box-shadow: 0 4px 16px rgba(0,0,0,.25); max-width: 200px; z-index: 2; }
+        .mhm-tip-name { color: var(--t0); font-weight: 600; }
+        .mhm-tip-value { font-family: var(--font-m); color: var(--t0); }
+        .mhm-tip-sub { color: var(--t3); font-size: .68rem; }
+        .mhm-readout { font-size: .76rem; color: var(--t1); min-height: 1.4em; margin-top: 8px; overflow-wrap: anywhere; }
+        .mhm-readout strong { color: var(--t0); }
+        .mhm-legend { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 8px; font-size: .7rem; color: var(--t2); }
+        .mhm-key { display: inline-flex; align-items: center; gap: 6px; }
+        .mhm-key.mono { font-size: .7rem; }
+        .mhm-swatch { width: 12px; height: 12px; border-radius: 3px; border: 1px solid var(--b1); }
+        .mhm-ramp { display: inline-flex; border-radius: 3px; overflow: hidden; }
+        .mhm-ramp span { width: 18px; height: 12px; }
+        .mhm-side { min-width: 0; }
+        .mhm-row { display: flex; width: 100%; justify-content: space-between; gap: 10px; background: none; border: none; border-bottom: 1px solid var(--b0); padding: 7px 4px; font-size: .78rem; color: var(--t1); text-align: left; cursor: pointer; }
+        .mhm-row:hover, .mhm-row.on { background: var(--bg3); color: var(--t0); }
+        .mhm-row:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
+        .mhm-row-name { min-width: 0; overflow-wrap: anywhere; }
+        .mhm-row-value { white-space: nowrap; color: var(--t0); }
+        /* 10/18 (Nic): the lean view's rows carry GAM's number and how the
+           area voted, one under the other so neither is squeezed out. */
+        .mhm-row-value.two { display: inline-flex; flex-direction: column; align-items: flex-end; line-height: 1.35; }
+        .mhm-row-lean { color: var(--t2); font-size: .72rem; }
+        /* 10/18 (Nic): the little window a click opens, over the map and out
+           of the way of the zoom controls in the other corner. It scrolls
+           inside itself rather than growing the card, and on a narrow screen
+           it takes the width it needs. */
+        .mhm-window { position: absolute; top: 8px; right: 8px; z-index: 3; width: min(300px, calc(100% - 16px));
+          max-height: calc(100% - 16px); overflow: auto; background: var(--bg2); border: 1px solid var(--b2);
+          border-radius: 10px; padding: 10px 12px; box-shadow: 0 6px 24px rgba(0,0,0,.3); font-size: .76rem; color: var(--t1); }
+        /* On a phone the map box is short, so the window is allowed to run
+           past it rather than becoming a letterbox with its own scrollbar. */
+        @media (max-width: 700px) { .mhm-window { width: calc(100% - 16px); max-height: 70vh; } }
+        .mhm-window-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+        .mhm-window-name { color: var(--t0); font-weight: 600; font-size: .86rem; overflow-wrap: anywhere; }
+        .mhm-window-kl { margin-top: 10px; }
+        .mhm-window-lines > div { margin-top: 2px; }
+        .mhm-window-lines strong { color: var(--t0); font-weight: 600; }
+        .mhm-window-table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+        .mhm-window-table th, .mhm-window-table td { text-align: left; padding: 3px 0; vertical-align: top; font-weight: 400; }
+        .mhm-window-table thead th { color: var(--t3); font-size: .68rem; border-bottom: 1px solid var(--b0); }
+        .mhm-window-table thead th span { display: block; color: var(--t3); font-size: .64rem; }
+        .mhm-window-table tbody th { color: var(--t1); padding-right: 8px; }
+        .mhm-window-table td { color: var(--t0); white-space: nowrap; }
+        .mhm-window-table td + td { padding-left: 8px; }
+        .mhm-more { margin-top: 8px; }
+        .mhm-missing { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--b0); }
+        .mhm-credit { margin-top: 6px; color: var(--t3); }
+      `}</style>
+    </div>
+  )
+}

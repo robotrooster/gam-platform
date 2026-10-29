@@ -17,7 +17,8 @@
  *     see the day-to-day items)
  *   - Maintenance awaiting_approval ALWAYS shows (always owner
  *     concern regardless of delegation — pre-S183 invariant)
- *   - Failed payment within 30 days triggers 'recent_failure'
+ *   - Failed payment within 30 days used to trigger 'recent_failure' (removed
+ *     10/21 — a bounced pull is a phone call, which is the Front Desk's job)
  *   - Empty state: all arrays empty, counts.total = 0
  */
 
@@ -105,15 +106,31 @@ describe('GET /api/landlords/me/todos', () => {
     expect(res.body.data.counts.total).toBe(2)
   })
 
-  it('bank account active → no landlord-bank todo', async () => {
+  // 10/12 (Nic): the task clears on live Stripe Connect payouts only. A row in
+  // the legacy bank catalog (the removed Add Bank Account form) used to clear
+  // it — and it never set up a payout (Country Acres, 10/5).
+  it('Stripe Connect payouts live → no landlord-bank todo', async () => {
+    const f = await seedTFixture()
+    await db.query(`UPDATE landlords SET connect_payouts_enabled = TRUE WHERE id = $1`, [f.landlordId])
+    const res = await getTodos(f.landlordToken)
+    expect(res.status).toBe(200)
+    const bankTodos = res.body.data.ach.filter((a: any) => a.id === 'landlord-bank')
+    expect(bankTodos.length).toBe(0)
+  })
+
+  it('an active legacy bank row alone → the todo stays, and says to set up payouts with Stripe', async () => {
     const f = await seedTFixture()
     const client = await db.connect()
     try { await seedUserBankAccount(client, { userId: f.landlordUserId }) }
     finally { client.release() }
     const res = await getTodos(f.landlordToken)
     expect(res.status).toBe(200)
-    const bankTodos = res.body.data.ach.filter((a: any) => a.id === 'landlord-bank')
-    expect(bankTodos.length).toBe(0)
+    const [todo] = res.body.data.ach.filter((a: any) => a.id === 'landlord-bank')
+    expect(todo).toMatchObject({
+      title: 'Set up payouts',
+      subtitle: 'Required to receive rent. Verify your business with Stripe on the Disbursement Account page.',
+      href: '/banking',
+    })
   })
 
   it('lease needs_review → leases[] has needs_review item', async () => {
@@ -256,7 +273,18 @@ describe('GET /api/landlords/me/todos', () => {
     expect(res.body.data.maintenance[0].subtitle).toMatch(/\$1,500/)
   })
 
-  it('tenant ACH not verified on active unit → tenant_ach todo', async () => {
+  // ── 10/21 (Nic): ONLY WHAT THE LANDLORD CAN ACTUALLY DO ───────────────────
+  //
+  //   "we should eliminate things that are not something a landlord can
+  //    achieve or take off of the to-do list. Like right now, I'm showing 56
+  //    ACH issues. For tenants that don't have ACH set up yet. Either they're
+  //    not going to, or they don't have a bank account, that's not something a
+  //    landlord can do. And it looks like I need to do 57 things right now."
+  //
+  // These two tests used to assert the rows EXISTED. They are inverted rather
+  // than deleted, because a to-do list is the kind of thing somebody helpfully
+  // adds a row back to, and the reason it went is not obvious from the absence.
+  it('a tenant who has not verified their bank is NOT the landlord\'s to do', async () => {
     const f = await seedTFixture()
     const client = await db.connect()
     try {
@@ -265,18 +293,21 @@ describe('GET /api/landlords/me/todos', () => {
       // need a primary lease_tenant linking the tenant to the unit's lease.
       const leaseId = await seedLease(client, { unitId: f.unitId, landlordId: f.landlordId })
       await seedLeaseTenant(client, { leaseId, tenantId: f.tenantId, role: 'primary' })
-      // Tenant default ach_verified is null/false → triggers the todo.
+      // ach_verified defaults to null/false — this is the 56-row case.
       await client.query('COMMIT')
     } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
 
     const res = await getTodos(f.landlordToken)
     expect(res.status).toBe(200)
-    const tenantAchTodos = res.body.data.ach.filter((a: any) => a.type === 'tenant_ach')
-    expect(tenantAchTodos.length).toBe(1)
-    expect(tenantAchTodos[0].title).toMatch(/ACH not verified/)
+    // The landlord cannot verify somebody else's bank account, and some
+    // tenants never will. It is not on the Front Desk either (Nic: "ACH is
+    // not something they're going to necessarily do, so it doesn't need to go
+    // there") — it is simply not a task.
+    expect(res.body.data.ach.filter((a: any) => a.type === 'tenant_ach')).toHaveLength(0)
+    expect(JSON.stringify(res.body.data)).not.toMatch(/ACH not verified/)
   })
 
-  it('failed rent pull in last 30 days → recent_failure todo', async () => {
+  it('a bounced rent pull is a phone call, so it belongs to the Front Desk and not here', async () => {
     const f = await seedTFixture()
     const client = await db.connect()
     try {
@@ -292,33 +323,10 @@ describe('GET /api/landlords/me/todos', () => {
 
     const res = await getTodos(f.landlordToken)
     expect(res.status).toBe(200)
-    const failureTodos = res.body.data.ach.filter((a: any) => a.type === 'recent_failure')
-    expect(failureTodos.length).toBe(1)
-    expect(failureTodos[0].title).toMatch(/Failed rent pull/)
-  })
-
-  it('failed rent pull OLDER than 30 days → no todo', async () => {
-    const f = await seedTFixture()
-    const client = await db.connect()
-    try {
-      await client.query('BEGIN')
-      const leaseId = await seedLease(client, { unitId: f.unitId, landlordId: f.landlordId })
-      await seedLeaseTenant(client, { leaseId, tenantId: f.tenantId, role: 'primary' })
-      const paymentId = await seedRentPayment(client, {
-        unitId: f.unitId, tenantId: f.tenantId, landlordId: f.landlordId,
-        amount: 1500, status: 'failed',
-      })
-      // Backdate the due_date past the 30-day window.
-      await client.query(
-        `UPDATE payments SET due_date = CURRENT_DATE - INTERVAL '60 days' WHERE id=$1`,
-        [paymentId])
-      await client.query('COMMIT')
-    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
-
-    const res = await getTodos(f.landlordToken)
-    expect(res.status).toBe(200)
-    const failureTodos = res.body.data.ach.filter((a: any) => a.type === 'recent_failure')
-    expect(failureTodos.length).toBe(0)
+    // Nothing is lost by dropping it: the money is still owed, so the tenant
+    // is on the Front Desk under "Owes — overdue", where somebody can ring
+    // them. The landlord cannot make a returned pull succeed.
+    expect(res.body.data.ach.filter((a: any) => a.type === 'recent_failure')).toHaveLength(0)
   })
 
   // S576 (B-8): a work-trade agreement paused (by the lease-end processor)
@@ -394,7 +402,7 @@ describe('GET /api/landlords/me/todos — onboarding control tower', () => {
   // holds the draft until everyone accepts. The dashboard used to read that as a
   // failed auto-draft and tell the landlord to draft it — which would have
   // produced a lease missing the co-tenant.
-  it('whole_unit, one of two accepted → awaiting_co_tenants, NOT lease_not_drafted', async () => {
+  it('whole_unit, one of two accepted → NO row at all, and above all not lease_not_drafted', async () => {
     const f = await seedTFixture()
     const client = await db.connect()
     let coTenantId: string
@@ -409,12 +417,15 @@ describe('GET /api/landlords/me/todos — onboarding control tower', () => {
        VALUES ($1,$2,'not_uploaded',$3, NULL)`,
       [f.landlordId, coTenantId!, f.unitId])
     const res = await getTodos(f.landlordToken)
-    expect(types(res)).toContain('awaiting_co_tenants')
+    // 10/21 (Nic): waiting on a housemate is nobody's TASK. This row's own
+    // subtitle used to say "Nothing for you to do unless you want to resend
+    // the invite" — the lease drafts itself the moment the last one accepts.
+    // Whoever is chasing them reads the Front Desk's "Waiting on household".
+    expect(types(res)).not.toContain('awaiting_co_tenants')
+    // What still matters is that the unit raises NO row at all while a
+    // housemate is outstanding — above all not "draft the lease", which would
+    // put the landlord to work on something that is about to happen by itself.
     expect(types(res)).not.toContain('lease_not_drafted')
-    // one row for the unit, not one per person who already accepted
-    expect(types(res).filter((t: string) => t === 'awaiting_co_tenants')).toHaveLength(1)
-    const row = res.body.data.onboarding.find((o: any) => o.type === 'awaiting_co_tenants')
-    expect(row.title).toContain('1 of 2')
   })
 
   it('whole_unit, BOTH accepted, no draft → still lease_not_drafted', async () => {
@@ -541,7 +552,8 @@ describe('to-dos for a co-owner of somebody else’s entity', () => {
           profileId: partner.landlordId,
           landlordIds: [partner.landlordId, owner.landlordId], permissions: {} },
         process.env.JWT_SECRET!, { expiresIn: '1h' })
-      return { token, propertyId, ownerLandlordId: owner.landlordId }
+      return { token, propertyId, ownerLandlordId: owner.landlordId,
+               partnerLandlordId: partner.landlordId, partnerUserId: partner.userId }
     } catch (e) { await client.query('ROLLBACK'); throw e }
     finally { client.release() }
   }
@@ -574,6 +586,29 @@ describe('to-dos for a co-owner of somebody else’s entity', () => {
     const res = await getTodos(token)
     expect(res.status).toBe(200)
     expect((res.body.data.ach as any[]).map((t) => t.id)).toContain('landlord-bank')
+  })
+
+  // 10/12 (Nic): Blu co-owns Oak Park (paid) and owns TruBlu Management LLC,
+  // which holds Country Acres and has no Stripe account. "Any company in scope
+  // can be paid" let Oak Park answer for TruBlu, so the to-do never showed.
+  it('demands payouts for the co-owner’s OWN company once it has a property', async () => {
+    const f = await seedCoOwner()
+    const own = { id: f.partnerLandlordId, user_id: f.partnerUserId }
+    await db.query(`UPDATE landlords SET business_name = 'TruBlu Management LLC' WHERE id = $1`, [own.id])
+    const client = await db.connect()
+    try {
+      await seedProperty(client, { landlordId: own.id, ownerUserId: own.user_id, managedByUserId: own.user_id })
+    } finally { client.release() }
+
+    const res = await getTodos(f.token)
+    expect(res.status).toBe(200)
+    const [todo] = (res.body.data.ach as any[]).filter((t) => t.id === 'landlord-bank')
+    expect(todo, 'a paid co-owned company hid the unpaid company that holds a property').toBeTruthy()
+    expect(todo).toMatchObject({
+      title: 'Set up payouts',
+      subtitle: "TruBlu Management LLC can't be paid yet. Verify it with Stripe on the Disbursement Account page.",
+      href: `/banking?entity=${own.id}`,
+    })
   })
 })
 

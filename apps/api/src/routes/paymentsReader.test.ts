@@ -61,6 +61,7 @@ import { db } from '../db'
 import { processingFeeFor } from '@gam/shared'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, seedLease, seedLeaseTenant, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import { paymentsRouter } from './payments'
 import { errorHandler } from '../middleware/errorHandler'
@@ -111,16 +112,15 @@ beforeEach(async () => {
   await cleanupAllSchema()
   process.env.JWT_SECRET = SECRET
   vi.clearAllMocks()
-  // platform_processing_rates is reference data the cleanup leaves alone, so a
-  // rate seeded here must be removed again (afterEach) or it leaks into suites
-  // that expect their own card rate.
-  await db.query(
-    `INSERT INTO platform_processing_rates (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent, notes)
-     SELECT 'card', 0.55, 3.5, 0.26, 2.9, 's654-reader-test'
-      WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'card' AND effective_until IS NULL)`)
-})
-afterEach(async () => {
-  await db.query(`DELETE FROM platform_processing_rates WHERE notes = 's654-reader-test'`)
+  // 10/17: the rate this file's figures are worked out on, STATED rather than
+  // seeded-if-missing: one row is open per method and cleanupAllSchema leaves the
+  // rate card alone, so an insert-if-missing took whatever an earlier file left.
+  await setEffectiveProcessingRate(db, {
+    paymentMethod: 'card',
+    customerFacingFlat: 0.55, customerFacingPercent: 3.5,
+    stripeCostFlat: 0.26, stripeCostPercent: 2.9,
+    notes: 's654-reader-test',
+  })
 })
 
 describe('S654 card on the counter reader', () => {

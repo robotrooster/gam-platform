@@ -670,7 +670,12 @@ describe('PATCH /leases/:id — auth + validation', () => {
   })
 
   // ─────────────────────────────────────────────────────────────
-  //  S476: state-law warning surfacing on PATCH response
+  //  S476: state-law warning surfacing on PATCH response — HIDDEN 10/20.
+  //  Nic: "There should be no state law warnings anywhere in the system. At
+  //  least not right now. Just hide all that stuff." The lease PATCH still
+  //  carries the state_law_warnings field and it is always empty; one switch
+  //  (system_features.state_law_warnings_enabled) brings it back, proven both
+  //  ways in services/stateLaw.test.ts and tenantsLeaseStateLaw.test.ts.
   // ─────────────────────────────────────────────────────────────
 
   // schema.sql is schema-only — state_law seed migrations INSERT data
@@ -697,7 +702,7 @@ describe('PATCH /leases/:id — auth + validation', () => {
        ON CONFLICT DO NOTHING`, [actId])
   }
 
-  it('S476: AZ deposit 2.0× rent (above 1.5mo cap) → state_law_warnings has flag', async () => {
+  it('hidden 10/20: AZ deposit 2.0× rent, over the seeded 1.5mo figure → the save says nothing', async () => {
     const f = await seedFixture({ leaseStatus: 'pending', rentAmount: 1500 })
     await seedAzDepositCap()
     const res = await request(buildApp())
@@ -706,11 +711,8 @@ describe('PATCH /leases/:id — auth + validation', () => {
       .send({ securityDeposit: 3000 })  // 2.0 months of 1500 rent
     expect(res.status).toBe(200)
     expect(Array.isArray(res.body.data.state_law_warnings)).toBe(true)
-    expect(res.body.data.state_law_warnings.length).toBe(1)
-    const flag = res.body.data.state_law_warnings[0]
-    expect(flag.topic).toBe('deposit_max_months')
-    expect(flag.message).toMatch(/above the 1\.5/)
-    expect(flag.message).toMatch(/AZ/)
+    expect(res.body.data.state_law_warnings).toEqual([])
+    expect(JSON.stringify(res.body)).not.toMatch(/not legal advice|A\.R\.S\./i)
   })
 
   it('S476: AZ deposit 1.0× rent (within 1.5mo cap) → state_law_warnings empty', async () => {

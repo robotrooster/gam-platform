@@ -66,6 +66,9 @@ export const getMyPayments: AgentTool = {
          FROM payments p
         WHERE ${householdRowSql('p', '$1')}
           AND (p.entry_description IS DISTINCT FROM 'FLEXPAY' OR p.tenant_id = $1)
+          -- 10/12 (Nic, G9): a voided charge was taken off and is owed by
+          -- nobody: not read out as a payment (it stays on file).
+          AND p.status <> 'voided'
         ORDER BY COALESCE(p.due_date, p.created_at::date) DESC, p.created_at DESC, p.id
         LIMIT $2`,
       [actor.profileId, limit]

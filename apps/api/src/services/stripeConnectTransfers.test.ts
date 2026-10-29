@@ -34,7 +34,7 @@ vi.mock('stripe', () => {
 
 import Stripe from 'stripe'
 import { db, getClient } from '../db'
-import { fireManagerTransfersForReference } from './stripeConnect'
+import { fireManagerTransfersForReference, firePmTransfersForReference } from './stripeConnect'
 import {
   cleanupAllSchema,
   seedLandlord, seedManager,
@@ -246,5 +246,59 @@ describe('fireManagerTransfersForReference', () => {
       [seed.ledgerId]
     )
     expect(row.rows[0].stripe_transfer_id).toBe('tr_prefired')
+  })
+})
+
+// 10/12 (Nic): a PM company's cut is booked to its active owner (there is no
+// catalog bank any more) and must be paid to the COMPANY's Stripe Connect
+// account — the one its owner verifies and PM acceptance checks. The owner has
+// no user-level Connect account; the old lookup read only that and skipped.
+describe('firePmTransfersForReference', () => {
+  async function seedPmFeeRow(opts: { ownerIsStaff: boolean }) {
+    const client = await getClient()
+    try {
+      const { userId: ownerUserId, landlordId } = await seedLandlord(client)
+      const { userId: pmOwnerUserId } = await seedLandlord(client)
+      const propertyId = await seedProperty(client, {
+        landlordId, ownerUserId, managedByUserId: ownerUserId,
+      })
+      const pm = await client.query<{ id: string }>(
+        `INSERT INTO pm_companies (name, stripe_connect_account_id, connect_payouts_enabled, connect_details_submitted)
+         VALUES ('Connect-only PM', 'acct_pm_company_1', TRUE, TRUE) RETURNING id`)
+      const pmCompanyId = pm.rows[0].id
+      if (opts.ownerIsStaff) {
+        await client.query(
+          `INSERT INTO pm_staff (pm_company_id, user_id, role, status, joined_at)
+           VALUES ($1, $2, 'owner', 'active', NOW())`, [pmCompanyId, pmOwnerUserId])
+      }
+      await client.query(`UPDATE properties SET pm_company_id = $1 WHERE id = $2`, [pmCompanyId, propertyId])
+      const leaseRef = (await client.query<{ id: string }>(`SELECT uuid_generate_v4() AS id`)).rows[0].id
+      const ledger = await client.query<{ id: string }>(
+        `INSERT INTO user_balance_ledger
+           (user_id, type, amount, balance_after, reference_id, reference_type, property_id, notes)
+         VALUES ($1, 'allocation_pm_company_fee', 150, 150, $2, 'lease', $3, 'Test leasing fee')
+         RETURNING id`, [pmOwnerUserId, leaseRef, propertyId])
+      return { ledgerId: ledger.rows[0].id, leaseRef }
+    } finally { client.release() }
+  }
+
+  it('pays the PM company’s Connect account when the recipient owns that company', async () => {
+    const seed = await seedPmFeeRow({ ownerIsStaff: true })
+    stripeMocks.transfersCreate.mockResolvedValueOnce({ id: 'tr_pm_1' } as any)
+    const result = await firePmTransfersForReference('lease', seed.leaseRef)
+    expect(result).toEqual({ fired: 1, failed: 0 })
+    expect(stripeMocks.transfersCreate.mock.calls[0][0]).toMatchObject({
+      amount: 15000, destination: 'acct_pm_company_1',
+    })
+    const row = await db.query<{ stripe_transfer_id: string | null }>(
+      `SELECT stripe_transfer_id FROM user_balance_ledger WHERE id=$1`, [seed.ledgerId])
+    expect(row.rows[0].stripe_transfer_id).toBe('tr_pm_1')
+  })
+
+  it('never pays a company the recipient is not an owner of', async () => {
+    const seed = await seedPmFeeRow({ ownerIsStaff: false })
+    const result = await firePmTransfersForReference('lease', seed.leaseRef)
+    expect(result).toEqual({ fired: 0, failed: 1 })
+    expect(stripeMocks.transfersCreate).not.toHaveBeenCalled()
   })
 })

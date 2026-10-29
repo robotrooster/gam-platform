@@ -1,25 +1,10 @@
-import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { Bell, MailX } from 'lucide-react'
+import { useQuery } from 'react-query'
+import { MailX } from 'lucide-react'
+import { emailCategoryLabel } from '@gam/shared'
 import { api, apiGet } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
-
-const LANDLORD_NOTIFICATION_TYPES: { type: string; label: string }[] = [
-  { type: 'rent_collected',                label: 'Rent collected' },
-  { type: 'rent_failed',                   label: 'Rent failed' },
-  { type: 'ach_retry_scheduled',           label: 'ACH retry scheduled' },
-  { type: 'ach_retries_exhausted',         label: 'ACH retries exhausted' },
-  { type: 'disbursement_sent',             label: 'Disbursement sent' },
-  { type: 'maintenance_submitted',         label: 'New maintenance request' },
-  { type: 'inspection_tenant_signed',      label: 'Tenant signed inspection' },
-  { type: 'inspection_finalized',          label: 'Inspection finalized' },
-  { type: 'inspection_scheduled_reminder', label: 'Inspection scheduled reminder' },
-  { type: 'entry_request_responded',       label: 'Tenant responded to entry request' },
-  { type: 'lease_expiring',                label: 'Lease expiring' },
-  { type: 'low_stock',                     label: 'Low POS stock' },
-  { type: 'tenant_invite_accepted',        label: 'Tenant accepted invite' },
-  { type: 'reservation_requested',         label: 'Amenity reservation request' },
-]
+import { NotificationPreferences } from '../../../../packages/shared-ui/NotificationPreferences'
 
 interface EmailFailureRow {
   id: string
@@ -33,71 +18,34 @@ interface EmailFailureRow {
   createdAt: string
 }
 
-// W-53 (S531): merged into Settings as a section — the standalone nav item
-// and page are gone; /notification-prefs redirects to /settings.
+/**
+ * W-53 (S531): merged into Settings as a section — the standalone nav item and
+ * page are gone; /notification-prefs redirects to /settings.
+ *
+ * 10/20 (Nic): the list itself is no longer written here. It used to be sixteen
+ * hand-typed rows, which is how a landlord came to be looking at a page that
+ * was missing twenty-two of the types GAM actually sends him — and showing two
+ * ('Rent failed', 'Disbursement sent') that nothing has ever sent. Every row now
+ * comes from the one notification catalog in @gam/shared, through the same
+ * component the tenant portal renders.
+ */
 export function NotificationPrefsSection() {
-  const qc = useQueryClient()
   const { user } = useAuth()
-  const { data: prefs = [], isLoading } = useQuery<any[]>('notification-prefs', () =>
-    apiGet<any[]>('/notifications/preferences'),
-  )
-  const prefMap = new Map<string, any>()
-  for (const p of (prefs as any[])) prefMap.set(p.type, p)
-
-  const update = useMutation(
-    (body: { type: string; emailEnabled: boolean; inAppEnabled: boolean }) =>
-      api.patch('/notifications/preferences', body).then(r => r.data),
-    { onSuccess: () => qc.invalidateQueries('notification-prefs') },
-  )
-
   const { can } = usePerms()
-
-  const toggle = (type: string, currentVal: boolean) => {
-    const current = prefMap.get(type) || { emailEnabled: true, inAppEnabled: true }
-    update.mutate({ type, emailEnabled: !currentVal, inAppEnabled: current.inAppEnabled })
-  }
 
   return (
     <div>
-      <div className="card-header" style={{ marginBottom: 12 }}>
-        <span className="card-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <Bell size={16} /> Notification Preferences
-        </span>
-        <span style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>Choose how GAM contacts you for each event type</span>
-      </div>
-
-      <div className="card" style={{ padding: 12, marginBottom: 16, fontSize: '.82rem', color: 'var(--text-2)' }}>
-        In-app notifications always show in your dashboard. Email is an
-        optional channel per type. Default: email on.
-      </div>
-
-      <div className="card" style={{ padding: 0 }}>
-        {isLoading ? (
-          <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)' }}>Loading…</div>
-        ) : (
-          <table className="data-table" style={{ width: '100%' }}>
-            <thead>
-              <tr>
-                <th>Notification</th>
-                <th style={{ textAlign: 'center' }}>Email</th>
-              </tr>
-            </thead>
-            <tbody>
-              {LANDLORD_NOTIFICATION_TYPES.map(({ type, label }) => {
-                const p = prefMap.get(type) || { emailEnabled: true }
-                return (
-                  <tr key={type}>
-                    <td><strong>{label}</strong></td>
-                    <td style={{ textAlign: 'center' }}>
-                      <input type="checkbox" checked={p.emailEnabled} onChange={() => toggle(type, p.emailEnabled)} />
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
+      <NotificationPreferences
+        audience="landlord"
+        title="Notification Preferences"
+        api={{
+          get:   (url) => apiGet<any[]>(url),
+          patch: (url, body) => api.patch(url, body).then(r => r.data),
+        }}
+        // A team member has no birthday on file and is never emailed one, so
+        // they are not shown a switch that would do nothing.
+        isAccountHolder={user?.role === 'landlord'}
+      />
 
       {/* S168: surface failed email sends from email_send_log so landlords
             see when GAM tried to email a tenant/staff and the send didn't
@@ -155,7 +103,16 @@ function EmailFailuresCard() {
                   <td style={{ fontSize: '.82rem', maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {r.subject}
                   </td>
-                  <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{r.category || '—'}</td>
+                  {/* 10/20: this printed the stored string — "late_payment_notice",
+                      "esign_signing_reminder" — directly under eighty rows of
+                      careful English (memory: gam-no-raw-enums-in-ui).
+                      notificationLabel could not cover it: an email's category
+                      and a notification's type are two different namespaces,
+                      which is itself why they are reconciled in one place now
+                      (@gam/shared emailCategories). */}
+                  <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
+                    {r.category ? emailCategoryLabel(r.category) : '—'}
+                  </td>
                   <td style={{ fontSize: '.78rem', color: 'var(--red, #dc4c4c)', maxWidth: 320 }}>
                     {r.errorMessage || '(no message)'}
                   </td>

@@ -383,8 +383,10 @@ describe('#46.4 — ending a lease whose tenant never paid the move-in bill or m
     for (const r of rows) expect(r.notes).toMatch(/the tenant never paid the move-in bill or moved in, so nothing on it is owed/)
     expect((await db.query(`SELECT status FROM invoices WHERE id = $1`, [b.inv])).rows[0].status).toBe('void')
     expect(await owed(m.tenantId)).toBe(0)
-    // A deposit record that never had a dollar is not a deposit.
-    expect((await db.query(`SELECT COUNT(*)::int AS n FROM security_deposits WHERE lease_id = $1`, [m.leaseId])).rows[0].n).toBe(0)
+    // A deposit record that never had a dollar is not a deposit. 10/12 (Nic,
+    // G8 — keep everything): it is voided and kept, never deleted.
+    expect((await db.query(`SELECT COUNT(*)::int AS n FROM security_deposits WHERE lease_id = $1 AND status <> 'voided'`, [m.leaseId])).rows[0].n).toBe(0)
+    expect((await db.query(`SELECT status FROM security_deposits WHERE lease_id = $1`, [m.leaseId])).rows.map((r: any) => r.status)).toEqual(['voided'])
   })
 
   it('a deposit nobody paid is never a deposit to refund: after the never-moved-in end, the deposit return shows $0 held and $0 back', async () => {

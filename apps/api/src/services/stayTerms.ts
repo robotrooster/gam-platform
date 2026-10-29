@@ -36,14 +36,24 @@ import { AppError } from '../middleware/errorHandler'
 import { todayIn } from '../lib/timezone'
 import { portalLink } from '../lib/portalUrls'
 import { createNotification } from './notifications'
-import { chargeLandlord } from './landlordGamAccount'
+import { chargeLandlord, voidGamCharge } from './landlordGamAccount'
 import { replyToProperty } from './replyRouting'
 import {
   guestScreeningContext, screeningHistorySentence, RESERVATION_PAID_SQL,
 } from './bookingLeaseDraft'
+import { lateFeePolicyToAgreementStamp } from './lateFeePolicy'
 
 /** Stays that hold or held a site. A cancelled or no-show stay never adds nights. */
 const LIVE_STAY_STATUSES = ['tentative', 'confirmed', 'checked_in', 'checked_out']
+/**
+ * 10/20 (Nic): the stays that prove a guest was HERE — the desk closed the stay,
+ * or the desk let them in and never closed it (nothing auto-closes a departed
+ * stay, so at a park that skips check-out this is what a finished stay looks
+ * like). A 'confirmed' row with a past date is not proof of anything: it reads
+ * identically to a reservation nobody turned up for. See priorCompletedStay.
+ */
+const COMPLETED_STAY_STATUSES = ['checked_out', 'checked_in']
+
 /** A check still on its way: paid for, not yet decided (or the provider still working). */
 const CHECK_IN_PROGRESS = ['pending', 'awaiting_applicant', 'submitted', 'processing', 'complete']
 /** Same marker the service-agreement door and the tenant invite use for "not set up yet". */
@@ -89,22 +99,37 @@ const normEmail = (e: string | null | undefined): string | null =>
 const daysBetween = (fromYmd: string, toYmd: string): number =>
   Math.round((Date.parse(toYmd.slice(0, 10) + 'T00:00:00Z') - Date.parse(fromYmd.slice(0, 10) + 'T00:00:00Z')) / 86400000)
 
-/** The tenant id and email for a person known by either. */
+/** The name on an account, as one string — '' and ' ' are no name at all. */
+const accountName = (first: string | null | undefined, last: string | null | undefined): string | null =>
+  [first, last].map(p => (p ?? '').trim()).filter(Boolean).join(' ') || null
+
+/**
+ * The tenant id and email for a person known by either — and the name on their
+ * account, which is the only name GAM holds for somebody who typed nothing but
+ * an address at the counter (see samePersonName).
+ */
 async function resolvePerson(tenantId?: string | null, email?: string | null): Promise<{
-  tenantId: string | null; userId: string | null; email: string | null
+  tenantId: string | null; userId: string | null; email: string | null; name: string | null
 }> {
   if (tenantId) {
-    const r = await queryOne<{ user_id: string; email: string | null }>(
-      `SELECT u.id AS user_id, u.email FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id = $1`, [tenantId])
-    return { tenantId, userId: r?.user_id ?? null, email: normEmail(email) ?? normEmail(r?.email) }
+    const r = await queryOne<{ user_id: string; email: string | null; first_name: string | null; last_name: string | null }>(
+      `SELECT u.id AS user_id, u.email, u.first_name, u.last_name
+         FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id = $1`, [tenantId])
+    return {
+      tenantId, userId: r?.user_id ?? null, email: normEmail(email) ?? normEmail(r?.email),
+      name: accountName(r?.first_name, r?.last_name),
+    }
   }
   const e = normEmail(email)
-  if (!e) return { tenantId: null, userId: null, email: null }
-  const r = await queryOne<{ user_id: string; tenant_id: string | null }>(
-    `SELECT u.id AS user_id, t.id AS tenant_id
+  if (!e) return { tenantId: null, userId: null, email: null, name: null }
+  const r = await queryOne<{ user_id: string; tenant_id: string | null; first_name: string | null; last_name: string | null }>(
+    `SELECT u.id AS user_id, t.id AS tenant_id, u.first_name, u.last_name
        FROM users u LEFT JOIN tenants t ON t.user_id = u.id
       WHERE LOWER(u.email) = $1 ORDER BY t.created_at NULLS LAST LIMIT 1`, [e])
-  return { tenantId: r?.tenant_id ?? null, userId: r?.user_id ?? null, email: e }
+  return {
+    tenantId: r?.tenant_id ?? null, userId: r?.user_id ?? null, email: e,
+    name: accountName(r?.first_name, r?.last_name),
+  }
 }
 
 // ── R7: CONTINUOUS NIGHTS ────────────────────────────────────────────────────
@@ -124,6 +149,12 @@ export interface StayChain {
   /** The person the chain was walked for (from the saved stay when the caller passed nobody). */
   tenantId: string | null
   email: string | null
+  /**
+   * 10/20 (review): the name this stay is in — what the door passed, else the
+   * one on the saved stay. An address match alone never proves who somebody is
+   * (priorCompletedStay, samePersonName), and this is the other half of it.
+   */
+  name: string | null
   /**
    * 10/6 (Nic): a stay of the chain carries the landlord's "Returning guest —
    * they've stayed with us before" (unit_bookings.returning_guest_at). Every
@@ -149,6 +180,8 @@ export async function continuousStayNights(args: {
   bookingId?: string | null
   tenantId?: string | null
   email?: string | null
+  /** The name the stay is in, when the door has one (see StayChain.name). */
+  guestName?: string | null
   checkIn: string
   checkOut: string
 }): Promise<StayChain> {
@@ -156,17 +189,21 @@ export async function continuousStayNights(args: {
   const checkOut = String(args.checkOut).slice(0, 10)
   let tenantId = args.tenantId ?? null
   let email = normEmail(args.email)
+  let name = (args.guestName ?? '').trim() || null
   // A saved stay is the same person whatever the caller passed.
   let selfCreatedAt: string | null = null
   let selfTerms: StayTerms | null = null
   let selfReturning = false
   if (args.bookingId) {
-    const self = await queryOne<{ tenant_id: string | null; guest_email: string | null; created_at: Date; stay_terms: StayTerms | null; returning: boolean }>(
-      `SELECT tenant_id, guest_email, created_at, stay_terms, (returning_guest_at IS NOT NULL) AS returning
+    const self = await queryOne<{ tenant_id: string | null; guest_email: string | null; guest_name: string | null; created_at: Date; stay_terms: StayTerms | null; returning: boolean }>(
+      `SELECT tenant_id, guest_email, guest_name, created_at, stay_terms, (returning_guest_at IS NOT NULL) AS returning
          FROM unit_bookings WHERE id = $1`, [args.bookingId])
     if (self) {
       tenantId = tenantId ?? self.tenant_id
       email = email ?? normEmail(self.guest_email)
+      // The door's own answer wins — an edit that corrects the name is the
+      // name the stay is in now.
+      name = name ?? ((self.guest_name ?? '').trim() || null)
       selfCreatedAt = new Date(self.created_at).toISOString()
       selfTerms = self.stay_terms
       selfReturning = self.returning === true
@@ -182,7 +219,7 @@ export async function continuousStayNights(args: {
     bookingIds: args.bookingId ? [args.bookingId] : [],
     terms: args.bookingId ? [selfTerms] : [],
     earliestCreatedAt: selfCreatedAt,
-    tenantId, email,
+    tenantId, email, name,
     returning: selfReturning,
   }
   if (!tenantId && !email) return out
@@ -326,6 +363,234 @@ export async function screeningOnFile(args: {
   return { onFile: false }
 }
 
+// ── RETURNING GUESTS, DERIVED FROM THEIR OWN HISTORY ───────────────────
+
+/**
+ * 10/20 (review) — AN EMAIL ADDRESS IS HOW YOU REACH A PERSON, NOT HOW YOU
+ * ARE ONE.
+ *
+ * Dale and Donna Carter share carters@example.com, which is how a couple's
+ * mail works and how the park has their address written down. Dale wintered
+ * here for ten nights; Donna booked forty-five in her own name at the front
+ * desk and read as returning off HIS stay — no $34.99 check ordered, no fee,
+ * and because the register and pay-link doors leave a 'returning' stay out of
+ * markScreeningRequired, nothing stopped her at the gate either. A month and a
+ * half on a site, unscreened, on somebody else's history. The same match fired
+ * for anybody who knew a prior guest's address.
+ *
+ * GAM's own duplicate-person matcher already refuses to call an email match
+ * identity without a name agreeing, and that one only raises a question on a
+ * screen. This one spends money and decides who sleeps on the park, so it is
+ * at least as careful: a bare address match has to be CORROBORATED by the name.
+ *
+ * What agrees, and what does not. The job is to let one person written two
+ * ways through and keep two people apart:
+ *   same   "Dale Carter" / "dale  carter"      — spelling is not identity
+ *          "Carter, Dale" / "Dale Carter"      — the filing-cabinet way round
+ *          "Dale A. Carter" / "Dale Carter"    — a middle name is not a person
+ *          "Dale Carter Jr" / "Dale Carter"    — nor is a suffix
+ *   not    "Dale Carter" / "Donna Carter"      — the whole point
+ *          "D Carter" / "Dale Carter"          — an initial is Dale as readily
+ *                                                as Donna; it proves nothing
+ *          "Dale" / "Dale Carter"              — one word is not a person
+ *          anything / no name                  — absence of a name is absence
+ *                                                of proof, and the landlord's
+ *                                                attestation is what covers it
+ *
+ * A name is never enough on its own and is never asked on its own: it only
+ * ever corroborates an address that already matched, at one account. Somebody
+ * who types a prior guest's exact name AND holds their address is claiming to
+ * be that person, which no name rule can catch and the duplicate matcher takes
+ * the same position on.
+ */
+const NAME_TITLES = new Set(['mr', 'mrs', 'ms', 'miss', 'mx', 'dr', 'prof', 'rev', 'sir'])
+const NAME_SUFFIXES = new Set(['jr', 'jnr', 'sr', 'snr', 'ii', 'iii', 'iv'])
+
+/** A name's words, lowercased and stripped of everything that is not one. */
+function personNameTokens(raw: string | null | undefined): string[] {
+  let s = String(raw ?? '')
+  if (!s.trim()) return []
+  // "Carter, Dale" is one person written the other way round.
+  const comma = s.indexOf(',')
+  if (comma > 0) s = `${s.slice(comma + 1)} ${s.slice(0, comma)}`
+  return s
+    // Muñoz and Munoz are the same man with a different keyboard.
+    .normalize('NFKD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+    .split(/\s+/)
+    .filter(t => t && !NAME_TITLES.has(t) && !NAME_SUFFIXES.has(t))
+}
+
+/** Are these two names the same person? Conservative — see the note above. */
+export function samePersonName(a: string | null | undefined, b: string | null | undefined): boolean {
+  const x = personNameTokens(a), y = personNameTokens(b)
+  if (!x.length || !y.length) return false
+  // The same words in any order: handles "Carter Dale" with no comma to read.
+  if (x.length === y.length && [...x].sort().join(' ') === [...y].sort().join(' ')) return true
+  // Otherwise the given name and the family name, both in full.
+  if (x.length < 2 || y.length < 2) return false
+  return x[0] === y[0] && x[x.length - 1] === y[y.length - 1]
+}
+
+/** A stay this person already took on this account — the proof they are returning. */
+export interface PriorStay {
+  bookingId: string
+  propertyId: string
+  propertyName: string | null
+  checkIn: string
+  checkOut: string
+}
+
+/**
+ * 10/20 (Nic): "I want the system to derive that somebody's returning from
+ * having customer data versus the landlord manually choosing to mark it."
+ *
+ * Returning used to mean exactly one thing: the landlord ticked "Returning
+ * guest — they've stayed with us before" and GAM took their word for it. For
+ * anybody GAM already holds a record of, that is the landlord doing work the
+ * data can do:
+ *
+ *   "Any completed prior stay at that property, at any of your properties? I'd
+ *    say completed stay at any properties of yours with no time limit. They're
+ *    a known quantity."
+ *
+ * So: any completed stay at ANY property on that landlord's ACCOUNT — one
+ * account can hold several companies, which is what public.account_companies
+ * walks — with no time limit, and the guest needs no background check. Never
+ * across accounts: another landlord's guest book is not this landlord's.
+ *
+ * The attestation path stays, and is still the only answer for somebody with no
+ * history here: a guest who wintered at the park for ten years before GAM
+ * existed has nothing in this table, and the landlord's word is all there is.
+ *
+ * WHAT COUNTS AS A COMPLETED STAY, and why it is drawn tight. Getting this
+ * wrong waives a $34.99 check on somebody who never stayed, so the question is
+ * "did a person at the desk see them":
+ *
+ *   'checked_out'  — the desk closed the stay. Unambiguous.
+ *   'checked_in', dates passed — the desk let them in and nobody closed it
+ *                    afterwards. Nothing in GAM auto-closes a departed stay, so
+ *                    at a park that never clicks check-out this is what a
+ *                    finished stay looks like.
+ *   'confirmed' / 'tentative' with a past date — NOT a stay. It is
+ *                    indistinguishable from a reservation nobody turned up for,
+ *                    and a planted no-show is exactly how somebody would buy a
+ *                    free waiver. 'cancelled' and 'no_show' never count.
+ *
+ * That is deliberately narrower than guestScreeningContext().priorStays, which
+ * counts 'confirmed' as well — that number writes a sentence for a human to
+ * read, and this one decides whether money changes hands.
+ *
+ * 10/20 (review) — AND THE STAY HAS TO BE OVER. "Dates passed" was written
+ * here from the first day and never reached the SQL: the only date test was
+ * `check_out < the chain's first night`, which a stay running RIGHT NOW passes
+ * whenever the new stay is months out. A guest checked in on the 10th through
+ * the 30th of November, his first ever stay, booked the winter from December
+ * 15th and came out 'returning' — no check ordered, no fee, check-in never
+ * waiting, on somebody sitting on a site he had not finished. So the ended
+ * test is in the WHERE clause now, against today where the PROPERTY is
+ * (properties.timezone, never the server's UTC), and it applies to a closed
+ * stay too: a check-out stamped on a stay whose last night is still ahead is
+ * not proof anybody was ever here.
+ *
+ * WHO IS THE SAME PERSON. Two handles, and they are not equally good:
+ *
+ *   their resident account (tenant_id) — a GAM login is one person. A stay
+ *       booked to it is theirs whatever name the desk typed on the row.
+ *   the email on the booking, lowercased, WITH THE NAME AGREEING — a mailbox
+ *       is shared (samePersonName, and the long note above it: Dale and Donna
+ *       Carter are one address and two people). The account's own name is used
+ *       when the door passed none, which is all GAM holds for somebody who
+ *       typed nothing but an address. No name on either side means no waiver:
+ *       the landlord's attestation is what covers a guest GAM cannot place.
+ *
+ * NEVER a phone: a phone off by a digit is a duplicate to PROPOSE to the
+ * landlord, not a waiver to grant on its own. An email match is still refused
+ * when that stay was booked to a DIFFERENT resident account — the same guard
+ * the chain walk uses.
+ *
+ * `before` is the first night of the continuous stay being priced, and the
+ * prior stay must have ended before it. That is also what stops a stay proving
+ * itself: no leg of a continuous stay can end before the chain's own first
+ * night, so the chain is never its own history, and a same-day move from one
+ * park to the next reads as one visit rather than a prior one.
+ */
+interface PriorStayRow {
+  id: string; check_in: string; check_out: string; guest_name: string | null
+  property_id: string; property_name: string | null
+}
+
+/**
+ * The stays that could be prior history, before anybody asks whose they are:
+ * finished (above), ended where the property is, and ended before the stay
+ * being priced began. $1 account, $2 statuses, $3 the chain's first night.
+ */
+const COMPLETED_PRIOR_STAY_SQL = `
+  FROM unit_bookings b
+  JOIN units u ON u.id = b.unit_id
+  JOIN properties p ON p.id = u.property_id
+ WHERE b.landlord_id IN (SELECT public.account_companies($1))
+   AND b.status = ANY($2::text[])
+   AND b.check_out < $3::date
+   AND b.check_out < (NOW() AT TIME ZONE p.timezone)::date`
+
+export async function priorCompletedStay(args: {
+  landlordId: string
+  tenantId?: string | null
+  email?: string | null
+  /**
+   * The name the stay being priced is in — what an address match is checked
+   * against. Falls back to the name on their GAM account.
+   */
+  name?: string | null
+  /** The first night of the continuous stay being priced (StayChain.checkIn). */
+  before: string
+}): Promise<PriorStay | null> {
+  const person = await resolvePerson(args.tenantId, args.email)
+  if (!person.tenantId && !person.email) return null
+  const found = (r: PriorStayRow): PriorStay => ({
+    bookingId: r.id,
+    propertyId: r.property_id,
+    propertyName: r.property_name,
+    checkIn: r.check_in,
+    checkOut: r.check_out,
+  })
+  const before = String(args.before).slice(0, 10)
+  const COLUMNS = `b.id, b.check_in::text AS check_in, b.check_out::text AS check_out,
+                   b.guest_name, u.property_id, p.name AS property_name`
+
+  // 1. Booked to their own GAM account: one person, no name needed.
+  if (person.tenantId) {
+    const own = await queryOne<PriorStayRow>(
+      `SELECT ${COLUMNS} ${COMPLETED_PRIOR_STAY_SQL} AND b.tenant_id = $4::uuid
+        ORDER BY b.check_out DESC LIMIT 1`,
+      [args.landlordId, COMPLETED_STAY_STATUSES, before, person.tenantId])
+    if (own) return found(own)
+  }
+
+  // 2. The address on the booking, corroborated by the name. The newest stay
+  //    under EACH name on that address, so a shared mailbox's busier user can
+  //    never bury the one stay that is actually theirs behind a LIMIT 1.
+  if (!person.email) return null
+  // What the door was told, else the name on their account — all GAM holds for
+  // somebody who typed nothing but an address.
+  const name = (args.name ?? '').trim() || person.name
+  if (!personNameTokens(name).length) return null
+  const rows = await query<PriorStayRow>(
+    `SELECT DISTINCT ON (LOWER(BTRIM(b.guest_name))) ${COLUMNS}
+     ${COMPLETED_PRIOR_STAY_SQL}
+       AND LOWER(b.guest_email) = $4::text
+       AND (b.tenant_id IS NULL OR $5::uuid IS NULL OR b.tenant_id = $5::uuid)
+       AND BTRIM(COALESCE(b.guest_name, '')) <> ''
+     ORDER BY LOWER(BTRIM(b.guest_name)), b.check_out DESC
+     LIMIT 200`,
+    [args.landlordId, COMPLETED_STAY_STATUSES, before, person.email, person.tenantId])
+  const theirs = rows
+    .filter(r => samePersonName(name, r.guest_name))
+    .sort((a, b) => (a.check_out < b.check_out ? 1 : a.check_out > b.check_out ? -1 : 0))[0]
+  return theirs ? found(theirs) : null
+}
+
 // ── THE ONE QUESTION EVERY DOOR ASKS ─────────────────────────────────────────
 
 export interface ScreeningFee {
@@ -347,8 +612,10 @@ export interface ScreeningFee {
 export interface StayNeeds {
   nights: number
   /**
-   * 'returning' (10/6, Nic): the landlord attests the guest has stayed at this
-   * property before — no fee, no check link, check-in never waits on screening.
+   * 'returning' (10/6, Nic; derived 10/20): the guest has stayed with this
+   * account before — no fee, no check link, check-in never waits on screening.
+   * Either GAM found a completed stay of theirs (returningBasis 'history') or
+   * the landlord attested one GAM has no record of (returningBasis 'attested').
    */
   screening: 'not_needed' | 'on_file' | 'fee_due' | 'returning'
   leaseChoice: 'not_asked' | 'needed' | 'lease' | 'stay'
@@ -369,6 +636,16 @@ export interface StayNeeds {
    * the property's allowance used up (message — never the count).
    */
   returningOffer: { available: boolean; free: boolean; message: string | null } | null
+  /**
+   * 10/20 (Nic): WHY the stay reads 'returning'. 'history' — GAM found the
+   * guest's own completed stay on this account (returningHistory says which),
+   * nobody was asked and nothing was recorded. 'attested' — the landlord's
+   * tick is what waived the check. The desk should never be told it marked
+   * somebody returning when the records did.
+   */
+  returningBasis: 'attested' | 'history' | null
+  /** The completed stay that makes them returning, when GAM derived it. */
+  returningHistory: PriorStay | null
 }
 
 /** 10/6 (Nic): the returning-guest choice, in the counter's words (@gam/shared). */
@@ -402,6 +679,15 @@ export async function stayNeeds(args: {
   bookingId?: string | null
   tenantId?: string | null
   email?: string | null
+  /**
+   * 10/20 (review): the name the guest gave this door. An address on its own
+   * never proves who somebody is — a mailbox is shared — so this is what a
+   * derived waiver is corroborated against (priorCompletedStay). A saved stay
+   * answers for itself and needs none; a door with neither gets the name on
+   * the guest's GAM account, and a guest GAM holds no name for at all is not
+   * waived off an address match.
+   */
+  guestName?: string | null
   checkIn: string
   checkOut: string
   stayTerms?: StayTerms | null
@@ -423,10 +709,26 @@ export async function stayNeeds(args: {
   let screeningFee: ScreeningFee | null = null
   let returningAttestNow = false
   let returningOffer: StayNeeds['returningOffer'] = null
+  let returningBasis: StayNeeds['returningBasis'] = null
+  let returningHistory: PriorStay | null = null
+  // 10/20 (Nic): ask the data before anybody is charged or asked. A guest with
+  // a completed stay anywhere on this account is returning whether or not
+  // somebody ticked a box — and nothing is written for it, so there is no
+  // attestation to record and no allowance to refuse. A check already on file
+  // is not consulted: returning means no check is needed at all, which is the
+  // stronger answer, and it is the order 10/6's inherited attestation already
+  // ran in.
+  if (nights >= STAY_SCREENING_NIGHTS && !chain.returning) {
+    returningHistory = await priorCompletedStay({
+      landlordId: args.landlordId, tenantId: chain.tenantId, email: chain.email,
+      name: chain.name, before: chain.checkIn,
+    })
+  }
   // 10/6 (Nic): a continuous stay that already carries the landlord's
   // returning attestation needs no check — its later legs inherit it.
-  if (nights >= STAY_SCREENING_NIGHTS && chain.returning) {
+  if (nights >= STAY_SCREENING_NIGHTS && (chain.returning || returningHistory)) {
     screening = 'returning'
+    returningBasis = chain.returning ? 'attested' : 'history'
   } else if (nights >= STAY_SCREENING_NIGHTS) {
     onFile = await screeningOnFile({
       landlordId: args.landlordId, propertyId: args.propertyId,
@@ -439,8 +741,23 @@ export async function stayNeeds(args: {
       // calculation background checks are sold at, never a copy of it.
       const { screeningIntakeFee } = await import('../routes/background')
       const fee = await screeningIntakeFee(prop?.state ?? null)
+      // 10/21 (Nic): ONE price for a background check, whoever pays it and
+      // however it is collected — `fee.total`, processing included.
+      //
+      //   "if the landlord is paying for it, we are still going to make the
+      //    price the same... That's just a little extra markup on our end. It
+      //    keeps the price consistent. That way it's not a landlord paying for
+      //    it for some people and getting a little bit of a break and making
+      //    other people pay for it themselves."
+      //
+      // This line used to stop before processing, so a check cost $43.94 at a
+      // counter taking cash and $46.03 on an applicant's own card — the same
+      // check, two prices, decided by how the money happened to arrive. Now it
+      // is the full price everywhere, and a screening line never takes a card
+      // fee on top of it (cardFeeSplit's `feeExempt`). Where no card is
+      // presented, the processing inside the price is GAM's.
       screeningFee = {
-        amount: Math.round((fee.screening + fee.gamFee + fee.tax) * 100) / 100,
+        amount: fee.total,
         screening: fee.screening, gamFee: fee.gamFee, tax: fee.tax, intakeTotal: fee.total,
       }
       // 10/6 (Nic): the third choice. One count per person per property per
@@ -454,6 +771,7 @@ export async function stayNeeds(args: {
           screening = 'returning'
           screeningFee = null
           returningAttestNow = true
+          returningBasis = 'attested'
         }
       }
     }
@@ -468,7 +786,93 @@ export async function stayNeeds(args: {
     leaseChoice = args.stayTerms ?? own ?? inherited ?? 'needed'
   }
 
-  return { nights, screening, leaseChoice, screeningFee, onFile, chain, returningAttestNow, returningOffer }
+  return {
+    nights, screening, leaseChoice, screeningFee, onFile, chain, returningAttestNow, returningOffer,
+    returningBasis, returningHistory,
+  }
+}
+
+/**
+ * 10/20 (review) — WHAT THIS STAY STILL OWES FOR ITS BACKGROUND CHECK.
+ *
+ * stayNeeds() says a check is needed and what it costs. It does NOT say whether
+ * somebody is already paying for it, and that second half is what decides
+ * whether a fee goes on the next payment. It was written out by hand at every
+ * door that takes money for a stay — three copies in routes/units alone, and
+ * already drifted: two of them never asked whether the check had already been
+ * PAID. Then the confirmation (services/bookingConfirmation) arrived and asked
+ * it nowhere at all, so the deposit link it mints carried no check line: the
+ * same 25-night reservation was quoted the deposit alone by one door and the
+ * deposit plus the check by the other, and because a deposit link claims the
+ * reservation's deposit_amount it was the fee-less one the desk got handed back
+ * from then on. Nobody was ever billed for the check and no prepaid check was
+ * recorded for the guest, so check-in sat waiting on a check nobody had paid
+ * for.
+ *
+ * So there is ONE answer, and every door that puts money on a stay asks it:
+ * the amount to add, or null for nothing to add. Null means "do not ASK",
+ * never "no check needed" — a stay whose fee is already on an open ticket or an
+ * unpaid link still has to clear its check before check-in (checkInBlock),
+ * which is a different question.
+ *
+ * One fee per continuous stay, never two (R8/M3). `bookingId` is the saved stay
+ * when there is one; a reservation being taken right now has none and the chain
+ * answers for its earlier legs.
+ */
+export async function screeningFeeToCarry(needs: StayNeeds, bookingId?: string | null): Promise<number | null> {
+  if (needs.screening !== 'fee_due') return null
+  const fee = needs.screeningFee?.amount ?? 0
+  if (!(fee > 0)) return null
+  const ids = [...needs.chain.bookingIds]
+  if (bookingId && !ids.includes(bookingId)) ids.push(bookingId)
+  // A read that FAILED is not evidence the fee is covered. Better a second ask
+  // the desk can see and close than a required check nobody ever pays for.
+  const carried = await screeningFeeAlreadyCarried(ids).catch((err) => {
+    logger.warn({ err, bookingIds: ids }, '[stay-terms] could not tell whether this stay\'s check fee is already out')
+    return false
+  })
+  return carried ? null : fee
+}
+
+/**
+ * Is the background check's fee already on its way for this continuous stay —
+ * on an open register ticket or an unpaid pay link of any stay in it (R7), or
+ * already paid? Then a longer stay is not sent a second fee (M3): one fee per
+ * stay, never two.
+ *
+ * Lived in routes/units until 10/20. The doors that need the answer are the
+ * register, the schedule, the deposit link and now the confirmation, so it
+ * cannot live inside any one of them. The last branch is the same question
+ * screeningPaidForStay asks, over the same stays, which is why the callers no
+ * longer ask it a second time.
+ */
+async function screeningFeeAlreadyCarried(bookingIds: string[]): Promise<boolean> {
+  if (!bookingIds.length) return false
+  // 'screening': the mark the server writes on a check line (routes/units
+  // screeningFeeTicketLine, routes/posPayLinks isScreeningLine) — the same test
+  // dropScreeningFeeForReturning uses below.
+  const carried = await queryOne<{ x: number }>(
+    `SELECT 1 AS x FROM pos_open_tickets t
+      WHERE t.booking_id = ANY($1::uuid[]) AND t.status = 'open'
+        AND EXISTS (SELECT 1 FROM jsonb_array_elements(
+                      CASE WHEN jsonb_typeof(t.items) = 'array' THEN t.items ELSE '[]'::jsonb END) i
+                     WHERE i->>'screening' = 'true')
+     UNION ALL
+     SELECT 1 AS x FROM pos_pay_links l
+      WHERE l.status = 'open'
+        AND EXISTS (SELECT 1 FROM jsonb_array_elements(
+                      CASE WHEN jsonb_typeof(l.items) = 'array' THEN l.items ELSE '[]'::jsonb END) i
+                     WHERE i->>'screening' = 'true'
+                       -- a deposit link names the stay on the link; a link for
+                       -- the check alone (createScreeningFeeLink) names it on its line.
+                       AND (l.booking_id = ANY($1::uuid[])
+                            OR (l.booking_id IS NULL AND i->>'bookingId' = ANY($1::text[]))))
+     UNION ALL
+     -- already paid for this continuous stay: nothing more to carry.
+     SELECT 1 AS x FROM screening_prepayments sp
+      WHERE sp.booking_id = ANY($1::uuid[]) AND sp.status <> 'void'
+     LIMIT 1`, [bookingIds])
+  return !!carried
 }
 
 /**
@@ -830,9 +1234,10 @@ export async function emailPrepaidScreeningLink(prepaymentId: string): Promise<{
  * The payment that carried a screening was taken back (a chargeback on the
  * card charge — services/heldPayouts): the screening was never really paid, so
  * it is voided and, if the landlord held it, their uncollected charge line is
- * removed (as landlordGamDebit does for a pull that never happened). A
- * screening the guest already used, or whose charge GAM has already taken from
- * a payout, is left as it is.
+ * voided too (as landlordGamDebit does for a pull that never happened; 10/12,
+ * ledger P0: voided and kept, never deleted). A screening the guest already
+ * used, or whose charge GAM has already taken from a payout — or is taking in
+ * a bank pull still settling — is left as it is.
  *
  * 10/5 (Nic): never on a cancel or a no-show — "a paid screening fee is not
  * refunded on denial or no-show"; the paid check keeps waiting for the guest.
@@ -849,15 +1254,23 @@ export async function voidScreeningPrepayment(client: PoolClient | null, by: { b
   if (!sp) return { voided: false, reason: 'none' }
   if (sp.status !== 'unused') return { voided: false, reason: 'used' }
   if (sp.landlord_charge_id) {
-    const [charge] = await run<{ collected: string }>(
-      `SELECT collected_amount::text AS collected FROM landlord_gam_charges WHERE id = $1 FOR UPDATE`,
+    const [charge] = await run<{ collected: string; voided: boolean }>(
+      `SELECT collected_amount::text AS collected, voided_at IS NOT NULL AS voided
+         FROM landlord_gam_charges WHERE id = $1 FOR UPDATE`,
       [sp.landlord_charge_id])
     if (charge && Number(charge.collected) > 0) {
       logger.error({ prepaymentId: sp.id, chargeId: sp.landlord_charge_id },
         '[stay-terms] screening fee already netted from a payout — prepayment left in place')
       return { voided: false, reason: 'collected' }
     }
-    await run(`DELETE FROM landlord_gam_charges WHERE id = $1 AND collected_amount = 0`, [sp.landlord_charge_id])
+    if (charge && !charge.voided
+        && !(await voidGamCharge(client, sp.landlord_charge_id, 'screening_payment_taken_back'))) {
+      // Not collected, not voided, and still not voidable: a bank pull that has
+      // not settled is carrying it, so the money is already on its way.
+      logger.error({ prepaymentId: sp.id, chargeId: sp.landlord_charge_id },
+        '[stay-terms] screening fee is inside a bank pull still settling — prepayment left in place')
+      return { voided: false, reason: 'collected' }
+    }
   }
   await run(
     `UPDATE screening_prepayments SET status = 'void', voided_at = NOW() WHERE id = $1`, [sp.id])
@@ -1192,7 +1605,14 @@ export async function syncStayUtilityAgreement(bookingId: string, opts: { byUser
       // Already ended. Its dates are what it bills (services/utilityBilling),
       // so a checked-out stay whose day of leaving was corrected afterwards
       // follows the real day — unless a lease took over from it.
-      if (b.status !== 'checked_out' || leaseTakesOver || existing.end_date === b.check_out) return { action: 'none' }
+      //
+      // 10/20 (review): and unless it covers NO DAY. An agreement ended the day
+      // it began is the record of a stay that never paid its own power at all —
+      // a no-show, or a stay re-dated back under thirty nights — and handing it
+      // a real span here would make it the payer again on the guest's way out
+      // the gate, which is the one thing the zero length is there to prevent.
+      if (b.status !== 'checked_out' || leaseTakesOver || existing.end_date === b.check_out
+          || existing.end_date === existing.start_date) return { action: 'none' }
       await query(
         `UPDATE utility_service_agreements SET end_date = $2, updated_at = NOW() WHERE id = $1`,
         [existing.id, b.check_out])
@@ -1215,7 +1635,63 @@ export async function syncStayUtilityAgreement(bookingId: string, opts: { byUser
     return { action: 'ended', agreementId: existing.id }
   }
 
+  // 10/20 (review) — THE NIGHT COUNT IS ASKED ON EVERY SAVE, NOT ONLY THE FIRST.
+  //
+  // This test used to sit at the bottom of the function, on the way to CREATING
+  // an agreement, and the update branch below simply re-dated whatever row it
+  // found. So a guest who booked 35 nights (agreement made, active) and was
+  // then re-dated down to 10 on the schedule kept an ACTIVE utility service
+  // agreement over a week-long stay — and a nightly or weekly guest's power is
+  // inside the rate they already paid, billed to NOBODY. The counter read that
+  // row back as "they pay their own", skipped the in-the-rate branch, and would
+  // have read a figure out to a guest who did not owe it.
+  //
+  // One test, asked every time, for the first save and every save after it.
+  // afterStaySaved (routes/units) calls this on every reservation save — "made,
+  // re-dated, moved or given another month" — so the row follows the dates
+  // instead of remembering what the dates used to be.
+  //
+  // Nothing to decide for an undecided short booking with no agreement, and
+  // that is most of the board — so it leaves before the chain is counted.
+  if (!existing && b.stay_terms !== 'stay') return { action: 'none' }
+  const chain = await continuousStayNights({
+    propertyId: b.property_id, bookingId, tenantId: b.tenant_id, email: b.guest_email,
+    checkIn: b.check_in, checkOut: b.check_out,
+  })
+  const paysItsOwn = chain.nights >= STAY_LEASE_CHOICE_NIGHTS
+
   if (existing) {
+    if (!paysItsOwn) {
+      // BACK UNDER THE LINE. The stay is a short one now, so nobody is the
+      // payer for any of it, and the right record of that is the zero-length
+      // agreement this file already uses for a stay that never happened: ended
+      // the day it began, which bills nothing anywhere (services/utilityBilling
+      // excludes it, the RUBS split does not count it, and the counter reads
+      // the read as in-the-rate). Ended rather than deleted because GAM never
+      // erases — the landlord can still see it was made and when it stopped.
+      // Re-dated back over thirty nights and the branch below brings it back,
+      // exactly as an undone check-out does.
+      if (existing.status === 'ended' && existing.end_date === existing.start_date) return { action: 'none' }
+      const done = await query<{ invoiced: number }>(
+        `UPDATE utility_service_agreements
+            SET status = 'ended', end_date = start_date, updated_at = NOW()
+          WHERE id = $1
+        RETURNING (SELECT COUNT(*)::int FROM invoices i
+                    WHERE i.service_agreement_id = utility_service_agreements.id) AS invoiced`,
+        [existing.id])
+      const invoiced = Number(done[0]?.invoiced ?? 0)
+      logger.info({ bookingId, agreementId: existing.id, nights: chain.nights },
+        '[stay-terms] stay re-dated under 30 nights — its utility agreement ended, its utilities are in the rate')
+      if (invoiced > 0) {
+        // Money was already asked for through an agreement this stay turns out
+        // never to have needed. Nothing here reverses an invoice — that is the
+        // landlord's call, not a side effect of a date change — but it must not
+        // pass in silence either.
+        logger.warn({ bookingId, agreementId: existing.id, invoiced, nights: chain.nights },
+          '[stay-terms] a re-dated short stay had already been invoiced for its utilities — the invoices stand and need a human')
+      }
+      return { action: 'ended', agreementId: existing.id }
+    }
     // In step with the stay: its dates and its site. A stay that came back
     // (a check-out undone) is billed again.
     try {
@@ -1236,11 +1712,7 @@ export async function syncStayUtilityAgreement(bookingId: string, opts: { byUser
   }
 
   if (b.stay_terms !== 'stay') return { action: 'none' }
-  const chain = await continuousStayNights({
-    propertyId: b.property_id, bookingId, tenantId: b.tenant_id, email: b.guest_email,
-    checkIn: b.check_in, checkOut: b.check_out,
-  })
-  if (chain.nights < STAY_LEASE_CHOICE_NIGHTS) return { action: 'none' }
+  if (!paysItsOwn) return { action: 'none' }
 
   return createStayAgreement(b, opts.byUserId ?? null)
 }
@@ -1357,12 +1829,36 @@ export async function stayGuestTenant(client: PoolClient, b: Pick<BookingFacts, 
 }
 
 async function createStayAgreement(b: BookingFacts, byUserId: string | null): Promise<StayUtilityResult> {
-  const property = await queryOne<any>(
-    `SELECT late_fee_enabled, late_fee_grace_days,
-            late_fee_initial_amount, late_fee_initial_type,
-            late_fee_accrual_amount, late_fee_accrual_type, late_fee_accrual_period,
-            late_fee_cap_amount, late_fee_cap_type
-       FROM properties WHERE id = $1`, [b.property_id])
+  // A STAY HAS NO LATE FEE. EVER.
+  //
+  // 10/20 (Nic), shown the $15 the two live agreements carry and asked whether
+  // to re-stamp them with the park's real RV policy: "It's gone, but they paid
+  // when they arrived, so why would there ever be a late fee? Stays are paid
+  // ahead of time, so they should never have late fees. It's not the same as a
+  // lease. Stays are paid for the duration at the time they show up. That's the
+  // whole distinction we made with somebody that didn't want a lease but wanted
+  // to stay 6 months. They would have to pay for 6 months all up front."
+  //
+  // That is the product, not a preference: a stay is money in hand on arrival,
+  // so there is no debt for a late fee to sit on top of. The stay's utilities
+  // follow it — a final read, then a bill the desk sends as a pay link — and a
+  // penalty on that is a penalty on somebody who already paid for their time.
+  //
+  // So this door stamps NO FEE: the switch off, every figure empty.
+  // `lateFeePolicyToAgreementStamp(null)` is exactly that shape, and going
+  // through it rather than hand-writing the columns keeps one definition of
+  // what "no late fee" looks like on an agreement.
+  //
+  // THE LANDLORD-FACING DOOR IS DIFFERENT and keeps the per-unit-type policy
+  // (routes/utilityServiceAgreements): that one is a serviced space with no
+  // stay behind it — the neighbor GAM supplies power to, billed month after
+  // month with nothing paid up front. `booking_id` is what tells the two apart,
+  // here and in the correction migration.
+  //
+  // Until 10/20 this copied properties.late_fee_*, which nothing writes. The
+  // $15 flat with a 5-day grace on RV 10 and RV 11 came from a schema default
+  // nobody chose, and it never should have been any figure at all.
+  const lateFee = lateFeePolicyToAgreementStamp(null)
 
   // Which account pays (A4). The stay's own tenant when it has one; otherwise
   // the login the guest's email already has, from any company; otherwise a
@@ -1383,18 +1879,20 @@ async function createStayAgreement(b: BookingFacts, byUserId: string | null): Pr
        late_fee_enabled, late_fee_grace_days,
        late_fee_initial_amount, late_fee_initial_type,
        late_fee_accrual_amount, late_fee_accrual_type, late_fee_accrual_period,
-       late_fee_cap_amount, late_fee_cap_type,
+       late_fee_accrual_from, late_fee_cap_amount, late_fee_cap_type,
        payer_attested_at, payer_attested_by, payer_attestation_note
-     ) VALUES ($1,$2,$3,$4,$5,$6,1,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),$9,$19)
+     ) VALUES ($1,$2,$3,$4,$5,$6,1,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW(),$9,$20)
      RETURNING id`,
     [b.landlord_id, b.unit_id, tenantId, `${b.property_name}, site ${b.unit_number}`,
      'Utilities for a stay of 30+ nights with no lease', b.id,
      b.check_in, b.check_out, byUserId,
-     property?.late_fee_enabled ?? true, property?.late_fee_grace_days ?? null,
-     property?.late_fee_initial_amount ?? null, property?.late_fee_initial_type ?? 'flat',
-     property?.late_fee_accrual_amount ?? null, property?.late_fee_accrual_type ?? null,
-     property?.late_fee_accrual_period ?? null,
-     property?.late_fee_cap_amount ?? null, property?.late_fee_cap_type ?? null,
+     lateFee.enabled, lateFee.graceDays,
+     lateFee.initialAmount, lateFee.initialType,
+     lateFee.accrualAmount, lateFee.accrualType, lateFee.accrualPeriod,
+     // Stamped explicitly: the column's own default is 'grace_end', and taking
+     // it would start Nic's $5/day five days after the day his policy counts
+     // from.
+     lateFee.accrualFrom, lateFee.capAmount, lateFee.capType,
      'Agreed when the stay was sold: a stay of 30+ nights with no lease pays its site\'s utilities.'])).rows[0].id
 
   const client = await getClient()
@@ -1407,8 +1905,8 @@ async function createStayAgreement(b: BookingFacts, byUserId: string | null): Pr
     tenantId = guest.tenantId
     invite = guest.invite
 
-    // The property's late-fee policy is STAMPED on, as on every agreement
-    // (S558: the instrument is the charge).
+    // The site's per-unit-type late-fee policy is STAMPED on, as on every
+    // agreement (S558: the instrument is the charge) — resolved above.
     await client.query('SAVEPOINT stay_agreement')
     try {
       agreementId = await insertAgreement(client, tenantId)
@@ -1508,6 +2006,31 @@ export async function checkInBlock(bookingId: string): Promise<CheckInBlock | nu
         WHERE id = ANY($1::uuid[]) AND screening_required AND status NOT IN ('cancelled', 'no_show') LIMIT 1`,
       [chain.bookingIds])
     if (!marked) return null
+  }
+
+  // 10/20 (review) — AND THE ANSWER GAM DERIVED ITSELF REACHES THE GATE.
+  //
+  // A guest GAM holds a completed stay for needs no background check at all
+  // (priorCompletedStay, 10/20). Nothing is written when that happens — no
+  // attestation, no allowance spent, by Nic's directive — so there is nothing
+  // on the row for this to read, and the screening_required flag written when
+  // the stay was SOLD cannot answer it either: the booking site marked every
+  // stay that was not 'not_needed', which included this one, and every stay
+  // sold before today still carries that mark. Nic's winter visitor stood at
+  // the gate, paid, refused 409 "No background check is on file for them yet",
+  // with "Returning guest" inert because there was no attestation to record.
+  //
+  // So the gate asks the same question the sale asked, of the same person, and
+  // lets them in when the records answer it. Asked after the mark check above,
+  // which costs nothing, so the common path is unchanged.
+  const history = await priorCompletedStay({
+    landlordId: b.landlord_id, tenantId: b.tenant_id, email: b.guest_email,
+    name: chain.name ?? b.guest_name, before: chain.checkIn,
+  })
+  if (history) {
+    logger.info({ bookingId, priorBookingId: history.bookingId, priorCheckOut: history.checkOut },
+      '[stay-terms] check-in waits on nothing — GAM has a completed stay for this guest on this account')
+    return null
   }
 
   const person = await resolvePerson(b.tenant_id, b.guest_email)

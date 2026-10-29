@@ -38,6 +38,7 @@ import {
 } from '../test/dbHelpers'
 import { reportsRouter } from './reports'
 import { errorHandler } from '../middleware/errorHandler'
+import { expectNoFigures } from '../test/noLeaks'
 
 function buildApp() {
   const app = express()
@@ -1163,10 +1164,16 @@ describe('S654: every dollar counted once in the landlord reports', () => {
     expect(sep9.gross.rent).toBe(0)
     expect(sep9.gross.total).toBe(0)
     expect(aug.gross.total + sep9.gross.total).toBe(700)
+    // 10/12 (Nic): no switch — Charged sits beside Received on the same
+    // report: September's bill is charged, covered by the money paid ahead
+    // (collected, nothing owed); August charged nothing. ?basis= is ignored.
     const sepBilled = (await get(9, 'billed')).body.data
-    expect(sepBilled.gross.rent).toBe(700)
-    expect(sepBilled.parts).toEqual([{ part: 'coveredByPaidAhead', label: 'Covered by money paid ahead', amount: 700 }])
-    expect((await get(8, 'billed')).body.data.gross.total).toBe(0)
+    expect(sepBilled.gross.rent).toBe(0)
+    expect(sepBilled.view).toMatchObject({ charged: 700, received: 0, owed: 0, collected: 700 })
+    expect(sepBilled.view.lines).toEqual([{ line: 'rent', label: 'Rent', charged: 700, received: 0, owed: 0 }])
+    expect(aug.view).toMatchObject({ charged: 0, received: 700, owed: 0 })
+    expect(aug.view.tie.received.paidAhead).toBe(700)
+    expect(sep9.view.tie.charged).toEqual({ collected: 700, clearing: 0, owed: 0, other: 0 })
 
     const tax = (await request(buildApp()).get('/api/reports/tax-summary?year=2026')
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)).body.data
@@ -1358,9 +1365,11 @@ describe('S654: one definition of landlord income — every report says 1,150 fo
     // August's rent, paid late on Sept 2; September's rent still pending.
     await seedSettledRow({ ...base, type: 'rent', amount: 700, revenueOwner: 'landlord', entry: 'RENT',
       dueDate: '2026-08-01', settledAt: '2026-09-02T10:00:00-07:00' })
+    // Written before it was due (the late clock runs from the later of the
+    // due date and the day GAM wrote the bill — services/openBalances).
     await db.query(
-      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date)
-       VALUES ($1,$2,$3,'rent',700,'pending','RENT','2026-09-01')`, [f.aUnitId, f.tenant1Id, f.aLid])
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, created_at)
+       VALUES ($1,$2,$3,'rent',700,'pending','RENT','2026-09-01','2026-08-25T09:00:00-07:00')`, [f.aUnitId, f.tenant1Id, f.aLid])
     for (const m of [8, 9]) {
       const pl = (await get(f, `/api/reports/monthly-pl?year=2026&month=${m}`)).body.data
       const st = (await get(f, `/api/reports/monthly-statement?year=2026&month=${m}`)).body.data
@@ -1375,11 +1384,14 @@ describe('S654: one definition of landlord income — every report says 1,150 fo
     // nothing in; it is counted as late, and it is on the Money billed statement.
     expect(sep.payments.map((p: any) => [p.dueDate, p.status])).toEqual([['2026-08-01', 'settled']])
     expect(sep.rowsTotal).toBe(700)
+    // 10/12 (Nic): late counts HOUSEHOLDS past grace (services/householdMonths).
     expect(sep.summary.latePayments).toBe(1)
-    const sepBilled = (await get(f, '/api/reports/monthly-statement?year=2026&month=9&basis=billed')).body.data
-    expect(sepBilled.payments.map((p: any) => [p.dueDate, p.status, p.parts])).toEqual([['2026-09-01', 'pending', { stillOwed: 700 }]])
-    expect(sepBilled.summary.totalCollected).toBe(0)
-    expect(sepBilled.rowsTotal).toBe(sepBilled.summary.totalIncome)
+    expect(sep.summary.households).toMatchObject({ outstanding: 1, pastGrace: 1, failed: 0 })
+    // 10/12: no switch — the open September bill is Charged and Owed beside Received.
+    expect(sep.view).toMatchObject({ charged: 700, received: 700, owed: 700 })
+    expect(sep.view.tie.received).toEqual({ forPeriodBills: 0, forEarlierBills: 700, paidAhead: 0, noBill: 0 })
+    const r2 = (n: number) => Math.round(n * 100) / 100
+    expect(sep.nets).toEqual({ charged: r2(700 - sep.summary.totalExpenses), received: r2(700 - sep.summary.totalExpenses) })
     const aug = (await get(f, '/api/reports/monthly-statement?year=2026&month=8')).body.data
     expect(aug.summary.totalIncome).toBe(0)
     expect(aug.payments).toHaveLength(0)
@@ -1435,8 +1447,8 @@ describe('S654: a FlexPay pull is not landlord income in any report', () => {
   })
 })
 
-// ── S655: "Money received" / "Money billed" on every report ──────────────────
-describe('S655: the basis switch on every report', () => {
+// ── S655 → 10/12 (Nic): no switch — Charged / Received / Owed on every report ──
+describe('10/12: Charged, Received and Owed side by side on every report', () => {
   const get = (f: Fixture, path: string) =>
     request(buildApp()).get(path).set('Authorization', `Bearer ${f.tokenLandlordA}`)
 
@@ -1454,21 +1466,24 @@ describe('S655: the basis switch on every report', () => {
       dueDate: '2026-09-01', settledAt: '2026-09-02T10:00:00-07:00' })
   }
 
-  it('every report says 1,150 for September under Money billed too (the bills were due and paid in September)', async () => {
+  it('every report says 1,150 charged and 1,150 received for September (the bills were due and paid in September)', async () => {
     const f = await seed()
     await seedSept(f)
-    const q = 'basis=billed'
-    expect((await get(f, `/api/reports/monthly-pl?year=2026&month=9&${q}`)).body.data.gross.total).toBe(1150)
-    expect((await get(f, `/api/reports/monthly-statement?year=2026&month=9&${q}`)).body.data.summary.totalIncome).toBe(1150)
-    expect((await get(f, `/api/reports/tax-summary?year=2026&${q}`)).body.data.income.totalRent).toBe(1150)
-    expect((await get(f, `/api/reports/property-pl?year=2026&month=9&${q}`)).body.data.properties[0].rent_collected).toBe(1150)
-    expect((await get(f, `/api/reports/property-detail?propertyId=${f.aPropId}&year=2026&month=9&${q}`)).body.data.breakdown.total).toBe(1150)
-    expect((await get(f, `/api/reports/query?start=2026-09-01&end=2026-09-30&level=unit&bucket=total&${q}`)).body.data.totals.income.total).toBe(1150)
-    expect((await get(f, `/api/reports/t12?asOf=2026-10-15&${q}`)).body.data.totals.income.total).toBe(1150)
+    const three = { charged: 1150, received: 1150, owed: 0 }
+    expect((await get(f, `/api/reports/monthly-pl?year=2026&month=9`)).body.data.view).toMatchObject(three)
+    expect((await get(f, `/api/reports/monthly-statement?year=2026&month=9`)).body.data.view).toMatchObject(three)
+    expect((await get(f, `/api/reports/tax-summary?year=2026`)).body.data.view).toMatchObject(three)
+    expect((await get(f, `/api/reports/property-pl?year=2026&month=9`)).body.data.properties[0]).toMatchObject(three)
+    const det = (await get(f, `/api/reports/property-detail?propertyId=${f.aPropId}&year=2026&month=9`)).body.data
+    expect(det.view).toMatchObject(three)
+    expect(det.breakdown.categories.reduce((s: number, c: any) => s + c.charged, 0)).toBe(1150)
+    expect((await get(f, `/api/reports/query?start=2026-09-01&end=2026-09-30&level=unit&bucket=total`)).body.data.totals.money).toEqual(three)
+    expect((await get(f, `/api/reports/t12?asOf=2026-10-15`)).body.data.totals.money).toEqual(three)
   })
 
-  it('every report echoes meta.basis and refuses an unknown basis', async () => {
+  it('no report has a switch: each names its three columns and ignores ?basis= (any value) for one release', async () => {
     const f = await seed()
+    await seedSept(f)
     for (const path of [
       '/api/reports/summary', '/api/reports/monthly-pl?year=2026&month=9',
       '/api/reports/monthly-statement?year=2026&month=9', '/api/reports/tax-summary?year=2026',
@@ -1477,12 +1492,14 @@ describe('S655: the basis switch on every report', () => {
     ]) {
       const ok = await get(f, path)
       expect(ok.status).toBe(200)
-      expect(ok.body.data.meta.basis).toMatchObject({ basis: 'received', label: 'Money received' })
-      expect(ok.body.data.meta.basis.note).toMatch(/day the money arrived/)
-      const billed = await get(f, `${path}${path.includes('?') ? '&' : '?'}basis=billed`)
-      expect(billed.body.data.meta.basis.label).toBe('Money billed')
-      const bad = await get(f, `${path}${path.includes('?') ? '&' : '?'}basis=accrual`)
-      expect(bad.status).toBe(400)
+      expect(ok.body.data.meta.basis).toBeUndefined()
+      // 10/12 (Nic, L2): Received leads.
+      expect(ok.body.data.meta.columns.map((c: any) => c.label)).toEqual(['Received', 'Charged', 'Owed'])
+      for (const basis of ['billed', 'accrual']) {
+        const other = await get(f, `${path}${path.includes('?') ? '&' : '?'}basis=${basis}`)
+        expect(other.status).toBe(200)
+        expect(other.body.data).toEqual(ok.body.data)
+      }
     }
   })
 
@@ -1493,13 +1510,15 @@ describe('S655: the basis switch on every report', () => {
     await db.query(
       `INSERT INTO landlord_expenses (landlord_id, property_id, category, amount, expense_date, description)
        VALUES ($1,$2,'insurance',120,'2026-06-01','Policy')`, [f.aLid, f.aPropId])
+    const tax = (await get(f, `/api/reports/tax-summary?year=2026`)).body.data
     for (const basis of ['received', 'billed']) {
-      const tax = (await get(f, `/api/reports/tax-summary?year=2026&basis=${basis}`)).body.data
       const { computeLandlordPL } = await import('../services/landlordPL')
       const { periodMonths } = await import('../services/platformFee')
       const pl = await computeLandlordPL(f.aLid, '2026-01-01', '2026-12-31', periodMonths(2026, null), basis as any)
-      expect(tax.netIncome).toBe(pl.net)
-      expect(tax.income.totalRent).toBe(pl.gross.total)
+      // 10/12: the net on each money column is that basis's P&L net.
+      expect(basis === 'received' ? tax.nets.received : tax.nets.charged).toBe(pl.net)
+      expect(basis === 'received' ? tax.view.received : tax.view.charged).toBe(pl.gross.total)
+      expect(tax.netIncome).toBe(pl.nets.received)
       expect(tax.deductions.enteredExpenses).toBe(120)
       const months = tax.monthlyBreakdown.reduce((s: number, m: any) => s + m.collected, 0)
       expect(Math.round(months * 100) / 100).toBe(tax.income.totalRent)
@@ -1651,7 +1670,7 @@ describe('S655: the basis switch on every report', () => {
       const refused = await pm(path)
       expect(refused.status).toBe(403)
       expect(refused.body.error ?? refused.body.message).toMatch(/covers the whole company/)
-      expect(JSON.stringify(refused.body)).not.toMatch(/700/)
+      expectNoFigures(refused.body, [700])
       expect((await get(f, path)).status).toBe(200)
     }
 

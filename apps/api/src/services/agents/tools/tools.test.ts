@@ -99,12 +99,29 @@ const GUEST_ACTOR: AgentActor = { userId: 'tok1', role: 'guest', profileId: 'bk1
 describe('tool allowlist', () => {
   it('gives tenant profiles the tenant tools, landlord profiles the landlord tools', () => {
     const t = getToolsForProfile(requireProfile('tenant_entry')).map((x) => x.name)
-    for (const name of ['file_maintenance_request', 'add_maintenance_comment', 'cancel_maintenance_request', 'get_my_lease', 'get_my_inspections', 'get_my_entry_requests', 'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_applicable_laws', 'search_state_law', 'check_against_law', 'get_my_notifications', 'mark_notifications_read'])
+    for (const name of ['file_maintenance_request', 'add_maintenance_comment', 'cancel_maintenance_request', 'get_my_lease', 'get_my_inspections', 'get_my_entry_requests', 'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_applicable_laws', 'search_state_law', 'get_my_notifications', 'mark_notifications_read'])
       expect(t).toContain(name)
 
     const l = getToolsForProfile(requireProfile('landlord_entry')).map((x) => x.name)
-    for (const name of ['get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_delinquent_tenants', 'get_vacant_units', 'get_lease_expirations', 'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'get_applicable_laws', 'check_against_law', 'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_my_notifications', 'mark_notifications_read'])
+    for (const name of ['get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_delinquent_tenants', 'get_vacant_units', 'get_lease_expirations', 'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'get_applicable_laws', 'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_my_notifications', 'mark_notifications_read'])
       expect(l).toContain(name)
+  })
+
+  // 10/20 (Nic): "There should be no state law warnings anywhere in the system."
+  it('offers no profile the figure-comparison tool while the warnings are hidden', () => {
+    // Hidden, not demolished: check_against_law is still registered and still
+    // has its own tests below. What changed is that no model is handed a
+    // description offering to compare someone's number against a statute, and
+    // then a refusal when it takes the offer up.
+    expect(getTool('check_against_law')).toBeTruthy()
+    for (const profileId of ['tenant_entry', 'tenant_escalation', 'landlord_entry', 'landlord_escalation'])
+      expect(getToolsForProfile(requireProfile(profileId)).map((x) => x.name), profileId)
+        .not.toContain('check_against_law')
+    // Statute RETRIEVAL stays on both sides - asked what the law says, an agent
+    // still answers from the catalog.
+    for (const profileId of ['tenant_entry', 'landlord_entry'])
+      expect(getToolsForProfile(requireProfile(profileId)).map((x) => x.name), profileId)
+        .toContain('search_state_law')
   })
 
   it('surfaces the agent inspection write-tools to landlord profiles (entry + escalation), never to tenants', () => {
@@ -511,24 +528,140 @@ describe('read tools scope to the actor', () => {
     })
   })
 
+  /**
+   * 10/20 (Nic): the tool used to edit ONLY rows that already existed, and its
+   * answer to a landlord who had never opened the settings page was "No
+   * notification preferences are set yet" — which is everyone, for most types,
+   * because a row is only written when somebody answers. "Stop emailing me
+   * about maintenance" did nothing for the person most likely to say it. It
+   * writes the row for any type in the catalog now, and it speaks the human
+   * label rather than the stored string (memory: gam-no-raw-enums-in-ui).
+   */
   describe('update_notification_preference (scoped to actor.userId)', () => {
-    it('updates an existing type, keeping unspecified channels', async () => {
+    it('writes the row from the human label, keeping the unspecified channel', async () => {
       ;(query as any)
-        .mockResolvedValueOnce([{ type: 'rent_due', email_enabled: true, in_app_enabled: true }])
-        .mockResolvedValueOnce([]) // the UPDATE
-      const res: any = await updateNotificationPreference.execute({ type: 'rent_due', emailEnabled: false }, TENANT_ACTOR)
+        .mockResolvedValueOnce([{ type: 'maintenance_updated', email_enabled: true, in_app_enabled: true }])
+        .mockResolvedValueOnce([]) // the upsert
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'Updates on your requests', emailEnabled: false }, TENANT_ACTOR)
       expect((query as any).mock.calls[0][1]).toEqual(['u1']) // read scoped to userId
-      const updateParams = (query as any).mock.calls[1][1]
-      expect(updateParams[0]).toBe('u1') // update scoped to userId
+      const writeParams = (query as any).mock.calls[1][1]
+      expect(writeParams[0]).toBe('u1')           // write scoped to userId
+      // A text[] since 10/20: one upsert covers one type or all of them
+      // (applyToAll), so the write is set-based either way.
+      expect(writeParams[1]).toEqual(['maintenance_updated'])
       expect(res).toMatchObject({ ok: true, email: false, inApp: true })
+      expect(res.notification).toBe('Updates on your requests')
     })
 
-    it('lists current types when the requested type is unknown', async () => {
-      ;(query as any).mockResolvedValueOnce([{ type: 'rent_due', email_enabled: true, in_app_enabled: true }])
+    it('writes a row for a type that has never been answered', async () => {
+      ;(query as any)
+        .mockResolvedValueOnce([])  // nothing stored for this user at all
+        .mockResolvedValueOnce([])  // the upsert still happens
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'maintenance_updated', emailEnabled: false }, TENANT_ACTOR)
+      expect(res.ok).toBe(true)
+      expect((query as any).mock.calls[1][1][1]).toEqual(['maintenance_updated'])
+      // Default was on; only email was named, so in-app keeps GAM's default.
+      expect(res).toMatchObject({ email: false, inApp: true })
+    })
+
+    it('refuses to switch off one of the five GAM always sends, and says why', async () => {
+      ;(query as any).mockResolvedValueOnce([])
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'payment_failed', emailEnabled: false }, TENANT_ACTOR)
+      expect(res.ok).toBe(false)
+      expect(res.alwaysOn).toBe(true)
+      expect(res.message).toContain('always sends')
+      expect((query as any)).toHaveBeenCalledTimes(1) // no write issued
+    })
+
+    it('lists what can be changed, in words, when the name does not match', async () => {
+      ;(query as any).mockResolvedValueOnce([])
       const res: any = await updateNotificationPreference.execute({ type: 'nonexistent' }, TENANT_ACTOR)
       expect(res.needsType).toBe(true)
-      expect(res.types[0].type).toBe('rent_due')
-      expect((query as any)).toHaveBeenCalledTimes(1) // no UPDATE issued
+      expect(res.notifications.length).toBeGreaterThan(20)
+      // Labels, never the stored enum.
+      for (const n of res.notifications) expect(n.notification).not.toMatch(/_/)
+      expect((query as any)).toHaveBeenCalledTimes(1) // no write issued
+    })
+
+    /**
+     * ── 10/20: "STOP EMAILING ME ABOUT MY INSPECTIONS" ──────────────────────
+     *
+     * The loose match picked the FIRST of many and reported success. One
+     * sentence switched off a single row and left the other five emailing, and
+     * the landlord had been told it was done, so he would not ask again. It
+     * narrows and confirms now (memory: gam-agent-goal-narrow-then-resolve).
+     *
+     * ('maintenance' on its own is NOT the example to use: it is an exact
+     * catalog type — "Other maintenance notices" — so it resolves to one row
+     * and always did. The ambiguity is in the ordinary phrasings around it.)
+     */
+    it('narrows instead of guessing when the words match several, and writes nothing', async () => {
+      ;(query as any).mockResolvedValueOnce([])
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'inspection', emailEnabled: false }, LANDLORD_ACTOR)
+      expect(res.ok).toBe(false)
+      expect(res.needsChoice).toBe(true)
+      expect(res.matches.length).toBe(6)
+      for (const m of res.matches) expect(m.notification).not.toMatch(/_/)
+      expect(res.message).toContain('all of them')
+      expect((query as any)).toHaveBeenCalledTimes(1) // the read only — nothing written
+    })
+
+    it('a maintenance-request phrasing matches three and still asks', async () => {
+      ;(query as any).mockResolvedValueOnce([])
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'maintenance request', emailEnabled: false }, LANDLORD_ACTOR)
+      expect(res.needsChoice).toBe(true)
+      expect(res.matches.map((m: any) => m.notification).length).toBe(3)
+      expect((query as any)).toHaveBeenCalledTimes(1)
+    })
+
+    it('switches all of them off in one statement once they have confirmed', async () => {
+      ;(query as any)
+        .mockResolvedValueOnce([])  // nothing answered yet
+        .mockResolvedValueOnce([])  // the upsert
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'inspection', emailEnabled: false, applyToAll: true }, LANDLORD_ACTOR)
+      expect(res.ok).toBe(true)
+      const writeParams = (query as any).mock.calls[1][1]
+      expect(writeParams[0]).toBe('u2')
+      expect([...writeParams[1]].sort()).toEqual([
+        'inspection_finalized', 'inspection_flagged_suspicious',
+        'inspection_scheduled_reminder', 'inspection_submitted',
+        'inspection_tenant_signed', 'moveout_inspection_due',
+      ])
+      expect(writeParams[2]).toEqual([false, false, false, false, false, false])
+      expect(res.changed.length).toBe(6)
+      expect(res.message).toContain('6 notifications')
+    })
+
+    it('an all-of-them sweep leaves the locked ones on and says which', async () => {
+      ;(query as any).mockResolvedValueOnce([]).mockResolvedValueOnce([])
+      const res: any = await updateNotificationPreference.execute(
+        { type: 'payment', emailEnabled: false, applyToAll: true }, LANDLORD_ACTOR)
+      expect(res.ok).toBe(true)
+      // Six matched; 'A scheduled payment failed' is one of Nic's five.
+      expect((query as any).mock.calls[1][1][1]).not.toContain('autopay_failed')
+      expect((query as any).mock.calls[1][1][1].length).toBe(5)
+      expect(res.alwaysOnSkipped).toEqual(['A scheduled payment failed'])
+      expect(res.message).toContain('GAM always sends')
+    })
+
+    it('one or two characters is a coincidence, not a name — nothing is written', async () => {
+      // 'a' used to substring-match 'A payment was recorded for you' and switch
+      // that off while reporting success.
+      for (const said of ['a', 'of']) {
+        ;(query as any).mockReset()
+        ;(query as any).mockResolvedValueOnce([])
+        const res: any = await updateNotificationPreference.execute(
+          { type: said, emailEnabled: false }, TENANT_ACTOR)
+        expect(res.ok, said).toBe(false)
+        expect(res.needsType, said).toBe(true)
+        expect((query as any), said).toHaveBeenCalledTimes(1) // no write issued
+      }
     })
   })
 
@@ -638,16 +771,53 @@ describe('read tools scope to the actor', () => {
       expect(res.bookings[0]).toMatchObject({ nights: 3, total: 300, status: 'confirmed' })
     })
 
-    it('get_setup_progress scopes Connect by userId, counts by landlord id, and finds the next step', async () => {
+    // 10/12 (Nic): payouts are the COMPANY's (landlords), not the user's, and
+    // only live payouts count. The SQL itself runs in getSetupProgress.db.test.ts.
+    it('get_setup_progress reads payouts and counts by the account’s companies, and finds the next step', async () => {
+      ;(mockQuery as any)
+        .mockResolvedValueOnce([{ id: 'L1', business_name: 'TruBlu', payouts: true, has_property: true }]) // companies
+        // 10/19 (review): bank setup is TWO steps and the tool knew only the
+        // first, so a landlord with payouts live and no read-only feed was told
+        // their setup was complete. Second read: the feed, per company.
+        .mockResolvedValueOnce([{ business_name: 'TruBlu', has_property: true, linked: true }])
       ;(mockQueryOne as any)
-        .mockResolvedValueOnce({ connect_details_submitted: true, connect_charges_enabled: true, connect_payouts_enabled: false }) // users (by userId)
-        .mockResolvedValueOnce({ properties: '1', units: '0', active_leases: '0', onboarding_complete: false }) // counts (by landlord_id)
+        .mockResolvedValueOnce({ properties: '1', units: '0', active_leases: '0' }) // counts (by landlord_id)
       const res: any = await getSetupProgress.execute({}, LANDLORD_ACTOR)
-      expect((mockQueryOne as any).mock.calls[0][1]).toEqual(['u2']) // connect by actor.userId
-      expect((mockQueryOne as any).mock.calls[1][1]).toEqual([['L1']]) // counts by the account's companies
+      expect((mockQuery as any).mock.calls[0][0]).toMatch(/FROM landlords l/)
+      expect((mockQuery as any).mock.calls[0][1]).toEqual([['L1']]) // payouts by the account's companies
+      expect((mockQuery as any).mock.calls[1][0]).toMatch(/FROM bank_connections bc/)
+      expect((mockQuery as any).mock.calls[1][1]).toEqual([['L1']]) // the feed, by the same companies
+      expect((mockQueryOne as any).mock.calls[0][1]).toEqual([['L1']]) // counts by the account's companies
       expect(res.complete).toBe(false)
-      expect(res.completedSteps).toBe(2) // bank (details submitted) + property
+      expect(res.completedSteps).toBe(3) // payouts + bank feed + property
       expect(res.nextStep).toMatch(/units/i) // next incomplete step
+    })
+
+    // 10/19 (review): the step that was missing entirely.
+    it('get_setup_progress: payouts live with no read-only feed is not complete', async () => {
+      ;(mockQuery as any)
+        .mockResolvedValueOnce([{ id: 'L1', business_name: 'TruBlu', payouts: true, has_property: true }])
+        .mockResolvedValueOnce([{ business_name: 'TruBlu', has_property: true, linked: false }])
+      ;(mockQueryOne as any)
+        .mockResolvedValueOnce({ properties: '1', units: '2', active_leases: '1' })
+      const res: any = await getSetupProgress.execute({}, LANDLORD_ACTOR)
+      expect(res.canGetPaid).toBe(true)
+      expect(res.bankFeedLinked).toBe(false)
+      expect(res.companiesWithNoBankFeed).toEqual(['TruBlu'])
+      expect(res.complete).toBe(false)
+      expect(res.nextStep).toMatch(/read-only/i)
+    })
+
+    it('get_setup_progress: details submitted without live payouts is not "can get paid"', async () => {
+      ;(mockQuery as any)
+        .mockResolvedValueOnce([{ id: 'L1', business_name: 'TruBlu', payouts: false, has_property: true }])
+        .mockResolvedValueOnce([{ business_name: 'TruBlu', has_property: true, linked: true }])
+      ;(mockQueryOne as any)
+        .mockResolvedValueOnce({ properties: '1', units: '2', active_leases: '1' })
+      const res: any = await getSetupProgress.execute({}, LANDLORD_ACTOR)
+      expect(res.canGetPaid).toBe(false)
+      expect(res.companiesThatCannotBePaid).toEqual(['TruBlu'])
+      expect(res.nextStep).toMatch(/payouts/i)
     })
 
     it('get_property_rent_roll binds units to the landlord id, supports a property filter', async () => {
@@ -727,15 +897,44 @@ describe('read tools scope to the actor', () => {
       expect((query as any).mock.calls[0][0]).not.toMatch(/INSERT/i)
     })
 
-    it('send_bulk_message inserts one notification per tenant when confirmed', async () => {
-      ;(query as any).mockResolvedValueOnce([{ id: 'a' }, { id: 'b' }, { id: 'c' }]) // INSERT ... RETURNING
+    it('send_bulk_message sends one notification per tenant when confirmed', async () => {
+      // 10/20: it reads the recipients and then goes through createNotification
+      // for each, instead of one raw set-based INSERT. That is what makes the
+      // blast honor the resident's in-app answer, store the right type
+      // ('bulk_message', not the one-to-one 'landlord_message'), and stay
+      // visible to the completeness scanner. The old insert also put the uuid[]
+      // of companies straight into the uuid landlord_id column, so a confirmed
+      // blast threw instead of sending — the landlord_id now comes off the lease.
+      ;(query as any).mockResolvedValueOnce([
+        { user_id: 'u1', landlord_id: 'L1' },
+        { user_id: 'u2', landlord_id: 'L1' },
+        { user_id: 'u3', landlord_id: 'L1' },
+      ])
       const res: any = await sendBulkMessage.execute({ message: 'Water shutoff Tuesday', confirmed: true }, LANDLORD_ACTOR)
       const sql = (query as any).mock.calls[0][0]
-      expect(sql).toMatch(/INSERT INTO notifications/i)
+      expect(sql).toMatch(/SELECT DISTINCT t\.user_id/i)
       expect(sql).toMatch(/l\.landlord_id = ANY\(\$1/) // recipients scoped to the landlord
+      expect(sql).not.toMatch(/INSERT/i)
       expect((query as any).mock.calls[0][1][0]).toEqual(['L1'])
+      expect(createNotification).toHaveBeenCalledTimes(3)
+      expect(createNotification).toHaveBeenCalledWith(expect.objectContaining({
+        userId: 'u1', landlordId: 'L1', type: 'bulk_message', body: 'Water shutoff Tuesday',
+      }))
       expect(res.ok).toBe(true)
       expect(res.sent).toBe(3)
+    })
+
+    it('send_bulk_message reaches a resident who rents from two companies once', async () => {
+      // One person, two leases on the same account. The preview counted people,
+      // so the send has to too — a blast arriving twice reads as a bug.
+      ;(query as any).mockResolvedValueOnce([
+        { user_id: 'u1', landlord_id: 'L1' },
+        { user_id: 'u1', landlord_id: 'L2' },
+        { user_id: 'u2', landlord_id: 'L1' },
+      ])
+      const res: any = await sendBulkMessage.execute({ message: 'Gate code changes Friday', confirmed: true }, LANDLORD_ACTOR)
+      expect(createNotification).toHaveBeenCalledTimes(2)
+      expect(res.sent).toBe(2)
     })
 
     it('get_background_check_status scopes by landlord and exposes no SSN/DOB/PII', async () => {
@@ -833,6 +1032,38 @@ describe('read tools scope to the actor', () => {
       expect(mockCreateNotification).not.toHaveBeenCalled()
     })
 
+    // 10/20 (Nic): no state-law warnings anywhere. The S630 caution — that a
+    // notice may have to be served in person or by certified mail depending on
+    // local law — is one, so it waits for the switch. What the landlord is
+    // told either way is what GAM actually DID with the notice, so nobody is
+    // left thinking GAM served it.
+    it('draft_tenant_notice: the service caution waits for the switch; what GAM did is always said', async () => {
+      const match = [{ user_id: 'tenantUser', landlord_id: 'L1', first_name: 'Jane', last_name: 'Doe', email: 'j@x.dev' }]
+      const args = { tenant: 'Jane', subject: 'Entry Notice', notice: 'We will enter Thursday.' }
+
+      ;(query as any).mockResolvedValueOnce(match)
+      mockQueryOne.mockResolvedValue(undefined) // no system_features row — production today
+      const off: any = await draftTenantNotice.execute(args, LANDLORD_ACTOR)
+      expect(off.alsoTellThem).toMatch(/on the record in GAM/i)
+      expect(off.alsoTellThem).not.toMatch(/certified mail|legal service|local requirements|their state/i)
+
+      vi.clearAllMocks()
+      ;(query as any).mockResolvedValueOnce(match)
+      mockQueryOne.mockResolvedValue({ enabled: true })
+      const on: any = await draftTenantNotice.execute(args, LANDLORD_ACTOR)
+      expect(on.alsoTellThem).toMatch(/certified mail/i)
+      expect(on.alsoTellThem).toMatch(/not the same as legal service/i)
+
+      // And the same rule on the delivered answer, not only the draft.
+      vi.clearAllMocks()
+      ;(query as any).mockResolvedValueOnce(match)
+      mockQueryOne.mockResolvedValue(undefined)
+      const sent: any = await draftTenantNotice.execute({ ...args, confirmed: true }, LANDLORD_ACTOR)
+      expect(sent.sent).toBe(true)
+      expect(sent.alsoTellThem).not.toMatch(/certified mail|legal service/i)
+      mockQueryOne.mockReset()
+    })
+
     it('draft_tenant_notice asks which one when several tenants match', async () => {
       ;(query as any).mockResolvedValueOnce([
         { user_id: 'u_a', first_name: 'Jane', last_name: 'Doe', email: 'a@x.dev' },
@@ -911,6 +1142,7 @@ describe('get_books_summary (landlord, ledger-scoped)', () => {
 
   it('binds both income and expense queries to the landlord id and computes net', async () => {
     ;(query as any)
+      .mockResolvedValueOnce([]) // 10/12 (ledger P8): the books are not live yet — the journal path
       .mockResolvedValueOnce([
         { code: '4010', name: 'Rental Income', period_amount: '5000' },
         { code: '4020', name: 'Late Fee Income', period_amount: '150' },
@@ -920,18 +1152,48 @@ describe('get_books_summary (landlord, ledger-scoped)', () => {
         { code: '5050', name: 'Utilities', period_amount: '300' },
       ]) // expenses
     const res: any = await getBooksSummary.execute({ period: 'last_month' }, LANDLORD_ACTOR)
-    expect((query as any).mock.calls[0][1][0]).toEqual(['L1']) // income scoped to landlord
-    expect((query as any).mock.calls[1][1][0]).toEqual(['L1']) // expenses scoped to landlord
+    expect((query as any).mock.calls[1][1][0]).toEqual(['L1']) // income scoped to landlord
+    expect((query as any).mock.calls[2][1][0]).toEqual(['L1']) // expenses scoped to landlord
     expect(res).toMatchObject({ totalIncome: 5150, totalExpenses: 1500, netIncome: 3650, period: 'last month' })
     expect(res.topExpenses[0]).toMatchObject({ category: 'Repairs & Maintenance', amount: 1200 })
+    // 10/11: the Books P&L's join shape — the period, posted and owner tests
+    // bind the lines summed (not a LEFT JOIN beside them), and a deactivated
+    // account with activity in the period still counts.
+    for (const call of (query as any).mock.calls.slice(1, 3)) {
+      const sql = String(call[0]).replace(/\s+/g, ' ')
+      expect(sql).toContain('LEFT JOIN (journal_entry_lines jel JOIN journal_entries je ON je.id = jel.entry_id AND je.date BETWEEN $2 AND $3')
+      expect(sql).toContain('HAVING ba.active OR')
+      expect(sql).not.toContain('ba.active = TRUE')
+    }
   })
 
   it('reports cleanly when no bookkeeping accounts exist', async () => {
-    ;(query as any).mockResolvedValueOnce([]).mockResolvedValueOnce([])
+    ;(query as any).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([])
     const res: any = await getBooksSummary.execute({}, LANDLORD_ACTOR)
     expect(res.ok).toBe(true)
     expect(res.netIncome).toBe(0)
     expect(res.note).toMatch(/no bookkeeping accounts/i)
+  })
+
+  // 10/12 (Nic, ledger P8): once the books are live, the summary is the
+  // ledger's P&L — Received leads (L2), Charged beside it.
+  it('reads the books once they are live: received and paid lead, charged and incurred beside', async () => {
+    const lr = await import('../../ledgerReports')
+    ;(query as any).mockResolvedValueOnce([{ id: 'L1' }]) // the books are live
+    const spy = vi.spyOn(lr, 'ledgerProfitAndLoss').mockResolvedValue({
+      source: 'ledger', period: { start: '2026-09-01', end: '2026-09-30', label: 'last month' }, lead: 'received',
+      view: { received: 900, charged: 1000, owed: 100 } as any, chargedBeside: [], corrections: [],
+      incomeAccounts: [{ accountId: 'a', code: '4010', name: 'Space and lot rent', charged: 1000 }],
+      expenses: { rows: [{ accountId: 'b', code: '5040', name: 'Repairs and maintenance', paid: 50, incurred: 80 }], paid: 50, incurred: 80 },
+      nets: { received: 850, charged: 920 },
+    })
+    try {
+      const res: any = await getBooksSummary.execute({ period: 'last_month' }, LANDLORD_ACTOR)
+      expect(spy.mock.calls[0][0]).toEqual({ landlordIds: ['L1'] })
+      expect(res).toMatchObject({ totalIncome: 900, totalExpenses: 50, netIncome: 850, owedAtEnd: 100 })
+      expect(res.charged).toEqual({ income: 1000, expensesIncurred: 80, net: 920 })
+      expect(res.topExpenses).toEqual([{ category: 'Repairs and maintenance', amount: 80 }])
+    } finally { spy.mockRestore() }
   })
 })
 
@@ -1036,17 +1298,28 @@ describe('get_team (landlord, all-role roster)', () => {
     ;(query as any)
       .mockResolvedValueOnce([
         { role: 'maintenance', first_name: 'Mike', last_name: 'Diaz', all_properties: false, prop_count: 2 },
-        { role: 'bookkeeper', first_name: 'Bea', last_name: 'Cook', all_properties: null, prop_count: null },
+        // 10/11: a bookkeeper's coverage is their property boxes — every
+        // property the company owns today ticked, or how many are. 10/12: the
+        // company-wide box is its own (bank and payroll named only when it is
+        // ticked), with the lease-dates box and any sold property's history.
+        { role: 'bookkeeper', first_name: 'Bea', last_name: 'Cook', all_properties: true, prop_count: 3, company_wide: true, lease_dates: false, former_count: 0 },
+        { role: 'bookkeeper', first_name: 'Nora', last_name: 'Park', all_properties: false, prop_count: 1, company_wide: false, lease_dates: true, former_count: 1 },
+        { role: 'bookkeeper', first_name: 'Cy', last_name: 'Wide', all_properties: false, prop_count: 0, company_wide: true, lease_dates: false, former_count: 0 },
       ]) // members
       .mockResolvedValueOnce([{ email: 'new@x.dev', role: 'onsite_manager' }]) // invites
     const res: any = await getTeam.execute({}, LANDLORD_ACTOR)
     expect((query as any).mock.calls[0][1]).toEqual([['L1']]) // members scoped to landlord
     expect((query as any).mock.calls[1][1]).toEqual([['L1']]) // invites scoped to landlord
+    expect(String((query as any).mock.calls[0][0])).toMatch(/FROM bookkeeper_scopes bs/)
     expect(res.members).toEqual([
       { name: 'Mike Diaz', role: 'Maintenance', coverage: '2 properties' },
-      { name: 'Bea Cook', role: 'Bookkeeper', coverage: 'books access' },
+      { name: 'Bea Cook', role: 'Bookkeeper', coverage: 'all properties; company-wide books (bank account, payouts, payroll)' },
+      { name: 'Nora Park', role: 'Bookkeeper', coverage: '1 property; lease start and end dates; history of 1 sold property up to the sale' },
+      { name: 'Cy Wide', role: 'Bookkeeper', coverage: 'company-wide books (bank account, payouts, payroll)' },
     ])
-    expect(res.pendingInvites[0]).toMatchObject({ email: 'new@x.dev', role: 'On-site Manager' })
+    expect(res.members[2].coverage).not.toMatch(/payroll|bank/)   // Nora: no company-wide box
+    // 10/25 (Nic): "Manager is not a word I would label with her permission set."
+    expect(res.pendingInvites[0]).toMatchObject({ email: 'new@x.dev', role: 'Front Desk' })
   })
 })
 
@@ -1091,16 +1364,37 @@ describe('get_my_landlord_patterns (tenant transparency, scoped to own data)', (
     expect(res.flags).toBeUndefined() // 1pm/2pm are normal hours
   })
 
-  it('flags an objectively odd-hour entry (e.g. a midnight inspection) factually', async () => {
-    ;(query as any).mockResolvedValueOnce([
-      { reason_category: 'inspection', local_hour: 0, notice_window_hours: 24, ymd: '2026-03-01', local_at: 'Mar 01, 2026 at 12:00am' },
-    ])
+  // 10/20 (Nic): "There should be no state law warnings anywhere in the
+  // system. At least not right now. Just hide all that stuff." The midnight
+  // entry is still named — that is the transparency he asked for in S442 — but
+  // the sentence about what entry laws require is a state-law caution and
+  // waits for the same switch every other warning waits for.
+  const ODD_HOUR_ROW = { reason_category: 'inspection', local_hour: 0, notice_window_hours: 24, ymd: '2026-03-01', local_at: 'Mar 01, 2026 at 12:00am' }
+
+  it('flags an objectively odd-hour entry factually, with no state-law caution while the switch is off', async () => {
+    ;(query as any).mockResolvedValueOnce([ODD_HOUR_ROW])
+    mockQueryOne.mockResolvedValue(undefined) // no system_features row — production today
     const res: any = await getMyLandlordPatterns.execute({}, TENANT_ACTOR)
     expect(res.flags).toHaveLength(1)
     expect(res.flags[0]).toMatch(/outside typical daytime hours/i)
-    expect(res.flags[0]).toMatch(/reasonable times/i)
-    // factual + points to local law, no legal conclusion
+    expect(res.flags[0]).toMatch(/ask your landlord/i)
+    // The whole answer, not just the flag: no law talk anywhere in it.
+    expect(JSON.stringify(res)).not.toMatch(/reasonable times|local law|entry laws/i)
+    // factual, no legal conclusion
     expect(JSON.stringify(res)).not.toMatch(/illegal|violation|not allowed/i)
+  })
+
+  it('switch ON: the same flag carries the entry-law caution back', async () => {
+    ;(query as any).mockResolvedValueOnce([ODD_HOUR_ROW])
+    mockQueryOne.mockResolvedValue({ enabled: true })
+    const res: any = await getMyLandlordPatterns.execute({}, TENANT_ACTOR)
+    expect(res.flags[0]).toMatch(/outside typical daytime hours/i)
+    expect(res.flags[0]).toMatch(/reasonable times/i)
+    expect(JSON.stringify(res)).not.toMatch(/illegal|violation|not allowed/i)
+    // vi.clearAllMocks() clears CALLS, not implementations, so a switch left
+    // on here would silently turn the warnings on for every test after this
+    // one. Put it back.
+    mockQueryOne.mockReset()
   })
 
   it('returns a clean note when there’s no entry history', async () => {
@@ -1129,14 +1423,32 @@ describe('tenant contact + entry-notice (read, scoped + compliant)', () => {
         { reason: 'inspection', reason_category: 'inspection', status: 'pending', notice_given_at: 'd', notice_window_hours: 48, proposed_entry_window_start: 's', proposed_entry_window_end: 'e', entry_actual_at: null },
       ]) // requests
       .mockResolvedValueOnce([{ default_entry_notice_hours: 24 }]) // landlord policy
+    mockQueryOne.mockResolvedValue(undefined) // no system_features row — production today
     const res: any = await getMyEntryRequests.execute({}, TENANT_ACTOR)
     expect((query as any).mock.calls[0][1][0]).toBe('t1') // requests scoped to tenant
     expect((query as any).mock.calls[1][1]).toEqual(['t1']) // policy scoped to tenant
     expect(res.entryRequests[0].noticeHours).toBe(48)
     expect(res.landlordNoticePolicyHours).toBe(24)
-    // Compliant: no state-specific legal assertion — a neutral "check local laws" pointer.
+    // 10/20: the landlord's own notice setting is a fact and stays; the line
+    // telling the tenant that required notice varies by state and to go read
+    // their local law is a state-law caution and is gone while the switch is
+    // off (queryOne returns no system_features row here).
+    expect(res.noticeDisclaimer).toBeUndefined()
+    expect(JSON.stringify(res)).not.toMatch(/local laws|varies by state/i)
+    expect(JSON.stringify(res)).not.toMatch(/required by law|legally required|statute|§/i)
+  })
+
+  it('get_my_entry_requests brings the local-law pointer back when the switch is on', async () => {
+    ;(query as any)
+      .mockResolvedValueOnce([
+        { reason: 'inspection', reason_category: 'inspection', status: 'pending', notice_given_at: 'd', notice_window_hours: 48, proposed_entry_window_start: 's', proposed_entry_window_end: 'e', entry_actual_at: null },
+      ])
+      .mockResolvedValueOnce([{ default_entry_notice_hours: 24 }])
+    mockQueryOne.mockResolvedValue({ enabled: true })
+    const res: any = await getMyEntryRequests.execute({}, TENANT_ACTOR)
     expect(res.noticeDisclaimer).toMatch(/check your local laws/i)
     expect(JSON.stringify(res)).not.toMatch(/required by law|legally required|statute|§/i)
+    mockQueryOne.mockReset()
   })
 })
 
@@ -1347,9 +1659,35 @@ describe('get_my_landlord_renewal_tendency (tenant transparency)', () => {
 })
 
 describe('check_against_law (objective numeric/timeline mismatch, both audiences)', () => {
+  // 10/20 (Nic): "There should be no state law warnings anywhere in the
+  // system." This tool's whole answer is a warning, so it stands down while
+  // the switch in services/stateLaw is off — and must NOT fall through to a
+  // "your number is within the figure" all-clear, which would be a worse lie
+  // than the banner. The tests that exercise the comparison turn the switch
+  // on; the first one holds the hidden behavior.
+  const SWITCH_ON = { enabled: true }
+  /** system_features reads through queryOne; the lease-state lookup does too,
+   *  so answer by statement rather than by call order. */
+  const switchOnAndLeaseState = (state: string | null) =>
+    mockQueryOne.mockImplementation(async (sql: string) =>
+      /system_features/.test(String(sql)) ? SWITCH_ON : (state ? { state } : undefined))
+
   beforeEach(() => { vi.clearAllMocks() })
 
-  it('landlord: flags a late fee above the statutory $5/day, factually + cited (not advice)', async () => {
+  it('hidden 10/20: declines the comparison instead of giving a false all-clear', async () => {
+    mockQueryOne.mockResolvedValue(undefined) // no system_features row — production today
+    const res: any = await checkAgainstLaw.execute({ topic: 'late_fee', value: 100, state: 'AZ' }, LANDLORD_ACTOR)
+    expect(res.ok).toBe(false)
+    expect(res.error).toMatch(/not comparing figures against state law/i)
+    expect(res.error).toMatch(/search_state_law/)
+    // Crucially: no verdict either way, and the catalog was never opened.
+    expect(res.mismatch).toBeUndefined()
+    expect(res.message).toBeUndefined()
+    expect(query as any).not.toHaveBeenCalled()
+  })
+
+  it('switch ON — landlord: flags a late fee above the statutory $5/day, factually + cited (not advice)', async () => {
+    mockQueryOne.mockResolvedValue(SWITCH_ON)
     ;(query as any)
       .mockResolvedValueOnce([{ topic: 'late_fee', rule_kind: 'max', threshold_numeric: '5', threshold_unit: 'dollars per day', summary: 'cap', statute_citation: 'A.R.S. § 33-2105', source_url: 'u', source_date: '2026-06-09' }]) // getLatestProvision (tool)
       .mockResolvedValueOnce([{ topic: 'late_fee', rule_kind: 'max', threshold_numeric: '5', threshold_unit: 'dollars per day', summary: 'cap', statute_citation: 'A.R.S. § 33-2105', source_url: 'u', source_date: '2026-06-09' }]) // getLatestProvision (checkAgainstStatute)
@@ -1360,18 +1698,20 @@ describe('check_against_law (objective numeric/timeline mismatch, both audiences
     expect(res.statute).toMatchObject({ citation: 'A.R.S. § 33-2105', figure: 5 })
   })
 
-  it('tenant: resolves state from lease; value within the figure → no mismatch', async () => {
-    mockQueryOne.mockResolvedValueOnce({ state: 'AZ' }) // lease state
+  it('switch ON — tenant: resolves state from lease; value within the figure → no mismatch', async () => {
+    switchOnAndLeaseState('AZ')
     ;(query as any)
       .mockResolvedValueOnce([{ topic: 'deposit_max_months', rule_kind: 'max', threshold_numeric: '1.5', threshold_unit: 'months of rent', summary: 'cap', statute_citation: 'A.R.S. § 33-1321', source_url: 'u', source_date: '2026-06-09' }]) // getLatestProvision
       .mockResolvedValueOnce([{ topic: 'deposit_max_months', rule_kind: 'max', threshold_numeric: '1.5', threshold_unit: 'months of rent', summary: 'cap', statute_citation: 'A.R.S. § 33-1321', source_url: 'u', source_date: '2026-06-09' }]) // checkAgainstStatute
     const res: any = await checkAgainstLaw.execute({ topic: 'deposit_max_months', value: 1 }, TENANT_ACTOR)
-    expect(mockQueryOne.mock.calls[0][1]).toEqual(['t1'])
+    const leaseLookup = mockQueryOne.mock.calls.find((c: any[]) => !/system_features/.test(String(c[0])))
+    expect(leaseLookup?.[1]).toEqual(['t1'])
     expect(res.mismatch).toBe(false)
     expect(res.message).toMatch(/within the 1.5/i)
   })
 
-  it('clean note when the topic isn’t on file for the state', async () => {
+  it('switch ON — clean note when the topic isn’t on file for the state', async () => {
+    mockQueryOne.mockResolvedValue(SWITCH_ON)
     ;(query as any).mockResolvedValueOnce([]) // getLatestProvision → none
     const res: any = await checkAgainstLaw.execute({ topic: 'late_fee', value: 50, state: 'NV' }, LANDLORD_ACTOR)
     expect(res.ok).toBe(true)
@@ -1568,28 +1908,37 @@ describe('get_portfolio_stats never tells a landlord who is on SSI/SSDI', () => 
   })
 })
 
-// S655 (money plan, Step 3): the agent's P&L is the reports page's P&L under
-// the same "Money received" / "Money billed" switch. The figures themselves are
-// held equal to the report and the dashboard card against a real database in
-// routes/reportsPropertyBreakdown.test.ts; here, that the switch reaches the
-// shared computation and the answer says which way it counted.
-describe('get_profit_and_loss follows the basis switch', () => {
+// 10/12 (Nic): "NO Money received / Money billed toggle anywhere — show
+// Charged, Received and Owed side by side." (L2) "Received leads." The agent's
+// P&L is the reports page's P&L (computeLandlordPL): the three columns, the tie
+// in words and the net on each money column. The old basis switch is gone; a
+// stale one passed in is ignored. The figures themselves are held equal to the
+// report against a real database in routes/reportsPropertyBreakdown.test.ts.
+describe('get_profit_and_loss: Received, Charged and Owed, no switch', () => {
   beforeEach(() => { mockQuery.mockReset(); mockQueryOne.mockReset() })
 
-  async function run(args: Record<string, unknown>) {
+  async function run(args: Record<string, unknown>, source?: 'ledger') {
     const pl = await import('../../landlordPL')
     const { getProfitAndLoss } = await import('./getProfitAndLoss')
     mockQuery.mockResolvedValue([{ id: 'L1', business_name: 'Oak Park' }])
-    const spy = vi.spyOn(pl, 'computeLandlordPL').mockImplementation(async (_l, _s, _e, _m, basis = 'received') => ({
+    const spy = vi.spyOn(pl, 'computeLandlordPL').mockImplementation(async () => ({
       gross: { rent: 460, fees: 0, utilities: 0, homeSale: 0, balances: 0, otherIncome: 0, other: 0, total: 460 },
       lines: {} as any,
       lineItems: [{ line: 'rent', label: 'Rent', amount: 460 }],
       beside: { clearing: 0, creditsYouGave: 0, workTrade: 0, depositsHeld: 0, collectedSoFar: 0, stillOwed: 0, paidAheadUnused: 0 },
       besideItems: [],
       depositsHeld: 0,
-      expenses: { platformFee: 10, maintenance: 0, lotRent: 0, enteredExpenses: 5, total: 15 },
+      expenses: { platformFee: 10, maintenance: 0, lotRent: 0, enteredExpenses: 5, total: 15, ...(source ? { cashTotal: 12 } : {}) },
       net: 445,
-      basis: { basis, label: basis === 'billed' ? 'Money billed' : 'Money received', note: 'n' },
+      basis: { basis: 'received', label: 'Money received', note: 'n' },
+      view: {
+        received: 460, charged: 920, owed: 460, collected: 0, clearing: 0,
+        lines: [{ line: 'rent', label: 'Rent', received: 460, charged: 920, owed: 460 }],
+        categories: [], uncategorized: [], tie: {} as any,
+        tieText: ['Of $460.00 received, $460.00 was for bills due in September 2026.', 'Owed $0.00 … = owed $460.00 at the end of Sep 30, 2026.'],
+        beside: [], ...(source ? { source } : {}),
+      },
+      nets: { charged: 905, received: source ? 448 : 445 },
     }) as any)
     try {
       const out: any = await getProfitAndLoss.execute(args, LANDLORD_ACTOR)
@@ -1597,22 +1946,28 @@ describe('get_profit_and_loss follows the basis switch', () => {
     } finally { spy.mockRestore() }
   }
 
-  it('passes Money billed to the shared P&L and says so in the answer', async () => {
-    const { out, call } = await run({ year: 2026, month: 9, basis: 'billed' })
-    expect(call[4]).toBe('billed')
-    expect(out.basis).toBe('Money billed')
-    expect(out.income.lines).toEqual([{ line: 'rent', label: 'Rent', amount: 460 }])
+  it('answers with the three columns, Received first, the tie, and the net on each', async () => {
+    const { out } = await run({ year: 2026, month: 9 })
+    expect(out.income).toMatchObject({ received: 460, charged: 920, owed: 460 })
+    expect(Object.keys(out.income).slice(0, 3)).toEqual(['received', 'charged', 'owed'])
+    expect(out.income.lines).toEqual([{ label: 'Rent', received: 460, charged: 920, owed: 460 }])
+    expect(out.net).toEqual({ received: 445, charged: 905 })
+    expect(out.howTheyTie).toHaveLength(2)
+    expect(out.basis).toBeUndefined()
+    expect(out.columns).toMatch(/still unpaid of those bills today/)
   })
 
-  it('defaults to Money received, and an unknown basis falls back to it', async () => {
-    expect((await run({ year: 2026, month: 9 })).call[4]).toBe('received')
-    expect((await run({ year: 2026, month: 9, basis: 'accrual' })).call[4]).toBe('received')
+  it('on the books, says Owed is at the period\'s end and gives the expenses paid', async () => {
+    const { out } = await run({ year: 2026, month: 9 }, 'ledger')
+    expect(out.columns).toMatch(/still owed at the end of the period/)
+    expect(out.expenses.paidInPeriod).toBe(12)
+    expect(out.net).toEqual({ received: 448, charged: 905 })
   })
 
-  it('offers the basis as a one-sentence parameter', async () => {
+  it('offers no basis parameter, and a stale one changes nothing', async () => {
     const { getProfitAndLoss } = await import('./getProfitAndLoss')
-    const p: any = (getProfitAndLoss.parameters as any).properties.basis
-    expect(p.enum).toEqual(['received', 'billed'])
-    expect(p.description.split('. ').length).toBeLessThanOrEqual(2)
+    expect((getProfitAndLoss.parameters as any).properties.basis).toBeUndefined()
+    const { call } = await run({ year: 2026, month: 9, basis: 'billed' })
+    expect(call).toHaveLength(4)
   })
 })

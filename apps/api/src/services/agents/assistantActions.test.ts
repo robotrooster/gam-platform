@@ -78,6 +78,27 @@ describe('a landlord can record a cost by talking', () => {
     expect(getTool('log_expense')!.description).toMatch(/CONFIRM FIRST/)
     expect(getTool('log_expense')!.description).toMatch(/writes to their books/i)
   })
+
+  // 10/13 (Nic): "each expense is chosen on the split or specific unit or
+  // property at the time of logging. there should never be a default setting
+  // to apply expenses." "insurance was $1,200" with no place said is asked,
+  // never split for them; naming a place and a split together is asked too.
+  it('never picks where a cost goes: nothing said is asked, a split only when they said so', async () => {
+    const t = getTool('log_expense')!
+    const ACTOR = { userId: 'u', role: 'landlord', profileId: null, landlordIds: ['00000000-0000-0000-0000-000000000001'] } as any
+    const base = { amount: 1200, category: 'insurance', expenseDate: '2026-10-13' }
+    const none: any = await t.execute(base, ACTOR)
+    expect(none.ok).toBe(false)
+    expect(none.needsPlace).toBe(true)
+    expect(none.logged).toBeUndefined()
+    expect(none.tellThem).toMatch(/one unit, one property, or split across all their properties/)
+    const both: any = await t.execute({ ...base, place: 'Oak Street', splitAcrossProperties: true }, ACTOR)
+    expect([both.ok, both.needsPlace, both.logged]).toEqual([false, true, undefined])
+    const p = (t.parameters as any).properties
+    expect(p.splitAcrossProperties.type).toBe('boolean')
+    expect(p.splitAcrossProperties.description).toMatch(/only when they said/i)
+    expect(t.description).toMatch(/never pick it for them/)
+  })
 })
 
 describe('the silo holds', () => {

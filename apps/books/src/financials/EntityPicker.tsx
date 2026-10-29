@@ -16,7 +16,20 @@ import { useEffect } from 'react'
 import { useQuery } from 'react-query'
 import { finGet, useIsBookkeeper, pinnedCompanyId } from './adapter'
 
-export interface EntityOption { id: string; businessName?: string | null; propertyCount?: number }
+export interface EntityOption {
+  id: string
+  businessName?: string | null
+  propertyCount?: number
+  /**
+   * 10/23 — OWNED, OR MANAGED FOR SOMEBODY ELSE. The third-party management
+   * portal folded into this one, so one account holds both: Blu owns Country
+   * Acres and manages Oak Park for its owner. Absent on a pass from before
+   * this, which reads as owned — which it was.
+   */
+  role?: 'owner' | 'manager'
+  /** The management company the access came through, when it came through one. */
+  viaPmCompanyId?: string | null
+}
 
 // 10/11: a bookkeeper keeps one company's books and is never asked which; the
 // company list is the owner's, so it is not even fetched for them. An app that
@@ -39,6 +52,12 @@ export function useCompanyMissing(value: string): boolean {
   const { data: entities = [] } = useEntities()
   return entities.length > 1 && !value
 }
+
+/** Owned first, then managed. The order is the point, so it is written once. */
+const OWNED_FIRST = [
+  { role: 'owner' as const, heading: 'Companies you own' },
+  { role: 'manager' as const, heading: 'Companies you manage for others' },
+]
 
 export function EntityPicker({ value, onChange, label = 'Company', note, disabled }: {
   value: string
@@ -74,12 +93,26 @@ export function EntityPicker({ value, onChange, label = 'Company', note, disable
       <select className="input" style={{ width: 'auto', minWidth: 240 }} disabled={disabled}
               value={value} onChange={e => onChange(e.target.value)}>
         <option value="">Choose a company…</option>
-        {entities.map(en => (
-          <option key={en.id} value={en.id}>
-            {en.businessName || 'Unnamed company'}
-            {en.propertyCount ? ` — ${en.propertyCount} propert${en.propertyCount === 1 ? 'y' : 'ies'}` : ''}
-          </option>
-        ))}
+        {/* 10/23: owned companies and managed ones are different kinds of
+            answer — "what did I earn" against "what did I earn managing" — so
+            they are grouped rather than mixed into one list. A portfolio with
+            no managed company renders exactly as it did. */}
+        {OWNED_FIRST.map(group => {
+          const inGroup = entities.filter(en => (en.role ?? 'owner') === group.role)
+          if (!inGroup.length) return null
+          const label = (en: EntityOption) =>
+            `${en.businessName || 'Unnamed company'}${en.propertyCount
+              ? ` — ${en.propertyCount} propert${en.propertyCount === 1 ? 'y' : 'ies'}` : ''}`
+          // One kind only: no heading to explain, so the list stays plain.
+          if (inGroup.length === entities.length) {
+            return inGroup.map(en => <option key={en.id} value={en.id}>{label(en)}</option>)
+          }
+          return (
+            <optgroup key={group.role} label={group.heading}>
+              {inGroup.map(en => <option key={en.id} value={en.id}>{label(en)}</option>)}
+            </optgroup>
+          )
+        })}
       </select>
       <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
         {note ?? 'Each company has its own bank account and its own transactions.'}

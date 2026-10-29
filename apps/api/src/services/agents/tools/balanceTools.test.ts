@@ -389,3 +389,120 @@ describe('a co-tenant hears the household\'s bill', () => {
     expect(byUnit.matches.map((m: any) => m.unit)).toEqual(['RV 7', 'RV 7', 'RV 7'])
   })
 })
+
+// 10/12 (Nic): "Grace = lease, else property, else 5 — the only chain." The
+// agent's "who pays late most" read the lease's grace, else 0: a lease with no
+// grace of its own (nearly every lease) was late the day after the due date.
+// 10/12 (Nic): "Payment health = ONE definition everywhere, per HOUSEHOLD per
+// BILL MONTH, never per line." It also counted payment lines by settled_at, so
+// work trade, a bounce and a payment still clearing all read as late; it now
+// counts the household's judged months (services/householdMonths).
+describe('query_portfolio late_payments reads the one payment-health definition', () => {
+  /** A tenant on a lease with no grace of its own at a park whose grace is 3 days. */
+  async function lateWorld(client: any, first: string, last: string) {
+    const { userId, landlordId } = await seedLandlord(client)
+    const tenantId = await seedTenant(client)
+    await client.query(`UPDATE users SET first_name = $2, last_name = $3 WHERE id = (SELECT user_id FROM tenants WHERE id = $1)`, [tenantId, first, last])
+    const propertyId = await seedProperty(client, { landlordId, ownerUserId: userId, managedByUserId: userId })
+    await client.query(`UPDATE properties SET late_fee_grace_days = 3 WHERE id = $1`, [propertyId])
+    const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 500 })
+    const leaseId = await seedLease(client, { unitId, landlordId, rentAmount: 500 })
+    await client.query(`UPDATE leases SET late_fee_grace_days = NULL WHERE id = $1`, [leaseId])
+    await seedLeaseTenant(client, { leaseId, tenantId, role: 'primary' })
+    const rent = async (due: string, status: string, extra: Record<string, unknown> = {}) => {
+      const all: Record<string, unknown> = {
+        unit_id: unitId, lease_id: leaseId, tenant_id: tenantId, landlord_id: landlordId, type: 'rent', amount: 500,
+        status, due_date: due, entry_description: 'RENT', ...extra,
+      }
+      const cols = Object.keys(all)
+      return (await client.query(
+        `INSERT INTO payments (${cols.join(',')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(',')}) RETURNING id`,
+        Object.values(all))).rows[0].id as string
+    }
+    return {
+      landlordId, tenantId, leaseId, unitId, rent,
+      landlordActor: { userId, role: 'landlord' as const, profileId: '', landlordIds: [landlordId] } as any,
+    }
+  }
+
+  it('a lease with no grace uses the property\'s: paid on the 3rd at a 3-day park is on time, the 4th is late; a voided row never counts', async () => {
+    const client = await getClient()
+    let landlordActor: any
+    try {
+      const w = await lateWorld(client, 'Lena', 'Late')
+      landlordActor = w.landlordActor
+      // Paid the 4th (noon, Phoenix): the park's first late day.
+      await w.rent('2026-08-01', 'settled', { settled_at: '2026-08-04T19:00:00Z' })
+      // Paid the 3rd: the park's last grace day — on time.
+      await w.rent('2026-09-01', 'settled', { settled_at: '2026-09-03T19:00:00Z' })
+      // A voided row was owed by nobody.
+      await w.rent('2026-07-01', 'voided', { voided_at: new Date(), void_reason: 'test void' })
+    } finally { client.release() }
+
+    const out: any = await queryPortfolio.execute({ subject: 'tenants', measure: 'late_payments' }, landlordActor)
+    expect(out.results).toHaveLength(1)
+    expect(out.results[0]).toMatchObject({ name: 'Lena Late', value: 1, detail: '2 months judged' })
+  })
+
+  // S652 (Nic): "let's count work trade as on time." The month close
+  // (jobs/workTradeSettlement creditInvoice) settles a rent line the hours
+  // cover in full at $0 with settled_at = NOW() — about the 1st of the NEXT
+  // month — and puts the value on the invoice. Read by settled_at, that line
+  // was late every month; a line still suspended (settled_at NULL) was late too.
+  it('rent work trade covers in full is never late: closed on the 1st of the next month, or still suspended', async () => {
+    const client = await getClient()
+    let landlordActor: any
+    try {
+      const w = await lateWorld(client, 'Wade', 'Worktrade')
+      landlordActor = w.landlordActor
+      // June: the month closed on July 1st — the line settled at $0 that day, the value on the invoice.
+      const inv = (await client.query(
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status,
+                               work_trade_credit_amount, work_trade_credit_hours)
+         VALUES ($1,$2,$3,$4,'INV-WT-JUNE','2026-06-01',0,'settled',500,40) RETURNING id`,
+        [w.landlordId, w.tenantId, w.leaseId, w.unitId])).rows[0].id
+      await w.rent('2026-06-01', 'settled', {
+        invoice_id: inv, amount: 0, settled_at: '2026-07-01T08:00:00Z', notes: 'Covered by work-trade credit',
+      })
+      // October: still suspended while the hours are worked (no settled_at yet), past the park's grace.
+      await w.rent('2026-10-01', 'pending', { work_trade_suspended_at: '2026-09-30T12:00:00Z' })
+    } finally { client.release() }
+
+    const out: any = await queryPortfolio.execute({ subject: 'tenants', measure: 'late_payments' }, landlordActor)
+    expect(out.unit).toBe('late months')
+    expect(out.results).toHaveLength(1)
+    expect(out.results[0]).toMatchObject({ name: 'Wade Worktrade', value: 0, detail: '2 months judged' })
+  })
+
+  // A bounce is one bill: the 'returned' original is carried by the row the
+  // reversal reopened, so the month is judged once. An ACH payment started
+  // inside grace and still clearing is paid the day it was started (the
+  // postmark rule), never late for being slow to clear.
+  it('a returned payment is one late month, never two lines; a payment still clearing is paid the day it started', async () => {
+    const client = await getClient()
+    let landlordActor: any
+    try {
+      const w = await lateWorld(client, 'Bo', 'Bounce')
+      landlordActor = w.landlordActor
+      // July: paid the 2nd, the bank sent it back; the reopened row was paid the 20th — late.
+      const jul = await w.rent('2026-07-01', 'returned', { settled_at: '2026-07-02T19:00:00Z', return_code: 'R01' })
+      const rv = await client.query(
+        `INSERT INTO payment_reversals (payment_id, landlord_id, tenant_id, lease_id, reversal_type, reversed_amount, stripe_event_id, raw_event)
+         VALUES ($1,$2,$3,$4,'ach_return',500,'evt_late_jul','{}') RETURNING id`, [jul, w.landlordId, w.tenantId, w.leaseId])
+      await w.rent('2026-07-01', 'settled', { reversal_id: rv.rows[0].id, settled_at: '2026-07-20T19:00:00Z' })
+      // August: a bank payment started the 2nd, still clearing.
+      const aug = await w.rent('2026-08-01', 'processing', { stripe_payment_intent_id: 'pi_late_aug' })
+      const rem = await client.query(
+        `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount, status,
+                                         payment_method, stripe_payment_intent_id, created_at)
+         VALUES ($1,$2,$3,500,500,0,'processing','ach','pi_late_aug','2026-08-02T19:00:00Z') RETURNING id`,
+        [w.tenantId, w.leaseId, w.landlordId])
+      await client.query(
+        `INSERT INTO remittance_applications (remittance_id, payment_id, amount_applied) VALUES ($1,$2,500)`, [rem.rows[0].id, aug])
+    } finally { client.release() }
+
+    const out: any = await queryPortfolio.execute({ subject: 'tenants', measure: 'late_payments' }, landlordActor)
+    expect(out.results).toHaveLength(1)
+    expect(out.results[0]).toMatchObject({ name: 'Bo Bounce', value: 1, detail: '2 months judged' })
+  })
+})

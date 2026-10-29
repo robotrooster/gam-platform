@@ -121,10 +121,48 @@ export function parseEmergencyContact(raw: string | null | undefined): ParsedEme
   return { name, phone, raw: original, quality, relationship: null }
 }
 
-/** Display form for a stored 10-digit number. */
+/**
+ * Display form for a stored US number: (520) 903-8134.
+ *
+ * 10/24 (Nic): "I would also like the phone number field to be correctly
+ * formatted for phone numbers. I don't want to have to type dashes or
+ * parentheses on everything. Let's get it all uniform." This is the ONE
+ * formatter — see typingPhone below for the as-you-type half of it.
+ *
+ * 10/24 fix: an eleven-digit number that leads with the US country code used to
+ * fall straight through and display as 16025550199, because the length test
+ * demanded exactly ten. Numbers reach GAM both ways — somebody types
+ * +1 (602) 555-0199 into a form, an import carries a leading 1 — so the 1 comes
+ * off first. Anything that is still not a US number is handed back untouched
+ * rather than mangled into a shape it is not.
+ */
 export function formatPhone(digits: string | null | undefined): string | null {
-  const d = (digits ?? '').replace(/\D/g, '')
-  if (d.length !== 10) return digits ?? null
+  const d = usDigits(digits)
+  if (!d) return digits ?? null
+  return `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`
+}
+
+/** The ten digits of a US number, or null when it is not one. */
+export function usDigits(value: string | null | undefined): string | null {
+  const d = (value ?? '').replace(/\D/g, '')
+  if (d.length === 10) return d
+  if (d.length === 11 && d.startsWith('1')) return d.slice(1)
+  return null
+}
+
+/**
+ * Format a phone field WHILE somebody types it, and stop at the real length.
+ *
+ * Lifted out of OnboardingPage (S-era "I don't want to type in fifty freaking
+ * numbers"), where it was a private copy, so the reservation form and every
+ * other phone field get the identical behaviour instead of a third version of
+ * it. Digits only: the parentheses, the space and the dash appear as the
+ * landlord types, and an eleventh digit cannot be entered.
+ */
+export function typingPhone(raw: string): string {
+  const d = (raw ?? '').replace(/\D/g, '').replace(/^1(?=\d{10})/, '').slice(0, 10)
+  if (d.length <= 3) return d
+  if (d.length <= 6) return `(${d.slice(0, 3)}) ${d.slice(3)}`
   return `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`
 }
 

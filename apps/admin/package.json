@@ -4,24 +4,30 @@
   "scripts": {
     "dev": "vite --port 3003",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run"
   },
   "dependencies": {
     "@gam/shared": "*",
     "@sentry/react": "^8.55.2",
+    "axios": "^1.6.5",
+    "d3-geo": "^3.1.1",
+    "lucide-react": "^0.309.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "react-router-dom": "^6.21.0",
-    "react-query": "^3.39.3",
-    "axios": "^1.6.5",
     "react-hook-form": "^7.49.2",
-    "zod": "^3.22.4",
+    "react-query": "^3.39.3",
+    "react-router-dom": "^6.21.0",
     "recharts": "^2.10.3",
-    "lucide-react": "^0.309.0"
+    "topojson-client": "^3.1.0",
+    "us-atlas": "3.0.1",
+    "zod": "^3.22.4"
   },
   "devDependencies": {
+    "@types/d3-geo": "^3.1.1",
     "@types/react": "^18.2.47",
     "@types/react-dom": "^18.2.18",
+    "@types/topojson-client": "^3.1.5",
     "@vitejs/plugin-react": "^5.2.0",
     "typescript": "^5.3.3",
     "vite": "^8.0.0"

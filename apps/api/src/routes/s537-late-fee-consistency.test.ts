@@ -18,6 +18,7 @@ import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLateFeeDecision, seedLeaseTenant, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import { coverFlexPayCycle } from '../services/flexpay'
 import { unitsRouter } from './units'
@@ -71,8 +72,11 @@ async function leaseWithOverdueInvoice(f: any, opts: {
               late_fee_initial_type='flat', late_fee_grace_days=$4 WHERE id=$1`,
       [leaseId, opts.leaseFee.enabled ?? true, opts.leaseFee.amount, opts.leaseFee.grace ?? 0])
     const inv = await client.query<{ id: string }>(
-      `INSERT INTO invoices (landlord_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
-       VALUES ($1, $2, $3, $4, (NOW() AT TIME ZONE $5)::date - $6::int, $7, $7, 'pending') RETURNING id`,
+      // 10/12 (Nic): written before it came due, as the monthly run writes it
+      // (a bill written after its due date counts from the day it was written).
+      `INSERT INTO invoices (landlord_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status, created_at)
+       VALUES ($1, $2, $3, $4, (NOW() AT TIME ZONE $5)::date - $6::int, $7, $7, 'pending',
+               NOW() - make_interval(days => $6::int + 3)) RETURNING id`,
       [f.landlordId, leaseId, opts.unitId, `INV-${Math.random().toString(36).slice(2, 8)}`, TZ, opts.daysOverdue ?? 10, rent])
     await client.query(
       `INSERT INTO payments (landlord_id, unit_id, lease_id, type, amount, status, entry_description, due_date, invoice_id)
@@ -504,8 +508,9 @@ describe('S655 FlexPay: a covered bill gets no late fee', () => {
                 late_fee_initial_type = 'flat', late_fee_grace_days = 5 WHERE id = $1`, [leaseId])
       // Due four days ago: today is the last of five grace days (due + 5 − 1).
       const inv = await client.query<{ id: string }>(
-        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
-         VALUES ($1, $2, $3, $4, $5, ($7::timestamptz AT TIME ZONE $6)::date - 4, 1000, 1000, 'pending') RETURNING id`,
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status, created_at)
+         VALUES ($1, $2, $3, $4, $5, ($7::timestamptz AT TIME ZONE $6)::date - 4, 1000, 1000, 'pending',
+                 $7::timestamptz - interval '7 days') RETURNING id`,
         [f.landlordId, tenantId, leaseId, unitId, `INV-${Math.random().toString(36).slice(2, 8)}`, TZ, NOW_AT])
       await client.query(
         `INSERT INTO payments (landlord_id, tenant_id, unit_id, lease_id, type, amount, status, entry_description, due_date, invoice_id)
@@ -521,10 +526,16 @@ describe('S655 FlexPay: a covered bill gets no late fee', () => {
     await db.query(
       `INSERT INTO system_features (key, enabled, description) VALUES ('flexpay_rollout_visible', TRUE, 'S655 test')
        ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
-    await db.query(
-      `INSERT INTO platform_processing_rates (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-       SELECT 'ach', 0, 1.0, 0, 0.5
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method='ach' AND effective_until IS NULL)`)
+    // 10/17: the rate this test's figures are worked out on, STATED rather than
+    // seeded-if-missing — one row is open per method and cleanupAllSchema leaves
+    // the rate card alone, so an insert-if-missing took whatever an earlier file
+    // left open.
+    await setEffectiveProcessingRate(db, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 0, customerFacingPercent: 1.0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: 's537-late-fee-consistency.test.ts ACH rate',
+    })
     const c = await db.connect()
     try { await seedAllocationRule(c, { propertyId: f.propertyId }) } finally { c.release() }
     const covered = await billOnItsLastGraceDay(f, true)
@@ -551,10 +562,16 @@ describe('S655 FlexPay: a covered bill gets no late fee', () => {
     await db.query(
       `INSERT INTO system_features (key, enabled, description) VALUES ('flexpay_rollout_visible', TRUE, 'S655 test')
        ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
-    await db.query(
-      `INSERT INTO platform_processing_rates (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-       SELECT 'ach', 0, 1.0, 0, 0.5
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method='ach' AND effective_until IS NULL)`)
+    // 10/17: the rate this test's figures are worked out on, STATED rather than
+    // seeded-if-missing — one row is open per method and cleanupAllSchema leaves
+    // the rate card alone, so an insert-if-missing took whatever an earlier file
+    // left open.
+    await setEffectiveProcessingRate(db, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 0, customerFacingPercent: 1.0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: 's537-late-fee-consistency.test.ts ACH rate',
+    })
     const c = await db.connect()
     try { await seedAllocationRule(c, { propertyId: f.propertyId }) } finally { c.release() }
     const covered = await billOnItsLastGraceDay(f, true)

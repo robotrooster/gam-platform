@@ -1,0 +1,24 @@
+-- 10/24 (Nic) — A MISSPELLING IS NOT AN ALIAS. FIX-FORWARD OF 20261025020000.
+--
+--   "On the ones where there are two different spellings for the name, one of
+--    those is obviously wrong because it's such a unique name. That it needs to
+--    be consolidated into the right one. You don't need to store the old one
+--    anywhere."
+--
+-- 20261025020000 added pos_customers.also_spelled on my reasoning that a clerk
+-- might type the old spelling off a guest's years-old paperwork and ought to
+-- still find them. Nic's call is the other way, and it is the simpler product:
+-- Werthmann/Worthman and Hemmersmeier/Hemmersmeyer are one right spelling and
+-- one typo each, not two names a person answers to. Carrying the typo forever
+-- means every merged record grows a tail of other people's keyboard slips, and
+-- the PHONE NUMBER is the key that makes the spelling not matter — which is the
+-- whole reason he asked for phone-first guest lookup in the first place.
+--
+-- The two merges themselves stand: the surviving record absorbed the duplicate's
+-- email and phone, and the wrong-spelling rows are gone. audit_pos_customers
+-- journals those deletes, so the change journal can still explain them (and the
+-- journal is never pruned — standing rule).
+--
+-- NO BACKFILL NEEDED. The column held two values, both cleared before this ran.
+DROP INDEX IF EXISTS idx_pos_customers_also_spelled;
+ALTER TABLE pos_customers DROP COLUMN IF EXISTS also_spelled;

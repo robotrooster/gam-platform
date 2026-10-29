@@ -35,13 +35,14 @@ import { api, apiGet, apiPost } from '../lib/api'
 import { TAP_WINDOW_SECONDS } from '../lib/terminal'
 import {
   money, toCents, toDollars, parseAmount, dayWord, localToday,
-  creditChoiceNeeded, oldBalanceOwedCents, postAnchor, planTender, recordedMessage, lateFeeDeleteRefusalText,
+  creditChoiceNeeded, creditCoversBill, oldBalanceOwedCents, postAnchor, planTender, recordedMessage, lateFeeDeleteRefusalText,
   serverMessage, serverStatus, readerChoiceParams, readerQuoteQuery, readerReady, readerLeases,
   postConfirmQuestion, numberRequired, deskFigures, sameFigures, figuresMovedMessage, CREDIT_USE_RULE,
   chargeMonthsRange, readChargesById, CHARGE_PAGE_SIZE, withReaderTaken, readerFinishedMessage,
   deskOnItsWay, nextAwaitingRereadAt, awaitingOpensAtWord,
   AMOUNT_FIELD_LABEL, NUMBER_FIELD_LABEL, numberMissingMessage, depositPhotoProblem, billName, stillOwedText, lateFeeOutcomeText, lateFeesBackOnShortBills,
   onboardingLateFeeBoxApplies, recordableMethods, partPaymentLines, backdatedLateFeeText, deskBillBalance, postAheadText,
+  billsBySpace, pickBillName,
   type CreditChoice, type DeskFigures, type DeskQuote, type DeskQuoteRow, type ReaderQuote, type ReaderSpace,
 } from '../lib/creditDesk'
 import '../styles/credit-desk.css'
@@ -161,6 +162,55 @@ function BillLines({ title, rows, labels, sub }: {
 }
 
 /**
+ * Every open bill, by space, oldest first — each bill named, with its lines
+ * under it.
+ *
+ * ── 10/27 (Nic): THE TICK BOXES ARE GONE ──────────────────────────────────
+ *
+ *   "that checkbox beside each bill before cash check or money order can turn
+ *    on, that is something you decided. That's not what I want at all. That's
+ *    clunky. That adds an extra step to things that just need to be smooth.
+ *    Disable that checkbox. There's no reason for it to exist."
+ *
+ * They went in on 10/14 to make the desk say which bill money paid. What that
+ * actually bought was a step between a resident holding cash and the desk
+ * taking it — and on 10/27 it stopped Lisa Scheeler's trailer payment dead,
+ * because every way of paying by hand was greyed out until a box nobody could
+ * see got ticked. The desk takes the whole balance now, oldest bill first,
+ * which is the platform's standing rule for where money lands anyway
+ * (10/15: "money gets applied to the most outstanding balance first"). The
+ * bills are still shown, named and split by space, so the desk can read out
+ * what the money covered — they are a statement, not a form to fill in.
+ */
+function BillGroups({ bills, labels }: {
+  bills: NonNullable<DeskQuote['bills']>
+  labels: Map<string, { label: string; detail: string | null }>
+}) {
+  if (!bills.length) return null
+  const spaces = billsBySpace(bills)
+  return (<>
+    {spaces.map(sp => (
+      <div key={sp.key} className="cd-bill-group">
+        <div className="cd-section-label">{sp.label ?? (spaces.length > 1 ? 'Other charges' : 'Bills')}</div>
+        {sp.bills.map(b => (
+          <div key={b.id} className="cd-line">
+            <span className="cd-line-label">
+              {pickBillName(b)}
+              <span className="cd-line-meta"> · due {dayWord(b.dueDate)}</span>
+              <span className="cd-check-sub">
+                {b.rows.map(r => `${lineName(r, labels)} ${money(r.amount)}`).join(' · ')}
+                {toCents(b.creditAlreadyApplied) > 0 ? ` · credit applied ${money(-b.creditAlreadyApplied)}` : ''}
+              </span>
+            </span>
+            <span className="mono">{money(b.owed)}</span>
+          </div>
+        ))}
+      </div>
+    ))}
+  </>)
+}
+
+/**
  * 10/6 (Nic): "the late fee is only deleted during onboarding at landlord's
  * discretion." Off by default; shown only when a bank deposit dated back takes
  * a late fee off the onboarding month's bill and this person may tick it.
@@ -205,6 +255,10 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   const [depositedOn, setDepositedOn] = useState(deskToday)
   const backdatedTo = mode === 'bank_deposit' && /^\d{4}-\d{2}-\d{2}$/.test(depositedOn) && depositedOn < deskToday
     ? depositedOn : null
+  // 10/27 (Nic): the desk takes the WHOLE balance — no bills named, so the
+  // server quotes every open bill of this household (oldest first). The
+  // ?bills= form it still accepts is what a browser holding yesterday's bundle
+  // sends; nothing here sends it any more.
   const quoteKey = ['desk-quote', anchorPaymentId, backdatedTo]
   // The window's result, said ONCE (fix pass 3): the screen that stays up with
   // the change to hand back, and the one notice the page keeps.
@@ -305,7 +359,7 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
         }
       } else {
         finished.current = true
-        const restOpen = !!quote && (quote.rows.length > 0 || quote.oldBalance.length > 0)
+        const restOpen = !!quote && ((quote.bills ?? quote.rows).length > 0 || quote.oldBalance.length > 0)
         onRecorded(`Took ${money(taken)} by card on the reader from ${name}.${restOpen ? ' The rest of what they owe is still open.' : ''}`)
       }
     }
@@ -341,6 +395,7 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   }
   /** The desk did something: the last message has been read. One message at a time. */
   const clearMsg = () => { setMsg(null); refusal.current = null }
+
   useEffect(() => {
     if (!stale || !answeredOn || !figures) return
     const text = refusal.current ?? figuresMovedMessage(answeredOn, figures)
@@ -350,9 +405,11 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   }, [stale])   // eslint-disable-line react-hooks/exhaustive-deps
 
   // The credit pays the whole bill: nothing is taken, and no method is asked.
-  const creditOnly = !!quote && liveChoice === 'use' && creditChoiceNeeded(quote) && toCents(quote.owedIfUsed) === 0
+  // 10/26: creditCoversBill, not the Use answer — where the landlord turned
+  // saving off nobody answers, and the credit still pays the bill.
+  const creditOnly = !!quote && creditCoversBill(quote, liveChoice) && toCents(quote.owedIfUsed) === 0
   // 10/6 (Nic): the desk applies the credit alone, though it pays only part of the bill.
-  const creditOnlyPart = !!quote && liveChoice === 'use' && creditChoiceNeeded(quote) && toCents(quote.owedIfUsed) > 0
+  const creditOnlyPart = !!quote && creditCoversBill(quote, liveChoice) && toCents(quote.owedIfUsed) > 0
     && creditAlone && mode === null
   const method: ManualPaymentMethod | null = mode && mode !== 'reader' ? mode : ((creditOnly || creditOnlyPart) && mode === null ? 'cash' : null)
   const tenderedCents = creditOnlyPart ? 0 : parseAmount(tendered)
@@ -374,7 +431,9 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
   // 10/6 (Nic): the bill as one balance, and the whole balance as owed now.
   const bill = quote ? deskBillBalance(quote) : null
   const fullOwedCents = quote
-    ? Math.max(0, toCents(quote.fullBalance) - toCents(quote.creditAlreadyApplied)
+    // 10/14: credit already on EVERY bill, ticked or not (creditAlreadyApplied is the ticked bills' alone).
+    ? Math.max(0, toCents(quote.fullBalance)
+      - (quote.bills ? quote.bills.reduce((t, b) => t + toCents(b.creditAlreadyApplied), 0) : toCents(quote.creditAlreadyApplied))
       - (quote.oldBalance ?? []).reduce((t, r) => t + toCents(r.creditAlreadyApplied), 0))
     : 0
   const needNumber = !!method && numberRequired(method)
@@ -513,7 +572,7 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
     )
   }
 
-  const nothingHere = !!quote && quote.rows.length === 0 && quote.oldBalance.length === 0
+  const nothingHere = !!quote && (quote.bills ?? quote.rows).length === 0 && quote.oldBalance.length === 0
   // Nothing left to take here: ONE message. When a refusal or a moved figure
   // brought the window here (another desk paid it, the space went into eviction
   // mode), it says that what they owe changed and where it stands now — never
@@ -553,14 +612,18 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
           ) : quote ? (<>
             {/* ── The whole balance, the way the desk takes it ── */}
             <div className="cd-bill">
-              <BillLines title="This bill" rows={quote.rows} labels={labels} />
+              {quote.bills ? (
+                <BillGroups bills={quote.bills} labels={labels} />
+              ) : (
+                <BillLines title="This bill" rows={quote.rows} labels={labels} />
+              )}
               {quote.rows.length > 0 && bill && bill.creditApplied > 0 && (<>
                 <div className="cd-line"><span>Charges</span><span className="mono">{money(toDollars(bill.charges))}</span></div>
                 <div className="cd-line"><span>Credit applied</span><span className="mono">{money(-toDollars(bill.creditApplied))}</span></div>
                 <div className="cd-line cd-line-total"><span>Still owed</span><span className="mono">{money(toDollars(bill.stillOwed))}</span></div>
               </>)}
               {quote.rows.length > 0 && bill && bill.creditApplied === 0 && (
-                <div className="cd-line cd-line-total"><span>This bill</span><span className="mono">{money(quote.currentTotal)}</span></div>
+                <div className="cd-line cd-line-total"><span>{(quote.bills?.length ?? 1) > 1 ? 'These bills' : 'This bill'}</span><span className="mono">{money(quote.currentTotal)}</span></div>
               )}
               <BillLines title="Old balance" sub="paid last, from whatever is over this bill" rows={quote.oldBalance} labels={labels} />
               {toCents(quote.payOnlineTotal) > 0 && (
@@ -616,6 +679,28 @@ export function RecordPaymentWindow({ anchorPaymentId, tenantId, name, onClose, 
               {/* ── Credit: beside the bill, used only when the desk says so.
                   The card reader asks its own Use / Save per space (fix round 2:
                   never the same question twice, one answer of which does nothing). ── */}
+              {/* 10/26 (Nic): "if the landlord's choice is to use it, they don't
+                  ever see anything except a statement". No question, no Change
+                  button — the credit is already on the bill below. */}
+              {quote.creditMustBeUsed === true && usable > 0 && mode !== 'reader' && (
+                <div className="cd-credit">
+                  <div className="cd-credit-head">
+                    Credit available <span className="mono">{money(quote.creditAvailable)}</span> — going on this bill
+                    {toCents(quote.creditOnFile) > usable && (
+                      <span className="cd-line-meta"> ({money(quote.creditOnFile)} on file)</span>
+                    )}
+                  </div>
+                  <div className="cd-stack">
+                    <div className="cd-chosen">
+                      <span>
+                        Using {money(quote.creditAvailable)} of credit — they owe{' '}
+                        <strong className="mono">{money(quote.owedIfUsed)}</strong>. This property puts credit on
+                        the next bill, so it is not held for later.
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
               {creditChoiceNeeded(quote) && mode !== 'reader' && (
                 <div className="cd-credit">
                   {/* 10/6 (Nic): credit is mentioned only when they have it, and only
@@ -1012,7 +1097,7 @@ function ReaderLeaseBlock({ anchorId, label, readerId, done, live, othersBusy = 
     // longer open, so the read is refused (a stray "no longer open" beside
     // "Taken." when the block comes back after Cash → Card, or "Read it again").
     { staleTime: 0, cacheTime: 0, retry: false, keepPreviousData: true, refetchOnWindowFocus: !locked, enabled: !done })
-  const choiceBody = () => readerChoiceParams(shownCredit, choice, oldCommitted)
+  const choiceBody = () => readerChoiceParams(shownCredit, choice, oldCommitted, quote?.creditMustBeUsed === true)
   // Fix round 2: the figures on screen belong to the CURRENT answers only. While
   // the quote for a new Use / Save answer or a new old-balance amount is on its
   // way (the previous one is kept on screen meanwhile), or an old-balance amount
@@ -1239,7 +1324,17 @@ function ReaderLeaseBlock({ anchorId, label, readerId, done, live, othersBusy = 
         <Message msg={{ kind: 'error', text: serverMessage(quoteError, 'The total could not be worked out.') }} />
       ) : quote ? (<>
         <div className="cd-line"><span>Owed on this space</span><span className="mono">{money(quote.outstanding)}</span></div>
-        {toCents(firstQuoteCredit) > 0 && (
+        {/* 10/26 (Nic): "the platform needs to operate the same per setting, no
+            matter which angle you're coming in from" — the reader states where
+            the credit went, the same as the cash window. */}
+        {toCents(firstQuoteCredit) > 0 && quote.creditMustBeUsed === true ? (
+          <div className="cd-chosen">
+            <span>
+              Using {money(firstQuoteCredit)} of credit — this property puts credit on the next
+              bill, so it is not held for later.
+            </span>
+          </div>
+        ) : toCents(firstQuoteCredit) > 0 && (
           choice === null ? (
             <div className="cd-credit">
               <div className="cd-credit-head">Credit available <span className="mono">{money(firstQuoteCredit)}</span></div>

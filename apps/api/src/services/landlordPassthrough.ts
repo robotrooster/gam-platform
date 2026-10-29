@@ -36,11 +36,13 @@
  */
 
 import type { PoolClient } from 'pg'
+import type { PlatformTransferPurpose } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { createPmCompanyTransfer } from './stripeConnect'
-import { netAgainstDisbursement, markBalance } from './landlordGamAccount'
+import { netAgainstDisbursement, markBalance, gamAccountLockKey, recordGamChargeCollections, type GamChargeTake } from './landlordGamAccount'
 import { createAdminNotification } from './adminNotifications'
 import { logger } from '../lib/logger'
+import { isDefiniteStripeRefusal } from '../lib/stripeRefusal'
 import { lockHeldItems, stampHeldItems } from './heldPayouts'
 import { lockPayoutCut } from './payoutCut'
 
@@ -211,7 +213,7 @@ async function reservePlatformHeldBatch(
     await client.query('BEGIN')
     await client.query(
       `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
-      [`platform_held_reconcile:${landlordRow.landlord_id}`]
+      [gamAccountLockKey(landlordRow.landlord_id)]
     )
 
     // S648: lock and read the EXACT rows this batch pays, then stamp those ids.
@@ -290,8 +292,9 @@ async function reservePlatformHeldBatch(
     //
     // Unlike reversal netting this takes PARTIAL amounts — carrying a $20
     // remainder to next week is exactly what stops a bank debit happening.
+    const gamTakes: GamChargeTake[] = []
     const gamTaken = await netAgainstDisbursement(
-      client, landlordRow.landlord_id, Math.round((owed - netted) * 100) / 100)
+      client, landlordRow.landlord_id, Math.round((owed - netted) * 100) / 100, gamTakes)
 
     const transferAmount = Math.round((owed - netted - gamTaken) * 100) / 100
     const fullyNetted = transferAmount <= 0
@@ -321,6 +324,10 @@ async function reservePlatformHeldBatch(
       ]
     )
     const intentId = intentRow.rows[0].id
+    // 10/12 (Nic, ledger P0): what this batch kept back for each GAM charge,
+    // as a record against the batch — the books post each collection on its
+    // own day, and a charge can now be seen to have been collected once.
+    await recordGamChargeCollections(client, gamTakes, { platformTransferIntentId: intentId })
     // A fully-netted batch has no Stripe id; use a sentinel for the ledger + row.
     const sentinel = fullyNetted ? `netted:${intentId}` : `intent:${intentId}`
     if (fullyNetted) {
@@ -407,9 +414,32 @@ export async function executePlatformTransferIntent(intentId: string): Promise<s
     id: string; landlord_id: string | null; landlord_user_id: string | null; business_id: string | null
     destination_connect_account_id: string; amount: string
     netted_amount: string; status: string; attempts: number
+    purpose: PlatformTransferPurpose | null
   }>(`SELECT * FROM platform_transfer_intents WHERE id = $1`, [intentId])
   if (!intent) return null
   if (intent.status !== 'pending') return intent.status === 'transferred' ? 'already' : null
+  // 10/12 (ledger P0): a direct transfer (a move-out's deposit share, a store
+  // charge account's merchant share) is retried under ITS OWN key and with the
+  // exact request it was first sent with — never the batch's key, which would
+  // let Stripe make it a second time. Reached by RECOVER only when the process
+  // stopped between writing the record and hearing back from Stripe.
+  if (intent.purpose && intent.purpose !== 'payout') {
+    return sendDirectTransfer(intentId).catch(async (e) => {
+      logger.error({ err: e, intentId }, '[direct-transfer] retry failed')
+      // 10/12 (Nic, G4): a store charge account's merchant share that the
+      // automatic retry could not send is told to an admin, as every other
+      // merchant-transfer failure is (a move-out's deposit share raises its
+      // own notice inside sendDirectTransfer).
+      if (intent.purpose === 'flexcharge_merchant') {
+        const st = await queryOne<{ flexcharge_statement_id: string | null }>(
+          `SELECT flexcharge_statement_id FROM platform_transfer_intents WHERE id = $1`, [intentId]).catch(() => null)
+        const { flexChargeMerchantTransferFailed } = await import('./flexCharge')
+        await flexChargeMerchantTransferFailed(st?.flexcharge_statement_id ?? null, intent.landlord_id, e, 'recovery',
+          { intent_id: intentId, amount: intent.amount })
+      }
+      return null
+    })
+  }
 
   const amount = Math.round(parseFloat(intent.amount) * 100) / 100
   const netted = Math.round(parseFloat(intent.netted_amount) * 100) / 100
@@ -480,11 +510,18 @@ async function confirmIntent(intentId: string, transferId: string): Promise<void
       [intentId])).rows[0]?.destination_connect_account_id
     if (dest) await lockPayoutCut(client, dest)
     // Only advance a still-pending intent (concurrent execute/recover safe).
+    // 10/12 (Nic, ledger P0 review): a DIRECT transfer (not the batch) marked
+    // failed is advanced too when Stripe hands back a transfer id — Stripe's
+    // answer wins. A second caller under the same key, refused while the
+    // first was still in flight, could mark it failed after Stripe had made
+    // it; left failed, the payout could never link it ("not traced") and the
+    // move-out would read the landlord's share as never sent.
     const upd = await client.query(
       `UPDATE platform_transfer_intents
           SET status = 'transferred', stripe_transfer_id = $1,
               transferred_at = COALESCE(transferred_at, clock_timestamp()), updated_at = NOW()
-        WHERE id = $2 AND status = 'pending'
+        WHERE id = $2
+          AND (status = 'pending' OR (status = 'failed' AND purpose <> 'payout'))
         RETURNING id`,
       [transferId, intentId]
     )
@@ -508,6 +545,166 @@ async function confirmIntent(intentId: string, transferId: string): Promise<void
   } finally {
     client.release()
   }
+}
+
+/**
+ * 10/12 (Nic, ledger P0, design M0b) — a transfer to a landlord's Stripe
+ * account that is not the weekly batch: the landlord's share of a GAM-held
+ * deposit at move-out (services/depositReturn), a store charge account's
+ * merchant share (services/flexCharge, flexpay, routes/webhooks).
+ *
+ * These called Stripe and wrote nothing: a success left no record a payout
+ * could list (the payout showed the money as "not traced"), and a failure
+ * left only an admin notice. Now, the same three steps as the batch (S580):
+ *
+ *   RECORD  — a platform_transfer_intents row (status pending, its purpose,
+ *             what it pays, its idempotency key and the exact request),
+ *             written BEFORE Stripe is asked;
+ *   EXECUTE — the transfer under that key (a retry, or a second caller with
+ *             the same key, can never pay twice);
+ *   CONFIRM — transferred, with Stripe's id, dated under the payout cut lock
+ *             like any other transfer, so stampPayoutTransfers links it to the
+ *             payout that carries it to the bank.
+ *
+ * A refusal marks the record 'failed' (RECOVER does not retry it: a person
+ * decides, as before) and is thrown so the caller says what it always said.
+ * Returns the Stripe transfer id — or null when Stripe's answer is not known
+ * (10/12 review: a timeout, a dropped connection, Stripe's own error, or the
+ * 409 a second caller gets while the first is in flight under the same key).
+ * Then the record stays pending and RECOVER asks again under the same key,
+ * which hands back the transfer if it was made and makes it once if not; it
+ * is never marked failed and no "not sent" notice is raised for it.
+ */
+export interface RecordedDirectTransfer {
+  purpose: Exclude<PlatformTransferPurpose, 'payout'>
+  /** The company paid. A merchant transfer may leave it out: read from the statement. */
+  landlordId?: string | null
+  destinationConnectAccountId: string
+  amount: number
+  idempotencyKey: string
+  depositReturnId?: string | null
+  flexchargeStatementId?: string | null
+  description: string
+  metadata: Record<string, string>
+}
+
+export async function fireRecordedDirectTransfer(t: RecordedDirectTransfer): Promise<{ intentId: string; transferId: string | null }> {
+  const amount = Math.round(t.amount * 100) / 100
+  if (!(amount > 0)) throw new Error(`A ${t.purpose} transfer must move more than nothing (${t.amount})`)
+  const landlordId = t.landlordId ?? (t.flexchargeStatementId
+    ? (await queryOne<{ landlord_id: string }>(
+        `SELECT a.landlord_id FROM flex_charge_statements s
+           JOIN flex_charge_accounts a ON a.id = s.account_id
+          WHERE s.id = $1`, [t.flexchargeStatementId]))?.landlord_id
+    : null)
+  if (!landlordId) throw new Error(`No company to record a ${t.purpose} transfer against (${t.idempotencyKey})`)
+
+  const ins = await queryOne<{ id: string }>(
+    `INSERT INTO platform_transfer_intents
+       (landlord_id, landlord_user_id, destination_connect_account_id, amount, gross_owed, netted_amount,
+        status, purpose, deposit_return_id, flexcharge_statement_id, stripe_idempotency_key, stripe_request)
+     SELECT l.id, l.user_id, $2, $3, $3, 0, 'pending', $4, $5, $6, $7, $8::jsonb
+       FROM landlords l WHERE l.id = $1
+     ON CONFLICT (stripe_idempotency_key) WHERE stripe_idempotency_key IS NOT NULL DO NOTHING
+     RETURNING id`,
+    [landlordId, t.destinationConnectAccountId, amount.toFixed(2), t.purpose,
+     t.depositReturnId ?? null, t.flexchargeStatementId ?? null, t.idempotencyKey,
+     JSON.stringify({ description: t.description, metadata: t.metadata })])
+  // Already recorded under this key (a second caller, or a retry): the same
+  // transfer, never a second one.
+  const intentId = ins?.id ?? (await queryOne<{ id: string }>(
+    `SELECT id FROM platform_transfer_intents WHERE stripe_idempotency_key = $1`, [t.idempotencyKey]))?.id
+  if (!intentId) throw new Error(`Company ${landlordId} not found for a ${t.purpose} transfer`)
+  return { intentId, transferId: await sendDirectTransfer(intentId) }
+}
+
+/** EXECUTE + CONFIRM for a recorded direct transfer (see fireRecordedDirectTransfer). */
+async function sendDirectTransfer(intentId: string): Promise<string | null> {
+  const i = await queryOne<{
+    id: string; status: string; purpose: PlatformTransferPurpose; amount: string
+    destination_connect_account_id: string; stripe_transfer_id: string | null
+    stripe_idempotency_key: string; stripe_request: { description: string; metadata: Record<string, string> }
+    deposit_return_id: string | null; flexcharge_statement_id: string | null
+  }>(
+    `SELECT id, status, purpose, amount::text AS amount, destination_connect_account_id,
+            stripe_transfer_id, stripe_idempotency_key, stripe_request,
+            deposit_return_id, flexcharge_statement_id
+       FROM platform_transfer_intents WHERE id = $1`, [intentId])
+  if (!i) throw new Error(`Transfer record ${intentId} not found`)
+  if (i.status === 'transferred' && i.stripe_transfer_id) return i.stripe_transfer_id
+  // Trying again after a refusal: it is pending again until Stripe answers.
+  if (i.status === 'failed') {
+    await query(`UPDATE platform_transfer_intents SET status = 'pending', updated_at = NOW() WHERE id = $1 AND status = 'failed'`, [intentId])
+  }
+  const amount = Math.round(parseFloat(i.amount) * 100) / 100
+
+  let transferId: string
+  try {
+    // The same request each caller made itself before 10/12, under its key.
+    const { getStripe } = await import('../lib/stripe')
+    const transfer = await getStripe().transfers.create(
+      {
+        amount:      Math.round(amount * 100),
+        currency:    'usd',
+        destination: i.destination_connect_account_id,
+        description: i.stripe_request.description,
+        metadata:    i.stripe_request.metadata,
+      },
+      { idempotencyKey: i.stripe_idempotency_key },
+    )
+    transferId = transfer.id
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    // 10/12 (Nic, ledger P0 review): only a definite refusal is a failure.
+    // Stripe may have made a transfer it answered with a timeout, its own
+    // error, or a 409 for a second caller under the same key — marking that
+    // 'failed' left money paid with a record that says it was not. Unknown:
+    // the record stays pending with the error, and RECOVER asks again under
+    // the same key (lib/stripeRefusal).
+    if (!isDefiniteStripeRefusal(e)) {
+      await query(
+        `UPDATE platform_transfer_intents
+            SET attempts = attempts + 1, last_error = $2, updated_at = NOW()
+          WHERE id = $1 AND status = 'pending'`,
+        [intentId, msg.slice(0, 1000)])
+      logger.warn({ err: e, intentId, purpose: i.purpose },
+        '[direct-transfer] Stripe\'s answer is unknown — left pending; RECOVER asks again under the same key')
+      return null
+    }
+    const marked = await queryOne<{ id: string }>(
+      `UPDATE platform_transfer_intents
+          SET status = 'failed', attempts = attempts + 1, last_error = $2, updated_at = NOW()
+        WHERE id = $1 AND status = 'pending'
+        RETURNING id`,
+      [intentId, msg.slice(0, 1000)])
+    if (!marked) {
+      // Another caller under the same key already confirmed it: Stripe's
+      // transfer stands, and nothing failed.
+      const done = await queryOne<{ stripe_transfer_id: string | null }>(
+        `SELECT stripe_transfer_id FROM platform_transfer_intents WHERE id = $1 AND status = 'transferred'`, [intentId])
+      if (done?.stripe_transfer_id) return done.stripe_transfer_id
+    }
+    if (i.purpose === 'deposit_settlement') {
+      // The notice the move-out always raised (paymentReversal reads it to
+      // know the landlord was never paid this share), now from here so a
+      // retry that fails says it too.
+      const dr = await queryOne<{ lease_id: string | null }>(
+        `SELECT lease_id FROM deposit_returns WHERE id = $1`, [i.deposit_return_id])
+      await createAdminNotification({
+        severity: 'warn',
+        category: 'deposit_disbursement_transfer_failed',
+        title:    `Deposit disbursement Transfer failed — return ${i.deposit_return_id}`,
+        body:     `Stripe Transfer for $${amount.toFixed(2)} to landlord Connect ${i.destination_connect_account_id} failed: ${msg}.`,
+        context:  { deposit_return_id: i.deposit_return_id, lease_id: dr?.lease_id ?? null, amount,
+                    connect_account: i.destination_connect_account_id, intent_id: intentId },
+      }).catch((err) => logger.error({ err, intentId }, '[direct-transfer] could not raise the failure notice'))
+    }
+    throw e
+  }
+  // Outside the try: Stripe has made the transfer. A database error here
+  // leaves the record pending, and RECOVER confirms it under the same key.
+  await confirmIntent(intentId, transferId)
+  return transferId
 }
 
 /**

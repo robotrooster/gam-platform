@@ -124,7 +124,9 @@ documentsRouter.get('/photo-targets', requirePerm('documents.upload', 'documents
          JOIN tenants t ON t.id = lt.tenant_id
          JOIN users us ON us.id = t.user_id
         WHERE u.property_id = $1 AND l.status IN ('active','pending')
-        ORDER BY NULLIF(regexp_replace(u.unit_number, '\\D', '', 'g'), '')::int NULLS LAST, u.unit_number, lt.role`, [propertyId])
+        -- 10/15 (Nic): number order comes from the column's collation now;
+        -- pulling the digits out read 'MH 3.5' as 35 and put it after MH 26.
+        ORDER BY u.unit_number, lt.role`, [propertyId])
     res.json({ success: true, data: { properties: [], residents } })
   } catch (e) { next(e) }
 })

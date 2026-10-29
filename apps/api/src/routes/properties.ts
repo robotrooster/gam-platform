@@ -14,6 +14,7 @@ import { openOnboardingWindow, getOnboardingWindow, closeOnboardingWindow, scree
 import { draftLeaseFromApplication } from '../services/applicationLeaseDraft'
 import { loadSubtype, setSubtypeUnits } from '../services/unitSubtype'
 import { AppError } from '../middleware/errorHandler'
+import { portalLink } from '../lib/portalUrls'
 import { landlordScopeIds, isEntityMember, resolveLandlordTarget, landlordIdForProperty, ownsLandlord } from '../lib/landlordScope'
 import { MAINTENANCE_CATEGORIES,
   FEE_PAYER_VALUES,
@@ -31,6 +32,7 @@ import { MAINTENANCE_CATEGORIES,
   CARD_FEE_PAYERS,
   PROCESSING_FEE_CHOICES,
   type ProcessingFeeChoice,
+  MAX_RIG_LENGTH_FT,
 } from '@gam/shared'
 import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
@@ -38,6 +40,12 @@ import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 import { checkAgainstStatute, checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { resolveLeaseSigner } from '../services/leaseSigner'
 import { initiateTransfer, confirmTransfer, declineTransfer, listIncomingTransfers } from '../services/propertyTransfer'
+// 10/18 (Nic): the two departure answers. services/departureRules is the one
+// place that knows whether migration 20261020120000 has landed on this
+// database yet — an UPDATE naming a column that is not there raises 42703 as
+// Postgres plans it, and inside the property-creation transaction that took
+// the whole property down with it.
+import { departureRulesStored, DEPARTURE_RULES_NOT_STORED_YET } from '../services/departureRules'
 
 export const propertiesRouter = Router()
 export const publicPropertiesRouter = Router()
@@ -112,6 +120,13 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
       // 10/5: where residents' and guests' replies go (services/replyRouting).
       // Optional — until set, replies go to whoever runs the property.
       officeEmail: z.string().trim().toLowerCase().email().max(200).nullable().optional().or(z.literal('')),
+      // 10/18 (Nic): the two departure answers, asked in the onboarding form
+      // with every other property choice. Optional, and written only when the
+      // caller actually answered, so the column defaults (money back, and
+      // proration — what every property does today) stand for anything that
+      // creates a property without asking.
+      refundsEarlyDeparture: z.boolean().optional(),
+      proratesMidMonth: z.boolean().optional(),
       // 16a: allocation rule required on every property creation.
       // S116: three independent fee toggles replace bankingFeePayer.
       // Legacy callers passing bankingFeePayer auto-mirror into ACH+card.
@@ -282,6 +297,40 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     if (body.officeEmail) {
       await client.query(`UPDATE properties SET office_email = $2 WHERE id = $1`, [prop.id, body.officeEmail])
       prop.office_email = body.officeEmail
+    }
+    // 10/18 (Nic): the departure answers from the onboarding form. Written
+    // only when they were given — an unanswered property keeps the column
+    // defaults, so nothing that creates a property without asking changes.
+    //
+    // 10/19 (review): and only when the columns are THERE. The form now sends
+    // both answers in every body, so this ran on every property creation; on a
+    // database the migration has not reached, the UPDATE raised 42703 inside
+    // this transaction, the catch below rolled the whole thing back, and a
+    // landlord pressing Next on step 2 of onboarding got a 500 and no property.
+    // A property matters more than an answer that is still at its default
+    // either way, so the property is created and the answer is simply not
+    // claimed: `prop` carries what is actually in effect (money back, and
+    // proration), which is what the card will show, so the landlord can answer
+    // again and see it stick.
+    if (body.refundsEarlyDeparture !== undefined || body.proratesMidMonth !== undefined) {
+      if (await departureRulesStored(client)) {
+        const set = await client.query<any>(
+          `UPDATE properties
+              SET early_departure_refunds = COALESCE($2, early_departure_refunds),
+                  prorates_mid_month_rent = COALESCE($3, prorates_mid_month_rent)
+            WHERE id = $1
+            RETURNING early_departure_refunds, prorates_mid_month_rent`,
+          [prop.id, body.refundsEarlyDeparture ?? null, body.proratesMidMonth ?? null])
+        prop.early_departure_refunds = set.rows[0].early_departure_refunds
+        prop.prorates_mid_month_rent = set.rows[0].prorates_mid_month_rent
+      } else {
+        prop.early_departure_refunds = true
+        prop.prorates_mid_month_rent = true
+        logger.warn({ propertyId: prop.id, refundsEarlyDeparture: body.refundsEarlyDeparture,
+                      proratesMidMonth: body.proratesMidMonth },
+          '[properties] the departure answers were given at creation but 20261020120000 is not applied yet — '
+          + 'the property is created and behaves as money back + proration until it is')
+      }
     }
 
     // S579: open the property's onboarding window. While it's open the landlord
@@ -535,6 +584,12 @@ propertiesRouter.post('/applications/:id/onboard', requirePerm('tenants.create')
 // never expires — so a code on a laminated sign at the office does not
 // silently go dead. Revoking access means clearing the slug, the same
 // switch that takes the booking site down.
+/** The one URL the apply QR encodes — printed, shown on a screen, or sent. */
+function applyLinkUrl(prop: { id: string; landlord_id: string }): string {
+  const qs = new URLSearchParams({ landlordId: prop.landlord_id, propertyId: prop.id })
+  return portalLink('tenant', `background-check?${qs.toString()}`)
+}
+
 propertiesRouter.get('/:id/apply-link', requirePerm('units.edit', 'units.view_status'), async (req, res, next) => {
   try {
     const prop = await queryOne<{ id: string; name: string; landlord_id: string; booking_slug: string | null }>(
@@ -560,14 +615,55 @@ propertiesRouter.get('/:id/apply-link', requirePerm('units.edit', 'units.view_st
     // So the code encodes the screening page itself, with the property and
     // landlord carried in the query string. The applicant scans and is in the
     // flow; the binding rides along without them entering anything for it.
-    const tenantApp = process.env.TENANT_APP_URL || 'http://localhost:3002'
-    const url = `${tenantApp}/background-check`
-      + `?landlordId=${prop.landlord_id}&propertyId=${prop.id}`
+    // 10/21: through portalUrls like every other link GAM sends. This one is
+    // PRINTED and stuck on a front desk, so a missing variable would be a
+    // localhost QR on a counter with nobody able to tell from looking at it.
+    const url = applyLinkUrl(prop)
     const QRCode = (await import('qrcode')).default
     const qrDataUrl = await QRCode.toDataURL(url, { margin: 1, width: 320 })
     res.json({ success: true, data: { url, qrDataUrl, propertyName: prop.name } })
   } catch (e) { next(e) }
 })
+
+// POST /:id/apply-link/send — the same link, emailed.
+//
+// 10/21 (Nic): "Somebody pays for a background check in person. The only way to
+// get there is to book 22 nights or more... they have to pay not only for the
+// check, but the whole 22 nights just to do the check. And then what happens if
+// the landlord denies them?... for people that just legitimately want to move
+// in, they need to be able to just do the background check first and see if
+// they're going to be approved."
+//
+// The QR on the desk already does this for anyone standing in front of it —
+// they scan, they pay GAM themselves, nobody fronts anything. This is the same
+// link for the person who rang instead of walked in. It is deliberately NOT a
+// second link: both come out of applyLinkUrl, so what is sent and what is
+// printed can never drift apart.
+propertiesRouter.post('/:id/apply-link/send', requirePerm('units.edit', 'units.view_status'), async (req, res, next) => {
+  try {
+    const prop = await queryOne<{ id: string; name: string; landlord_id: string; booking_slug: string | null; state: string | null }>(
+      `SELECT id, name, landlord_id, booking_slug, state FROM properties WHERE id = $1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (!prop.booking_slug) {
+      throw new AppError(409, `${prop.name} has no booking address yet, so there is no application link to send. `
+        + 'Set one under the property\'s booking settings, then press Send again.')
+    }
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new AppError(400, 'That does not look like an email address — check it and press Send again.')
+    }
+    const { screeningIntakeFee } = await import('./background')
+    const { emailStartScreening } = await import('../services/email')
+    const fee = await screeningIntakeFee(prop.state ?? null)
+    await emailStartScreening(email, {
+      name: typeof req.body?.name === 'string' ? req.body.name.trim() : null,
+      propertyName: prop.name, url: applyLinkUrl(prop), price: fee.total,
+    }, { landlordId: prop.landlord_id })
+    res.json({ success: true, data: { sentTo: email, price: fee.total } })
+  } catch (e) { next(e) }
+})
+
 
 propertiesRouter.get('/:id', async (req, res, next) => {
   try {
@@ -692,6 +788,12 @@ const unitSubtypeSchema = z.object({
   // S550: subtype-level dwelling ownership (rv_spot / mobile_home only) —
   // "MH Lot" mints tenant-owned units, "Park Model Rental" mints park-owned.
   dwellingOwnership: z.enum(['landlord', 'tenant']).nullable().optional(),
+  // 10/24 (Nic): the longest rig this CLASS of pad takes, in feet. A park with
+  // "Big rig pull-through" and "Back-in compact" states 45 and 28 once here
+  // instead of on 100 sites one at a time; a unit created from the class
+  // inherits it exactly the way it inherits the layout and the amps, and the
+  // unit owns it from that moment (moving one pad's limit never moves another's).
+  rvMaxRigLengthFt: z.number().int().positive().max(MAX_RIG_LENGTH_FT).nullable().optional(),
 })
 
 // POST /api/properties/:id/unit-subtypes — create (or update via id) one
@@ -718,6 +820,9 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
       body.rentAmount ?? null, body.securityDeposit ?? null,
       body.nightlyRate ?? null, body.weeklyRate ?? null, body.monthlyRate ?? null,
       ownershipRelevant ? body.dwellingOwnership ?? null : null,
+      // Only an RV pad has a rig limit; a type switch must not leave a stale
+      // "45 ft" on what is now an apartment class.
+      isRv ? body.rvMaxRigLengthFt ?? null : null,
     ]
 
     // S613 (Nic, DATA LOSS): a create whose name already existed used to
@@ -733,7 +838,8 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
     // picker are unusable. So the collision is refused out loud, naming what
     // already exists and what it holds, instead of being resolved by deletion.
     const clash = await queryOne<any>(
-      `SELECT id, name, rv_site_layout, rv_amp_service, bedrooms, bathrooms, storage_size
+      `SELECT id, name, rv_site_layout, rv_amp_service, rv_max_rig_length_ft,
+              bedrooms, bathrooms, storage_size
          FROM property_unit_subtypes
         WHERE property_id=$1 AND unit_type=$2 AND lower(btrim(name))=lower(btrim($3))
           AND ($4::uuid IS NULL OR id <> $4)`,
@@ -746,6 +852,9 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
           ? (clash.rv_site_layout === 'pull_through' ? 'pull-through' : 'back-in') : null,
         clash.rv_amp_service && clash.rv_amp_service !== 'none'
           ? (clash.rv_amp_service === 'both' ? '30/50 amp' : `${clash.rv_amp_service} amp`) : null,
+        // 10/24: "up to 45 ft" among the facts, so the refusal tells the
+        // landlord which of two same-named classes they are looking at.
+        clash.rv_max_rig_length_ft ? `up to ${clash.rv_max_rig_length_ft} ft` : null,
         clash.storage_size || null,
       ].filter(Boolean).join(', ')
       throw new AppError(409,
@@ -762,8 +871,8 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
            unit_type=$2, name=$3, bedrooms=$4, bathrooms=$5, rv_site_layout=$6,
            rv_amp_service=$7, storage_size=$8, rent_amount=$9, security_deposit=$10,
            nightly_rate=$11, weekly_rate=$12, monthly_rate=$13,
-           dwelling_ownership=$14, updated_at=NOW()
-         WHERE id=$15 AND property_id=$1
+           dwelling_ownership=$14, rv_max_rig_length_ft=$15, updated_at=NOW()
+         WHERE id=$16 AND property_id=$1
          RETURNING *`,
         [...vals, body.id],
       )
@@ -773,8 +882,9 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
         `INSERT INTO property_unit_subtypes
            (property_id, unit_type, name, bedrooms, bathrooms, rv_site_layout,
             rv_amp_service, storage_size, rent_amount, security_deposit,
-            nightly_rate, weekly_rate, monthly_rate, dwelling_ownership)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            nightly_rate, weekly_rate, monthly_rate, dwelling_ownership,
+            rv_max_rig_length_ft)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
          RETURNING *`,
         vals,
       )
@@ -1163,6 +1273,50 @@ propertiesRouter.patch('/:id/move-in-collection', requirePerm('properties.edit')
   } catch (e) { next(e) }
 })
 
+// PATCH /api/properties/:id/departure-rules — 10/18 (Nic): "refunds are pro
+// rated to the next price down ... if the landlord does refunds at all at that
+// property. the only way it is different is for longer term people for rent pro
+// ration. moving in or out at the middle of a month and also only if the
+// landlord allows the pro rate. these should all be property level settings."
+//
+// Two answers, each sent on its own as the landlord gives it (the card saves one
+// at a time), so a body naming neither is a mistake worth refusing rather than a
+// silent no-op. Both default TRUE in the database — what every property did
+// before the columns existed — so an unanswered property keeps behaving as it
+// does today. Takes effect from the next check-out; a refund already sent, and
+// a month already billed, are history and are not revisited.
+propertiesRouter.patch('/:id/departure-rules', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      refundsEarlyDeparture: z.boolean().optional(),
+      proratesMidMonth: z.boolean().optional(),
+    }).refine(b => b.refundsEarlyDeparture !== undefined || b.proratesMidMonth !== undefined,
+      'Say whether this property gives money back when someone leaves early, or whether it prorates a mid-month move')
+      .parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/19 (review): on a database 20261020120000 has not reached, this UPDATE
+    // cannot run at all (42703 as Postgres plans it). The landlord is told so
+    // in plain words rather than shown "Could not save that answer" over a
+    // 500 — or, worse, a 200 for an answer that was never kept.
+    if (!(await departureRulesStored())) throw new AppError(503, DEPARTURE_RULES_NOT_STORED_YET)
+    const row = await queryOne<{ early_departure_refunds: boolean; prorates_mid_month_rent: boolean }>(
+      `UPDATE properties
+          SET early_departure_refunds = COALESCE($2, early_departure_refunds),
+              prorates_mid_month_rent = COALESCE($3, prorates_mid_month_rent),
+              updated_at = NOW()
+        WHERE id = $1
+        RETURNING early_departure_refunds, prorates_mid_month_rent`,
+      [req.params.id, body.refundsEarlyDeparture ?? null, body.proratesMidMonth ?? null])
+    res.json({ success: true, data: {
+      propertyId: req.params.id,
+      earlyDepartureRefunds: row!.early_departure_refunds,
+      proratesMidMonthRent: row!.prorates_mid_month_rent,
+    } })
+  } catch (e) { next(e) }
+})
+
 // PATCH /api/properties/:id/processing-fee-payers — 10/5 (Nic): "The only
 // thing the landlord chooses is if they absorb the cost or if they pass it
 // through ... they cannot absorb it for some people and pass it through to
@@ -1230,6 +1384,28 @@ propertiesRouter.patch('/:id/office-email', requirePerm('properties.edit'), asyn
       `UPDATE properties SET office_email = $2, updated_at = NOW() WHERE id = $1 RETURNING office_email`,
       [req.params.id, officeEmail])
     res.json({ success: true, data: { propertyId: req.params.id, officeEmail: row!.office_email } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/paper-bills — 10/27 (Nic). Does this property hand
+// deliver paper bills?
+//
+//   "It's a setting on the landlord page, a property level setting. Do you want
+//    to print paper copies of the bills when these are generated?"
+//
+// Per PROPERTY, not per resident: a park that delivers to doors delivers to all
+// of them, and asking each resident was the clunky version he rejected (the
+// tenants.prefers_paper_bill column from 10/26 is unused and says so).
+propertiesRouter.patch('/:id/paper-bills', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { paperBills } = z.object({ paperBills: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, req.params.id)
+    await query(`UPDATE properties SET print_all_bills = $2, updated_at = NOW() WHERE id = $1`,
+      [req.params.id, paperBills])
+    res.json({ success: true, data: { propertyId: req.params.id, paperBills } })
   } catch (e) { next(e) }
 })
 
@@ -1301,6 +1477,26 @@ propertiesRouter.patch('/:id/tenants-deposit-at-bank', requirePerm('properties.e
     await query(`UPDATE properties SET tenants_deposit_at_bank = $2, updated_at = NOW() WHERE id = $1`,
       [req.params.id, allowed])
     res.json({ success: true, data: { propertyId: req.params.id, tenantsDepositAtBank: allowed } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/accepts-checks — 10/23 (Nic): "we need to add a
+// button to record check payments. That also needs to be turned on or off if a
+// property chooses to accept checks. A lot of places don't accept them."
+//
+// One answer per property, defaulting to Yes (migration 20261024030000). The
+// register reads it to decide whether to show the Check button, and the sale
+// route reads it again to refuse a check regardless — a hidden button is a
+// courtesy, not a rule.
+propertiesRouter.patch('/:id/accepts-checks', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const { accepted } = z.object({ accepted: z.boolean() }).parse(req.body)
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(`UPDATE properties SET accepts_checks = $2, updated_at = NOW() WHERE id = $1`,
+      [req.params.id, accepted])
+    res.json({ success: true, data: { propertyId: req.params.id, acceptsChecks: accepted } })
   } catch (e) { next(e) }
 })
 
@@ -1669,6 +1865,16 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
           operator_owns_land      = COALESCE($17, operator_owns_land),
           lease_signing_email = CASE WHEN $18::boolean THEN $19 ELSE lease_signing_email END,
           lease_signing_name  = CASE WHEN $20::boolean THEN $21 ELSE lease_signing_name  END,
+          -- 10/25 (Nic): "Let landlords choose how it gets bundled." TRUE
+          -- (default) gives an installment (home/trailer) payment its own bill,
+          -- paid separately from the space rent; FALSE puts it on the rent bill.
+          home_payments_own_bill = COALESCE($23, home_payments_own_bill),
+          -- 10/26 (Nic): whether a tenant may keep account credit instead of
+          -- putting it on the bill they are paying. FALSE and the pay screen
+          -- never offers "Save it for later". Credit already lands on an open
+          -- balance by itself everywhere (10/15); this is only the payer's
+          -- option to hold it back.
+          credit_save_up_allowed = COALESCE($24, credit_save_up_allowed),
           updated_at  = NOW()
         WHERE id=$15 RETURNING *`,
         [name||null, street1||null, street2||null, city||null, state||null,
@@ -1688,7 +1894,13 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
          // purpose clears it; COALESCE could never clear a wrong suite line.
          // Not sent = left alone. storedAddressOf above reads it the same way,
          // so the duplicate check and the audit row see what is stored.
-         raw.street2 !== undefined]
+         raw.street2 !== undefined,
+         // $23 and after come AFTER $22, the street2-was-sent flag above. A new
+         // setting appends here; it never takes a number already in use, which
+         // would silently swap two columns' values.
+         typeof raw.homePaymentsOwnBill === 'boolean' ? raw.homePaymentsOwnBill : null,
+         // $24
+         typeof raw.creditSaveUpAllowed === 'boolean' ? raw.creditSaveUpAllowed : null]
       )).rows[0]
       // S649: a property that moved states is due in the new state's timezone.
       if (addressChangedState) {

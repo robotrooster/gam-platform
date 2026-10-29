@@ -23,28 +23,40 @@ import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 export const getWorkTradeStatus: AgentTool = {
   name: 'get_work_trade_status',
   description:
-    'All active work-trade agreements for this landlord: each tenant\'s hours target, hours worked ' +
-    'this month, hours carried over from earlier months, what they would owe in cash if the hours ' +
-    'are never worked, and whether catching up is still realistic. Use for "who is behind on their ' +
-    'work trade?", "how is everyone doing on hours?", "is anyone never going to catch up?". Read-only.',
+    'Every live work-trade agreement for this landlord, running or paused: each tenant\'s hours ' +
+    'target, hours worked this month, hours carried over from earlier months, what they would owe ' +
+    'in cash if the hours are never worked, and whether catching up is still realistic. A paused ' +
+    'row says whether its hours are still counting — a paused trade whose space is still being ' +
+    'used keeps counting, and one whose space is empty asks for nothing. Use for "who is behind on ' +
+    'their work trade?", "how is everyone doing on hours?", "is anyone never going to catch up?". ' +
+    'Read-only.',
   parameters: { type: 'object', properties: {} },
   audiences: ['landlord'],
   async execute(_args, actor: AgentActor) {
+    const { liveTenancySql } = await import('../../workTradeStanding')
     const rows = await query<any>(
       `SELECT wta.id, wta.monthly_hours_target, wta.carry_forward_months,
               wta.banked_hours::float AS banked_hours,
+              wta.status,
               u.unit_number,
               TRIM(COALESCE(usr.first_name,'') || ' ' || COALESCE(usr.last_name,'')) AS tenant_name
          FROM work_trade_agreements wta
          JOIN units u ON u.id = wta.unit_id
          JOIN tenants t ON t.id = wta.tenant_id
          JOIN users usr ON usr.id = t.user_id
-        WHERE wta.landlord_id = ANY($1::uuid[]) AND wta.status = 'active'
+        WHERE wta.landlord_id = ANY($1::uuid[]) AND wta.status IN ('active','paused')
+          -- 10/19 (review): a PAUSED row only while the tenancy is still there.
+          -- A lease ending with no successor pauses the trade and nothing ever
+          -- ends it, so without this the landlord's assistant reads out a space
+          -- nobody lives on as a live agreement with hours counting. Same gate
+          -- as the tenant's side (liveTenancySql) — the two sides of a trade
+          -- reading different rosters is what this subsystem exists to prevent.
+          AND ${liveTenancySql()}
         ORDER BY u.unit_number`,
       [actorLandlordIds(actor)])
 
     if (rows.length === 0) {
-      return { ok: true, count: 0, note: 'No active work-trade agreements.' }
+      return { ok: true, count: 0, note: 'No live work-trade agreements.' }
     }
 
     const agreements = await Promise.all(rows.map(async (r: any) => {
@@ -52,7 +64,14 @@ export const getWorkTradeStatus: AgentTool = {
       return {
         tenant: r.tenant_name || 'Tenant',
         unit: r.unit_number,
-        monthlyHoursTarget: Number(r.monthly_hours_target),
+        // 10/19 (Nic, "Show it while paused"): the tenant's own tool and portal
+        // now show a paused agreement, so this one shows it too — a landlord
+        // and their tenant reading different stories about the same space is
+        // the argument this subsystem exists to prevent. The target follows the
+        // same rule as the tenant's: none while nobody is counting.
+        paused: s?.paused ?? (r.status === 'paused'),
+        hoursBeingCounted: s?.hoursCounted ?? true,
+        monthlyHoursTarget: s && !s.hoursCounted ? 0 : Number(r.monthly_hours_target),
         graceMonths: Number(r.carry_forward_months),
         hoursThisMonth: s?.currentMonthHours ?? null,
         hoursCarriedOver: s?.carriedHours ?? 0,

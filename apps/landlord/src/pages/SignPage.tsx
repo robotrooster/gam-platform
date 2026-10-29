@@ -4,11 +4,17 @@ import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
 import { LEASE_COLUMN_CATEGORY, humanize, unlockScrollIfStandalone, isoToDocumentDate, documentDateToIso,
   FEE_TYPES, FEE_TYPE_META, moveInDepositMirror, moveInTotalDue, moneyBoxValue, prorateMoveInRent,
-  leaseDueDay, dueDayLabel, parseDueDay, renewalSchedule, renewalBillingSummary, dayBefore, defaultMoneyKind,
-  type FeeType } from '@gam/shared'
+  leaseDueDay, dueDayLabel, parseDueDay, nextDueDateAfter, renewalSchedule, renewalBillingSummary, dayBefore,
+  defaultMoneyKind, type FeeType } from '@gam/shared'
 import { toast } from '../components/dialogs'
 import { loadPdfjs } from '../lib/pdfjs'
-import { TypedDateInput } from '../components/TypedDateInput'
+// 10/19 (Nic): a lease date is CLICKED, never typed — so this page's three
+// typed date boxes are gone. The tenant page keeps typed boxes, because its one
+// typed date is a birthdate and nobody scrolls a calendar back forty years; it
+// has its own copy at apps/tenant/src/components/TypedDateInput.tsx. The
+// landlord copy was left behind by this change with nothing importing it, and
+// was deleted rather than left looking like the one the tenant page uses.
+import { LeaseDateCalendar } from '../components/LeaseDateCalendar'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const tok = () => localStorage.getItem('gam_token')
@@ -286,6 +292,114 @@ function fitFontSize(text: string, boxW: number, boxH: number): number {
 const isDateSignedField = (f: any) =>
   f.leaseColumn === 'date_signed' || (!f.leaseColumn && /date\s*signed|signed\s*date/i.test(f.label || ''))
 
+/**
+ * 10/19 (Nic): the prorated-rent line is DERIVED — "that one does not need to
+ * be typable." Clicking it opens the explainer below instead of an editor.
+ */
+const isProrationBox = (f: any) => f?.leaseColumn === 'move_in_proration'
+
+const monthAndDay = (iso: string) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || '')
+  if (!m) return iso
+  const names = ['January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December']
+  return `${names[Number(m[2]) - 1]} ${Number(m[3])}`
+}
+const usd = (n: number) => '$' + (Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+
+/**
+ * Why the prorated-rent line says what it says, in plain words — and what to
+ * change when it looks wrong.
+ *
+ * Nic, on the same call: "eventually I'd like to be able to trust somebody else
+ * to fill out leases. And so we need it to handhold as much as possible." A
+ * locked box with a number in it and nothing to click is how a clerk decides
+ * the number is wrong and goes looking for someone.
+ *
+ * `words` is where the figure came from. `lever` is what moves it, and the two
+ * come out of the SAME branch for a reason: the start date is the lever in only
+ * three of the six cases. On a renewal, for a resident recorded as already
+ * living here, and at a park that bills a whole month as a whole month, the
+ * figure does not follow the start date at all — and those are exactly the
+ * three a clerk is most likely to question. Telling them to fix the start date
+ * there sends them changing dates on somebody's lease until they give up.
+ *
+ * The MONEY is never recomputed here — it is the figure already on the page,
+ * which came from shared prorateMoveInRent. Only the day count is worked out,
+ * the same way that function works it out, so the sentence matches the math.
+ */
+const START_DATE_LEVER = 'It follows the lease start date, the rent and the day rent is due, and moves the '
+  + 'moment any of them changes. If the amount looks wrong, the start date is what to fix.'
+
+export function prorationExplainer(opts: {
+  figure: string
+  startIso: string | null
+  rent: number
+  dueDay: number
+  prorates: boolean
+  moveInDay: boolean
+  renewal: boolean
+  existingTenancy: boolean
+  propertyName?: string | null
+}): { words: string; lever: string } {
+  const park = opts.propertyName || 'This property'
+  if (opts.renewal) {
+    return {
+      words: 'A new lease for a household already living here bills no rent on this page — their rent carries on, '
+        + `on the household's own due dates. ${usd(0)}.`,
+      lever: 'The start date does not move it: a renewal bills no rent on this page at all. Their rent carries on '
+        + 'where it is, and the nightly run bills it on their own due dates.',
+    }
+  }
+  if (opts.existingTenancy) {
+    return {
+      words: 'This resident already lives here, so there is no move-in to prorate — their move-in charges were '
+        + `settled long ago. ${usd(0)}.`,
+      lever: 'The start date does not move it. It is $0.00 because this lease records somebody who already lives '
+        + 'here, and that answer was set on their invite — not on this page.',
+    }
+  }
+  if (!opts.startIso) {
+    return { words: 'Pick the lease start date and this figure fills itself in from it.', lever: START_DATE_LEVER }
+  }
+  if (opts.moveInDay) {
+    return {
+      words: `${park} bills rent on each tenant's move-in day, so their first whole month starts the day they `
+        + `move in and there is nothing to prorate. ${usd(0)}.`,
+      lever: `The start date does not move it: ${park} bills each tenant on their own move-in day, so whichever day `
+        + 'they arrive is the day their first whole month starts.',
+    }
+  }
+  if (Number(opts.startIso.slice(8, 10)) === opts.dueDay) {
+    return {
+      words: `They move in on the day rent is due, so their first whole month starts that day and there is `
+        + `nothing to prorate. ${usd(0)}.`,
+      lever: START_DATE_LEVER,
+    }
+  }
+  if (!opts.prorates) {
+    return {
+      words: `${park} bills a whole month as a whole month — it does not cut a month into days when somebody `
+        + `moves in part-way through — so the month they move into is charged in full: ${usd(opts.rent)}.`,
+      lever: `The start date does not move it: ${park} is set not to cut a month into days. Changing that is a `
+        + 'property setting, not something on this lease.',
+    }
+  }
+  // Days from the move-in day up to the next due date, against the days in that
+  // whole period — never a flat 30. Same window shared prorateMoveInRent uses.
+  const next = nextDueDateAfter(opts.startIso, opts.dueDay)
+  const at = (iso: string) => { const [y, m, d] = iso.split('-').map(Number); return Date.UTC(y, m - 1, d) }
+  const [ny, nm] = next.split('-').map(Number)
+  const prevDue = Date.UTC(nm === 1 ? ny - 1 : ny, nm === 1 ? 11 : nm - 2, opts.dueDay)
+  const days = Math.round((at(next) - at(opts.startIso)) / 86400000)
+  const period = Math.round((at(next) - prevDue) / 86400000)
+  return {
+    words: `${days} day${days === 1 ? '' : 's'} — ${monthAndDay(opts.startIso)} up to ${monthAndDay(next)} — out of the `
+      + `${period} in that period, at ${usd(opts.rent)} a month: ${usd(Number(String(opts.figure).replace(/[$,\s]/g, '')) || 0)}.`,
+    lever: START_DATE_LEVER,
+  }
+}
+
 export function SignPage() {
   const { token } = useParams<{ token:string }>()
 
@@ -428,7 +542,6 @@ export function SignPage() {
   //    typable." "Page eight security deposit copies page two."
   // The server recomputes the same numbers when you sign (moveInBoxes.ts);
   // this is so the page you are signing already shows them.
-  const autoProration = useRef<string | null>(null)
   const autoDueDay = useRef<string | null>(null)
   useEffect(() => {
     if (!data?.fields) return
@@ -488,18 +601,49 @@ export function SignPage() {
           autoDueDay.current = autoDay
         }
       }
-      const dueDay = parseDueDay(want['rent_due_day'] ?? val('rent_due_day')) ?? 1
-      // Proration follows the start date and rent until the landlord types
-      // their own figure over it (a special) — then it is theirs. Billed on
-      // the move-in day, there is nothing to prorate.
-      const current = val('move_in_proration')
+      // 10/19 review: the lease form usually has NO "rent is due on the" box —
+      // not one of the six templates that prints a prorated-rent line has one —
+      // and this fell back to the 1st. At a park due on the 15th the draft
+      // stamped the right figure and this page overwrote it with the one for
+      // the 1st, leaving a month nothing billed. data.rentDueDayRule is the
+      // server's own reading (the invite's day, else the property's rule), the
+      // same one the draft and the sign-time check use.
+      const dueDay = parseDueDay(want['rent_due_day'] ?? val('rent_due_day'))
+        ?? parseDueDay(data.rentDueDayRule) ?? 1
+      // ── 10/19 (Nic): THE PRORATION IS DERIVED. NOBODY TYPES IT. ──────────
+      //
+      //   "Just lock the box so it's not typable. The prorated box. Yeah, we
+      //    want the deposit and pet deposit to be typable. The proration is
+      //    derived from a mid-month start. That's based on their lease amount.
+      //    It should be auto-calculated. That doesn't need to be, that one does
+      //    not need to be typable."
+      //
+      // It used to stop following the start date the moment anything was typed
+      // over it (S648 kept it editable for a move-in special). One keystroke
+      // froze the figure, and every later change of the start date left it
+      // where it was — silently. Kay Howard (RV 21) and Clint Cook (RV 18) both
+      // signed $323.00, which is the 17 days from 10/15, the day the forms were
+      // filled out — not from the day either of them actually arrived. One was
+      // about $38 short and the other about $19 over.
+      //
+      // So it is written every pass now, from the start date, the rent and the
+      // due day, and the box itself has nothing to type into (see the derived
+      // lock on the field below). First month's rent stays typeable: that one
+      // really is a move-in special the landlord sets.
+      //
+      // 10/18 (Nic): "moving in or out at the middle of a month and also only
+      // if the landlord allows the pro rate." A park that answers No bills the
+      // WHOLE month they moved into on this same line (it is the line for the
+      // move-in day up to the next due date) — the mirror of the whole month
+      // charged on the way out. Same arithmetic as the server's page-8
+      // defaults and the move-in bill (shared moveInDefaults), so the page and
+      // the invoice cannot tell different stories.
+      const prorates = data.proratesMidMonthRent !== false
       const auto = !start ? null
         : (moveInDay || Number(start.slice(8, 10)) === dueDay) ? '0.00'
+        : !prorates ? rent.toFixed(2)
         : prorateMoveInRent(rent, start, dueDay).toFixed(2)
-      if (auto != null && (current == null || current === autoProration.current)) {
-        want['move_in_proration'] = auto
-        autoProration.current = auto
-      }
+      if (auto != null) want['move_in_proration'] = auto
     }
     const first = want['move_in_first_month_rent'] ?? val('move_in_first_month_rent')
     const prorate = want['move_in_proration'] ?? val('move_in_proration')
@@ -927,6 +1071,12 @@ export function SignPage() {
             // system's, not a move-in special to type over.
             const RENEWAL_LOCKED = !!doc?.renewsLeaseId && (
               f.leaseColumn === 'move_in_first_month_rent' || f.leaseColumn === 'move_in_proration')
+            // 10/19 (Nic): the prorated-rent box has nothing to type into, with
+            // or without a figure in it yet. It is derived from the start date,
+            // the rent and the due day on every pass, and clicking it says so.
+            // Ahead of `locked` on purpose: the onboarding and renewal $0 cases
+            // reach the same explainer rather than a dead not-allowed cursor.
+            const DERIVED_PRORATION = isProrationBox(f)
             const locked = !!val && !!f.leaseColumn && (
               LEASE_COLUMN_CATEGORY[f.leaseColumn as keyof typeof LEASE_COLUMN_CATEGORY] === 'identity'
               || DERIVED_LOCKED.has(f.leaseColumn)
@@ -987,15 +1137,16 @@ export function SignPage() {
                 // defaults the landlord must be able to quick-edit.
                 // S535: policy late-fee fields always open (the click shows
                 // the read-only policy explainer, not an editor).
-                onClick={()=>{ if (isPolicyLateFee) { setActiveField(f); return } if (!locked) handleFieldClick(f) }}
-                title={locked?(f.leaseColumn==='lease_type'||f.leaseColumn==='end_date'
+                onClick={()=>{ if (isPolicyLateFee || DERIVED_PRORATION) { setActiveField(f); return } if (!locked) handleFieldClick(f) }}
+                title={DERIVED_PRORATION ? 'Worked out from the lease start date, the rent and the due day — click to see how'
+                  : locked?(f.leaseColumn==='lease_type'||f.leaseColumn==='end_date'
                     ? 'Set by the lease template’s term — change the template, not the document, so the record and the paper agree'
                     : 'Linked to the unit/tenant record — edit the record, not the document'):isPolicyLateFee?'Set by the property late-fee policy — click for details':undefined}
                 style={{
                   position:'absolute', left:f.x*s, top:f.y*s, width:f.width*s, height:f.height*s,
                   border:`2px solid ${val?'#22c55e':isNext?color:'#aaa'}`,
                   borderRadius:6, background:val?'rgba(34,197,94,.12)':isNext?`${color}20`:'rgba(180,180,180,.08)',
-                  cursor:locked?'not-allowed':val?'default':'pointer', display:'flex', alignItems:'center', justifyContent:'center',
+                  cursor:DERIVED_PRORATION?'help':locked?'not-allowed':val?'default':'pointer', display:'flex', alignItems:'center', justifyContent:'center',
                   overflow:'hidden', boxSizing:'border-box' as const,
                   boxShadow:isNext&&!val?`0 0 0 3px ${color}55`:'', zIndex:val?4:isNext?6:5
                 }}>
@@ -1103,7 +1254,58 @@ export function SignPage() {
         )
       })()}
 
-      {activeField && activeField.fieldType!=='signature' && activeField.fieldType!=='initials' && !(data.propertyLateFee && String(activeField.leaseColumn||'').startsWith('late_fee_') && !!fieldValues[activeField.id]) && (
+      {/* 10/19 (Nic): the PRORATED RENT box — read-only, and it shows its work.
+          "The proration is derived from a mid-month start. That's based on
+          their lease amount. It should be auto-calculated. That doesn't need to
+          be, that one does not need to be typable." There is no input in here,
+          so there is no keystroke that can leave the figure disagreeing with
+          the start date. What to change, if it looks wrong, is the start date. */}
+      {activeField && isProrationBox(activeField) && (() => {
+        const valOf = (col: string) => {
+          const f = allFields.find((x: any) => x.leaseColumn === col && (fieldValues[x.id] ?? x.value ?? '').toString().trim() !== '')
+          return f ? String(fieldValues[f.id] ?? f.value) : null
+        }
+        const startRaw = valOf('start_date')
+        const startIso = startRaw ? (/^\d{4}-\d{2}-\d{2}/.test(startRaw) ? startRaw.slice(0, 10) : documentDateToIso(startRaw)) : ''
+        const rent = moneyBoxValue(valOf('rent_amount'))
+        const dueDay = parseDueDay(valOf('rent_due_day')) ?? parseDueDay(data.rentDueDayRule) ?? 1
+        const figure = fieldValues[activeField.id] ?? '0.00'
+        const { words, lever } = prorationExplainer({
+          figure, startIso: startIso || null, rent, dueDay,
+          prorates: data.proratesMidMonthRent !== false,
+          moveInDay: data.rentDueMode === 'move_in_day',
+          renewal: !!doc?.renewsLeaseId,
+          existingTenancy: !!data.existingTenancy,
+          propertyName: doc?.propertyName ?? null,
+        })
+        return (
+          <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
+            <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:400, width:'100%', margin:'auto' }}>
+              <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:6 }}>Prorated rent — worked out for you</div>
+              <div style={{ fontSize:'1.5rem', fontWeight:800, color:'#1a1a1a', marginBottom:12 }}>
+                {usd(moneyBoxValue(figure))}
+              </div>
+              <div style={{ background:'#f4f7f4', border:'1px solid #22c55e', borderRadius:8, padding:'10px 12px', marginBottom:12, fontSize:'.82rem', color:'#14532d', lineHeight:1.6 }}>
+                {words}
+              </div>
+              {/* 10/19 review: this note used to read "the start date is what to
+                  fix" behind every one of the five sentences above it — including
+                  the three where the start date is not the lever. It is the
+                  explainer's own sentence now, out of the same branch. */}
+              <div style={{ background:'#fef3c7', border:'1px solid #d97706', borderRadius:8, padding:'10px 12px', marginBottom:14, fontSize:'.78rem', color:'#78350f', lineHeight:1.55 }}>
+                <strong>This line is never typed.</strong> {lever}
+              </div>
+              {/* Gray, not gold: nothing here is an action — it is a back-out
+                  (gam-button-color-rule). Styled inline to match this white
+                  card; .btn-ghost is themed for the dark portal shell. */}
+              <button onClick={()=>setActiveField(null)}
+                style={{ width:'100%', padding:'10px', borderRadius:8, border:'1px solid #e5e7eb', background:'white', color:'#555', fontWeight:600, cursor:'pointer' }}>Close</button>
+            </div>
+          </div>
+        )
+      })()}
+
+      {activeField && activeField.fieldType!=='signature' && activeField.fieldType!=='initials' && !isProrationBox(activeField) && !(data.propertyLateFee && String(activeField.leaseColumn||'').startsWith('late_fee_') && !!fieldValues[activeField.id]) && (
         <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
           <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:360, width:'100%', margin:'auto' }}>
             <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:14 }}>{activeField.label||activeField.fieldType}</div>
@@ -1203,15 +1405,25 @@ export function SignPage() {
             )}
             {activeField.fieldType==='date' && (
               // S534: term dates (lease start/end) are picked deliberately.
+              //
               // S652 (Blu): the browser's own date box closed the editor on every
-              // part he changed — month, then day, then year, three trips in. The
-              // tenant page already uses three typed boxes that stay put until
-              // Save; the landlord page uses the same now.
+              // part he changed — month, then day, then year, three trips in. It
+              // was replaced with three typed boxes that stay put until Save
+              // (the tenant page still signs with those).
+              //
+              // 10/19 (Nic): "make it so that box can only be a calendar date
+              // pick and not possible to be typed in by hand... eventually I'd
+              // like to be able to trust somebody else to fill out leases. And
+              // so we need it to handhold as much as possible." A typed date is
+              // how two leases ended up dated the day the forms were filled out
+              // instead of the day the residents arrived. So: a month grid with
+              // no input in it at all. Picking a day only reports the date —
+              // Blu's editor stays open, because that is the whole reason the
+              // native box went away.
               <div style={{ marginBottom:14 }}>
-                <TypedDateInput key={activeField.id}
+                <LeaseDateCalendar key={activeField.id}
                   value={documentDateToIso(fieldValues[activeField.id])}
                   onChange={iso=>{ setFieldValues(p=>({...p,[activeField.id]:isoToDocumentDate(iso)})) }}
-                  inputStyle={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, background:'white', color:'#1a1a1a' }}
                 />
               </div>
             )}

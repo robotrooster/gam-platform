@@ -11,8 +11,10 @@
  * way out: a draft nobody can execute or complete sat on the dashboard as a
  * permanent action item whose only button opened a PDF that does not exist.
  *
- * Discard is a SOFT close — the row stays, marked terminated — and it stops at
- * paperwork nobody has signed.
+ * Discard stops at paperwork nobody has signed. 10/14 (Nic, #6): "Leases →
+ * Discard on an unsigned draft: delete the paperwork and the never-signed
+ * lease record" — erased when no money touched the lease and nothing else
+ * lives on it; otherwise a SOFT close, the row kept and marked terminated.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 vi.mock('../services/email', async (orig) => ({
@@ -67,21 +69,44 @@ const discard = (leaseId: string, token: string, body: Record<string, unknown> =
   .post(`/api/leases/${leaseId}/discard`).set('Authorization', `Bearer ${token}`).send(body)
 
 describe('POST /api/leases/:id/discard', () => {
-  it('closes an unsigned pending draft and clears it off the review list', async () => {
+  it('10/14 (Nic, #6): an unsigned pending draft no money touched is deleted — the lease row is gone', async () => {
     const f = await seedDraft('pending')
     const res = await discard(f.leaseId, f.token)
     expect(res.status).toBe(200)
-    const l = (await db.query<any>('SELECT status, needs_review FROM leases WHERE id=$1', [f.leaseId])).rows[0]
-    expect(l.status).toBe('terminated')
-    expect(l.needs_review).toBe(false)
+    expect(res.body.data).toMatchObject({ id: f.leaseId, status: 'deleted' })
+    const n = await db.query<any>('SELECT COUNT(*)::int AS c FROM leases WHERE id=$1', [f.leaseId])
+    expect(n.rows[0].c).toBe(0)
   })
 
-  // GAM keeps everything — a discard hides the draft, it does not erase it.
-  it('keeps the row', async () => {
+  // Review 10/14: a document on the draft voided EARLIER that no money
+  // touched is erased first — it never keeps the lease row as "another
+  // document on it".
+  it('an older voided document on the draft that no money touched goes too, and the lease row is deleted', async () => {
     const f = await seedDraft('pending')
-    await discard(f.leaseId, f.token)
-    const n = await db.query<any>('SELECT COUNT(*)::int AS c FROM leases WHERE id=$1', [f.leaseId])
-    expect(n.rows[0].c).toBe(1)
+    const old = (await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (lease_id, landlord_id, unit_id, title, status, document_type, voided_at)
+       VALUES ($1,$2,$3,'Lease (first try)','voided','original_lease', NOW()) RETURNING id`,
+      [f.leaseId, f.landlordId, f.unitId])).rows[0].id
+    const res = await discard(f.leaseId, f.token)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toMatchObject({ id: f.leaseId, status: 'deleted' })
+    expect((await db.query<any>('SELECT 1 FROM lease_documents WHERE id=$1', [old])).rows).toHaveLength(0)
+    expect((await db.query<any>('SELECT 1 FROM leases WHERE id=$1', [f.leaseId])).rows).toHaveLength(0)
+  })
+
+  // Money touched it: the soft close, as before — the row stays, terminated,
+  // off the review list, and the reply says why.
+  it('a draft with money on it keeps the row, ended, and says why', async () => {
+    const f = await seedDraft('pending')
+    await db.query(
+      `INSERT INTO payments (unit_id, lease_id, landlord_id, type, amount, status, due_date, entry_description, voided_at, void_reason)
+       VALUES ($1,$2,$3,'deposit',100,'voided','2026-11-01','DEPOSIT', NOW(), 'not owed')`, [f.unitId, f.leaseId, f.landlordId])
+    const res = await discard(f.leaseId, f.token)
+    expect(res.status).toBe(200)
+    expect(res.body.data.status).toBe('terminated')
+    expect(res.body.data.kept_words).toMatch(/^Money touched this lease/)
+    const l = (await db.query<any>('SELECT status, needs_review FROM leases WHERE id=$1', [f.leaseId])).rows[0]
+    expect(l).toEqual({ status: 'terminated', needs_review: false })
   })
 
   it('refuses an ACTIVE lease — no Discard ends a tenancy; it names “They never moved in — end the lease” and “They’re leaving on…”', async () => {
@@ -160,7 +185,7 @@ describe('POST /api/leases/:id/discard', () => {
 
   // Fix pass 3: an unsigned draft's paperwork already sent for signature ends
   // with it — a signing link already sent stops working.
-  it('discarding an unsigned draft whose document was sent voids it, so a tenant signature afterwards is refused', async () => {
+  it('discarding an unsigned draft whose document was sent deletes it (10/14 #6), so a signature afterwards finds nothing', async () => {
     const f = await seedDraft('pending')
     const docId = (await db.query<{ id: string }>(
       `INSERT INTO lease_documents (lease_id, landlord_id, unit_id, title, status, document_type)
@@ -172,16 +197,16 @@ describe('POST /api/leases/:id/discard', () => {
     await signer(docId, { role: 'primary', signed: false, order: 2 })
     const res = await discard(f.leaseId, f.token)
     expect(res.status).toBe(200)
-    const doc = (await db.query<any>(`SELECT status, voided_at, void_reason FROM lease_documents WHERE id = $1`, [docId])).rows[0]
-    expect(doc.status).toBe('voided')
-    expect(doc.voided_at).toBeTruthy()
-    expect(doc.void_reason).toBe('The lease ended: the unsigned draft was discarded')
+    expect((await db.query<any>(`SELECT 1 FROM lease_documents WHERE id = $1`, [docId])).rows).toHaveLength(0)
     expect((await db.query<any>(`SELECT status FROM lease_documents WHERE id = $1`, [sale])).rows[0].status).toBe('sent')
     // The link already sent no longer signs anything.
     const signRes = await request(buildApp())
       .post(`/api/esign/sign/${docId}`).set('Authorization', `Bearer ${f.token}`).send({ fieldValues: [] })
-    expect(signRes.status).toBe(400)
-    expect(signRes.body.error).toBe('Document has been voided')
+    // Its signer rows went with it: the sign route's first check refuses.
+    expect(signRes.status).toBe(403)
+    expect(signRes.body.error).toBe('You are not a signer on this document')
+    // The home-sale paper still on the lease keeps the lease row (ended, as before).
+    expect(res.body.data.status).toBe('terminated')
     expect((await db.query<any>(`SELECT status FROM leases WHERE id = $1`, [f.leaseId])).rows[0].status).toBe('terminated')
   })
 

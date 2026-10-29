@@ -115,13 +115,24 @@ describe('draftLeaseFromApplication', () => {
     expect(vals.end_date).toBe('-')
   })
 
-  it('drafts a fixed term, month-end snapped, when one was named', async () => {
+  // 10/24 (Nic, DIRECTIVE): "The 3 months becomes a note, not a contract term,
+  // and every drafted lease starts month to month with no end date." The number
+  // an applicant types on the form is their guess before they have seen the
+  // place; it is kept on the application and asked about later, never turned
+  // into a binding end date the landlord never chose. (James Fenton said "3
+  // months" through the screening door and got a lease ending 2027-01-31 on RV
+  // 15 — the park's busiest month — which nothing on the lease screen said.)
+  it('drafts month-to-month even when a term was named, and keeps the move-in they asked for', async () => {
     const fx = await seedFixture({ moveIn: '2027-01-01', term: 6 })
     const r = await draftLeaseFromApplication(fx.applicationId)
     const vals = await fieldVals(r.documentId!)
-    expect(vals.lease_type).toBe('Fixed term')
-    expect(vals.start_date).toBe('2027-01-01')
-    expect(vals.end_date).toBe('2027-06-30')
+    expect(vals.lease_type).toBe('Month-to-month')
+    expect(vals.start_date).toBe('2027-01-01')   // the date they asked for still stands
+    expect(vals.end_date).toBe('-')              // the document's own "no end date" mark
+    // The answer itself is not discarded — the follow-up prompt reads it here.
+    const app = (await db.query<any>(
+      `SELECT desired_term_months FROM unit_applications WHERE id = $1`, [fx.applicationId])).rows[0]
+    expect(Number(app.desired_term_months)).toBe(6)
   })
 
   it('says so when the unit type has no default template — the applicant still lands on the space', async () => {

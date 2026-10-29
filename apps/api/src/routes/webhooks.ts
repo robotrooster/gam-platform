@@ -19,7 +19,7 @@ import { confirmBookingDeposit } from '../services/propertyBooking'
 // BEFORE capturing, so payment_intent.succeeded settles it like any card.
 const HELD_PURPOSES = new Set(['pos_terminal', 'pos_pay_link', 'booking_deposit', 'business_invoice', 'business_pos_terminal', 'rent_terminal_pending'])
 import { applyTenantSupersedence, type PostCommitTransfer } from '../services/supersedence'
-import { emitPaymentFailedEvent } from '../services/creditLedgerEmitters'
+import { emitPaymentFailedEvent, recomputeScoresAfterCorrection } from '../services/creditLedgerEmitters'
 // S655 (Step 10): the one post-settle routine (going live, the on-time mark,
 // the receipt) every settle path shares.
 import { afterRowsSettled } from '../services/settleHooks'
@@ -102,7 +102,9 @@ webhooksRouter.post('/stripe', async (req, res) => {
       // HERE — an ACH pull can still bounce days after it was submitted.
       if (pi.metadata?.gam_debit_id) {
         const { settleGamDebit } = await import('../services/landlordGamDebit')
-        await settleGamDebit(pi.id, true)
+        // 10/12 (ledger P0 review): the pull's own id too, so a pull GAM never
+        // stamped with this payment id is still found and settled.
+        await settleGamDebit(pi.id, true, undefined, pi.metadata.gam_debit_id)
         break
       }
 
@@ -145,7 +147,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
       if (pi.metadata?.gam_debit_id) {
         const { settleGamDebit } = await import('../services/landlordGamDebit')
         await settleGamDebit(pi.id, false,
-          pi.last_payment_error?.message ?? 'the bank refused the transfer')
+          pi.last_payment_error?.message ?? 'the bank refused the transfer', pi.metadata.gam_debit_id)
         break
       }
 
@@ -177,7 +179,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
       if (HELD_PURPOSES.has(pi.metadata?.gam_purpose ?? '')) break
       if (pi.metadata?.gam_debit_id) {
         const { settleGamDebit } = await import('../services/landlordGamDebit')
-        await settleGamDebit(pi.id, false, 'the bank pull was canceled')
+        await settleGamDebit(pi.id, false, 'the bank pull was canceled', pi.metadata.gam_debit_id)
         break
       }
       try {
@@ -315,6 +317,42 @@ webhooksRouter.post('/stripe', async (req, res) => {
         const disputeRow = await queryOne<{ id: string }>(
           `SELECT id FROM connect_disputes WHERE stripe_dispute_id = $1`, [dispute.id])
         const { recordChargeback } = await import('../services/heldPayouts')
+
+        // 10/13 (Nic): "GAM fee pull disputed by landlord's bank: AUTOMATIC —
+        // the disputed fees reopen as owed by the landlord, collected on the
+        // next pull, admin told." A dispute on GAM's own pull of its fees from
+        // a landlord's bank (landlord_gam_debits) is not a tenant's payment or
+        // a held charge: services/landlordGamDebit handles all of it (the
+        // inquiry, the reopening, the pull's $6 voided and what the pull cost
+        // GAM at Stripe billed at cost (Nic G1), a $15 dispute fee corrected
+        // once an event states Stripe's own, and — 10/13 afternoon, "Won GAM
+        // pull dispute: AUTOMATIC" — a win undone by itself: fees back to
+        // collected, anything collected twice given back, admin told; a win
+        // waiting on a later pull still settling ('won_waiting') is answered
+        // 200 and undone by the nightly sweep) and nothing below runs. It used
+        // to fall through to the "charge GAM cannot place" notice and nothing
+        // else.
+        if (piId) {
+          const { handleGamDebitDispute } = await import('../services/landlordGamDebit')
+          const { disputeFeeReturnedOnWinCents } = await import('../services/stripeCosts')
+          const pulled = await handleGamDebitDispute({
+            paymentIntentId: piId, stripeDisputeId: dispute.id, disputeStatus: status, eventStatus: dispute.status,
+            disputedCents: dispute.amount ?? 0, feeCents,
+            // Stripe's word on its dispute fee only when the event carries the
+            // dispute's balance transactions; else it is read from Stripe.
+            feeStated: (dispute.balance_transactions ?? []).length > 0,
+            feeReturnedCents: dispute.status === DISPUTE_STATUS_WON ? disputeFeeReturnedOnWinCents(dispute as any) : 0,
+          })
+          if (pulled.handled) {
+            // The pull's own success is not recorded yet: Stripe sends this again.
+            if (pulled.action === 'not_settled') {
+              logger.warn({ event_type: event.type, stripe_dispute_id: dispute.id, debit_id: pulled.debitId },
+                'dispute on a GAM fee pull that has not settled yet — Stripe will deliver it again')
+              return res.status(503).json({ error: 'the pull has not settled yet — try again in a moment' })
+            }
+            break
+          }
+        }
 
         if (status === DISPUTE_STATUS_WON) {
           // Decisions #55-AMENDED: a won dispute is NOT undone automatically
@@ -677,6 +715,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
           await recordHeldItem({
             businessId: ins[0].business_id,
             sourceType: 'business_invoice_payment', sourceId: session.id,
+            property: { propertyId: null },  // 10/12 (Nic, ledger P1): a business's line is company-level
             amount: (cents - businessInvoiceCutCents(cents, paidByBank)) / 100,
             description: `Invoice payment (${paymentKind})`,
           })
@@ -1496,22 +1535,24 @@ async function afterSucceededCommit(pi: Stripe.PaymentIntent, eventId: string, o
         continue
       }
       try {
-        const stripeApi = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-10-16' })
-        await stripeApi.transfers.create(
-          {
-            amount:      Math.round(t.amount * 100),
-            currency:    'usd',
-            destination: t.destination_connect_account,
-            description: `FlexCharge merchant payout (supersedence) — statement ${t.ref_id}`,
-            metadata: {
-              gam_purpose:             'flexcharge_merchant_payout',
-              gam_statement_id:        t.ref_id,
-              gam_via_supersedence:    'true',
-              gam_paid_via_payment_id: entry.paymentId,
-            },
+        // 10/12 (Nic, ledger P0, design M0b): recorded before Stripe is asked
+        // (platform_transfer_intents, purpose 'flexcharge_merchant'), under the
+        // same key flexpay's found-pull path uses, so the two still pay once.
+        const { fireRecordedDirectTransfer } = await import('../services/landlordPassthrough')
+        await fireRecordedDirectTransfer({
+          purpose:                     'flexcharge_merchant',
+          destinationConnectAccountId: t.destination_connect_account,
+          amount:                      t.amount,
+          flexchargeStatementId:       t.ref_id,
+          idempotencyKey:              `flexcharge_payout_super_${t.ref_id}`,
+          description:                 `FlexCharge merchant payout (supersedence) — statement ${t.ref_id}`,
+          metadata: {
+            gam_purpose:             'flexcharge_merchant_payout',
+            gam_statement_id:        t.ref_id,
+            gam_via_supersedence:    'true',
+            gam_paid_via_payment_id: entry.paymentId,
           },
-          { idempotencyKey: `flexcharge_payout_super_${t.ref_id}` },
-        )
+        })
       } catch (e) {
         logger.error({ err: e, statement_id: t.ref_id, paid_via_payment_id: entry.paymentId }, 'supersedence flexcharge-merchant-transfer failed')
         await createAdminNotification({
@@ -1912,10 +1953,12 @@ async function handleFailedIntent(stripe: Stripe, pi: Stripe.PaymentIntent): Pro
     }
   }
 
-  // Terminal (no retry coming): the credit ledger's payment_failed_nsf and the
-  // opt-in products' own failure handling. A still-retrying payment is alive —
-  // the tenant's record only takes a hit when it flunks for good. FlexPay's
-  // pull was handled inside failIntentRows (its advance, in the transaction).
+  // Terminal (no retry coming): the credit ledger and the opt-in products' own
+  // failure handling. A still-retrying payment is alive — the tenant's record
+  // only takes a hit when it flunks for good. FlexPay's pull was handled inside
+  // failIntentRows (its advance, in the transaction). 10/12 (Nic): "one mark per
+  // invoice" — a failed pull is no longer a mark of its own; the bill's one
+  // mark is judged again (creditLedgerEmitters.emitPaymentFailedEvent).
   if (!willRetry) {
     try {
       const pinfo = await query<{ id: string; tenant_id: string | null; type: string; amount: string; due_date: string }>(
@@ -1924,9 +1967,17 @@ async function handleFailedIntent(stripe: Stripe, pi: Stripe.PaymentIntent): Pro
       )
       const p = pinfo[0]
       if (p && p.tenant_id && (p.type === 'rent' || p.type === 'utility')) {
+        // 10/12 (review): in its own transaction — the bill-mark sync takes the
+        // household's lock and appendEvent the subject's, both transaction-
+        // scoped; on a bare client each was released after its own statement,
+        // so a failed pull racing a settle for the same household could fork
+        // the hash chain or leave the bill two live marks, and the new mark and
+        // the superseding of the old one were not atomic.
         const ledgerClient = await getClient()
+        let markSubjects: string[] = []
         try {
-          await emitPaymentFailedEvent(ledgerClient, {
+          await ledgerClient.query('BEGIN')
+          const changes = await emitPaymentFailedEvent(ledgerClient, {
             tenantId:               p.tenant_id,
             paymentId:              p.id,
             paymentType:            p.type as 'rent' | 'utility',
@@ -1937,9 +1988,15 @@ async function handleFailedIntent(stripe: Stripe, pi: Stripe.PaymentIntent): Pro
             failureCode:            returnCode ?? null,
             failureMessage:         reasonText,
           })
+          await ledgerClient.query('COMMIT')
+          markSubjects = (changes ?? []).flatMap(c => c.subjectIds)
+        } catch (e) {
+          await ledgerClient.query('ROLLBACK').catch(() => {})
+          throw e
         } finally {
           ledgerClient.release()
         }
+        if (markSubjects.length) await recomputeScoresAfterCorrection(markSubjects)
         // OTP NSF default (S155; gated/no-op while OTP is hidden).
         if (p.type === 'rent') {
           try {

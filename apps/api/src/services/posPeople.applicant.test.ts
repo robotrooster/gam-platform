@@ -4,9 +4,14 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import { randomUUID } from 'crypto'
-import { db } from '../db'
+import { db, query } from '../db'
 import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
 import { applicantRegisterRecord } from './posPeople'
+import { accountAsCaller } from './registerBook'
+
+// A screening is written by GAM for the company, not by a person at a counter:
+// the company's own account asks (services/registerBook).
+const itself = (landlordId: string) => accountAsCaller(landlordId, query)
 
 beforeEach(async () => { await cleanupAllSchema() })
 
@@ -26,10 +31,10 @@ const record = async (id: string) => (await db.query(
 describe('an applicant on the register', () => {
   it('gets one record with the legal name from the application and their email', async () => {
     const landlordId = await company(); const a = await applicant('Robert.H@Park.dev')
-    const id = await applicantRegisterRecord(db, landlordId, a.tenantId, { firstName: ' Robert ', lastName: 'Housley ' })
+    const id = await applicantRegisterRecord(db, landlordId, a.tenantId, { firstName: ' Robert ', lastName: 'Housley ' }, await itself(landlordId))
     expect(await record(id)).toEqual({ first_name: 'Robert', last_name: 'Housley', email: 'robert.h@park.dev', tenant_id: a.tenantId })
     // A second screening for the same company: the same record, nothing doubled.
-    expect(await applicantRegisterRecord(db, landlordId, a.tenantId, { firstName: 'Bob', lastName: 'H' })).toBe(id)
+    expect(await applicantRegisterRecord(db, landlordId, a.tenantId, { firstName: 'Bob', lastName: 'H' }, await itself(landlordId))).toBe(id)
     expect((await record(id)).first_name).toBe('Robert')
     expect((await db.query(`SELECT count(*)::int AS n FROM pos_customers WHERE landlord_id = $1`, [landlordId])).rows[0].n).toBe(1)
   })
@@ -37,14 +42,14 @@ describe('an applicant on the register', () => {
   it('an email another record here already holds is left off — one record per address', async () => {
     const landlordId = await company(); const a = await applicant('shared@park.dev')
     await db.query(`INSERT INTO pos_customers (landlord_id, first_name, last_name, email) VALUES ($1,'Front','Desk','shared@park.dev')`, [landlordId])
-    const id = await applicantRegisterRecord(db, landlordId, a.tenantId, { firstName: 'A', lastName: 'B' })
+    const id = await applicantRegisterRecord(db, landlordId, a.tenantId, { firstName: 'A', lastName: 'B' }, await itself(landlordId))
     expect((await record(id)).email).toBeNull()
   })
 
   it('each company keeps its own record', async () => {
     const one = await company(); const two = await company(); const a = await applicant()
-    const x = await applicantRegisterRecord(db, one, a.tenantId, { firstName: 'A', lastName: 'B' })
-    const y = await applicantRegisterRecord(db, two, a.tenantId, { firstName: 'A', lastName: 'B' })
+    const x = await applicantRegisterRecord(db, one, a.tenantId, { firstName: 'A', lastName: 'B' }, await itself(one))
+    const y = await applicantRegisterRecord(db, two, a.tenantId, { firstName: 'A', lastName: 'B' }, await itself(two))
     expect(x).not.toBe(y)
   })
 })

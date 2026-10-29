@@ -18,13 +18,16 @@ import bcrypt from 'bcryptjs'
 import { getClient } from '../db'
 import { emailAdminInvitation } from '../services/email'
 import { backfillInvoices } from '../jobs/invoiceGeneration'
-import { PASSWORD_MIN_LEN, PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE, launchPlatformFeeForProperty, SALES_LEAD_STATUSES, SALES_BOOKING_KIND_VALUES } from '@gam/shared'
+import { PASSWORD_MIN_LEN, PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE, launchPlatformFeeForProperty, SALES_LEAD_STATUSES, SALES_BOOKING_KIND_VALUES, READER_BOOK_REFERENCE } from '@gam/shared'
 import { fetchAccountStatus } from '../services/stripeConnect'
 import { unproductiveTurnSql } from '../services/agents/turnBudget'
 import { emailTenantOnboarded, emailLandlordBankingSetup, emailTenantAchSetup } from '../services/email'
 import { replyToProperty } from '../services/replyRouting'
-import { getNexusDashboard, recomputeNexusTally, setStateRegistration } from '../services/nexusMonitor'
+import { getNexusDashboard, recomputeNexusTally, setStateRegistration, setStateMeasureRule, NEXUS_LINE_ITEMS } from '../services/nexusMonitor'
 import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
+import { graceDaysSql } from '../services/lateness'
+import { REVENUE_SLICE_TYPE_SQL } from '../services/revenueSlices'
+import { openMatchReviews, decideMatchReview } from '../services/leftOwing'
 
 export const adminRouter = Router()
 adminRouter.use(requireAuth)
@@ -63,8 +66,6 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
                   OR l.id IN (SELECT m.landlord_id FROM landlord_members m WHERE m.user_id = u.id))
         ) AS landlords_without_property,
         (SELECT COUNT(*)::int FROM users WHERE role='tenant')   AS total_tenants,
-        (SELECT COUNT(*)::int FROM units WHERE status='active') AS active_units,
-        (SELECT COUNT(*)::int FROM units WHERE status='vacant') AS vacant_units,
         (SELECT COUNT(*)::int FROM units WHERE payment_block=TRUE) AS eviction_mode_units,
         -- ── S639: THE ADMIN LENS IS MONEY THAT MOVED ───────────────────────
         --
@@ -225,7 +226,23 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
              AND COALESCE(p.mapping_status, 'unverified') = 'unverified'
         ) AS csv_imports_pending_review
     `)
-    res.json({ success: true, data: platform })
+    // 10/12 (Nic, A5): "Active units card: MATCH BILLING (occupied = billable
+    // evidence; vacant = rest; retired excluded)." This counted unit STATUS
+    // ('active' / 'vacant') across every unit on the platform — retired ones,
+    // demo accounts and signups that never went live included — so it could
+    // not agree with what GAM bills. It now reads the platform fee's own count
+    // of occupied spaces this month (services/platformMetrics spacesOccupied →
+    // billableUnits.occupiedSpacesSql), out of the spaces under management,
+    // and the rest are vacant.
+    const { spacesOccupied } = await import('../services/platformMetrics')
+    const spaces = await spacesOccupied()
+    res.json({ success: true, data: {
+      ...platform,
+      active_units: spaces.occupied,
+      vacant_units: spaces.vacant,
+      total_spaces: spaces.spaces,
+      spaces_month: spaces.month,
+    } })
   } catch (e) { next(e) }
 })
 
@@ -922,6 +939,57 @@ adminRouter.get('/nacha/monitoring', requireSuperAdmin, async (_req, res, next) 
 // Read model: GAM own-revenue by customer state vs each state's economic-nexus
 // registration threshold + current registration status. MONITORING ONLY — the
 // register action flips tax collection, but the dashboard itself charges nothing.
+// ── 10/22 (Nic): the close calls on a debt somebody walked away from ────────
+//
+//   "Maybe when there's a not sure call, we can leave it to the admin to kind
+//    of do some research on."
+//
+// A contact point agreed and the name only half did — an initial, a brother at
+// the same phone number, a surname that changed with a marriage. Until somebody
+// here decides, NO landlord sees a flag and no door opens. Both halves of that
+// are deliberate: a flag is somebody's reputation, and a miss is a landlord
+// taking on a person who owes money elsewhere.
+//
+// A GAM admin sees the whole debt — amount, dates, who was owed — because that
+// is what research takes. The rule that holds all of it back is a rule about
+// other LANDLORDS.
+adminRouter.get('/left-owing-reviews', requireAdmin, async (req, res, next) => {
+  try {
+    const limit = Math.min(Math.max(1, Number(req.query.limit) || 200), 500)
+    res.json({ success: true, data: await openMatchReviews(limit) })
+  } catch (e) { next(e) }
+})
+
+// The answer. It decides ONE thing — is this the same human being — and moves
+// no money: the amount is frozen at import and cannot change inside GAM
+// (10/22). 'same person' makes the debt count for every landlord who asks from
+// then on; 'somebody else' puts it away for good. Deciding twice is refused
+// rather than overwritten, and both answers are audited.
+adminRouter.post('/left-owing-reviews/:id/decide', requireAdmin, async (req, res, next) => {
+  try {
+    const body = z.object({
+      samePerson: z.boolean(),
+      note: z.string().max(1000).nullish(),
+    }).parse(req.body)
+    const said = await decideMatchReview({
+      reviewId: req.params.id,
+      samePerson: body.samePerson,
+      byUserId: req.user!.userId,
+      note: body.note ?? null,
+    })
+    if (!said.decided) throw new AppError(409, said.why)
+    await logAdminAction({
+      adminUserId: req.user!.userId,
+      actionType: 'left_owing_match_decided',
+      targetType: 'tenant_left_owing_match_review',
+      targetId: req.params.id,
+      metadata: { samePerson: body.samePerson },
+      ipAddress: req.ip ?? null,
+    })
+    res.json({ success: true, data: said })
+  } catch (e) { next(e) }
+})
+
 adminRouter.get('/nexus/dashboard', requireSuperAdmin, async (_req, res, next) => {
   try {
     const data = await getNexusDashboard()
@@ -972,6 +1040,31 @@ adminRouter.post('/nexus/register', requireSuperAdmin, async (req, res, next) =>
   } catch (e) { next(e) }
 })
 
+// Narrow (or re-widen) which of GAM's line items a state measures toward its
+// threshold. 10/17 (Nic): "if that state's not counting some of those, where
+// are we really at?" — a researched legal answer, recorded as data so the page
+// can show that state's own subtotal beside the combined total. It collects no
+// tax and moves no money; the combined total still drives every crossing.
+adminRouter.post('/nexus/measure-rule', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const schema = z.object({
+      stateCode: z.string().length(2),
+      counts: z.record(z.enum(NEXUS_LINE_ITEMS), z.boolean()),
+      notes: z.string().max(500).optional().nullable(),
+    })
+    const body = schema.parse(req.body)
+    await setStateMeasureRule(body.stateCode, body.counts, { notes: body.notes ?? undefined })
+    await logAdminAction({
+      adminUserId: req.user!.userId,
+      actionType: 'nexus_measure_rule',
+      targetType: 'state_nexus_measure_rule',
+      metadata: { state: body.stateCode.toUpperCase(), counts: body.counts },
+      ipAddress: req.ip ?? null,
+    })
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
 // ── ONBOARDING OVERVIEW (regular admin) ──────────────────────
 // S592: exported for the scoped /api/portfolio router — caller-scoped by userId
 // (super_admin → platform-wide), identical for a portfolio_manager.
@@ -985,11 +1078,13 @@ export const onboardingOverviewHandler = async (req: any, res: any, next: any) =
       SELECT
         (SELECT COUNT(*)::int FROM landlords l WHERE l.onboarding_complete=FALSE
            AND ($1::uuid IS NULL OR l.portfolio_manager_id=$1::uuid OR l.service_manager_id=$1::uuid)) AS landlords_incomplete,
+        -- 10/12 (Nic): "no bank" = Stripe cannot pay them yet. This counted
+        -- rows in the legacy bank catalog (the old Add Bank Account form, now
+        -- removed), which never set up payouts — so a landlord with live
+        -- Connect payouts counted as missing a bank, and one who only typed a
+        -- routing number in (Country Acres, 10/5) counted as done.
         (SELECT COUNT(*)::int FROM landlords l
-          WHERE NOT EXISTS (
-            SELECT 1 FROM user_bank_accounts ba
-             WHERE ba.user_id = l.user_id AND ba.status = 'active'
-          )
+          WHERE NOT COALESCE(l.connect_payouts_enabled, FALSE)
           AND ($1::uuid IS NULL OR l.portfolio_manager_id=$1::uuid OR l.service_manager_id=$1::uuid)
         ) AS landlords_no_bank,
         (SELECT COUNT(*)::int FROM tenants t WHERE t.ach_verified=FALSE
@@ -1008,16 +1103,21 @@ export const onboardingOverviewHandler = async (req: any, res: any, next: any) =
                JOIN units un ON un.id=le.unit_id
                JOIN landlords ld ON ld.id=un.landlord_id
                WHERE vlat.tenant_id=t.id AND (ld.portfolio_manager_id=$1::uuid OR ld.service_manager_id=$1::uuid)))) AS tenants_no_flex,
-        (SELECT COUNT(*)::int FROM units un WHERE un.status='vacant'
-           AND ($1::uuid IS NULL OR EXISTS (
-             SELECT 1 FROM landlords ld WHERE ld.id=un.landlord_id
-              AND (ld.portfolio_manager_id=$1::uuid OR ld.service_manager_id=$1::uuid)))) AS vacant_units,
         (SELECT COUNT(*)::int FROM v_unit_occupancy vuo WHERE NOT vuo.is_occupied
            AND ($1::uuid IS NULL OR EXISTS (
              SELECT 1 FROM units un JOIN landlords ld ON ld.id=un.landlord_id
               WHERE un.id=vuo.unit_id AND (ld.portfolio_manager_id=$1::uuid OR ld.service_manager_id=$1::uuid)))) AS units_no_tenant
     `, [scopeId])
-    res.json({ success: true, data: stats })
+    // 10/12 (Nic, A5: "MATCH BILLING (occupied = billable evidence; vacant =
+    // rest; retired excluded)"). This tile counted unit STATUS = 'vacant' — a
+    // label somebody typed — while the Overview's vacant count follows the
+    // platform fee, so the admin showed two different "vacant" numbers. Now
+    // the same count as the Overview (services/platformMetrics spacesOccupied:
+    // open spaces on live properties of real landlords, less those occupied
+    // this month the way the bill counts them), in this admin's portfolio.
+    const { spacesOccupied } = await import('../services/platformMetrics')
+    const spaces = await spacesOccupied(undefined, { portfolioUserId: scopeId })
+    res.json({ success: true, data: { ...stats, vacant_units: spaces.vacant } })
   } catch (e) { next(e) }
 }
 adminRouter.get('/onboarding/overview', onboardingOverviewHandler)
@@ -1030,10 +1130,9 @@ export const onboardingLandlordDetailHandler = async (req: any, res: any, next: 
   try {
     const landlord = await queryOne<any>(
       `SELECT l.*, u.first_name, u.last_name, u.email, u.phone,
-        EXISTS (
-          SELECT 1 FROM user_bank_accounts ba
-           WHERE ba.user_id = l.user_id AND ba.status = 'active'
-        ) AS bank_account_ready
+        -- 10/12 (Nic): ready = Stripe Connect payouts are live, nothing else
+        -- (see landlords_no_bank above).
+        COALESCE(l.connect_payouts_enabled, FALSE) AS bank_account_ready
        FROM landlords l JOIN users u ON u.id = l.user_id
        WHERE l.id = $1`, [req.params.id]
     )
@@ -1052,11 +1151,7 @@ export const onboardingLandlordDetailHandler = async (req: any, res: any, next: 
          COUNT(DISTINCT p.id)::int AS property_count,
          COUNT(DISTINCT u.id)::int AS unit_count,
          COUNT(DISTINCT u.id) FILTER (WHERE vuo.is_occupied)::int AS units_with_tenants,
-         COUNT(DISTINCT l.id) FILTER (WHERE l.status='active')::int AS active_leases,
-         (
-           SELECT COUNT(*)::int FROM user_bank_accounts ba
-            WHERE ba.user_id = ld.user_id AND ba.status = 'active'
-         ) AS active_bank_accounts
+         COUNT(DISTINCT l.id) FILTER (WHERE l.status='active')::int AS active_leases
        FROM landlords ld
        LEFT JOIN properties p ON p.landlord_id = ld.id
        LEFT JOIN units u ON u.landlord_id = ld.id
@@ -1068,7 +1163,10 @@ export const onboardingLandlordDetailHandler = async (req: any, res: any, next: 
 
     const checklist = [
       { key: 'account_created',   label: 'Account created',         done: true },
-      { key: 'bank_account_added', label: 'Bank account added',     done: counts.active_bank_accounts > 0 },
+      // 10/12 (Nic): done when Stripe can pay them — not when a routing number
+      // sat in the legacy catalog (the removed Add Bank Account form). Key kept
+      // so existing readers of the checklist do not break.
+      { key: 'bank_account_added', label: 'Payouts set up with Stripe', done: !!landlord.bank_account_ready },
       { key: 'property_added',    label: 'Property added',           done: counts.property_count > 0 },
       { key: 'unit_added',        label: 'Units added',              done: counts.unit_count > 0 },
       { key: 'tenant_invited',    label: 'Tenant invited',           done: counts.units_with_tenants > 0 },
@@ -1688,6 +1786,15 @@ adminRouter.get('/platform-balance', requireSuperAdmin, async (_req, res, next) 
              COALESCE(SUM(amount) FILTER (WHERE created_at >= date_trunc('month', CURRENT_DATE)), 0)::float AS this_month,
              COALESCE(SUM(amount), 0)::float AS all_time
         FROM platform_revenue_ledger GROUP BY type ORDER BY all_time DESC`)
+    // 10/13 (Nic, full purchase): "each $87.50 payment as paying it back
+    // (lowers 'earned all time' until repaid)" — what the card readers put in
+    // the earned figure, all time, so the card can say why it is lower.
+    const [readers] = await query<{ bought: number; repaid: number; markup: number }>(`
+      SELECT COALESCE(SUM(amount) FILTER (WHERE type = 'adjustment' AND reference_type = '${READER_BOOK_REFERENCE.purchase}'), 0)::float AS bought,
+             COALESCE(SUM(amount) FILTER (WHERE type = 'adjustment' AND reference_type = '${READER_BOOK_REFERENCE.costRepaid}'), 0)::float AS repaid,
+             COALESCE(SUM(amount) FILTER (WHERE type = 'device_markup'), 0)::float AS markup
+        FROM platform_revenue_ledger
+       WHERE type = 'device_markup' OR (type = 'adjustment' AND reference_type IN ('${READER_BOOK_REFERENCE.purchase}', '${READER_BOOK_REFERENCE.costRepaid}'))`)
     const r = split.reconciliation
     res.json({ success: true, data: {
       stripe_available: split.stripeAvailable,
@@ -1765,9 +1872,38 @@ adminRouter.get('/platform-balance', requireSuperAdmin, async (_req, res, next) 
         book: r.book,
         on_balance: r.onBalance,
         gap: r.gap,
+        // 10/12 (Nic, A3): "SHOW THE BRIDGE" — from what the earnings ledger
+        // says GAM has earned to GAM's own on the balance, line by line; the
+        // leftover must read $0.00 (services/stripeCosts platformBalanceBridge).
+        bridge: r.bridge ? {
+          earned: r.bridge.earned,
+          platform_fees_not_collected: r.bridge.platformFeesNotCollected,
+          // 10/12 (G5 review): the part of a processing fee a landlord covers
+          // that the payment could not hold, billed to them and not collected yet.
+          processing_fees_not_collected: r.bridge.processingFeesNotCollected,
+          // 10/13 (Nic, full purchase): a card reader is inside `earned` as its
+          // purchase (an expense) and each piece billed (cost repaid, then
+          // markup). The purchase was paid outside the Stripe balance, so it is
+          // added back; pieces billed and not collected yet are taken off.
+          reader_bought: r.bridge.readerBought,
+          reader_billed_not_collected: r.bridge.readerBilledNotCollected,
+          reader_payments_collected: r.bridge.readerPaymentsCollected,
+          reader_cost_repaid_collected: r.bridge.readerCostRepaidCollected,
+          reader_markup_collected: r.bridge.readerMarkupCollected,
+          paid_out_to_gam_bank: r.bridge.paidOutToGamBank,
+          // Not "items": the camelizer passes an `items` value through untouched.
+          timing: r.bridge.timing.map(t => ({ key: t.key, label: t.label, amount: t.amount })),
+          gams_own: r.bridge.gamsOwn,
+          on_balance: r.bridge.onBalance,
+          leftover: r.bridge.leftover,
+        } : null,
       } : null,
       owed_by_landlords_uncollected: split.owedByLandlordsUncollected,
+      // 10/12 (Nic) review: the same figure kind by kind, so the card can say
+      // what it is (platform fees, card-reader installments …).
+      owed_by_landlords_by_kind: split.owedByLandlordsByKind,
       revenue_by_type: revenue,
+      readers_in_earned: { bought: readers.bought, cost_repaid: readers.repaid, markup: readers.markup },
       revenue_this_month: Math.round(revenue.reduce((a: number, x: any) => a + Number(x.this_month), 0) * 100) / 100,
       revenue_all_time: Math.round(revenue.reduce((a: number, x: any) => a + Number(x.all_time), 0) * 100) / 100,
     } })
@@ -1900,8 +2036,13 @@ const INCOME_WINDOWS: Record<string, { start: string; label: string }> = {
  * function that says what GAM bills is the one being asked.
  */
 async function currentPlatformRunRate(): Promise<number> {
-  const props = await query<{ id: string }>(`
-    SELECT p.id
+  // 10/12 (Nic): the $10 minimum is per payout account, not per property
+  // (S630 — gam-platform-minimum-per-connect-account). This forecast floored
+  // every property on its own, so two small properties on one payout account
+  // forecast two minimums where the bill charges one. Grouped the way the
+  // accrual's applyConnectAccountMinimums groups them.
+  const props = await query<{ id: string; group_key: string }>(`
+    SELECT p.id, COALESCE(l.stripe_connect_account_id, 'entity:' || l.id::text) AS group_key
       FROM properties p
       JOIN landlords l ON l.id = p.landlord_id
      WHERE l.is_system IS NOT TRUE
@@ -1921,11 +2062,14 @@ async function currentPlatformRunRate(): Promise<number> {
 
   const client = await getClient()
   try {
-    let total = 0
+    const spacesByGroup = new Map<string, number>()
     for (const p of props) {
       const b = await billableUnitsForProperty(client, p.id, monthIso, arrears, NIGHTS_AGGREGATION_UNIT_TYPES)
-      if (b.total > 0) total += launchPlatformFeeForProperty(b.total)
+      if (b.total > 0) spacesByGroup.set(p.group_key, (spacesByGroup.get(p.group_key) ?? 0) + b.total)
     }
+    // max($2 × spaces, $10) once per payout account with something billable.
+    let total = 0
+    for (const spaces of spacesByGroup.values()) total += launchPlatformFeeForProperty(spaces)
     return total
   } finally { client.release() }
 }
@@ -1944,32 +2088,27 @@ const REVENUE_SLICES: Array<{ key: string; label: string; types: string[]; recur
   { key: 'flexpay',            label: 'FlexPay',             types: ['flexpay_subscription'],      recurring: false },
   { key: 'placement',          label: 'Placement Fees',      types: ['placement_fee_share'],       recurring: false },
   { key: 'instant_withdrawal', label: 'Instant Withdrawals', types: ['manual_withdrawal_fee'],     recurring: false },
+  // 10/13 (Nic, full purchase): "Book the $331.73 as an expense the day we buy
+  // it, and each $87.50 payment as paying it back (lowers 'earned all time'
+  // until repaid)." A reader is three slices: what GAM paid for it (below
+  // zero), the pieces paying that cost back, and — once it is repaid — the
+  // markup (10/12, Q-g: cost first; the only part that is earnings beyond the
+  // cost). The purchase and the cost repaid are 'adjustment' rows of their own
+  // reference (SLICE_TYPE_SQL).
+  { key: 'card_reader_purchases', label: 'Card Readers Bought',      types: ['reader_purchase'],     recurring: false },
+  { key: 'card_reader_repaid',    label: 'Card Reader Cost Repaid', types: ['reader_cost_repaid'],  recurring: false },
+  { key: 'card_reader_markup',    label: 'Card Reader Markup',      types: ['device_markup'],       recurring: false },
   { key: 'adjustments',        label: 'Adjustments',         types: ['adjustment'],                recurring: false },
 ]
 
-// S653 (Nic): "Where are those adjustments coming from? Because we are not
-// spending any money." The monthly processing true-up (services/platformRevenue
-// trueUpProcessingMargin) is typed 'adjustment' with its own reference_type, but
-// it IS processing income — it is the correction that makes the estimated
-// per-payment spreads equal Stripe's real invoice. It belongs in the slice it
-// corrects, or the Processing slice under-reads every month and an unexplained
-// "adjustment" appears beside it.
-//
-// S655: likewise a FlexPay $25 taken back because its pull was taken back by
-// the bank (services/flexpay handleFlexPayPullReversed) is an 'adjustment' that
-// corrects the FlexPay slice, so it nets inside it.
-// 10/5 (Nic, prepaid stays): a screening margin taken back because the check
-// paid with a stay was cancelled before a report (services/stayTerms
-// restorePrepaidScreening) corrects the Background Checks slice.
-const SLICE_TYPE_SQL = `CASE WHEN type = 'adjustment' AND reference_type = 'processing_margin_true_up'
-                             THEN 'banking_spread'
-                             WHEN type = 'adjustment' AND reference_type = 'screening_margin_reversal'
-                             THEN 'screening_margin'
-                             WHEN type = 'adjustment' AND reference_type LIKE 'flexpay_advance_reversal%'
-                             THEN 'flexpay_subscription'
-                             ELSE type END`
+// Which slice each revenue-book row belongs to — one definition, shared with the
+// Metrics page's platform fees (services/revenueSlices, which says why each
+// adjustment goes where it goes).
+const SLICE_TYPE_SQL = REVENUE_SLICE_TYPE_SQL
 
-async function computeComposition(key: string, startSql: string, label: string, platformRunRate: number) {
+// 10/12 (Nic) review: `platformRunRate` is left out (null) by the polled
+// all-windows read, which does not compute the forecast unless asked.
+async function computeComposition(key: string, startSql: string, label: string, platformRunRate: number | null) {
   const rows = await query<{ type: string; amt: number }>(`
     SELECT ${SLICE_TYPE_SQL} AS type, COALESCE(SUM(amount), 0)::float AS amt
       FROM platform_revenue_ledger
@@ -1996,7 +2135,7 @@ async function computeComposition(key: string, startSql: string, label: string, 
   return {
     window: key, label, gross, sources,
     // Forward-looking, and kept apart from the history on purpose.
-    runRate: +platformRunRate.toFixed(2),
+    ...(platformRunRate == null ? {} : { runRate: +platformRunRate.toFixed(2) }),
   }
 }
 
@@ -2027,31 +2166,27 @@ adminRouter.get('/income/composition', requireSuperAdmin, async (req, res, next)
  * went out is the answer — it is a fact, and it is the number a landlord would
  * quote back at us.
  */
-async function recurringMonthlyFromLedger(): Promise<{ amount: number; month: string | null }> {
-  const recurringTypes = REVENUE_SLICES.filter(sl => sl.recurring).flatMap(sl => sl.types)
-  const rows = await query<{ month: string; amt: number }>(`
-    SELECT to_char(date_trunc('month', created_at), 'YYYY-MM') AS month,
-           COALESCE(SUM(amount), 0)::float AS amt
-      FROM platform_revenue_ledger
-     WHERE type = ANY($1::text[])
-     GROUP BY 1
-     -- The most recent month that actually billed something. An empty current
-     -- month (the 2nd, before the accrual runs) must not read as a collapse in
-     -- recurring revenue.
-     HAVING COALESCE(SUM(amount), 0) > 0
-     ORDER BY 1 DESC
-     LIMIT 1`, [recurringTypes])
-  const r = rows[0]
-  return { amount: r ? Math.round(Number(r.amt) * 100) / 100 : 0, month: r?.month ?? null }
-}
+//
+// 10/12 (Nic): "as we bill for that month, so next month when it goes up, I
+// want to see what we billed." Still the bill, still the book — now read by
+// the month each line BILLS (an accrual's own month, not the day it was
+// written), without the screening sweep, and split by property with the
+// spaces each was billed for. See services/platformFeeBill.
 
-adminRouter.get('/income/composition/all', requireSuperAdmin, async (_req, res, next) => {
+adminRouter.get('/income/composition/all', requireSuperAdmin, async (req, res, next) => {
   try {
-    const rr = await currentPlatformRunRate()
+    const { platformFeeBill } = await import('../services/platformFeeBill')
+    // 10/12 (Nic) review: the Recurring Revenue card polls this every 30
+    // seconds on the Overview and the Metrics page. The forward run-rate runs
+    // billableUnitsForProperty once per live property, one after another —
+    // hundreds of serial queries per poll at an 11,000-unit PM — for a number
+    // no screen shows. It is computed only when asked for (?withRunRate=1);
+    // the recurring bill and the pies are a handful of aggregates.
+    const rr = req.query.withRunRate === '1' ? await currentPlatformRunRate() : null
     const keys = ['month', 'quarter', 'ytd', 'rolling12', 'all']
     const [periods, recurring] = await Promise.all([
       Promise.all(keys.map(k => computeComposition(k, INCOME_WINDOWS[k].start, INCOME_WINDOWS[k].label, rr))),
-      recurringMonthlyFromLedger(),
+      platformFeeBill(),
     ])
     res.json({ success: true, data: {
       periods,
@@ -2059,9 +2194,100 @@ adminRouter.get('/income/composition/all', requireSuperAdmin, async (_req, res, 
       recurringMonthly: recurring.amount,
       recurringMonth:   recurring.month,
       recurringAnnual:  Math.round(recurring.amount * 12 * 100) / 100,
-      // The forward number, kept separate and named as what it is.
-      platformRunRate:  +rr.toFixed(2),
+      // 10/12 (Nic): the month's bill, property by property — spaces billed,
+      // dollars billed, and what no payout has taken yet.
+      recurringSpaces:       recurring.spaces,
+      recurringNotCollected: recurring.notCollected,
+      recurringByProperty:   recurring.byProperty,
+      // The forward number, kept separate and named as what it is — only when asked for.
+      ...(rr == null ? {} : { platformRunRate: +rr.toFixed(2) }),
     } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/metrics — 10/12 (Nic): the Metrics page's all-time numbers
+// ("total rents that we've ever processed electronically ... rent collected
+// through the platform all time, whether that's paid in cash or check").
+// Super admin only, like every platform-wide money figure here (S570: the
+// admin role must never see platform financials). Read only; cached a minute
+// (services/platformMetrics).
+adminRouter.get('/metrics', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const { platformMetrics } = await import('../services/platformMetrics')
+    res.json({ success: true, data: await platformMetrics() })
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/metrics/boundaries/:layer[/:state] — 10/13 (Nic): the
+// Metrics map's city, district and ZIP code shapes (Census boundary files kept
+// in apps/api/geo; services/platformMetricsGeo). Behind the same login as the
+// Metrics page — never on a public site or a CDN (gam-nothing-public-rule).
+// The raw TopoJSON, gzipped as it sits on disk; cached a day by the browser.
+adminRouter.get('/metrics/boundaries/:layer/:state?', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const { readBoundary } = await import('../services/platformMetricsGeo')
+    const file = await readBoundary(req.params.layer, req.params.state, req.acceptsEncodings('gzip') === 'gzip')
+    if (!file) throw new AppError(404, 'There is no such map.')
+    res.set('Cache-Control', 'private, max-age=86400')
+    res.vary('Accept-Encoding')
+    if (file.gzipped) res.set('Content-Encoding', 'gzip')
+    res.type('application/json').send(file.body)
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/metrics/census/:level — 10/17 (Nic): the census numbers the
+// Metrics map's saturation overlay divides GAM's footprint by ("we are
+// responsible for 30% of the population or 60% of the total rental units").
+// American Community Survey five-year estimates, cut into one file per map
+// level and kept in apps/api/census (services/platformCensus). Behind the same
+// login as the Metrics page — never on a public site or a CDN
+// (gam-nothing-public-rule). Fetched once per level, the first time the
+// overlay is turned on there; cached a day by the browser.
+adminRouter.get('/metrics/census/:level', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const { readCensus } = await import('../services/platformCensus')
+    const file = await readCensus(req.params.level, req.acceptsEncodings('gzip') === 'gzip')
+    if (!file) throw new AppError(404, 'There are no census numbers for that map level.')
+    res.set('Cache-Control', 'private, max-age=86400')
+    res.vary('Accept-Encoding')
+    if (file.gzipped) res.set('Content-Encoding', 'gzip')
+    res.type('application/json').send(file.body)
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/metrics/elections/:level — 10/18 (Nic): the election results
+// the Metrics map's lean overlay colors an area by ("the overlay to show which
+// way those certain districts vote, and where our strong areas tend to be in
+// Democratic areas or Republican areas"). Official county returns, cut into
+// one file per map level and kept in apps/api/elections
+// (services/platformElections). Only the county level has one — results are
+// published county by county, and the page says so plainly at every other
+// level rather than carrying a district margin nobody reported. Behind the
+// same login as the Metrics page — never on a public site or a CDN
+// (gam-nothing-public-rule). Fetched once per level, the first time the
+// overlay is turned on there; cached a day by the browser.
+adminRouter.get('/metrics/elections/:level', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const { readElections } = await import('../services/platformElections')
+    const file = await readElections(req.params.level, req.acceptsEncodings('gzip') === 'gzip')
+    if (!file) throw new AppError(404, 'There are no election results for that map level.')
+    res.set('Cache-Control', 'private, max-age=86400')
+    res.vary('Accept-Encoding')
+    if (file.gzipped) res.set('Content-Encoding', 'gzip')
+    res.type('application/json').send(file.body)
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/metrics/lifetime — 10/13 (Nic): the Metrics page's money
+// billed and collected (rent, each utility, GAM's platform fees), tenants ever
+// on GAM, the landlords' default rate through GAM (by rent range) and ages.
+// Super admin only, read only, cached a minute (services/platformMetrics
+// platformLifetimeMetrics). Its own request, so the page's first numbers never
+// wait on it.
+adminRouter.get('/metrics/lifetime', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const { platformLifetimeMetrics } = await import('../services/platformMetrics')
+    res.json({ success: true, data: await platformLifetimeMetrics() })
   } catch (e) { next(e) }
 })
 
@@ -2598,13 +2824,20 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
     const countedDefault = flexPayCountedDefaultSql('fa')
     // S542c (Nic): queue ordered by FLOAT NEED — shortest float first,
     // FIFO created_at as tiebreak. Float = days between GAM's front
-    // (lease grace-period end, default 5) and the tenant's benefit-
+    // (grace-period end: lease, else property, else 5) and the tenant's benefit-
     // arrival day; a benefit day at/before grace-end is ~zero float.
     // Shorter float recycles bankroll faster (3 tenants × 1 week beats
     // 1 tenant × 3 weeks) and longer floats earn less per dollar-day.
     // Unknown day (questionnaire-funneled) sorts LAST until captured.
     // Position numbers are ADMIN-SIDE ONLY — tenants never see one.
     // state_hold rows keep their place but cannot be approved (422).
+    //
+    // 10/12 (Nic): "Grace = lease, else property, else 5 — the only chain."
+    // The front is the late-fee engine's grace (services/lateness, one
+    // definition). Lease-else-5 measured a park with a 2-day grace as if
+    // FlexPay fronted on the 5th, understating the float by 3 days and
+    // queueing that tenant ahead of shorter ones.
+    const grace = graceDaysSql('l', 'pr')
     const rows = await query<any>(
       `SELECT fi.id, fi.status, fi.claimed_income_source, fi.tenant_note,
               fi.admin_notes, fi.created_at, fi.reviewed_at,
@@ -2612,7 +2845,7 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
               -- NB: CASE guard required — GREATEST(0, NULL) is 0 in
               -- Postgres, which would sort unknown-day rows FIRST.
               CASE WHEN fi.desired_pull_day IS NULL THEN NULL
-                   ELSE GREATEST(0, fi.desired_pull_day - COALESCE(l.late_fee_grace_days, 5))
+                   ELSE GREATEST(0, fi.desired_pull_day - ${grace})
               END AS est_float_days,
               -- S545: lease context the reviewer needs — the terms the
               -- float rides on: due day, remaining term.
@@ -2661,7 +2894,7 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
                    AND NOT COALESCE(t.flexpay_returner_cleared, false)) ASC,
                   (fi.claimed_income_source IN ('ssi', 'ssdi')) DESC,
                   CASE WHEN fi.desired_pull_day IS NULL THEN NULL
-                       ELSE GREATEST(0, fi.desired_pull_day - COALESCE(l.late_fee_grace_days, 5))
+                       ELSE GREATEST(0, fi.desired_pull_day - ${grace})
                   END ASC NULLS LAST,
                   fi.created_at ASC))::int
               END AS queue_position,
@@ -2686,7 +2919,7 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
                  is_flexpay_returner ASC,
                  (fi.claimed_income_source IN ('ssi', 'ssdi')) DESC,
                  CASE WHEN fi.desired_pull_day IS NULL THEN NULL
-                      ELSE GREATEST(0, fi.desired_pull_day - COALESCE(l.late_fee_grace_days, 5))
+                      ELSE GREATEST(0, fi.desired_pull_day - ${grace})
                  END ASC NULLS LAST,
                  fi.created_at ASC`,
       [status, otherIncomeOpen],
@@ -4236,6 +4469,44 @@ adminRouter.patch('/reader-orders/:id', requireSuperAdmin, async (req, res, next
     }).parse(req.body)
     const { adminUpdateReaderOrder } = await import('../services/readerOrders')
     res.json({ success: true, data: await adminUpdateReaderOrder(req.params.id, body) })
+  } catch (e) { next(e) }
+})
+/**
+ * 10/12 (Nic): "those orders are going to need to be tracked because shipping
+ * will vary." GAM's actual cost of the reader, typed from the shop receipt:
+ * base price, tax and shipping — or tax and shipping as one figure when the
+ * receipt does not split them. Each save is a new entry (the old ones are
+ * kept). 10/13 (Nic): "allow dated cost corrections" — `effectiveOn`
+ * ('YYYY-MM-DD') is the day the entry applies from: the day GAM bought the
+ * reader, or the day a correction (a refund, extra shipping) applies from;
+ * never before the entry it corrects (409). A payment billed on or after it
+ * is split under it. (10/13, Nic: full purchase) The entry goes into GAM's
+ * own book at once — the first as the purchase, GAM's expense, on its date; a
+ * correction as the difference on its own date; nothing already booked is
+ * rewritten (services/readerOrders bookReaderBook). Returns the order as the
+ * desk shows it.
+ */
+adminRouter.post('/reader-orders/:id/cost', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const amt = z.number().finite().nonnegative().max(100000)
+    const body = z.object({
+      basePrice: amt,
+      tax: amt.nullable().optional(),
+      shipping: amt.nullable().optional(),
+      taxAndShipping: amt.nullable().optional(),
+      note: z.string().trim().max(500).nullable().optional(),
+      effectiveOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Give the date as YYYY-MM-DD.').nullable().optional(),
+    }).refine(b => b.taxAndShipping == null || (b.tax == null && b.shipping == null),
+      { message: 'Enter tax and shipping separately, or as one combined amount — not both.' })
+      .parse(req.body)
+    const { recordReaderOrderCost } = await import('../services/readerOrders')
+    const data = await recordReaderOrderCost(req.params.id, body, req.user!.userId)
+    await logAdminAction({
+      adminUserId: req.user!.userId, actionType: 'reader_order_cost_recorded',
+      targetId: req.params.id, targetType: 'pos_reader_order',
+      metadata: { ...body, total: data?.cost_total ?? null }, ipAddress: req.ip ?? null,
+    })
+    res.json({ success: true, data })
   } catch (e) { next(e) }
 })
 

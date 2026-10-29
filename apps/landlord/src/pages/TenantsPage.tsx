@@ -6,6 +6,7 @@ import { Plus, UserPlus, MailWarning } from 'lucide-react'
 import { InviteTenantModal } from './InviteTenantModal'
 import { usePerms } from '../lib/permissions'
 import { SearchBox, PropertySelect } from '../components/ListControls'
+import { healthColor } from '../lib/paymentStamps'
 
 
 /**
@@ -71,6 +72,23 @@ function UndeliveredEmailNotice() {
   )
 }
 
+/** GET /tenants/health-by-unit: the health of the lease on each space. */
+interface LeaseHealth { unitId: string; leaseId: string; percent: number | null; label: string }
+
+/** Said on hover when the lease-by-lease health could not be read (the column shows a dash). */
+export const HEALTH_NOT_LOADED = 'Payment health could not be loaded — refresh the page to try again.'
+
+/**
+ * 10/13 (Nic): a space whose lease has nothing counted yet says why — the
+ * server's words ("Onboarding month — not counted", "No months to judge yet");
+ * the list's own column (GAM admin) has none to give, so "Nothing counted yet".
+ * Null — a dash — only while the figures load or when they could not be read.
+ */
+export function healthNoneText(h: { percent: number | null; label: string | null }, loading: boolean): string | null {
+  if (loading || h.label === HEALTH_NOT_LOADED) return null
+  return h.label ?? 'Nothing counted yet'
+}
+
 export function TenantsPage() {
   const [showInvite, setShowInvite] = useState(false)
   const [search, setSearch] = useState('')
@@ -78,6 +96,25 @@ export function TenantsPage() {
   const navigate = useNavigate()
   const { data: units = [], isLoading } = useQuery<any[]>('units', () => apiGet('/units'))
   const { can } = usePerms()
+  // 10/13 (Nic): "Tenants list + tenant profile: split health BY LEASE." One
+  // row per space, and each row's figure is the health of the LEASE on that
+  // space (GET /tenants/health-by-unit — the Rent Roll's figure for that
+  // household), so a person renting two spots on two leases reads each lease's
+  // own number. null (GAM admin): the list's own column. Until it answers, a
+  // dash — never the household figure in between; and a dash if it fails
+  // (10/13 review: the household figure would read the same number on both of
+  // a person's leases, undoing the split without a word), with why on hover.
+  const leaseHealth = useQuery<LeaseHealth[] | null>('tenants-health-by-unit',
+    () => apiGet<LeaseHealth[] | null>('/tenants/health-by-unit'), { retry: false })
+  const healthOf = (u: any): { percent: number | null; label: string | null } => {
+    if (leaseHealth.isLoading) return { percent: null, label: null }
+    if (leaseHealth.error) return { percent: null, label: HEALTH_NOT_LOADED }
+    if (leaseHealth.data == null) {
+      return { percent: u.paymentHealth == null ? null : Number(u.paymentHealth), label: null }
+    }
+    const h = leaseHealth.data.find(x => x.unitId === u.id)
+    return { percent: h?.percent ?? null, label: h?.label ?? null }
+  }
 
   const allTenants = units.filter(u => u.tenantFirst)
   const propertyOptions = allTenants.map((u: any) => ({ id: u.propertyId, name: u.propertyName }))
@@ -121,7 +158,7 @@ export function TenantsPage() {
           {/* S655 (Nic, 10/2): no SSI/SSDI column. "That's our check for the
               flex products" — GAM-side only. */}
           <table className="data-table" style={{minWidth:880}}>
-            <thead><tr><th style={{width:'22%'}}>Tenant</th><th>Unit</th><th>Property</th><th title="Charges paid on time, work trade counted as paid">Payment health</th><th>Rent</th><th>ACH</th></tr></thead>
+            <thead><tr><th style={{width:'22%'}}>Tenant</th><th>Unit</th><th>Property</th><th title="Months the lease on this space paid on time since joining GAM — judged on the whole month's bill after its grace period; late fees never count as a bill; a month work trade covers counts as on time">Payment health</th><th>Rent</th><th>ACH</th></tr></thead>
             <tbody>
               {tenants.length ? tenants.map((u: any) => (
                 <tr key={u.id} onClick={() => u.tenantId && navigate(`/tenants/${u.tenantId}`)} style={{ cursor: u.tenantId ? 'pointer' : 'default' }}>
@@ -129,11 +166,23 @@ export function TenantsPage() {
                   <td className="mono">{u.unitNumber}</td>
                   <td style={{fontSize:'.82rem'}}>{u.propertyName}</td>
                   {/* S652 (Nic): the percentage on the first screen, between property
-                      and rent. Work trade reads 100% — hours paid it. */}
-                  <td className="mono">{u.paymentHealth == null
-                    ? <span style={{color:'var(--text-3)'}}>—</span>
-                    : <span style={{fontWeight:700,color:Number(u.paymentHealth)>=90?'var(--green)':Number(u.paymentHealth)>=70?'var(--amber)':'var(--red)'}}>{Number(u.paymentHealth)}%</span>}</td>
-                  <td className="mono">{u.rentAmount ? `$${Number(u.rentAmount).toLocaleString()}` : '—'}
+                      and rent. 10/12 (Nic): the one definition — months paid on
+                      time since the household joined GAM (all time, per bill month).
+                      10/13 (Nic): the lease on this space's own figure. */}
+                  <td className="mono" title={healthOf(u).label ?? undefined}>{(() => {
+                    const h = healthOf(u)
+                    if (h.percent != null) return <span style={{fontWeight:700,color:healthColor(h.percent)}}>{h.percent}%</span>
+                    // 10/13 (Nic): "Keep it out, but say so" — nothing counted yet is
+                    // said in words ("Onboarding month — not counted"), never a bare
+                    // dash. A dash only while the figures load, or when they could
+                    // not be read (why on hover).
+                    const words = healthNoneText(h, leaseHealth.isLoading)
+                    return words
+                      ? <span style={{color:'var(--text-3)',fontFamily:'var(--font-body)',fontSize:'.72rem',fontWeight:600}}>{words}</span>
+                      : <span style={{color:'var(--text-3)'}}>—</span>
+                  })()}</td>
+                  {/* 10/12 (Nic): the lease's rent, not the space's listed price (the Rent Roll's figure). */}
+                  <td className="mono">{(u.leaseRentAmount ?? u.rentAmount) ? `$${Number(u.leaseRentAmount ?? u.rentAmount).toLocaleString()}` : '—'}
                     {u.workTradeRent && <div style={{fontSize:'.68rem',color:'var(--text-3)'}}>traded for work</div>}</td>
                   {/* S640 (Nic): a work-trade resident pays in hours and will
                       never link a bank, so "ACH pending" is a chore that can

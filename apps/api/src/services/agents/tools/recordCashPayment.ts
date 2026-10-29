@@ -173,7 +173,23 @@ export const recordCashPayment: AgentTool = {
         owedIfUsed: q.owedIfUsed, owedIfSaved: q.owedIfSaved, creditAvailable: q.usableCredit,
         tellThem: `Ask: use the $${q.usableCredit.toFixed(2)} credit (they owe $${q.owedIfUsed.toFixed(2)}) or save it (they owe $${q.owedIfSaved.toFixed(2)})? Then call again with credit "use" or "save" and creditAvailable ${q.usableCredit.toFixed(2)}.`,
       })
-      if (q.usableCredit > 0 && credit == null) {
+      // 10/26 (Nic): "the platform needs to operate the same per setting, no
+      // matter which angle you're coming in from." Where the landlord turned
+      // "let residents save credit for later" off, there is no question — the
+      // assistant does not ask it, and it refuses an answer of "save" rather
+      // than quietly doing the opposite of the property's own setting.
+      if (q.usableCredit > 0 && q.creditMustBeUsed) {
+        if (credit === 'save') {
+          await client.query('ROLLBACK')
+          return {
+            ok: false,
+            error: `Credit goes on the balance at this property — it cannot be saved for later. Nothing was recorded.`,
+            tellThem: `Tell the landlord their property applies credit to the next bill, so ${name}'s `
+              + `$${q.usableCredit.toFixed(2)} goes on this one and they owe $${q.owedIfUsed.toFixed(2)}. `
+              + `Then call again without a credit answer.`,
+          }
+        }
+      } else if (q.usableCredit > 0 && credit == null) {
         await client.query('ROLLBACK')
         return askAgain(`${name} has $${q.usableCredit.toFixed(2)} of account credit that can pay part of this bill.`)
       }
@@ -191,6 +207,8 @@ export const recordCashPayment: AgentTool = {
           tellThem: `Tell the landlord there is no credit to use and they owe $${q.owedIfSaved.toFixed(2)}; once they confirm the amount, call again without credit.`,
         }
       }
+      // Where nobody was asked there is no figure to have been told, so the
+      // told-figure check applies only to an answer actually given.
       if (credit != null && usableCents > 0) {
         if (toldCents == null) {
           await client.query('ROLLBACK')
@@ -213,7 +231,9 @@ export const recordCashPayment: AgentTool = {
         provenance: 'recorded by the assistant',
         settleHousehold: true,
         amountTendered: amount,
-        creditToUse: q.usableCredit > 0 ? (credit === 'use' ? q.usableCredit : 0) : null,
+        creditToUse: q.usableCredit > 0
+          ? ((credit === 'use' || q.creditMustBeUsed) ? q.usableCredit : 0)
+          : null,
         surplusHandling: surplus as any,
         towardOldBalance: args.towardOldBalance != null ? Number(args.towardOldBalance) : null,
         confirmWrittenAmount: args.writtenAmountConfirmed === true,

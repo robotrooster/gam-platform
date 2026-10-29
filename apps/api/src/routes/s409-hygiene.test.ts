@@ -191,17 +191,30 @@ describe('S402b: PATCH /api/notifications/preferences body validation', () => {
     finally { c.release() }
   }
 
-  it('happy path: valid snake_case type accepted', async () => {
+  // 10/20: the type also has to be one GAM actually sends. This used a made-up
+  // 'rent_due', which the route now refuses — a preference row for a
+  // notification nothing sends is a row nobody can act on.
+  it('happy path: a real notification type is accepted', async () => {
     const { userId, token } = await seedUser()
     const res = await request(buildNotificationsApp())
       .patch('/api/notifications/preferences')
       .set('Authorization', `Bearer ${token}`)
-      .send({ type: 'rent_due', emailEnabled: true, smsEnabled: false, inAppEnabled: true })
+      .send({ type: 'rent_collected', emailEnabled: true, smsEnabled: false, inAppEnabled: true })
     expect(res.status).toBe(200)
     const { rows } = await db.query<any>(
       `SELECT type, email_enabled FROM notification_preferences WHERE user_id=$1`, [userId])
     expect(rows).toHaveLength(1)
-    expect(rows[0].type).toBe('rent_due')
+    expect(rows[0].type).toBe('rent_collected')
+  })
+
+  it('a snake_case type GAM does not send → 400, naming it', async () => {
+    const { token } = await seedUser()
+    const res = await request(buildNotificationsApp())
+      .patch('/api/notifications/preferences')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ type: 'rent_due', emailEnabled: true, inAppEnabled: true })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toContain('rent_due')
   })
 
   it('rejects type with uppercase letters → 400', async () => {

@@ -18,9 +18,13 @@
  * S655 (Nic, 10/2): "use my account credit first" — the tenant's own setting,
  * OFF by default. Off: autopay charges the whole bill and any credit waits for
  * the tenant to use it. On: the credit pays its part and the rest is charged.
- * Credit is applied by itself only when it covers a whole bill (the bill run
- * does that, and skips a bill with a GAM charge, a neighbor's utility or a
- * scheduled retry on it — so the copy never says "always").
+ * Credit on the account goes on the open balance by itself, oldest bill first
+ * (10/15 — not "only when it covers a whole bill", which this copy said until
+ * 10/18). The bill run does that, and skips a bill with a GAM charge, a
+ * neighbor's utility or a scheduled retry on it — so the copy never says
+ * "always". 10/18 (Nic): money the tenant paid ahead stays with the space they
+ * paid it for; a credit from the landlord crosses every space they hold with
+ * that company.
  */
 
 import { useState } from 'react'
@@ -251,7 +255,7 @@ function AutopayCard({ row, multi }: { row: AutopayRow; multi: boolean }) {
               <span style={{ display: 'block', fontSize: '.72rem', color: 'var(--t3)', marginTop: 2, lineHeight: 1.5 }}>
                 {useCredit
                   ? 'Any account credit pays its part of the bill and we charge the rest.'
-                  : 'Off: we charge the whole bill and your credit waits until you choose to use it. Money you paid ahead goes on your bill by itself; other credit is applied by itself only when it covers a whole bill.'}
+                  : 'Off: we charge the whole bill and your credit waits until you choose to use it. Money you paid ahead goes on your bill by itself and stays with the space you paid it for; credit from your landlord goes on your oldest bill first, whatever space it is on.'}
               </span>
             </span>
           </label>

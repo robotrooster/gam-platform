@@ -1,0 +1,317 @@
+import { useQuery } from 'react-query'
+import { declaredDateFlagText, type OpenMonthRow, type RentRollPayment } from '@gam/shared'
+import { apiGet } from '../../lib/api'
+import {
+  money, toCents, dayWord, returnDetail, chargeMonthsRange, readChargesById, CHARGE_PAGE_SIZE,
+  ZERO_TOLERANCE_TEXT, CREDIT_TAKEN_BACK_TEXT, type LedgerPayment, type ReturnFacts,
+} from '../../lib/creditDesk'
+import { BankReceiptPhoto } from '../BankReceiptPhoto'
+import { paidWords, spaceOnlyWords } from './openMonth'
+import { OtherMoneyLines } from './OtherMoney'
+
+// ── A ROW OPENED ON THE PAYMENTS PAGE ───────────────────────────────────────
+//
+// 10/13 (Nic), answered: "clicking the ROW opens underneath: each payment
+// (date, amount, method) and every charge on the bill with what it's for
+// (rent, water, late fee…)". The server sends both on the row
+// (OpenMonthRow.payments / .charges).
+//
+// What the Payments ledger showed on a payment is kept here, read from the same
+// ledger (GET /balances/payments-by-month — the row's payments carry its ids):
+// 10/5 (Nic) the photo of the bank's deposit receipt (seen, or added when it was
+// not sent with the payment) and the flag when the tenant dated a deposit
+// earlier than the bank ("Said they deposited Oct 1 — the bank shows Oct 6.");
+// S655 why a payment came back (the bank's reason with its code, and the
+// zero-tolerance mark), read from the charges (GET /payments) only when a
+// payment on the row came back.
+
+interface LedgerLine { paymentId: string; dueDate: string; returned: number; creditReturned: number }
+type LedgerRow = LedgerPayment & { lines: LedgerLine[] }
+
+const PAYMENT_BADGE: Record<RentRollPayment['status'], string> = {
+  settled: 'badge-green',
+  clearing: 'badge-blue',
+  returned: 'badge-red',
+}
+
+export function OpenMonthDetail({ row, month, canAddPhoto, ledgerFacts = true }: {
+  row: OpenMonthRow
+  /** 'YYYY-MM': the open month (the ledger month its payments are filed under). */
+  month: string
+  /** May add a missing bank-receipt photo (Take payments). */
+  canAddPhoto: boolean
+  /**
+   * Read what the Payments ledger says on each payment (the receipt photo, the
+   * deposit date flag, why one came back). false for a bookkeeper (10/13, Nic:
+   * the pages read-only) — those reads are not theirs (lib/bookkeeperAccess),
+   * so they are never asked — and for the front desk (10/14, Nic: "View who
+   * owes" without "View all payments"), whom the Payments ledger refuses.
+   */
+  ledgerFacts?: boolean
+}) {
+  const year = month.slice(0, 4)
+  // The ledger month, read once while any row with a payment is open; the desk
+  // window's own refresh ('payments-ledger') reads it again after a payment.
+  const { data: ledger, refetch: refetchLedger } = useQuery<{ payments: LedgerRow[] }>(
+    ['payments-ledger', 'month', month],
+    () => apiGet(`/balances/payments-by-month?month=${month}`),
+    { enabled: ledgerFacts && row.payments.length > 0, staleTime: 30_000, retry: false })
+  const ledgerById = new Map((ledger?.payments ?? []).map(p => [p.id, p]))
+  const facts = (p: RentRollPayment) => ledgerById.get(p.paymentId)
+
+  // Why a payment came back: only when one on this row did.
+  const cameBack = row.payments.some(p => {
+    const f = facts(p)
+    return p.status === 'returned' || toCents(f?.returned) > 0
+  })
+  const range = chargeMonthsRange(row.charges.map(c => c.dueDate))
+  const wanted = [...new Set(row.charges.map(c => c.chargeId))].sort()
+  const { data: returnRead } = useQuery<{ rows: Array<ReturnFacts & { id: string }>; complete: boolean }>(
+    ['payments-returns', range?.from ?? '', range?.to ?? '', wanted.join(',')],
+    () => readChargesById<ReturnFacts & { id: string }>(
+      page => apiGet(`/payments?from=${range!.from}&to=${range!.to}&limit=${CHARGE_PAGE_SIZE}&page=${page}`),
+      new Set(wanted)),
+    { enabled: ledgerFacts && cameBack && !!range && wanted.length > 0, staleTime: 60_000, retry: false })
+  const returnsById = new Map<string, NonNullable<ReturnType<typeof returnDetail>>>()
+  for (const r of returnRead?.rows ?? []) {
+    const d = returnDetail(r)
+    if (d && r.id) returnsById.set(r.id, d)
+  }
+  /** The reasons on the charges this payment paid (all the row's, when the ledger has no lines for it). */
+  const reasonsFor = (p: RentRollPayment) => {
+    const ids = facts(p)?.lines.map(l => l.paymentId) ?? row.charges.map(c => c.chargeId)
+    const seen = new Map<string, NonNullable<ReturnType<typeof returnDetail>>>()
+    for (const id of ids) {
+      const d = returnsById.get(id)
+      if (d && !seen.has(d.text)) seen.set(d.text, d)
+    }
+    return [...seen.values()]
+  }
+
+  return (
+    <div className="pay-detail-body">
+      <div className="pay-detail-block">
+        <div className="cd-section-label">Payments</div>
+        {row.payments.length === 0 ? (
+          <div className="pay-none">No payment on this month’s bills yet.</div>
+        ) : (
+          <table className="pay-lines">
+            <thead><tr><th>Date</th><th className="num">Amount</th><th>Method</th><th></th></tr></thead>
+            <tbody>
+              {row.payments.map(p => {
+                const f = facts(p)
+                const returned = p.status === 'returned' || toCents(f?.returned) > 0
+                const why = returned ? reasonsFor(p) : []
+                return (
+                  <tr key={p.paymentId} data-line="payment">
+                    <td className="day">{dayWord(p.paidOn, year)}</td>
+                    <td className="num">
+                      {money(p.amount)}
+                      {toCents(p.credit) > 0 && toCents(p.credit) < toCents(p.amount) && (
+                        <span className="pay-sub">{money(p.credit)} from credit</span>
+                      )}
+                      {toCents(f?.returned) > 0 && <span className="pay-sub cd-timing-late">{money(f!.returned)} taken back</span>}
+                      {toCents(f?.creditReturned) > 0 && <span className="pay-sub cd-timing-late">{money(f!.creditReturned)} credit taken back</span>}
+                    </td>
+                    <td>
+                      {p.methodLabel}
+                      {p.reference && <span className="pay-sub">#{p.reference}</span>}
+                      {/* 10/15 (Nic): "lets record devices so if a problem
+                          happens we can solve" — a payment somebody typed in
+                          says who, and from what. */}
+                      {p.recordedBy && (
+                        <span className="pay-sub">
+                          Recorded by {p.recordedBy}{p.recordedFrom ? ` · ${p.recordedFrom}` : ''}
+                        </span>
+                      )}
+                      {f?.method === 'bank_deposit' && (
+                        <BankReceiptPhoto receiptId={f.receiptId} url={f.depositPhotoUrl}
+                          canAdd={canAddPhoto} onAdded={() => { void refetchLedger() }} />
+                      )}
+                      {f?.tenantReceiptPhotoUrl && (
+                        <BankReceiptPhoto receiptId={f.receiptId} url={f.tenantReceiptPhotoUrl}
+                          canAdd={false} onAdded={() => {}} label="Tenant's photo of the bank receipt" />
+                      )}
+                      {f?.depositDateFlag && (
+                        <div className="cd-ledger-sub cd-timing-late" role="note">
+                          {declaredDateFlagText(f.depositDateFlag.said, f.depositDateFlag.bank)}
+                        </div>
+                      )}
+                    </td>
+                    <td>
+                      {p.status !== 'settled' && <span className={`badge ${PAYMENT_BADGE[p.status] ?? 'badge-muted'}`}>{p.statusLabel}</span>}
+                      {why.map(d => <div key={d.text} className="cd-ledger-sub cd-return">{d.text}</div>)}
+                      {why.some(d => d.zeroTolerance) && <div className="cd-ledger-sub cd-return cd-strong-sub">{ZERO_TOLERANCE_TEXT}</div>}
+                      {/* The bill's own charges were not disputed: the payment that put the
+                          credit on their account was (fix pass 2). */}
+                      {toCents(f?.creditReturned) > 0 && <div className="cd-ledger-sub cd-return">{CREDIT_TAKEN_BACK_TEXT}</div>}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
+        {returnRead?.complete === false && (
+          <div className="cd-note">
+            A returned payment here may show no reason — the month has too many charges to read them all here. GAM
+            support can tell you why it came back.
+          </div>
+        )}
+      </div>
+
+      <div className="pay-detail-block">
+        <div className="cd-section-label">What it’s for</div>
+        {row.charges.length === 0 ? (
+          <div className="pay-none">Nothing billed this month yet.</div>
+        ) : (
+          <table className="pay-lines">
+            <thead>
+              <tr><th>For</th><th>Due</th><th className="num">Invoiced</th><th className="num">Paid</th><th className="num">Owed</th></tr>
+            </thead>
+            <tbody>
+              {row.charges.map(c => {
+                const paid = paidWords(c)
+                const why = returnsById.get(c.chargeId)
+                return (
+                  <tr key={c.chargeId} data-line="charge">
+                    <td>
+                      {c.label}{c.detail ? <span className="pay-muted"> · {c.detail}</span> : null}
+                      {/* 10/6 (Nic): a payment logged by hand after the late fee posted
+                          counts late from the day it was logged. */}
+                      {c.loggedAfterLateFee && (
+                        <span className="pay-sub">Logged after the late fee posted — late from the day it was logged</span>
+                      )}
+                      {why && <span className="pay-sub cd-return">{why.text}</span>}
+                    </td>
+                    <td className="day">{dayWord(c.dueDate, year)}</td>
+                    <td className="num">{money(c.invoiced)}</td>
+                    <td className="num">
+                      {paid.amount ?? <span className="pay-muted">—</span>}
+                      {paid.workTrade && <span className="pay-sub">{paid.workTrade}</span>}
+                    </td>
+                    <td className="num">{toCents(c.owed) > 0 ? <span className="pay-owed">{money(c.owed)}</span> : <span className="pay-muted">—</span>}</td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+      <SpaceMoney row={row} month={month} />
+    </div>
+  )
+}
+
+// ── THE REGISTER'S AND PAY LINKS' MONEY ON A ROW (10/13, Nic, round 3) ──────
+//
+//   "Pay links / register sales that name a space go ON that space's row."
+//
+// Every sale and pay link this month that names the row's space, and what went
+// back on one at the register (OpenMonthRow.otherMoney) — in the folder's own
+// lines. Nothing is read; nothing here is a desk action. Nothing when there is
+// none.
+export function SpaceMoney({ row, month }: { row: Pick<OpenMonthRow, 'otherMoney'>; month: string }) {
+  if (!row.otherMoney?.length) return null
+  return (
+    <div className="pay-detail-block" data-block="space-money">
+      <div className="cd-section-label">Register sales and pay links</div>
+      <OtherMoneyLines lines={row.otherMoney} month={month} />
+    </div>
+  )
+}
+
+/**
+ * A space nobody holds on a lease, opened (10/13, Nic: "just make them all
+ * clickable even if they're vacant and just show you know an expanded box with
+ * nothing"): that nothing is billed on it this month, and the register's and
+ * the pay links' money that names it, when there is some.
+ */
+export function SpaceDetail({ row, month }: { row: Pick<OpenMonthRow, 'otherMoney' | 'status' | 'statusLabel'>; month: string }) {
+  return (
+    <div className="pay-detail-body">
+      <div className="pay-detail-block" data-block="space-only">
+        <div className="pay-none">{spaceOnlyWords(row)}</div>
+      </div>
+      <SpaceMoney row={row} month={month} />
+    </div>
+  )
+}
+
+// ── A STAY GUEST'S ROW OPENED (10/13, Nic) ──────────────────────────────────
+//
+//   "the payments page ... should show all money coming in. The people that
+//    paid short-term stays like Space RV 10 and 11 at Mountain View, those
+//    should have details of the money that was paid."
+//
+// Each payment toward the stay this month — the day, the amount, how it was
+// paid and what it was for (the server's words: "Booking deposit · stay Oct 12
+// – Oct 15 · booking site") — anything an early check-out gave back this
+// month, and the stay itself. Everything is on the row (OpenMonthRow.payments
+// and .stay); nothing more is read. 10/13 (Nic), round 3: "Stay rows SHOW
+// what's still owed" — and what is still owed on the stay, with the day its
+// balance went out on its pay link — or, before arrival with nothing billed,
+// the day it comes due (arrival day, S649: the row's Owed is 0 until then).
+export function StayDetail({ row, month }: {
+  row: OpenMonthRow
+  /** 'YYYY-MM': the open month. */
+  month: string
+}) {
+  const year = month.slice(0, 4)
+  const stay = row.stay
+  return (
+    <div className="pay-detail-body">
+      <div className="pay-detail-block">
+        <div className="cd-section-label">Paid this month</div>
+        {row.payments.length === 0 && !stay?.refunds.length ? (
+          <div className="pay-none">Nothing paid toward this stay this month.</div>
+        ) : (
+          <table className="pay-lines">
+            <thead><tr><th>Date</th><th className="num">Amount</th><th>Method</th><th>For</th></tr></thead>
+            <tbody>
+              {row.payments.map(p => (
+                <tr key={p.paymentId} data-line="stay-payment">
+                  <td className="day">{dayWord(p.paidOn, year)}</td>
+                  <td className="num">{money(p.amount)}</td>
+                  <td>{p.methodLabel}</td>
+                  <td>{p.forLabel ?? '—'}</td>
+                </tr>
+              ))}
+              {(stay?.refunds ?? []).map(r => (
+                <tr key={r.refundId} data-line="stay-refund">
+                  <td className="day">{dayWord(r.refundedOn, year)}</td>
+                  <td className="num cd-timing-late">−{money(r.amount)}</td>
+                  <td>Refunded</td>
+                  <td>Back to the guest — {r.label}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+      {stay && (
+        <div className="pay-detail-block">
+          <div className="cd-section-label">The stay</div>
+          <table className="pay-lines">
+            <tbody>
+              <tr data-line="stay">
+                <td>{dayWord(stay.checkIn, year)} – {dayWord(stay.checkOut, year)}</td>
+                <td>{stay.nights} {stay.nights === 1 ? 'night' : 'nights'}</td>
+                <td>{stay.statusLabel}</td>
+              </tr>
+              {toCents(stay.owed) > 0 && (
+                <tr data-line="stay-owed">
+                  <td>Still owed on the stay</td>
+                  <td className="num">{toCents(row.owed) > 0 ? <span className="pay-owed">{money(stay.owed)}</span> : money(stay.owed)}</td>
+                  <td>{stay.balanceBilledOn ? `Pay link sent ${dayWord(stay.balanceBilledOn, year)}`
+                    : toCents(row.owed) > 0 ? 'No pay link sent yet' : `Due on arrival, ${dayWord(stay.checkIn, year)}`}</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <SpaceMoney row={row} month={month} />
+    </div>
+  )
+}

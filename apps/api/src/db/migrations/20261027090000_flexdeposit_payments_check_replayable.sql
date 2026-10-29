@@ -1,0 +1,47 @@
+-- Widen the FlexDeposit payments CHECK back to 2..6 so the migration chain can
+-- replay. The product still sells only 2 and 4.
+-- (10/26 — the idempotency guard in posPropaneProduct.test.ts caught this.)
+--
+-- WHAT BROKE.  20261027060000 narrowed the CHECK to IN (2, 4), which is a
+-- faithful statement of what FlexDeposit sells. But three EARLIER migrations
+-- from the same evening insert rows for 3, 5 and 6 payments, and those rows are
+-- then deleted by the narrowing one. Applied in order on a fresh database that
+-- is fine. RE-APPLIED individually — which the guard does, and which any
+-- environment bootstrap or restore effectively does — the earlier insert now
+-- hits the narrower constraint and throws:
+--
+--   new row for relation "flexdeposit_fee_schedule" violates check constraint
+--   "flexdeposit_fee_schedule_payments_check"
+--
+-- So the chain stopped being replayable, and "migrations are re-runnable" is a
+-- standing rule precisely because a chain that only works once is a chain
+-- nobody can rebuild from.
+--
+-- WHY WIDEN RATHER THAN EDIT THE EARLIER ONES.  An applied migration is never
+-- edited — the runner tracks a sha256 per file and a mismatch blocks startup.
+-- Fix-forward is the only direction available.
+--
+-- WHAT IS LOST, AND WHAT STILL GUARDS IT.  The CHECK no longer states the menu.
+-- That protection moves to where it is actually enforced for every caller:
+--
+--   • isAllowedFlexDepositPaymentCount (packages/shared/src/flexFees.ts) is a
+--     MEMBERSHIP test over FLEX_DEPOSIT_PAYMENT_CHOICES = [2, 4], and every
+--     route and service checks it before quoting or enrolling;
+--   • there are no rows for 3, 5 or 6, so a quote for one resolves to null, and
+--     services/flexFees.ts treats a null as an error and never as a zero;
+--   • services/flexDepositFee.test.ts asserts all three of those explicitly.
+--
+-- The range CHECK still does its own job: it stops a nonsense count (0, 1, 9)
+-- reaching the table at all.
+--
+-- THE LESSON, for whoever re-prices next: FIVE same-day migrations that mutate
+-- one another's rows was the wrong shape. A price card should get ONE migration
+-- per agreed state. The drafts were all superseded in place before anything was
+-- ever charged, which is why no history was harmed, but the chain is the thing
+-- that paid for it.
+--
+-- No backfill: this only loosens a constraint. Re-runnable.
+
+ALTER TABLE flexdeposit_fee_schedule DROP CONSTRAINT IF EXISTS flexdeposit_fee_schedule_payments_check;
+ALTER TABLE flexdeposit_fee_schedule
+  ADD CONSTRAINT flexdeposit_fee_schedule_payments_check CHECK (payments BETWEEN 2 AND 6);

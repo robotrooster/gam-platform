@@ -40,22 +40,27 @@
  * invented day-range buckets and a tenant count that existed nowhere.
  */
 
+// 10/12 (Nic, ledger P6, L5): which expenses count as a cost, and a repair's cost once (lib/liveExpense).
+import { liveExpenseSql, maintenanceCostNotBilledSql } from '../../../lib/liveExpense'
 import { query } from '../../../db'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 import { incomeTotals } from '../../incomeBasis'
+import { ledgerReportsLive, ledgerPLExpenses } from '../../ledgerReports'
 import { incomeCardMtd } from '../../../lib/rentCollected'
 import { todayIn, addDaysTo } from '../../../lib/timezone'
+import { householdMonths, currentBillMonth, ALL_TIME_FROM } from '../../householdMonths'
 
 /** Occupied = a unit someone lives in. Same set the portfolio and KPI use. */
 const OCCUPIED = `('active','delinquent','suspended')`
 
 /**
- * Late = past the grace period on that tenant's OWN lease. Identical to
- * get_late_payment_history — two definitions of "late" in one product is how
- * the billing bug happened, where three parts of the system each had their own
- * idea of "occupied".
+ * Late — identical to get_late_payment_history, because two definitions of
+ * "late" in one product is how the billing bug happened, where three parts of
+ * the system each had their own idea of "occupied". 10/12 (Nic): both read
+ * services/householdMonths, the one payment-health definition — one judgment
+ * per household per bill month, after its grace period (the lease's, else the
+ * property's, else 5), days late = days past grace.
  */
-const LATE = `COALESCE(p.settled_at, NOW()) > p.due_date + (COALESCE(l.late_fee_grace_days, 0) || ' days')::interval`
 
 /**
  * S655 (Nic, 10/2): SSI/SSDI is GAM's check for the flex products, kept
@@ -180,26 +185,28 @@ export const getPortfolioStats: AgentTool = {
 
     if (want.includes('payments')) {
       const [r] = await query<any>(
-        `SELECT COUNT(*)::int AS due,
-                COUNT(*) FILTER (WHERE ${LATE})::int AS late,
-                ROUND(AVG(EXTRACT(EPOCH FROM (
-                  COALESCE(p.settled_at, NOW())
-                  - (p.due_date + (COALESCE(l.late_fee_grace_days, 0) || ' days')::interval)
-                )) / 86400) FILTER (WHERE ${LATE})::numeric, 1) AS avg_days_late,
-                COUNT(*) FILTER (WHERE p.status IN ('pending','failed'))::int AS unpaid,
+        `SELECT COUNT(*) FILTER (WHERE p.status IN ('pending','failed'))::int AS unpaid,
                 SUM(p.amount) FILTER (WHERE p.status IN ('pending','failed')) AS unpaid_amount
            FROM payments p
-           JOIN leases l ON l.id = p.lease_id
-          WHERE p.landlord_id = ANY($1::uuid[]) AND p.type = 'rent' AND p.due_date <= CURRENT_DATE`, [id])
+          WHERE p.landlord_id = ANY($1::uuid[]) AND p.type = 'rent' AND p.due_date <= CURRENT_DATE
+            AND p.amount > 0`, [id])
+      // 10/12 (Nic): all time, like payment health everywhere else (the Rent
+      // Roll, the tenant report, the Tenants page) — since each household's
+      // first bill on GAM, not the last 12 months.
+      const through = currentBillMonth()
+      const judged = (await householdMonths({ landlordIds: id, from: ALL_TIME_FROM, through })).filter(m => m.counted)
+      const late = judged.filter(m => !m.on_time)
+      const lateDays = late.filter(m => m.days_past_grace > 0)
       out.payments = {
-        rentChargesToDate: r.due,
-        paidLate: r.late,
+        householdMonthsJudged: judged.length,
+        paidLate: late.length,
         // The headline Nic asked for: "17% of people pay late".
-        lateRatePct: pct(r.late, r.due),
-        averageDaysLate: numOrNull(r.avg_days_late),
+        lateRatePct: pct(late.length, judged.length),
+        averageDaysPastGrace: lateDays.length
+          ? Math.round((lateDays.reduce((n, m) => n + m.days_past_grace, 0) / lateDays.length) * 10) / 10 : null,
         stillUnpaid: r.unpaid,
         stillUnpaidAmount: numOrNull(r.unpaid_amount),
-        lateMeans: 'past the grace period on that tenant’s own lease, not the due date',
+        lateMeans: 'a household’s whole monthly bill not paid in full by the end of its grace period, over all time since each household’s first bill on GAM',
       }
     }
 
@@ -255,18 +262,31 @@ export const getPortfolioStats: AgentTool = {
       // the last 12 months to today. thisMonth IS the dashboard's income card.
       const today = todayIn(null)
       const from = addDaysTo(`${Number(today.slice(0, 4)) - 1}${today.slice(4, 10)}`, 1)
-      const [inc, card, [r]] = await Promise.all([
+      // 10/12 (Nic, ledger P8): once the company's books are live, income
+      // comes from the ledger (incomeTotals reads it) and so do the expenses:
+      // the expenses PAID in the window, the same figure the P&L's Received
+      // net takes (services/ledgerReports).
+      const onLedger = await ledgerReportsLive(id)
+      const [inc, card, [r], ledgerEx] = await Promise.all([
         incomeTotals({ landlordIds: id, start: from, end: today, basis: 'received' }),
         incomeCardMtd(id, null, 'received'),
         query<any>(
           `SELECT
              (SELECT COALESCE(SUM(amount),0) FROM landlord_expenses
-               WHERE landlord_id= ANY($1::uuid[]) AND voided_at IS NULL
+               WHERE landlord_id= ANY($1::uuid[]) AND voided_at IS NULL AND ${liveExpenseSql('')}
                  AND expense_date >= $2::date AND expense_date <= $3::date) AS expenses`,
           [id, from, today]),
+        onLedger ? ledgerPLExpenses({ landlordIds: id }, from, today) : Promise.resolve(null),
       ])
-      const exp = Number(r.expenses)
-      if (exp === 0) missing.push('no expenses have been recorded, so there is no cost side to this')
+      // 10/12 (Nic, review): whether THEY recorded any cost is read from their
+      // Expenses record in both modes (as get_profit_and_loss does) — on the
+      // books every expense account also holds what GAM records for them (its
+      // platform fee, processing fees), so that total is never zero and could
+      // not tell. expensesRecorded means the same in both modes: what they
+      // entered; the books' figure is its own field.
+      const entered = Number(r.expenses)
+      const exp = ledgerEx ? ledgerEx.cashTotal : entered
+      if (entered === 0) missing.push('no expenses have been recorded, so there is no cost side to this')
       out.money = {
         windowMonths: 12,
         basis: inc.meta.label,
@@ -274,16 +294,21 @@ export const getPortfolioStats: AgentTool = {
         rentCollected: inc.lines.rent,
         paidAheadForLaterBills: inc.lines.paidAhead,
         otherIncome: inc.lines.otherIncome,
-        expensesRecorded: exp,
+        expensesRecorded: entered,
+        ...(ledgerEx ? { expensesPaidEveryAccount: ledgerEx.cashTotal, expensesIncurredEveryAccount: ledgerEx.total } : {}),
         net: Math.round((inc.total - exp) * 100) / 100,
         thisMonth: {
           moneyReceived: card.received.amount,
           includesPaidAhead: card.received.paidAhead,
           stillClearing: card.received.clearing,
         },
-        netNote: exp === 0
-          ? 'Net equals income because no expenses are on file — it is NOT a profit figure.'
-          : 'Income minus the expenses recorded on the platform. Off-platform costs are not included.',
+        netNote: entered === 0
+          ? (ledgerEx
+            ? 'No expenses of their own are on file: net is income minus only the fees GAM records for them — it is NOT a profit figure.'
+            : 'Net equals income because no expenses are on file — it is NOT a profit figure.')
+          : ledgerEx
+            ? 'Income minus the expenses paid from every account in their books (theirs and the fees GAM records). Off-platform costs they did not record are not included.'
+            : 'Income minus the expenses recorded on the platform. Off-platform costs are not included.',
       }
     }
 

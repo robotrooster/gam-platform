@@ -63,7 +63,7 @@ beforeEach(async () => {
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_autopay'
 })
 
-async function seed(opts: { graceDays?: number | null; dueDay?: number } = {}) {
+async function seed(opts: { graceDays?: number | null; dueDay?: number; propertyGraceDays?: number } = {}) {
   const c = await db.connect()
   try {
     await c.query('BEGIN')
@@ -71,6 +71,10 @@ async function seed(opts: { graceDays?: number | null; dueDay?: number } = {}) {
     const propertyId = await seedProperty(c, {
       landlordId, ownerUserId: userId, managedByUserId: userId,
     })
+    if (opts.propertyGraceDays !== undefined) {
+      await c.query(`UPDATE properties SET late_fee_grace_days = $2 WHERE id = $1`,
+        [propertyId, opts.propertyGraceDays])
+    }
     const unitId = await seedUnit(c, { propertyId, landlordId })
     const tenantId = await seedTenant(c)
     const leaseId = await seedLease(c, { unitId, landlordId, status: 'active' })
@@ -79,7 +83,9 @@ async function seed(opts: { graceDays?: number | null; dueDay?: number } = {}) {
       `UPDATE leases SET rent_due_day = $2, late_fee_grace_days = $3,
                          late_fee_enabled = true
         WHERE id = $1`,
-      [leaseId, opts.dueDay ?? 1, opts.graceDays ?? 5])
+      // 10/12: `null ?? 5` is 5, so the "no grace on the lease" case below
+      // was seeding a 5 and never tested the fallback at all.
+      [leaseId, opts.dueDay ?? 1, opts.graceDays === undefined ? 5 : opts.graceDays])
     await c.query('COMMIT')
     return {
       tenantId, leaseId,
@@ -110,6 +116,23 @@ describe('GET /api/autopay carries the grace period (S616)', () => {
       .get('/api/autopay')
       .set('Authorization', `Bearer ${f.token}`)
     expect(res.body.data[0].lateFeeGraceDays).toBe(5)
+  })
+
+  // 10/12 (Nic): "Grace = lease, else property, else 5 — the only chain." A
+  // lease with no grace of its own takes the park's: lease-else-5 told a tenant
+  // at a 2-day park that the 4th and 5th were free days the engine fines.
+  it('a lease with no grace takes the property\'s, and a lease grace still wins', async () => {
+    const parkOnly = await seed({ graceDays: null, propertyGraceDays: 2 })
+    const res = await request(buildApp())
+      .get('/api/autopay')
+      .set('Authorization', `Bearer ${parkOnly.token}`)
+    expect(res.body.data[0].lateFeeGraceDays).toBe(2)
+
+    const leaseOwn = await seed({ graceDays: 7, propertyGraceDays: 2 })
+    const res2 = await request(buildApp())
+      .get('/api/autopay')
+      .set('Authorization', `Bearer ${leaseOwn.token}`)
+    expect(res2.body.data[0].lateFeeGraceDays).toBe(7)
   })
 
   // The portal computes lastFreeDay = dueDay + grace - 1. This pins that

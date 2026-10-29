@@ -102,7 +102,12 @@ async function capturePropertySnapshots(): Promise<void> {
         WHERE mu.property_id = p.id
           AND mr.status NOT IN ('completed', 'cancelled'))
     FROM properties p
-    LEFT JOIN units u ON u.property_id = p.id
+    -- 10/12 review: a property's spaces — never a retired unit (retire-and-
+    -- replace keeps the old row, status 'vacant', beside its replacement) nor
+    -- a utility service point (a neighbor's meter, S616). Counted, they
+    -- doubled each replaced space and inflated vacancy in the monthly
+    -- property report, the one reader of these rows.
+    LEFT JOIN units u ON u.property_id = p.id AND u.retired_at IS NULL AND u.status <> 'utility_service'
     LEFT JOIN LATERAL (
       SELECT l.id AS lease_id, l.rent_amount,
              (SELECT COUNT(*) FROM lease_tenants lt

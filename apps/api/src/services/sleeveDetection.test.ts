@@ -51,6 +51,12 @@ beforeEach(async () => {
   await cleanupAllSchema()
   await query(`DELETE FROM sleeve_coverings`); await query(`UPDATE lease_templates SET sleeve_id=NULL`)
   await query(`DELETE FROM document_sleeves`)
+  // The government-form library is platform-wide and cleanupAllSchema keeps
+  // it, so another suite's forms (disclosureLibrary.test.ts shelves several
+  // and leaves them) reached "sees each government form once" whenever that
+  // suite ran first in the same process. Start from an empty library, as
+  // documentSleeves.test.ts and tenantLaws.test.ts do.
+  await query(`DELETE FROM disclosure_library_fields`); await query(`DELETE FROM disclosure_library_documents`)
   const c = await db.connect()
   try {
     await c.query('BEGIN')

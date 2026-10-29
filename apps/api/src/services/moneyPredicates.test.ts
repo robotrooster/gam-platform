@@ -15,7 +15,7 @@ import {
   allocationOrderSql, isPayableRow, isBankPayableRow, isCreditEligibleRow, isDepositOrMoveOutRow,
   lockHousehold, lockPaymentRowsById, householdLockKey, leaseLockKey,
   flexDepositFactSql, deskPayableRowSql, creditEligibleRowForCreditSql, isCreditEligibleRowForCredit,
-  disputeGaveBackCreditIdsSql,
+  disputeGaveBackCreditIdsSql, moneyTakenOrMovingRowSql, isMoneyTakenOrMovingRow,
 } from './moneyPredicates'
 import { deskQuote, settleManualRentPayment } from './manualPaymentSettle'
 import type { MoneyRowFacts } from './moneyPredicates'
@@ -93,6 +93,44 @@ describe('S655 money predicates', () => {
       for (const [label, [sql, ts]] of Object.entries(got)) expect(ts, label).toBe(sql)
       expect(Object.entries(got).filter(([, [sql]]) => sql).map(([l]) => l).sort())
         .toEqual(['failed, retry scheduled', 'pending, nothing moving'])
+    })
+  })
+
+  // 10/20 (review) — THE OTHER QUESTION, added when the pay-link utility door
+  // was found deciding "is this bill still owed?" from utility_bills.status
+  // alone. That status follows a charge only as far as 'settled', so a bill
+  // whose money was already in flight or already swept from the deposit read
+  // 'billed' and was collected a second time. Same rows as above, so the two
+  // questions can be read side by side — and they are NOT complements: a
+  // failed, returned, $0 or FlexPay row answers no to both, which is exactly
+  // where "owed again" lives.
+  it('taken-or-moving is the charge\'s own answer, and never agrees with payable on the same row', async () => {
+    await withRollback(async c => {
+      const f = await household(c)
+      const rows: Row[] = [
+        { label: 'pending, nothing moving' },
+        { label: 'failed, retry scheduled', status: 'failed', intent: 'pi_bounced' },
+        { label: 'retry in flight', status: 'processing', intent: 'pi_retry' },
+        { label: 'pending with an intent', intent: 'pi_new' },
+        { label: 'settled', status: 'settled' },
+        { label: 'swept from the deposit', status: 'paid_via_deposit' },
+        { label: 'returned', status: 'returned' },
+        { label: 'work trade', workTrade: true },
+        { label: 'flexpay pull', type: 'fee', entry: 'FLEXPAY', owner: 'gam' },
+        { label: 'zero', amount: 0 },
+      ]
+      const ids = []
+      for (const r of rows) ids.push(await insertRow(c, f, r))
+      const got = await bothSides(c, ids, moneyTakenOrMovingRowSql, isMoneyTakenOrMovingRow)
+      for (const [label, [sql, ts]] of Object.entries(got)) expect(ts, label).toBe(sql)
+      expect(Object.entries(got).filter(([, [sql]]) => sql).map(([l]) => l).sort())
+        .toEqual(['pending with an intent', 'retry in flight', 'settled', 'swept from the deposit', 'work trade'])
+
+      // No row is ever both: a payer cannot owe money that is already moving.
+      const payable = await bothSides(c, ids, payableRowSql, isPayableRow)
+      for (const label of Object.keys(got)) {
+        expect([payable[label][0], got[label][0]], label).not.toEqual([true, true])
+      }
     })
   })
 

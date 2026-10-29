@@ -9,10 +9,15 @@
  *    expenses whether they're tacked on to a unit or to a whole property...
  *    maybe not even necessarily people's names."
  *
+ * Later the same day, on names: "let's probably have it actually just show
+ * their names." So tenant NAMES reach a bookkeeper wherever the books need
+ * them (who paid, whose unit); contact details never do.
+ *
  * The world: one owner account with two companies — Mountain View (two parks:
  * MV and MV Annex) and Oak Park. A bookkeeper keeps Mountain View's books
- * (every property); a second keeps only the MV park. Tenants carry a name that
- * must never reach a bookkeeper: Zebulon Quixote.
+ * (every property); a second keeps only the MV park. Tenants are named Zebulon
+ * Quixote — a name a bookkeeper may read — and carry an email and a phone
+ * number that must never reach one.
  */
 import { describe, it, expect, beforeEach, afterAll } from 'vitest'
 import fs from 'fs'
@@ -79,6 +84,7 @@ function buildApp() {
 const SECRET_FIRST = 'Zebulon'
 const SECRET_LAST = 'Quixote'
 const SECRET_EMAIL_PART = 'zebulon.quixote'
+const SECRET_PHONE = '480-555-0199'
 
 interface World {
   ownerUserId: string
@@ -124,7 +130,10 @@ async function world(): Promise<World> {
     const bkNarrow = (await c.query<{ id: string }>(
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1, 'x', 'bookkeeper', 'Nora', 'Narrow', TRUE) RETURNING id`, [`bkn-${randomUUID()}@test.dev`])).rows[0].id
-    await c.query(`INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level) VALUES ($1, $2, 'read_only')`, [bk, mv])
+    // 10/11: every box ticked by hand. 10/12 (Nic): the company-wide box (bank
+    // account, payouts, payroll) is the owner's own choice, ticked here for Bea.
+    await c.query(`INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level, property_ids, company_wide) VALUES ($1, $2, 'read_only', $3, TRUE)`,
+      [bk, mv, [mvPark, mvAnnex]])
     await c.query(`INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level, property_ids) VALUES ($1, $2, 'read_only', $3)`,
       [bkNarrow, mv, [mvPark]])
 
@@ -154,9 +163,9 @@ async function residentOn(unitId: string, landlordId: string, opts: { bookingTyp
   try {
     const tenantId = await seedTenant(c)
     await c.query(
-      `UPDATE users SET first_name = $2, last_name = $3, email = $4
+      `UPDATE users SET first_name = $2, last_name = $3, email = $4, phone = $5
         WHERE id = (SELECT user_id FROM tenants WHERE id = $1)`,
-      [tenantId, SECRET_FIRST, SECRET_LAST, `${SECRET_EMAIL_PART}.${randomUUID().slice(0, 6)}@test.dev`])
+      [tenantId, SECRET_FIRST, SECRET_LAST, `${SECRET_EMAIL_PART}.${randomUUID().slice(0, 6)}@test.dev`, SECRET_PHONE])
     const leaseId = await seedLease(c, { unitId, landlordId, rentAmount: 500 })
     await seedLeaseTenant(c, { leaseId, tenantId })
     if (opts.bookingType) {
@@ -194,14 +203,17 @@ async function september(w: World) {
   await paid({ ...opRes, unitId: w.opUnit, landlordId: w.op, type: 'rent', amount: 700, at: '2026-09-04T18:00:00Z' })
 }
 
-/** Nothing in a bookkeeper's answer names the tenant. */
-function expectNoTenant(body: unknown) {
+/**
+ * 10/11 (Nic): nothing in a bookkeeper's answer reaches a person — no email,
+ * phone number, address or date of birth, under any key, at any depth. Names
+ * are allowed (who paid is half of keeping the books).
+ */
+function expectNoContact(body: unknown) {
   const s = JSON.stringify(body)
-  expect(s).not.toContain(SECRET_FIRST)
-  expect(s).not.toContain(SECRET_LAST)
   expect(s).not.toContain(SECRET_EMAIL_PART)
-  expect(s).not.toMatch(/"tenant(Name|First|Last|Email|Phone|Id)"/i)
-  expect(s).not.toMatch(/"(firstName|lastName|email|phone|guestName|leaseId)"/)
+  expect(s).not.toContain(SECRET_PHONE)
+  expect(s).not.toMatch(/"[A-Za-z0-9_]*(email|phone|phoneNumber|phone_number|address)"\s*:/i)
+  expect(s).not.toMatch(/"[A-Za-z0-9_]*(dateOfBirth|date_of_birth|dob|tenantUserId|tenant_user_id)"\s*:/i)
 }
 
 const app = () => buildApp()
@@ -217,7 +229,7 @@ afterAll(() => {
 const remember = (res: any) => { const u = res?.body?.data?.receipt_url ?? res?.body?.data?.receiptUrl; if (u) uploaded.push(u); return res }
 
 describe('income pools — money in by type, by month and by day', () => {
-  it("a Mountain View bookkeeper sees Mountain View's pools with correct totals and no tenant anywhere", async () => {
+  it("a Mountain View bookkeeper sees Mountain View's pools with correct totals and no one's contact details", async () => {
     const w = await world(); await september(w)
     const r = await request(app()).get('/api/financials/income?from=2026-09-01&to=2026-10-31').set('Authorization', `Bearer ${w.tokBk}`)
     expect(r.status).toBe(200)
@@ -239,7 +251,7 @@ describe('income pools — money in by type, by month and by day', () => {
     expect(sep3.total).toBe(540)
     expect(sep3.pools.find((p: any) => p.key === 'electric').amount).toBe(40)
     expect(d.days.reduce((s: number, x: any) => s + x.total, 0)).toBe(940)
-    expectNoTenant(r.body)
+    expectNoContact(r.body)
   })
 
   it("is the P&L's income total for the same days and properties", async () => {
@@ -256,7 +268,8 @@ describe('income pools — money in by type, by month and by day', () => {
     const scope = await request(app()).get('/api/financials/scope').set('Authorization', `Bearer ${w.tokBk}`)
     expect(scope.body.data.properties.map((p: any) => p.name).sort()).toEqual(['MV Annex', 'Mountain View'])
     expect(scope.body.data.companies.map((c: any) => c.name)).toEqual(['Mountain View LLC'])
-    expect(scope.body.data.canRemoveExpenses).toBe(false)
+    // 10/12 (Nic, ledger decision 2): one level — a bookkeeper removes expenses too.
+    expect(scope.body.data.canRemoveExpenses).toBe(true)
   })
 
   it('a bookkeeper kept to one park sees that park only', async () => {
@@ -267,7 +280,7 @@ describe('income pools — money in by type, by month and by day', () => {
     expect(annex.status).toBe(403)
     const scope = await request(app()).get('/api/financials/scope').set('Authorization', `Bearer ${w.tokBkNarrow}`)
     expect(scope.body.data.properties.map((p: any) => p.name)).toEqual(['Mountain View'])
-    expect(scope.body.data.wholeCompany).toBe(false)
+    expect(scope.body.data.companyWide).toBe(false)
   })
 
   it('the owner reads the same page across both companies, or the one GAM Books has open', async () => {
@@ -293,11 +306,14 @@ describe('everything else a bookkeeper session could reach is refused', () => {
     ['get', '/api/payments'], ['post', '/api/payments/' + randomUUID() + '/record-manual'],
     ['get', '/api/balances'], ['get', '/api/maintenance'], ['get', '/api/maintenance/' + randomUUID()],
     ['get', '/api/notifications'], ['get', '/api/units'], ['get', '/api/properties'],
-    ['get', '/api/bank-feed/transactions'], ['post', '/api/bank-feed/link-session'],
-    ['get', '/api/disbursements'], ['post', '/api/expenses/' + randomUUID() + '/void'],
+    // 10/12 (Nic, L19): bank lines are open with the company-wide box (below);
+    // a tenant's payment never is.
+    ['post', '/api/bank-feed/deposits/' + randomUUID() + '/confirm'], ['post', '/api/bank-feed/link-session'],
+    // 10/12 (Nic, ledger decision 2): removing an expense is bookkeeping now
+    // (below); a tenant's account never is.
+    ['get', '/api/disbursements'], ['post', '/api/payments/' + randomUUID() + '/void'],
     ['get', '/api/reports/monthly-statement'], ['get', '/api/reports/tax-summary'],
     ['get', '/api/reports/work-trade-1099'], ['get', '/api/reports/query'], ['get', '/api/reports/t12'],
-    ['get', '/api/books/rent-roll'],
   ]
   for (const [method, path] of REFUSED) {
     it(`${method.toUpperCase()} ${path} → 403, in words`, async () => {
@@ -308,13 +324,28 @@ describe('everything else a bookkeeper session could reach is refused', () => {
     })
   }
 
-  it('the Books rent roll refuses a bookkeeper even past the gate (the route says so itself)', async () => {
-    const { booksRouter: br } = await import('./books')
-    expect(br).toBeTruthy()
+  // 10/12 (Nic, L19): the bank lines follow the company-wide box — a
+  // bookkeeper kept to a property is told so, in words.
+  it('GET /api/bank-feed/transactions → the company-wide refusal for a property bookkeeper', async () => {
     const w = await world()
-    // The gate refuses first; the message is the gate's.
-    const r = await request(app()).get('/api/books/rent-roll').set('Authorization', `Bearer ${w.tokBk}`).set('X-Client-Id', w.mv)
+    const r = await request(app()).get('/api/bank-feed/transactions').set('Authorization', `Bearer ${w.tokBkNarrow}`)
     expect(r.status).toBe(403)
+    expect(r.body.error).toMatch(/company-wide books/)
+  })
+
+  // 10/11 (Nic): names are allowed where the books need them, so the Books
+  // rent roll is a bookkeeper's again — their properties, names in, contact out.
+  it('the Books rent roll answers a bookkeeper: their properties, the tenant’s name, no email or phone', async () => {
+    const w = await world(); await september(w)
+    const r = await request(app()).get('/api/books/rent-roll').set('Authorization', `Bearer ${w.tokBk}`).set('X-Client-Id', w.mv)
+    expect(r.status).toBe(200)
+    expect(r.body.data.units.map((u: any) => u.property_name).sort()).toEqual(['MV Annex', 'Mountain View', 'Mountain View'])
+    expect(r.body.data.units.some((u: any) => u.tenant_first === SECRET_FIRST && u.tenant_last === SECRET_LAST)).toBe(true)
+    expectNoContact(r.body)
+    const narrow = await request(app()).get('/api/books/rent-roll').set('Authorization', `Bearer ${w.tokBkNarrow}`).set('X-Client-Id', w.mv)
+    expect(narrow.status).toBe(200)
+    expect(new Set(narrow.body.data.units.map((u: any) => u.property_name))).toEqual(new Set(['Mountain View']))
+    expectNoContact(narrow.body)
   })
 
   it('a bookkeeper whose access was removed loses it on the next request', async () => {
@@ -333,7 +364,7 @@ describe('everything else a bookkeeper session could reach is refused', () => {
   })
 })
 
-describe('expenses — look and add; edit their own; receipts by row', () => {
+describe('expenses — full bookkeeping on the properties they keep (10/12, one level); receipts by row', () => {
   const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex')
 
   it('adds an expense with a receipt on a unit, and one on the whole property', async () => {
@@ -361,8 +392,11 @@ describe('expenses — look and add; edit their own; receipts by row', () => {
     const mine = list.body.data.find((e: any) => e.id === id)
     const owners = list.body.data.find((e: any) => e.id === w.ownerExpense)
     expect(mine.can_edit ?? mine.canEdit).toBe(true)
-    expect(owners.can_edit ?? owners.canEdit).toBe(false)
-    expect(mine.can_remove ?? mine.canRemove).toBe(false)
+    // 10/12 (Nic, ledger decision 2): one level — the owner's expense on a park
+    // they keep is theirs to correct and remove too (a read_only row decides nothing).
+    expect(owners.can_edit ?? owners.canEdit).toBe(true)
+    expect(mine.can_remove ?? mine.canRemove).toBe(true)
+    expect(owners.can_remove ?? owners.canRemove).toBe(true)
   })
 
   it('cannot file an expense on Oak Park, nor on a park it does not keep', async () => {
@@ -378,7 +412,7 @@ describe('expenses — look and add; edit their own; receipts by row', () => {
     expect(companyWide.status).toBe(400)
   })
 
-  it('edits its own expense; never the owner’s, never Oak Park’s, never onto a park it does not keep', async () => {
+  it('10/12: edits and removes any expense on a park it keeps — the owner’s too; never Oak Park’s, never onto a park it does not keep', async () => {
     const w = await world()
     const mine = (await request(app()).post('/api/expenses').set('Authorization', `Bearer ${w.tokBkNarrow}`)
       .send({ unitId: w.mvUnit, category: 'supplies', amount: 20, expenseDate: '2026-09-07' })).body.data.id
@@ -386,15 +420,25 @@ describe('expenses — look and add; edit their own; receipts by row', () => {
       .send({ amount: 25, vendor: 'Gas Stop' })
     expect(ok.status).toBe(200)
     expect(Number(ok.body.data.amount)).toBe(25)
+    // 10/12 (Nic, ledger decision 2): full bookkeeping — the owner's expense on their park too.
     const owners = await request(app()).patch(`/api/expenses/${w.ownerExpense}`).set('Authorization', `Bearer ${w.tokBkNarrow}`).send({ amount: 1 })
-    expect(owners.status).toBe(404)
+    expect(owners.status).toBe(200)
+    expect(Number(owners.body.data.amount)).toBe(1)
     const oak = await request(app()).patch(`/api/expenses/${w.opExpense}`).set('Authorization', `Bearer ${w.tokBk}`).send({ amount: 1 })
     expect(oak.status).toBe(404)
+    const oakRemove = await request(app()).post(`/api/expenses/${w.opExpense}/void`).set('Authorization', `Bearer ${w.tokBk}`)
+    expect(oakRemove.status).toBe(404)
     const move = await request(app()).patch(`/api/expenses/${mine}`).set('Authorization', `Bearer ${w.tokBkNarrow}`)
       .send({ propertyId: w.mvAnnex, unitId: null })
     expect(move.status).toBe(403)
+    // An expense on a park the narrow bookkeeper does not keep reads as missing.
+    const annexOne = (await request(app()).post('/api/expenses').set('Authorization', `Bearer ${w.tokBk}`)
+      .send({ propertyId: w.mvAnnex, isCommon: true, category: 'repairs', amount: 15, expenseDate: '2026-09-07' })).body.data.id
+    expect((await request(app()).post(`/api/expenses/${annexOne}/void`).set('Authorization', `Bearer ${w.tokBkNarrow}`)).status).toBe(404)
     const remove = await request(app()).post(`/api/expenses/${mine}/void`).set('Authorization', `Bearer ${w.tokBkNarrow}`)
-    expect(remove.status).toBe(403)
+    expect(remove.status).toBe(200)
+    // Kept on record, voided.
+    expect((await db.query(`SELECT status FROM landlord_expenses WHERE id = $1`, [mine])).rows[0].status).toBe('voided')
     // The owner still edits and removes theirs.
     const ownerEdit = await request(app()).patch(`/api/expenses/${w.ownerExpense}`).set('Authorization', `Bearer ${w.owner}`).send({ vendor: 'Pump Co.' })
     expect(ownerEdit.status).toBe(200)
@@ -404,9 +448,14 @@ describe('expenses — look and add; edit their own; receipts by row', () => {
     const w = await world()
     const dir = path.join(process.cwd(), 'uploads', 'expense-receipts')
     const before = fs.existsSync(dir) ? fs.readdirSync(dir).length : 0
-    // The owner's expense and Oak Park's are not this bookkeeper's to attach to.
-    for (const id of [w.ownerExpense, w.opExpense]) {
-      const r = await request(app()).post(`/api/expenses/${id}/receipt`).set('Authorization', `Bearer ${w.tokBk}`)
+    // Oak Park's expense is not this bookkeeper's, nor (for the one kept to the
+    // park) an expense on the annex. 10/12 (Nic, one level): the owner's
+    // expense on a property they keep IS theirs to give a receipt.
+    const annexExpense = (await db.query<{ id: string }>(
+      `INSERT INTO landlord_expenses (landlord_id, created_by, property_id, category, amount, expense_date, is_common)
+       VALUES ($1, $2, $3, 'repairs', 40, '2026-09-05', TRUE) RETURNING id`, [w.mv, w.ownerUserId, w.mvAnnex])).rows[0].id
+    for (const [id, tok] of [[w.opExpense, w.tokBk], [annexExpense, w.tokBkNarrow]]) {
+      const r = await request(app()).post(`/api/expenses/${id}/receipt`).set('Authorization', `Bearer ${tok}`)
         .attach('receipt', Buffer.from('89504e470d0a1a0a', 'hex'), { filename: 'x.png', contentType: 'image/png' })
       expect(r.status).toBe(404)
     }
@@ -451,7 +500,7 @@ describe('the financial scope never widens a bookkeeper by default', () => {
 })
 
 describe('maintenance costs — the cost, never the request', () => {
-  it('returns amounts, days and kinds, without the request’s words or the tenant', async () => {
+  it('returns amounts, days and kinds, without the request’s words (which name the tenant)', async () => {
     const w = await world()
     await residentOn(w.mvUnit, w.mv)
     await db.query(
@@ -469,18 +518,23 @@ describe('maintenance costs — the cost, never the request', () => {
     expect(s).not.toContain('Leaky')
     expect(s).not.toContain('drips')
     expect(s).not.toContain('Oak Park')
-    expectNoTenant(r.body)
+    expect(s).not.toContain(SECRET_FIRST)          // only the request's words named them
+    expectNoContact(r.body)
   })
 })
 
-describe('reports — the P&L, scrubbed of names', () => {
-  it("the month's P&L reads Mountain View's money and names nobody", async () => {
+describe('reports — the P&L, with who paid and no contact details', () => {
+  it("the month's P&L reads Mountain View's money and who paid it, and no one's email or phone", async () => {
     const w = await world(); await september(w)
     const r = await request(app()).get('/api/reports/monthly-pl?year=2026&month=9').set('Authorization', `Bearer ${w.tokBk}`)
     expect(r.status).toBe(200)
     expect(r.body.data.gross.total).toBe(640)
     expect(r.body.data.payments.length).toBeGreaterThan(0)
-    expectNoTenant(r.body)
+    // 10/11 (Nic): who paid is half of keeping the books.
+    for (const p of r.body.data.payments) {
+      expect(p).toMatchObject({ tenantName: `${SECRET_FIRST} ${SECRET_LAST}`, tenantFirst: SECRET_FIRST, tenantLast: SECRET_LAST })
+    }
+    expectNoContact(r.body)
   })
 
   it('a property detail of Oak Park is not theirs; the narrowed bookkeeper gets its own park only', async () => {
@@ -494,10 +548,10 @@ describe('reports — the P&L, scrubbed of names', () => {
     const names = JSON.stringify(pl.body)
     expect(names).not.toContain('MV Annex')
     expect(names).not.toContain('Oak Park')
-    expectNoTenant(pl.body)
+    expectNoContact(pl.body)
   })
 
-  it('a property detail gives a bookkeeper maintenance costs by kind, never the request’s words, and no rent roll', async () => {
+  it('a property detail gives a bookkeeper the rent roll with names, and maintenance costs by kind — never the request’s words', async () => {
     const w = await world(); await september(w)
     await db.query(
       `INSERT INTO maintenance_requests (unit_id, landlord_id, title, description, category, status, actual_cost, completed_at)
@@ -505,17 +559,23 @@ describe('reports — the P&L, scrubbed of names', () => {
       [w.mvUnit, w.mv, `Leaky faucet in ${SECRET_FIRST}'s bathroom`])
     const r = await request(app()).get(`/api/reports/property-detail?propertyId=${w.mvPark}&year=2026&month=9`).set('Authorization', `Bearer ${w.tokBk}`)
     expect(r.status).toBe(200)
-    expect(r.body.data.units).toEqual([])
+    // 10/11 (Nic): the park's rent roll — unit, status, rent, occupied and the
+    // tenant's name. Nothing else rides on a row.
+    expect(r.body.data.units).toHaveLength(2)
+    for (const u of r.body.data.units) {
+      expect(Object.keys(u).sort()).toEqual(['bathrooms', 'bedrooms', 'id', 'isOccupied', 'rent', 'status', 'tenantName', 'unitNumber'])
+    }
+    expect(r.body.data.units.find((u: any) => u.id === w.mvUnit)).toMatchObject({ isOccupied: true, tenantName: `${SECRET_FIRST} ${SECRET_LAST}` })
     expect(r.body.data.property.totalUnits).toBeGreaterThan(0)
     expect(r.body.data.maintenance).toHaveLength(1)
     expect(r.body.data.maintenance[0]).toMatchObject({ categoryLabel: 'Plumbing', actualCost: 185.5 })
     expect(r.body.data.maintenance[0]).not.toHaveProperty('title')
     expect(JSON.stringify(r.body)).not.toContain('Leaky')
-    expectNoTenant(r.body)
-    // The owner keeps the request's words and the rent roll.
+    expectNoContact(r.body)
+    // The owner reads the same rent roll, and keeps the request's words.
     const owner = await request(app()).get(`/api/reports/property-detail?propertyId=${w.mvPark}&year=2026&month=9`).set('Authorization', `Bearer ${w.owner}`)
     expect(owner.body.data.maintenance[0].title).toContain('Leaky')
-    expect(owner.body.data.units.length).toBeGreaterThan(0)
+    expect(owner.body.data.units).toEqual(r.body.data.units)
   })
 
   it('the By Property report sends only what its table shows — never the lease signer or office contact', async () => {
@@ -528,19 +588,23 @@ describe('reports — the P&L, scrubbed of names', () => {
       for (const k of Object.keys(p)) expect(k, k).not.toMatch(/signing|office|owner_user|managed_by|stripe/i)
     }
     expect(JSON.stringify(r.body)).not.toContain('signer@t.dev')
-    expectNoTenant(r.body)
+    expectNoContact(r.body)
   })
 
-  it('the overview answers, without names', async () => {
+  it('the overview answers, with no one\'s contact details', async () => {
     const w = await world(); await september(w)
     const r = await request(app()).get('/api/reports/summary').set('Authorization', `Bearer ${w.tokBk}`)
     expect(r.status).toBe(200)
-    expectNoTenant(r.body)
+    expectNoContact(r.body)
   })
 })
 
 describe('bank activity and payouts — company-wide, read only', () => {
-  it('a bookkeeper sees what a deposit was, never the payer’s memo; the owner sees the memo', async () => {
+  // 10/11 (Nic): names are allowed where the books need them, and the payee on a
+  // bank line is how it is reconciled — so a bookkeeper reads the bank's memo as
+  // the owner does, with what it was filed as in its own column. Contact details
+  // stay out: an email or phone number on a memo is taken out of their copy.
+  it('a bookkeeper reads the bank memo as the owner does, and what it was filed as — never an email or phone number on it', async () => {
     const w = await world()
     const conn = (await db.query<{ id: string }>(
       `INSERT INTO bank_connections (landlord_id, display_name) VALUES ($1, 'MV Operating') RETURNING id`, [w.mv])).rows[0].id
@@ -554,8 +618,8 @@ describe('bank activity and payouts — company-wide, read only', () => {
        VALUES ($1, $2, 'a', '2026-09-02', 500, $3, 'matched', $4),
               ($1, $2, 'b', '2026-09-03', -25, 'HOME DEPOT #123', 'needs_review', NULL)`,
       [conn, w.mv, `ZELLE FROM ${SECRET_FIRST.toUpperCase()} ${SECRET_LAST.toUpperCase()}`, pid])
-    // Money OUT can name a person too — a deposit refund by Zelle — and a filed
-    // one reads as the expense's own vendor and kind.
+    // Money OUT names who was paid too — a deposit refund by Zelle — and a filed
+    // one says what it was filed as beside its memo.
     await db.query(
       `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description, normalized_merchant, status)
        VALUES ($1, $2, 'c', '2026-09-04', -150, $3, $3, 'needs_review')`,
@@ -564,27 +628,37 @@ describe('bank activity and payouts — company-wide, read only', () => {
       `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description, status, expense_id)
        VALUES ($1, $2, 'd', '2026-09-05', -120, $3, 'categorized', $4)`,
       [conn, w.mv, `CHECK 1042 ${SECRET_LAST.toUpperCase()}`, w.ownerExpense])
+    // A Zelle memo can carry the phone number and email the money went to.
+    await db.query(
+      `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description, status)
+       VALUES ($1, $2, 'e', '2026-09-06', -10, 'ZELLE TO PAT 480-555-1234 pat.lee@example.com', 'needs_review')`,
+      [conn, w.mv])
     const bk = await request(app()).get('/api/financials/bank-activity?from=2026-09-01&to=2026-09-30').set('Authorization', `Bearer ${w.tokBk}`)
     expect(bk.status).toBe(200)
     expect(bk.body.data.moneyIn).toBe(500)
-    expect(bk.body.data.moneyOut).toBe(295)
-    const inRow = bk.body.data.transactions.find((t: any) => t.direction === 'in')
-    expect(inRow.description).toBe('Tenant’s bank deposit')
-    const outs = bk.body.data.transactions.filter((t: any) => t.direction === 'out').map((t: any) => t.description).sort()
-    expect(outs).toEqual(['Money out', 'Money out', 'Pump Co · Repairs'])
-    expect(JSON.stringify(bk.body).toUpperCase()).not.toContain(SECRET_FIRST.toUpperCase())
-    expect(JSON.stringify(bk.body).toUpperCase()).not.toContain(SECRET_LAST.toUpperCase())
-    expect(JSON.stringify(bk.body)).not.toContain('HOME DEPOT')
+    expect(bk.body.data.moneyOut).toBe(305)
+    const name = `${SECRET_FIRST.toUpperCase()} ${SECRET_LAST.toUpperCase()}`
+    const byDay = (body: any) => Object.fromEntries(body.data.transactions.map((t: any) => [t.day, t]))
+    const b = byDay(bk.body)
+    expect(b['2026-09-02']).toMatchObject({ description: `ZELLE FROM ${name}`, filedAs: 'Tenant’s bank deposit' })
+    expect(b['2026-09-03']).toMatchObject({ description: 'HOME DEPOT #123', filedAs: null })
+    expect(b['2026-09-04']).toMatchObject({ description: `ZELLE PAYMENT TO ${name}`, filedAs: null })
+    expect(b['2026-09-05']).toMatchObject({ description: `CHECK 1042 ${SECRET_LAST.toUpperCase()}`, filedAs: 'Repairs' })
+    expect(b['2026-09-06'].description).toBe('ZELLE TO PAT (phone hidden) (email hidden)')
+    expect(JSON.stringify(bk.body)).not.toContain('480-555-1234')
+    expect(JSON.stringify(bk.body)).not.toContain('pat.lee@example.com')
     const owner = await request(app()).get('/api/financials/bank-activity?from=2026-09-01&to=2026-09-30').set('Authorization', `Bearer ${w.owner}`)
-    expect(owner.body.data.transactions.find((t: any) => t.direction === 'in').description).toContain('ZELLE')
-    expect(owner.body.data.transactions.map((t: any) => t.description)).toContain('HOME DEPOT #123')
+    const o = byDay(owner.body)
+    // The owner reads the same lines, and the contact details on them.
+    for (const day of ['2026-09-02', '2026-09-03', '2026-09-04', '2026-09-05']) expect(o[day], day).toEqual(b[day])
+    expect(o['2026-09-06'].description).toBe('ZELLE TO PAT 480-555-1234 pat.lee@example.com')
   })
 
-  it('a bookkeeper kept to one park is told the bank and payouts cover the whole company', async () => {
+  it('a bookkeeper without the company-wide box is told the bank and payouts are in it', async () => {
     const w = await world()
     const bank = await request(app()).get('/api/financials/bank-activity').set('Authorization', `Bearer ${w.tokBkNarrow}`)
     expect(bank.status).toBe(403)
-    expect(bank.body.error).toMatch(/whole company/)
+    expect(bank.body.error).toMatch(/company-wide books/)
     const pay = await request(app()).get('/api/financials/payouts').set('Authorization', `Bearer ${w.tokBkNarrow}`)
     expect(pay.status).toBe(403)
   })
@@ -621,7 +695,8 @@ describe('the Team page invite: a company, and its properties', () => {
     expect(acc.status).toBe(200)
     const row = (await db.query<{ landlord_id: string; property_ids: string[] | null; access_level: string }>(
       `SELECT landlord_id, property_ids, access_level FROM bookkeeper_scopes WHERE user_id = $1`, [acc.body.data.userId])).rows[0]
-    expect(row).toEqual({ landlord_id: w.mv, property_ids: [w.mvPark], access_level: 'read_only' })
+    // 10/12 (Nic, ledger decision 2): one level — written 'read_write' (full bookkeeping).
+    expect(row).toEqual({ landlord_id: w.mv, property_ids: [w.mvPark], access_level: 'read_write' })
   })
 
   it("refuses an Oak Park property on a Mountain View bookkeeper", async () => {
@@ -638,14 +713,17 @@ describe('the Team page invite: a company, and its properties', () => {
     expect(ch.status).toBe(200)
     const narrowed = await request(app()).get('/api/financials/scope').set('Authorization', `Bearer ${w.tokBk}`)
     expect(narrowed.body.data.properties.map((p: any) => p.name)).toEqual(['MV Annex'])
-    const all = await request(app()).patch(`/api/scopes/bookkeeper/${w.bk}`).set('Authorization', `Bearer ${w.owner}`)
-      .send({ landlordId: w.mv, propertyIds: [] })
-    expect(all.status).toBe(200)
-    expect((await db.query(`SELECT property_ids FROM bookkeeper_scopes WHERE user_id = $1`, [w.bk])).rows[0].property_ids).toBeNull()
+    // 10/11: ticking nothing is refused, and the boxes stay as they were.
+    // 10/12: "nothing" is no property AND no company-wide box.
+    const none = await request(app()).patch(`/api/scopes/bookkeeper/${w.bk}`).set('Authorization', `Bearer ${w.owner}`)
+      .send({ landlordId: w.mv, propertyIds: [], companyWide: false })
+    expect(none.status).toBe(400)
+    expect(none.body.error).toBe('Tick at least one property or Company-wide.')
+    expect((await db.query(`SELECT property_ids FROM bookkeeper_scopes WHERE user_id = $1`, [w.bk])).rows[0].property_ids).toEqual([w.mvAnnex])
     const team = await request(app()).get('/api/scopes/team').set('Authorization', `Bearer ${w.owner}`)
     const member = team.body.data.members.find((m: any) => (m.user_id ?? m.userId) === w.bk)
-    expect(member.scope).toHaveProperty('propertyIds')
-    const del = await request(app()).delete(`/api/scopes/bookkeeper/${w.bk}`).set('Authorization', `Bearer ${w.owner}`)
+    expect(member.scope).toMatchObject({ propertyIds: [w.mvAnnex], coversCompany: false })
+    const del = await request(app()).delete(`/api/scopes/bookkeeper/${w.bk}?landlordId=${w.mv}`).set('Authorization', `Bearer ${w.owner}`)
     expect(del.status).toBe(200)
     expect((await request(app()).get('/api/financials/income').set('Authorization', `Bearer ${w.tokBk}`)).status).toBe(403)
   })
@@ -663,14 +741,19 @@ describe('GAM Books — the bookkeeper portal shows the same pages, for exactly 
     '/api/reports/monthly-pl?year=2026&month=9', '/api/reports/site-downtime?year=2026',
   ]
 
-  it('a Mountain View bookkeeper never sees Oak Park on any page, and no tenant', async () => {
+  it('a Mountain View bookkeeper never sees Oak Park on any page, nor anyone\'s contact details', async () => {
     const w = await world(); await september(w)
     for (const url of PAGES) {
       const r = await request(app()).get(url).set('Authorization', `Bearer ${w.tokBk}`).set('X-Client-Id', w.mv)
       expect(r.status, url).toBe(200)
       expect(JSON.stringify(r.body), url).not.toContain('Oak Park')
-      expect(JSON.stringify(r.body), url).not.toContain('700')
-      expectNoTenant(r.body)
+      // 10/12: Oak Park's 700 as an amount — never inside a random id or seeded
+      // unit number (a uuid holding "700" made this fail at random).
+      const money = JSON.stringify(r.body)
+        .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '')
+        .replace(/U-[0-9A-F]{6}/g, '')
+      expect(money, url).not.toContain('700')
+      expectNoContact(r.body)
     }
   })
 
@@ -704,7 +787,8 @@ describe('GAM Books — the bookkeeper portal shows the same pages, for exactly 
       otherCompany = other.landlordId
       const park = await seedProperty(c, { landlordId: otherCompany, ownerUserId: other.userId, managedByUserId: other.userId })
       await c.query(`UPDATE properties SET name = 'Elsewhere Park' WHERE id = $1`, [park])
-      await c.query(`INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level) VALUES ($1, $2, 'read_only')`, [w.bk, otherCompany])
+      await c.query(`INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level, property_ids) VALUES ($1, $2, 'read_only', $3)`,
+        [w.bk, otherCompany, [park]])
     } finally { c.release() }
     const mv = await request(app()).get('/api/financials/scope').set('Authorization', `Bearer ${w.tokBk}`).set('X-Client-Id', w.mv)
     expect(mv.body.data.properties.map((p: any) => p.name).sort()).toEqual(['MV Annex', 'Mountain View'])

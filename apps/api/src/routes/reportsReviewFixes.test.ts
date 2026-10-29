@@ -131,11 +131,21 @@ describe('Reports overview: each month row nets the way the P&L it opens nets', 
 })
 
 describe('decisions #25: the grand total of what everyone owes', () => {
+  /**
+   * A $300 bill and the rent charge that is its line. 10/18: the Outstanding
+   * Balance reads the charge rows (lib/rentCollected outstandingBalanceOf), the
+   * same rule the balances page reads, so the bill needs its line.
+   */
   async function seedOwed(f: F) {
-    await db.query(
+    const invoiceId = (await db.query<{ id: string }>(
       `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status)
-       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,300,'pending')`,
-      [f.lid, f.tenantId, f.leaseId, f.unitId, `INV-${randomUUID().slice(0, 8)}`])
+       VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,300,'pending') RETURNING id`,
+      [f.lid, f.tenantId, f.leaseId, f.unitId, `INV-${randomUUID().slice(0, 8)}`])).rows[0].id
+    await db.query(
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+                             due_date, entry_description)
+       VALUES ($1,$2,$3,$4,$5,'rent',300,'pending',CURRENT_DATE,'RENT')`,
+      [invoiceId, f.unitId, f.leaseId, f.tenantId, f.lid])
   }
 
   it('reaches the account owner and a property manager', async () => {
@@ -186,11 +196,15 @@ describe('the charges behind a total are filed under the day they counted', () =
     expect(statement.rowsTotal).toBe(0)
   })
 
-  it('Money billed files each bill on its due day', async () => {
+  it('10/12: a bill is Charged in its due month and its money is filed under the day it arrived (one line per day)', async () => {
     const f = await seed()
     const p = await settledRent(f, 500, '2026-08-05', '2026-08-07T10:00:00-07:00')
     const aug = (await get(f.owner, '/api/reports/monthly-pl?year=2026&month=8&basis=billed')).body.data
-    expect(aug.payments.find((r: any) => r.id === p)).toMatchObject({ day: '2026-08-05', dueDate: '2026-08-05' })
+    expect(aug.payments.find((r: any) => r.id === p)).toMatchObject({ day: '2026-08-07', dueDate: '2026-08-05' })
+    expect(aug.view).toMatchObject({ charged: 500, received: 500, owed: 0 })
+    const day = aug.days.find((d: any) => d.day === '2026-08-07')
+    expect(day).toMatchObject({ received: 500, chargesTotal: 500, noCharge: 0, paymentCount: 1 })
+    expect(day.paymentKeys).toEqual([`${p}:2026-08-07`])
   })
 })
 

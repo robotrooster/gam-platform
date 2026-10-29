@@ -23,6 +23,7 @@
 
 import type { PoolClient } from 'pg'
 import { propaneSplitOptions } from '@gam/shared'
+import { spaceTakesDeliveredPropane } from './propaneMode'
 import { AppError } from '../middleware/errorHandler'
 import { todayIn, monthStartOf } from '../lib/timezone'
 
@@ -63,7 +64,11 @@ export async function validateFillLine(
   // that you can record the event in the first place." A fill against a space
   // with no tank on record is a transcription slip — the delivery form no longer
   // offers those units, so reaching here means the wrong line got typed.
-  if (!unit.has_propane_tank) {
+  // 10/20: asked through the one rule that answers it (services/propaneMode),
+  // which takes the space's own marking and cannot see its unit type. Delivered
+  // tanks are on mobile home sites at Mountain View and will be on RV sites at
+  // the next property — "it needs to not be unit type exclusive."
+  if (!spaceTakesDeliveredPropane(unit)) {
     throw new AppError(400,
       `Unit ${unit.unit_number} has no propane tank on record. Mark it under Utilities on the ` +
       `unit's page — that is what tells the delivery form which spaces to offer.`)
@@ -75,6 +80,15 @@ export async function validateFillLine(
       WHERE l.unit_id = $1 AND l.status = 'active' AND vlat.role = 'primary'
       LIMIT 1`, [unit.id])
   if (!lt.rows[0]) {
+    // 10/20: the SCHEMA no longer insists on a lease — a fill may name a stay or
+    // a serviced agreement instead (migration 20261022090100), because delivered
+    // propane is about to be on RV sites where the occupant often has neither.
+    // The WRITE path still only knows how to bill a lease: a lease's propane
+    // rides the monthly invoice, while a stay has a balance and a serviced
+    // agreement has its own due day and late-fee policy, and which one a
+    // delivery lands on is a money decision for Nic, not one to invent here.
+    // Until he calls it, refuse loudly rather than record gallons with no way to
+    // collect them.
     throw new AppError(400, `Unit ${unit.unit_number} has no active lease — a propane fill bills the tenant`)
   }
   if (args.installments > 1) {

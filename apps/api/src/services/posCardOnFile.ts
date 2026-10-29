@@ -30,6 +30,7 @@ import { getStripe } from '../lib/stripe'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 import { tenantLivesHereSql } from './posPeople'
+import { inBook, askingAs, type BookCaller } from './registerBook'
 
 export interface SavedCard {
   paymentMethodId: string
@@ -68,6 +69,13 @@ export async function savedCardFor(opts: {
   tenantId?: string | null
   posCustomerId?: string | null
   landlordId: string
+  /**
+   * 10/20 (review): who is asking. The lives-here gate below reads the
+   * ACCOUNT's companies, so without this a co-owner of one of them reached the
+   * card on a sibling company's resident's own GAM account — chargeable at his
+   * counter. See services/registerBook.
+   */
+  caller: BookCaller
 }): Promise<SavedCard | null> {
   let holderName: string | null = null
   // Where to look, in order: Stripe customers (their chosen card first, then any
@@ -76,32 +84,41 @@ export async function savedCardFor(opts: {
   let recordId: string | null = null
 
   if (opts.tenantId) {
+    const tp: unknown[] = [opts.tenantId, opts.landlordId]
+    const wt = askingAs(tp, opts.caller)
     const t = await queryOne<any>(
-      `SELECT CASE WHEN ${tenantLivesHereSql('t.id', '$2')} THEN t.stripe_customer_id END AS stripe_customer_id,
+      `SELECT CASE WHEN ${tenantLivesHereSql('t.id', '$2', wt)} THEN t.stripe_customer_id END AS stripe_customer_id,
               u.first_name, u.last_name
          FROM tenants t JOIN users u ON u.id = t.user_id
-        WHERE t.id = $1`, [opts.tenantId, opts.landlordId])
+        WHERE t.id = $1`, tp)
     if (!t) throw new AppError(404, 'That resident could not be found — remove them (×), then type their name and pick them again.')
     if (t.stripe_customer_id) customers.push(t.stripe_customer_id)
     holderName = [t.first_name, t.last_name].filter(Boolean).join(' ') || null
+    const rp: unknown[] = [opts.landlordId, opts.tenantId]
+    const wr = askingAs(rp, opts.caller)
     const rec = await queryOne<{ id: string; stripe_customer_id: string | null }>(
       `SELECT id, stripe_customer_id FROM pos_customers
-        WHERE landlord_id = $1 AND tenant_id = $2 AND archived_at IS NULL`, [opts.landlordId, opts.tenantId])
+        WHERE ${inBook('landlord_id', '$1', wr)} AND tenant_id = $2 AND archived_at IS NULL
+        ORDER BY created_at LIMIT 1`, rp)
     if (rec) { recordId = rec.id; if (rec.stripe_customer_id) customers.push(rec.stripe_customer_id) }
   } else if (opts.posCustomerId) {
-    // Scoped to the landlord ringing the sale: one company's register may not
-    // charge another company's customer.
+    // Scoped to the ACCOUNT behind the register ringing the sale: one account's
+    // register may not charge another account's customer. 10/20 (review): the
+    // account, not the single LLC — Nic's two parks are two companies, and the
+    // man's one record is filed under whichever of them first wrote it down.
     // A resident's record reaches the card on their account only while they
     // live here — the record carrying their tenant id is not enough.
+    const cp: unknown[] = [opts.posCustomerId, opts.landlordId]
+    const wc = askingAs(cp, opts.caller)
     const c = await queryOne<any>(
       `SELECT c.id, c.stripe_customer_id, c.first_name, c.last_name,
-              CASE WHEN ${tenantLivesHereSql('t.id', '$2')} THEN t.stripe_customer_id END AS tenant_stripe_customer_id,
+              CASE WHEN ${tenantLivesHereSql('t.id', '$2', wc)} THEN t.stripe_customer_id END AS tenant_stripe_customer_id,
               u.first_name AS t_first, u.last_name AS t_last
          FROM pos_customers c
          LEFT JOIN tenants t ON t.id = c.tenant_id
          LEFT JOIN users u ON u.id = t.user_id
-        WHERE c.id = $1 AND c.landlord_id = $2 AND c.archived_at IS NULL`,
-      [opts.posCustomerId, opts.landlordId])
+        WHERE c.id = $1 AND ${inBook('c.landlord_id', '$2', wc)} AND c.archived_at IS NULL`,
+      cp)
     if (!c) throw new AppError(404, 'That customer is not on this register any more — remove them (×), then type their name and pick them again.')
     recordId = c.id
     if (c.stripe_customer_id) customers.push(c.stripe_customer_id)

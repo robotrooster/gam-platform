@@ -1,32 +1,24 @@
 /**
- * S66: per-user bank account catalog.
+ * S66: per-user bank account catalog — HISTORY ONLY since 10/12.
  *
- * Owner workflow: add accounts here, then assign each property to one of
- * them on the Properties page. Multiple properties can share one account
- * (LLC consolidation) — they collapse into a single Friday disbursement.
+ * This was the pre-Stripe-Connect payout catalog: an owner typed a routing and
+ * account number here and assigned properties to it on the Properties page.
+ * Payouts have run only through Stripe Connect since S561, so neither step
+ * ever moved money. 10/12 (Nic): the add form and the per-property routing are
+ * removed from the landlord portal and POST refuses new entries (see below).
  *
- * Mutation surface is intentionally narrow: routing/account numbers are
- * immutable once written (a number change = add new + archive old). Edit
- * exposes nickname only. Delete is soft (`status='archived'`) — rows and
- * the encrypted blob persist forever for GAM audit.
- *
- * Account numbers are encrypted at rest (lib/bankAccountCrypto). UI only
- * ever sees the last4; the full number is decrypted server-side at payout
- * fire time and via the super_admin reveal flow (separate route).
+ * What stays, for the rows that already exist: GET lists the caller's rows,
+ * PATCH renames one, archive retires one (soft — rows and the encrypted blob
+ * persist forever for GAM audit). Account numbers are encrypted at rest
+ * (lib/bankAccountCrypto); the UI only ever saw the last4.
  */
 
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth, requirePerm } from '../middleware/auth'
+import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { validateAbaRoutingNumber } from '../lib/banking'
-import { encryptBankAccountNumber, last4 } from '../lib/bankAccountCrypto'
-import {
-  ACCOUNT_TYPE_VALUES,
-  ACCOUNT_HOLDER_TYPE_VALUES,
-  BankAccountSummary,
-} from '@gam/shared'
+import { BankAccountSummary } from '@gam/shared'
 
 export const bankAccountsRouter = Router()
 bankAccountsRouter.use(requireAuth)
@@ -50,74 +42,31 @@ bankAccountsRouter.get('/', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-const createSchema = z.object({
-  // ── S637: A NICKNAME IS A CONVENIENCE, NOT A REQUIREMENT ────────────
-  //
-  // Nic, watching a co-owner stall: "Is the nickname for the account actually
-  // required? That may be holding him up. He's old school, and he may not have
-  // named the account."
-  //
-  // It was required on both sides, and the client refused BEFORE any request —
-  // so the button produced a re-render and nothing else, with "Required"
-  // printed under the first field of a long form, off-screen on a phone. A
-  // person entering a routing number and an account number was blocked by a
-  // label for their own benefit.
-  //
-  // Optional now, and filled in below from the bank details themselves, which
-  // is a better name than most people would type anyway.
-  nickname: z.string().max(80).optional(),
-  accountHolderName: z.string().min(1).max(120),
-  accountHolderType: z.enum(ACCOUNT_HOLDER_TYPE_VALUES),
-  accountType: z.enum(ACCOUNT_TYPE_VALUES),
-  routingNumber: z.string(),
-  accountNumber: z.string(),
-})
+// ── 10/12 (Nic): "Remove the old form." NEW ENTRIES ARE REFUSED ─────────────
+//
+// This catalog predates Stripe Connect. Rent pays out ONLY through the Connect
+// account a landlord verifies in step 1 of Bank setup
+// (jobs/autoPayouts.ts fires stripe.payouts.create against it and never reads
+// this table), so a row added here never set up payouts and never reached
+// Stripe at all — no verification, no microdeposits. It did, though, flip
+// GAM's "bank account ready" checks to true.
+//
+// Country Acres' owner typed his First Mid checking account into this form on
+// 10/5, saw it saved, and waited for microdeposits that could never come: his
+// company had no Stripe account at all.
+//
+// So the form is gone from the landlord portal and this endpoint refuses new
+// entries with the place payouts are actually set up. Existing rows stay
+// (keep-everything): GET still lists them, archive still works, and the
+// historical ledger joins still read them.
+// 10/19 (Nic): the Disbursement Account page no longer exists — its Stripe step
+// is step 1 of Bank setup on the Bank page, and /banking redirects there. A
+// refusal that names a page the landlord cannot find is worse than no refusal,
+// so it names where they should actually go.
+const REFUSAL = 'Payouts are set up with Stripe on the Bank page, under Bank setup.'
 
-// Self-service: adds the CALLER's own bank account (req.user), never the
-// landlord's — so it is NOT gated on a landlord-staff catalog key (that would
-// block property_manager/manager direct-deposit self-onboarding for no gain).
-bankAccountsRouter.post('/', async (req, res, next) => {
-  try {
-    const body = createSchema.parse(req.body)
-
-    const routing = body.routingNumber.replace(/\D/g, '')
-    const aba = validateAbaRoutingNumber(routing)
-    if (!aba.ok) {
-      throw new AppError(400, `Invalid routing number (${aba.reason})`)
-    }
-
-    const acctRaw = body.accountNumber.replace(/\D/g, '')
-    if (acctRaw.length < 4 || acctRaw.length > 17) {
-      throw new AppError(400, 'Account number must be 4–17 digits')
-    }
-
-    const encrypted = encryptBankAccountNumber(acctRaw)
-    const acctLast4 = last4(acctRaw)
-
-    // S637: name it from what they DID enter. "Checking ••4821" tells them
-    // which account this is on a list better than most people would type, and
-    // nobody is stopped by a blank box for a label.
-    const nickname = (body.nickname ?? '').trim()
-      || `${body.accountType === 'savings' ? 'Savings' : 'Checking'} ••${acctLast4}`
-
-    const row = await queryOne<BankAccountSummary>(`
-      INSERT INTO user_bank_accounts
-        (user_id, nickname, account_holder_name, account_holder_type,
-         account_type, routing_number, account_number_last4, account_number_encrypted)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING ${SAFE_COLUMNS}
-    `, [
-      req.user!.userId,
-      nickname,
-      body.accountHolderName.trim(),
-      body.accountHolderType,
-      body.accountType,
-      routing,
-      acctLast4,
-      encrypted,
-    ])
-    res.status(201).json({ success: true, data: row })
-  } catch (e) { next(e) }
+bankAccountsRouter.post('/', async (_req, _res, next) => {
+  next(new AppError(410, REFUSAL))
 })
 
 const patchSchema = z.object({

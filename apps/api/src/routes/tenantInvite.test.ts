@@ -389,6 +389,22 @@ describe('S654: accept-invite refuses an account that already has its own passwo
     expect(await state(id)).toEqual(before)
   })
 
+  it('10/13: a refused link gives its database connection back — invalid, expired or already used', async () => {
+    // Both refusals returned from inside the activation transaction, before
+    // the release: every refused link kept one pool connection for good, and
+    // on the full suite (pool of 8) the drafting further down this file timed
+    // out waiting for one. Nothing else is running here, so every connection
+    // the pool holds must be idle once each request has answered.
+    const busy = () => db.totalCount - db.idleCount
+    expect(busy()).toBe(0)
+    expect((await accept('no-such-link-anywhere')).status).toBe(404)
+    expect(busy()).toBe(0)
+    await resident(PLACEHOLDER, 'used-once')
+    expect((await accept('used-once')).status).toBe(200)
+    expect((await accept('used-once', 'a-different-password')).status).toBe(409)
+    expect(busy()).toBe(0)
+  })
+
   it('a resident still waiting on their first password activates', async () => {
     const id = await resident(PLACEHOLDER, 'first-time')
     const info = await request(buildApp()).get('/api/tenants/invite-info?token=first-time')

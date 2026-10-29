@@ -1,11 +1,10 @@
 /**
- * S624 — the zero-touch path, and the guards that keep it narrow.
- *
- * This is the ONLY place GAM settles a tenant's rent with nobody in the loop, so
- * what it REFUSES matters more than what it accepts. It overrides the S570
- * design lock ("landlord always confirms") on the strength of two independent
- * signals agreeing — a tenant's declaration and a bank row — neither of which is
- * the landlord's guess. Anything less than that must fall back to a shortlist.
+ * S624 — the zero-touch path, and the guards that keep it narrow. 10/14 (Nic,
+ * answer 16: "no guessing"): a tenant's report and a bank row no longer settle
+ * rent with nobody in the loop — the report is picked on the deposit review and
+ * a person confirms it. What the matcher REFUSES to pick still matters more than
+ * what it picks: anything less than a report that adds up, with no rival, must
+ * fall back to a shortlist with nothing picked.
  *
  * The failure this prevents is specific and bad: in a park where every lot pays
  * the same rent, settling on amount alone books one tenant's money onto
@@ -14,8 +13,9 @@
 import { randomUUID } from 'crypto'
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db, getClient } from '../db'
-import { autoSettleDeclaredDeposits, autoSettleByAmount, reconcileDeposits, namesAPayer, normalizeMerchant } from './bankFeed'
-import { undoDepositMatch } from './bankDepositConfirm'
+import { reconcileDeposits, namesAPayer, normalizeMerchant } from './bankFeed'
+import { undoDepositMatch, confirmDepositMatch } from './bankDepositConfirm'
+import { candidatesForDeposit } from './bankDepositCandidates'
 import { memoNameTokens, memoNamesTenant, memoNamesOnlyTenant, isTenantCheckMemo, BANK_BOILERPLATE_WORDS } from './bankDepositMatch'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedLease,
@@ -81,14 +81,38 @@ async function declareFor(p: Park, i: number, amount: number, method = 'cash') {
 const rentStatus = async (id: string) => (await db.query(
   `SELECT status FROM payments WHERE id=$1`, [id])).rows[0].status
 
-describe('two independent signals settle without a human', () => {
-  it('settles the declaring tenant, and only them, in an identical-rent park', async () => {
+// 10/14 (Nic, answer 16): "if gam 100 percent knows who that money came from it
+// can file it but no guessing." Confirmed: "Exact matches file themselves (GAM
+// payouts, front-desk-logged deposits for the exact amount); anything that
+// would be a guess asks." A tenant's report and a bank row of the same amount
+// are the tenant's claim, not GAM knowing who paid: the report is PICKED on the
+// deposit review for the person to confirm (candidate preselect), and only the
+// person's confirm settles it. The guards below decide what is picked.
+
+/** The report-backed candidate picked for the person on this line, or undefined. */
+const picked = async (t: string) => (await offered(t)).find(c => c.preselect && c.declaration)
+
+/** The person confirms the picked report (the deposit review's Confirm). */
+async function confirmPicked(t: string) {
+  const c = await picked(t)
+  expect(c, 'a report should be picked for the person').toBeTruthy()
+  return confirmDepositMatch({
+    bankTransactionId: t, chargeIds: c!.chargeIds, method: 'cash', declarationId: c!.declaration!.id, confirmedByUserId: null,
+  })
+}
+
+describe('a tenant’s report and the bank row: picked for the person, never settled without one', () => {
+  it('picks the declaring tenant, and only them, in an identical-rent park; nothing settles until the person confirms', async () => {
     const p = await buildPark(25)
     await declareFor(p, 6, 250)
-    await deposit(p, 250, 'ATM CASH DEPOSIT')
+    const t = await deposit(p, 250, 'ATM CASH DEPOSIT')
 
-    const n = await autoSettleDeclaredDeposits(p.landlordId)
-    expect(n).toBe(1)
+    const r = await reconcileDeposits(p.landlordId)
+    expect(r.recorded + r.slips + r.payouts).toBe(0)
+    for (const lot of p.lots) expect(await rentStatus(lot.rentId)).toBe('pending')
+    expect((await picked(t))?.chargeIds).toEqual([p.lots[6].rentId])
+
+    await confirmPicked(t)
     expect(await rentStatus(p.lots[6].rentId)).toBe('settled')
     // Every other lot is untouched — this is the whole safety property.
     for (const [i, lot] of p.lots.entries()) {
@@ -97,11 +121,13 @@ describe('two independent signals settle without a human', () => {
     }
   })
 
-  it('marks the declaration confirmed and the bank row matched', async () => {
+  it('the person’s confirm marks the declaration confirmed and the bank row matched', async () => {
     const p = await buildPark(3)
     const dId = await declareFor(p, 0, 250)
     const tId = await deposit(p, 250, 'ATM CASH DEPOSIT')
-    await autoSettleDeclaredDeposits(p.landlordId)
+    await reconcileDeposits(p.landlordId)
+    expect((await db.query(`SELECT status FROM tenant_declared_deposits WHERE id=$1`, [dId])).rows[0].status).toBe('pending')
+    await confirmPicked(tId)
 
     const d = (await db.query(
       `SELECT status, bank_transaction_id FROM tenant_declared_deposits WHERE id=$1`,
@@ -114,40 +140,44 @@ describe('two independent signals settle without a human', () => {
   })
 })
 
-describe('what it refuses to do alone', () => {
-  it('will not settle when two tenants both declared the same figure', async () => {
+describe('what it never picks', () => {
+  it('two tenants both declared the same figure: neither is picked', async () => {
     const p = await buildPark(25)
     await declareFor(p, 3, 250, 'cash')
     await declareFor(p, 11, 250, 'cash')
-    await deposit(p, 250, 'ATM CASH DEPOSIT')
+    const t = await deposit(p, 250, 'ATM CASH DEPOSIT')
     // Ambiguous between the two claimants — a human picks.
-    expect(await autoSettleDeclaredDeposits(p.landlordId)).toBe(0)
+    await reconcileDeposits(p.landlordId)
+    expect(await picked(t)).toBeUndefined()
     expect(await rentStatus(p.lots[3].rentId)).toBe('pending')
     expect(await rentStatus(p.lots[11].rentId)).toBe('pending')
   })
 
-  it('ignores a deposit that matches no claim', async () => {
+  it('a deposit that matches no claim', async () => {
     const p = await buildPark(5)
     await declareFor(p, 0, 250)
-    await deposit(p, 900, 'ATM CASH DEPOSIT')
-    expect(await autoSettleDeclaredDeposits(p.landlordId)).toBe(0)
+    const t = await deposit(p, 900, 'ATM CASH DEPOSIT')
+    await reconcileDeposits(p.landlordId)
+    expect(await picked(t)).toBeUndefined()
   })
 
   it('never reaches another landlord’s deposits', async () => {
     const a = await buildPark(2)
     const b = await buildPark(2)
     await declareFor(b, 0, 250)
-    await deposit(b, 250, 'ATM CASH DEPOSIT')
-    expect(await autoSettleDeclaredDeposits(a.landlordId)).toBe(0)
+    const t = await deposit(b, 250, 'ATM CASH DEPOSIT')
+    await reconcileDeposits(a.landlordId)
+    await reconcileDeposits(b.landlordId)
     expect(await rentStatus(b.lots[0].rentId)).toBe('pending')
+    expect((await db.query(`SELECT status FROM bank_transactions WHERE id=$1`, [t])).rows[0].status).toBe('needs_review')
   })
 
-  it('is safe to run twice — a settled deposit is not settled again', async () => {
+  it('a deposit the person confirmed is not settled again', async () => {
     const p = await buildPark(3)
     await declareFor(p, 0, 250)
-    await deposit(p, 250, 'ATM CASH DEPOSIT')
-    expect(await autoSettleDeclaredDeposits(p.landlordId)).toBe(1)
-    expect(await autoSettleDeclaredDeposits(p.landlordId)).toBe(0)
+    const t = await deposit(p, 250, 'ATM CASH DEPOSIT')
+    await confirmPicked(t)
+    await reconcileDeposits(p.landlordId)
     const settled = await db.query(
       `SELECT COUNT(*)::int AS n FROM payments
         WHERE lease_id=$1 AND type='rent' AND status='settled'`, [p.lots[0].leaseId])
@@ -157,11 +187,11 @@ describe('what it refuses to do alone', () => {
 
 // S655 HIGH (decisions #11, money plan leftovers): a tenant's report used to
 // settle their WHOLE open balance whatever the deposit — the matcher fell back
-// to every open charge when no set added up. A report settles only charges
-// that add up to it to the cent; anything else waits for the landlord with
-// "covers $X of $Y owed".
-describe('a report settles only what adds up to it, to the cent', () => {
-  it('never settles a report that adds up to no set of the tenant’s charges', async () => {
+// to every open charge when no set added up. A report is picked only with
+// charges that add up to it to the cent; anything else waits for the landlord
+// with "covers $X of $Y owed".
+describe('a report picks only what adds up to it, to the cent', () => {
+  it('never picks a report that adds up to no set of the tenant’s charges', async () => {
     const p = await buildPark(1)
     const lot = p.lots[0]
     const old = (await db.query(
@@ -170,13 +200,14 @@ describe('a report settles only what adds up to it, to the cent', () => {
       [lot.unitId, lot.leaseId, lot.tenantId, p.landlordId])).rows[0].id
     await declareFor(p, 0, 300)
     const txn = await deposit(p, 300, 'ATM CASH DEPOSIT')
-    expect(await autoSettleDeclaredDeposits(p.landlordId)).toBe(0)
+    await reconcileDeposits(p.landlordId)
+    expect(await picked(txn)).toBeUndefined()
     expect(await rentStatus(lot.rentId)).toBe('pending')
     expect(await rentStatus(old)).toBe('pending')
     expect((await db.query(`SELECT status FROM bank_transactions WHERE id=$1`, [txn])).rows[0].status).toBe('needs_review')
   })
 
-  it('settles exactly the charges that add up to the report and leaves the rest open', async () => {
+  it('picks exactly the charges that add up to the report; the confirm leaves the rest open', async () => {
     const p = await buildPark(1)
     const lot = p.lots[0]
     const water = (await db.query(
@@ -184,19 +215,38 @@ describe('a report settles only what adds up to it, to the cent', () => {
        VALUES ($1,$2,$3,$4,'utility',40,'pending',CURRENT_DATE,'UTILITY') RETURNING id`,
       [lot.unitId, lot.leaseId, lot.tenantId, p.landlordId])).rows[0].id
     await declareFor(p, 0, 250)
-    await deposit(p, 250, 'ATM CASH DEPOSIT')
-    expect(await autoSettleDeclaredDeposits(p.landlordId)).toBe(1)
+    const t = await deposit(p, 250, 'ATM CASH DEPOSIT')
+    await reconcileDeposits(p.landlordId)
+    expect((await picked(t))?.chargeIds).toEqual([lot.rentId])
+    await confirmPicked(t)
     expect(await rentStatus(lot.rentId)).toBe('settled')
     expect(await rentStatus(water)).toBe('pending')
   })
 })
 
-// ── S655 (money plan §3, Step 12): auto-settle by amount ─────────────────────
+// ── S655 (money plan §3, Step 12): a tenant's whole bill to the cent ──────────
 //
-// Nic (10/2): "auto-settle a tenant's own bank deposit that equals exactly one
-// tenant's whole open bill to the cent with nothing else fitting (Undo + notice
-// to both sides; same for a check memo naming the tenant with an exact amount)".
-// This flips S624's "never on amount alone" — narrowly.
+// Nic (10/2) had it settle by itself ("auto-settle a tenant's own bank deposit
+// that equals exactly one tenant's whole open bill to the cent with nothing
+// else fitting; same for a check memo naming the tenant with an exact amount").
+// 10/14 (Nic, answer 16): "if gam 100 percent knows who that money came from it
+// can file it but no guessing." An amount that happens to match, or a familiar
+// name, is a guess: it is OFFERED on the deposit review, picked for the person
+// to confirm (candidate preselect) — never settled by itself.
+
+/** Every automatic step for the company; how many deposits were settled or tied by themselves. */
+const settledByItself = async (landlordId: string) => {
+  const r = await reconcileDeposits(landlordId)
+  return r.slips + r.recorded + r.payouts
+}
+
+/** The deposit review's shortlist for one bank line. */
+async function offered(t: string) {
+  const row = (await db.query<any>(
+    `SELECT id, landlord_id, amount::float AS amount, to_char(posted_date,'YYYY-MM-DD') AS posted_date, description
+       FROM bank_transactions WHERE id = $1`, [t])).rows[0]
+  return (await candidatesForDeposit(row)).candidates
+}
 
 const txnStatus = async (id: string) => (await db.query(
   `SELECT status, auto_settled_at IS NOT NULL AS auto FROM bank_transactions WHERE id=$1`, [id])).rows[0]
@@ -209,46 +259,43 @@ async function addLine(p: Park, i: number, type: string, amount: number, entry: 
     [lot.unitId, lot.leaseId, lot.tenantId, p.landlordId, type, amount.toFixed(2), entry])).rows[0].id
 }
 
-async function waitFor<T>(f: () => Promise<T | null | undefined>, ms = 2000): Promise<T> {
-  const until = Date.now() + ms
-  for (;;) {
-    const v = await f()
-    if (v) return v
-    if (Date.now() > until) throw new Error('timed out waiting')
-    await new Promise(r => setTimeout(r, 25))
-  }
-}
 
-describe('Step 12: a deposit nobody reported settles a tenant’s whole bill by itself', () => {
-  it('settles a tenant’s whole bank-payable bill to the cent when nothing else fits', async () => {
+describe('Step 12 / 10/14: a deposit nobody reported is offered against a tenant’s whole bill, never settled by itself', () => {
+  it('a tenant’s whole bank-payable bill to the cent is offered first, picked for the person to confirm', async () => {
     const p = await buildPark(1)
     const water = await addLine(p, 0, 'utility', 41.25, 'UTILITY')
     const home = await addLine(p, 0, 'home_payment', 200, 'HOMEPMT')
     const t = await deposit(p, 491.25, 'BRANCH DEPOSIT')
-    expect(await autoSettleByAmount(p.landlordId)).toBe(1)
+    expect(await settledByItself(p.landlordId)).toBe(0)
+    for (const id of [p.lots[0].rentId, water, home]) expect(await rentStatus(id)).toBe('pending')
+    expect(await txnStatus(t)).toEqual({ status: 'needs_review', auto: false })
+    const top = (await offered(t))[0]
+    expect(top).toMatchObject({ tenantId: p.lots[0].tenantId, confidence: 'amount_unique', preselect: true })
+    expect([...top.chargeIds].sort()).toEqual([p.lots[0].rentId, water, home].sort())
+    // The person confirms it.
+    await confirmDepositMatch({ bankTransactionId: t, chargeIds: top.chargeIds, method: 'cash', confirmedByUserId: null })
     for (const id of [p.lots[0].rentId, water, home]) expect(await rentStatus(id)).toBe('settled')
-    expect(await txnStatus(t)).toEqual({ status: 'matched', auto: true })
   })
 
   it('a rival bill, a pending report or a same-amount deposit within 4 days stops it', async () => {
     // A rival: two tenants each owe exactly $250.
     const rival = await buildPark(2)
     const t1 = await deposit(rival, 250, 'BRANCH DEPOSIT')
-    expect(await autoSettleByAmount(rival.landlordId)).toBe(0)
+    expect(await settledByItself(rival.landlordId)).toBe(0)
     expect((await txnStatus(t1)).status).toBe('needs_review')
 
     // Part of a bill is not the whole bill.
     const part = await buildPark(1)
     await addLine(part, 0, 'utility', 40, 'UTILITY')
     await deposit(part, 250, 'BRANCH DEPOSIT')
-    expect(await autoSettleByAmount(part.landlordId)).toBe(0)
+    expect(await settledByItself(part.landlordId)).toBe(0)
     expect(await rentStatus(part.lots[0].rentId)).toBe('pending')
 
     // A report from this household (of another amount) is the tenant's own story to check.
     const reported = await buildPark(1)
     await declareFor(reported, 0, 300)
     await deposit(reported, 250, 'BRANCH DEPOSIT')
-    expect(await autoSettleByAmount(reported.landlordId)).toBe(0)
+    expect(await settledByItself(reported.landlordId)).toBe(0)
     expect(await rentStatus(reported.lots[0].rentId)).toBe('pending')
 
     // Someone else reported a deposit of this amount.
@@ -256,7 +303,7 @@ describe('Step 12: a deposit nobody reported settles a tenant’s whole bill by 
     await db.query(`UPDATE payments SET amount = 999 WHERE id = $1`, [other.lots[1].rentId])
     await declareFor(other, 1, 250)
     await deposit(other, 250, 'BRANCH DEPOSIT')
-    expect(await autoSettleByAmount(other.landlordId)).toBe(0)
+    expect(await settledByItself(other.landlordId)).toBe(0)
     expect(await rentStatus(other.lots[0].rentId)).toBe('pending')
 
     // Two deposits of the same amount within 4 days: which is whose?
@@ -266,47 +313,30 @@ describe('Step 12: a deposit nobody reported settles a tenant’s whole bill by 
       `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description, status)
        VALUES ($1,$2,$3,CURRENT_DATE - 3,250,'BRANCH DEPOSIT','categorized')`,
       [twice.connectionId, twice.landlordId, randomUUID()])
-    expect(await autoSettleByAmount(twice.landlordId)).toBe(0)
+    expect(await settledByItself(twice.landlordId)).toBe(0)
     expect(await rentStatus(twice.lots[0].rentId)).toBe('pending')
   })
 
-  it('a check memo naming the tenant with the exact amount settles', async () => {
+  it('a check memo naming the tenant with the exact amount is offered first (that tenant only), never settled by itself', async () => {
     const p = await buildPark(3)
     await db.query(`UPDATE users SET last_name = 'Garcia' WHERE id = (SELECT user_id FROM tenants WHERE id = $1)`,
       [p.lots[1].tenantId])
     const t = await deposit(p, 250, 'REMOTE DEP CHK R GARCIA')
-    expect(await autoSettleByAmount(p.landlordId)).toBe(1)
-    expect(await rentStatus(p.lots[1].rentId)).toBe('settled')
-    expect(await rentStatus(p.lots[0].rentId)).toBe('pending')
-    expect(await rentStatus(p.lots[2].rentId)).toBe('pending')
-    expect((await txnStatus(t)).auto).toBe(true)
-    const method = (await db.query(`SELECT manual_method FROM payments WHERE id=$1`, [p.lots[1].rentId])).rows[0].manual_method
-    expect(method).toBe('check')
+    expect(await settledByItself(p.landlordId)).toBe(0)
+    for (const lot of p.lots) expect(await rentStatus(lot.rentId)).toBe('pending')
+    expect((await txnStatus(t)).status).toBe('needs_review')
+    const top = (await offered(t))[0]
+    expect(top).toMatchObject({ tenantId: p.lots[1].tenantId, confidence: 'named_exact', preselect: true })
   })
 
-  it('both sides are told', async () => {
-    const p = await buildPark(1)
-    await deposit(p, 250, 'BRANCH DEPOSIT')
-    expect(await autoSettleByAmount(p.landlordId)).toBe(1)
-    const tenantUser = (await db.query(`SELECT user_id FROM tenants WHERE id=$1`, [p.lots[0].tenantId])).rows[0].user_id
-    const owner = (await db.query(`SELECT user_id FROM landlords WHERE id=$1`, [p.landlordId])).rows[0].user_id
-    const tn = await waitFor(async () => (await db.query(`SELECT title, body FROM notifications WHERE user_id=$1`, [tenantUser])).rows[0])
-    expect(tn.title).toBe('Your bank deposit has been applied')
-    expect(tn.body).toMatch(/^We applied your \$250\.00 deposit of \d{4}-\d{2}-\d{2} to your bill — it matched what you owed to the cent\./)
-    const ln = await waitFor(async () => (await db.query(`SELECT title, body, action_url FROM notifications WHERE user_id=$1`, [owner])).rows[0])
-    expect(ln.title).toBe('A bank deposit was applied to rent by itself')
-    expect(ln.body).toMatch(/was auto-applied — it was exactly one tenant’s whole bill and nothing else fit\. If that is wrong, press Undo/)
-  })
-
-  it('an auto-applied deposit can be undone, and is never applied by itself again', async () => {
+  it('a deposit a person confirmed and then undid is never applied by itself', async () => {
     const p = await buildPark(1)
     const t = await deposit(p, 250, 'BRANCH DEPOSIT')
-    expect(await autoSettleByAmount(p.landlordId)).toBe(1)
+    await confirmDepositMatch({ bankTransactionId: t, chargeIds: [p.lots[0].rentId], method: 'cash', confirmedByUserId: null })
     await undoDepositMatch({ bankTransactionId: t, landlordId: p.landlordId, undoneBy: null })
     expect(await rentStatus(p.lots[0].rentId)).toBe('pending')
     expect((await txnStatus(t)).status).toBe('needs_review')
-    expect(await autoSettleByAmount(p.landlordId)).toBe(0)
-    expect((await reconcileDeposits(p.landlordId)).autoSettled).toBe(0)
+    expect(await settledByItself(p.landlordId)).toBe(0)
     expect(await rentStatus(p.lots[0].rentId)).toBe('pending')
   })
 
@@ -316,7 +346,7 @@ describe('Step 12: a deposit nobody reported settles a tenant’s whole bill by 
     await deposit(p, 250, 'Square Inc       SQ261001   261001 T3H80F2ZQ67M')
     // (Two deposits of $250 would stop it anyway; each is checked alone too.)
     await db.query(`UPDATE bank_transactions SET posted_date = CURRENT_DATE - 9 WHERE description LIKE 'Square%'`)
-    expect(await autoSettleByAmount(p.landlordId)).toBe(0)
+    expect(await settledByItself(p.landlordId)).toBe(0)
     expect(await rentStatus(p.lots[0].rentId)).toBe('pending')
   })
 
@@ -351,21 +381,21 @@ describe('Step 12: a deposit nobody reported settles a tenant’s whole bill by 
     expect(await rentStatus(lot.rentId)).toBe('pending')
 
     const t = await deposit(p, 250, 'BRANCH DEPOSIT')
-    expect(await autoSettleByAmount(p.landlordId)).toBe(0)
+    expect(await settledByItself(p.landlordId)).toBe(0)
     expect((await txnStatus(t)).status).toBe('needs_review')
     // 10/6 review fix: the household's next month is still open for exactly
     // this amount, so the line could as well be a second deposit of theirs —
     // with no reference number on it GAM does not tie it by itself (and never
     // pays it onto that bill); a person picks.
     const r0 = await reconcileDeposits(p.landlordId)
-    expect(r0).toMatchObject({ autoSettled: 0, recorded: 0 })
+    expect(r0).toMatchObject({ recorded: 0 })
     expect((await txnStatus(t)).status).toBe('needs_review')
     // 10/6 (Nic, "Yes, build it"): the receipt's reference number on the bank's
     // line says which deposit it is — tied to it (no money moves again), never
     // paid onto another bill.
     await db.query(`UPDATE bank_transactions SET description = 'BRANCH DEPOSIT BR-1001' WHERE id = $1`, [t])
     const r = await reconcileDeposits(p.landlordId)
-    expect(r).toMatchObject({ autoSettled: 0, recorded: 1 })
+    expect(r).toMatchObject({ recorded: 1 })
     expect(await rentStatus(lot.rentId)).toBe('pending')
     const tied = (await db.query<any>(`SELECT status, auto_settle_undo FROM bank_transactions WHERE id = $1`, [t])).rows[0]
     expect(tied.status).toBe('matched')
@@ -388,7 +418,7 @@ describe('Step 12: a deposit nobody reported settles a tenant’s whole bill by 
       } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
     }
     const t = await deposit(p, 250, 'BRANCH DEPOSIT')
-    expect(await reconcileDeposits(p.landlordId)).toMatchObject({ recorded: 0, autoSettled: 0 })
+    expect(await reconcileDeposits(p.landlordId)).toMatchObject({ recorded: 0 })
     expect((await txnStatus(t)).status).toBe('needs_review')
     // The landlord sees both on the deposit review, to pick the one it is.
     const { candidatesForDeposit } = await import('./bankDepositCandidates')
@@ -401,13 +431,13 @@ describe('Step 12: a deposit nobody reported settles a tenant’s whole bill by 
     const p = await buildPark(1)
     const t = await deposit(p, 250, 'BRANCH DEPOSIT')
     await db.query(`UPDATE bank_transactions SET posted_date = CURRENT_DATE - 12 WHERE id = $1`, [t])
-    expect(await autoSettleByAmount(p.landlordId)).toBe(0)
+    expect(await settledByItself(p.landlordId)).toBe(0)
     expect(await rentStatus(p.lots[0].rentId)).toBe('pending')
   })
 
   // S655 leftover (Steps 9 and 12): a settle that is neither Stripe nor credit
   // writes how it was paid, so an old failed card intent never reads as GAM-held.
-  it('an auto-settled move-in box row over an old failed intent becomes landlord-funded paid-ahead money', async () => {
+  it('a move-in box row over an old failed intent, settled from a bank line, becomes landlord-funded paid-ahead money', async () => {
     const p = await buildPark(1)
     await db.query(`UPDATE payments SET status = 'settled', settled_at = now(), manual_method = 'cash' WHERE id = $1`, [p.lots[0].rentId])
     const lot = p.lots[0]
@@ -419,8 +449,9 @@ describe('Step 12: a deposit nobody reported settles a tenant’s whole bill by 
                              entry_description, revenue_owner, lease_fee_id, stripe_payment_intent_id)
        VALUES ($1,$2,$3,$4,'fee',300,'failed',CURRENT_DATE,'OTHERFEE','held',$5,'pi_old_card') RETURNING id`,
       [lot.unitId, lot.leaseId, lot.tenantId, p.landlordId, fee])).rows[0].id
-    await deposit(p, 300, 'BRANCH DEPOSIT')
-    expect(await autoSettleByAmount(p.landlordId)).toBe(1)
+    const t = await deposit(p, 300, 'BRANCH DEPOSIT')
+    expect(await settledByItself(p.landlordId)).toBe(0)
+    await confirmDepositMatch({ bankTransactionId: t, chargeIds: [box], method: 'cash', confirmedByUserId: null })
     expect((await db.query(`SELECT status, manual_method, platform_held FROM payments WHERE id=$1`, [box])).rows[0])
       .toMatchObject({ status: 'settled', manual_method: 'cash', platform_held: false })
     const credit = (await db.query(
@@ -445,7 +476,7 @@ describe('Step 12: a memo that is not a tenant’s check never settles a named t
     const p = await buildPark(1)
     await nameTenant(p, 0, 'Nicholas', 'Rhoades')
     const t = await deposit(p, 250, SQUARE_MEMO)
-    expect(await autoSettleByAmount(p.landlordId)).toBe(0)
+    expect(await settledByItself(p.landlordId)).toBe(0)
     expect(await rentStatus(p.lots[0].rentId)).toBe('pending')
     expect((await txnStatus(t)).status).toBe('needs_review')
   })
@@ -459,7 +490,7 @@ describe('Step 12: a memo that is not a tenant’s check never settles a named t
     const p = await buildPark(2)
     await nameTenant(p, 0, 'Pat', 'Green')
     const t = await deposit(p, 250, BRANCH_MEMO)
-    expect(await autoSettleByAmount(p.landlordId)).toBe(0)
+    expect(await settledByItself(p.landlordId)).toBe(0)
     expect(await rentStatus(p.lots[0].rentId)).toBe('pending')
     expect(await rentStatus(p.lots[1].rentId)).toBe('pending')
     expect((await txnStatus(t)).status).toBe('needs_review')
@@ -505,7 +536,7 @@ describe('Step 12: a memo that is not a tenant’s check never settles a named t
     await nameTenant(p, 0, 'Nicholas', 'Rhoades')
     // Not anonymous either, so it is not an amount-only settle.
     await deposit(p, 250, 'MOBILE DEPOSIT MERYL RHOADES')
-    expect(await autoSettleByAmount(p.landlordId)).toBe(0)
+    expect(await settledByItself(p.landlordId)).toBe(0)
     expect(await rentStatus(p.lots[0].rentId)).toBe('pending')
   })
 })

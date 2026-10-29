@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry, sessionRenewalDue, readKeepSignedInChoice, rememberKeepSignedInChoice } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, sessionRenewalDue, readKeepSignedInChoice, rememberKeepSignedInChoice, installPrintLightTheme } from '@gam/shared'
 // S540: self-hosted fonts — no render-blocking external stylesheet
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
@@ -24,13 +24,16 @@ import {
   LayoutDashboard, Rocket, Building2, Users, Zap, ClipboardList, DoorOpen,
   CreditCard, ArrowDownToLine, Plug, Activity, Map as MapIcon, FileText,
   Scale, SlidersHorizontal, Lightbulb, Landmark, Mail, Send,
-  Target, TrendingUp, Bot, Lock, LogOut, Sun, Moon, ShieldCheck,
+  Target, TrendingUp, Bot, Lock, LogOut, Sun, Moon, ShieldCheck, Trophy, UserSearch,
 } from 'lucide-react'
 import axios from 'axios'
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
-import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, startVersionWatch, FLEXPAY_TERMS } from '@gam/shared'
+import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
+import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, startVersionWatch, FLEXPAY_TERMS, incomeRing, incomeLegend, incomeShare } from '@gam/shared'
 import { toast, appConfirm, DialogHost } from './components/dialogs'
 import { RentVolumeMonitor } from './components/RentVolumeMonitor'
+import { MetricsHeatMap } from './components/MetricsHeatMap'
+import { ReaderOrdersDesk } from './components/ReaderOrdersDesk'
+import { MetricsLifetime } from './components/MetricsLifetime'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const api = axios.create({ baseURL: `${API}/api` })
@@ -212,7 +215,8 @@ const css=`
 :root{--bg0:#080a0c;--bg1:#0d1014;--bg2:#121519;--bg3:#181c22;--bg4:#1e2330;
   --b0:#1a1f28;--b1:#222a38;--b2:#2a3547;
   --t0:#eef0f6;--t1:#b8c4d8;--t2:#7a8aaa;--t3:#475060;
-  --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;--purple:#a855f7;
+  --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;--purple:#a855f7;--teal:#14b8a6;
+  --s1:var(--bg3);--s2:var(--bg4);
   --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace}
 html{-webkit-font-smoothing:antialiased;height:100%}
 body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
@@ -311,6 +315,31 @@ html{font-size:17px}
 :root[data-theme="light"] .inp,:root[data-theme="light"] .input,:root[data-theme="light"] .form-input{color-scheme:light}
 :root[data-theme="light"] a{color:var(--gold-ink)}
 :root[data-theme="light"] .ni.active{background:rgba(239,68,68,.10);border-color:rgba(239,68,68,.28)}
+/* 10/12 (Nic): the Metrics page. Tiles wrap to whatever width there is. */
+.mx-hero{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
+.mx-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
+.mx-big{font-family:var(--font-d);font-size:clamp(1.45rem,2.3vw,2.1rem);font-weight:800;color:var(--gold);line-height:1.1;margin-bottom:6px;overflow-wrap:break-word}
+.mx-v{font-size:clamp(1.1rem,1.6vw,1.35rem);overflow-wrap:break-word}
+.mx-section{margin:6px 0 10px}
+/* 10/12: at phone width the fixed 220px sidebar left the page about 150px to
+   draw in. Below 760px the sidebar becomes a top bar whose links scroll
+   sideways, and the page scrolls as one column. Desktop is untouched. */
+@media(max-width:760px){
+  body{overflow:auto;height:auto}
+  .shell{flex-direction:column;height:auto;overflow:visible}
+  .sidebar{position:static;width:100%;flex-direction:column;overflow:visible;border-right:none;border-bottom:1px solid var(--b0)}
+  .logo{padding:10px 16px}
+  .nav{display:flex;flex-wrap:nowrap;gap:4px;overflow-x:auto;padding:6px 10px;-webkit-overflow-scrolling:touch}
+  .nav .nl{display:none}
+  .nav .ni{width:auto;flex-shrink:0;white-space:nowrap}
+  .sfooter{display:flex;align-items:center;justify-content:space-between;padding:6px 10px}
+  .sfooter .ni{width:auto}
+  .main{margin-left:0;height:auto;overflow:visible}
+  .topbar{padding:0 16px}
+  .page{padding:16px;overflow:visible}
+  .ph{flex-wrap:wrap;gap:8px}
+  .mx-big{font-size:1.6rem}
+}
 `
 
 // ── LAYOUT ────────────────────────────────────────────────────
@@ -331,12 +360,18 @@ function Layout(){
         <nav className="nav">
           <div className="nl">Platform</div>
           {isSuperAdmin&&<NavLink to="/overview" className={({isActive})=>`ni${isActive?' active':''}`}><LayoutDashboard size={15}/> Overview</NavLink>}
+          {/* 10/12 (Nic): "I want a page specifically for Metrics." */}
+          {isSuperAdmin&&<NavLink to="/metrics" className={({isActive})=>`ni${isActive?' active':''}`}><Trophy size={15}/> Metrics</NavLink>}
           {!isSuperAdmin&&<NavLink to="/onboarding" className={({isActive})=>`ni${isActive?' active':''}`}><Rocket size={15}/> Onboarding</NavLink>}
           <NavLink to="/landlords" className={({isActive})=>`ni${isActive?' active':''}`}><Building2 size={15}/> Landlords</NavLink>
           <NavLink to="/tenants" className={({isActive})=>`ni${isActive?' active':''}`}><Users size={15}/> Tenants</NavLink>
           {isSuperAdmin&&<NavLink to="/screenings" className={({isActive})=>`ni${isActive?' active':''}`}><ShieldCheck size={15}/> Screenings</NavLink>}
           {isSuperAdmin&&<NavLink to="/flexpay-requests" className={({isActive})=>`ni${isActive?' active':''}`}><Zap size={15}/> FlexPay Requests</NavLink>}
           {isSuperAdmin&&<NavLink to="/property-reviews" className={({isActive})=>`ni${isActive?' active':''}`}><ClipboardList size={15}/> Property Reviews</NavLink>}
+          {/* 10/22 (Nic): "when there's a not sure call, we can leave it to the
+              admin to kind of do some research on." Nobody is flagged while a
+              row sits here, so an empty list is the normal state. */}
+          {isSuperAdmin&&<NavLink to="/left-owing-reviews" className={({isActive})=>`ni${isActive?' active':''}`}><UserSearch size={15}/> Left-Owing Matches<LeftOwingReviewBadge/></NavLink>}
           {isSuperAdmin&&<NavLink to="/feature-requests" className={({isActive})=>`ni${isActive?' active':''}`}><Lightbulb size={15}/> Feature Requests</NavLink>}
           <NavLink to="/units" className={({isActive})=>`ni${isActive?' active':''}`}><DoorOpen size={15}/> Units</NavLink>
           <div className="nl" style={{marginTop:8}}>Finance</div>
@@ -495,10 +530,13 @@ function AdminOnboardingOverview(){
           <div className={`kv ${(stats?.tenantsNoFlex||0)>0?'a':'g'}`}>{stats?.tenantsNoFlex||0}</div>
           <div className="ks">No flex products enrolled</div>
         </div>
+        {/* 10/12 (Nic, A5: "match billing"): the Overview's vacant count — spaces
+            under management not occupied this month the way GAM bills them —
+            in this admin's portfolio. It counted unit status before. */}
         <div className="kpi">
           <div className="kl">Vacant Units</div>
           <div className="kv b">{stats?.vacantUnits||0}</div>
-          <div className="ks">{stats?.unitsNoTenant||0} without tenant assigned</div>
+          <div className="ks">counted the way GAM bills · {stats?.unitsNoTenant||0} without tenant assigned</div>
         </div>
       </div>
 
@@ -1039,7 +1077,9 @@ function AgentAnalytics(){
   )
 }
 
-const INCOME_COLORS:Record<string,string>={platform_unit:'#c9a227',processing:'#3b82f6',flexpay:'#22c55e',flex_deposit:'#ec4899',flex_credit:'#eab308',business_pos:'#06b6d4',placement:'#f97316',instant_withdrawal:'#14b8a6',background_checks:'#e10600'}
+// 10/13 (Nic, full purchase): a card reader is three slices — what GAM paid
+// for it (below zero), the pieces paying that back, and the markup once repaid.
+const INCOME_COLORS:Record<string,string>={platform_unit:'#c9a227',processing:'#3b82f6',flexpay:'#22c55e',flex_deposit:'#ec4899',flex_credit:'#eab308',business_pos:'#06b6d4',placement:'#f97316',instant_withdrawal:'#14b8a6',background_checks:'#e10600',card_reader_markup:'#a855f7',card_reader_repaid:'#c4b5fd',card_reader_purchases:'#7c3aed'}
 const incomeColorOf=(k:string)=>INCOME_COLORS[k]||'#94a3b8'
 
 // ── 10/3 (Nic): the two admin money cards ──────────────────────────────────
@@ -1051,10 +1091,18 @@ const money=(n:number|null|undefined)=>n==null?'—':formatCurrency(n)
 /** GAM's own money: what is GAM's, what sits beside it, and the check against GAM's records. */
 function GamsOwnMoneyCard({bal}:{bal:any}){
   const[showCheck,setShowCheck]=useState(false)
+  const[showBridge,setShowBridge]=useState(false)
   const r=bal.reconciliation
+  const br=r?.bridge
+  const leftoverZero=br!=null&&Math.abs(br.leftover)<0.005
+  // A signed amount on a bridge line: "+$4.00" / "−$4.00".
+  const signed=(n:number)=>Math.abs(n)<0.005?money(0):n>0?`+${money(n)}`:`−${money(-n)}`
   const c=bal.clearing||{}
   const gap=r?.gap
   const ties=gap!=null&&Math.abs(gap)<0.005
+  // 10/13 (Nic, full purchase): what card readers put in "Earned" (GET /admin/platform-balance readers_in_earned).
+  const rie=bal.readersInEarned
+  const readersIn=rie&&(Math.abs(rie.bought||0)>0.004||Math.abs(rie.costRepaid||0)>0.004||Math.abs(rie.markup||0)>0.004)?rie:null
   return(
     <div className="kpi"><div className="kl">GAM's Own Money</div>
       <div className="kv g">{money(bal.gamsOwn)}</div>
@@ -1071,8 +1119,67 @@ function GamsOwnMoneyCard({bal}:{bal:any}){
           :gap>0?`The balance holds ${money(gap)} more than GAM’s records say (${money(r.book)})`
           :`The balance is ${money(-gap)} short of what GAM’s records say (${money(r.book)})`}
       </div>}
-      <div className="ks" style={{marginTop:2}}>book: {money(bal.revenueThisMonth||0)} earned this month, {money(bal.revenueAllTime||0)} all time{(bal.owedByLandlordsUncollected||0)>0?` — ${money(bal.owedByLandlordsUncollected)} of that still owed by landlords`:''}</div>
-      {r&&<button className="btn btn-primary btn-sm" style={{marginTop:8}} onClick={()=>setShowCheck(v=>!v)}>{showCheck?'Hide the check':'Show the check'}</button>}
+      {/* 10/12 (Nic): "two numbers means two sources" — and it is two: the
+          figure above is GAM's cash on the Stripe balance, this one is what the
+          revenue book says GAM has earned. "book:" read like a third set of
+          records beside "GAM's records" above it, and "of that still owed"
+          claimed the landlords' open charges sit inside the earned figure,
+          which holds only for platform fees and card-reader installments
+          (10/13, Nic: full purchase — a reader's pieces are booked as billed,
+          the cost they repay and then the markup). Same numbers, plainer
+          words. Nothing about how either number is worked out changed here. */}
+      {/* 10/12 (Nic, A3): "rename 'book' so it doesn't collide with 'GAM's
+          records'" — the earned figure is GAM's earnings ledger
+          (platform_revenue_ledger); "GAM's records" stays the check's name. */}
+      <div className="ks" style={{marginTop:2}}>Earned, per GAM's earnings ledger: {money(bal.revenueThisMonth||0)} this month, {money(bal.revenueAllTime||0)} all time</div>
+      {/* 10/13 (Nic): "Book the $331.73 as an expense the day we buy it, and
+          each $87.50 payment as paying it back (lowers 'earned all time' until
+          repaid)." Says what the readers put in that figure. */}
+      {readersIn&&<div className="ks" style={{fontSize:'.7rem'}}>Card readers in it: {signed(readersIn.bought||0)} bought, {signed(readersIn.costRepaid||0)} cost repaid, {signed(readersIn.markup||0)} markup</div>}
+      {/* 10/12 (Nic) review: this total is every open landlord charge — a
+          card-reader installment is not a fee — and a payout is not the only
+          way it is collected. So it names what is owed, kind by kind, and both
+          ways GAM collects it (services/landlordGamAccount: netted from the
+          next payout; a bank debit only when the balance passes the
+          property's limit with no payout to take it from). */}
+      {(bal.owedByLandlordsUncollected||0)>0&&<div className="ks">
+        Landlords still owe GAM {money(bal.owedByLandlordsUncollected)}
+        {(bal.owedByLandlordsByKind||[]).length>0&&<> ({(bal.owedByLandlordsByKind as any[]).map((k:any)=>`${k.label.toLowerCase()} ${money(k.amount)}`).join(', ')})</>}
+        {' '}— taken from their next payout, or by bank debit if it passes their limit first
+      </div>}
+      {r&&<div style={{display:'flex',gap:8,flexWrap:'wrap',marginTop:8}}>
+        {br&&<button className="btn btn-primary btn-sm" onClick={()=>setShowBridge(v=>!v)}>{showBridge?'Hide the bridge':'Show the bridge'}</button>}
+        <button className="btn btn-primary btn-sm" onClick={()=>setShowCheck(v=>!v)}>{showCheck?'Hide the check':'Show the check'}</button>
+      </div>}
+      {/* 10/12 (Nic, A3): "SHOW THE BRIDGE (earned − billed-not-collected +
+          reader payments − payouts to GAM bank = money in Stripe)". From the
+          earnings ledger to the headline, line by line, every timing item
+          named; the leftover must read $0.00 (services/stripeCosts
+          platformBalanceBridge). */}
+      {br&&showBridge&&<div style={{marginTop:8}}>
+        <div className="dr"><span className="dk">Earned, all time (GAM's earnings ledger)</span><span className="dv mono">{money(br.earned)}</span></div>
+        {(br.platformFeesNotCollected||0)!==0&&<div className="dr"><span className="dk">Less platform fees billed, not collected yet</span><span className="dv mono">−{money(br.platformFeesNotCollected)}</span></div>}
+        {/* 10/12 (G5 review): a fee a landlord covers that was more than the
+            payment (the $6 bank fee on a $4 payment) — the rest is billed to
+            the landlord; earned in full, on the balance once collected. */}
+        {(br.processingFeesNotCollected||0)!==0&&<div className="dr"><span className="dk">Less processing fees landlords cover beyond the payment, billed, not collected yet</span><span className="dv mono">−{money(br.processingFeesNotCollected)}</span></div>}
+        {/* 10/13 (Nic, full purchase): a reader is inside "Earned" as its
+            purchase (GAM's expense) and each payment billed (the cost it
+            repays, then the markup). GAM paid Stripe's shop for it, not from
+            this balance, so the purchase is added back; payments billed and not
+            collected yet are taken off. */}
+        {(br.readerBilledNotCollected||0)!==0&&<div className="dr"><span className="dk">Less card-reader payments billed, not collected yet</span><span className="dv mono">−{money(br.readerBilledNotCollected)}</span></div>}
+        {(br.readerBought||0)!==0&&<div className="dr"><span className="dk">Plus card readers GAM bought — an expense inside Earned, not paid from the Stripe balance</span><span className="dv mono">+{money(br.readerBought)}</span></div>}
+        {(br.readerPaymentsCollected||0)!==0&&<div className="ks" style={{marginTop:-2,marginBottom:4}}>Card-reader payments collected: {money(br.readerPaymentsCollected)} = {money(br.readerCostRepaidCollected||0)} cost repaid + {money(br.readerMarkupCollected||0)} markup (both inside Earned)</div>}
+        {(br.paidOutToGamBank||0)!==0&&<div className="dr"><span className="dk">Less paid out to GAM's own bank</span><span className="dv mono">−{money(br.paidOutToGamBank)}</span></div>}
+        {(br.timing||[]).length>0&&<div className="ks" style={{marginTop:6}}>Timing and the rest, each named:</div>}
+        {(br.timing||[]).map((t:any)=>(
+          <div key={t.key} className="dr"><span className="dk">{t.label}</span><span className="dv mono">{signed(t.amount)}</span></div>
+        ))}
+        <div className="dr"><span className="dk">Comes to</span><span className="dv mono">{money(br.gamsOwn)}</span></div>
+        <div className="dr"><span className="dk">GAM's own on the Stripe balance</span><span className="dv mono">{money(br.onBalance)}</span></div>
+        <div className="dr"><span className="dk">Leftover (must read $0.00)</span><span className="dv mono" style={{color:leftoverZero?'var(--green)':'var(--amber)'}}>{money(br.leftover)}</span></div>
+      </div>}
       {r&&showCheck&&<div style={{marginTop:8}}>
         <div className="dr"><span className="dk">Bank and card fees on payments that cleared</span><span className="dv mono">{money(r.collectedParts?.processingFees)}</span></div>
         <div className="dr"><span className="dk">Register and pay-link card fees</span><span className="dv mono">{money(r.collectedParts?.registerCardFees)}</span></div>
@@ -1102,7 +1209,7 @@ function GamsOwnMoneyCard({bal}:{bal:any}){
         <div className="dr"><span className="dk">The Stripe balance says</span><span className="dv mono">{money(r.onBalance)}</span></div>
         <div className="dr"><span className="dk">Difference</span><span className="dv mono" style={{color:ties?'var(--green)':'var(--amber)'}}>{money(gap)}</span></div>
         <div className="ks" style={{marginTop:6}}>Not in this check: money a tenant's payment carried toward an older FlexDeposit or FlexCharge balance, and what GAM has paid Checkr. The Checkr line is every background check applicants paid that was not refunded — once GAM pays Checkr, that line reads high and GAM's own reads low by what was paid. A dispute GAM wins puts the money back on the balance: the fee on top in it is counted here (and what the landlords were charged for it is owed back to them), but GAM's records do not undo the rent part of the dispute yet, so that part reads as a difference of its amount.</div>
-        <div className="ks" style={{marginTop:4}}>Not in the earnings book one by one yet: card fees on stay deposits paid online and GAM's cut of business payments are counted in this check, but reach the earnings book only through the nightly processing true-up; businesses' invoicing fees are not in the earnings book at all yet.</div>
+        <div className="ks" style={{marginTop:4}}>Not in GAM's earnings ledger one by one yet: card fees on stay deposits paid online and GAM's cut of business payments are counted in this check, but reach the earnings ledger only through the nightly processing true-up; businesses' invoicing fees are not in the earnings ledger at all. A card reader is in the earnings ledger as GAM's expense the day GAM bought it, and each payment, as it is billed, as paying that cost back — then the markup once the cost is repaid; GAM paid Stripe's shop for the reader from outside the balance, so this check never counts the purchase.</div>
       </div>}
     </div>)
 }
@@ -1270,6 +1377,249 @@ function ProcessingMarginCard({m}:{m:any}){
     </div>)
 }
 
+/** Month 'YYYY-MM' in words: '2026-10' → 'October 2026'. */
+const monthName=(ym?:string|null)=>{
+  const m=/^(\d{4})-(\d{2})/.exec(ym||'')
+  if(!m)return ym||''
+  return new Date(Number(m[1]),Number(m[2])-1,1).toLocaleString('en-US',{month:'long',year:'numeric'})
+}
+
+/**
+ * Recurring revenue + the income pies (all from platform_revenue_ledger).
+ * 10/12 (Nic): one component, on the Overview and on the Metrics page — "we
+ * have these pie charts on here, which is nice." The recurring line is the
+ * month's platform-fee bill as GAM billed it, top-ups included, and it
+ * follows the book: it refreshes on the page's 30-second beat, so a space the
+ * nightly top-up bills shows without a reload.
+ */
+function PlatformRevenueCard(){
+  const{user}=useAuth()
+  const{data:compositionAll,isError:compositionFailed}=useQuery('income-composition-all',()=>get<any>('/admin/income/composition/all'),{enabled:!!user,staleTime:30000,refetchInterval:30000,refetchOnWindowFocus:true})
+  const[breakdownWindow,setBreakdownWindow]=React.useState<string|null>(null)
+  const{data:breakdown,isLoading:breakdownLoading}=useQuery(['income-breakdown',breakdownWindow],()=>get<any>(`/admin/income/breakdown?window=${breakdownWindow}`),{enabled:!!user&&!!breakdownWindow,staleTime:30000})
+  // 10/12 (Nic, A4): "make it CLICKABLE to open a list of properties (spaces + $ each)".
+  const[showByProperty,setShowByProperty]=useState(false)
+  return(<>
+      {(()=>{
+        const colorOf=incomeColorOf
+        // S652: the legend is built from what the SERVER actually returned, not
+        // from a list kept in parallel here. A hand-maintained copy is how a
+        // slice ends up on the chart with no name beside it, or a name with no
+        // slice — and the whole point of this pass is that the page agrees with
+        // itself.
+        // 10/13 (review): a color only for a slice some ring draws (above zero
+        // in some window) — a card reader GAM bought, below zero, is named under
+        // its pie instead (@gam/shared incomeLegend).
+        const SRC=incomeLegend(compositionAll?.periods)
+        // S652 (Nic): "just reconcile all the different KPI cards where they're
+        // getting their numbers from the same source. That way, everything
+        // balances out." This used to read a re-derived run-rate ($120) while
+        // the bill that actually went out was $130. It now comes from the same
+        // ledger the pies below are drawn from.
+        // 10/12 (Nic) review: "not loaded yet" and "could not be read" are not
+        // "nothing billed yet". Before the first answer arrives the card said
+        // $0.00 · nothing billed yet, which is false; it now waits, or says the
+        // read failed. "Nothing billed yet" is kept for an answer with no month.
+        const loaded=compositionAll!=null
+        const recurringMonthly=compositionAll?.recurringMonthly??0
+        const recurringMonth=compositionAll?.recurringMonth as string|undefined
+        const recurringAnnual=compositionAll?.recurringAnnual??0
+        const recurringSpaces:number=compositionAll?.recurringSpaces??0
+        const notCollected:number=compositionAll?.recurringNotCollected??0
+        const byProperty:any[]=compositionAll?.recurringByProperty||[]
+        const byPropertyText=byProperty.map((p:any)=>`${p.name}: ${p.spaces} space${p.spaces===1?'':'s'} · ${formatCurrency(p.billed)}`).join('\n')
+        const periods:any[]=compositionAll?.periods||[]
+        // Small-donut geometry (stroke-dasharray technique).
+        const R=40,SW=12,C=2*Math.PI*R
+        return(
+          <div className="card" style={{marginTop:4,background:'linear-gradient(135deg,rgba(201,162,39,.06) 0%,rgba(8,10,12,0) 60%)',border:'1px solid rgba(201,162,39,.2)'}}>
+            {/* Recurring ARR — one-time revenue is NEVER in these two numbers */}
+            <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',flexWrap:'wrap',gap:16,marginBottom:20,paddingBottom:20,borderBottom:'1px solid var(--b0)'}}>
+              <div className={byProperty.length>0?'rr-open':undefined} style={{flex:'1 1 280px',minWidth:0}}
+                {...(byProperty.length>0?{
+                  role:'button',tabIndex:0,'aria-haspopup':'dialog' as const,
+                  'aria-label':`Recurring revenue: see each property billed for ${monthName(recurringMonth)}`,
+                  onClick:()=>setShowByProperty(true),
+                  onKeyDown:(e:React.KeyboardEvent)=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();setShowByProperty(true)}},
+                }:{})}>
+                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Recurring Revenue</div>
+                <div style={{fontFamily:'var(--font-d)',fontSize:'2.8rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{loaded?formatCurrency(recurringMonthly):'…'}</div>
+                {/* 10/12 (Nic): "is there only 12 units there?" — the month it is
+                    for in words, how many spaces it bills, and who it bills,
+                    so the split never has to be worked out by hand. */}
+                <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}} title={byPropertyText||undefined}>
+                  {!loaded
+                    ?(compositionFailed?'The bill could not be read just now. It tries again every 30 seconds.':'Loading…')
+                    :recurringMonth
+                    ?`platform fees billed for ${monthName(recurringMonth)} · ${recurringSpaces.toLocaleString()} occupied space${recurringSpaces===1?'':'s'} · spaces filled mid-month included`
+                    :'nothing billed yet · $2 per occupied space'}
+                </div>
+                {notCollected>0&&<div style={{fontSize:'.74rem',color:'var(--amber)',marginTop:4}}>{formatCurrency(notCollected)} of it not collected yet — see by property</div>}
+                {byProperty.length>0&&<div style={{fontSize:'.72rem',color:'var(--gold)',marginTop:8,fontWeight:600}}>See each property ›</div>}
+              </div>
+              <div style={{flex:'0 0 auto',textAlign:'right'}}>
+                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Annual Run Rate</div>
+                <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--green)',lineHeight:1}}>{loaded?formatCurrency(recurringAnnual):'…'}</div>
+                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:6}}>ARR · platform fees × 12</div>
+              </div>
+            </div>
+            {/* Income composition — a wall of pies, one per time window */}
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,flexWrap:'wrap',marginBottom:16}}>
+              <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em'}}>Income composition by period <span style={{color:'var(--t3)',opacity:.7,textTransform:'none',letterSpacing:0}}>(incl. one-time)</span></div>
+              <div style={{display:'flex',gap:14,flexWrap:'wrap'}}>
+                {SRC.map(s=>(
+                  <div key={s.key} style={{display:'flex',alignItems:'center',gap:6}}>
+                    <div style={{width:9,height:9,borderRadius:'50%',background:colorOf(s.key),flexShrink:0}}/>
+                    <span style={{fontSize:'.7rem',color:'var(--t2)'}}>{s.label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{display:'flex',gap:16,flexWrap:'wrap',justifyContent:'space-between'}}>
+              {periods.length===0&&<div style={{color:'var(--t3)',fontSize:'.8rem',padding:'24px 0',width:'100%',textAlign:'center'}}>{!loaded&&compositionFailed?'The income pies could not be read just now.':'Loading…'}</div>}
+              {periods.map((p:any)=>{
+                const g=p.gross||0
+                // 10/13 (Nic, full purchase): a card reader GAM bought is a slice
+                // below zero. The ring is drawn from the slices above zero, each
+                // against their own total (against the net it overflowed the
+                // ring); the middle is the net, and what is below zero is named
+                // under it (@gam/shared incomeRing).
+                const{arcs:segs,below:negs}=incomeRing(p.sources,C)
+                return(
+                  <div key={p.window} onClick={()=>setBreakdownWindow(p.window)} title={`View ${p.label} breakdown`}
+                    style={{flex:'1 1 130px',minWidth:120,maxWidth:180,textAlign:'center',cursor:'pointer',borderRadius:10,padding:'6px 4px',transition:'background .15s'}}
+                    onMouseEnter={e=>{(e.currentTarget as HTMLDivElement).style.background='rgba(201,162,39,.07)'}}
+                    onMouseLeave={e=>{(e.currentTarget as HTMLDivElement).style.background='transparent'}}>
+                    <div style={{fontSize:'.72rem',color:'var(--t1)',fontWeight:600,marginBottom:8}}>{p.label}</div>
+                    <svg width={112} height={112} viewBox="0 0 104 104" style={{maxWidth:'100%'}}>
+                      <circle cx={52} cy={52} r={R} fill="none" stroke="var(--bg3)" strokeWidth={SW}/>
+                      {segs.map((s:any)=>(
+                        <circle key={s.key} cx={52} cy={52} r={R} fill="none" stroke={colorOf(s.key)} strokeWidth={SW}
+                          strokeDasharray={`${s.len} ${C-s.len}`} strokeDashoffset={-s.off} transform="rotate(-90 52 52)"/>
+                      ))}
+                      <text x={52} y={56} textAnchor="middle" style={{fill:'var(--t0)',fontSize:13,fontWeight:800,fontFamily:'var(--font-d)'}}>{formatCurrency(g)}</text>
+                    </svg>
+                    {negs.map((s:any)=>(
+                      <div key={s.key} style={{fontSize:'.66rem',color:'var(--t3)',marginTop:2}}>incl. {s.label} −{formatCurrency(-s.amount)}</div>
+                    ))}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )
+      })()}
+      {breakdownWindow&&(
+        <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.72)',zIndex:200,display:'flex',alignItems:'center',justifyContent:'center',padding:20}} onClick={e=>{if(e.target===e.currentTarget)setBreakdownWindow(null)}}>
+          <div style={{background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:14,width:'100%',maxWidth:640,maxHeight:'85vh',overflowY:'auto',padding:24}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:18,paddingBottom:16,borderBottom:'1px solid var(--b0)'}}>
+              <div>
+                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:4}}>Income breakdown</div>
+                <div style={{fontFamily:'var(--font-d)',fontSize:'1.3rem',fontWeight:800,color:'var(--t0)'}}>{breakdown?.label||''}</div>
+                <div style={{fontSize:'.8rem',color:'var(--gold)',fontWeight:700,marginTop:2,fontFamily:'var(--font-m)'}}>{formatCurrency(breakdown?.gross||0)} total</div>
+              </div>
+              <button onClick={()=>setBreakdownWindow(null)} style={{background:'none',border:'none',color:'var(--t3)',fontSize:'1.4rem',cursor:'pointer',lineHeight:1}}>×</button>
+            </div>
+            {breakdownLoading?<div style={{padding:32,textAlign:'center',color:'var(--t3)'}}>Loading…</div>:(
+              <div style={{display:'flex',flexDirection:'column',gap:16}}>
+                {(breakdown?.sources||[]).map((s:any)=>{
+                  // 10/13: shares of what came in (the slices above zero); a
+                  // slice below zero (a card reader GAM bought) has none, and
+                  // no color either — the ring never draws it (@gam/shared incomeShare).
+                  const pct=incomeShare(s.amount,breakdown?.sources)
+                  const zero=s.amount===0&&s.count===0
+                  const below=s.amount<0
+                  return(
+                    <div key={s.key} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:10,opacity:zero?.5:1}}>
+                      <div style={{display:'flex',alignItems:'center',gap:8}}>
+                        <div title={below?'Below zero — named under the pie, not drawn on it':undefined} style={{width:11,height:11,borderRadius:'50%',background:below?'transparent':incomeColorOf(s.key),border:below?'1.5px solid var(--t3)':'none',boxSizing:'border-box',flexShrink:0}}/>
+                        <span style={{fontSize:'.85rem',color:'var(--t0)',fontWeight:600}}>{s.label}</span>
+                        {s.count>0&&<span style={{fontSize:'.68rem',color:'var(--t3)'}}>{s.count} item{s.count===1?'':'s'}</span>}
+                      </div>
+                      <div style={{display:'flex',alignItems:'baseline',gap:8}}>
+                        <span style={{fontFamily:'var(--font-m)',fontSize:'.85rem',color:'var(--t0)',fontWeight:700}}>{formatCurrency(s.amount)}</span>
+                        <span style={{fontFamily:'var(--font-m)',fontSize:'.7rem',color:'var(--t3)',width:40,textAlign:'right'}}>{pct==null?'':`${pct.toFixed(0)}%`}</span>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+      {showByProperty&&<RecurringByPropertyDialog bill={compositionAll} onClose={()=>setShowByProperty(false)}/>}
+      <style>{`
+        .rr-open { cursor: pointer; border-radius: 10px; margin: -8px; padding: 8px; transition: background .15s; }
+        .rr-open:hover { background: var(--bg3); }
+        .rr-open:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+      `}</style>
+  </>)
+}
+
+/**
+ * 10/12 (Nic, A4): "Recurring revenue card: make it CLICKABLE to open a list of
+ * properties (spaces + $ each)". The month's platform-fee bill, property by
+ * property — the spaces each was billed for and the dollars — from the same
+ * read as the card (GET /admin/income/composition/all → services/platformFeeBill),
+ * so the list always adds up to the card.
+ */
+function RecurringByPropertyDialog({bill,onClose}:{bill:any;onClose:()=>void}){
+  const rows:any[]=bill?.recurringByProperty||[]
+  const total=bill?.recurringMonthly??0
+  const spaces:number=bill?.recurringSpaces??0
+  const notCollected:number=bill?.recurringNotCollected??0
+  const closeRef=React.useRef<HTMLButtonElement>(null)
+  // The card re-reads every 30 seconds and hands a new onClose each time;
+  // focus moves to Close once, when the list opens, not on every re-read.
+  const onCloseRef=React.useRef(onClose)
+  onCloseRef.current=onClose
+  useEffect(()=>{
+    closeRef.current?.focus()
+    const onKey=(e:KeyboardEvent)=>{if(e.key==='Escape')onCloseRef.current()}
+    window.addEventListener('keydown',onKey)
+    return()=>window.removeEventListener('keydown',onKey)
+  },[])
+  return(
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.72)',zIndex:200,display:'flex',alignItems:'center',justifyContent:'center',padding:16}} onClick={e=>{if(e.target===e.currentTarget)onClose()}}>
+      <div role="dialog" aria-modal="true" aria-labelledby="rr-dialog-title" style={{background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:14,width:'100%',maxWidth:640,maxHeight:'85vh',overflowY:'auto',padding:20}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:12,marginBottom:14,paddingBottom:14,borderBottom:'1px solid var(--b0)'}}>
+          <div style={{minWidth:0}}>
+            <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:4}}>Recurring revenue by property</div>
+            <div id="rr-dialog-title" style={{fontFamily:'var(--font-d)',fontSize:'1.2rem',fontWeight:800,color:'var(--t0)'}}>Platform fees billed for {monthName(bill?.recurringMonth)}</div>
+            <div style={{fontSize:'.8rem',color:'var(--gold)',fontWeight:700,marginTop:2,fontFamily:'var(--font-m)'}}>{formatCurrency(total)} · {spaces.toLocaleString()} space{spaces===1?'':'s'}</div>
+          </div>
+          <button ref={closeRef} className="btn btn-ghost btn-sm" onClick={onClose}>Close</button>
+        </div>
+        <div style={{overflowX:'auto'}}>
+          <table className="tbl" style={{width:'100%'}}>
+            <thead><tr><th>Property</th><th style={{textAlign:'right'}}>Spaces billed</th><th style={{textAlign:'right'}}>Billed</th><th style={{textAlign:'right'}}>Not collected yet</th></tr></thead>
+            <tbody>
+              {rows.map((p:any)=>(
+                <tr key={p.propertyId||p.name}>
+                  <td style={{color:'var(--t0)',overflowWrap:'anywhere'}}>{p.name}
+                    {p.notCollected>0&&<div style={{fontSize:'.7rem',color:'var(--amber)'}}>{p.payoutBankLinked
+                      ?'comes out of their next payout'
+                      :'no payout bank linked yet, so it comes out of their first payout'}</div>}
+                  </td>
+                  <td className="mono" style={{textAlign:'right'}}>{Number(p.spaces||0).toLocaleString()}</td>
+                  <td className="mono" style={{textAlign:'right'}}>{formatCurrency(p.billed)}</td>
+                  <td className="mono" style={{textAlign:'right',color:p.notCollected>0?'var(--amber)':'var(--t3)'}}>{p.notCollected>0?formatCurrency(p.notCollected):'—'}</td>
+                </tr>
+              ))}
+              <tr>
+                <td style={{fontWeight:700,color:'var(--t0)'}}>Total</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:700}}>{spaces.toLocaleString()}</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:700}}>{formatCurrency(total)}</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:700,color:notCollected>0?'var(--amber)':'var(--t3)'}}>{notCollected>0?formatCurrency(notCollected):'—'}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>)
+}
+
 function Overview(){
   const{user}=useAuth()
   const navigate=useNavigate()
@@ -1281,9 +1631,8 @@ function Overview(){
   // number on this page now comes from platform_revenue_ledger. The endpoint
   // still exists for forecasting work; it just does not feed a card that reads
   // as fact.
-  const{data:compositionAll}=useQuery('income-composition-all',()=>get<any>('/admin/income/composition/all'),{enabled:!!user,staleTime:60000,refetchOnWindowFocus:false})
-  const[breakdownWindow,setBreakdownWindow]=React.useState<string|null>(null)
-  const{data:breakdown,isLoading:breakdownLoading}=useQuery(['income-breakdown',breakdownWindow],()=>get<any>(`/admin/income/breakdown?window=${breakdownWindow}`),{enabled:!!user&&!!breakdownWindow,staleTime:30000})
+  // 10/12: the income-composition and breakdown queries moved into
+  // PlatformRevenueCard (shared with the Metrics page).
   // S650 (Nic): whose money is actually on the Stripe balance, and what part of it is GAM's.
   const{data:bal}=useQuery('platform-balance',()=>get<any>('/admin/platform-balance'),{enabled:!!user&&isSuperAdmin,staleTime:60000})
   const{data:stats,isLoading}=useQuery(['admin-overview',user?.id],()=>get<any>('/admin/overview'),{refetchInterval:30000,enabled:!!user,staleTime:30000,keepPreviousData:true})
@@ -1373,7 +1722,12 @@ function Overview(){
 
       {/* ── Row 2: Units + Flex + Rent Volume ── */}
       <div className="grid3" style={{marginBottom:12}}>
-        <div className="kpi"><div className="kl">Active Units</div><div className="kv g">{(stats?.activeUnits||0).toLocaleString()}</div><div className="ks">{stats?.vacantUnits||0} vacant</div></div>
+        {/* 10/12 (Nic, A5): "MATCH BILLING (occupied = billable evidence; vacant =
+            rest; retired excluded)". Occupied = the spaces GAM bills this month
+            (a lease, a month stay, owner use or a utility arrangement); vacant =
+            the rest of the spaces under management. Nightly and weekly stays
+            bill by their nights after the month, so they are not spaces here. */}
+        <div className="kpi"><div className="kl">Active Units</div><div className="kv g">{(stats?.activeUnits||0).toLocaleString()}</div><div className="ks">{(stats?.vacantUnits||0).toLocaleString()} vacant of {(stats?.totalSpaces||0).toLocaleString()} spaces · counted the way GAM bills {stats?.spacesMonth?monthName(stats.spacesMonth):'this month'}</div></div>
         <div className="kpi">
           <div className="kl">Flex Products</div>
           <div className="kv gold">{(stats?.flexCredit||0)+(stats?.flexDeposit||0)+(stats?.flexPay||0)}</div>
@@ -1426,131 +1780,239 @@ function Overview(){
         <div className="card">
           <div className="ct">FlexPay Reserve &amp; Float</div>
           <div className="dr"><span className="dk">Default reserve balance</span><span className="dv mono">{formatCurrency(stats?.reserveBalance||0)}</span></div>
-          <div className="dr"><span className="dk">Target (3% of FlexPay float)</span><span className="dv mono">{formatCurrency(reserveTarget)}</span></div>
+          {/* 10/12: the label said 3% while the target is figured at 10% (S642, DEFAULT_RESERVE_RATE above). */}
+          <div className="dr"><span className="dk">Target (10% of FlexPay float)</span><span className="dv mono">{formatCurrency(reserveTarget)}</span></div>
           <div className="dr"><span className="dk">Coverage</span><span className={`badge ${reservePct>=100?'bg2':reservePct>=50?'ba':'br'}`}>{reservePct.toFixed(0)}%</span></div>
           <div className="dr"><span className="dk">Float bankroll needed</span><span className="dv mono">{formatCurrency(floatBankroll)}</span></div>
-          <div style={{fontSize:'.68rem',color:'var(--t3)',marginTop:8,lineHeight:1.5}}>Reserve absorbs FlexPay defaults — 3% of the FlexPay float (money at risk), not total rent. Bankroll = rent of income-verified tenants who requested FlexPay (survey inquiry approved) — the capital to front if they enroll. Verified SSI/SSDI income without a FlexPay request does NOT count. Float yield income begins at ODFI partnership.</div>
+          <div style={{fontSize:'.68rem',color:'var(--t3)',marginTop:8,lineHeight:1.5}}>Reserve absorbs FlexPay defaults — 10% of the FlexPay float (money at risk), not total rent. Bankroll = rent of income-verified tenants who requested FlexPay (survey inquiry approved) — the capital to front if they enroll. Verified SSI/SSDI income without a FlexPay request does NOT count. Float yield income begins at ODFI partnership.</div>
         </div>
       </div>}
-      {isSuperAdmin&&<>
-      {/* ── Platform Revenue: recurring ARR + full income composition ── */}
-      {(()=>{
-        const colorOf=incomeColorOf
-        // S652: the legend is built from what the SERVER actually returned, not
-        // from a list kept in parallel here. A hand-maintained copy is how a
-        // slice ends up on the chart with no name beside it, or a name with no
-        // slice — and the whole point of this pass is that the page agrees with
-        // itself.
-        const SRC=Array.from(new Map(
-          ((compositionAll?.periods||[]) as any[])
-            .flatMap((p:any)=>p.sources||[])
-            .filter((s:any)=>s.amount!==0)
-            .map((s:any)=>[s.key,{key:s.key,label:s.label,recurring:!!s.recurring}])
-        ).values())
-        // S652 (Nic): "just reconcile all the different KPI cards where they're
-        // getting their numbers from the same source. That way, everything
-        // balances out." This used to read a re-derived run-rate ($120) while
-        // the bill that actually went out was $130. It now comes from the same
-        // ledger the pies below are drawn from.
-        const recurringMonthly=compositionAll?.recurringMonthly??0
-        const recurringMonth=compositionAll?.recurringMonth as string|undefined
-        const recurringAnnual=compositionAll?.recurringAnnual??0
-        const periods:any[]=compositionAll?.periods||[]
-        // Small-donut geometry (stroke-dasharray technique).
-        const R=40,SW=12,C=2*Math.PI*R
-        return(
-          <div className="card" style={{marginTop:4,background:'linear-gradient(135deg,rgba(201,162,39,.06) 0%,rgba(8,10,12,0) 60%)',border:'1px solid rgba(201,162,39,.2)'}}>
-            {/* Recurring ARR — one-time revenue is NEVER in these two numbers */}
-            <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',marginBottom:20,paddingBottom:20,borderBottom:'1px solid var(--b0)'}}>
-              <div>
-                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Recurring Revenue</div>
-                <div style={{fontFamily:'var(--font-d)',fontSize:'2.8rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{formatCurrency(recurringMonthly)}</div>
-                <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}}>
-                  {recurringMonth?`platform fees billed ${recurringMonth} · $2 per occupied space`:'platform fees per month · $2 per occupied space'}
-                </div>
-              </div>
-              <div style={{textAlign:'right'}}>
-                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Annual Run Rate</div>
-                <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--green)',lineHeight:1}}>{formatCurrency(recurringAnnual)}</div>
-                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:6}}>ARR · platform fees × 12</div>
-              </div>
-            </div>
-            {/* Income composition — a wall of pies, one per time window */}
-            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,flexWrap:'wrap',marginBottom:16}}>
-              <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em'}}>Income composition by period <span style={{color:'var(--t3)',opacity:.7,textTransform:'none',letterSpacing:0}}>(incl. one-time)</span></div>
-              <div style={{display:'flex',gap:14,flexWrap:'wrap'}}>
-                {SRC.map(s=>(
-                  <div key={s.key} style={{display:'flex',alignItems:'center',gap:6}}>
-                    <div style={{width:9,height:9,borderRadius:'50%',background:colorOf(s.key),flexShrink:0}}/>
-                    <span style={{fontSize:'.7rem',color:'var(--t2)'}}>{s.label}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div style={{display:'flex',gap:16,flexWrap:'wrap',justifyContent:'space-between'}}>
-              {periods.length===0&&<div style={{color:'var(--t3)',fontSize:'.8rem',padding:'24px 0',width:'100%',textAlign:'center'}}>Loading…</div>}
-              {periods.map((p:any)=>{
-                const g=p.gross||0
-                let acc=0
-                const segs=(p.sources||[]).filter((s:any)=>s.amount>0).map((s:any)=>{const len=g>0?(s.amount/g)*C:0;const o=acc;acc+=len;return{key:s.key,len,off:o}})
-                return(
-                  <div key={p.window} onClick={()=>setBreakdownWindow(p.window)} title={`View ${p.label} breakdown`}
-                    style={{flex:'1 1 130px',minWidth:120,maxWidth:180,textAlign:'center',cursor:'pointer',borderRadius:10,padding:'6px 4px',transition:'background .15s'}}
-                    onMouseEnter={e=>{(e.currentTarget as HTMLDivElement).style.background='rgba(201,162,39,.07)'}}
-                    onMouseLeave={e=>{(e.currentTarget as HTMLDivElement).style.background='transparent'}}>
-                    <div style={{fontSize:'.72rem',color:'var(--t1)',fontWeight:600,marginBottom:8}}>{p.label}</div>
-                    <svg width={112} height={112} viewBox="0 0 104 104" style={{maxWidth:'100%'}}>
-                      <circle cx={52} cy={52} r={R} fill="none" stroke="var(--bg3)" strokeWidth={SW}/>
-                      {segs.map((s:any)=>(
-                        <circle key={s.key} cx={52} cy={52} r={R} fill="none" stroke={colorOf(s.key)} strokeWidth={SW}
-                          strokeDasharray={`${s.len} ${C-s.len}`} strokeDashoffset={-s.off} transform="rotate(-90 52 52)"/>
-                      ))}
-                      <text x={52} y={56} textAnchor="middle" style={{fill:'var(--t0)',fontSize:13,fontWeight:800,fontFamily:'var(--font-d)'}}>{formatCurrency(g)}</text>
-                    </svg>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        )
-      })()}
-      {breakdownWindow&&(
-        <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.72)',zIndex:200,display:'flex',alignItems:'center',justifyContent:'center',padding:20}} onClick={e=>{if(e.target===e.currentTarget)setBreakdownWindow(null)}}>
-          <div style={{background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:14,width:'100%',maxWidth:640,maxHeight:'85vh',overflowY:'auto',padding:24}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:18,paddingBottom:16,borderBottom:'1px solid var(--b0)'}}>
-              <div>
-                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:4}}>Income breakdown</div>
-                <div style={{fontFamily:'var(--font-d)',fontSize:'1.3rem',fontWeight:800,color:'var(--t0)'}}>{breakdown?.label||''}</div>
-                <div style={{fontSize:'.8rem',color:'var(--gold)',fontWeight:700,marginTop:2,fontFamily:'var(--font-m)'}}>{formatCurrency(breakdown?.gross||0)} total</div>
-              </div>
-              <button onClick={()=>setBreakdownWindow(null)} style={{background:'none',border:'none',color:'var(--t3)',fontSize:'1.4rem',cursor:'pointer',lineHeight:1}}>×</button>
-            </div>
-            {breakdownLoading?<div style={{padding:32,textAlign:'center',color:'var(--t3)'}}>Loading…</div>:(
-              <div style={{display:'flex',flexDirection:'column',gap:16}}>
-                {(breakdown?.sources||[]).map((s:any)=>{
-                  const pct=breakdown?.gross>0?(s.amount/breakdown.gross)*100:0
-                  const zero=s.amount===0&&s.count===0
-                  return(
-                    <div key={s.key} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:10,opacity:zero?.5:1}}>
-                      <div style={{display:'flex',alignItems:'center',gap:8}}>
-                        <div style={{width:11,height:11,borderRadius:'50%',background:incomeColorOf(s.key),flexShrink:0}}/>
-                        <span style={{fontSize:'.85rem',color:'var(--t0)',fontWeight:600}}>{s.label}</span>
-                        {s.count>0&&<span style={{fontSize:'.68rem',color:'var(--t3)'}}>{s.count} item{s.count===1?'':'s'}</span>}
-                      </div>
-                      <div style={{display:'flex',alignItems:'baseline',gap:8}}>
-                        <span style={{fontFamily:'var(--font-m)',fontSize:'.85rem',color:'var(--t0)',fontWeight:700}}>{formatCurrency(s.amount)}</span>
-                        <span style={{fontFamily:'var(--font-m)',fontSize:'.7rem',color:'var(--t3)',width:40,textAlign:'right'}}>{pct.toFixed(0)}%</span>
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-      </> }
+      {/* 10/12 (Nic): the recurring bill and the income pies live in one component,
+          shown here and on the Metrics page. */}
+      {isSuperAdmin&&<PlatformRevenueCard/>}
       <DepositTrust/>
+    </div>
+  )
+}
+
+// ── METRICS (10/12) ───────────────────────────────────────────
+// Nic: "I want a page specifically for vanity metrics. I want to track things
+// like total rents that we've ever processed electronically through card or
+// ACH ... how much money we have logged for rent collected through the
+// platform all time, whether that's paid in cash or check in person ... I
+// still want to show that we've helped landlords log, you know, $6 million or
+// whatever." Every number comes from GET /admin/metrics (services/
+// platformMetrics), which says what each one counts and what it leaves out.
+// The recurring bill, the income pies and the tenant-payments heartbeat are
+// the same components the Overview shows.
+
+const METHOD_COLORS:Record<string,string>={card:'var(--gold)',ach:'var(--blue)',cash:'var(--green)',check:'var(--purple)',money_order:'var(--amber)',bank_deposit:'var(--teal)'}
+const methodColor=(m:string)=>METHOD_COLORS[m]||'var(--t3)'
+const count=(n:number|null|undefined)=>Number(n||0).toLocaleString('en-US')
+const plural=(n:number,one:string,many=one+'s')=>`${count(n)} ${n===1?one:many}`
+/** 'YYYY-MM-DD' in words, read as a calendar day (no time zone shift). */
+const dayName=(d?:string|null)=>{
+  const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(d||'')
+  if(!m)return d||''
+  return new Date(Number(m[1]),Number(m[2])-1,Number(m[3])).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})
+}
+const monthShort=(ym:string)=>{
+  const m=/^(\d{4})-(\d{2})/.exec(ym)
+  if(!m)return ym
+  // "Sep 2026", never "Sep 26" — that reads as a day.
+  return new Date(Number(m[1]),Number(m[2])-1,1).toLocaleDateString('en-US',{month:'short',year:'numeric'})
+}
+
+function MetricTile({label,value,sub,tone}:{label:string;value:React.ReactNode;sub?:React.ReactNode;tone?:'gold'|'g'|'b'|'a'}){
+  return(
+    <div className="kpi">
+      <div className="kl">{label}</div>
+      <div className={`kv mx-v${tone?' '+tone:''}`}>{value}</div>
+      {sub&&<div className="ks">{sub}</div>}
+    </div>)
+}
+
+/** The tenant-payments heartbeat with its own window, for pages other than the Overview. */
+function RentHeartbeat(){
+  const{user}=useAuth()
+  const[months,setMonths]=useState(6)
+  const{data=[]}=useQuery<any[]>(['rent-volume-trend',months],()=>get<any[]>(`/admin/rent-volume-trend?months=${months}`),{enabled:!!user})
+  return<RentVolumeMonitor months={data} windowMonths={months} onWindowChange={setMonths}/>
+}
+
+function Metrics(){
+  const{user}=useAuth()
+  const{data:m,isError}=useQuery<any>('admin-metrics',()=>get<any>('/admin/metrics'),{enabled:!!user,staleTime:60000,refetchInterval:60000})
+
+  const header=(
+    <div className="ph">
+      <div>
+        <h1 className="pt">Metrics</h1>
+        <p className="ps">Everything that has moved through GAM, all time{m?.firstPaymentOn?` · first payment ${dayName(m.firstPaymentOn)}`:''}</p>
+      </div>
+    </div>)
+  // 10/12 (Nic) review: a failed refresh (an API restart during a deploy, a
+  // network blip) must not throw away numbers already on screen. The error
+  // takes the page only when there is nothing to show; otherwise the page
+  // stays and says the last refresh failed.
+  if(!m)return<div>{header}{isError
+    ?<div className="alert ae">The metrics could not be loaded just now. They try again every minute.</div>
+    :<div style={{color:'var(--t3)'}}>Loading metrics…</div>}</div>
+
+  const rent=m.rent, logged=rent.logged, elec=rent.electronic
+  const methods:any[]=(logged.byMethod||[]).filter((x:any)=>x.amount>0)
+  const months=(rent.byMonth||[]).map((r:any)=>({label:monthShort(r.month),electronic:r.electronic,byHand:r.byHand}))
+  const growth=(m.growth||[]).map((g:any)=>({...g,label:dayName(g.date).replace(/, \d{4}$/,'')}))
+  const mi=m.moneyIn, pay=m.payments, fp=m.footprint, pw=m.paperwork, op=m.operations
+  const tooltipStyle={background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:8,fontSize:'.75rem',color:'var(--t0)'}
+
+  return(
+    <div>
+      {header}
+      {isError&&<div className="ks" style={{marginTop:-8,marginBottom:12,color:'var(--amber)'}}>The last refresh failed — these are the numbers from {new Date(m.asOf).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})}. It tries again every minute.</div>}
+
+      {/* ── The headline numbers ── */}
+      <div className="mx-hero" style={{marginBottom:16}}>
+        <div className="kpi mx-hero-tile">
+          <div className="kl">Rent logged through GAM</div>
+          <div className="mx-big">{formatCurrency(logged.total)}</div>
+          <div className="ks">{plural(logged.payments,'rent payment')}, every way it was paid — card, bank, cash, check, money order and bank deposit</div>
+        </div>
+        <div className="kpi mx-hero-tile">
+          <div className="kl">Rent processed electronically</div>
+          <div className="mx-big">{formatCurrency(elec.total)}</div>
+          <div className="ks">Card {formatCurrency(elec.card)} · Bank (ACH) {formatCurrency(elec.ach)} · {plural(elec.payments,'payment')}</div>
+        </div>
+        <div className="kpi mx-hero-tile">
+          <div className="kl">Money paid in through GAM</div>
+          <div className="mx-big">{formatCurrency(mi.total)}</div>
+          <div className="ks">rent, utilities, fees and deposits, register sales, stays and background checks — card fees not included</div>
+        </div>
+        <div className="kpi mx-hero-tile">
+          <div className="kl">Paid out to landlords</div>
+          <div className="mx-big">{formatCurrency(m.payouts.amount)}</div>
+          <div className="ks">{plural(m.payouts.count,'payout')} to landlords' banks</div>
+        </div>
+      </div>
+
+      {/* ── Rent by how it was paid ── */}
+      <div className="grid2 mx-pair" style={{marginBottom:16}}>
+        <div className="card">
+          <div className="ct">Rent logged, by how it was paid</div>
+          {methods.length===0?<div style={{color:'var(--t3)',fontSize:'.8rem'}}>No rent has been paid yet.</div>:<>
+            <div style={{display:'flex',height:14,borderRadius:7,overflow:'hidden',background:'var(--bg3)',marginBottom:14}}>
+              {methods.map((x:any)=><div key={x.method} title={`${x.label}: ${formatCurrency(x.amount)}`} style={{width:`${logged.total>0?(x.amount/logged.total)*100:0}%`,background:methodColor(x.method)}}/>)}
+            </div>
+            {methods.map((x:any)=>(
+              <div key={x.method} className="dr" style={{gap:10}}>
+                <span className="dk" style={{display:'flex',alignItems:'center',gap:8,minWidth:0}}>
+                  <span style={{width:9,height:9,borderRadius:'50%',background:methodColor(x.method),flexShrink:0}}/>
+                  <span style={{color:'var(--t1)'}}>{x.label}</span>
+                  <span style={{fontSize:'.68rem'}}>{plural(x.payments,'payment')}</span>
+                </span>
+                <span className="dv mono" style={{whiteSpace:'nowrap'}}>{formatCurrency(x.amount)} <span style={{color:'var(--t3)',fontSize:'.7rem'}}>{logged.total>0?((x.amount/logged.total)*100).toFixed(0):0}%</span></span>
+              </div>
+            ))}
+            <div className="dr"><span className="dk">Electronic</span><span className="dv mono">{formatCurrency(elec.total)}</span></div>
+            <div className="dr"><span className="dk">Logged by hand (cash, check, money order, bank deposit)</span><span className="dv mono">{formatCurrency(logged.byHand)}</span></div>
+          </>}
+        </div>
+        <div className="card">
+          <div className="ct">Rent logged, month by month</div>
+          {months.length===0?<div style={{color:'var(--t3)',fontSize:'.8rem'}}>No rent has been paid yet.</div>:<>
+            <div style={{height:220}}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={months} margin={{top:4,right:4,left:0,bottom:0}}>
+                  <XAxis dataKey="label" tick={{fontSize:10,fill:'var(--t3)'}} tickLine={false} axisLine={false}/>
+                  <YAxis tick={{fontSize:10,fill:'var(--t3)'}} tickLine={false} axisLine={false} width={48} tickFormatter={(v:number)=>v>=1000?`$${Math.round(v/1000)}k`:`$${v}`}/>
+                  <Tooltip contentStyle={tooltipStyle} cursor={{fill:'var(--bg3)'}} formatter={(v:any,name:any)=>[formatCurrency(Number(v)),name==='electronic'?'Electronic':'Logged by hand']}/>
+                  <Bar dataKey="electronic" stackId="rent" fill="var(--gold)" maxBarSize={64}/>
+                  <Bar dataKey="byHand" stackId="rent" fill="var(--blue)" radius={[4,4,0,0]} maxBarSize={64}/>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            <div style={{display:'flex',gap:14,flexWrap:'wrap',marginTop:8}}>
+              <span style={{display:'flex',alignItems:'center',gap:6,fontSize:'.7rem',color:'var(--t2)'}}><span style={{width:9,height:9,borderRadius:'50%',background:'var(--gold)'}}/>Electronic (card and bank)</span>
+              <span style={{display:'flex',alignItems:'center',gap:6,fontSize:'.7rem',color:'var(--t2)'}}><span style={{width:9,height:9,borderRadius:'50%',background:'var(--blue)'}}/>Logged by hand</span>
+            </div>
+          </>}
+        </div>
+      </div>
+
+      {/* ── Payments ── */}
+      <div className="ct mx-section">Payments</div>
+      <div className="mx-grid" style={{marginBottom:16}}>
+        <MetricTile label="Tenant payments" value={count(pay.count)} tone="gold" sub={`${formatCurrency(mi.tenantPayments.amount)} toward rent, utilities, fees and deposits`}/>
+        <MetricTile label="Paid electronically" value={formatCurrency(mi.tenantPayments.electronic)} sub="tenant payments by card or bank"/>
+        <MetricTile label="Logged by hand" value={formatCurrency(mi.tenantPayments.byHand)} sub="cash, check, money order and bank deposit"/>
+        <MetricTile label="Average payment" value={formatCurrency(pay.average)} sub={`middle payment ${formatCurrency(pay.median)}`}/>
+        <MetricTile label="Biggest payment" value={formatCurrency(pay.biggest)} sub={pay.biggestElectronic>0?`biggest electronic ${formatCurrency(pay.biggestElectronic)}`:undefined}/>
+        {pay.busiestDay&&<MetricTile label="Busiest day" value={dayName(pay.busiestDay.date)} sub={`${plural(pay.busiestDay.count,'payment')} · ${formatCurrency(pay.busiestDay.amount)}`}/>}
+        <MetricTile label="Register and pay-link sales" value={formatCurrency(mi.registerSales.amount)} sub={plural(mi.registerSales.count,'sale')}/>
+        {mi.stayDepositsOnline.count>0&&<MetricTile label="Stay deposits paid online" value={formatCurrency(mi.stayDepositsOnline.amount)} sub={plural(mi.stayDepositsOnline.count,'deposit')}/>}
+      </div>
+
+      {/* ── Footprint ── */}
+      <div className="ct mx-section">On GAM today</div>
+      <div className="mx-grid" style={{marginBottom:16}}>
+        <MetricTile label="Rent under management" value={formatCurrency(fp.rentRollMonthly)} tone="gold" sub={`a month, from active leases · ${formatCurrency(fp.rentRollMonthly*12)} a year`}/>
+        {/* 10/12 (Nic) review: live only — a property with a lease, a billed month or a stay (services/platformMetrics LIVE_PROPERTY). */}
+        <MetricTile label="Landlords" value={count(fp.landlords)} sub="people with a property live on GAM"/>
+        <MetricTile label="Properties" value={count(fp.properties)} sub={`in ${plural(fp.cities,'city','cities')} across ${plural(fp.states,'state')}`}/>
+        {/* 10/12 (Nic, A5/H1): occupied = the spaces GAM bills this month (the Overview's
+            Active Units and the heat map's "Occupied (billed)" view read the same count). */}
+        <MetricTile label="Spaces under management" value={count(fp.units)} sub={fp.occupiedMonth!=null
+          ?`${count(fp.occupiedSpaces)} occupied in ${monthName(fp.occupiedMonth)}, counted the way GAM bills · ${count(fp.vacantSpaces)} vacant${fp.spacesBilledMonth?` · ${count(fp.spacesBilled)} billed for ${monthName(fp.spacesBilledMonth)}`:''}`
+          :fp.spacesBilledMonth?`${count(fp.spacesBilled)} occupied and billed for ${monthName(fp.spacesBilledMonth)}`:undefined}/>
+        <MetricTile label="Households" value={count(fp.households)} sub="active leases"/>
+        <MetricTile label="Residents" value={count(fp.residents)} sub="people on an active lease"/>
+      </div>
+
+      {/* 10/12 (Nic): "a heat map, toggleable at the state and county levels. darker colors for more units
+          in that area. toggleable between a heat map for units and money." Units = the Spaces tile above,
+          money = the Rent logged tile, by place (services/platformMetrics buildPlatformMap).
+          10/12 (Nic, H1): Units toggles Occupied (billed) — the tile's occupied count — and All spaces. */}
+      <MetricsHeatMap data={m.map} api={api}/>
+
+      {/* 10/13 (Nic): money billed and collected, tenants ever, the default rate, ages (components/MetricsLifetime). */}
+      <MetricsLifetime api={api}/>
+
+      {/* ── Paperwork and operations ── */}
+      <div className="ct mx-section">Done on GAM</div>
+      <div className="mx-grid" style={{marginBottom:16}}>
+        <MetricTile label="Leases signed" value={count(pw.leasesSigned)} tone="gold" sub="signed on GAM, start to finish"/>
+        <MetricTile label="Documents signed" value={count(pw.documentsSigned)} sub="leases, addendums and purchase agreements"/>
+        <MetricTile label="Signatures collected" value={count(pw.signatures)}/>
+        <MetricTile label="Meter readings" value={count(op.meterReadings)}/>
+        <MetricTile label="Utility bills sent" value={count(op.utilityBills)} sub={`${formatCurrency(op.utilityBilled)} billed`}/>
+        {op.electricKwh>0&&<MetricTile label="Electricity billed" value={`${count(op.electricKwh)} kWh`}/>}
+        {op.stays>0&&<MetricTile label="Stay nights" value={count(op.stayNights)} sub={plural(op.stays,'stay')}/>}
+        {op.homeSales>0&&<MetricTile label="Home sales" value={count(op.homeSales)} sub={`${formatCurrency(op.homeSalesValue)} in home sales billed on GAM`}/>}
+        <MetricTile label="Background checks" value={count(op.backgroundChecksRun)} sub={mi.backgroundChecks.count>0?`${formatCurrency(mi.backgroundChecks.amount)} paid by applicants`:undefined}/>
+        {op.workTradeAgreements>0&&<MetricTile label="Work-trade agreements" value={count(op.workTradeAgreements)}/>}
+      </div>
+
+      {/* ── Growth ── */}
+      {growth.length>1&&<div className="card" style={{marginBottom:16}}>
+        <div className="ct">Rent under management over time</div>
+        <div style={{height:200}}>
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={growth} margin={{top:4,right:4,left:0,bottom:0}}>
+              <XAxis dataKey="label" tick={{fontSize:10,fill:'var(--t3)'}} tickLine={false} axisLine={false} minTickGap={24}/>
+              <YAxis tick={{fontSize:10,fill:'var(--t3)'}} tickLine={false} axisLine={false} width={48} tickFormatter={(v:number)=>v>=1000?`$${Math.round(v/1000)}k`:`$${v}`}/>
+              <Tooltip contentStyle={tooltipStyle} formatter={(v:any)=>[formatCurrency(Number(v)),'Rent a month']}/>
+              <Area type="monotone" dataKey="rentRoll" stroke="var(--gold)" fill="var(--gold)" fillOpacity={0.15} strokeWidth={2}/>
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+        <div className="ks" style={{marginTop:4}}>Rent on active leases, from the platform's daily snapshot</div>
+      </div>}
+
+      {/* ── GAM's own revenue and the tenant-payments heartbeat (same as the Overview) ── */}
+      <div className="ct mx-section">Revenue and payments</div>
+      <PlatformRevenueCard/>
+      <div style={{marginTop:16}}><RentHeartbeat/></div>
+      <div className="ks" style={{marginTop:12}}>Updated {new Date(m.asOf).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})} · refreshes every minute · demo accounts, GAM's own accounts and signups with no tenants yet are left out</div>
     </div>
   )
 }
@@ -2036,19 +2498,38 @@ function NachaMonitor(){
 }
 
 // ── SALES-TAX NEXUS MONITOR (S565) ───────────────────────────────────────
-// GAM own-revenue by customer state vs each state's economic-nexus registration
+// GAM's own earnings by state vs each state's economic-nexus registration
 // threshold. MONITORING ONLY — the dashboard never collects tax; the register
 // action flips collection (gated separately in the screening-fee path).
-const NEXUS_STATUS_BADGE:Record<string,string>={crossed:'br',approaching:'ba',registered:'bg2',under:'bmu',no_threshold:'bmu'}
-const NEXUS_STATUS_LABEL:Record<string,string>={crossed:'Threshold crossed',approaching:'Approaching',registered:'Registered',under:'Under',no_threshold:'No sales tax'}
+//
+// 10/17 (Nic): "the sales tax nexus on the admin platform is not accurately
+// reading... it would need to take into account any margins that GAM makes on
+// card payments or ACH payments", and per state he wants "a breakdown of total
+// transactions, and then the actual subscription costs, hard markup fees,
+// background checks or screenings, and then any other customer opt-in things…
+// Let's have them all as a combined total on the Nexus by default, but then we
+// can expand it and see line items and see, okay, if that state's not counting
+// some of those, where are we really at? I'd rather count high and register
+// with those states early."
+//
+// So: the column is the combined total and every crossing reads it; Breakdown
+// opens the line items, with each state's own measurement rule beside them and
+// the subtotal that rule would really measure.
+const NEXUS_STATUS_BADGE:Record<string,string>={crossed:'br',approaching:'ba',registered:'bg2',under:'bmu',no_threshold:'bmu',unresearched:'ba'}
+const NEXUS_STATUS_LABEL:Record<string,string>={crossed:'Threshold crossed',approaching:'Approaching',registered:'Registered',under:'Under',no_threshold:'No sales tax',unresearched:'Not researched'}
 function NexusMonitor(){
   const{user}=useAuth()
   const qc=useQueryClient()
   const{data,isLoading}=useQuery('nexus',()=>get<any>('/admin/nexus/dashboard'),{enabled:!!user})
   const[confirm,setConfirm]=React.useState<any>(null) // {state, register, date, notes}
+  const[open,setOpen]=React.useState<Record<string,boolean>>({})
   const states:any[]=data?.states||[]
-  const summary=data?.summary||{crossed:0,approaching:0,registered:0,under:0}
+  const summary=data?.summary||{crossed:0,approaching:0,registered:0,under:0,unresearched:0}
   const warnPct=Math.round((data?.warnFraction??0.8)*100)
+  const unattributed=data?.unattributed
+  const nonReceipt=data?.nonReceipt
+  // The legend comes from what the server returned, never a list kept here.
+  const legend:any[]=data?.lineItems||[]
 
   const recomputeMut=useMutation(()=>post('/admin/nexus/recompute'),{
     onSuccess:()=>{qc.invalidateQueries('nexus');toast('Nexus tally recomputed')},
@@ -2056,23 +2537,30 @@ function NexusMonitor(){
   const registerMut=useMutation((b:any)=>post('/admin/nexus/register',b),{
     onSuccess:()=>{qc.invalidateQueries('nexus');setConfirm(null);toast('Registration updated')},
   })
+  const ruleMut=useMutation((b:any)=>post('/admin/nexus/measure-rule',b),{
+    onSuccess:()=>{qc.invalidateQueries('nexus');toast('Measurement rule saved')},
+  })
 
-  // Show states that matter first: crossed, approaching, registered, then the
-  // rest — but only ones with a threshold + some signal by default.
-  const ORDER:Record<string,number>={crossed:0,approaching:1,registered:2,under:3,no_threshold:4}
+  // Show states that matter first: crossed, not researched, approaching,
+  // registered, then the rest.
+  const ORDER:Record<string,number>={crossed:0,unresearched:1,approaching:2,registered:3,under:4,no_threshold:5}
   const sorted=[...states].sort((a,b)=>(ORDER[a.status]-ORDER[b.status])||(b.pctOfThreshold||0)-(a.pctOfThreshold||0)||a.stateCode.localeCompare(b.stateCode))
   const crossed=sorted.filter(s=>s.status==='crossed')
+  const unresearched=sorted.filter(s=>s.status==='unresearched')
 
   return(
     <div>
       <div className="ph">
-        <div><h1 className="pt">Sales-Tax Nexus Monitor</h1><p className="ps">GAM own-revenue by customer state vs economic-nexus thresholds</p></div>
+        <div><h1 className="pt">Sales-Tax Nexus Monitor</h1><p className="ps">What GAM earns in each state vs that state's registration threshold</p></div>
         <button className="btn bgold bsm" onClick={()=>recomputeMut.mutate()} disabled={recomputeMut.isLoading}>{recomputeMut.isLoading?'Recomputing…':'↻ Recompute tally'}</button>
       </div>
 
       <div className="nacha-flag" style={{borderColor:'var(--b1)'}}>
         <div style={{fontSize:'.8rem',color:'var(--t2)',lineHeight:1.6}}>
-          <strong style={{color:'var(--gold)',fontFamily:'var(--font-d)'}}>Monitoring only — this page collects no tax.</strong> Revenue counted conservatively (platform fee + screening + Flex fees, by customer state) to register <em>early</em>. A crossing means it's time to register; collection turns on only when you register a state <em>and</em> a screening service is taxable there. Thresholds + tax rates are research-grade — confirm with a tax pro before registering.
+          <strong style={{color:'var(--gold)',fontFamily:'var(--font-d)'}}>Monitoring only — this page collects no tax.</strong> Every figure is money GAM actually earned, read from GAM's own revenue book: the platform subscription, the real margin on each card and bank payment, screening margins, and what customers pay for opt-in services. Counted high on purpose, so a state gets registered early. A crossing means it's time to register; collection turns on only when you register a state <em>and</em> a screening service is taxable there. Thresholds, tax rates and what each state measures are research-grade — confirm with a tax pro before registering.
+          <div style={{marginTop:6,color:'var(--t3)',fontSize:'.72rem'}}>
+            Margins are measured at the property's state, so they line up with the space fee earned there; a screening is measured where the applicant lives, or at the property they applied to when no address was collected. The business portal's monthly fee is counted from its own billing records — it is the one receipt that has never been posted to GAM's revenue book, and it stops being counted that way the moment it is.
+          </div>
           {data?.computedAt&&<div style={{marginTop:6,color:'var(--t3)',fontSize:'.72rem'}}>Tally last computed {new Date(data.computedAt).toLocaleString()}</div>}
         </div>
       </div>
@@ -2085,20 +2573,28 @@ function NexusMonitor(){
       </div>
 
       {crossed.length>0&&<div className="alert ae">🚨 {crossed.length} state{crossed.length>1?'s have':' has'} crossed the economic-nexus threshold: {crossed.map(s=>s.stateCode).join(', ')}. Register to begin collecting where taxable.</div>}
+      {unresearched.length>0&&<div className="alert aw">GAM is earning in {unresearched.length} place{unresearched.length>1?'s':''} with no researched threshold yet: {unresearched.map(s=>s.stateCode).join(', ')}. The money is counted here; the threshold still needs looking up.</div>}
 
       <div className="card" style={{padding:0}}>
         <div style={{padding:'12px 14px',borderBottom:'1px solid var(--b1)'}}><div className="ct" style={{marginBottom:0}}>All states</div></div>
         {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
           <table className="tbl">
-            <thead><tr><th>State</th><th>Measured revenue</th><th>Threshold</th><th style={{width:'26%'}}>Progress</th><th>Taxable</th><th>Status</th><th></th></tr></thead>
+            <thead><tr><th>State</th><th>Measured receipts</th><th>Transactions</th><th>Threshold</th><th style={{width:'20%'}}>Progress</th><th>Taxable</th><th>Status</th><th></th></tr></thead>
             <tbody>
               {sorted.map((s:any)=>{
                 const pct=s.pctOfThreshold!=null?Math.min(s.pctOfThreshold,1.5):null
                 const barColor=s.status==='crossed'?'var(--red)':s.status==='approaching'?'var(--amber,#d99e2b)':s.status==='registered'?'var(--gold)':'var(--green,#3fb950)'
+                const narrowed=s.measureRule&&!s.measureRule.countsEverything
                 return(
-                  <tr key={s.stateCode} style={{background:s.status==='crossed'?'rgba(239,68,68,.04)':''}}>
+                  <React.Fragment key={s.stateCode}>
+                  <tr style={{background:s.status==='crossed'?'rgba(239,68,68,.04)':''}}>
                     <td className="mono" style={{fontWeight:600,color:'var(--t0)'}}>{s.stateCode}</td>
-                    <td className="mono">{formatCurrency(s.measureUsd)}</td>
+                    <td className="mono">{formatCurrency(s.measureUsd)}
+                      {narrowed&&<div style={{fontSize:'.65rem',color:'var(--t3)'}}>{formatCurrency(s.countedMeasureUsd)} by this state's rule</div>}
+                    </td>
+                    <td className="mono" style={{color:'var(--t2)'}}>{s.measureTxn}
+                      {s.txnThreshold!=null&&<span style={{color:'var(--t3)',fontSize:'.65rem'}}> / {s.txnThreshold}</span>}
+                    </td>
                     <td className="mono" style={{color:'var(--t3)'}}>{s.thresholdUsd!=null?formatCurrency(s.thresholdUsd):'—'}</td>
                     <td>
                       {pct!=null?(
@@ -2106,11 +2602,14 @@ function NexusMonitor(){
                           <div style={{flex:1,height:7,background:'var(--bg3)',borderRadius:4,overflow:'hidden'}}><div style={{width:`${Math.min(pct*100,100)}%`,height:'100%',background:barColor,transition:'width .3s'}}/></div>
                           <span className="mono" style={{fontSize:'.68rem',color:'var(--t3)',minWidth:34,textAlign:'right'}}>{Math.round(s.pctOfThreshold*100)}%</span>
                         </div>
-                      ):<span style={{color:'var(--t3)',fontSize:'.72rem'}}>no threshold</span>}
+                      ):<span style={{color:'var(--t3)',fontSize:'.72rem'}}>{s.status==='unresearched'?'threshold not researched':'no threshold'}</span>}
                     </td>
                     <td>{s.thresholdUsd==null?<span style={{color:'var(--t3)'}}>—</span>:<span className={`badge ${s.taxable?'ba':'bmu'}`}>{s.taxable?'Taxable':'$0'}</span>}</td>
                     <td><span className={`badge ${NEXUS_STATUS_BADGE[s.status]||'bmu'}`}>{NEXUS_STATUS_LABEL[s.status]||s.status}</span></td>
-                    <td style={{textAlign:'right'}}>
+                    <td style={{textAlign:'right',whiteSpace:'nowrap'}}>
+                      {/* Neutral, not red: this only opens the row. Red here sat
+                          flush against Unregister in the identical class. */}
+                      <button className="btn bg bsm" style={{fontSize:'.7rem',padding:'3px 8px',marginRight:6}} onClick={()=>setOpen(x=>({...x,[s.stateCode]:!x[s.stateCode]}))}>{open[s.stateCode]?'Hide':'Breakdown'}</button>
                       {s.status!=='no_threshold'&&(
                         s.registered
                           ?<button className="btn bd bsm" style={{fontSize:'.7rem',padding:'3px 8px'}} onClick={()=>setConfirm({stateCode:s.stateCode,register:false})}>Unregister</button>
@@ -2118,12 +2617,107 @@ function NexusMonitor(){
                       )}
                     </td>
                   </tr>
+                  {open[s.stateCode]&&(
+                    <tr>
+                      <td colSpan={8} style={{background:'var(--bg2)',padding:14}}>
+                        {!s.breakdownReady&&<div style={{fontSize:'.72rem',color:'var(--t3)',marginBottom:8}}>The line items for {s.stateCode} haven't been computed yet — press Recompute tally above to fill them in.</div>}
+                        <table className="tbl" style={{marginBottom:0}}>
+                          <thead><tr><th>Line item</th><th style={{textAlign:'right'}}>This year</th><th style={{textAlign:'right'}}>Last year</th><th style={{width:180}}>{s.stateCode} counts it</th></tr></thead>
+                          <tbody>
+                            {(s.lineItems||[]).map((li:any)=>(
+                              <tr key={li.key}>
+                                <td style={{fontSize:'.75rem'}}>{li.label}</td>
+                                <td className="mono" style={{textAlign:'right'}}>{formatCurrency(li.currentYtd)}</td>
+                                <td className="mono" style={{textAlign:'right',color:'var(--t2)'}}>{formatCurrency(li.priorYear)}</td>
+                                <td>
+                                  <label style={{display:'flex',alignItems:'center',gap:6,fontSize:'.7rem',color:'var(--t3)',cursor:'pointer'}}>
+                                    <input type="checkbox" checked={!!li.counted} style={{accentColor:'var(--gold)'}} disabled={ruleMut.isLoading}
+                                      onChange={e=>ruleMut.mutate({stateCode:s.stateCode,counts:{[li.key]:e.target.checked}})}/>
+                                    {li.counted?'Counted':'Not counted here'}
+                                  </label>
+                                </td>
+                              </tr>
+                            ))}
+                            <tr>
+                              <td style={{fontSize:'.75rem',fontWeight:600,color:'var(--t0)'}}>Combined total</td>
+                              <td className="mono" style={{textAlign:'right',fontWeight:600,color:'var(--t0)'}}>{formatCurrency(s.revenueCurrentYtd)}</td>
+                              <td className="mono" style={{textAlign:'right',fontWeight:600,color:'var(--t0)'}}>{formatCurrency(s.revenuePriorYear)}</td>
+                              <td style={{fontSize:'.68rem',color:'var(--t3)'}}>Drives the crossing above</td>
+                            </tr>
+                            <tr>
+                              <td style={{fontSize:'.75rem'}}>What {s.stateCode} would measure</td>
+                              <td className="mono" style={{textAlign:'right'}}>{formatCurrency(s.countedCurrentYtd)}</td>
+                              <td className="mono" style={{textAlign:'right',color:'var(--t2)'}}>{formatCurrency(s.countedPriorYear)}</td>
+                              <td style={{fontSize:'.68rem',color:'var(--t3)'}}>{s.countedPctOfThreshold!=null?`${Math.round(s.countedPctOfThreshold*100)}% of threshold`:'no threshold'}</td>
+                            </tr>
+                            <tr>
+                              <td style={{fontSize:'.75rem'}}>Transactions</td>
+                              <td className="mono" style={{textAlign:'right'}}>{s.txnCurrentYtd}</td>
+                              <td className="mono" style={{textAlign:'right',color:'var(--t2)'}}>{s.txnPriorYear}</td>
+                              <td style={{fontSize:'.68rem',color:'var(--t3)'}}>{s.txnThreshold!=null?`threshold ${s.txnThreshold}`:'no transaction threshold'}</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                        <div style={{marginTop:8,fontSize:'.7rem',color:'var(--t3)',lineHeight:1.6}}>
+                          Unticking a line item records that {s.stateCode} does not measure it — a researched answer, not a guess. It changes only the subtotal above; the combined total still decides when to register.
+                          {s.measureRule?.notes&&<div style={{marginTop:4}}>{s.measureRule.notes}</div>}
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                  </React.Fragment>
                 )
               })}
             </tbody>
           </table>
         )}
       </div>
+
+      {unattributed&&(unattributed.currentYtd!==0||unattributed.priorYear!==0)&&(
+        <div className="card" style={{marginTop:16}}>
+          <div className="ct">Earned, but not placed in a state</div>
+          <p style={{fontSize:'.76rem',color:'var(--t2)',lineHeight:1.6,marginBottom:10}}>
+            Money GAM earned that no single state owns — a monthly processing true-up that corrects every state at once, a fee pull from a landlord whose properties sit in two states, a receipt whose property row was removed. It is shown here rather than split across states by guesswork, so the states above, this, and what GAM spent always add back up to GAM's book.
+          </p>
+          <table className="tbl">
+            <thead><tr><th>Line item</th><th style={{textAlign:'right'}}>This year</th><th style={{textAlign:'right'}}>Last year</th></tr></thead>
+            <tbody>
+              {(unattributed.lineItems||[]).map((li:any)=>(
+                <tr key={li.key}><td style={{fontSize:'.75rem'}}>{li.label}</td>
+                  <td className="mono" style={{textAlign:'right'}}>{formatCurrency(li.currentYtd)}</td>
+                  <td className="mono" style={{textAlign:'right',color:'var(--t2)'}}>{formatCurrency(li.priorYear)}</td></tr>
+              ))}
+              <tr><td style={{fontSize:'.75rem',fontWeight:600,color:'var(--t0)'}}>Total</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:600,color:'var(--t0)'}}>{formatCurrency(unattributed.currentYtd)}</td>
+                <td className="mono" style={{textAlign:'right',fontWeight:600,color:'var(--t0)'}}>{formatCurrency(unattributed.priorYear)}</td></tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {nonReceipt&&(nonReceipt.currentYtd!==0||nonReceipt.priorYear!==0)&&(
+        <div className="card" style={{marginTop:16}}>
+          <div className="ct">What GAM spent — no state measures it</div>
+          <p style={{fontSize:'.76rem',color:'var(--t2)',lineHeight:1.6,marginBottom:10}}>
+            A state's threshold counts what GAM takes IN from customers there. Buying card readers from the manufacturer is money going OUT, so it belongs to no state's figure. It is listed here because it sits on GAM's revenue book, and the states, the block above and this one have to add back up to that book.
+          </p>
+          <table className="tbl">
+            <thead><tr><th>Paid out</th><th style={{textAlign:'right'}}>This year</th><th style={{textAlign:'right'}}>Last year</th></tr></thead>
+            <tbody>
+              {(nonReceipt.items||[]).map((li:any)=>(
+                <tr key={li.key}><td style={{fontSize:'.75rem'}}>{li.label}</td>
+                  <td className="mono" style={{textAlign:'right'}}>{formatCurrency(li.currentYtd)}</td>
+                  <td className="mono" style={{textAlign:'right',color:'var(--t2)'}}>{formatCurrency(li.priorYear)}</td></tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{marginTop:8,fontSize:'.7rem',color:'var(--t3)',lineHeight:1.6}}>
+            What a landlord pays back toward a reader's cost, and GAM's markup on it, are real money received — those stay counted in the state the reader went to.
+          </div>
+        </div>
+      )}
+
+      {legend.length>0&&<div style={{marginTop:10,fontSize:'.7rem',color:'var(--t3)'}}>Line items: {legend.map((l:any)=>l.label).join(' · ')}</div>}
 
       {confirm&&(
         <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.7)',zIndex:200,display:'flex',alignItems:'center',justifyContent:'center',padding:20}} onClick={e=>{if(e.target===e.currentTarget)setConfirm(null)}}>
@@ -2145,7 +2739,7 @@ function NexusMonitor(){
               </div>
             )}
             <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
-              <button className="btn bd" onClick={()=>setConfirm(null)}>Cancel</button>
+              <button className="btn bg" onClick={()=>setConfirm(null)}>Cancel</button>
               <button className="btn bgold" disabled={registerMut.isLoading} onClick={()=>registerMut.mutate({stateCode:confirm.stateCode,registered:confirm.register,registeredDate:confirm.date||null,notes:confirm.notes||null})}>{registerMut.isLoading?'Saving…':confirm.register?'Confirm register':'Confirm unregister'}</button>
             </div>
           </div>
@@ -2319,66 +2913,10 @@ function ReaderOrdersBadge() {
   return <span style={{ marginLeft: 'auto', background: '#c9a227', color: '#060809', borderRadius: 10, padding: '0 7px', fontSize: '.68rem', fontWeight: 800 }}>{n}</span>
 }
 
+// 10/12 (Nic): the desk itself — with what each reader cost GAM and the
+// markup it earns — lives in components/ReaderOrdersDesk.
 function ReaderOrders() {
-  const qc = useQueryClient()
-  const { data: orders = [], isLoading } = useQuery<any[]>('admin-reader-orders', () => get<any[]>('/admin/reader-orders'))
-  const [draft, setDraft] = React.useState<Record<string, any>>({})
-  const [busy, setBusy] = React.useState<string | null>(null)
-  const [msg, setMsg] = React.useState<string | null>(null)
-  const STATUSES = ['requested', 'ordered', 'shipped', 'delivered', 'registered', 'cancelled']
-  const LABEL: Record<string, string> = { requested: 'Requested', ordered: 'Ordered from Stripe', shipped: 'Shipped', delivered: 'Delivered', registered: 'Registered — ready', cancelled: 'Cancelled' }
-  const save = async (o: any) => {
-    const d = draft[o.id] || {}
-    setBusy(o.id); setMsg(null)
-    try {
-      await api.patch(`/admin/reader-orders/${o.id}`, {
-        status: d.status ?? o.status, stripeHardwareOrderId: d.stripeHardwareOrderId ?? o.stripeHardwareOrderId ?? null,
-        serial: d.serial ?? o.serial ?? null, trackingUrl: d.trackingUrl ?? o.trackingUrl ?? null,
-      })
-      setDraft(prev => { const n = { ...prev }; delete n[o.id]; return n })
-      qc.invalidateQueries('admin-reader-orders'); setMsg('Saved')
-    } catch (e: any) { setMsg(e?.response?.data?.error || 'Could not save') } finally { setBusy(null) }
-  }
-  const field = (o: any, k: string, placeholder: string) => (
-    <input className="inp" style={{ width: '100%', fontSize: '.78rem' }} placeholder={placeholder}
-      value={draft[o.id]?.[k] ?? o[k] ?? ''} onChange={e => setDraft(prev => ({ ...prev, [o.id]: { ...(prev[o.id] || {}), [k]: e.target.value } }))} />
-  )
-  return (
-    <div>
-      <div className="ph"><div><h1 className="pt">Reader Orders</h1><p className="ps">Card readers landlords asked for — order in Stripe's shop, pre-registered to the location shown, shipped to the address shown</p></div></div>
-      {msg && <div style={{ fontSize: '.8rem', color: 'var(--t2)', marginBottom: 8 }}>{msg}</div>}
-      {isLoading ? <div style={{ color: 'var(--t3)' }}>Loading…</div> : (orders as any[]).length === 0 ? (
-        <div className="card" style={{ padding: 24, color: 'var(--t3)' }}>No reader requests yet.</div>
-      ) : (
-        <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
-          <table className="tbl" style={{ minWidth: 1100 }}>
-            <thead><tr><th>Requested</th><th>Landlord · property</th><th>Ship to</th><th>Stripe location</th><th>Plan</th><th>Status</th><th>Stripe order</th><th>Serial</th><th>Tracking</th><th></th></tr></thead>
-            <tbody>
-              {(orders as any[]).map(o => (
-                <tr key={o.id}>
-                  <td style={{ fontSize: '.78rem', whiteSpace: 'nowrap' }}>{new Date(o.createdAt).toLocaleDateString()}</td>
-                  <td style={{ fontSize: '.82rem' }}><div style={{ fontWeight: 600 }}>{o.businessName || o.landlordEmail}</div><div style={{ color: 'var(--t3)', fontSize: '.74rem' }}>{o.propertyName}</div></td>
-                  <td style={{ fontSize: '.74rem', color: 'var(--t2)' }}>{o.shipName}{o.shipCompany ? ` · ${o.shipCompany}` : ''}<br />{o.shipLine1}{o.shipLine2 ? `, ${o.shipLine2}` : ''}<br />{o.shipCity}, {o.shipState} {o.shipZip}{o.shipPhone ? <><br />{o.shipPhone}</> : null}</td>
-                  <td className="mono" style={{ fontSize: '.72rem', color: o.stripeTerminalLocationId ? 'var(--t2)' : 'var(--red)' }}>{o.stripeTerminalLocationId || 'no location — open the property'}</td>
-                  <td style={{ fontSize: '.78rem', whiteSpace: 'nowrap' }}>${Number(o.price).toFixed(2)} · {o.installments} × ${Number(o.installmentAmount).toFixed(2)}<br /><span style={{ color: 'var(--t3)' }}>{o.installmentsRaised} of {o.installments} raised</span></td>
-                  <td>
-                    <select className="inp" style={{ fontSize: '.78rem' }} value={draft[o.id]?.status ?? o.status}
-                      onChange={e => setDraft(prev => ({ ...prev, [o.id]: { ...(prev[o.id] || {}), status: e.target.value } }))}>
-                      {STATUSES.map(st => <option key={st} value={st}>{LABEL[st]}</option>)}
-                    </select>
-                  </td>
-                  <td style={{ minWidth: 150 }}>{field(o, 'stripeHardwareOrderId', 'thor_…')}</td>
-                  <td style={{ minWidth: 140 }}>{field(o, 'serial', 'serial number')}</td>
-                  <td style={{ minWidth: 160 }}>{field(o, 'trackingUrl', 'tracking link')}</td>
-                  <td><button className="btn btn-primary btn-sm" disabled={busy === o.id} onClick={() => save(o)}>{busy === o.id ? '…' : 'Save'}</button></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
-  )
+  return <ReaderOrdersDesk api={api}/>
 }
 
 function ConnectAccounts() {
@@ -2618,8 +3156,9 @@ function Bool({ v }: { v: boolean }) {
 function Reserve(){
   const{user}=useAuth()
   const{data:stats}=useQuery('admin-overview',()=>get<any>('/admin/overview'),{enabled:!!user})
-  // Matches the Overview reserve/float model (S566): reserve target = 3% of the
-  // FlexPay FLOAT (money at risk), NOT total platform rent; bankroll = rent of
+  // Matches the Overview reserve/float model (S566): reserve target = a share of the
+  // FlexPay FLOAT (money at risk) — 10% since S642; 10/12: the labels below still
+  // said 3% — NOT total platform rent; bankroll = rent of
   // income-verified FlexPay tenants; no phases; float yield waits for ODFI.
   // S642: same two-target model as the Overview, read from the same server
   // figure, so the two pages cannot drift.
@@ -2634,17 +3173,17 @@ function Reserve(){
         <div className="card">
           <div className="ct">Default Reserve Fund</div>
           <div className="dr"><span className="dk">Balance</span><span className="dv mono" style={{color:pct>=100?'var(--green)':pct>=50?'var(--amber)':'var(--red)'}}>{formatCurrency(stats?.reserveBalance||0)}</span></div>
-          <div className="dr"><span className="dk">Target (3% of FlexPay float)</span><span className="dv mono">{formatCurrency(target)}</span></div>
+          <div className="dr"><span className="dk">Target (10% of FlexPay float)</span><span className="dv mono">{formatCurrency(target)}</span></div>
           <div className="dr"><span className="dk">Coverage</span><span className={`badge ${pct>=100?'bg2':pct>=50?'ba':'br'}`}>{pct.toFixed(0)}%</span></div>
           <div style={{marginTop:14,fontSize:'.78rem',color:'var(--t3)',lineHeight:1.5}}>
-            Reserve absorbs FlexPay defaults — sized at 3% of the FlexPay float (money at risk), not total rent. It only grows as income-verified tenants enroll, so it stays $0 during the demand-test phase.
+            Reserve absorbs FlexPay defaults — sized at 10% of the FlexPay float (money at risk), not total rent. It only grows as income-verified tenants enroll, so it stays $0 during the demand-test phase.
           </div>
         </div>
         <div className="card">
           <div className="ct">FlexPay Float Bankroll</div>
           <div className="dr"><span className="dk">Bankroll</span><span className="dv mono" style={{color:'var(--blue)'}}>{formatCurrency(floatBankroll)}</span></div>
           <div className="dr"><span className="dk">Basis</span><span className="dv mono">rent of income-verified tenants who requested FlexPay</span></div>
-          <div className="dr"><span className="dk">Reserve needed (3%)</span><span className="dv mono">{formatCurrency(target)}</span></div>
+          <div className="dr"><span className="dk">Reserve needed (10%)</span><span className="dv mono">{formatCurrency(target)}</span></div>
           <div style={{marginTop:14,fontSize:'.78rem',color:'var(--t3)',lineHeight:1.5}}>Bankroll = the rent GAM would front each cycle if these tenants enroll. Float yield income begins at ODFI partnership; no interest is booked before then.</div>
         </div>
       </div>
@@ -4366,12 +4905,14 @@ function App(){
         }>
           <Route index element={<Navigate to={user?.role==='super_admin'?'/overview':'/onboarding'} replace/>}/>
           <Route path="overview"      element={user?.role==='super_admin'?<Overview/>:<Navigate to="/onboarding" replace/>}/>
+          <Route path="metrics"       element={<SuperAdminGuard><Metrics/></SuperAdminGuard>}/>
           <Route path="onboarding"    element={<AdminOnboardingOverview/>}/>
           <Route path="landlords"     element={<Landlords/>}/>
           <Route path="tenants"       element={<Tenants/>}/>
           <Route path="screenings"    element={<SuperAdminGuard><Screenings/></SuperAdminGuard>}/>
           <Route path="flexpay-requests" element={<SuperAdminGuard><FlexPayRequests/></SuperAdminGuard>}/>
           <Route path="property-reviews" element={<SuperAdminGuard><PropertyReviews/></SuperAdminGuard>}/>
+          <Route path="left-owing-reviews" element={<SuperAdminGuard><LeftOwingReviews/></SuperAdminGuard>}/>
           <Route path="feature-requests" element={<SuperAdminGuard><FeatureRequests/></SuperAdminGuard>}/>
           <Route path="team"          element={<SuperAdminGuard><Team/></SuperAdminGuard>}/>
           <Route path="units"         element={<Units/>}/>
@@ -4481,15 +5022,22 @@ function SystemFeatures(){
 }
 
 // ── DISPUTES (credit ledger) ─────────────────────────────────
+// 10/12 (Nic): "the payment history should be a health percentage. one mark
+// per invoice." A payment mark is the whole BILL's now (rent, utilities and
+// fees together), so it reads per bill — the same words as the landlord's
+// screening page and the tenant's credit page (TenantScreeningPage.tsx,
+// apps/tenant main.tsx EVENT_LABEL; creditMarkLabels.test.ts keeps the three
+// in step). The event types are unchanged; the grace-period and failed-payment
+// labels stay for marks written before.
 const DISPUTE_EVENT_LABEL: Record<string,string> = {
-  payment_received_on_time:           'Rent paid on time',
+  payment_received_on_time:           'Bill paid on time',
   payment_received_late_grace:        'Paid within grace period',
-  payment_received_late_minor:        'Paid late (minor)',
-  payment_received_late_major:        'Paid late (major)',
-  payment_received_late_severe:       'Paid late (severe)',
-  payment_partial:                    'Partial payment',
+  payment_received_late_minor:        'Bill paid late (1–3 days past grace)',
+  payment_received_late_major:        'Bill paid late (4–15 days past grace)',
+  payment_received_late_severe:       'Bill paid late (16+ days past grace)',
+  payment_partial:                    'Bill partly paid past grace',
   payment_failed_nsf:                 'Payment failed (NSF)',
-  payment_skipped:                    'Payment skipped',
+  payment_skipped:                    'Bill unpaid past grace',
   lease_signed:                       'Lease signed',
   lease_renewed:                      'Lease renewed',
   lease_terminated_natural:           'Lease completed',
@@ -4656,7 +5204,7 @@ function Disputes(){
                       <div style={{color:'var(--t0)',fontWeight:600}}>{d.disputingSubjectType}</div>
                       <div className="mono" style={{fontSize:'.65rem',color:'var(--t3)'}}>{d.disputingSubjectRefId?.slice(0,8)}…</div>
                     </td>
-                    <td style={{fontSize:'.78rem',color:'var(--t0)'}}>{DISPUTE_EVENT_LABEL[d.disputedEventType] || d.disputedEventType}</td>
+                    <td style={{fontSize:'.78rem',color:'var(--t0)'}}>{DISPUTE_EVENT_LABEL[d.disputedEventType] || humanize(d.disputedEventType)}</td>
                     <td style={{fontSize:'.78rem'}}>{humanize(d.reason)}</td>
                     <td>
                       {d.evidenceCount > 0
@@ -4685,7 +5233,7 @@ function Disputes(){
                   <span style={{fontSize:'.7rem',color:'var(--t3)'}}>filed {new Date(detail.createdAt).toLocaleString()}</span>
                 </div>
                 <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.05rem',color:'var(--t0)'}}>
-                  {DISPUTE_EVENT_LABEL[detail.disputedEventType] || detail.disputedEventType}
+                  {DISPUTE_EVENT_LABEL[detail.disputedEventType] || humanize(detail.disputedEventType)}
                 </div>
                 <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>
                   Disputing party: {detail.disputingSubjectType} <span className="mono">{detail.disputingSubjectRefId}</span>
@@ -4804,7 +5352,7 @@ function Disputes(){
                         )}
                         {cReplaceWithSame && (
                           <div style={{fontSize:'.72rem',color:'var(--t3)'}}>
-                            Re-emits as <span className="mono">{detail.disputedEventType}</span> with <code>dispute_corrected: true</code> in event_data. Use this when the original happened but the data was wrong.
+                            Re-emits as <strong>{DISPUTE_EVENT_LABEL[detail.disputedEventType] || humanize(detail.disputedEventType)}</strong> with <code>dispute_corrected: true</code> in event_data. Use this when the original happened but the data was wrong.
                           </div>
                         )}
                       </div>
@@ -5171,6 +5719,112 @@ const SCHEDULE_LABEL: Record<string, string> = {
   ssi_day_1: '1st of month', ssdi_day_3: '3rd of month',
   ssdi_wed_2: '2nd Wednesday', ssdi_wed_3: '3rd Wednesday',
   ssdi_wed_4: '4th Wednesday', fixed_day: 'Fixed day',
+}
+
+/**
+ * 10/22 (Nic) — THE CLOSE CALLS ON A DEBT SOMEBODY WALKED AWAY FROM.
+ *
+ *   "Maybe when there's a not sure call, we can leave it to the admin to kind
+ *    of do some research on."
+ *
+ * A contact point agreed — the email or the phone — and the name only half did:
+ * an initial, a brother at the same number, a surname that changed. The matcher
+ * refuses to guess either way, so until somebody here decides, NO landlord sees
+ * a flag and no door opens.
+ *
+ * Everything about the debt is on the row, because that is what research takes.
+ * The rule that keeps the amount and the landlord back is a rule about other
+ * LANDLORDS, not about this desk.
+ */
+interface LeftOwingReviewRow {
+  id: string; owingId: string
+  debtName: string | null; personName: string | null
+  personEmail: string | null; personPhone: string | null
+  matchedOn: 'email' | 'phone' | 'account'
+  nameAgreement: 'same' | 'unsure' | 'different'
+  why: string; amount: number; owedTo: string | null
+  leftOn: string | null; where: string | null; source: string; raisedAt: string
+}
+
+function LeftOwingReviewBadge() {
+  const { data: rows = [] } = useQuery<LeftOwingReviewRow[]>(
+    'left-owing-reviews', () => get<LeftOwingReviewRow[]>('/admin/left-owing-reviews'))
+  if (!rows.length) return null
+  return <span className="badge b-amber" style={{ marginLeft: 'auto' }}>{rows.length}</span>
+}
+
+function LeftOwingReviews() {
+  const qc = useQueryClient()
+  const [note, setNote] = React.useState<Record<string, string>>({})
+  const [err, setErr] = React.useState<string | null>(null)
+  const { data: rows = [], isLoading } = useQuery<LeftOwingReviewRow[]>(
+    'left-owing-reviews', () => get<LeftOwingReviewRow[]>('/admin/left-owing-reviews'))
+
+  const decide = useMutation(
+    (p: { id: string; samePerson: boolean; note?: string }) =>
+      post(`/admin/left-owing-reviews/${p.id}/decide`, { samePerson: p.samePerson, note: p.note || undefined }),
+    { onSuccess: () => { qc.invalidateQueries('left-owing-reviews'); setErr(null) },
+      onError: (e: any) => setErr(e?.response?.data?.error || 'That did not save — try again') },
+  )
+
+  const money = (n: number) => '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  const WHICH: Record<string, string> = { email: 'Same email address', phone: 'Same phone number', account: 'Same account' }
+  const CLOSE: Record<string, string> = {
+    unsure: 'The names are close', different: 'The names do not match', same: 'The names match',
+  }
+
+  return (
+    <div>
+      <div className="ph">
+        <div>
+          <h1 className="pt">Left-Owing Matches</h1>
+          <p className="ps">
+            {rows.length === 0
+              ? 'Nothing waiting. A flag only needs a person when a contact point matches and the name does not quite.'
+              : `${rows.length} waiting — no landlord sees a flag for these until you decide`}
+          </p>
+        </div>
+      </div>
+      {err && <div className="alert a-red" style={{ marginBottom: 12 }}>{err}</div>}
+      {isLoading && <div className="muted">Loading…</div>}
+      {rows.map(r => (
+        <div key={r.id} className="card" style={{ marginBottom: 12 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 24, alignItems: 'flex-start' }}>
+            <div style={{ flex: 1, minWidth: 260 }}>
+              <div className="kpi-l">On the old invoice</div>
+              <div style={{ fontSize: '1.05rem', fontWeight: 600 }}>{r.debtName || '— no name —'}</div>
+              <div className="kpi-s">
+                {money(r.amount)} · left {r.leftOn || 'date unknown'}{r.where ? ` · ${r.where}` : ''}
+              </div>
+              <div className="kpi-s">Owed to {r.owedTo || 'a landlord on GAM'} · {r.source}</div>
+            </div>
+            <div style={{ flex: 1, minWidth: 260 }}>
+              <div className="kpi-l">The person being checked</div>
+              <div style={{ fontSize: '1.05rem', fontWeight: 600 }}>{r.personName || '— no name —'}</div>
+              <div className="kpi-s">{r.personEmail || 'no email'} · {r.personPhone || 'no phone'}</div>
+              <div className="kpi-s">
+                <span className="badge b-amber">{WHICH[r.matchedOn]}</span>{' '}
+                <span className="badge b-muted">{CLOSE[r.nameAgreement]}</span>
+              </div>
+            </div>
+          </div>
+          <p className="ps" style={{ marginTop: 10 }}>{r.why}</p>
+          <input className="in" style={{ marginTop: 8 }} placeholder="What you found (optional, kept with the decision)"
+            value={note[r.id] ?? ''} onChange={e => setNote({ ...note, [r.id]: e.target.value })}/>
+          <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+            <button className="btn btn-primary btn-sm" disabled={decide.isLoading}
+              onClick={() => decide.mutate({ id: r.id, samePerson: true, note: note[r.id] })}>
+              Same person — every landlord sees the flag
+            </button>
+            <button className="btn btn-ghost btn-sm" disabled={decide.isLoading}
+              onClick={() => decide.mutate({ id: r.id, samePerson: false, note: note[r.id] })}>
+              Somebody else — never show it
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
 }
 
 function FlexPayRequests() {
@@ -6205,6 +6859,11 @@ function Root(){
 }
 
 installDatePickerAutoClose()
+
+// 10/26 (Nic): a printed page is always the light theme, whatever the screen
+// is set to — he printed an eviction balance summary in dark mode and got a
+// solid black sheet. Installed once here; restores the viewer's theme after.
+installPrintLightTheme()
 
 // HMR guard: when Vite re-executes this entry module, calling createRoot on
 // the same container again STACKS a second mounted app under the first

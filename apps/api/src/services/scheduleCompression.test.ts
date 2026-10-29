@@ -90,6 +90,58 @@ describe('compressPropertySchedule', () => {
     expect(await unitOf(b)).toBe(p.s3)
   })
 
+  // ── 10/24 (Nic) — A 37-FOOT TRAILER DOES NOT GO ON A 30-FOOT PAD ──────────
+  //
+  //   "I'm trying to make a reservation right now where somebody's got a 37 foot
+  //    camper. They can't go in the small sites, right?... one, does that lock
+  //    them to that site? Two, does compression and expansion happen as needed?
+  //    And three, is there anything that keeps them in their range if that
+  //    compression and expansion happens?"
+  //
+  // The answer to the third had been no, because no length existed anywhere.
+  // The packer honoured the layout and the amps and would cheerfully have moved
+  // a 37-footer onto a pad it cannot physically occupy — overnight, unasked,
+  // after somebody at the counter had already put them somewhere that fit.
+  it('never packs a long rig onto a site too short for it', async () => {
+    const p = await seedPark()
+    // RV 01/02 are short pads; RV 03/04 take anything this size.
+    await db.query(`UPDATE units SET rv_max_rig_length_ft = 30 WHERE id = ANY($1::uuid[])`, [[p.s1, p.s2]])
+    await db.query(`UPDATE units SET rv_max_rig_length_ft = 45 WHERE id = ANY($1::uuid[])`, [[p.s3, p.s4]])
+    const b = await booking(p.s4, p.landlordId, plusDays(5), plusDays(8), { rig_length_ft: 37 })
+    const moves = await compressPropertySchedule(p.propertyId)
+    // RV 01 is the lowest-numbered free site and would win on every other
+    // count. It is 30 ft. So the stay packs to RV 03 — the first that fits.
+    expect(moves).toHaveLength(1)
+    expect(await unitOf(b)).toBe(p.s3)
+    // And it stays there: run again and nothing tries to squeeze it lower.
+    expect(await compressPropertySchedule(p.propertyId)).toEqual([])
+    expect(await unitOf(b)).toBe(p.s3)
+  })
+
+  it('a rig exactly as long as the pad fits — the limit is the longest it takes, not one less', async () => {
+    const p = await seedPark()
+    await db.query(`UPDATE units SET rv_max_rig_length_ft = 30 WHERE id = ANY($1::uuid[])`, [[p.s1, p.s2]])
+    const b = await booking(p.s4, p.landlordId, plusDays(5), plusDays(8), { rig_length_ft: 30 })
+    await compressPropertySchedule(p.propertyId)
+    expect(await unitOf(b)).toBe(p.s1)
+  })
+
+  it('a pad with no stated limit takes any rig, so no park changes until it is measured', async () => {
+    const p = await seedPark()
+    // Every site NULL — the state every existing park is in right now.
+    const b = await booking(p.s4, p.landlordId, plusDays(5), plusDays(8), { rig_length_ft: 42 })
+    await compressPropertySchedule(p.propertyId)
+    expect(await unitOf(b)).toBe(p.s1)
+  })
+
+  it('a stay with no rig length given is packed as it always was', async () => {
+    const p = await seedPark()
+    await db.query(`UPDATE units SET rv_max_rig_length_ft = 30 WHERE id = ANY($1::uuid[])`, [[p.s1, p.s2]])
+    const b = await booking(p.s4, p.landlordId, plusDays(5), plusDays(8))   // nobody asked how long it was
+    await compressPropertySchedule(p.propertyId)
+    expect(await unitOf(b)).toBe(p.s1)
+  })
+
   // S653 (Nic): "they didn't like the spot they were in last year... an
   // avoidance type situation."
   it('never packs a guest onto a site they asked not to have', async () => {

@@ -63,14 +63,15 @@ async function seedOwedTenant() {
     const invoiceId = inv.rows[0].id
 
     await c.query(
+      // 10/12: written on its due date (lateness counts from the later of the two).
       `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-                             type, amount, status, due_date, entry_description, notes)
-       VALUES ($1,$2,$3,$4,$5,'rent',440,'pending','2026-09-01','RENT',NULL)`,
+                             type, amount, status, due_date, entry_description, notes, created_at)
+       VALUES ($1,$2,$3,$4,$5,'rent',440,'pending','2026-09-01','RENT',NULL,'2026-09-01')`,
       [invoiceId, unitId, leaseId, tenantId, ll.landlordId])
     await c.query(
       `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-                             type, amount, status, due_date, entry_description, notes)
-       VALUES ($1,$2,$3,$4,$5,'utility',176.40,'pending','2026-09-01','UTILITY',$6)`,
+                             type, amount, status, due_date, entry_description, notes, created_at)
+       VALUES ($1,$2,$3,$4,$5,'utility',176.40,'pending','2026-09-01','UTILITY',$6,'2026-09-01')`,
       [invoiceId, unitId, leaseId, tenantId, ll.landlordId,
        'Electric — Aug 2026 (used before the lease was signed)'])
     await c.query('COMMIT')
@@ -545,5 +546,100 @@ describe('GAM\'s FlexPay pull never reaches a landlord screen', () => {
     expect(res.status).toBe(200)
     expect(JSON.stringify(res.body)).not.toMatch(/flexpay/i)
     expect(Number(res.body.data[0].balance)).toBe(616.4)
+  })
+})
+
+/**
+ * 10/25 (Nic): "Is that going to appear on the front desk person's list as like,
+ * hey, collect this money?" → "Show it, collect-only, can't be rung up."
+ *
+ * Dominic Gonzalez's installment is the trust's money: GAM bills nothing for it
+ * and none of it may reach the park's books, but he pays at the counter, so the
+ * desk has to be told. The line carries the warning and NO way to record a
+ * payment, because there is no charge behind it at all.
+ */
+describe('a tracked home payment on the outstanding list', () => {
+  async function trackedDue() {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const ll = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId: ll.landlordId, ownerUserId: ll.userId, managedByUserId: ll.userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId: ll.landlordId })
+      const { seedTenant, seedLeaseTenant } = await import('../test/dbHelpers')
+      const tenantId = await seedTenant(c)
+      const leaseId = await seedLease(c, { unitId, landlordId: ll.landlordId, rentAmount: 460 })
+      await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
+      const { createHomeSaleContract } = await import('../services/homeSale')
+      const k = await createHomeSaleContract(c, {
+        unitId, leaseId, tenantId, landlordId: ll.landlordId,
+        salePrice: 4060.42, downPayment: 0, annualInterestRate: 0,
+        termMonths: 13, startMonth: '2026-03-10', planType: 'flat',
+      })
+      await c.query(`UPDATE home_sale_contracts SET tracked_not_billed = TRUE WHERE id = $1`, [k.id])
+      await c.query('COMMIT')
+      return { ...ll, propertyId, unitId, tenantId, contractId: k.id as string }
+    } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e } finally { c.release() }
+  }
+
+  it('is on the list, says it is not a GAM payment, and offers nothing to record', async () => {
+    const f = await trackedDue()
+    const res = await request(buildApp()).get('/api/balances')
+      .set('Authorization', `Bearer ${tokenFor(f.userId, f.landlordId)}`)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const row = (res.body.data as any[]).find(r => r.tracked_payment)
+    expect(row, JSON.stringify(res.body.data)).toBeTruthy()
+    expect(row.collect_only).toBe(true)
+    expect(Number(row.balance)).toBeCloseTo(312.34, 2)
+    expect(row.tracked_payment.say).toContain('NOT a GAM payment')
+    expect(row.tracked_payment.say).toContain('do not ring it up')
+    // Nothing for Record payment, the reader or the register to act on.
+    expect(row.record_with).toEqual([])
+  })
+
+  it('is ONE line per contract — the oldest owed — however many are behind', async () => {
+    const f = await trackedDue()
+    const res = await request(buildApp()).get('/api/balances')
+      .set('Authorization', `Bearer ${tokenFor(f.userId, f.landlordId)}`)
+    const lines = (res.body.data as any[]).filter(r => r.tracked_payment)
+    // The contract started 2026-03-10, so several months are past due — a
+    // counter reads a person, not a list of months.
+    expect(lines).toHaveLength(1)
+    expect(lines[0].tracked_payment.installmentNumber).toBe(1)
+    expect(lines[0].tracked_payment.behind).toBeGreaterThan(1)
+    expect(lines[0].tracked_payment.say).toContain('payments are behind')
+  })
+
+  it('moves to the next payment when the oldest is marked received', async () => {
+    const f = await trackedDue()
+    const { markTrackedInstallmentPaid } = await import('../services/homeSale')
+    await markTrackedInstallmentPaid(f.contractId, 1, true)
+    const res = await request(buildApp()).get('/api/balances')
+      .set('Authorization', `Bearer ${tokenFor(f.userId, f.landlordId)}`)
+    const lines = (res.body.data as any[]).filter(r => r.tracked_payment)
+    expect(lines).toHaveLength(1)
+    expect(lines[0].tracked_payment.installmentNumber).toBe(2)
+  })
+
+  it('leaves the list entirely once nothing is owed on it', async () => {
+    const f = await trackedDue()
+    const { markTrackedInstallmentPaid } = await import('../services/homeSale')
+    // Mark every month that has come due.
+    const { query } = await import('../db')
+    const due = await query<any>(
+      `SELECT installment_number AS n FROM home_sale_installments
+        WHERE contract_id = $1 AND billing_month <= CURRENT_DATE ORDER BY n`, [f.contractId])
+    for (const d of due) await markTrackedInstallmentPaid(f.contractId, d.n, true)
+    const res = await request(buildApp()).get('/api/balances')
+      .set('Authorization', `Bearer ${tokenFor(f.userId, f.landlordId)}`)
+    expect((res.body.data as any[]).filter(r => r.tracked_payment)).toHaveLength(0)
+  })
+
+  it('never counts toward the grand totals — it is not money GAM is owed', async () => {
+    const f = await trackedDue()
+    const res = await request(buildApp()).get('/api/balances')
+      .set('Authorization', `Bearer ${tokenFor(f.userId, f.landlordId)}`)
+    expect(res.body.data.some((r: any) => r.tracked_payment)).toBe(true)
+    expect(Number(res.body.meta?.totals?.balance ?? 0)).toBe(0)
   })
 })

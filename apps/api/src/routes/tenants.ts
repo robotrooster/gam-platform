@@ -17,6 +17,15 @@ import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { signEmailOtpSessionToken, issueEmailOtp } from './emailOtp'
 import { applyScreeningWaive, WAIVER_NOT_RECORDED_MESSAGE } from '../services/onboardingWindow'
 import { landlordScopeIds } from '../lib/landlordScope'
+import { householdRowSql, tenantCompanies } from '../services/openBalances'
+import { chargeLabelColumnsSql, chargeLabel, chargeDetail } from '../services/invoiceNotice'
+// 10/26: FlexDeposit sells exactly two splits; the helper is the one place
+// that says which.
+import { isAllowedFlexDepositPaymentCount } from '@gam/shared'
+import {
+  healthByHousehold, healthByLease, householdsOf, householdMonths, paymentHealth, addMonths, currentBillMonth, ALL_TIME_FROM,
+  type PaymentHealth,
+} from '../services/householdMonths'
 import { portalLink } from '../lib/portalUrls'
 
 export const tenantsRouter = Router()
@@ -61,6 +70,49 @@ tenantsRouter.get('/', requireAuth, async (req: any, res, next) => {
         ORDER BY t.id, l.created_at DESC`,
       [landlordIds])
     res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+/**
+ * GET /api/tenants/health-by-unit — the Tenants list's Payment health column,
+ * per LEASE. 10/13 (Nic): "Tenants list + tenant profile: split health BY
+ * LEASE" — the list is one row per occupied space, and each row's figure is
+ * the health of the lease on that space (the Rent Roll's figure for that
+ * household, services/householdMonths healthByLease), so a person renting two
+ * spots on two leases reads each lease's own number on each row, never one
+ * number for both.
+ *
+ * → [{ unitId, leaseId, percent, label }] for every space with an active
+ * lease the viewer may see (their companies, their properties). Who: as the
+ * list's column always was (routes/units seesHealth) — the owner, or staff with
+ * "View all payments" or the books; anyone else gets [] (S641: "I don't want
+ * her to see ... the payment histories"). GAM admin reads the list's own
+ * column (data: null) — this route answers for the account's companies.
+ * Declared here, before the /:id routes, so the path is never read as an id.
+ */
+tenantsRouter.get('/health-by-unit', requireAuth, async (req: any, res, next) => {
+  try {
+    const role = req.user!.role
+    if (role === 'admin' || role === 'super_admin') return res.json({ success: true, data: null })
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) throw new AppError(403, 'Forbidden')
+    if (!userHasPerm(req.user, 'payments.view_all', 'books.view')) return res.json({ success: true, data: [] })
+    const propertyIds = await (await import('../middleware/auth')).getScopedPropertyIds(req.user)
+    const spaces = await query<{ unit_id: string; lease_id: string }>(`
+      SELECT vuo.unit_id, vuo.active_lease_id AS lease_id
+        FROM v_unit_occupancy vuo
+        JOIN units u ON u.id = vuo.unit_id
+       WHERE vuo.active_lease_id IS NOT NULL
+         AND u.landlord_id = ANY($1::uuid[])
+         AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))`, [landlordIds, propertyIds])
+    const health = await healthByLease({ landlordIds, propertyIds, leaseIds: spaces.map(s => s.lease_id) })
+    res.json({
+      success: true,
+      data: spaces.map(s => {
+        const h = health.get(s.lease_id)
+        return { unitId: s.unit_id, leaseId: s.lease_id, percent: h?.percent ?? null, label: h?.label ?? 'No months to judge yet' }
+      }),
+    })
   } catch (e) { next(e) }
 })
 
@@ -245,10 +297,16 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       // The token is still on the user, so the link the tenant already has in
       // their inbox keeps working. That is the whole point.
       await client.query('ROLLBACK').catch(() => {})
-      client.release()
       throw e
+    } finally {
+      // 10/13: released on EVERY way out. The two refusals above (an already
+      // used link, an invalid or expired one) return from inside the try, and
+      // the release used to sit only after it and in the catch — so each
+      // refused link kept one of the pool's connections forever. Enough bad or
+      // reused links and every request in the API waited on a connection that
+      // never came back ("timeout exceeded when trying to connect").
+      client.release()
     }
-    client.release()
 
     // S558 (Flow B): stamp this person's unit-bound intent as accepted, then
     // auto-draft the lease(s) if the unit's roster is now ready. Best-effort in
@@ -495,6 +553,48 @@ tenantsRouter.use(requireAuth)
 // Do not reintroduce either endpoint. If a tenant genuinely cannot pay, the
 // reason will be about THEIR payment method, and it belongs in that error.
 
+// ── 10/20 — "THE LEASE WAITING ON THEM" HAS TO BE A LEASE ────────────────
+//
+// GET /me asks this one question four times: which document is waiting
+// (pending_lease_document_id), whether it takes the portal over
+// (pending_lease_locks), who it is waiting on (sig) and the whole roster
+// (roster). Four copies of one sentence, so they are written once, here.
+//
+// The sentence has to name the document TYPE, and none of the four did. Any
+// open document the person was a signer on became "their lease" — which the
+// day the resident-page signing door shipped turned into this: Blu opens
+// Curtis's file at Mattoon, sends the Mattoon Maintenance Agreement, signs his
+// own box first — and Curtis, a resident of two years with rent due, logs in
+// to a signing page with no nav and no way out, titled "Sign your lease". He
+// cannot reach Payments until he signs a maintenance agreement. Nobody wrote
+// that rule; it fell out of a missing filter.
+//
+// A LEASE is what holds the portal, because a lease is the thing you cannot
+// live there without. Everything else — a work-trade agreement, a contract, an
+// add-a-roommate addendum, a packet disclosure — is paper that waits on the
+// Documents screen while they go on paying their rent. The tenant app has said
+// exactly that in prose since S655 (apps/tenant/src/lib/pendingLease.ts: "any
+// other unsigned document ... is not that"); this is the server finally saying
+// it too, with the same test every other door uses (routes/landlords.ts:
+// d.document_type = 'original_lease').
+//
+// Reads `u.id` from the enclosing query — every one of the four sites has the
+// users row joined in.
+//
+// S655 still holds: a NEW lease for the home they already live in
+// (renews_lease_id) is not this either. It comes back as pending_renewal_* and
+// shows as a banner, never the lock-in.
+const PENDING_LEASE_DOC_ID = `
+  SELECT d.id
+    FROM lease_document_signers lds
+    JOIN lease_documents d ON d.id = lds.document_id
+   WHERE lds.user_id = u.id
+     AND d.document_type = 'original_lease'
+     AND d.status IN ('sent','in_progress')
+     AND d.renews_lease_id IS NULL
+   ORDER BY d.created_at DESC
+   LIMIT 1`
+
 tenantsRouter.get('/me', async (req, res, next) => {
   try {
     // S655: a new lease whose lease before it ended early, nobody signed — not theirs to sign.
@@ -515,12 +615,7 @@ tenantsRouter.get('/me', async (req, res, next) => {
         -- S655: a NEW LEASE for the home they already live in (renews_lease_id)
         -- is not this. It comes back as pending_renewal_* below and shows as a
         -- banner — never the signing lock-in, which stays for new tenants.
-        (SELECT d.id FROM lease_document_signers lds
-           JOIN lease_documents d ON d.id = lds.document_id
-          WHERE lds.user_id = u.id
-            AND d.status IN ('sent','in_progress')
-            AND d.renews_lease_id IS NULL
-          ORDER BY d.created_at DESC LIMIT 1) AS pending_lease_document_id,
+        (${PENDING_LEASE_DOC_ID}) AS pending_lease_document_id,
         -- S655 (Nic, 10/2): their new lease, signed by the landlord and waiting
         -- on them. They keep paying rent and using the portal meanwhile.
         nlw.document_id AS pending_renewal_document_id,
@@ -649,12 +744,8 @@ tenantsRouter.get('/me', async (req, res, next) => {
                   SELECT 1 FROM utility_service_agreements lks
                    WHERE lks.tenant_id = t.id AND lks.status = 'active'
                      AND lks.landlord_id NOT IN (SELECT public.account_companies(lkd.landlord_id)))
-           FROM lease_document_signers lkds
-           JOIN lease_documents lkd ON lkd.id = lkds.document_id
-          WHERE lkds.user_id = u.id
-            AND lkd.status IN ('sent','in_progress')
-            AND lkd.renews_lease_id IS NULL
-          ORDER BY lkd.created_at DESC LIMIT 1) AS pending_lease_locks,
+           FROM lease_documents lkd
+          WHERE lkd.id = (${PENDING_LEASE_DOC_ID})) AS pending_lease_locks,
         -- S639 (Nic): "does the middle tenant project their name onto the first
         -- and third tenant so that everybody can know full transparency where
         -- everything's at?"
@@ -676,7 +767,8 @@ tenantsRouter.get('/me', async (req, res, next) => {
         LIMIT 1
       ) un ON TRUE
       LEFT JOIN properties pr ON pr.id = un.property_id
-      LEFT JOIN security_deposits sd ON sd.tenant_id = t.id
+      -- 10/12 (G8): a voided deposit record is not a deposit.
+      LEFT JOIN security_deposits sd ON sd.tenant_id = t.id AND sd.status <> 'voided'
       LEFT JOIN LATERAL (
         SELECT landlord_id, property_id
         FROM pending_tenant_intents
@@ -735,12 +827,7 @@ tenantsRouter.get('/me', async (req, res, next) => {
       LEFT JOIN LATERAL (
         SELECT lds2.name, lds2.role, lds2.user_id
           FROM lease_document_signers lds2
-         WHERE lds2.document_id = (
-                 SELECT d.id FROM lease_document_signers lds3
-                   JOIN lease_documents d ON d.id = lds3.document_id
-                  WHERE lds3.user_id = u.id AND d.status IN ('sent','in_progress')
-                    AND d.renews_lease_id IS NULL
-                  ORDER BY d.created_at DESC LIMIT 1)
+         WHERE lds2.document_id = (${PENDING_LEASE_DOC_ID})
            AND lds2.status <> 'signed'
          ORDER BY lds2.order_index
          LIMIT 1
@@ -753,12 +840,7 @@ tenantsRouter.get('/me', async (req, res, next) => {
                  'isMe', r.user_id = u.id
                ) ORDER BY r.order_index) AS signers
           FROM lease_document_signers r
-         WHERE r.document_id = (
-                 SELECT d.id FROM lease_document_signers lds4
-                   JOIN lease_documents d ON d.id = lds4.document_id
-                  WHERE lds4.user_id = u.id AND d.status IN ('sent','in_progress')
-                    AND d.renews_lease_id IS NULL
-                  ORDER BY d.created_at DESC LIMIT 1)
+         WHERE r.document_id = (${PENDING_LEASE_DOC_ID})
       ) roster ON TRUE
       -- S655: the new lease waiting on them, once the landlord has signed it
       -- (issued: it has a lease). Before that there is nothing for them to see.
@@ -842,9 +924,16 @@ tenantsRouter.post('/lease-notices/:id/acknowledge', requireAuth, async (req, re
 
 // ── GET /api/tenants/me/payment-health ───────────────────────────────────
 // #12: the tenant's own view of the Payment Health card the landlord sees on
-// TenantDetailPage — same metric (settled / total payments → on-time rate)
-// computed from the authenticated tenant's own payments. Gives the resident
-// a positive, at-a-glance read on their standing.
+// TenantDetailPage. 10/12 (Nic): "Payment health = ONE definition everywhere,
+// per HOUSEHOLD per BILL MONTH" — the same figure the landlord sees
+// (services/householdMonths): the household's months paid on time over all
+// time — every month since its first bill on GAM (10/12, Nic: "ALL-TIME, not
+// 12 months") — judged on rent, utilities, fees and the home payment (never a late
+// fee), grace = the lease's, else the property's, else 5 (a blank lease grace
+// used to read as 0 here, so a bill paid on day 3 read late), a month work
+// trade covers counts as paid on time (every work-trade resident read 0%
+// here), the onboarding month good news only. The six beats are the last six
+// months, each one month: 1 of 1 on time, or 0 of 1.
 tenantsRouter.get('/me/payment-health', async (req, res, next) => {
   try {
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
@@ -858,7 +947,7 @@ tenantsRouter.get('/me/payment-health', async (req, res, next) => {
         MIN(due_date) AS first_payment
       FROM payments WHERE tenant_id = $1
         -- A voided charge (decisions #48.5) was owed by nobody: it is not a payment.
-        AND status <> 'voided'`, [req.user!.profileId!])
+        AND status <> 'voided'`, [tenantId])
     const total = parseInt(s?.total_payments || 0)
     const settled = parseInt(s?.settled || 0)
     const firstPayment = s?.first_payment ? new Date(s.first_payment) : null
@@ -866,55 +955,34 @@ tenantsRouter.get('/me/payment-health', async (req, res, next) => {
       ? Math.floor((Date.now() - firstPayment.getTime()) / (1000 * 60 * 60 * 24 * 30))
       : 0
 
-    // S595 (Nic): TRUE on-time payment health for the heartbeat monitor — of the
-    // tenant's billed obligations (rent/utility/fee/home_payment) that have
-    // RESOLVED (settled, or already past due_date + the lease grace window), how
-    // many settled ON TIME (by due_date + grace). Per-month for the last 6 months
-    // (the beats) + the window rate (the color). This is on-time-ness, NOT total
-    // paid — a tenant who always pays but always late reads unhealthy here.
-    // Excludes late_fees (the penalty) and deposits (one-time move-in).
-    const otRows = await query<any>(`
-      WITH obl AS (
-        SELECT date_trunc('month', p.due_date) AS m,
-               (p.status = 'settled'
-                 AND p.settled_at::date <= p.due_date + COALESCE(l.late_fee_grace_days, 0)) AS on_time,
-               (p.status = 'settled'
-                 OR (p.due_date + COALESCE(l.late_fee_grace_days, 0)) < CURRENT_DATE) AS counted
-          FROM payments p
-          LEFT JOIN leases l ON l.id = p.lease_id
-         WHERE p.tenant_id = $1
-           AND p.type IN ('rent','utility','fee','home_payment')
-           -- A voided charge was owed by nobody: never an on-time or late mark.
-           AND p.status <> 'voided'
-           AND p.due_date >= (date_trunc('month', CURRENT_DATE) - interval '5 months')::date
-      )
-      SELECT to_char(m, 'Mon') AS month, to_char(m, 'YYYY-MM') AS ym,
-             COUNT(*) FILTER (WHERE counted)             AS total,
-             COUNT(*) FILTER (WHERE counted AND on_time) AS on_time
-        FROM obl
-       GROUP BY m
-       ORDER BY m`, [tenantId])
-    const winTotal  = otRows.reduce((n: number, r: any) => n + parseInt(r.total || 0), 0)
-    const winOnTime = otRows.reduce((n: number, r: any) => n + parseInt(r.on_time || 0), 0)
+    const companies = await tenantCompanies(tenantId)
+    const through = currentBillMonth()
+    const hh = (await householdsOf([tenantId], companies)).get(tenantId) ?? tenantId
+    const months = companies.length
+      ? await householdMonths({ landlordIds: companies, householdIds: [hh], from: ALL_TIME_FROM, through })
+      : []
+    const health = paymentHealth(months, through)
+    const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    const beats = Array.from({ length: 6 }, (_, i) => addMonths(through, i - 5)).map(ym => {
+      const m = months.find(x => x.month === ym && x.counted)
+      return { month: MONTH_ABBR[Number(ym.slice(5, 7)) - 1], ym, total: m ? 1 : 0, onTime: m?.on_time ? 1 : 0, rate: m ? (m.on_time ? 1 : 0) : null }
+    }).filter(b => b.total > 0)
 
     res.json({
       success: true,
       data: {
-        onTimeRate: total > 0 ? Math.round((settled / total) * 100) : 0,
         settledCount: settled,
         failedCount: parseInt(s?.failed || 0),
         totalPayments: total,
         totalPaid: parseFloat(s?.total_paid || 0),
         tenantMonths,
-        // S595: real on-time health (drives the tenant heartbeat monitor).
+        // 10/12: the one payment-health figure (drives the tenant heartbeat
+        // monitor): months on time ÷ months judged, all time on GAM.
         onTime: {
-          pct: winTotal > 0 ? Math.round((winOnTime / winTotal) * 100) : null,
-          resolved: winTotal,
-          onTimeCount: winOnTime,
-          months: otRows.map((r: any) => {
-            const t = parseInt(r.total || 0), ot = parseInt(r.on_time || 0)
-            return { month: r.month, ym: r.ym, total: t, onTime: ot, rate: t > 0 ? ot / t : null }
-          }),
+          pct: health.percent,
+          resolved: health.counted,
+          onTimeCount: health.on_time,
+          months: beats,
         },
       },
     })
@@ -1069,7 +1137,7 @@ tenantsRouter.get('/me/deposit-interest', async (req, res, next) => {
          JOIN leases    l ON l.id = sd.lease_id
          JOIN units     u ON u.id = l.unit_id
          JOIN properties p ON p.id = u.property_id
-        WHERE sd.tenant_id = $1
+        WHERE sd.tenant_id = $1 AND sd.status <> 'voided'
         ORDER BY sd.created_at DESC
         LIMIT 1`,
       [tenantId],
@@ -1336,6 +1404,72 @@ tenantsRouter.get('/flexpay/inquiry/proof-file', async (req: any, res, next) => 
   } catch (e) { next(e) }
 })
 
+// ── THE FIXED-INCOME BANNER (10/26, Nic) ─────────────────────
+//
+//   "Maybe the survey could just literally be in the banner, like pop up on
+//    their screen. Are you on fixed income? Yes or no? If yes, it takes them
+//    to the descriptor of FlexPay. If they click no, then boom, they're just
+//    flagged no, and it's done and over with right there without leaving the
+//    page."
+//
+// And on WHERE: never while they are setting a password or verifying an
+// email — "not a gatekeeping thing... We need to just ask it casually later
+// at like the first login when they're adding a payment method."
+//
+// So it is asked once, answered in place, and never blocks anything. A "no"
+// ends it for good; a "yes" sends them to the FlexPay explainer, which is
+// where the inquiry and the existing proof-of-income upload already live
+// (POST /flexpay/inquiry/proof) — this does not grow a second store for the
+// document.
+//
+// The answer is SELF-REPORTED and gates nothing. tenants.ssi_ssdi stays the
+// verified flag an admin sets after reviewing income, and remains the only
+// thing FlexPay enrollment reads: a tap on "Yes" must never qualify anybody.
+
+// GET /api/tenants/me/fixed-income-prompt — should the banner show?
+tenantsRouter.get('/me/fixed-income-prompt', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const t = await queryOne<{
+      fixed_income_self_reported: boolean | null
+      fixed_income_answered_at: string | null
+      ssi_ssdi: boolean | null
+      flexpay_enrolled: boolean
+    }>(`SELECT fixed_income_self_reported, fixed_income_answered_at, ssi_ssdi, flexpay_enrolled
+          FROM tenants WHERE id = $1`, [req.user!.profileId!])
+    if (!t) throw new AppError(404, 'No resident record')
+    const { isFeatureEnabled } = await import('../services/systemFeatures')
+    // Never ask about a product that is not being offered, never ask twice,
+    // and never ask somebody already enrolled or already verified.
+    const show = await isFeatureEnabled('flexpay_rollout_visible')
+      && t.fixed_income_answered_at === null
+      && !t.flexpay_enrolled
+      && t.ssi_ssdi !== true
+    res.json({ success: true, data: { show, answered: t.fixed_income_self_reported } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/tenants/me/fixed-income { onFixedIncome: boolean }
+tenantsRouter.post('/me/fixed-income', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const parsed = z.object({ onFixedIncome: z.boolean() }).safeParse(req.body ?? {})
+    if (!parsed.success) throw new AppError(400, 'Answer yes or no.')
+    const { onFixedIncome } = parsed.data
+    // First answer wins: re-answering would re-open a banner they closed.
+    const rows = await query<{ id: string }>(
+      `UPDATE tenants
+          SET fixed_income_self_reported = $2,
+              fixed_income_asked_at = COALESCE(fixed_income_asked_at, NOW()),
+              fixed_income_answered_at = NOW(),
+              updated_at = NOW()
+        WHERE id = $1 AND fixed_income_answered_at IS NULL
+        RETURNING id`, [req.user!.profileId!, onFixedIncome])
+    // Already answered: not an error, the banner is simply done.
+    res.json({ success: true, data: { recorded: rows.length > 0, onFixedIncome } })
+  } catch (e) { next(e) }
+})
+
 // GET /api/tenants/flex-visibility — S541: which Flex products the
 // tenant portal may surface. Per-product rollout flags drive the UI
 // (the old client-side LAUNCH_HIDDEN gate showed all-or-nothing);
@@ -1356,7 +1490,8 @@ tenantsRouter.get('/flex-visibility', async (req, res, next) => {
 // GET /api/tenants/flexpay — current enrollment + eligibility
 tenantsRouter.get('/flexpay', async (req, res, next) => {
   try {
-    const { isFlexPayVisible, isFlexPayEnrollmentOpen, getFlexPayEligibility, calculateFlexPayFee } = await import('../services/flexpay')
+    const { isFlexPayVisible, isFlexPayEnrollmentOpen, getFlexPayEligibility,
+            quoteFlexPayCycleFee, flexPayAmountToFront } = await import('../services/flexpay')
     const visible = await isFlexPayVisible()
     if (!visible) return res.json({ success: true, data: { visible: false } })
     // S544: survey mode — visible but not launched. Drives the
@@ -1410,7 +1545,15 @@ tenantsRouter.get('/flexpay', async (req, res, next) => {
         eligibility,
         inquiry,
         stateHold,
-        previewFee: row?.flexpay_pull_day ? calculateFlexPayFee(row.flexpay_pull_day) : null,
+        // 10/26: priced from the table on what FlexPay would actually front
+        // and their benefit Wednesday — never a flat figure, and null rather
+        // than a number when there is no bracket (a bill of $3,000 or more) or
+        // no open bill to price against.
+        previewFee: row?.flexpay_pull_day
+          ? await quoteFlexPayCycleFee(
+              await flexPayAmountToFront(req.user!.profileId!), row.flexpay_pull_day,
+              new Date().toISOString().slice(0, 10))
+          : null,
       },
     })
   } catch (e) { next(e) }
@@ -1517,14 +1660,19 @@ tenantsRouter.patch('/flexpay/pull-day', async (req, res, next) => {
 // same render fn that runs at acceptance, returned for display.
 tenantsRouter.get('/flexpay/terms', async (req, res, next) => {
   try {
-    const { calculateFlexPayFee } = await import('../services/flexpay')
+    const { requireFlexPayCycleFee, flexPayAmountToFront } = await import('../services/flexpay')
     const { renderFlexPayAcceptanceText, FLEXPAY_TEMPLATE_VERSION } =
       await import('../services/flexsuiteAcceptance')
     const pullDay = Number(req.query.pullDay)
     if (!Number.isInteger(pullDay) || pullDay < 1 || pullDay > 28) {
       throw new AppError(400, 'pullDay must be an integer 1..28')
     }
-    const fee = calculateFlexPayFee(pullDay)
+    // 10/26: the terms state the price they will actually be charged, from the
+    // table. A bill with no bracket refuses here rather than rendering terms
+    // around a price that does not exist.
+    const fee = await requireFlexPayCycleFee(
+      await flexPayAmountToFront(req.user!.profileId!), pullDay,
+      new Date().toISOString().slice(0, 10))
     const { renderedText } = await renderFlexPayAcceptanceText({
       tenantId:  req.user!.profileId!,
       userId:    req.user!.userId,
@@ -1675,6 +1823,7 @@ tenantsRouter.get('/flexdeposit', async (req, res, next) => {
          FROM security_deposits sd
         WHERE sd.tenant_id = $1
           AND sd.flex_deposit_enabled = TRUE
+          AND sd.status <> 'voided'
         ORDER BY sd.created_at DESC
         LIMIT 1`,
       [req.user!.profileId!],
@@ -1735,8 +1884,9 @@ tenantsRouter.get('/flexdeposit/terms', async (req, res, next) => {
     const { renderFlexDepositAcceptanceText, FLEXDEPOSIT_TEMPLATE_VERSION } =
       await import('../services/flexsuiteAcceptance')
     const installmentCount = Number(req.query.installmentCount)
-    if (!Number.isInteger(installmentCount) || installmentCount < 2 || installmentCount > 6) {
-      throw new AppError(400, 'installmentCount must be an integer 2..6')
+    // 10/26: the two splits FlexDeposit sells, nothing between them.
+    if (!isAllowedFlexDepositPaymentCount(installmentCount)) {
+      throw new AppError(400, 'Choose 2 payments or 4 — those are the two FlexDeposit splits.')
     }
     const preview = await previewFlexDepositSchedule({
       tenantId: req.user!.profileId!,
@@ -1750,6 +1900,7 @@ tenantsRouter.get('/flexdeposit/terms', async (req, res, next) => {
       installmentCount,
       installments:           preview.schedule.installments,
       totalInstallmentAmount: preview.schedule.totalInstallmentAmount,
+      serviceFee:             preview.schedule.serviceFee,
       moveInDate:             preview.schedule.startDate,
       ip:                     null,
       userAgent:              null,
@@ -1904,6 +2055,10 @@ tenantsRouter.get('/payments', async (req, res, next) => {
       LEFT JOIN tenant_remittances rm ON p.stripe_payment_intent_id IS NOT NULL
                                      AND rm.stripe_payment_intent_id = p.stripe_payment_intent_id
       WHERE p.tenant_id = $1
+        -- 10/12 (Nic, G9): a voided charge (owed by nobody, kept as a record)
+        -- is not shown in the tenant's payments list; it stays on file and in
+        -- the full history.
+        AND p.status <> 'voided'
       ORDER BY p.due_date DESC LIMIT 24`, [req.user!.profileId!])
     res.json({ success: true, data: payments })
   } catch (e) { next(e) }
@@ -2438,6 +2593,51 @@ tenantsRouter.post('/:tenantId/waive-screening', requirePerm('tenants.invite'), 
 // this file, BEFORE tenantsRouter.use(requireAuth). See header
 // comment on the pre-auth public routes section.
 
+// GET /api/tenants/:id/payment-report — THE TENANT PAYMENT REPORT (10/12,
+// Nic): the household's whole payment story, printable — payment health (the
+// one definition, services/householdMonths), how late in days past grace and
+// the pattern ("usually 1–2 days past grace"), partial payments, late fees,
+// credit applied, work trade, and every charge with what it is for.
+//
+// Who: the same as the Rent Roll it opens from — the account owner, or anyone
+// with "View all payments" (payments.view_all), only for the companies they
+// work for that have had this person; staff assigned to particular properties
+// see only those properties. GAM admin sees every company the person has been
+// with. A resident never opens it here.
+//
+// ?leaseId= (10/13, Nic: "when someone is renting 2 spots with 2 leases it is
+// 2 households") — the report of one Payments / Rent Roll row: that lease
+// alone. The person must be on it and the viewer must see it, else 404.
+tenantsRouter.get('/:id/payment-report', requirePerm('payments.view_all'), async (req, res, next) => {
+  try {
+    const leaseIdRaw = req.query.leaseId
+    if (leaseIdRaw !== undefined && (typeof leaseIdRaw !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(leaseIdRaw))) {
+      throw new AppError(400, 'That lease is not one GAM knows.')
+    }
+    const role = req.user!.role
+    if (role === 'tenant') throw new AppError(403, 'Forbidden')
+    const isAdmin = role === 'admin' || role === 'super_admin'
+    const related = (await query<{ landlord_id: string }>(`
+      SELECT DISTINCT l.landlord_id FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id WHERE lt.tenant_id = $1
+      UNION
+      SELECT DISTINCT p.landlord_id FROM payments p WHERE p.tenant_id = $1`, [req.params.id])).map(r => r.landlord_id)
+    if (!isAdmin && !related.some(id => canAccessLandlordResource(req.user, id))) throw new AppError(403, 'Forbidden')
+    if (!related.length) throw new AppError(403, 'Forbidden')
+    // Judged over the viewer's whole account, like the Rent Roll and the
+    // Tenants list it sits beside (landlordScopeIds), so the household reads
+    // the same health here as there; GAM admin, every company it has been with.
+    const landlordIds = isAdmin ? related : landlordScopeIds(req.user!)
+    const propertyIds = isAdmin ? null : await (await import('../middleware/auth')).getScopedPropertyIds(req.user)
+    const { tenantPaymentReport } = await import('../services/tenantPaymentReport')
+    const report = await tenantPaymentReport({
+      tenantId: req.params.id, landlordIds, propertyIds, leaseId: (leaseIdRaw as string | undefined) ?? null,
+    })
+    if (!report) throw new AppError(404, 'There is no payment history for this resident at the properties you can see.')
+    res.json({ success: true, data: report })
+  } catch (e) { next(e) }
+})
+
 // GET /api/tenants/:id/profile — a resident's profile.
 //
 // Who sees what:
@@ -2462,8 +2662,43 @@ tenantsRouter.post('/:tenantId/waive-screening', requirePerm('tenants.invite'), 
 // payment history, no work trade and no money figures here — except the
 // paid-ahead figure for a front desk that posts payments (take_payment).
 // A landlord or staff viewer never gets the SSI/SSDI flag (GAM-side only).
+// 10/12 (Nic): the Payment History is household-wide with no 36-row cap — it
+// comes a page at a time (?historyPage=, newest first, PROFILE_HISTORY_PAGE_SIZE
+// a page); the full report has every charge on one printable page.
+export const PROFILE_HISTORY_PAGE_SIZE = 50
+const profileQuery = z.object({
+  historyPage: z.coerce.number().int().min(1, 'Pick a page from 1.').max(100000).optional(),
+})
+// 10/14 (Nic): "Only the landlord can fix a birthday." A tenant's birthday
+// (copied off their signed lease) is read and corrected here by the landlord
+// — the owner of a company the person has had a lease with — never by the
+// tenant (services/tenantBirthday). The happy-birthday email reads it.
+tenantsRouter.get('/:id/birthday', async (req, res, next) => {
+  try {
+    const { assertMayFixTenantBirthday, readTenantBirthday } = await import('../services/tenantBirthday')
+    await assertMayFixTenantBirthday(req.user, req.params.id)
+    res.json({ success: true, data: { dateOfBirth: await readTenantBirthday(req.params.id) } })
+  } catch (e) { next(e) }
+})
+tenantsRouter.patch('/:id/birthday', async (req, res, next) => {
+  try {
+    const { assertMayFixTenantBirthday, tenantBirthdayFrom, writeTenantBirthday } = await import('../services/tenantBirthday')
+    await assertMayFixTenantBirthday(req.user, req.params.id)
+    if (!req.body || !Object.prototype.hasOwnProperty.call(req.body, 'dateOfBirth')) {
+      throw new AppError(400, 'Enter the birthday as a date, like 1980-04-23.')
+    }
+    const dob = tenantBirthdayFrom(req.body.dateOfBirth)
+    const saved = await writeTenantBirthday(req.params.id, dob)
+    logger.info({ tenantId: req.params.id, by: req.user!.userId, cleared: dob === null }, '[tenants] birthday fixed by the landlord')
+    res.json({ success: true, data: { dateOfBirth: saved } })
+  } catch (e) { next(e) }
+})
+
 tenantsRouter.get('/:id/profile', async (req, res, next) => {
   try {
+    const pq = profileQuery.safeParse(req.query)
+    if (!pq.success) throw new AppError(400, pq.error.issues[0]?.message ?? 'Pick a page from 1.')
+    const historyPage = pq.data.historyPage ?? 1
     const tenantRow = await queryOne<any>(`
       SELECT t.*, u.first_name, u.last_name, u.email, u.phone,
         u.created_at as account_created
@@ -2566,10 +2801,17 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
     // pull rows are left out of the list and the stats for every viewer, and
     // the unscoped branch (GAM admin, the resident) names its columns so
     // flexpay_advance_id is never sent.
+    // 10/12 (Nic): "The profile Payment History also gets the 'What it's for'
+    // column and covers the household" — every charge of the household (one
+    // balance, S652: billed to them, or on a lease they are on), each with what
+    // it is for (Rent, Electric, Late fee, Home payment…), the words every bill
+    // and ledger uses (invoiceNotice.chargeLabel). The note and code the words
+    // are read from stay on the server for a company viewer.
     const payments = !seesPayments ? [] : await query<any>(`
       SELECT ${scoped
         ? `p.id, p.type, p.amount, p.status, p.due_date, p.settled_at, p.processed_at,
-           p.manual_method, p.work_trade_suspended_at`
+           p.manual_method, p.work_trade_suspended_at,
+           p.entry_description AS label_entry_description, p.notes AS label_notes`
         : `p.id, p.unit_id, p.lease_id, p.tenant_id, p.landlord_id, p.type, p.amount, p.status,
            p.stripe_payment_intent_id, p.stripe_charge_id, p.ach_trace_number, p.entry_description,
            p.return_code, p.return_reason, p.zero_tolerance_flag, p.due_date, p.processed_at,
@@ -2578,16 +2820,42 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
            p.gam_supersedence_amount, p.gam_supersedence_breakdown, p.gam_supersedence_applied_at,
            p.import_source, p.imported_at, p.import_extra_data, p.is_remainder, p.reversal_id,
            p.manual_method, p.sublease_markup_amount, p.home_sale_installment_id, p.revenue_owner,
-           p.work_trade_suspended_at, p.payment_channel, p.issued_credit_amount`}, u.unit_number, pr.name as property_name
+           p.work_trade_suspended_at, p.payment_channel, p.issued_credit_amount,
+           p.entry_description AS label_entry_description, p.notes AS label_notes`}, u.unit_number, pr.name as property_name,
+           ${chargeLabelColumnsSql('p')}
       FROM payments p
       LEFT JOIN units u ON u.id = p.unit_id
       LEFT JOIN properties pr ON pr.id = u.property_id
-      WHERE p.tenant_id = $1
+      WHERE ${householdRowSql('p', '$1')}
         AND p.entry_description IS DISTINCT FROM 'FLEXPAY'
         AND ($2::uuid[] IS NULL OR p.landlord_id = ANY($2::uuid[]))
         AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
-      ORDER BY p.due_date DESC
-      LIMIT 36`, [req.params.id, scope, propScope])
+      -- 10/12: a page at a time, in an order that holds still between pages
+      -- (the old LIMIT 36 on the due date alone could repeat or skip a line).
+      ORDER BY p.due_date DESC, p.created_at DESC, p.id
+      LIMIT ${PROFILE_HISTORY_PAGE_SIZE} OFFSET $4`,
+      [req.params.id, scope, propScope, (historyPage - 1) * PROFILE_HISTORY_PAGE_SIZE])
+    const historyTotal = !seesPayments ? 0 : Number((await queryOne<{ n: string }>(`
+      SELECT COUNT(*)::text AS n
+        FROM payments p
+        LEFT JOIN units u ON u.id = p.unit_id
+       WHERE ${householdRowSql('p', '$1')}
+         AND p.entry_description IS DISTINCT FROM 'FLEXPAY'
+         AND ($2::uuid[] IS NULL OR p.landlord_id = ANY($2::uuid[]))
+         AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))`,
+      [req.params.id, scope, propScope]))?.n ?? 0)
+    for (const p of payments) {
+      const row = { ...p, entry_description: p.label_entry_description, notes: p.label_notes }
+      p.label = chargeLabel(row)
+      p.detail = chargeDetail(row)
+      // Words only: the code and note they came from are not the viewer's.
+      delete p.label_entry_description
+      delete p.label_notes
+      delete p.utility_type
+      delete p.fee_type
+      delete p.fee_description
+      delete p.origin_notes
+    }
 
     // 10/6 (Nic): "Delete this late fee" on the line of a late fee a reversal
     // credited (or, before 10/6, zeroed) on the onboarding month's bill — said
@@ -2613,8 +2881,15 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
     // same events the score reads. The old tenants.late_payment_count column
     // was bumped every morning a balance stayed open and is no longer kept.
     // A scoped viewer counts only late marks on THIS company's charges: the
-    // ledger event names the payment it was raised for. The ledger itself is
+    // ledger event names the payments it was raised for. The ledger itself is
     // unchanged.
+    // 10/12 (Nic: "one mark per invoice"): a bill mark names EVERY line of its
+    // bill (event_data.payment_ids); payment_id is only the bill's first line.
+    // Reading payment_id alone judged the whole bill by that one line — a bill
+    // whose first line sat on another property (or another company's line on
+    // the household's bill) was left out of a viewer's count although the
+    // bill has lines of theirs. A per-line mark from before 10/12 names its
+    // one payment in payment_id.
     const lateRow = !seesPayments ? null : await queryOne<{ n: string }>(
       `SELECT COUNT(*)::text AS n
          FROM credit_events ce
@@ -2625,7 +2900,11 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
           AND ($2::uuid[] IS NULL OR EXISTS (
                 SELECT 1 FROM payments p
                   LEFT JOIN units pu ON pu.id = p.unit_id
-                 WHERE p.id::text = ce.event_data->>'payment_id'
+                 WHERE p.id::text IN (
+                         SELECT jsonb_array_elements_text(
+                                  CASE WHEN jsonb_typeof(ce.event_data->'payment_ids') = 'array'
+                                       THEN ce.event_data->'payment_ids' ELSE '[]'::jsonb END)
+                         UNION ALL SELECT ce.event_data->>'payment_id')
                    AND p.landlord_id = ANY($2::uuid[])
                    AND ($3::uuid[] IS NULL OR pu.property_id = ANY($3::uuid[]))))`,
       [req.params.id, scope, propScope])
@@ -2649,6 +2928,70 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
         AND ($2::uuid[] IS NULL OR landlord_id = ANY($2::uuid[]))
         AND ($3::uuid[] IS NULL OR unit_id IN (SELECT id FROM units WHERE property_id = ANY($3::uuid[])))`,
       [req.params.id, scope, propScope])
+
+    // 10/12 (Nic): "Payment health = ONE definition everywhere, per HOUSEHOLD
+    // per BILL MONTH." The household's months paid on time, all time (10/12:
+    // since its first bill on GAM; services/householdMonths), with this
+    // company's (and property's) scope —
+    // never paid rows ÷ rows, which read each $5 daily late fee as another
+    // unpaid bill (Gerald Logue: 6%, one month of two on time).
+    //
+    // Over the same companies every other screen judges this viewer's
+    // households on — the Tenants list and the Rent Roll read the viewer's
+    // whole account (landlordScopeIds), the resident their own companies
+    // (tenantCompanies, the heartbeat's), GAM admin every company the person
+    // has been with — so one household reads one number on every screen.
+    let health: PaymentHealth | null = null
+    let healthByLeaseRows: Array<{
+      lease_id: string; unit_number: string | null; property_name: string | null; current: boolean; status: string
+      start_date: string | null; end_date: string | null; health: PaymentHealth | null
+    }> = []
+    if (seesPayments) {
+      const companies = scoped ? landlordScopeIds(req.user!)
+        : isSelf ? await tenantCompanies(req.params.id)
+        : (await query<{ landlord_id: string }>(
+            `SELECT DISTINCT l.landlord_id FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id WHERE lt.tenant_id = $1
+             UNION SELECT DISTINCT p.landlord_id FROM payments p WHERE p.tenant_id = $1`,
+            [req.params.id])).map(r => r.landlord_id)
+      // A viewer kept to some properties: the household of the lease there (10/12).
+      const hh = (await householdsOf([req.params.id], companies, propScope)).get(req.params.id) ?? req.params.id
+      health = (await healthByHousehold({
+        landlordIds: companies, propertyIds: propScope, householdIds: [hh], through: currentBillMonth(),
+      })).get(hh) ?? null
+      // 10/13 (Nic): "Tenants list + tenant profile: split health BY LEASE" —
+      // every lease this person is on with these companies (at the viewer's
+      // properties) is its own household with its own health, the figure its
+      // Rent Roll row shows; a person on two leases reads each lease's. The
+      // current leases first, then the newest. `status` is the lease's own
+      // (shared LEASE_STATUSES): one not signed yet is 'pending' — never
+      // "ended" (10/13 review: Arturo Melendez's new MH 15 lease read "Ended"
+      // beside his MH 23 while it waited for signatures).
+      const leases = await query<{
+        lease_id: string; unit_number: string | null; property_name: string | null; status: string
+        start_date: string | null; end_date: string | null
+      }>(`
+        SELECT DISTINCT ON (l.id) l.id AS lease_id, u.unit_number, pr.name AS property_name, l.status,
+               to_char(l.start_date, 'YYYY-MM-DD') AS start_date, to_char(l.end_date, 'YYYY-MM-DD') AS end_date
+          FROM lease_tenants lt
+          JOIN leases l ON l.id = lt.lease_id
+          JOIN units u ON u.id = l.unit_id
+          JOIN properties pr ON pr.id = u.property_id
+         WHERE lt.tenant_id = $1 AND lt.status <> 'void'
+           AND l.landlord_id = ANY($2::uuid[])
+           AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
+         ORDER BY l.id`, [req.params.id, companies, propScope])
+      const byLease = await healthByLease({
+        landlordIds: companies, propertyIds: propScope, leaseIds: leases.map(l => l.lease_id), through: currentBillMonth(),
+      })
+      healthByLeaseRows = leases
+        .sort((a, z) => Number(z.status === 'active') - Number(a.status === 'active')
+          || (z.start_date ?? '').localeCompare(a.start_date ?? '') || a.lease_id.localeCompare(z.lease_id))
+        .map(l => ({
+          lease_id: l.lease_id, unit_number: l.unit_number, property_name: l.property_name,
+          current: l.status === 'active', status: l.status, start_date: l.start_date, end_date: l.end_date,
+          health: byLease.get(l.lease_id) ?? null,
+        }))
+    }
 
     // Maintenance requests — this company's only, for a scoped viewer, and
     // never its internal notes.
@@ -2692,9 +3035,10 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
 
     // S655 (Nic, 10/2): ALL the credit on their account, and what of it would
     // pay their bills right now. They differ: paid-ahead money stops at a
-    // monthly draw cap, credit pays only the landlord's own rent, utilities and
-    // fees (never a GAM fee, a home payment or a neighbor's utility), and
-    // credit tied to one lease pays only that lease. Usable is the household
+    // monthly draw cap and pays only the space it was paid for, deposit
+    // interest only its own space (10/18), and credit pays only the landlord's
+    // own rent, utilities and fees (never a GAM fee, a home payment or a
+    // neighbor's utility). Usable is the household
     // plan the tenant's Pay Now and the desk offer ("credit available $X"); the
     // balance itself is never netted. Same money rule as seesPaidAhead above: only
     // a viewer who may see payments, or the desk that takes them. A
@@ -2737,7 +3081,8 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
       : 0
     const settled = parseInt(paymentStats?.settled || 0)
     const total = parseInt(paymentStats?.total_payments || 0)
-    const onTimeRate = total > 0 ? Math.round((settled / total) * 100) : 0
+    // 10/12: the one payment-health figure (null until a month is judged).
+    const onTimeRate = health?.percent ?? null
 
     res.json({
       success: true,
@@ -2745,6 +3090,8 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
         tenant,
         units,
         payments,
+        // 10/12: which page of the household's Payment History `payments` is.
+        paymentsPage: { page: historyPage, pageSize: PROFILE_HISTORY_PAGE_SIZE, total: historyTotal },
         maintenance,
         workTrade,
         paidAhead,
@@ -2761,6 +3108,9 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
           lateCount:    parseInt(lateRow?.n || '0', 10),
           totalPayments: total,
           onTimeRate,
+          health,
+          // 10/13 (Nic): the same, lease by lease (each lease its own household).
+          healthByLease: healthByLeaseRows,
           firstPayment: paymentStats?.first_payment,
           lastPayment:  paymentStats?.last_payment,
           unitsOccupied: units.length,
@@ -2774,6 +3124,8 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
           lateCount:    null,
           totalPayments: null,
           onTimeRate:   null,
+          health:       null,
+          healthByLease: [],
           firstPayment: null,
           lastPayment:  null,
           unitsOccupied: units.length,
@@ -3248,18 +3600,72 @@ tenantsRouter.get('/lease/addendums', requireAuth, async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+/**
+ * 10/19 (Nic) — A TENANT CAN SEE THEIR WORK TRADE WHILE IT IS PAUSED.
+ *
+ * Asked whether a paused agreement should still appear in the tenant portal,
+ * Nic chose to show it while paused: the tab stays up and says plainly which
+ * situation they are in — hours still counting, or nothing being counted.
+ *
+ * This one route is what FOUR tenant surfaces ask (the nav tab, the Work Trade
+ * page, the Meter Readings page, and — through its own tool — the tenant
+ * assistant), and it used to answer `status = 'active'` only. So a paused
+ * agreement came back empty, the tab vanished, and the honest sentence the
+ * window and the standing had been written to say never reached anybody. The
+ * one a snowbird most needs — "your hours keep counting while this is paused" —
+ * was the one nobody could read.
+ *
+ * ACTIVE AND PAUSED, and deliberately not ended. Pausing is not ending (the
+ * month close says the same thing: CLOSE_STATUSES is `('active','paused')`), so
+ * a paused trade is a live arrangement whose hours may still be counting and
+ * whose charges are still being covered. An ENDED one is finished with — its
+ * hours were billed when it ended — and bringing dead trades back into the
+ * portal would be a different change nobody asked for.
+ *
+ * 10/19 (review) — AND "PAUSED" IS NOT THE SAME AS "STILL LIVING HERE." Leaving
+ * 'ended' out was not enough: a move-out does not produce 'ended'. A lease
+ * reaching its end_date with no signed successor PAUSES the work trade
+ * (jobs/scheduler) and nothing ever ends it, so this route on its own would hand
+ * a former resident their Work Trade tab back a month after they left, reading
+ * "your hours keep counting". The status word cannot tell the two pauses apart,
+ * so the tenancy itself is the test — liveTenancySql, shared with both
+ * assistants' tools so a tab and an assistant can never disagree.
+ *
+ * `hours_counted` rides along so every surface can be honest without
+ * re-deriving the rule: it is the same expression the close and the standing
+ * read (hoursCountedSql), which is what stops a tenant being shown a target the
+ * close is about to waive.
+ *
+ * Preferring ACTIVE over paused matters for a tenant who has both — a paused
+ * seasonal trade on one space and a running one on another. The live
+ * arrangement is the one their portal is about.
+ */
 tenantsRouter.get('/work-trade', requireAuth, async (req, res, next) => {
   try {
     const tenant = await queryOne<any>('SELECT t.id FROM tenants t WHERE t.user_id=$1', [req.user!.userId])
     if (!tenant) throw new AppError(404, 'Tenant not found')
+    const { HOURS_COUNTED_COL, liveTenancySql } = await import('../services/workTradeStanding')
     const agreement = await queryOne<any>(`
-      SELECT wta.*, u.unit_number, p.name as property_name, p.id AS property_id
+      SELECT wta.*, u.unit_number, p.name as property_name, p.id AS property_id,
+             ${HOURS_COUNTED_COL}
       FROM work_trade_agreements wta
       JOIN units u ON u.id = wta.unit_id
       JOIN properties p ON p.id = u.property_id
-      WHERE wta.tenant_id=$1 AND wta.status='active'
-      ORDER BY wta.created_at DESC LIMIT 1`, [tenant.id])
-    res.json({ success: true, data: agreement || null })
+      WHERE wta.tenant_id=$1 AND wta.status IN ('active','paused')
+        -- 10/19 (review): and a PAUSED one only while the tenancy is still
+        -- there. A lease ending with no successor pauses the trade and nothing
+        -- ever ends it, so without this a resident who moved out a month ago
+        -- gets their Work Trade tab back (liveTenancySql).
+        AND ${liveTenancySql()}
+      ORDER BY (wta.status = 'active') DESC, wta.created_at DESC LIMIT 1`, [tenant.id])
+    // 10/12 (Nic): a rate kept from an earlier setting is not the tenant's to
+    // read — the extra-hours rate is theirs only while their agreement PAYS
+    // extra hours. The panel's own fetch has always done this
+    // (routes/workTrade agreementForTenant); this route handed over the whole
+    // row, so the one number a tenant must never be shown beside an hour count
+    // was reachable here. Same helper, so the two cannot drift.
+    const { agreementForTenant } = await import('./workTrade')
+    res.json({ success: true, data: agreement ? agreementForTenant(agreement) : null })
   } catch (e) { next(e) }
 })
 

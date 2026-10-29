@@ -13,6 +13,16 @@
 //   - property_id                  → the property the rate is bound to
 //                                    (NULL means landlord-wide, applies
 //                                    to all properties as a fallback)
+//   - on_stays = TRUE              → 10/17 (Nic): this tax is also charged on
+//                                    a STAY here. A stay is priced, not
+//                                    carted: properties.short_term_tax_rate
+//                                    follows the on_stays rows and every door
+//                                    puts the tax INSIDE the stay's price. A
+//                                    stay's line is therefore never taxed
+//                                    again here (the stay skip below), so the
+//                                    same tax is never charged twice — while a
+//                                    tax on goods AND stays still reaches the
+//                                    goods
 //
 // Multiple rates STACK. A property might have a state rate + a county
 // rate + a city rate all active, and each is applied independently to
@@ -89,9 +99,10 @@ export async function calculateCartTax(
     category_id: string
     category_name: string | null
     tax_rate: string
+    stay_unit: string | null
   }>(
     `SELECT pi.id, pi.name, pi.property_id, pi.category_id, pi.tax_rate::text AS tax_rate,
-            pc.name AS category_name
+            pi.stay_unit, pc.name AS category_name
        FROM pos_items pi
        LEFT JOIN pos_categories pc ON pc.id = pi.category_id
       WHERE pi.id = ANY($1::uuid[]) AND pi.landlord_id = $2`,
@@ -160,6 +171,27 @@ export async function calculateCartTax(
     const lineAppliedRates: PosTaxBreakdownLine['appliedRates'] = []
     let lineTax = 0
 
+    // 10/17 (Nic, one home for a tax rate) — A STAY IS TAXED ONCE, AND NOT
+    // HERE. A stay's line is priced whole with its lodging tax already inside
+    // it (registerStay priceWholeStay/taxInside — the counter, a pay link and
+    // the booking site all charge that one figure, and the sale records the
+    // tax part of it). Taxing it here too would be a second helping of the
+    // same tax on the same money: 6.6% inside the price and 6.6% again on top.
+    // So nothing in the tax list reaches a stay item, whatever is ticked on it
+    // — the one home for that rate is the on_stays rows, which the property's
+    // stay percentage follows.
+    if (item.stay_unit) {
+      lines.push({
+        itemId: c.itemId,
+        itemName: item.name,
+        categoryName: item.category_name,
+        subtotal,
+        appliedRates: [],
+        taxAmount: 0,
+      })
+      continue
+    }
+
     if (applicableRates.length === 0) {
       // S554 (button-sweep bug #3): no pos_tax_rates configured for this
       // item's property (neither property-bound nor landlord-wide). Fall
@@ -169,6 +201,13 @@ export async function calculateCartTax(
       // while the client charged item.tax_rate, so the amount-match guard
       // 400'd every card sale AFTER capture. This is NOT client-trusted
       // math: tax_rate is read from the landlord-owned pos_items row.
+      //
+      // 10/17 (Nic): never a STAY item, whose own rate was the stale third
+      // copy of the lodging rate (6.35% against a named 6.6%) — those are
+      // cleared and a stay's tax comes from the one home. What is left here is
+      // goods at a company that has named no taxes at all: GAM Books shows
+      // that money by name as a tax with no agency, to be settled before
+      // filing (BOOKS_TAX_UNNAMED_LABEL), rather than silently not charged.
       const rateNum = Number(item.tax_rate) || 0
       if (rateNum > 0) {
         const amt = round2(subtotal * rateNum)

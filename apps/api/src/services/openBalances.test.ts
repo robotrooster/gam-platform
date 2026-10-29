@@ -14,7 +14,7 @@ import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seed
 import { addDaysTo, todayIn } from '../lib/timezone'
 import {
   listOpenTenantBalances, creditBeside, openBalanceSql, openAmountSql, outstandingTotals, seesGrandTotals,
-  daysLate, OUTSTANDING_ROW_STATUS_LABEL, showCreditOncePerHousehold,
+  daysLate, firstLateDay, lastGraceDay, daysPastGrace, OUTSTANDING_ROW_STATUS_LABEL, showCreditOncePerHousehold,
 } from './openBalances'
 
 beforeEach(async () => { await cleanupAllSchema() })
@@ -73,8 +73,9 @@ async function bill(p: { landlordId: string }, tenantId: string, s: { unitId: st
   const rows: string[] = []
   for (const [type, amt] of lines) {
     const r = await db.query<{ id: string }>(
-      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9) RETURNING id`,
+      // 10/12: written on its due date, so lateness counts from the due date.
+      `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$8::date) RETURNING id`,
       [inv.rows[0].id, s.unitId, s.leaseId, tenantId, p.landlordId, type, amt, dueDate,
        ENTRY[type] ?? type.toUpperCase()])
     rows.push(r.rows[0].id)
@@ -394,6 +395,30 @@ describe('S655 the full balance, with credit beside it', () => {
     expect(rows.reduce((sum, r) => sum + r.credit_on_account, 0)).toBe(25)
   })
 
+  // 10/18 (Nic): "it does need to go on the October bill for the other spot."
+  // A credit the landlord gave on a space with nothing owed pays the
+  // household's open bill on the other space — so the list shows it beside
+  // that space instead of showing it nowhere, and once.
+  it('a credit given on a space that owes nothing is shown beside the space whose bill it pays', async () => {
+    const p = await park()
+    const t = await resident('Billy Miranda')
+    const owing = await space(p, 'RV 34')
+    const clear = await space(p, 'RV 35')
+    await inTx(async c => {
+      await seedLeaseTenant(c, { leaseId: owing.leaseId, tenantId: t, role: 'primary' })
+      await seedLeaseTenant(c, { leaseId: clear.leaseId, tenantId: t, role: 'primary' })
+    })
+    await bill(p, t, owing, daysAgo(10), [['rent', 400]])
+    await generalCredit(p, t, 120, clear.leaseId)            // issued on the space that owes nothing
+    const rows = await listOpenTenantBalances({ landlordIds: [p.landlordId] })
+    expect(rows).toHaveLength(1)
+    expect(rows[0].balance).toBe('400.00')
+    expect(rows[0].credit_available).toBe(120)
+    expect(rows[0].credit_on_account).toBe(120)
+    // Once: the space that owes carries it, and the spaces add up to the line.
+    expect(rows[0].spaces.reduce((sum, sp) => sum + Number(sp.credit_available), 0)).toBe(120)
+  })
+
   it('two people on two different leases are still two households', async () => {
     const p = await park()
     const a = await resident('Ann Apart')
@@ -575,21 +600,34 @@ describe('decisions #29 the Outstanding row', () => {
     expect(await listOpenTenantBalances({ landlordIds: [p.landlordId] })).toHaveLength(0)
   })
 
-  it('days late honors the grace period: inside it 0, past it counted from the due date', async () => {
+  // 10/12 (Nic): "'Days late' = days past the grace period everywhere", and
+  // the 6th is late for the 1st with 5 days (the due day is grace day 1).
+  it('days late honors the grace period: inside it 0, past it the days past grace', async () => {
     const p = await park()
     const inside = await resident('Inside Grace')
     const past = await resident('Past Grace')
     const a = await space(p, 'RV 22')
     const b = await space(p, 'RV 23')
-    await bill(p, inside, a, daysAgo(5), [['rent', 300]])      // the last grace day (5) is today
+    await bill(p, inside, a, daysAgo(4), [['rent', 300]])      // the last grace day (due + 4) is today
     await bill(p, past, b, daysAgo(9), [['rent', 300]])
     const rows = await listOpenTenantBalances({ landlordIds: [p.landlordId] })
     expect(rows.find(r => r.tenant_id === inside)!.days_late).toBe(0)
-    expect(rows.find(r => r.tenant_id === past)!.days_late).toBe(9)
+    expect(rows.find(r => r.tenant_id === past)!.days_late).toBe(5)
     // The lease's own grace wins over the property's.
     await db.query(`UPDATE leases SET late_fee_grace_days = 10 WHERE id = $1`, [b.leaseId])
     const again = await listOpenTenantBalances({ landlordIds: [p.landlordId] })
     expect(again.find(r => r.tenant_id === past)!.days_late).toBe(0)
+  })
+
+  it('a bill GAM wrote after its due date counts from the day it was written (lateCountsFrom)', async () => {
+    const p = await park()
+    const t = await resident('Late Written')
+    const s = await space(p, 'RV 29')
+    const { rows } = await bill(p, t, s, daysAgo(20), [['rent', 300]])
+    // Written 6 days ago for a bill due 20 days ago: day 6 of its grace is today, 1 day past.
+    await db.query(`UPDATE payments SET created_at = $2::date WHERE id = $1`, [rows[0], daysAgo(5)])
+    const [row] = await listOpenTenantBalances({ landlordIds: [p.landlordId] })
+    expect(row.days_late).toBe(1)
   })
 
   it('a bank payment still clearing shows "Payment clearing" — not owed, not late — and is owed again if it bounces', async () => {
@@ -615,7 +653,7 @@ describe('decisions #29 the Outstanding row', () => {
     expect(back.status).toBe('owes')
     expect(back.balance).toBe('500.00')
     expect(back.clearing).toBe(0)
-    expect(back.days_late).toBe(20)
+    expect(back.days_late).toBe(16)
   })
 
   it('a household that owes and has a payment clearing shows both, and only what is owed counts as late', async () => {
@@ -662,7 +700,7 @@ describe('decisions #29 the Outstanding row', () => {
     expect(owner.work_trade).toBe(true)
     expect(owner.balance).toBe('42.00')                     // the utility the trade does not cover
     expect(owner.months).toEqual([{ month: daysAgo(20).slice(0, 7), amount: 42 }])
-    expect(owner.days_late).toBe(20)                       // late on the utility, not the rent
+    expect(owner.days_late).toBe(16)                       // late on the utility, not the rent (days past grace)
     // The covered rent is never an amount. Ids and the email are random and may
     // carry the digits 589 by chance, so they are left out of the scan.
     const figures = JSON.stringify(owner, (k, v) => (/(^id$|_id$|_ids$|email)/.test(k) ? undefined : v))
@@ -740,13 +778,15 @@ describe('decisions #29 the Outstanding row', () => {
 })
 
 describe('decisions #25 the grand total', () => {
-  it('only account owners and property managers see a grand total', () => {
+  // 10/12 (Nic): "A/R totals visible to bookkeepers" — over their own
+  // properties (routes/bookkeeperGrandTotals.test.ts).
+  it('only account owners, property managers and bookkeepers see a grand total', () => {
     expect(seesGrandTotals({ role: 'landlord' })).toBe(true)
     expect(seesGrandTotals({ role: 'property_manager' })).toBe(true)
     expect(seesGrandTotals({ role: 'super_admin' })).toBe(true)
+    expect(seesGrandTotals({ role: 'bookkeeper' })).toBe(true)
     expect(seesGrandTotals({ role: 'onsite_manager' })).toBe(false)
     expect(seesGrandTotals({ role: 'maintenance' })).toBe(false)
-    expect(seesGrandTotals({ role: 'bookkeeper' })).toBe(false)
     expect(seesGrandTotals({ role: 'tenant' })).toBe(false)
     expect(seesGrandTotals(undefined)).toBe(false)
   })
@@ -780,12 +820,23 @@ describe('decisions #25 the grand total', () => {
   })
 })
 
-describe('daysLate', () => {
-  it('is 0 through the last grace day, then counts from the due date', () => {
+describe('daysLate (days past the grace period, 10/12)', () => {
+  it('is 0 through the last grace day; the first late day (the 6th for the 1st with 5 days) is 1', () => {
     expect(daysLate('2026-10-01', '2026-10-01', 5)).toBe(0)
-    expect(daysLate('2026-10-01', '2026-10-06', 5)).toBe(0)
-    expect(daysLate('2026-10-01', '2026-10-07', 5)).toBe(6)
-    expect(daysLate('2026-10-01', '2026-11-01', 0)).toBe(31)
+    expect(daysLate('2026-10-01', '2026-10-05', 5)).toBe(0)
+    expect(daysLate('2026-10-01', '2026-10-06', 5)).toBe(1)
+    expect(daysLate('2026-10-01', '2026-10-07', 5)).toBe(2)
     expect(daysLate('2026-10-01', '2026-09-28', 5)).toBe(0)
+  })
+  it('a grace of 0 never makes the due day itself late', () => {
+    expect(daysLate('2026-10-01', '2026-10-01', 0)).toBe(0)
+    expect(daysLate('2026-10-01', '2026-10-02', 0)).toBe(1)
+    expect(daysLate('2026-10-01', '2026-11-01', 0)).toBe(31)
+  })
+  it('the first and last grace days', () => {
+    expect(firstLateDay('2026-10-01', 5)).toBe('2026-10-06')
+    expect(lastGraceDay('2026-10-01', 5)).toBe('2026-10-05')
+    expect(firstLateDay('2026-12-29', 5)).toBe('2027-01-03')
+    expect(daysPastGrace('2026-10-01', '2026-10-12', 5)).toBe(7)
   })
 })

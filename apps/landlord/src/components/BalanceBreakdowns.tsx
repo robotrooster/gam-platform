@@ -13,6 +13,7 @@
  */
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
+import { Printer } from 'lucide-react'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 
 export const fmtMoney = (n: number) => n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
@@ -276,11 +277,21 @@ export function InvoiceBreakdown({ tenantId }: { tenantId: string }) {
                 due {new Date(String(inv.dueDate).slice(0, 10) + 'T00:00:00').toLocaleDateString()}
               </span>
             </div>
-            {/* 10/6 (Nic): one balance — what is still owed. The credit and the
-                money paid are their own lines under the charges, never "paid
-                $14.70 of $344.70" when credit covers more than that. */}
-            <div style={{ fontSize: '.8rem', color: 'var(--gold)', fontWeight: 700 }}>
-              {fmtMoney(Number(inv.balance))} owed
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+              {/* 10/27 (Nic): "just make a button on each invoice that can be
+                  printed." One bill, on its own sheet, for a door. */}
+              <a className="btn btn-ghost btn-sm" style={{ textDecoration: 'none' }}
+                 href={`/bills/print?tenantId=${tenantId}&invoiceId=${inv.id}`}
+                 target="_blank" rel="noreferrer"
+                 title="Print this bill">
+                <Printer size={12} /> Print
+              </a>
+              {/* 10/6 (Nic): one balance — what is still owed. The credit and the
+                  money paid are their own lines under the charges, never "paid
+                  $14.70 of $344.70" when credit covers more than that. */}
+              <div style={{ fontSize: '.8rem', color: 'var(--gold)', fontWeight: 700 }}>
+                {fmtMoney(Number(inv.balance))} owed
+              </div>
             </div>
           </div>
           <table className="data-table" style={{ width: '100%' }}>

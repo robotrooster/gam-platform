@@ -406,11 +406,14 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────
-//  S491: state-law warnings on CSV property validate
-//  Recompute-on-validate posture mirrors S483 (tenant GET /lease) and
-//  S486 (property GET /:id) — landlord sees a hedged factual notice
-//  during the import preview, before commit, so they can correct or
-//  acknowledge before shipping the data.
+//  S491: state-law warnings on CSV property validate — HIDDEN 10/20.
+//  Nic: "There should be no state law warnings anywhere in the system. At
+//  least not right now. Just hide all that stuff." The import preview used to
+//  put a hedged deposit-vs-statute notice on the row. It no longer does, and
+//  these tests hold that line. Every other validation issue on the row is
+//  untouched — what went away is GAM's opinion about a statute, not the
+//  import's own checks. One switch (system_features.state_law_warnings_enabled)
+//  brings it back; see services/stateLaw.ts.
 // ─────────────────────────────────────────────────────────────────────
 
 async function seedAzDepositCap(): Promise<void> {
@@ -435,7 +438,7 @@ async function seedAzDepositCap(): Promise<void> {
 }
 
 describe('S491: state-law warnings on CSV property validate', () => {
-  it('AZ row with deposit 2.0× rent → warn issue surfaced', async () => {
+  it('hidden 10/20: AZ row with deposit 2.0× rent → the preview says nothing about state law', async () => {
     const { token } = await seedLandlordWithToken()
     await seedAzDepositCap()
     const csv = [
@@ -447,12 +450,11 @@ describe('S491: state-law warnings on CSV property validate', () => {
       .set('Authorization', `Bearer ${token}`)
       .send({ csv, source: 'generic' })
     expect(res.status).toBe(200)
-    const warns = res.body.data.rows[0].issues.filter((i: any) => i.severity === 'warn' && i.field === 'security_deposit')
-    expect(warns.length).toBe(1)
-    expect(warns[0].message).toMatch(/above the 1\.5/)
-    expect(warns[0].message).toMatch(/AZ/)
-    expect(res.body.data.summary.warnings).toBeGreaterThanOrEqual(1)
-    // Row still ships as ready — warnings don't block commit.
+    const warns = res.body.data.rows[0].issues.filter((i: any) => i.field === 'security_deposit')
+    expect(warns).toEqual([])
+    expect(JSON.stringify(res.body)).not.toMatch(/not legal advice|A\.R\.S\./i)
+    // The row still imports exactly as it did — hiding the notice changes
+    // nothing about what the file is allowed to bring in.
     expect(res.body.data.summary.blockers).toBe(0)
     expect(res.body.data.summary.ready).toBe(1)
   })
@@ -504,7 +506,7 @@ describe('S491: state-law warnings on CSV property validate', () => {
     expect(warns.length).toBe(0)
   })
 
-  it('Mixed batch: 1 AZ above-cap row + 1 AZ within-range row → only one warn', async () => {
+  it('hidden 10/20: a batch with an above-cap row and a within-range row warns on neither', async () => {
     const { token } = await seedLandlordWithToken()
     await seedAzDepositCap()
     const csv = [
@@ -518,8 +520,9 @@ describe('S491: state-law warnings on CSV property validate', () => {
       .send({ csv, source: 'generic' })
     expect(res.status).toBe(200)
     const totalWarns = res.body.data.rows.flatMap((r: any) =>
-      r.issues.filter((i: any) => i.severity === 'warn' && i.field === 'security_deposit'),
+      r.issues.filter((i: any) => i.field === 'security_deposit'),
     )
-    expect(totalWarns.length).toBe(1)
+    expect(totalWarns).toEqual([])
+    expect(JSON.stringify(res.body)).not.toMatch(/not legal advice|A\.R\.S\./i)
   })
 })

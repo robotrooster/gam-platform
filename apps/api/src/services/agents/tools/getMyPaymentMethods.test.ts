@@ -51,6 +51,7 @@ vi.mock('../../../lib/stripe', () => ({ getStripe: () => stripeFake }))
 import { db } from '../../../db'
 import { cleanupAllSchema, seedTenant } from '../../../test/dbHelpers'
 import { getMyPaymentMethods } from './getMyPaymentMethods'
+import { expectNoFigures } from '../../../test/noLeaks'
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -86,7 +87,8 @@ describe('get_my_payment_methods', () => {
       { id: 'pm_card', type: 'card', brand: 'visa', last4: '4242', chargeable: true, verificationPending: false, isDefault: false },
     ])
     // Never a full account number or routing number.
-    expect(JSON.stringify(r)).not.toMatch(/110000000|routing/)
+    expect(JSON.stringify(r)).not.toMatch(/routing/)
+    expectNoFigures(r, ['110000000'])
   })
 
   it('a new bank verifying beside a verified one: the note says the old one still works', async () => {

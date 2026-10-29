@@ -1,16 +1,28 @@
 import { Router } from 'express'
+// 10/12 (Nic, ledger P6, L5): which expenses count as a cost, and a repair's cost once (lib/liveExpense).
+import { liveExpenseSql, maintenanceCostNotBilledSql } from '../lib/liveExpense'
+// 10/12 (Nic, ledger P8): the recovery report's spend reads the books once they are live.
+import { ledgerReportsLive } from '../services/ledgerReports'
 import { z } from 'zod'
 import path from 'path'
 import crypto from 'crypto'
 import multer from 'multer'
 import { storage, sendStoredFile, uploadKeyFromStored } from '../lib/storage'
-import { meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, METER_USAGE_ALERT_THRESHOLDS, MASTER_TOTAL_JUMP_FACTOR, METER_READ_REASONS, RUBS_ALLOCATION_METHODS, RUBS_BASES, RUBS_SUBMETER_RATES, RUBS_EXCLUSION_MODES } from '@gam/shared'
+import { meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, MASTER_TOTAL_JUMP_FACTOR, METER_READ_REASONS, RUBS_ALLOCATION_METHODS, RUBS_BASES, RUBS_SUBMETER_RATES, RUBS_EXCLUSION_MODES, meterWorksNoUseLabel } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds, userHasPerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
+// 10/20 (Nic): the departure side of the recovery report. washPairing is the
+// ONE place a departure's money kept and power absorbed are put beside each
+// other; the report reads it rather than re-deriving either half.
+import { washPairing } from '../services/earlyDepartureWash'
+import { markMeterRepaired, markMeterWorksNoUse, flaggedPeriodEstimates, flaggedPeriodStart, voidFlaggedPeriodEstimates, ZERO_USE_CLEARED_SET } from '../services/meterRepair'
 import { logger } from '../lib/logger'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
+// 10/20: who may be shown a meter reading figure, and a bill with the odometer
+// taken off it. One definition for the whole file (lib/meterReadBlind).
+import { METER_READING_VALUE_PERMS, canSeeMeterReadingValues, withoutReadingFigures } from '../lib/meterReadBlind'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { traderHasFieldPermission } from '../services/workTradeJobs'
 
@@ -40,6 +52,7 @@ import {
   generateBillsForProperty,
   generateBillsForLandlord,
   billMoveOutRead,
+  usageNeedsDoubleCheck,
 } from '../services/utilityBilling'
 import {
   openReadingRun,
@@ -59,7 +72,37 @@ utilityRouter.use(requireAuth)
 // Tenant: own bills. Landlord (or scoped worker with units.edit /
 // units.view_status / payments.view_all): all bills under their landlord.
 // Admin: all.
-utilityRouter.get('/bills', async (req, res, next) => {
+//
+// 10/20 — THIS ROUTE SAID ALL OF THAT IN A COMMENT AND ENFORCED NONE OF IT.
+//
+// It was declared with no requirePerm and no property scope, and the staff
+// branch was `ub.landlord_id = <the token's landlordId>`. So the front-desk
+// onsite_manager who walks the park — holding only "Enter meter readings",
+// assigned to one property — called it and got every utility bill in the
+// company, other parks included, each row carrying reading_end (last cycle's
+// closing odometer value) and usage_amount off `ub.*`. That is precisely the
+// number blind entry (S559) exists to withhold: walk in knowing it and you can
+// type a reading that produces normal-looking usage, which clears the rollover
+// check, the usage-alert thresholds and the landlord's double-check window in
+// one go. The meter list has stripped that figure from this exact caller since
+// 10/3; this route contradicted it.
+//
+// Three things now hold, in the order they fail:
+//   1. the permission gate the comment above always claimed (requireBillReader),
+//   2. the property lock every other staff-reachable utility read honors, and
+//   3. the odometer off the row for anyone outside the reading-value audience
+//      (lib/meterReadBlind), so holding units.view_status buys the prices and
+//      the charge, never the figures.
+// A tenant's own issued bill is untouched: the reading range is already printed
+// on their invoice line (jobs/invoiceGeneration), it is their own meter, and
+// they can walk out and look at its face any time.
+const BILL_READER_PERMS = [...METER_READING_VALUE_PERMS, 'units.view_status', 'payments.view_all']
+function requireBillReader(req: any, res: any, next: any) {
+  if (!req.user) return res.status(401).json({ success: false, error: 'Unauthenticated' })
+  if (req.user.role === 'tenant') return next()   // own bills only — see the handler
+  return requirePerm(...BILL_READER_PERMS)(req, res, next)
+}
+utilityRouter.get('/bills', requireBillReader, async (req, res, next) => {
   try {
     const role = req.user!.role
     const isAdmin = role === 'admin' || role === 'super_admin'
@@ -80,6 +123,12 @@ utilityRouter.get('/bills', async (req, res, next) => {
     } else if (!isAdmin) {
       return res.json({ success: true, data: [] })
     }
+    // S560's property lock, which this read never had: a worker assigned to one
+    // park reads that park's bills. null = unrestricted (owners, all_properties).
+    const scopedPropIds = await getScopedPropertyIds(req.user)
+    if (scopedPropIds !== null) {
+      where += `${where ? ' AND' : 'WHERE'} u.property_id = ANY($${params.push(scopedPropIds)}::uuid[])`
+    }
     const bills = await query<any>(`
       SELECT ub.*, u.unit_number, p.name AS property_name,
         m.label AS meter_label, m.digits
@@ -88,7 +137,10 @@ utilityRouter.get('/bills', async (req, res, next) => {
       JOIN properties p  ON p.id = u.property_id
       JOIN utility_meters m ON m.id = ub.meter_id
       ${where} ORDER BY ub.billing_cycle_month DESC, p.name ASC`, params)
-    res.json({ success: true, data: bills })
+    // Blind entry: the odometer comes off for a staffer who may not see a
+    // reading figure. A tenant keeps their own bill's range (see the header).
+    const blind = role !== 'tenant' && !canSeeMeterReadingValues(req.user)
+    res.json({ success: true, data: blind ? bills.map(withoutReadingFigures) : bills })
   } catch (e) { next(e) }
 })
 
@@ -241,7 +293,10 @@ utilityRouter.get('/meters', requirePerm('units.edit', 'units.view_status', 'pro
     // a reading value back — the opening read keeps its id and date, not its
     // number. A staffer who only reads meters (no unit access) gets no prices
     // either; they need the meter, not what it bills at.
-    if (userHasPerm(req.user, 'properties.edit', 'units.edit')) return res.json({ success: true, data: meters })
+    // 10/20: the rule this line used to spell out in place now lives in
+    // lib/meterReadBlind, so the bills list and the readings export ask the
+    // same question instead of each carrying its own answer.
+    if (canSeeMeterReadingValues(req.user)) return res.json({ success: true, data: meters })
     const seesPrices = userHasPerm(req.user, 'units.view_status')
     res.json({ success: true, data: meters.map((m: any) => {
       const { opening_read, rate_per_unit, base_fee, sewer_rate_per_unit, rubs_weights, ...rest } = m
@@ -325,6 +380,8 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
     if (!canAccessLandlordResource(req.user, property.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, property.id)
 
     // S605: the double-billing guard is checked BEFORE the meter exists, so a
     // refused assignment can no longer leave a half-created meter behind.
@@ -440,13 +497,20 @@ utilityRouter.post('/meters', requirePerm('properties.edit'), async (req, res, n
 utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const meter = await queryOne<any>(
-      `SELECT m.*, p.landlord_id FROM utility_meters m
+      `SELECT m.*, p.landlord_id
+         FROM utility_meters m
          JOIN properties p ON p.id = m.property_id
         WHERE m.id = $1`, [req.params.id])
     if (!meter) throw new AppError(404, 'Meter not found')
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): a team member held to some properties edits only
+    // those properties' meters, as every other meter write path already
+    // required (reads-due, /meters/:id/reads, master bills). Without it, a
+    // manager scoped to one park could re-rate, retire or confirm "uses no
+    // power" (bills $0) on a meter at another park of the same company.
+    await assertPropertyInScope(req.user, meter.property_id)
 
     const body = z.object({
       label:          z.string().min(1).optional(),
@@ -488,18 +552,139 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
       // one somewhere, it may have some number on it. And we need to set that
       // as the starting point for the next billing cycle."
       repairedStartingReading: z.number().nonnegative().optional(),
+      // 10/12 (Nic), M1: "ADD 'Works, tenant uses no power' choice next to
+      // 'Repaired' (Gerald specifically is gone, not plugged in, paying for
+      // occupancy)." The meter works and the household on it uses nothing:
+      // back in service with no new reading (nothing was replaced), and a flat
+      // read bills $0 instead of being flagged until the meter moves
+      // (services/meterRepair → markMeterWorksNoUse).
+      // 10/12 (Nic): "usable on ANY meter, any time" — broken or not.
+      // 10/12 (review): a boolean, not only `true`. The assistant passes every
+      // parameter it was given, so a "mark it repaired" call carrying
+      // zeroUseConfirmed: false was refused outright. Only true is the choice;
+      // false (or leaving it out) means not this choice.
+      zeroUseConfirmed: z.boolean().optional(),
+      // 10/12 (Nic, review): take "Works, tenant uses no power" back. On a
+      // master or a flat-rate meter nothing else could: "Mark broken" (which
+      // also ends it) is offered on submeters only, and those meters never
+      // reach the stuck-meter test that ends it on a submeter — a mis-click
+      // stayed on the meter for good. Its own field, not zeroUseConfirmed:
+      // false, which stays "not this choice" (the assistant sends every
+      // parameter it was given, so false on a rename must change nothing).
+      // Only true acts; on a meter with no confirmation it changes nothing.
+      zeroUseWithdrawn: z.boolean().optional(),
+      // 10/12 (Nic), Q-f: "past estimates when picking 'Works': LANDLORD'S
+      // CHOICE at that moment (void unpaid estimated charges from the flagged
+      // period, or leave them)." Asked in the same window: true voids them
+      // (soft — kept on record), false or absent leaves them. Paid ones are
+      // never touched (services/meterRepair voidFlaggedPeriodEstimates).
+      voidFlaggedEstimates: z.boolean().optional(),
+      // 10/12 (review): the estimated charges the window SHOWED (their ids,
+      // from GET /meters/:id/flagged-estimates). Only those come off — one
+      // written between the question and the answer is never voided unseen.
+      voidEstimateIds: z.array(z.string().uuid()).max(1000).optional(),
+      // 10/13 (Nic): "Flat-rate meter marked 'Works, nobody using it':
+      // LANDLORD'S CHOICE, asked at the moment of marking ('Stop the flat
+      // charge too?')." Sent with zeroUseConfirmed on a flat-rate meter, and
+      // required there: true stops the flat charge while the meter is marked
+      // unused (it starts again once it is not), false keeps it billing.
+      stopFlatCharge: z.boolean().optional(),
     }).parse(req.body)
     // S648: marking a broken meter repaired REQUIRES what the new meter reads
     // now. Without it, the first bill after the repair would be measured from
     // the old meter's last number — a meaningless difference between two
     // different devices.
     const repairing = body.outOfService === false && meter.out_of_service === true
-    if (repairing && body.repairedStartingReading == null) {
+    const confirmingNoUse = body.zeroUseConfirmed === true
+    if (confirmingNoUse && body.outOfService === true) {
+      throw new AppError(400, 'A meter cannot be marked broken and confirmed working at the same time.')
+    }
+    const withdrawingNoUse = body.zeroUseWithdrawn === true
+    if (withdrawingNoUse && confirmingNoUse) {
+      throw new AppError(400, '"Works, tenant uses no power" cannot be chosen and taken back at the same time.')
+    }
+    const voidingEstimates = body.voidFlaggedEstimates === true
+    if (voidingEstimates && !confirmingNoUse) {
+      throw new AppError(400,
+        'Estimated charges come off only with "Works, tenant uses no power" — the meter was working while it was flagged.')
+    }
+    // 10/12 (Nic), Q-f: the LANDLORD's choice. Voiding charges is a money
+    // decision, and the assistant makes none (decisions #38 Q6): it can put
+    // the meter back with "Works", and the landlord voids the estimates
+    // themselves on the Utilities page.
+    if (voidingEstimates && req.get('X-GAM-Actor') === 'agent') {
+      throw new AppError(403,
+        'Voiding the estimated charges is the landlord\'s own choice on the Utilities page — the assistant does not void charges.')
+    }
+    if (voidingEstimates && body.voidEstimateIds === undefined) {
+      throw new AppError(400, 'Send the estimated charges the window showed (voidEstimateIds) — only those are taken off.')
+    }
+    // 10/13 (Nic): "Stop the flat charge too?" — a flat-rate meter's question,
+    // asked when it is marked "Works, nobody using it", and only then.
+    // (Only true acts, like zeroUseConfirmed: false, or leaving it out, changes nothing.)
+    const flatRate = meter.billing_method === 'flat_rate'
+    if (body.stopFlatCharge === true && !confirmingNoUse) {
+      throw new AppError(400,
+        `Stopping the flat charge is answered only with "${meterWorksNoUseLabel(meter.utility_type)}".`)
+    }
+    if (body.stopFlatCharge === true && !flatRate) {
+      throw new AppError(400, 'Only a flat-rate charge can be stopped this way — this meter bills what it measures.')
+    }
+    // ...and it is the landlord's own choice: the assistant makes no money
+    // decision (decisions #38 Q6), so it neither stops a charge nor keeps one
+    // billing on the landlord's behalf.
+    if (confirmingNoUse && flatRate && req.get('X-GAM-Actor') === 'agent') {
+      throw new AppError(403,
+        `Whether ${meter.label}'s flat charge stops too is the landlord's own choice, made with `
+        + `"${meterWorksNoUseLabel(meter.utility_type)}" on the Utilities page — nothing was changed.`)
+    }
+    if (confirmingNoUse && flatRate && body.stopFlatCharge === undefined) {
+      const served = await queryOne<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM utility_meter_units WHERE meter_id = $1`, [meter.id])
+      const n = served?.n ?? 0
+      return void res.status(409).json({
+        success: false, code: 'flat_charge_question',
+        error: `Stop the flat charge too? Yes: ${meter.label} bills nothing to the ${n} space${n === 1 ? '' : 's'} on it `
+          + 'while it is marked unused, and starts again once it is not. No: it keeps billing.',
+        spaces: n,
+      })
+    }
+    // The flagged period this meter is in (services/meterRepair
+    // flaggedPeriodStart: since it last came back into service), read BEFORE
+    // the meter goes back in service below — that write is the next "came back".
+    const flaggedFrom = meter.out_of_service
+      ? await flaggedPeriodStart((t, p) => query<any>(t, p).then(rows => ({ rows })), meter.id)
+      : null
+    // ...and the assistant never takes that choice away by putting a flagged
+    // meter back first: once it is back in service there is no flagged period
+    // left to ask about. With estimates waiting on the answer, it is the
+    // landlord's press, where the window shows how many and how much.
+    if (confirmingNoUse && meter.out_of_service && req.get('X-GAM-Actor') === 'agent') {
+      const waiting = await flaggedPeriodEstimates(
+        (t, p) => query<any>(t, p).then(rows => ({ rows })), meter.id, flaggedFrom)
+      if (waiting.length > 0) {
+        const total = Math.round(waiting.reduce((s, e) => s + Math.round(e.amount * 100), 0)) / 100
+        throw new AppError(409,
+          `${meter.label} has ${waiting.length} unpaid estimated charge${waiting.length === 1 ? '' : 's'} from while it was flagged `
+          + `($${total.toFixed(2)}). Whether to void them is the landlord's choice, made with "Works, tenant uses no power" `
+          + `on the Utilities page (the wrench on the meter) — nothing was changed.`)
+      }
+    }
+    // 10/12 (Nic): "Works, tenant uses no power" — "Any meter". It used to be
+    // refused on anything but a submeter (only a submeter is ever flagged for
+    // not moving, services/utilityBilling), which left a RUBS master, a
+    // master the landlord pays and a flat-rate meter with no way to say it.
+    // On those it records the confirmation and puts the meter back in service
+    // when it was marked broken; what it bills is unchanged (the stuck-meter
+    // test it quiets runs on submeters only).
+    // "Works, tenant uses no power" needs no reading: the meter was never
+    // broken, so the reads it already has stand and the next is measured from them.
+    if (repairing && body.repairedStartingReading == null && !confirmingNoUse) {
       throw new AppError(400,
         'Enter what the repaired or replaced meter reads right now (0 for a brand-new meter). Its next bill is measured from that number.')
     }
-    if (repairing && meter.digits != null
-        && body.repairedStartingReading! >= meterReadingModulus(Number(meter.digits))) {
+    if (repairing && meter.digits != null && body.repairedStartingReading != null
+        && body.repairedStartingReading >= meterReadingModulus(Number(meter.digits))) {
       throw new AppError(400,
         `${body.repairedStartingReading} does not fit on a ${meter.digits}-digit meter — check the number, or change the meter's digits first.`)
     }
@@ -632,24 +817,84 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
           nextMethod,
           body.readingMultiplier ?? null,
         ])).rows[0]
-      if (repairing) {
+      // 10/12 (Nic): somebody marking the meter broken by hand overrides an
+      // earlier "it works, the household uses nothing" (utility_meters.
+      // zero_use_confirmed_at, services/meterRepair): from here a flat read is
+      // a stuck meter again. Only written when one is on record.
+      // 10/12 (Nic, review): ...and the landlord taking it back (zeroUseWithdrawn).
+      // 10/13 (Nic): and a flat charge stopped with it starts again
+      // (ZERO_USE_CLEARED_SET clears the answer with the mark).
+      if ((body.outOfService === true || withdrawingNoUse) && meter.zero_use_confirmed_at) {
+        await tx.query(
+          `UPDATE utility_meters SET ${ZERO_USE_CLEARED_SET} WHERE id = $1`,
+          [req.params.id])
+        updated = (await tx.query(`SELECT * FROM utility_meters WHERE id = $1`, [req.params.id])).rows[0]
+      }
+      if (repairing && body.repairedStartingReading != null) {
         // The fresh starting point, dated today at the property. Recorded as a
         // replacement read: it starts the next measurement and bills nothing.
-        await tx.query(`
-          INSERT INTO utility_meter_readings
-            (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
-          SELECT $1, (NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date, $2,
-                 date_trunc('month', NOW() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date,
-                 'meter_replaced', $3
-            FROM properties p WHERE p.id = $4`,
-          [req.params.id, body.repairedStartingReading, req.user!.userId, meter.property_id])
+        // 10/12: the one repair path (services/meterRepair), shared with the
+        // one-time repair of Gerald Logue's meter — confirmed working with
+        // nobody using it too, when that is said with it.
+        await markMeterRepaired(tx, {
+          meterId: req.params.id, startingReading: body.repairedStartingReading, userId: req.user!.userId,
+          zeroUseConfirmed: confirmingNoUse, stopFlatCharge: body.stopFlatCharge === true,
+        })
+        updated = (await tx.query(`SELECT * FROM utility_meters WHERE id = $1`, [req.params.id])).rows[0]
+      } else if (confirmingNoUse) {
+        // 10/12 (Nic), M1: "Works, tenant uses no power".
+        await markMeterWorksNoUse(tx, { meterId: req.params.id, userId: req.user!.userId, stopFlatCharge: body.stopFlatCharge === true })
+        updated = (await tx.query(`SELECT * FROM utility_meters WHERE id = $1`, [req.params.id])).rows[0]
       }
       await tx.query('COMMIT')
     } catch (e) {
       await tx.query('ROLLBACK').catch(() => {})
       throw e
     } finally { tx.release() }
+    // 10/12 (Nic), Q-f: the landlord chose to void the unpaid estimates billed
+    // while the meter was flagged. The flagged period is the one it was in
+    // when the choice was made (read above, before it went back in service);
+    // a meter that was not flagged has none. Each household is voided under
+    // its own lock after the meter is back (services/meterRepair), and only
+    // the charges the window showed.
+    if (voidingEstimates && flaggedFrom) {
+      const result = await voidFlaggedPeriodEstimates({
+        meterId: req.params.id, from: flaggedFrom, utilityType: meter.utility_type,
+        shownIds: body.voidEstimateIds ?? [],
+      })
+      return res.json({ success: true, data: { ...updated, flagged_estimates_voided: result } })
+    }
     res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+/**
+ * 10/12 (Nic), Q-f — the numbers for the question in the "Works, tenant uses no
+ * power" window: "Also void the N unpaid estimated charges from while it was
+ * flagged ($X)?" The same list PATCH voids when the landlord says yes
+ * (services/meterRepair flaggedPeriodEstimates). Empty for a meter that is not
+ * flagged — nothing to ask. Read-only.
+ */
+utilityRouter.get('/meters/:id/flagged-estimates', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const meter = await queryOne<any>(
+      `SELECT m.id, m.property_id, p.landlord_id FROM utility_meters m
+         JOIN properties p ON p.id = m.property_id
+        WHERE m.id = $1`, [req.params.id])
+    if (!meter) throw new AppError(404, 'Meter not found')
+    if (!canAccessLandlordResource(req.user, meter.landlord_id)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, meter.property_id)
+    const list = await flaggedPeriodEstimates((t, p) => query<any>(t, p).then(rows => ({ rows })), meter.id)
+    const amount = Math.round(list.reduce((s, e) => s + Math.round(e.amount * 100), 0)) / 100
+    res.json({ success: true, data: {
+      count: list.length,
+      amount,
+      // 10/12 (review): each charge's id, sent back with "Yes, void them"
+      // (PATCH voidEstimateIds) so only what was shown comes off.
+      charges: list.map(e => ({
+        id: e.id, state: e.state, cycleMonth: e.cycleMonth, amount: e.amount, invoiceNumber: e.invoiceNumber,
+      })),
+    } })
   } catch (e) { next(e) }
 })
 
@@ -663,6 +908,8 @@ utilityRouter.delete('/meters/:id', requirePerm('properties.edit'), async (req, 
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH).
+    await assertPropertyInScope(req.user, meter.property_id)
     // Retention guard (data-retention rule — reading history is permanent).
     // The utility_meter_readings FK is ON DELETE CASCADE, so hard-deleting a
     // meter would silently WIPE its whole reading history (point-in-time reads,
@@ -724,6 +971,8 @@ utilityRouter.post('/meters/:id/units', requirePerm('properties.edit'), async (r
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
     // A submeter measures exactly ONE unit, so a multi-select against one is a
     // mistake worth naming rather than half-applying.
     if (meter.billing_method === 'submeter' && requested.length > 1) {
@@ -824,6 +1073,8 @@ utilityRouter.post('/meters/:id/bill-back', requirePerm('properties.edit'), asyn
          JOIN properties p ON p.id = m.property_id WHERE m.id = $1`, [req.params.id])
     if (!meter) throw new AppError(404, 'Meter not found')
     if (!canManageLandlordResource(req.user, meter.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
 
     const rows = await query<{ lease_id: string; unit_id: string }>(
       `INSERT INTO lease_utility_responsibilities
@@ -898,6 +1149,8 @@ utilityRouter.patch('/meters/:id/units/:unitId', requirePerm('properties.edit'),
          JOIN properties p ON p.id = m.property_id WHERE m.id = $1`, [req.params.id])
     if (!meter) throw new AppError(404, 'Meter not found')
     if (!canManageLandlordResource(req.user, meter.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
     if (meter.billing_method !== 'flat_rate') {
       throw new AppError(400,
         'A count only applies to a flat charge. On a meter, usage already reflects how much this unit used.')
@@ -921,27 +1174,29 @@ utilityRouter.delete('/meters/:id/units/:unitId', requirePerm('properties.edit')
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
     await query(`DELETE FROM utility_meter_units WHERE meter_id = $1 AND unit_id = $2`,
       [req.params.id, req.params.unitId])
     res.json({ success: true })
   } catch (e) { next(e) }
 })
 
-// Which metered utility a register / pay-link line is, or NULL when it is not
-// one. The register has no utility column — a line is utility billed back when
-// it sits in the Utilities category AND names a metered utility. Propane there
-// is the pump price, a retail sale, and deliberately matches nothing.
-function registerUtilityType(catExpr: string, nameExpr: string): string {
-  return `SELECT CASE
-            WHEN COALESCE(${catExpr}, '') NOT ILIKE 'utilit%' THEN NULL
-            WHEN ${nameExpr} ~* '\\melectric' THEN 'electric'
-            WHEN ${nameExpr} ~* '\\mwater'    THEN 'water'
-            WHEN ${nameExpr} ~* '\\msewer'    THEN 'sewer'
-            WHEN ${nameExpr} ~* '\\m(trash|garbage)' THEN 'trash'
-            WHEN ${nameExpr} ~* '\\mgas\\M' THEN 'gas'
-          END AS utility_type`
-}
-
+// 10/20 (Nic) — THE TWO FREE-TEXT STRINGS ARE GONE FROM THIS REPORT.
+//
+// `registerUtilityType(cat, name)` used to decide whether a register or
+// pay-link line was utility money given back by grepping a category name for
+// 'utilit%' and an item name for electric / water / sewer / trash / gas. Both
+// strings arrived from the request body, so what money WAS could be set by text
+// a register posted — and Mountain View's "Propane" at $3.30/gal sits in a
+// category literally named "Utilities", safe only because the word "Propane"
+// matches none of the patterns. Rename that button "Propane gas" and $328 of
+// TPT-taxed fuel revenue reads as gas bill-back.
+//
+// A line now says what it is: pos_items.recovers_utility on the catalog button,
+// snapshotted onto pos_transaction_items at sale time (10/20). NULL means
+// PRODUCT — an answer, not a missing value — so dispensed propane can never
+// reach this report whatever anyone names or categorizes it.
 // GET /api/utility/recovery?propertyId=&from=&to= — S613 (Nic).
 //
 // "Unbilled utility tracking would just be the difference between an owner
@@ -952,11 +1207,82 @@ function registerUtilityType(catExpr: string, nameExpr: string): string {
 //
 // Exactly that, and no new ledger for it: what the property SPENT is its utility
 // expenses, what it RECOVERED is the bills it sent, and the gap is the answer.
-// The one slice that can be named without guessing is the owner-occupied share,
-// because that is recorded as it happens. Everything else in the gap — common
-// areas, a nightly stay with power in the rate, a vacant space, a lease that
-// doesn't pass it through — is reported together as "not recovered", because
-// attributing it would mean inventing a number rather than reading one.
+// The slices that can be named without guessing are the ones recorded as they
+// happen. Everything else in the gap — common areas, a lease that doesn't pass
+// it through — is reported together as unattributed, because attributing it
+// would mean inventing a number rather than reading one.
+//
+// 10/20 (Nic) — AND THE GAP SPLITS THREE WAYS, BECAUSE TWO OF THEM ARE NOT THE
+// SAME QUESTION AT ALL.
+//
+//   "I know we already have a utilities not build back, but it needs to be
+//    separated between stuff that the property just generally uses, the
+//    property's own consumption, versus what somebody used that didn't get
+//    billed back. There's a distinction there that I want to make, and that
+//    distinction needs to be applied against money that could have been
+//    prorated back that wasn't."
+//
+//   THE PROPERTY USED IT — the office, the shop, irrigation, a vacant site's
+//     base charge, and an owner-occupied space's power. On the last one he was
+//     explicit: "owner-occupied power would be considering the property to have
+//     used it." A cost of doing business, and never in the gap.
+//   RECOVERED — from THREE sources, where this report counted only the first:
+//     a utility bill; a register or pay-link sale; and power that was inside a
+//     nightly or weekly rate all along. A delivered propane fill is the fourth
+//     shape of the first — propane's bill is the fill, billed back in
+//     installments, because utility_bills cannot hold propane at all.
+//   SOMEBODY'S USAGE, NEVER RECOVERED — a wash, a resident GAM could not bill,
+//     a stay with no agreement. THIS is the gap number, and the ONLY one the
+//     money-kept figure is set against.
+//
+// So each line carries `propertyUsed` and `somebodysUsage` beside the whole gap,
+// and the comparison at the bottom sets money kept against `somebodysUsage`
+// alone. Setting it against the whole gap would charge the departing guests for
+// the office lights.
+//
+// WHAT IS STILL NOT SPLIT, SAID OUT LOUD. The park's own general use is a
+// RESIDUAL: no record says "the shop used $40 of power", so it falls into
+// `unattributed` along with anything else nobody wrote down. Nic is right that
+// most of it is the property's own — but moving it there on that hunch would be
+// the invented number this report exists to avoid, so it stays its own figure
+// and the screen says what it mostly is.
+//
+// 10/20 (Nic) — AND THE EARLY DEPARTURES, BOTH HALVES OF THEM.
+//
+//   "I would like to keep track of money that wasn't refunded versus electric
+//    that should have been billed that wasn't charged to see how close we
+//    actually get to evening out. You know, because people leave at various
+//    times and we try to be generous with it, but I want to make sure that it's
+//    somewhat fair."
+//
+// A wash's power was swallowed into the unattributed gap along with the common
+// areas and the vacant spaces, which is exactly why he could not see it. It is
+// named now, the way the owner-occupied share already was.
+//
+// THE GAP IS NOT AN ADDITION SUM, and that matters more than anything else
+// here. `notRecovered` is the whole gap — spent minus billed back — and every
+// named slice lives INSIDE it. So each line also carries `unattributed`, the
+// part no record accounts for, and they reconcile exactly:
+//
+//     notRecovered = propertyUsed + somebodysUsage + unattributed
+//     propertyUsed = ownerOccupied + vacantSpaces
+//     somebodysUsage = earlyDepartureWash
+//
+// Nic's standing rule is that every dollar is counted exactly once. A report
+// that showed the absorbed power as its own slice AND left it inside the gap
+// would be adding the same dollar twice, and routes/utilityRecovery.test.ts
+// asserts that identity rather than trusting it.
+//
+// TWO WINDOWS, deliberately, because the two questions are asked on different
+// axes and pretending otherwise would make one of them wrong:
+//   - the per-utility-type slice is scoped by BILLING CYCLE MONTH, like the
+//     bills and the owner-use rows it has to reconcile against; and
+//   - the comparison in `earlyDepartures` is scoped by the DAY SOMEBODY LEFT
+//     and paired per departure (washPairing), because the money kept and the
+//     power eaten belong to a person, not to a month. They coincide except at
+//     the edge of a window, where a December departure's final read bills in
+//     January — which is what `awaitingClosingRead` is there to say out loud
+//     instead of quietly reading as a park that came out ahead.
 utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status'), async (req, res, next) => {
   try {
     const propertyId = z.string().uuid().parse(req.query.propertyId)
@@ -966,16 +1292,37 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
       `SELECT id, landlord_id FROM properties WHERE id = $1`, [propertyId])
     if (!property) throw new AppError(404, 'Property not found')
     if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/20: and the property lock. This report is one park's money — what it
+    // spent, billed back and collected — and the check above only says the
+    // caller works for the company that owns it.
+    await assertPropertyInScope(req.user, propertyId)
 
+    // 10/12 (Nic, ledger P8): once the company's books are live, what the
+    // property SPENT is its utility expenses as the books hold them — the
+    // property's share of each (a company-wide bill split by units included),
+    // on its accounting day; the expense still says which utility.
+    const onBooks = await ledgerReportsLive([property.landlord_id])
+    const spentSql = onBooks
+      ? `SELECT COALESCE(e.utility_type, 'unspecified') AS utility_type,
+                SUM(l.debit - l.credit)::numeric AS amount
+           FROM ledger_posting_lines l
+           JOIN ledger_postings ps ON ps.id = l.posting_id AND ps.source_type = 'expense'
+           JOIN landlord_expenses e ON e.id::text = ps.source_id
+           JOIN books_accounts a ON a.id = l.account_id AND a.type = 'expense'
+          WHERE l.landlord_id = $4::uuid AND l.property_id = $1 AND e.category = 'utilities'
+            AND l.accounting_date BETWEEN $2::date AND $3::date
+          GROUP BY 1`
+      : `SELECT COALESCE(e.utility_type, 'unspecified') AS utility_type,
+                SUM(e.amount)::numeric AS amount
+           FROM landlord_expenses e
+          WHERE e.property_id = $1 AND e.category = 'utilities'
+            AND ${liveExpenseSql('e')}
+            AND e.expense_date BETWEEN $2::date AND $3::date
+            AND $4::uuid IS NOT NULL
+          GROUP BY 1`
     const rows = await query<any>(`
       WITH spent AS (
-        SELECT COALESCE(e.utility_type, 'unspecified') AS utility_type,
-               SUM(e.amount)::numeric AS amount
-          FROM landlord_expenses e
-         WHERE e.property_id = $1 AND e.category = 'utilities'
-           AND e.status = 'active'
-           AND e.expense_date BETWEEN $2::date AND $3::date
-         GROUP BY 1
+        ${spentSql}
       ),
       -- S652 (Nic): "spent zero, billed back $1,588.65, and not recovered
       -- $1,588.65. Those are an exact match and I don't know why it's saying
@@ -998,14 +1345,21 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
       -- instead of a lease. That is utility billed back exactly like a bill
       -- on an invoice, so it is counted the same: an open link is still owed,
       -- and a utility line rung up and paid (a paid link is a register sale)
-      -- is paid. Only lines in the register's Utilities category that name a
-      -- metered utility count — propane at the pump is a retail sale.
+      -- is paid.
+      --
+      -- 10/20 (Nic): three sources, and a "source" column says which, because
+      -- one "billed back" number meaning three different things is how a
+      -- report stops being readable. A line is utility money only when its own
+      -- row says so (pos_items.recovers_utility) — never a name, never a
+      -- category.
       billed AS (
+        -- SOURCE 1: A UTILITY BILL on somebody's invoice.
         SELECT ub.utility_type,
                (ub.charge_amount + COALESCE(ub.tax_amount, 0))::numeric AS amount,
                CASE WHEN wt.covered THEN 'work_trade'
                     WHEN ub.status = 'paid' THEN 'paid'
-                    ELSE 'owed' END AS bucket
+                    ELSE 'owed' END AS bucket,
+               'bill' AS source
           FROM utility_bills ub
           JOIN units u ON u.id = ub.unit_id
           LEFT JOIN payments pay ON pay.id = ub.payment_id
@@ -1020,45 +1374,159 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
            AND ub.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
                                           AND date_trunc('month', $3::date)::date
         UNION ALL
-        SELECT k.utility_type,
+        -- SOURCE 1, THE PROPANE SHAPE OF IT. A DELIVERED fill is propane's
+        -- bill: utility_bills' own CHECK holds five types and propane is not
+        -- one, so a tank filled on the space can never be a utility_bills row.
+        -- It bills back as installments on the resident's invoice, and
+        -- total_amount already carries the fill's propane tax and its share
+        -- of the delivery charge, so the installments sum to it exactly
+        -- (services/propaneFill) and nothing is added on top here.
+        --
+        -- DISPENSED propane — a bottle filled at the counter — is a PRODUCT and
+        -- is not in this report at any point: it has no fill row, and its
+        -- register line's recovers_utility is NULL by the item's own say-so.
+        SELECT 'propane' AS utility_type,
+               i.amount::numeric AS amount,
+               CASE WHEN pwt.covered THEN 'work_trade'
+                    WHEN ppay.status = 'settled' THEN 'paid'
+                    ELSE 'owed' END AS bucket,
+               'bill' AS source
+          FROM propane_fills f
+          JOIN propane_fill_installments i ON i.fill_id = f.id
+          LEFT JOIN payments ppay ON ppay.id = i.payment_id
+          CROSS JOIN LATERAL (
+            SELECT COALESCE(
+              (ppay.status = 'pending' AND ppay.work_trade_suspended_at IS NOT NULL)
+              OR (ppay.status = 'settled' AND ppay.amount = 0 AND ppay.notes ILIKE '%work-trade credit%'),
+              false) AS covered
+          ) pwt
+         WHERE f.property_id = $1 AND f.landlord_id = $4::uuid
+           AND i.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
+                                         AND date_trunc('month', $3::date)::date
+        UNION ALL
+        -- SOURCE 2a: a utility line on an OPEN pay link — billed back, not paid
+        -- yet. The line's catalog item is what says it is a utility, joined by
+        -- the id the link carries.
+        --
+        -- A line RAISED FROM A BILL is deliberately invisible here: it has no
+        -- item id (services/utilityPayLink writes id: null with utilityBillId)
+        -- so it joins no item, and its bill is already counted by source 1.
+        -- Counting the link too would bill the same kilowatts twice.
+        SELECT pi.recovers_utility AS utility_type,
                ROUND((it->>'qty')::numeric * (it->>'price')::numeric
                      * (1 + COALESCE((it->>'tax')::numeric, 0)), 2) AS amount,
-               'owed' AS bucket
+               'owed' AS bucket,
+               'sale' AS source
           FROM pos_pay_links l
           CROSS JOIN LATERAL jsonb_array_elements(l.items) it
-          CROSS JOIN LATERAL (${registerUtilityType(`it->>'cat'`, `it->>'name'`)}) k
+          -- The id is read through a shape check before it is cast. A line
+          -- with no item (id null, or a hand-typed ad-hoc line) is the normal
+          -- case and must land as "no item", not as a 22P02 that takes the
+          -- landlord's whole money report down with it.
+          CROSS JOIN LATERAL (
+            SELECT CASE WHEN it->>'id' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                        THEN (it->>'id')::uuid END AS item_id
+          ) iid
+          JOIN pos_items pi ON pi.id = iid.item_id
          WHERE l.property_id = $1
            AND l.kind = 'one_time' AND l.status = 'open'
            AND (l.expires_at IS NULL OR l.expires_at > NOW())
-           AND k.utility_type IS NOT NULL
+           AND pi.recovers_utility IS NOT NULL
            AND date_trunc('month', l.created_at)::date BETWEEN date_trunc('month', $2::date)::date
                                                            AND date_trunc('month', $3::date)::date
         UNION ALL
-        SELECT k.utility_type,
+        -- SOURCE 2b: a utility line RUNG UP — at the register or by a pay link
+        -- being paid. Read off the sale line's own snapshot, which posSale
+        -- writes from the item's DB row and never from the request body, so a
+        -- rename or a recategorize cannot restate a settled month.
+        --
+        -- status = 'completed' leaves out a sale that was refunded in whole or
+        -- in part, which is Nic's own rule on the wash applied here: "any
+        -- refund, even partial, means no wash." Money handed back is money not
+        -- recovered, and apportioning a part refund across a sale's lines would
+        -- be inventing a number.
+        SELECT ti.recovers_utility AS utility_type,
                ROUND(ti.subtotal * (1 + COALESCE(ti.tax_rate, 0)), 2) AS amount,
-               'paid' AS bucket
+               'paid' AS bucket,
+               'sale' AS source
           FROM pos_transaction_items ti
           JOIN pos_transactions t ON t.id = ti.transaction_id
-          CROSS JOIN LATERAL (${registerUtilityType('ti.item_category', 'ti.item_name')}) k
          WHERE t.property_id = $1
            AND t.status = 'completed'
-           AND k.utility_type IS NOT NULL
+           AND ti.recovers_utility IS NOT NULL
            AND date_trunc('month', t.created_at)::date BETWEEN date_trunc('month', $2::date)::date
                                                            AND date_trunc('month', $3::date)::date
+        UNION ALL
+        -- SOURCE 3: POWER THAT WAS INSIDE THE RATE ALL ALONG. A nightly or
+        -- weekly guest's electric is not billed back because the rate already
+        -- charged for it, so the money came in with the stay. Recorded as it
+        -- happens on the one book for utility billed to nobody, and counted
+        -- here as recovered rather than left in the gap — "power inside a
+        -- nightly or weekly rate" is the third source Nic named.
+        --
+        -- Already collected by definition: the stay was paid for at its rate.
+        SELECT a.utility_type,
+               (a.charge_amount + a.tax_amount)::numeric AS amount,
+               'paid' AS bucket,
+               'in_rate' AS source
+          FROM utility_absorbed_charges a
+          JOIN units u ON u.id = a.unit_id
+         WHERE u.property_id = $1
+           AND a.landlord_id = $4::uuid
+           AND a.reason = 'short_stay_in_rate'
+           AND a.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
+                                         AND date_trunc('month', $3::date)::date
       ),
       recovered AS (
         SELECT b.utility_type,
                SUM(b.amount)::numeric AS amount,
                SUM(b.amount) FILTER (WHERE b.bucket = 'work_trade')::numeric AS work_trade,
-               SUM(b.amount) FILTER (WHERE b.bucket = 'paid')::numeric AS collected
+               SUM(b.amount) FILTER (WHERE b.bucket = 'paid')::numeric AS collected,
+               SUM(b.amount) FILTER (WHERE b.source = 'bill')::numeric AS from_bills,
+               SUM(b.amount) FILTER (WHERE b.source = 'sale')::numeric AS from_sales,
+               SUM(b.amount) FILTER (WHERE b.source = 'in_rate')::numeric AS in_the_rate
           FROM billed b
          GROUP BY 1
       ),
-      owner_use AS (
-        SELECT a.utility_type, SUM(a.charge_amount)::numeric AS amount
-          FROM utility_owner_use_absorptions a
+      -- THE PROPERTY'S OWN USE, as far as anything is recorded: an
+      -- owner-occupied space's share ("owner-occupied power would be
+      -- considering the property to have used it") and an empty space's base
+      -- charge. Both read off utility_absorbed_charges by reason — the one book
+      -- — and never off the compatibility view beside it, which shows owner-use
+      -- rows only on purpose.
+      property_use AS (
+        SELECT a.utility_type,
+               SUM(a.charge_amount + a.tax_amount) FILTER (WHERE a.reason = 'owner_use')::numeric AS owner_use,
+               SUM(a.charge_amount + a.tax_amount) FILTER (WHERE a.reason = 'vacant')::numeric AS vacant
+          FROM utility_absorbed_charges a
           JOIN units u ON u.id = a.unit_id
          WHERE u.property_id = $1
+           AND a.landlord_id = $4::uuid
+           AND a.reason IN ('owner_use', 'vacant')
+           AND a.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
+                                         AND date_trunc('month', $3::date)::date
+         GROUP BY 1
+      ),
+      -- 10/20: the stub a departing guest was never billed because the landlord
+      -- kept their money. Read off utility_absorbed_charges by reason — the one
+      -- book for utility billed to nobody — and NOT off the compatibility view
+      -- beside it, which shows owner-use rows only on purpose so that column
+      -- cannot quietly start swallowing washes.
+      --
+      -- Tax is in it, because the billed side counts tax too; a stub absorbed
+      -- with its tax and compared against a recovered figure that includes tax
+      -- is the only way the two sides are the same measurement.
+      --
+      -- Landlord-scoped as well as property-scoped. The property is already
+      -- authorized above and its units cannot belong to anyone else, so this is
+      -- belt and braces on a money figure rather than the only gate.
+      early_wash AS (
+        SELECT a.utility_type, SUM(a.charge_amount + a.tax_amount)::numeric AS amount
+          FROM utility_absorbed_charges a
+          JOIN units u ON u.id = a.unit_id
+         WHERE u.property_id = $1
+           AND a.landlord_id = $4::uuid
+           AND a.reason = 'early_departure_wash'
            AND a.billing_cycle_month BETWEEN date_trunc('month', $2::date)::date
                                          AND date_trunc('month', $3::date)::date
          GROUP BY 1
@@ -1066,47 +1534,149 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
       SELECT t.utility_type,
              COALESCE(s.amount, 0)::float  AS spent,
              COALESCE(r.amount, 0)::float  AS recovered,
+             COALESCE(r.from_bills, 0)::float  AS from_bills,
+             COALESCE(r.from_sales, 0)::float  AS from_sales,
+             COALESCE(r.in_the_rate, 0)::float AS in_the_rate,
              COALESCE(r.collected, 0)::float AS collected,
              COALESCE(r.work_trade, 0)::float AS work_trade,
-             COALESCE(o.amount, 0)::float  AS owner_occupied
+             COALESCE(o.owner_use, 0)::float AS owner_occupied,
+             COALESCE(o.vacant, 0)::float  AS vacant_spaces,
+             COALESCE(w.amount, 0)::float  AS early_departure_wash
         FROM (SELECT utility_type FROM spent
               UNION SELECT utility_type FROM recovered
-              UNION SELECT utility_type FROM owner_use) t
-        LEFT JOIN spent s     ON s.utility_type = t.utility_type
-        LEFT JOIN recovered r ON r.utility_type = t.utility_type
-        LEFT JOIN owner_use o ON o.utility_type = t.utility_type
+              UNION SELECT utility_type FROM property_use
+              UNION SELECT utility_type FROM early_wash) t
+        LEFT JOIN spent s        ON s.utility_type = t.utility_type
+        LEFT JOIN recovered r    ON r.utility_type = t.utility_type
+        LEFT JOIN property_use o ON o.utility_type = t.utility_type
+        LEFT JOIN early_wash w   ON w.utility_type = t.utility_type
        ORDER BY 2 DESC
-    `, [propertyId, from, to])
+    `, [propertyId, from, to, property.landlord_id])
 
-    const lines = rows.map((r: any) => ({
-      utilityType: r.utility_type,
-      spent: Number(r.spent),
-      recovered: Number(r.recovered),
-      collected: Number(r.collected),
-      workTrade: Number(r.work_trade),
-      stillOwed: Math.round((Number(r.recovered) - Number(r.collected) - Number(r.work_trade)) * 100) / 100,
-      ownerOccupied: Number(r.owner_occupied),
+    const round2 = (n: number) => Math.round(n * 100) / 100
+    const lines = rows.map((r: any) => {
+      const spent = Number(r.spent)
+      const ownerOccupied = Number(r.owner_occupied)
+      const vacantSpaces = Number(r.vacant_spaces)
+      const earlyDepartureWash = Number(r.early_departure_wash)
+      // 10/20 (Nic), the first of the three: "stuff that the property just
+      // generally uses, the property's own consumption." A cost of doing
+      // business, so it is named and taken out before anything is compared
+      // against money somebody did not get back.
+      const propertyUsed = round2(ownerOccupied + vacantSpaces)
+      // And the third: "what somebody used that didn't get billed back." The
+      // only one the money-kept figure is set against. Today the single
+      // recorded shape of it is a wash; a resident GAM could not bill and a
+      // stay with no agreement join it the day either is written down.
+      const somebodysUsage = earlyDepartureWash
       // Only meaningful where the landlord recorded what he SPENT. Without the
       // bill on the expense side there is nothing to subtract from, so this
       // reports null rather than implying the whole recovery was a shortfall.
-      notRecovered: Number(r.spent) > 0
-        ? Math.round((Number(r.spent) - Number(r.recovered)) * 100) / 100
-        : null,
-    }))
-    const sum = (k: 'spent' | 'recovered' | 'collected' | 'workTrade' | 'stillOwed' | 'ownerOccupied') =>
-      Math.round(lines.reduce((n: number, l: any) => n + l[k], 0) * 100) / 100
+      const notRecovered = spent > 0 ? round2(spent - Number(r.recovered)) : null
+      return {
+        utilityType: r.utility_type,
+        spent,
+        recovered: Number(r.recovered),
+        // The three sources, so "billed back" is never one number meaning
+        // three things: a bill (a propane fill among them), a register or
+        // pay-link sale, and power that was inside a nightly or weekly rate.
+        fromBills: Number(r.from_bills),
+        fromSales: Number(r.from_sales),
+        inTheRate: Number(r.in_the_rate),
+        collected: Number(r.collected),
+        workTrade: Number(r.work_trade),
+        stillOwed: round2(Number(r.recovered) - Number(r.collected) - Number(r.work_trade)),
+        propertyUsed,
+        ownerOccupied,
+        vacantSpaces,
+        somebodysUsage,
+        earlyDepartureWash,
+        notRecovered,
+        // What is left of the gap once the recorded slices come out of it. Null
+        // for the same reason notRecovered is: there is no gap to divide up.
+        //
+        // Mostly the park's own general use — the office, the shop, irrigation
+        // — but NOTHING ON FILE SAYS SO, so it is not moved into propertyUsed
+        // on that reasoning. It also holds a lease that never passed the
+        // utility through.
+        //
+        // It can come out NEGATIVE, and it is deliberately not clamped. That
+        // means more utility is recorded as absorbed than the recorded spend
+        // leaves room for — which says the expense side is short, and clamping
+        // it to zero would hide the one thing worth knowing.
+        unattributed: notRecovered == null
+          ? null
+          : round2(notRecovered - propertyUsed - somebodysUsage),
+      }
+    })
+    const sum = (k: 'spent' | 'recovered' | 'fromBills' | 'fromSales' | 'inTheRate' | 'collected'
+      | 'workTrade' | 'stillOwed' | 'propertyUsed' | 'ownerOccupied' | 'vacantSpaces'
+      | 'somebodysUsage' | 'earlyDepartureWash') =>
+      round2(lines.reduce((n: number, l: any) => n + l[k], 0))
     // The gap is only a number where a spend was recorded — summed over those
     // utilities alone, so a utility with no bill entered cannot make the
     // total claim a shortfall (or a surplus) that nobody measured.
+    //
+    // ONE CONSEQUENCE, AND IT IS DELIBERATE: the three-way identity holds on
+    // every LINE, and on the totals only when every utility has a spend
+    // recorded. A park that entered its electric bill but not its water one
+    // still gets water's recorded owner-use and washes in the totals — those
+    // are real figures, recorded as they happened — while water's gap is a
+    // dash. Dropping them from the totals to make the subtraction come out
+    // even would hide money that was actually written down, which is the
+    // worse of the two.
     const measured = lines.filter((l: any) => l.notRecovered != null)
+    const measuredSum = (k: 'notRecovered' | 'unattributed') => measured.length
+      ? round2(measured.reduce((n: number, l: any) => n + l[k], 0))
+      : null
+
+    // 10/20 — THE MONEY SIDE, which is money and not a utility type, so it sits
+    // in the summary rather than on a per-utility line. Paired per departure by
+    // the service that owns the rule; this handler adds nothing up that the
+    // service has not already put side by side.
+    const departures = await washPairing(property.landlord_id, { propertyId, from, to })
+    // 10/20 (Nic): the money figure is NET of the short-term lodging tax a
+    // re-priced stay would owe — "even though they weren't charged the tax
+    // needs to be factored in" — because the landlord remits that out of his
+    // own pocket if he ever squares it up. The service prices it per departure
+    // (earlyDepartureWash repricedStayTax); the gross and the tax come up too,
+    // so the screen can show the subtraction rather than a figure that dropped
+    // $35.51 a departure with no explanation.
+    const moneyKept = round2(departures.reduce((n, d) => n + d.moneyKept, 0))
+    const moneyKeptBeforeTax = round2(departures.reduce((n, d) => n + d.moneyKeptBeforeTax, 0))
+    const lodgingTaxOwed = round2(departures.reduce((n, d) => n + d.lodgingTaxOwed, 0))
+    const utilityAbsorbed = round2(departures.reduce((n, d) => n + d.utilityAbsorbed, 0))
     res.json({ success: true, data: {
       from, to, lines,
       totals: {
         spent: sum('spent'), recovered: sum('recovered'), collected: sum('collected'), workTrade: sum('workTrade'), stillOwed: sum('stillOwed'),
+        fromBills: sum('fromBills'), fromSales: sum('fromSales'), inTheRate: sum('inTheRate'),
+        propertyUsed: sum('propertyUsed'),
         ownerOccupied: sum('ownerOccupied'),
-        notRecovered: measured.length
-          ? Math.round(measured.reduce((n: number, l: any) => n + l.notRecovered, 0) * 100) / 100
-          : null,
+        vacantSpaces: sum('vacantSpaces'),
+        somebodysUsage: sum('somebodysUsage'),
+        earlyDepartureWash: sum('earlyDepartureWash'),
+        notRecovered: measuredSum('notRecovered'),
+        unattributed: measuredSum('unattributed'),
+        earlyDepartures: {
+          departures: departures.length,
+          moneyKept,
+          moneyKeptBeforeTax,
+          lodgingTaxOwed,
+          utilityAbsorbed,
+          // Which way it leans, signed: positive means the money kept covered
+          // the power and then some, negative means the power cost more than
+          // was kept. NOT clamped and NOT labelled good or bad — Nic asked
+          // whether it is fair, and a number that only ever reads as a win
+          // would not answer that.
+          evenedOutBy: round2(moneyKept - utilityAbsorbed),
+          // Departures whose closing read has not landed, so their power is not
+          // in `utilityAbsorbed` yet and the comparison leans generous until it
+          // is. Said out loud so nobody reads a half-measured window as even.
+          awaitingClosingRead: departures.filter(d => !d.closingReadsIn).length,
+          // Final stubs computed but parked on an unanswered money question.
+          heldStubs: departures.reduce((n, d) => n + d.heldStubs, 0),
+        },
       },
     } })
   } catch (e) { next(e) }
@@ -1125,6 +1695,11 @@ utilityRouter.get('/reading-history', requirePerm('properties.edit'), async (req
     const property = await queryOne<any>(`SELECT id, landlord_id FROM properties WHERE id = $1`, [propertyId])
     if (!property) throw new AppError(404, 'Property not found')
     if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/20: and to the properties a team member is assigned to. The check
+    // above passes a manager for their whole COMPANY, so without this one a
+    // manager scoped to one park read every reading value at another park by
+    // passing its id in the query string.
+    await assertPropertyInScope(req.user, propertyId)
     const rows = await query<any>(`
       SELECT m.id AS meter_id, m.label, m.utility_type, m.billing_method, m.digits, m.reading_multiplier,
              COALESCE(m.out_of_service, FALSE) AS out_of_service,
@@ -1187,6 +1762,8 @@ utilityRouter.get('/meters/:id/readings', requirePerm('properties.edit'), async 
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
     const readings = await query<any>(`
       SELECT * FROM utility_meter_readings
        WHERE meter_id = $1
@@ -1218,6 +1795,8 @@ utilityRouter.post('/meters/:id/readings', requirePerm('properties.edit'), async
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
     const reading = await queryOne<any>(`
       INSERT INTO utility_meter_readings
         (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
@@ -1243,6 +1822,11 @@ utilityRouter.get('/tax-rates', requirePerm('units.edit', 'units.view_status', '
     if (!canAccessLandlordResource(req.user, property.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/20: and the property lock. The check above passes anyone who works
+    // for the company that owns the park; this one asks whether the park is
+    // one of theirs, which is what "assigned to a property" has to mean on a
+    // read as well as on a write.
+    await assertPropertyInScope(req.user, propertyId)
     const rows = await query<any>(
       `SELECT utility_type, tax_rate_pct, label FROM property_utility_tax_rates
         WHERE property_id = $1`, [propertyId])
@@ -1264,6 +1848,9 @@ utilityRouter.post('/tax-rates', requirePerm('properties.edit'), async (req, res
     if (!canAccessLandlordResource(req.user, property.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, property.id)
     const row = await queryOne<any>(
       `INSERT INTO property_utility_tax_rates (property_id, utility_type, tax_rate_pct, label)
        VALUES ($1, $2, $3, $4)
@@ -1315,6 +1902,8 @@ utilityRouter.patch('/meters/:id/readings/:readingId', requirePerm('properties.e
          JOIN properties p ON p.id = m.property_id WHERE m.id = $1`, [req.params.id])
     if (!meter) throw new AppError(404, 'Meter not found')
     if (!canManageLandlordResource(req.user, meter.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/12 (review): held to the properties a team member is scoped to (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, meter.property_id)
 
     const reading = await queryOne<any>(
       `SELECT * FROM utility_meter_readings WHERE id = $1 AND meter_id = $2`,
@@ -1594,11 +2183,18 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requireMeterRead
     // a misread that slipped past the rollover guard would otherwise
     // land a huge charge on the tenant's next invoice.
     if (!meter.out_of_service && !needsReview && meter.billing_method === 'submeter' && prior) {
-      const threshold = METER_USAGE_ALERT_THRESHOLDS[meter.utility_type] ?? null
-      const usage = isRollover
+      // 10/20: compared in BILLING UNITS — the quantity the bill actually
+      // charges for — not in face turns. A face that counts per hundred gallons
+      // (S613's multiplier) reads 4130 → 6130 for 200,000 gallons; as turns
+      // that is 2,000 and the threshold never saw it. The rule itself is one
+      // function now (usageNeedsDoubleCheck), shared with the move-out path,
+      // which is how that path went without an upward check at all.
+      const faceTurns = isRollover
         ? (modulus - Number(prior.reading_value)) + body.readingValue
         : body.readingValue - Number(prior.reading_value)
-      if (threshold != null && usage > threshold) {
+      const mult = Number(meter.reading_multiplier)
+      const usage = faceTurns * (mult > 0 ? mult : 1)
+      if (usageNeedsDoubleCheck(meter.utility_type, usage)) {
         needsReview = true
         reviewNote = `Unusually high usage this cycle (${usage.toLocaleString()}) — double-check the meter`
       }
@@ -1720,12 +2316,18 @@ utilityRouter.get('/master-bills', requirePerm('properties.edit'), async (req, r
              m.id AS meter_id, m.label AS meter_label, m.utility_type,
              m.billing_method, m.rubs_basis, m.rate_per_unit, m.base_fee,
              (SELECT COUNT(*) FROM utility_meter_units mu WHERE mu.meter_id = m.id) AS unit_count,
+             -- 10/12: a voided bill recovered nothing — a tenancy that never
+             -- happened (kept, voided_at set, its usage back on hold and billed
+             -- to whoever is next) or a voided estimate / paused-cycle marker.
+             -- Counting it counted the same usage twice.
              COALESCE((SELECT SUM(ub.charge_amount) FROM utility_bills ub
                         WHERE ub.meter_id = m.id
-                          AND ub.billing_cycle_month = r.billing_cycle_month), 0) AS recovered_amount,
+                          AND ub.billing_cycle_month = r.billing_cycle_month
+                          AND ub.voided_at IS NULL AND ub.status <> 'void'), 0) AS recovered_amount,
              COALESCE((SELECT COUNT(*) FROM utility_bills ub
                         WHERE ub.meter_id = m.id
-                          AND ub.billing_cycle_month = r.billing_cycle_month), 0) AS recovered_count
+                          AND ub.billing_cycle_month = r.billing_cycle_month
+                          AND ub.voided_at IS NULL AND ub.status <> 'void'), 0) AS recovered_count
         FROM utility_meter_readings r
         JOIN utility_meters m ON m.id = r.meter_id
        WHERE m.property_id = $1
@@ -1817,6 +2419,11 @@ utilityRouter.get('/readings/flagged', requirePerm('properties.edit'), async (re
     if (!canAccessLandlordResource(req.user, property.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/20: and to the park they were put on. This is the one window that
+    // shows the entered reading beside the prior one, and it was landlord-only
+    // already — but "landlord" there meant the company, so a manager held to
+    // Mountain View read Oak Park's pairs by passing its id in the query.
+    await assertPropertyInScope(req.user, propertyId)
     const rows = await query<any>(
       `SELECT r.id, r.reading_value, r.reading_date, r.billing_cycle_month, r.review_note,
               m.id AS meter_id, m.label, m.utility_type, m.digits,
@@ -1848,6 +2455,13 @@ utilityRouter.get('/readings/flagged', requirePerm('properties.edit'), async (re
 //                    meter, unknown usage).
 // Either way the flag clears; if the cycle's run already completed,
 // billing re-runs for that meter (idempotent — UNIQUE meter+unit+cycle).
+//
+// 10/20: this window now also settles a HELD MOVE-OUT READ — a departing
+// tenant's final read whose usage came in over the utility type's threshold
+// (one slipped digit at the counter prices a final bill in the thousands). It
+// billed nothing when it was taken, so there is nothing stale to clear; what
+// happens here is the final bill getting built, once, off whatever value the
+// landlord corrects or confirms.
 utilityRouter.post('/readings/:id/resolve-review', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const body = z.object({
@@ -1864,6 +2478,9 @@ utilityRouter.post('/readings/:id/resolve-review', requirePerm('properties.edit'
     if (!canAccessLandlordResource(req.user, reading.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, reading.property_id)
     if (!reading.needs_review) throw new AppError(409, 'Reading is not flagged for review')
     if (body.correctedValue != null && body.correctedValue >= meterReadingModulus(reading.digits)) {
       throw new AppError(400, `Reading exceeds this meter's ${reading.digits}-digit capacity`)
@@ -1881,14 +2498,51 @@ utilityRouter.post('/readings/:id/resolve-review', requirePerm('properties.edit'
          + (body.rollover ? ' (rollover)' : ''),
        !!body.rollover])
 
+    // 10/20 — A HELD MOVE-OUT READ IS FINISHED HERE, AND ONLY HERE.
+    //
+    // Everything below this point is the MONTHLY run's resolution: it drops the
+    // cycle's not-yet-invoiced bills and re-runs the monthly engine for the
+    // meter. A move-out read is not on a run and produced no bill of its own
+    // (it was held before anything was written), so that path would do two
+    // wrong things to it — delete the monthly bills belonging to whoever else
+    // is on this meter for the cycle, and then bill the monthly cycle instead
+    // of the departing household's final span.
+    //
+    // Its own billing call is the one that belongs here: the household the desk
+    // named and the space-move flag, both carried on the read since it was
+    // held, plus `reviewed` so the plausibility guard does not hold it a second
+    // time. The landlord has now looked at the number, which is the entire
+    // point of the window — a confirmed-genuine huge read bills, a corrected
+    // one bills the corrected usage, and either way the departing tenant's
+    // final bill goes out today instead of being lost.
+    if (reading.reason !== 'monthly_cycle') {
+      let billed = false
+      let billingNote: string | undefined
+      if (reading.reason === 'move_out_final' || reading.move_out_lease_id || reading.move_out_space_move) {
+        const r = await billMoveOutRead(reading.meter_id, reading.id, {
+          leaseId: reading.move_out_lease_id ?? null,
+          spaceMove: !!reading.move_out_space_move,
+          reviewed: true,
+        })
+        billed = r.billed
+        if (!billed) billingNote = r.reason
+      }
+      return res.json({ success: true, data: { reading: updated, billsCreated: billed ? 1 : 0, run: null, billingNote } })
+    }
+
     // S652 (Nic): "get rid of the clean meters random blind reread. Just flag
     // the ones that need flagging, with limited to one window." This IS that
     // window. A bill built on the superseded value and not yet on an invoice
     // is stale; and if this was the last flagged read on a waiting run, the
     // run completes here.
+    // 10/12: never a voided bill — it is kept on record (keep everything): one
+    // voided out of its slot (voided_at, a tenancy that never happened) and
+    // the older void markers (a voided estimate, a paused cycle), which hold
+    // their cycle so it is never billed again.
     if (body.correctedValue != null && Number(reading.reading_value) !== body.correctedValue) {
       await query(
-        `DELETE FROM utility_bills WHERE meter_id = $1 AND billing_cycle_month = $2 AND payment_id IS NULL`,
+        `DELETE FROM utility_bills WHERE meter_id = $1 AND billing_cycle_month = $2 AND payment_id IS NULL
+            AND voided_at IS NULL AND status <> 'void'`,
         [reading.meter_id, reading.billing_cycle_month])
     }
     const cycleIso = reading.billing_cycle_month instanceof Date
@@ -1934,6 +2588,9 @@ utilityRouter.post('/reading-runs/:id/complete', requirePerm('properties.edit'),
     if (!canAccessLandlordResource(req.user, run.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, run.property_id)
     if (run.status === 'completed') throw new AppError(409, 'Reading run is already completed')
     // S652: the landlord completing the run IS the approval of its bills.
     const completed = await completeReadingRun(run.id, req.user!.userId, { approve: true })
@@ -1959,6 +2616,9 @@ utilityRouter.post('/reading-runs/:id/approve', requirePerm('properties.edit'), 
     const run = await queryOne<any>(`SELECT * FROM utility_reading_runs WHERE id = $1`, [req.params.id])
     if (!run) throw new AppError(404, 'Reading run not found')
     if (!canManageLandlordResource(req.user, run.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, run.property_id)
     if (run.status === 'completed') throw new AppError(409, 'These bills already went out')
     // A reading still flagged as a possible typo bills nothing and holds only
     // its own unit's invoice (S534) — it never holds the park (Nic).
@@ -1970,11 +2630,19 @@ utilityRouter.post('/reading-runs/:id/approve', requirePerm('properties.edit'), 
 // Every read at a property as a spreadsheet — one row per meter, a reading and
 // a usage column per month (Nic: "your sites and your reads at different dates
 // for total evaluation history of overall utility usage"). CSV opens in Excel.
-utilityRouter.get('/readings/export', requirePerm('properties.edit', 'units.view_status'), async (req, res, next) => {
+// 10/20: this spreadsheet IS the reading values, a column per month — so it is
+// gated on seeing a reading value, not on seeing unit status. It admitted
+// 'units.view_status', which is an onsite_manager permission held by the same
+// front desk that takes the walk, and which the meter list already refuses the
+// reading figure to. Nobody who walks blind downloads the answer key.
+utilityRouter.get('/readings/export', requirePerm(...METER_READING_VALUE_PERMS), async (req, res, next) => {
   try {
     const propertyId = z.string().uuid().parse(req.query.propertyId)
     const prop = await queryOne<any>(`SELECT name, landlord_id FROM properties WHERE id = $1`, [propertyId])
     if (!prop || !canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(404, 'Property not found')
+    // And held to the properties a team member is assigned to: landlord-wide
+    // access is the company, not the park (see PATCH /meters/:id).
+    await assertPropertyInScope(req.user, propertyId)
     const reads = await query<any>(`
       SELECT m.id AS meter_id, m.label, m.utility_type, m.digits, COALESCE(m.reading_multiplier, 1) AS mult,
              (SELECT string_agg(u.unit_number, ' / ' ORDER BY u.unit_number) FROM utility_meter_units mu
@@ -2042,6 +2710,9 @@ utilityRouter.post('/generate-bills', requirePerm('properties.edit'), async (req
       if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
         throw new AppError(403, 'Forbidden')
       }
+      // 10/12 (review): a team member held to some properties acts only on those
+      // properties, as every other meter write path requires (assertPropertyInScope).
+      await assertPropertyInScope(req.user, meter.property_id)
       const result = await generateBillsForMeter(body.meterId, cycleDate)
       return res.json({ success: true, data: [result] })
     }
@@ -2053,6 +2724,7 @@ utilityRouter.post('/generate-bills', requirePerm('properties.edit'), async (req
       if (!canAccessLandlordResource(req.user, property.landlord_id)) {
         throw new AppError(403, 'Forbidden')
       }
+      await assertPropertyInScope(req.user, property.id)
       const results = await generateBillsForProperty(body.propertyId, cycleDate)
       return res.json({ success: true, data: results })
     }
@@ -2063,6 +2735,11 @@ utilityRouter.post('/generate-bills', requirePerm('properties.edit'), async (req
       : req.user!.landlordId
     if (!landlordId) {
       throw new AppError(400, 'meterId or propertyId required for admin/super_admin calls')
+    }
+    // 10/12 (review): every property of the company is more than a team member
+    // held to some of them may bill — they choose one of theirs.
+    if ((await getScopedPropertyIds(req.user)) !== null) {
+      throw new AppError(400, 'Choose one of your properties to generate its utility bills.')
     }
     const results = await generateBillsForLandlord(landlordId, cycleDate)
     res.json({ success: true, data: results })
@@ -2078,13 +2755,20 @@ utilityRouter.post('/generate-bills', requirePerm('properties.edit'), async (req
 // finalization is a property-level admin action.
 utilityRouter.post('/bills/:id/finalize', requirePerm('properties.edit'), async (req: any, res, next) => {
   try {
-    const bill = await queryOne<{ id: string; landlord_id: string; status: string }>(
-      `SELECT id, landlord_id, status FROM utility_bills WHERE id=$1`, [req.params.id]
+    const bill = await queryOne<{ id: string; landlord_id: string; status: string; property_id: string | null }>(
+      `SELECT ub.id, ub.landlord_id, ub.status, COALESCE(m.property_id, u.property_id) AS property_id
+         FROM utility_bills ub
+         LEFT JOIN utility_meters m ON m.id = ub.meter_id
+         LEFT JOIN units u ON u.id = ub.unit_id
+        WHERE ub.id=$1`, [req.params.id]
     )
     if (!bill) throw new AppError(404, 'Utility bill not found')
     if (!canAccessLandlordResource(req.user, bill.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, bill.property_id)
     if (bill.status !== 'unbilled') {
       throw new AppError(409, `Bill is ${bill.status}; only 'unbilled' can be finalized`)
     }
@@ -2149,12 +2833,17 @@ utilityRouter.post('/bills/:id/pay', async (req: any, _res, next) => {
 // of who entered their unit. Same posture as the S535 property-level late fees.
 utilityRouter.get('/property-rates', requirePerm('units.edit', 'units.view_status', 'properties.edit'), async (req, res, next) => {
   try {
-    const propertyId = String(req.query.propertyId || '')
-    if (!propertyId) throw new AppError(400, 'propertyId is required')
+    // 10/20: parsed as a uuid like every sibling read. A propertyId that was
+    // not one reached `WHERE id = $1` and came back a 500 out of Postgres
+    // instead of a bad request.
+    const propertyId = z.string().uuid().parse(req.query.propertyId)
     const property = await queryOne<any>(
       `SELECT id, landlord_id FROM properties WHERE id = $1`, [propertyId])
     if (!property) throw new AppError(404, 'Property not found')
     if (!canAccessLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/20: and the property lock. The desk needs the price of the park they
+    // are standing in to ring up a fill — not another park's.
+    await assertPropertyInScope(req.user, propertyId)
     const rows = await query<any>(
       `SELECT utility_type, rate_per_unit, base_fee, sewer_rate_per_unit,
               prevailing_residential_rate, updated_at
@@ -2187,6 +2876,9 @@ utilityRouter.post('/property-rates', requirePerm('properties.edit'), async (req
       `SELECT id, landlord_id FROM properties WHERE id = $1`, [body.propertyId])
     if (!property) throw new AppError(404, 'Property not found')
     if (!canManageLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, property.id)
 
     const row = await queryOne<any>(
       `INSERT INTO property_utility_rates
@@ -2276,6 +2968,9 @@ utilityRouter.post('/opening-reads', requirePerm('properties.edit'), async (req,
       `SELECT id, landlord_id FROM properties WHERE id = $1`, [body.propertyId])
     if (!property) throw new AppError(404, 'Property not found')
     if (!canManageLandlordResource(req.user, property.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/12 (review): a team member held to some properties acts only on those
+    // properties, as every other meter write path requires (assertPropertyInScope).
+    await assertPropertyInScope(req.user, property.id)
 
     const cycleMonth = body.readingDate.slice(0, 7) + '-01'
     const results: { meterId: string; label: string; status: string; message?: string }[] = []

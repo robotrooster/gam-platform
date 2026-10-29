@@ -1,4 +1,4 @@
-import { isAuthRejection, fetchAuthMeWithRetry, startVersionWatch, unlockScrollIfStandalone } from '@gam/shared'
+import { isAuthRejection, fetchAuthMeWithRetry, startVersionWatch, unlockScrollIfStandalone, installPrintLightTheme } from '@gam/shared'
 import { renewTenantSession } from './lib/sessionRenewal'
 import { utilityLine } from './lib/utilityLine'
 // S540: self-hosted fonts — no render-blocking external stylesheet
@@ -18,6 +18,7 @@ import '@fontsource/inter/700.css'
 import '@fontsource/jetbrains-mono/400.css'
 import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
+import { NotificationPreferences } from '../../../packages/shared-ui/NotificationPreferences'
 import { AcceptInvitePage } from './pages/AcceptInvitePage'
 import { BackgroundCheckPage } from './pages/BackgroundCheckPage'
 import { TenantNotificationsPage } from './pages/TenantNotificationsPage'
@@ -164,11 +165,16 @@ const post = <T,>(url: string, body?: any) => api.post<{success:boolean;data:T;m
 // until GAM reviews the lease + verifies SSI/SSDI income and approves;
 // only approved tenants can enroll (server-enforced).
 function useFlexVisibility() {
-  const { data } = useQuery('flex-visibility',
+  const { data, isLoading } = useQuery('flex-visibility',
     () => get<{ flexpay: boolean; flexdeposit: boolean; flexcredit: boolean }>('/tenants/flex-visibility'),
     { staleTime: 5 * 60 * 1000, retry: false })
   const v = data ?? { flexpay: false, flexdeposit: false, flexcredit: false }
-  return { ...v, any: v.flexpay || v.flexdeposit || v.flexcredit }
+  // 10/27: `settled` says the answer is actually IN, not merely absent. The
+  // Flex page used to redirect to Home on `!any`, which is true for the first
+  // paint of every cold load — so opening /services by URL or bookmark bounced
+  // you off it, while clicking the sidebar link worked because the answer was
+  // already cached. "Not yet known" and "none of them" are different facts.
+  return { ...v, any: v.flexpay || v.flexdeposit || v.flexcredit, settled: !isLoading }
 }
 
 // ── AUTH ──────────────────────────────────────────────────────
@@ -673,6 +679,11 @@ function Layout() {
   // Conditional nav (Nic): Work Trade only appears once the tenant is actually
   // in a work-trade agreement; Amenities only when their property has something
   // reservable. Otherwise these are dead/empty tabs.
+  //
+  // 10/19 (Nic, "Show it while paused"): the endpoint answers a PAUSED
+  // agreement too, so the tab stays up through a season away instead of
+  // vanishing — which is what used to happen, taking the honest sentence about
+  // whether their hours were still counting with it.
   const { data: workTradeNav } = useQuery('work-trade-nav', () =>
     fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/work-trade', {
       headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
@@ -752,7 +763,12 @@ function Layout() {
             {hasAmenities && <NavLink to="/amenities" className={({isActive})=>`ni${isActive?' active':''}`}><CalendarClock size={16}/>Amenities</NavLink>}
             {hasWorkTrade && <NavLink to="/work-trade" className={({isActive})=>`ni${isActive?' active':''}`}><HeartHandshake size={16}/>Work Trade</NavLink>}
             {/* S652: a work trader whose agreement carries "Read meters" takes the property's reading walk from here. */}
-            {hasWorkTrade && Array.isArray((workTradeNav as any)?.fieldPermissions) && (workTradeNav as any).fieldPermissions.includes('read_meters') &&
+            {/* 10/19: field work is not paused work. The Work Trade tab stays up
+                while a trade is paused, but nobody is reading meters for a
+                landlord while their agreement sleeps — the panel's own meter
+                card has always been active-only, and this matches it. */}
+            {hasWorkTrade && (workTradeNav as any)?.status === 'active' &&
+              Array.isArray((workTradeNav as any)?.fieldPermissions) && (workTradeNav as any).fieldPermissions.includes('read_meters') &&
               <NavLink to="/meter-readings" className={({isActive})=>`ni${isActive?' active':''}`}><Gauge size={16}/>Meter Readings</NavLink>}
             {!LAUNCH_HIDDEN.has('/credit') && <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}><BarChart3 size={16}/>My Record</NavLink>}
             {!LAUNCH_HIDDEN.has('/my-disputes') && <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}><Scale size={16}/>My Disputes</NavLink>}
@@ -787,7 +803,7 @@ function Layout() {
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
           </button>
         </header>
-        <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <><NewLeaseBanner me={tenantMe} /><Outlet /></>}</div>
+        <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <><NewLeaseBanner me={tenantMe} /><FixedIncomeBanner /><Outlet /></>}</div>
         <DialogHost />
       </div>
       {showFullNav && !serviceOnly && !isRenterPoolOnly && <FlexsuiteReAcceptanceGate />}
@@ -1311,6 +1327,72 @@ function joinNames(list: string[]): string {
 // the portal while it waits. The words are a new lease / a rent update: their
 // current lease stays as it is until the new one starts. It never reads as
 // "your lease is ending".
+/**
+ * ── 10/26 (Nic): THE FIXED-INCOME QUESTION, ANSWERED WITHOUT LEAVING ────────
+ *
+ *   "Maybe the survey could just literally be in the banner, like pop up on
+ *    their screen. Are you on fixed income? Yes or no? If yes, it takes them
+ *    to the descriptor of FlexPay. If they click no, then boom, they're just
+ *    flagged no, and it's done and over with right there without leaving the
+ *    page."
+ *
+ * And it is never a gate: "not a gatekeeping thing while they're trying to set
+ * up their password and verify the email and all that stuff. We need to just
+ * ask it casually later at like the first login."
+ *
+ * So: one question, two buttons, dismissible, asked once. "No" closes it for
+ * good in place. "Yes" goes to the FlexPay page, which is where the interest
+ * request and the proof-of-income upload already live. Saying yes qualifies
+ * nobody — the server records it as self-reported and never touches the
+ * verified flag that gates enrolling.
+ */
+function FixedIncomeBanner() {
+  const location = useLocation()
+  const qc = useQueryClient()
+  const navigate = useNavigate()
+  const { data } = useQuery<{ show: boolean; answered: boolean | null }>(
+    'fixed-income-prompt', () => get<{ show: boolean; answered: boolean | null }>('/tenants/me/fixed-income-prompt'),
+    { retry: false, staleTime: 5 * 60 * 1000 })
+  const [closed, setClosed] = useState(false)
+  const answer = useMutation(
+    (onFixedIncome: boolean) => post('/tenants/me/fixed-income', { onFixedIncome }),
+    { onSettled: () => qc.invalidateQueries('fixed-income-prompt') })
+
+  if (!data?.show || closed) return null
+  // Never over the signing flow or the move-in gate — the same places the
+  // lease banner stays out of.
+  if (location.pathname.startsWith('/sign')) return null
+
+  const say = (onFixedIncome: boolean) => {
+    setClosed(true)
+    answer.mutate(onFixedIncome)
+    if (onFixedIncome) navigate('/flexpay')
+  }
+
+  return (
+    <div style={{
+      background: 'rgba(201,162,39,.10)', border: '1px solid rgba(201,162,39,.35)',
+      borderRadius: 10, padding: '14px 16px', marginBottom: 18, lineHeight: 1.6,
+      display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap',
+    }}>
+      <div>
+        <div style={{ fontWeight: 700, color: 'var(--gold)', marginBottom: 2 }}>
+          Are you on a fixed income?
+        </div>
+        <div style={{ fontSize: '.88rem', color: 'var(--text-1)' }}>
+          Social Security, SSI, SSDI, a pension or disability. If you are, there may be a way to
+          line your rent up with the day your money arrives. Asking once — your landlord is not
+          told either way.
+        </div>
+      </div>
+      <div style={{ display: 'flex', gap: 8, whiteSpace: 'nowrap' }}>
+        <button className="btn btn-primary" onClick={() => say(true)}>Yes</button>
+        <button className="btn btn-ghost" onClick={() => say(false)}>No</button>
+      </div>
+    </div>
+  )
+}
+
 function NewLeaseBanner({ me }: { me: any }) {
   const location = useLocation()
   const docId = me?.pendingRenewalDocumentId
@@ -1590,9 +1672,14 @@ function HomePage() {
 
       {/* S595 (Nic): Payment Health heartbeat — the tenant's ON-TIME payment
           health as an animated ECG (mirrors the landlord dashboard monitor).
-          Health = % of billed obligations paid on time over the last 6 months
-          (NOT total paid): 100% gold, 80%+ green, below that red. */}
-      {health && health.totalPayments > 0 && (() => {
+          10/12 (Nic): health = months paid on time since joining GAM (all
+          time, the one definition the landlord sees too); the beats are the last 6 months
+          (NOT total paid): 100% gold, 80%+ green, below that red.
+          10/12: shown once a household month has been judged — not when this
+          person has rows of their own: a co-tenant's lease charges are billed
+          under the primary resident, so totalPayments is 0 for every co-tenant
+          while the household's health (what the landlord sees) is not. */}
+      {health && health.onTime && health.onTime.resolved > 0 && (() => {
         const oh = health.onTime
         const monthsAbbr = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
         const now = new Date()
@@ -1631,7 +1718,7 @@ function HomePage() {
           </div>
           {flexVis.flexcredit && <div className="dr"><span className="dk">Credit Reporting</span><span className={`badge ${me?.creditReportingEnrolled?'b-green':'b-muted'}`}>{me?.creditReportingEnrolled?'Active — $5/mo':'Not enrolled'}</span></div>}
           {flexVis.flexpay && <div className="dr"><span className="dk">FlexPay</span><span className={`badge ${me?.flexpayPausedMultiLease?'b-amber':me?.flexpayEnrolled?'b-green':'b-muted'}`}>{me?.flexpayPausedMultiLease?'⏸ Paused — 2+ leases':me?.flexpayEnrolled?`Active — day ${me.flexpayPullDay}`:'Not enrolled'}</span></div>}
-          {flexVis.flexdeposit && <div className="dr"><span className="dk">FlexDeposit</span><span className={`badge ${me?.flexDepositEnrolled?'b-green':'b-muted'}`}>{me?.flexDepositEnrolled?'Active — $3/mo':'Not enrolled'}</span></div>}
+          {flexVis.flexdeposit && <div className="dr"><span className="dk">FlexDeposit</span><span className={`badge ${me?.flexDepositEnrolled?'b-green':'b-muted'}`}>{me?.flexDepositEnrolled?'Active':'Not enrolled'}</span></div>}
           <div style={{marginTop:16}}>
             <span className="btn btn-g btn-sm">Manage services →</span>
           </div>
@@ -1699,23 +1786,23 @@ function PaymentHealthMonitor({ months, pct }: { months: { label: string; rate: 
   return (
     <div className="card" style={{ marginBottom: 24 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <div style={{ fontWeight: 700, color: 'var(--t0)' }}>Payment Health — last 6 months</div>
+        <div style={{ fontWeight: 700, color: 'var(--t0)' }}>Payment Health</div>
         <span style={{ fontSize: '.72rem', fontWeight: 700, color: status.color }}>◆ {status.label}</span>
       </div>
       <div className="tphm-screen" ref={screenRef} onMouseMove={onMove} onMouseLeave={() => setHoverIdx(null)}>
         {hoverIdx == null ? (
           <div className="tphm-readout">
-            <span className="tphm-readout-label">on-time · last 6 mo</span>
+            <span className="tphm-readout-label">months on time · since joining GAM</span>
             <span className="tphm-readout-value" style={{ color: status.color }}>{pct == null ? '—' : `${pct}%`}</span>
           </div>
         ) : (
           <div className="tphm-tip" style={{ left: `clamp(64px, ${((hoverIdx + 0.53) / data.length) * 100}%, calc(100% - 64px))` }}>
             <div className="tphm-tip-month">{data[hoverIdx].label || '—'}</div>
             <div className="tphm-tip-val" style={{ color: status.color }}>
-              {data[hoverIdx].rate == null ? 'no bills due' : `${Math.round((data[hoverIdx].rate as number) * 100)}% on time`}
+              {data[hoverIdx].rate == null ? 'nothing to judge yet' : data[hoverIdx].rate === 1 ? 'Paid on time' : 'Not on time'}
             </div>
             {data[hoverIdx].total > 0 && (
-              <div className="tphm-tip-sub">{data[hoverIdx].onTime} of {data[hoverIdx].total} paid on time</div>
+              <div className="tphm-tip-sub">Judged on the whole month's bill, after the grace period</div>
             )}
           </div>
         )}
@@ -2278,8 +2365,20 @@ function FlexPayInquireModal({ survey, onClose, onSuccess }: { survey?: boolean;
 }
 
 // FlexPay is a payment-scheduling subscription. Tenant picks a pull day
-// (6-28: Nic 10/2, never the 1st-5th — FLEXPAY_FORBIDDEN_PULL_DAYS); fee is a
-// FLAT $25/month (S562) — pull day is scheduling only. Day 28 cap covers all
+// (6-28: Nic 10/2, never the 1st-5th — FLEXPAY_FORBIDDEN_PULL_DAYS).
+//
+// ── 10/27: THE PRICE IS NOT FLAT AND THE DAY IS NOT ONLY SCHEDULING ────────
+// S562's flat $25 is gone. The fee comes from flexpay_fee_schedule, priced by
+// the amount GAM fronts that cycle CROSSED WITH the benefit Wednesday the
+// chosen day falls in — $23 to $79. So the day a resident picks moves their
+// price, and this screen may not promise otherwise.
+//
+// Enrollment is CLOSED (flexpay_enrollment_open), so nobody can reach this
+// today. Before it opens, this modal has to QUOTE the chosen day from the
+// table as the slider moves — GET /tenants/flexpay already returns previewFee
+// for a resident who has a day set, and the enrollment case needs the same
+// quote by candidate day. Until then it names no figure rather than a wrong
+// one. Day 28 cap covers all
 // U.S. social security payout windows (SSDI 4th-Wed-of-month). S314:
 // click-accept of the Subscription Terms is required + persisted. S655: the
 // terms summary is FLEXPAY_TERMS (shared) — the same sections the PDF, emails
@@ -2292,8 +2391,7 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
   const [fullTermsText, setFullTermsText] = useState<string | null>(null)
   const [loadingTerms, setLoadingTerms] = useState(false)
   const [error, setError] = useState('')
-  const fee = 25  // S562: FlexPay is a flat $25/month (pull day is scheduling only)
-
+  // 10/27: no figure is invented here — see the note above this component.
   async function openFullTerms() {
     setLoadingTerms(true)
     try {
@@ -2334,7 +2432,7 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
       <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:520}}>
         <div className="modal-t">⚡ Enroll in FlexPay</div>
         <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:20}}>
-          Pick the day GAM collects from your bank each month — match it to when your income lands. Your FlexPay fee is a flat <strong>$25/month</strong> no matter which day you choose.
+          Pick the day GAM collects from your bank each month — match it to when your income lands. Your FlexPay fee depends on your rent and the day you pick, and is shown to you before you confirm.
         </p>
 
         <div className="fg">
@@ -2350,9 +2448,9 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
         <div style={{background:'var(--bg3)',borderRadius:10,padding:16,marginBottom:16,marginTop:16}}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
             <span style={{fontWeight:700,color:'var(--t0)',fontSize:'.875rem'}}>Monthly FlexPay fee</span>
-            <span style={{fontFamily:'var(--font-m)',fontSize:'1.4rem',fontWeight:800,color:'var(--gold)'}}>${fee}</span>
+            <span style={{fontFamily:'var(--font-m)',fontSize:'.9rem',fontWeight:700,color:'var(--t2)'}}>Shown before you confirm</span>
           </div>
-          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>Flat $25/month · day {pullDay} is just your pull schedule</div>
+          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>Set by your rent and the payday your {ordinal(pullDay)} falls in</div>
         </div>
 
         {error && <div className="alert a-warn" style={{marginBottom:12}}>{error}</div>}
@@ -2361,7 +2459,7 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
         <div style={{background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:8,padding:14,marginBottom:14,fontSize:'.72rem',color:'var(--t2)',lineHeight:1.5}}>
           <div style={{fontWeight:700,color:'var(--t0)',marginBottom:8,fontSize:'.78rem'}}>FlexPay Subscription Terms — please review</div>
           <p style={{marginBottom:8}}>
-            <strong style={{color:'var(--t1)'}}>Subscription, not a loan.</strong> FlexPay is a payment-date coordination subscription. GAM does not advance funds on your behalf. You authorize a recurring ACH pull from your verified bank account on the pull day you choose; your monthly fee is a flat $25 regardless of that day.
+            <strong style={{color:'var(--t1)'}}>Subscription, not a loan.</strong> FlexPay is a payment-date coordination subscription. GAM does not advance funds on your behalf. You authorize a recurring ACH pull from your verified bank account on the pull day you choose; your monthly fee is set by your rent and the payday your chosen day falls in, and is shown to you before you confirm.
           </p>
           {FLEXPAY_TERMS.map((t, i) => (
             <p key={t.key} style={{marginBottom: i === FLEXPAY_TERMS.length - 1 ? 0 : 8}}>
@@ -2395,7 +2493,7 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
         <div className="modal-f">
           <button className="btn btn-g" onClick={onClose}>Cancel</button>
           <button className="btn btn-p" disabled={mut.isLoading || !tosAck} onClick={()=>mut.mutate()}>
-            {mut.isLoading ? <span className="spinner"/> : `Enroll — $${fee}/month`}
+            {mut.isLoading ? <span className="spinner"/> : 'Enroll in FlexPay'}
           </button>
         </div>
         {showFullTerms && fullTermsText && (
@@ -2412,8 +2510,9 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
 
 // ── FLEXPAY CHANGE-PULL-DAY MODAL ─────────────────────────────────────────
 // Enrolled tenants can move their pull day; the change takes effect NEXT
-// cycle (the current cycle's pull is already scheduled). Fee recomputes to
-// flat $25/month; the new day is scheduling only.
+// cycle (the current cycle's pull is already scheduled). 10/27: moving the day
+// can MOVE THE PRICE — the grid is rent crossed with the benefit Wednesday the
+// day falls in — so this screen must not imply the fee is unchanged.
 function FlexPayChangeDayModal({
   currentDay, onClose, onSuccess,
 }: { currentDay: number; onClose: () => void; onSuccess: () => void }) {
@@ -2421,7 +2520,6 @@ function FlexPayChangeDayModal({
   // rule starts the picker at the nearest offered day.
   const [pullDay, setPullDay] = useState(offeredPullDay(currentDay || 15))
   const [error, setError] = useState('')
-  const fee = 25  // S562: FlexPay is a flat $25/month (pull day is scheduling only)
 
   const mut = useMutation(
     () => fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/flexpay/pull-day', {
@@ -2443,7 +2541,7 @@ function FlexPayChangeDayModal({
       <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:480}}>
         <div className="modal-t">⚡ Change FlexPay pull day</div>
         <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:20}}>
-          Pick a new day of the month, any day from the {pullDayRangeText()}. This takes effect <strong>next billing cycle</strong> — your current cycle's pull is already scheduled. Your FlexPay fee stays a flat $25/month.
+          Pick a new day of the month, any day from the {pullDayRangeText()}. This takes effect <strong>next billing cycle</strong> — your current cycle's pull is already scheduled. Your fee is set by your rent and the payday your new day falls in, so moving it can change what you pay.
         </p>
         <div className="fg">
           <label className="fl">Pull day of month</label>
@@ -2456,9 +2554,9 @@ function FlexPayChangeDayModal({
         <div style={{background:'var(--bg3)',borderRadius:10,padding:16,margin:'16px 0'}}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
             <span style={{fontWeight:700,color:'var(--t0)',fontSize:'.875rem'}}>New monthly fee (next cycle)</span>
-            <span style={{fontFamily:'var(--font-m)',fontSize:'1.4rem',fontWeight:800,color:'var(--gold)'}}>${fee}</span>
+            <span style={{fontFamily:'var(--font-m)',fontSize:'.9rem',fontWeight:700,color:'var(--t2)'}}>Shown before you confirm</span>
           </div>
-          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>Flat $25/month · day {pullDay} is just your pull schedule</div>
+          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>Moving your day can move your fee — it is set by your rent and the payday the {ordinal(pullDay)} falls in</div>
         </div>
         {error && <div className="alert a-red" style={{marginBottom:12}}>{error}</div>}
         <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
@@ -2535,17 +2633,34 @@ function FeatureRequestModal({ onClose, onSuccess }: { onClose: () => void; onSu
   )
 }
 
-// ── FLEXDEPOSIT ENROLL MODAL (S246) ───────────────────────────────────────
-// Pre-move-in flow. Tenant picks 2..maxInstallments (max comes from
-// the eligibility payload — deposit amount × BG risk_level). The
-// move-in invoice generator reads security_deposits.flexDepositEnabled
-// after enrollment and excludes the deposit line from the landlord-
-// facing invoice. GAM fronts the gap on move-in via Connect Transfer.
+// ── FLEXDEPOSIT ENROLL MODAL (S246; reworked 10/26) ───────────────────────
+// Pre-move-in flow. TWO choices, 2 payments or 4, at the same price for
+// everybody with the same deposit (Nic, 10/26):
+//
+//   "The same amount of installments at the same amount of security deposit
+//    needs to be the same price for everybody. That's what keeps it not
+//    lending. It's a service they're paying for. It's like window tinting."
+//
+// So this screen shows both choices WITH their fee and lets them pick. It never
+// shows a price table, and nothing about the person changes either price.
+//
+// The whole fee is collected with installment 1, so `firstPull` — not the
+// installment size — is the number that matters at move-in.
+//
+// The move-in invoice generator reads security_deposits.flex_deposit_enabled
+// and excludes the deposit line from the LANDLORD-facing invoice: the landlord
+// sees their rent and the deposit as settled, never which installment the
+// resident is on. GAM holds the cash in custody and floats nothing.
 
 function FlexDepositModal({
   eligibility, onClose, onSuccess,
 }: { eligibility: any; onClose: () => void; onSuccess: () => void }) {
-  const [count, setCount] = useState<number>(eligibility?.maxInstallments ?? 2)
+  const choices: Array<{
+    payments: number; fee: number; installment: number; firstPull: number; total: number
+    /** 10/27: the part above the top of the grid, paid in full with payment 1. */
+    payUpFront?: number
+  }> = eligibility?.choices ?? []
+  const [count, setCount] = useState<number>(choices[0]?.payments ?? 2)
   const [tosAck, setTosAck] = useState(false)
   const [showFullTerms, setShowFullTerms] = useState(false)
   const [fullTermsText, setFullTermsText] = useState<string | null>(null)
@@ -2553,9 +2668,15 @@ function FlexDepositModal({
   const [error, setError] = useState('')
 
   const deposit = Number(eligibility?.depositAmount ?? 0)
-  const max = eligibility?.maxInstallments ?? null
   const eligible = !!eligibility?.eligible
-  const installmentAmt = max ? Math.round((deposit / count) * 100) / 100 : 0
+  const picked = choices.find(c => c.payments === count) ?? choices[0] ?? null
+  const installmentAmt = picked?.installment ?? 0
+  // 10/27 (Nic): a deposit over the top of the price grid is split on the
+  // CEILING and the rest is paid in full with the first payment, so the
+  // division shown has to be of the split part — "$4,000 ÷ 4" would read $1,000
+  // beside payments of $750.
+  const upFront = Number(picked?.payUpFront ?? 0)
+  const splitPart = Math.round((deposit - upFront) * 100) / 100
 
   async function openFullTerms() {
     setLoadingTerms(true)
@@ -2605,7 +2726,17 @@ function FlexDepositModal({
             {eligibility?.blockers?.includes('no_deposit_row')    && 'No upcoming deposit found. FlexDeposit must be enrolled before move-in.'}
             {eligibility?.blockers?.includes('already_funded')    && 'Your deposit is already fully funded. FlexDeposit can only be enrolled before paying the deposit.'}
             {eligibility?.blockers?.includes('not_ssi_ssdi')      && 'FlexDeposit is currently available only to SSDI/SSI recipients with verified income.'}
-            {eligibility?.blockers?.includes('insufficient_platform_tenure') && `FlexDeposit requires at least 30 days on the GAM platform. Check back closer to your move-in date.`}
+            {/* 10/27: the 30 days are the LANDLORD's standing, not this
+                person's. Said as a fact about the property, because a
+                resident is not told how their landlord is doing with GAM. */}
+            {eligibility?.blockers?.includes('landlord_not_established') && `FlexDeposit is not available at this property yet.`}
+            {/* 10/27 (Nic): the two window refusals, said as facts about
+                timing rather than as a judgement about them. A bank is
+                verified only by microdeposits and that takes a day or two,
+                which is exactly why the link has to be started on signing day
+                — so the reason is given, not just the refusal. */}
+            {eligibility?.blockers?.includes('bank_link_not_started_on_signing_day') && `To split your deposit, your bank had to be linked on the day you signed — verifying one takes a couple of days, so it has to start right away. Your deposit is owed as billed.`}
+            {eligibility?.blockers?.includes('signing_window_closed') && `The window to split this deposit has closed. It is owed as billed.`}
             {eligibility?.blockers?.includes('insufficient_on_time_payment_history') && `FlexDeposit requires at least one on-time rent payment on a prior lease in the last 90 days.`}
           </div>
           <div className="modal-f"><button className="btn btn-g" onClick={onClose}>Close</button></div>
@@ -2619,25 +2750,40 @@ function FlexDepositModal({
       <div className="modal" onClick={e => e.stopPropagation()} style={{maxWidth:560}}>
         <div className="modal-t">🏦 Enroll in FlexDeposit</div>
         <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:16}}>
-          Split your ${deposit.toFixed(2)} deposit into 2–{max} installments. Pay the first one at move-in; the rest pull automatically over the following months.
+          Split your ${deposit.toFixed(2)} deposit into 2 payments or 4. You pay the first one
+          at move-in together with the whole service fee; the rest pull automatically over the
+          following months.
         </p>
+        {/* 10/26 (Nic): "the screen where they sign up for flex deposit says on
+            it that the landlord has no control over flex deposit. It is not
+            offered by the landlord. It's offered by the software." */}
+        <div style={{fontSize:'.74rem',color:'var(--t3)',lineHeight:1.55,marginBottom:16,
+                     padding:'10px 12px',background:'var(--bg3)',borderRadius:8}}>
+          FlexDeposit is offered by GAM, not by your landlord. Your landlord does not control it,
+          is not told which payment you are on, and sees your deposit as settled either way. The
+          price below is the same for everyone with a deposit your size.
+        </div>
 
         <div className="fg">
           <label className="fl">Number of installments</label>
           <div style={{display:'flex',gap:8,marginTop:8}}>
-            {Array.from({length: (max ?? 2) - 1}, (_, i) => i + 2).map(n => (
+            {choices.map(c => (
               <button
-                key={n}
-                onClick={() => setCount(n)}
+                key={c.payments}
+                onClick={() => setCount(c.payments)}
                 style={{
-                  flex:1, padding:'10px', borderRadius:8,
-                  border: count === n ? '2px solid var(--gold)' : '1px solid var(--b1)',
-                  background: count === n ? 'rgba(201,162,39,.08)' : 'var(--bg3)',
-                  cursor:'pointer', fontWeight:600,
-                  color: count === n ? 'var(--gold)' : 'var(--t2)',
+                  flex:1, padding:'12px 10px', borderRadius:8, textAlign:'left',
+                  border: count === c.payments ? '2px solid var(--gold)' : '1px solid var(--b1)',
+                  background: count === c.payments ? 'rgba(201,162,39,.08)' : 'var(--bg3)',
+                  cursor:'pointer',
+                  color: count === c.payments ? 'var(--gold)' : 'var(--t2)',
                   fontSize:'.85rem',
                 }}>
-                {n} payments
+                <div style={{fontWeight:700}}>{c.payments} payments</div>
+                {/* The fee is the decision, so it is on the button. */}
+                <div style={{fontSize:'.74rem',opacity:.85,marginTop:2}}>
+                  ${c.fee.toFixed(2)} service fee
+                </div>
               </button>
             ))}
           </div>
@@ -2649,8 +2795,37 @@ function FlexDepositModal({
             <span style={{fontFamily:'var(--font-m)',fontSize:'1.4rem',fontWeight:800,color:'var(--gold)'}}>${installmentAmt.toFixed(2)}</span>
           </div>
           <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>
-            ${deposit.toFixed(2)} ÷ {count} installments. First due at move-in.
+            ${splitPart.toFixed(2)} ÷ {count} installments. First due at move-in.
+            {upFront > 0 && ` The remaining $${upFront.toFixed(2)} of your deposit is paid in full with the first payment.`}
           </div>
+          {picked && (
+            <div style={{marginTop:12,paddingTop:12,borderTop:'1px solid var(--b1)'}}>
+              {/* What they actually hand over at move-in: installment 1 + the
+                  WHOLE fee. Showing only the installment size would understate
+                  it by the fee, which is the one number they are deciding on. */}
+              <div style={{display:'flex',justifyContent:'space-between',fontSize:'.78rem',color:'var(--t2)'}}>
+                <span>At move-in (first payment + the whole fee{upFront > 0 ? ` + $${upFront.toFixed(2)} of deposit` : ''})</span>
+                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--t0)'}}>
+                  ${picked.firstPull.toFixed(2)}
+                </span>
+              </div>
+              <div style={{display:'flex',justifyContent:'space-between',fontSize:'.78rem',color:'var(--t2)',marginTop:4}}>
+                <span>Then {count - 1} × ${picked.installment.toFixed(2)}, monthly</span>
+                <span style={{fontFamily:'var(--font-m)',color:'var(--t2)'}}>
+                  ${(Math.round(picked.installment * (count - 1) * 100) / 100).toFixed(2)}
+                </span>
+              </div>
+              <div style={{display:'flex',justifyContent:'space-between',fontSize:'.78rem',marginTop:6,
+                           paddingTop:6,borderTop:'1px solid var(--b1)',fontWeight:700,color:'var(--t0)'}}>
+                <span>Total</span>
+                <span style={{fontFamily:'var(--font-m)'}}>${picked.total.toFixed(2)}</span>
+              </div>
+              <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>
+                ${deposit.toFixed(2)} deposit + ${picked.fee.toFixed(2)} service fee. The deposit is
+                yours and comes back to you at move-out; the fee is what GAM charges for the service.
+              </div>
+            </div>
+          )}
         </div>
 
         {error && <div className="alert a-warn" style={{marginBottom:12}}>{error}</div>}
@@ -3018,7 +3193,25 @@ function ServicesPage() {
       // S655 (decisions #35.8): a payment-date coordination subscription —
       // never described as advancing, fronting or lending money.
       desc: 'FlexPay pays your monthly bill to your landlord on time, and GAM collects it from your bank on the day you choose — matched to when your income lands. A payment-date subscription: not a loan, no interest, no penalties.',
-      price: '$25/month',
+      // ── 10/27 (Nic): NO PRICE ON THE CARD ────────────────────────────────
+      //
+      //   "I want flex pay to not show a flat price. For the people. I want it
+      //    to say learn more and kind of probe them for information before
+      //    revealing the price. If they see that price without having done any
+      //    of the work to get verified, they're just going to take the late
+      //    fee. They'll be like, oh, it only saves me a couple bucks and I
+      //    don't have to do all this sign up. So it's not worth it."
+      //
+      // A price read cold is compared against a late fee in the abstract and
+      // loses. The same price read AFTER their own history is on screen — what
+      // they were actually charged, against what this would have cost — is a
+      // different conversation. So the card opens the conversation and the
+      // figure arrives inside it (FLEXPAY_SAVINGS_SPEC).
+      //
+      // It is also no longer ONE price: the grid is rent crossed with the
+      // payday their pull day falls in, $23 to $79, so there is no honest flat
+      // figure to print here even if we wanted one.
+      price: null,
       enrolled: me?.flexpayEnrolled,
       // S581: paused because the tenant now holds more than one lease.
       warning: fpMultiLeasePaused
@@ -3034,6 +3227,7 @@ function ServicesPage() {
       action: () => (fpLaunched && fpApproved) ? setFlexPayModal(true) : setFlexPayInquireModal(true),
       loading: false,
       highlight: me?.flexpayEnrolled
+        // Already enrolled: this is THEIR price, which they agreed to — shown.
         ? `Day ${me.flexpayPullDay} · $${me.flexpayMonthlyFee}/mo`
         : !fpLaunched
           ? (fpInquiry
@@ -3050,7 +3244,9 @@ function ServicesPage() {
           ? (!me?.achVerified ? '⚠ Approved — verify your bank account to enroll' : `✓ Approved — pick your pull day (the ${pullDayRangeText()})`)
           : 'For SSI/SSDI recipients — tap to request access',
       locked: fpLaunched && fpApproved && !me?.achVerified,
-      ctaLabel: !fpLaunched ? 'Take the survey' : fpApproved ? 'Enroll' : 'I’m interested',
+      // 10/27: "Learn more" before any number — the survey and the interest
+      // step are where the probing happens.
+      ctaLabel: !fpLaunched ? 'Learn more' : fpApproved ? 'Enroll' : 'Learn more',
       // statusBadge REPLACES the CTA button — so in survey mode only
       // the already-surveyed state gets one (nothing more to do);
       // the not-yet-surveyed state keeps the "Take the survey" CTA.
@@ -3063,8 +3259,12 @@ function ServicesPage() {
     {
       id: 'flexdeposit',
       name: 'FlexDeposit',
-      desc: 'Split your security deposit into 2–4 monthly installments. Pay the first one at move-in; the rest spread over the next months.',
-      price: '$3/month custody fee',
+      // 10/27: the $3/month custody fee is GONE — there is ONE service fee,
+      // by deposit size and the number of payments, collected in full with the
+      // first payment. The amount is not named here because it depends on both:
+      // the modal shows each choice priced before anything is chosen.
+      desc: 'Split your security deposit into 2 or 4 payments. The first payment and the whole service fee are collected at move-in; the rest come monthly.',
+      price: 'One service fee, by deposit size — shown before you choose',
       enrolled: me?.flexDepositEnrolled,
       action: () => setFlexDepositModal(true),
       loading: false,
@@ -3081,6 +3281,8 @@ function ServicesPage() {
     s.id === 'credit' ? flexVis.flexcredit :
     s.id === 'flexpay' ? flexVis.flexpay :
     flexVis.flexdeposit)
+  // Wait for the answer before acting on it — see useFlexVisibility.
+  if (!flexVis.settled) return <div className="ks" style={{padding:24}}>Loading…</div>
   if (!flexVis.any) return <Navigate to="/home" replace />
 
   return (
@@ -3102,7 +3304,10 @@ function ServicesPage() {
             {s.highlight && <div style={{fontSize:'.75rem',color:'var(--t3)',background:'var(--bg4)',padding:'6px 10px',borderRadius:6}}>{s.highlight}</div>}
             {(s as any).warning && <div className="alert a-warn" style={{fontSize:'.75rem',margin:0,lineHeight:1.45}}>⏸ {(s as any).warning}</div>}
             <div className="dr" style={{border:'none',padding:0}}>
-              <span className="price-tag">{s.price}</span>
+              {/* 10/27: a card may carry NO price (FlexPay) — the figure
+                  arrives inside the conversation, not on the tile. An empty
+                  tag would still hold its space and read as a missing number. */}
+              {s.price ? <span className="price-tag">{s.price}</span> : <span />}
               {s.enrolled
                 ? <span style={{display:'flex',gap:8,alignItems:'center'}}>
                     <span className={`badge ${(s as any).warning ? 'b-amber' : 'b-green'}`}>{(s as any).warning ? '⏸ Paused' : '✓ Active'}</span>
@@ -3695,17 +3900,25 @@ function TenantMyWalkthroughsPage() {
 // Tenant view of own GAM behavioral record. Shows event timeline,
 // payment / property / cooperation roll-ups, and lets tenant open
 // disputes on events they believe are inaccurate. Score itself is
-// internal-only; tenant sees event count + on-time % + streaks.
+// internal-only; tenant sees event count + payment health + streaks.
+//
+// 10/12 (Nic): "the payment history should be a health percentage. one mark
+// per invoice." Each bill carries ONE mark (on time, paid late by its days
+// past grace, partly paid or unpaid past grace — the payment-health rule), and
+// the percent shown is that payment health: bills on time ÷ bills judged
+// (credit stats paymentStats.health). The labels below speak of bills; the
+// grace-period and failed-payment labels are kept for marks written before.
+// (Duplicated in apps/landlord TenantScreeningPage.tsx — keep both in step.)
 
 const EVENT_LABEL: Record<string, string> = {
-  payment_received_on_time:           'Rent paid on time',
+  payment_received_on_time:           'Bill paid on time',
   payment_received_late_grace:        'Paid within grace period',
-  payment_received_late_minor:        'Paid late (minor)',
-  payment_received_late_major:        'Paid late (major)',
-  payment_received_late_severe:       'Paid late (severe)',
-  payment_partial:                    'Partial payment',
+  payment_received_late_minor:        'Bill paid late (1–3 days past grace)',
+  payment_received_late_major:        'Bill paid late (4–15 days past grace)',
+  payment_received_late_severe:       'Bill paid late (16+ days past grace)',
+  payment_partial:                    'Bill partly paid past grace',
   payment_failed_nsf:                 'Payment failed (NSF)',
-  payment_skipped:                    'Payment skipped',
+  payment_skipped:                    'Bill unpaid past grace',
   payment_refunded:                   'Payment refunded',
   lease_signed:                       'Lease signed',
   lease_renewed:                      'Lease renewed',
@@ -3757,8 +3970,9 @@ const EVENT_LABEL: Record<string, string> = {
   multi_landlord_history_clean:       'Clean history across landlords',
 }
 
+// 10/12: a bill paid late is not good news (payment health counts it not on time).
 const POSITIVE_EVENT_TYPES = new Set([
-  'payment_received_on_time','payment_received_late_grace','payment_received_late_minor',
+  'payment_received_on_time','payment_received_late_grace',
   'lease_signed','lease_renewed','lease_terminated_natural','lease_anniversary',
   'proper_notice_given_for_move_out','move_in_inspection_completed','move_out_inspection_completed',
   'move_out_condition_matches_move_in','move_in_photos_submitted','move_out_photos_submitted',
@@ -3803,9 +4017,11 @@ function CreditPage() {
   // Most recent month first
   grouped.reverse()
 
-  const payment = (stats as any)?.paymentStats?.lifetime || {}
-  const onTimePct = payment.onTimePct
-  const totalPayments = payment.totalEvents ?? 0
+  // 10/12 (Nic): the payment health — bills on time ÷ bills judged, one mark per bill.
+  const health = (stats as any)?.paymentStats?.health || {}
+  const healthPct: number | null = typeof health.percent === 'number' ? health.percent : null
+  const billsJudged: number = health.counted ?? 0
+  const billsOnTime: number = health.onTime ?? 0
   const longestStreak = (stats as any)?.paymentStats?.longestOnTimeStreakCount ?? 0
   const currentStreak = (stats as any)?.paymentStats?.currentOnTimeStreakCount ?? 0
 
@@ -3822,7 +4038,8 @@ function CreditPage() {
       <div className="alert a-blue" style={{ marginBottom: 16 }}>
         ℹ️ This is the same record GAM uses internally for FlexPay /
         FlexCharge underwriting. Landlords on the network see specific
-        events, not the underlying score.
+        events, not the underlying score. Each bill counts once: on time
+        when it is paid in full by the last day of its grace period.
       </div>
 
       <div className="grid3" style={{ marginBottom: 16 }}>
@@ -3832,14 +4049,18 @@ function CreditPage() {
           <div className="kpi-s">attested behavior on file</div>
         </div>
         <div className="kpi">
-          <div className="kpi-l">On-time payments</div>
-          <div className="kpi-v">{totalPayments > 0 ? `${onTimePct}%` : '—'}</div>
-          <div className="kpi-s">{totalPayments} payments tracked</div>
+          <div className="kpi-l">Payment health</div>
+          <div className="kpi-v">{healthPct !== null ? `${healthPct}%` : '—'}</div>
+          <div className="kpi-s">
+            {billsJudged > 0
+              ? `${billsOnTime} of ${billsJudged} bill${billsJudged === 1 ? '' : 's'} paid on time`
+              : 'No bills judged yet'}
+          </div>
         </div>
         <div className="kpi">
           <div className="kpi-l">On-time streak</div>
           <div className="kpi-v">{currentStreak}</div>
-          <div className="kpi-s">longest: {longestStreak}</div>
+          <div className="kpi-s">bills in a row · longest: {longestStreak}</div>
         </div>
       </div>
 
@@ -4057,50 +4278,15 @@ function HardshipModal({ onClose }: { onClose: () => void }) {
 }
 
 // ── NOTIFICATION PREFERENCES ─────────────────────────────────
-const TENANT_NOTIFICATION_TYPES: { type: string; label: string }[] = [
-  { type: 'rent_collected',                  label: 'Rent collected' },
-  { type: 'rent_failed',                     label: 'Rent failed' },
-  { type: 'ach_retry_scheduled',             label: 'ACH retry scheduled' },
-  { type: 'ach_retries_exhausted',           label: 'ACH retries exhausted' },
-  { type: 'maintenance_updated',             label: 'Maintenance status update' },
-  { type: 'inspection_ready',                label: 'Inspection ready to sign' },
-  { type: 'inspection_finalized',            label: 'Inspection finalized' },
-  { type: 'inspection_scheduled_reminder',   label: 'Inspection scheduled reminder' },
-  { type: 'entry_request_new',               label: 'New entry request' },
-  { type: 'entry_recorded',                  label: 'Entry recorded by landlord' },
-  { type: 'dispute_resolved',                label: 'Dispute resolved' },
-  { type: 'work_trade_reminder',             label: 'Work trade reminder' },
-  { type: 'amenity_unavailable',             label: 'Amenity unavailable / reserved' },
-  { type: 'reservation_decision',            label: 'Reservation approved / declined' },
-  { type: 'service_interruption',            label: 'Utility outage / service interruption' },
-]
-
+/**
+ * 10/20 (Nic): the fifteen hand-typed rows that used to live here are gone, and
+ * so is the second, shorter list on Profile → Notifications. Both render the one
+ * component (packages/shared-ui/NotificationPreferences) off the one catalog in
+ * @gam/shared, so neither can be missing a type GAM sends — and three of the
+ * rows that were here ('Rent failed', 'Work trade reminder' and the old
+ * 'Disbursement sent' on the landlord side) had no sender behind them at all.
+ */
 function NotificationPrefsPage() {
-  const qc = useQueryClient()
-  const { data: prefs = [], isLoading } = useQuery<any[]>('notification-prefs', () =>
-    get<any[]>('/notifications/preferences'),
-  )
-  const prefMap = new Map<string, any>()
-  for (const p of (prefs as any[])) prefMap.set(p.type, p)
-
-  const update = useMutation(
-    (body: { type: string; emailEnabled: boolean; inAppEnabled: boolean }) =>
-      api.patch('/notifications/preferences', body).then(r => r.data),
-    {
-      onSuccess: () => qc.invalidateQueries('notification-prefs'),
-    },
-  )
-
-  const toggle = (type: string, currentVal: boolean) => {
-    // S554 (button-sweep bug #4): responses are camelized, so an existing
-    // pref lands as emailEnabled/inAppEnabled. The default MUST use the
-    // same camelCase keys — a snake-case default left inAppEnabled
-    // undefined on the (common) no-existing-row path, and the API's
-    // zod .boolean() then 400'd the PATCH, so no pref ever saved.
-    const current = prefMap.get(type) || { emailEnabled: true, inAppEnabled: true }
-    update.mutate({ type, emailEnabled: !currentVal, inAppEnabled: current.inAppEnabled ?? true })
-  }
-
   return (
     <div>
       <div className="ph">
@@ -4109,37 +4295,13 @@ function NotificationPrefsPage() {
           <p className="ps">Choose how GAM contacts you</p>
         </div>
       </div>
-      <div className="alert a-blue" style={{ marginBottom: 16 }}>
-        ℹ️ In-app notifications always show in your dashboard. Email is an
-        optional channel per notification type.
-      </div>
-      <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
-        {isLoading ? (
-          <div style={{ padding: 32, color: 'var(--t3)', textAlign: 'center' }}>Loading…</div>
-        ) : (
-          <table className="tbl" style={{ minWidth: 480 }}>
-            <thead>
-              <tr>
-                <th>Notification</th>
-                <th style={{ textAlign: 'center' }}>Email</th>
-              </tr>
-            </thead>
-            <tbody>
-              {TENANT_NOTIFICATION_TYPES.map(({ type, label }) => {
-                const p = prefMap.get(type) || { emailEnabled: true, inAppEnabled: true }
-                return (
-                  <tr key={type}>
-                    <td style={{ color: 'var(--t0)' }}>{label}</td>
-                    <td style={{ textAlign: 'center' }}>
-                      <input type="checkbox" checked={p.emailEnabled} onChange={() => toggle(type, p.emailEnabled)} />
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
+      <NotificationPreferences
+        audience="tenant"
+        api={{
+          get:   (url) => get<any[]>(url),
+          patch: (url, body) => api.patch(url, body).then(r => r.data),
+        }}
+      />
     </div>
   )
 }
@@ -5085,6 +5247,11 @@ function Root() {
 }
 
 installDatePickerAutoClose()
+
+// 10/26 (Nic): a printed page is always the light theme, whatever the screen
+// is set to — he printed an eviction balance summary in dark mode and got a
+// solid black sheet. Installed once here; restores the viewer's theme after.
+installPrintLightTheme()
 
 // HMR guard: when Vite re-executes this entry module, calling createRoot on
 // the same container again STACKS a second mounted app under the first

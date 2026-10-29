@@ -123,6 +123,37 @@ export function BackgroundCheckPage() {
   // doesn't allow. Address is now plain manual entry, verified only by GAM's own
   // /background/verify-address endpoint. (This whole legacy intake step is dropped
   // entirely under Checkr, which collects the address on its hosted flow.)
+  // ── 10/26 (Nic): PROOF OF INCOME, OPTIONAL ──
+  //
+  //   "We don't have any way on the application for when people do the
+  //    background check, we don't have any way for them to upload proof of
+  //    income... We probably need to start adding that."
+  //
+  // S636 care: this is NOT the six-page intake coming back. One row, never
+  // required, never a gate on submitting, and not sent to the screener —
+  // Checkr collects what it needs on its own flow. GAM keeps it so it can
+  // answer its own later question about fixed income (FlexPay eligibility).
+  const [incomeDocs, setIncomeDocs] = useState<Array<{ url: string; filename: string }>>([])
+  const [incomeUploading, setIncomeUploading] = useState(false)
+  const [incomeError, setIncomeError] = useState<string | null>(null)
+  const uploadIncomeDoc = async (file: File) => {
+    setIncomeError(null)
+    const token = tok()
+    if (!token) { setIncomeError('Finish the payment step first, then attach it.'); return }
+    setIncomeUploading(true)
+    try {
+      const body = new FormData()
+      body.append('file', file)
+      const r = await fetch(`${API}/api/background/upload-income`, {
+        method: 'POST', headers: { Authorization: `Bearer ${token}` }, body,
+      })
+      const j = await r.json()
+      if (!r.ok || !j?.data?.url) throw new Error(j?.error || 'That file could not be attached.')
+      setIncomeDocs(d => [...d, { url: j.data.url, filename: j.data.filename }])
+    } catch (e: any) {
+      setIncomeError(e?.message || 'That file could not be attached.')
+    } finally { setIncomeUploading(false) }
+  }
   const [form, setForm] = useState({ firstName:'', lastName:'', dob:'', ssn:'', email:'', password:'', confirmPassword:'', street1:'', street2:'', city:'', state:'', zip:'', years:'', empStatus:'employed', employer:'', empPhone:'', income:'', prevName:'', prevPhone:'', prevEmail:'', moveIn:'', stay:'', consentCredit:false, consentCriminal:false, consentPool:false, acceptedTerms:false })
   const set = (k: string, v: any) => setForm(f=>({...f,[k]:v}))
   // S642: an anonymous walk-up now lands HERE rather than being bounced to
@@ -190,6 +221,9 @@ export function BackgroundCheckPage() {
         firstName:form.firstName, lastName:form.lastName,
         zip: isSpeculative ? form.zip : null,
         consentPool:form.consentPool,
+        // 10/26: whatever they chose to attach, or an empty list. Optional
+        // throughout — the server stores it and the screener never sees it.
+        incomeDocUrls: incomeDocs.map(d => d.url),
         // ── S637 (Nic): THE QR'S LANDLORD HAS TO SURVIVE TO THE SUBMIT ──
         //
         // "I thought the check was linked to the QR code locked to the
@@ -751,6 +785,35 @@ export function BackgroundCheckPage() {
                 </div>
               </div>
             </label>}
+            {/* 10/26 (Nic): optional proof of income. One row, no step of its
+                own, and nothing here blocks Continue. */}
+            <div style={{marginBottom:14,padding:'14px 16px',background:'#141a22',border:'1px solid #1e2530',borderRadius:10}}>
+              <div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:4}}>
+                Proof of income <span style={{fontSize:'.7rem',fontWeight:400,color:'#c9a227'}}>(optional)</span>
+              </div>
+              <div style={{fontSize:'.75rem',color:'#4a5568',lineHeight:1.5,marginBottom:10}}>
+                A benefit letter, pay stub or award letter, if you have one handy. It is not part
+                of your screening report and is not sent to the screening company — it helps us
+                know which payment options you may qualify for later. JPEG, PNG or PDF, up to
+                10MB.
+              </div>
+              {incomeDocs.length > 0 && (
+                <div style={{marginBottom:10,display:'flex',flexDirection:'column',gap:6}}>
+                  {incomeDocs.map(d => (
+                    <div key={d.url} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:10,fontSize:'.75rem',color:'#b8c4d8'}}>
+                      <span style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{d.filename}</span>
+                      <button type="button" onClick={() => setIncomeDocs(x => x.filter(y => y.url !== d.url))}
+                        style={{background:'none',border:'none',color:'#c9a227',cursor:'pointer',fontSize:'.72rem',flexShrink:0}}>Remove</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <input type="file" accept="image/jpeg,image/png,application/pdf" disabled={incomeUploading}
+                onChange={e => { const f = e.target.files?.[0]; if (f) uploadIncomeDoc(f); e.currentTarget.value = '' }}
+                style={{fontSize:'.75rem',color:'#b8c4d8'}}/>
+              {incomeUploading && <div style={{fontSize:'.72rem',color:'#4a5568',marginTop:6}}>Attaching…</div>}
+              {incomeError && <div style={{fontSize:'.72rem',color:'#ef4444',marginTop:6}}>{incomeError}</div>}
+            </div>
             <div style={{padding:'10px 14px',background:'#141a22',border:'1px solid #1e2530',borderRadius:8,fontSize:'.72rem',color:'#4a5568',lineHeight:1.5}}>By continuing I certify all information provided is accurate. Providing false information is grounds for immediate denial.</div>
         </div>}
         {STEPS[step]==='Review & Pay'&&<div style={{textAlign:'center'}}>

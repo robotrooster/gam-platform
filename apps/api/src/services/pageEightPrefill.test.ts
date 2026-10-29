@@ -8,6 +8,8 @@
  *    deposit is not really gonna apply to RVs because the tenants own those."
  */
 import { describe, it, expect, beforeEach, afterAll } from 'vitest'
+import { readFileSync } from 'fs'
+import { join } from 'path'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
 import { createDocumentRecord } from '../routes/esign'
@@ -141,6 +143,33 @@ describe('S648 page 8 rent lines, deposit copy and total', () => {
     expect(await page8()).toEqual({
       move_in_first_month_rent: '0.00', move_in_proration: '250.00',
       move_in_security_deposit: '350.00', move_in_total_due: '1100.00',
+    })
+  })
+
+  /**
+   * 10/18 (Nic): "the only way it is different is for longer term people for
+   * rent pro ration. moving in or out at the middle of a month and also only if
+   * the landlord allows the pro rate. these should all be property level
+   * settings." Page 8 IS the move-in invoice, so a park where a whole month is
+   * a whole month must not have a cut month printed on its leases — answering
+   * No changed nothing here at all (10/19 review), while the card's own words
+   * promised "moving in and moving out alike".
+   *
+   * Every other test in this file runs WITHOUT the migration that adds the
+   * column, which is the proof that the read falls back to proration.
+   */
+  it('a park where a whole month is a whole month bills the month they moved into', async () => {
+    const f = await seed('apartment')
+    await db.query(readFileSync(join(__dirname, '..', 'db', 'migrations',
+      '20261020120000_leaving_early_is_the_propertys_call.sql'), 'utf8'))
+    await db.query(`UPDATE properties SET prorates_mid_month_rent = FALSE WHERE id = $1`, [f.propertyId])
+    await draft(f)
+    // $500 a month from September 16. A park that prorates bills $250 for the
+    // half month; this one bills all of it, on the same line — so the total
+    // moves by exactly that $250 and nothing else does.
+    expect(await page8()).toEqual({
+      move_in_first_month_rent: '0.00', move_in_proration: '500.00',
+      move_in_security_deposit: '350.00', move_in_total_due: '1350.00',
     })
   })
 

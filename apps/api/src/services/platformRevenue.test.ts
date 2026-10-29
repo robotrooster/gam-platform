@@ -13,7 +13,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { db } from '../db'
 import { logger } from '../lib/logger'
-import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, setEffectiveProcessingRate } from '../test/dbHelpers'
 import { recordPlatformRevenue, recordScreeningEarnings, restateRunningBalance, trueUpProcessingMargin } from './platformRevenue'
 
 beforeEach(async () => {
@@ -21,12 +21,15 @@ beforeEach(async () => {
   await db.query(`DELETE FROM platform_revenue_ledger`)
   await db.query(`DELETE FROM stripe_processing_costs`)
   await db.query(`DELETE FROM tenant_remittances`)
-  await db.query(`DELETE FROM platform_processing_rates WHERE payment_method = 'card' AND effective_until IS NULL`)
-  // The live card row: customer 3.5% + $0.55, Stripe's cost 2.9% + $0.26.
-  await db.query(
-    `INSERT INTO platform_processing_rates
-       (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent, effective_from, notes)
-     VALUES ('card', 0.55, 3.50, 0.26, 2.90, NOW(), 'S650 test')`)
+  // The live card row: customer 3.5% + $0.55, Stripe's cost 2.9% + $0.26. STATED
+  // rather than deleted-and-reinserted: a rate row is effective-dated and is
+  // retired, never removed, and what an earlier file left open is irrelevant.
+  await setEffectiveProcessingRate(db, {
+    paymentMethod: 'card',
+    customerFacingFlat: 0.55, customerFacingPercent: 3.5,
+    stripeCostFlat: 0.26, stripeCostPercent: 2.9,
+    notes: 'S650 test',
+  })
 })
 
 const ledger = async () => (await db.query<{ type: string; amount: string }>(

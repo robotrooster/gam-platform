@@ -9,14 +9,14 @@ import { sendNotificationEmail } from './email'
 import { logger } from '../lib/logger'
 import { todayIn } from '../lib/timezone'
 import {
-  WAITLIST_CLAIM_WINDOW_MINUTES, priceStay, BOOKING_MONTHLY_DEPOSIT_DEFAULT,
+  WAITLIST_CLAIM_WINDOW_MINUTES, priceStay,
   SHORT_STAY_LOCKED_UNIT_TYPES, processingFeeFor, stayHeldWords, longCalendarDate,
   STAY_LEASE_CHOICE_NIGHTS, type CardFeePayer, type StayTerms,
 } from '@gam/shared'
 import {
   stayNeeds, chooseStayTerms, recordScreeningPrepayment, type StayNeeds, type RecordedPrepayment,
 } from './stayTerms'
-import { LEASE_OR_STAY_WORDS, dueNowFor, firstStayMonth, leaseFromStay, type DueNow } from './propertyBookingQuote'
+import { LEASE_OR_STAY_WORDS, depositForStay, dueNowFor, firstStayMonth, leaseFromStay, type DueNow } from './propertyBookingQuote'
 import { activateBillingForMoneyMoved } from './billingActivation'
 
 // ============================================================
@@ -147,31 +147,13 @@ function quoteStay(unit: UnitRow, prop: PropertyRow, checkIn: string, checkOut: 
 }
 
 /**
- * The deposit on a stay, from the property's own two settings.
- *
- * A flat amount for a stay of 30+ nights (S547: the percentage is for short
- * stays only) — hard-capped at one month's rent regardless of what the flat
- * setting says. Everything shorter is a percentage of the taxed total.
- * 10/6: decided by the stay's LENGTH, not by the rate it is charged at — a
- * 25-night stay charged at the monthly rate (the lower price) is still a short
- * stay and owes the percentage.
- *
- * S652: pulled out of quoteStay so a reservation taken at the COUNTER quotes
- * the same deposit the booking site would have. A guest who phones and a guest
- * who books online are buying the same nights on the same site and must not be
- * told two different numbers. (memory: gam-register-price-is-its-own-thing)
+ * The deposit on a stay — services/propertyBookingQuote's `depositForStay`,
+ * re-exported because this is where every door that is not the booking site
+ * has always imported it from. 10/20 (review): it moved next to the booking
+ * site's own quote, which had been carrying a second copy of the same
+ * arithmetic, and the two had drifted on a site with no monthly rate on it.
  */
-export function depositForStay(
-  prop: { booking_deposit_pct: string | number; booking_monthly_deposit: string | number | null },
-  stay: { total: number; nights: number; monthlyRate: number | null },
-): number {
-  if (stay.nights >= STAY_LEASE_CHOICE_NIGHTS && stay.monthlyRate != null && stay.monthlyRate > 0) {
-    const flat = prop.booking_monthly_deposit != null
-      ? Number(prop.booking_monthly_deposit) : BOOKING_MONTHLY_DEPOSIT_DEFAULT
-    return Math.round(Math.min(flat, stay.monthlyRate) * 100) / 100
-  }
-  return Math.round(stay.total * (Number(prop.booking_deposit_pct) / 100) * 100) / 100
-}
+export { depositForStay } from './propertyBookingQuote'
 
 /**
  * What deposit to ask for on a reservation the counter just took.
@@ -180,9 +162,20 @@ export function depositForStay(
  * (minimum stay, maximum stay, no past check-in), and a staff reservation is
  * allowed to break all three — somebody standing at the desk can book one night
  * where the website requires two. Only the money is shared.
+ *
+ * 10/18 (review) — A STAY PRICED BY HAND IS STILL PRICED. A site with no rate
+ * on it anywhere prices at nothing, and the counter is allowed to take that
+ * reservation at a typed total (routes/units: the rate card, "falling back to a
+ * client-supplied total only when no rate is set"). Quoting the rate card alone
+ * then told the desk the guest "owes no deposit on this stay" as a fact about
+ * the park — on a park that does take one. So when the rate card prices this
+ * stay at nothing, the reservation's OWN price is what the percentage is taken
+ * of. `bookedTotal` is that price: the reservation form passes what it saved,
+ * and the schedule's deposit button passes what the reservation says.
  */
 export async function quoteStayDeposit(
   unitId: string, checkIn: string, checkOut: string,
+  opts: { bookedTotal?: number | null } = {},
 ): Promise<number> {
   const row = await queryOne<any>(
     `SELECT u.nightly_rate, u.weekly_rate, u.monthly_rate,
@@ -200,7 +193,119 @@ export async function quoteStayDeposit(
       weekly:  num(row.weekly_rate)  ?? num(row.p_weekly),
       monthly: monthlyRate },
     row.short_term_tax_rate, checkIn, nights)
-  return depositForStay(row, { total: price.total, nights, monthlyRate })
+  const total = price.total > 0 ? price.total : Math.max(0, round2(Number(opts.bookedTotal) || 0))
+  return depositForStay(row, { total, nights, monthlyRate })
+}
+
+/**
+ * 10/17 (Nic) — GAM PICKS THE SITE, AND THE GUEST IS NOT TOLD WHICH ONE.
+ *
+ * Asked whether a pay link has to name a site: "pay links work the same as
+ * booking site — no site details given to the customer until morning of
+ * arrival. the system can assign it but may move it as needed for compression."
+ *
+ * So a stay sold on a pay link no longer waits for the cashier to pick a spot
+ * off a list. The cashier rings the stay and the dates; this picks a site that
+ * is genuinely free for those nights, and the guest learns which one on the
+ * morning they arrive. That is also what makes compression possible — nobody
+ * was promised RV 14, so RV 14 can be freed for a rig that needs it.
+ *
+ * IT PICKS THE WAY THE BOOKING SITE PICKS — same sites, same order. Nic's
+ * sentence is "pay links work the same as booking site", and that is not only
+ * about what the guest is told; it is which sites are even candidates and which
+ * one wins.
+ *
+ *   • WHICH SITES: the booking site's own list (propertyBookingQuote
+ *     bookableUnits) — the sites the operator has switched on for short stays
+ *     (`is_bookable`) and whose allowed lease types include a short stay. An
+ *     earlier draft of this asked only "vacant, not storage, has a rate", and
+ *     at Mountain View that chose MH 3.5: a mobile home, switched OFF for short
+ *     stays, allowed only month-to-month and long-term, which priced at the
+ *     park's RV rate purely because the fallback found no rate of its own.
+ *     Seven such homes sort ahead of every RV site alphabetically, so EVERY
+ *     link would have landed on one.
+ *   • WHICH ONE: best fit (scheduleCompression rankUnitsBestFit), the same
+ *     ranking the booking site uses at booking time — the stay slots into the
+ *     snuggest gap so wide-open sites stay free for longer stays. First-fit in
+ *     unit-number order would scatter short stays across empty sites and leave
+ *     the park unable to take a two-week rig.
+ *
+ * And it is what makes "may move it as needed for compression" true: the
+ * nightly packer only ever looks at that same bookable list, so a stay parked
+ * outside it could never be moved. Nobody was promised RV 14, so RV 14 can be
+ * freed for a 40-footer — but only if the stay is somewhere the packer looks.
+ *
+ * FREE MEANS THE SAME THING IT MEANS EVERYWHERE ELSE. The last word is the
+ * shared per-site test (services/registerStay siteIsFree: another booking, a
+ * lease, or an out-of-order window), asked of the candidates in best-fit order,
+ * because it is stricter than the ranking in the one way that matters here — a
+ * guest who paid for a week and never showed still holds those nights
+ * (10/17 Nic), and the ranking would hand their site to somebody else. A site
+ * under an unpaid hold is also not taken: a link is not payment and displaces
+ * nobody.
+ *
+ * Storage is never a candidate (SHORT_STAY_LOCKED_UNIT_TYPES — a site switched
+ * on for short stays cannot be storage, so this is a guard on old rows), and
+ * neither is a site with no rate for this length of stay: one that cannot be
+ * priced cannot be sold.
+ *
+ * Returns null when the park is genuinely full for those nights; the caller
+ * says so in its own words.
+ */
+export async function chooseFreeSite(
+  client: Pick<PoolClient, 'query'>,
+  opts: { propertyId: string; landlordId: string; checkIn: string; checkOut: string
+          /** What one of quantity buys — the site needs a rate for it. */
+          stayUnit: 'night' | 'week' | 'month'
+          /**
+           * 10/20 — SPACES THE CALLER HAS ALREADY HAD TO REFUSE.
+           *
+           * The ranking below reads the pool, so asking twice in one
+           * transaction scores both tries against the same board and hands
+           * back the same space again. A caller that takes the space and finds
+           * it gone (services/reservationImport's placement retry) says so
+           * here, and the next ask looks past it instead of spinning on it and
+           * then telling a guest the park is full with spaces still empty.
+           * Empty by default: nothing else's behavior changes.
+           */
+          excludeUnitIds?: string[] },
+): Promise<{ id: string; unitNumber: string } | null> {
+  const { bookableUnits } = await import('./propertyBookingQuote')
+  const { rankUnitsBestFit } = await import('./scheduleCompression')
+  const { siteIsFree, STAY_RATE_COLUMN } = await import('./registerStay')
+  const rateCol = STAY_RATE_COLUMN[opts.stayUnit]
+  // The property's own rate is the fallback for a site that has none of its
+  // own — the same two places and the same order every other door reads
+  // (the counter's site list, the booking site's quote).
+  const prop = await queryOne<any>(
+    `SELECT landlord_id, nightly_rate, weekly_rate, monthly_rate FROM properties WHERE id = $1`,
+    [opts.propertyId])
+  if (!prop || prop.landlord_id !== opts.landlordId) return null
+  const bookable = (await bookableUnits(opts.propertyId)).filter((u: any) =>
+    !(SHORT_STAY_LOCKED_UNIT_TYPES as readonly string[]).includes(u.unit_type ?? '')
+    && Number(u[rateCol] ?? prop[rateCol] ?? 0) > 0)
+  if (!bookable.length) return null
+  // Retired and in-use sites are left out here rather than relied on from the
+  // booking site's list, which does not ask (a retired site keeps whatever
+  // flags it had). `vacant` is the counter's own rule for a site it may sell.
+  // Ordered, because the ranking breaks a tie on the order it is handed: on an
+  // empty park every site scores the same, and without this the winner would be
+  // whatever order the database happened to return.
+  const open = await client.query<{ id: string; unit_number: string }>(
+    `SELECT id, unit_number FROM units
+      WHERE id = ANY($1::uuid[]) AND landlord_id = $2
+        AND retired_at IS NULL AND status = 'vacant'
+        AND NOT (id = ANY($3::uuid[]))
+      ORDER BY unit_number`,
+    [bookable.map((u: any) => u.id), opts.landlordId, opts.excludeUnitIds ?? []])
+  const numberById = new Map(open.rows.map(r => [r.id, r.unit_number]))
+  const ranked = await rankUnitsBestFit([...numberById.keys()], { checkIn: opts.checkIn, checkOut: opts.checkOut })
+  for (const id of ranked) {
+    if (await siteIsFree(client, id, opts.checkIn, opts.checkOut)) {
+      return { id, unitNumber: numberById.get(id)! }
+    }
+  }
+  return null
 }
 
 /** Landlord's Connect account for destination charges; null if not onboarded. */
@@ -323,11 +428,15 @@ interface StayPlan {
  */
 async function planStay(
   prop: PropertyRow, unit: UnitRow,
-  o: { checkIn: string; checkOut: string; email: string; stayTerms?: StayTerms | null },
+  o: { checkIn: string; checkOut: string; email: string; guestName?: string | null; stayTerms?: StayTerms | null },
 ): Promise<StayPlan> {
   const quote = quoteStay(unit, prop, o.checkIn, o.checkOut)
   const ask = (checkOut: string, stayTerms: StayTerms | null) => stayNeeds({
-    landlordId: prop.landlord_id, propertyId: prop.id, email: o.email,
+    // 10/20 (review): the name they booked under travels with the address. A
+    // returning guest is derived from GAM's own record of their stays, and an
+    // address on its own is a mailbox two people share — the name is what says
+    // which of them this is (services/stayTerms samePersonName).
+    landlordId: prop.landlord_id, propertyId: prop.id, email: o.email, guestName: o.guestName ?? null,
     checkIn: o.checkIn, checkOut, stayTerms,
   })
   let needs = await ask(o.checkOut, o.stayTerms ?? null)
@@ -357,6 +466,26 @@ async function planStay(
     heldWords: terms === 'stay' ? stayHeldWords(checkOut) : null,
   }
 }
+
+/**
+ * 10/20 (review, R9): does this stay's check-in WAIT on a background check?
+ *
+ * The flag used to be `screening !== 'not_needed'`, which marked a RETURNING
+ * guest as waiting on a check nobody was ever going to run. For the landlord's
+ * attested returning guest it only looked harmless (attestReturningGuest
+ * clears the flag a moment later); for one GAM derived from its own records it
+ * was the blocker — nothing is written for a derived waiver, so nothing ever
+ * cleared the mark, and check-in refused a guest who was standing at the gate
+ * having paid, with no button on the screen that could let them in.
+ *
+ * 'on_file' still waits: there IS a check, and R9 waits for its result and the
+ * landlord's decision. 'fee_due' waits: the check has to happen. 'returning'
+ * and 'not_needed' never wait, because there is no check to wait for.
+ * (checkInBlock derives the same answer again at the gate rather than trusting
+ * this flag, so a stay sold before today is admitted too.)
+ */
+const screeningWaits = (needs: StayNeeds): boolean =>
+  needs.screening === 'on_file' || needs.screening === 'fee_due'
 
 /**
  * 10/6: a booking-site stay's lease_type from its length (as the schedule's
@@ -424,7 +553,8 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
   const prop = await resolvePropertyBySlug(opts.slug)
   const unit = await resolveUnit(prop.id, opts.unitId)
   const plan = await planStay(prop, unit, {
-    checkIn: opts.checkIn, checkOut: opts.checkOut, email: opts.guestEmail, stayTerms: opts.stayTerms,
+    checkIn: opts.checkIn, checkOut: opts.checkOut, email: opts.guestEmail,
+    guestName: opts.guestName, stayTerms: opts.stayTerms,
   })
   const connect = await landlordConnect(prop.landlord_id)
   // S547 dev-mock: demo landlords have no Connect account, so outside
@@ -464,7 +594,7 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
        opts.requiredSiteLayout ?? 'none', opts.requiredAmpService ?? 'none',
        opts.note?.trim() || null,
        // R2: the answer is saved with the stay; R9: check-in waits on screening.
-       plan.terms, plan.needs.screening !== 'not_needed'])
+       plan.terms, screeningWaits(plan.needs)])
     const bookingId = ins.rows[0].id
     await client.query('COMMIT')
 
@@ -549,7 +679,7 @@ export async function claimQuote(token: string): Promise<null | {
   if (!w) return null
   const prop = await resolvePropertyBySlug(w.booking_slug)
   const unit = await resolveUnit(prop.id, w.unit_id)
-  const o = { checkIn: w.check_in_ymd, checkOut: w.check_out_ymd, email: w.guest_email }
+  const o = { checkIn: w.check_in_ymd, checkOut: w.check_out_ymd, email: w.guest_email, guestName: w.guest_name }
   try {
     const plain = await planStay(prop, unit, o)
     return {
@@ -707,11 +837,18 @@ export async function confirmBookingDeposit(
     if (b && paid) {
       const deposit = Number(b.deposit_amount ?? 0)
       const charged = chargedCents / 100
-      // GAM's fee is on the whole charge (the stay's part + any check), and
-      // comes out whoever paid it: on top (charged = base + fee) or absorbed
-      // (charged = base).
+      // GAM's fee comes out whoever paid it: on top (charged = base + fee) or
+      // absorbed (charged = base).
+      //
+      // 10/21 (Nic): it is figured on the STAY's part alone. A background check
+      // is one price with its own processing already inside it, so its line
+      // takes no fee on top (dueNowFor / cardFeeSplit's feeExempt) — and this
+      // is the same base the checkout actually charged. Figuring it on the
+      // whole charge, as it did, took the check's share of the fee out of the
+      // landlord's money: a $900 month with a $46.03 check held $898.39.
       const base = round2(deposit + screening)
-      const cardFee = processingFeeFor({ amount: base, paymentMethod: 'card' })
+      const feeBase = round2(Math.max(0, deposit))
+      const cardFee = feeBase > 0 ? processingFeeFor({ amount: feeBase, paymentMethod: 'card' }) : 0
       const baseCents = Math.round(base * 100)
       if (chargedCents !== baseCents && chargedCents !== baseCents + Math.round(cardFee * 100)) {
         logger.error({ bookingId, deposit, screening, cardFee, got: chargedCents }, '[propertyBooking] deposit amount mismatch — holding what was charged, less the card fee')
@@ -728,6 +865,7 @@ export async function confirmBookingDeposit(
       if (held > 0) {
         await recordHeldItem({
           landlordId: b.landlord_id, sourceType: 'booking_deposit', sourceId: bookingId,
+          property: { propertyId: b.property_id },  // 10/12 (Nic, ledger P1): the booked site's property
           // A no-lease stay's first month is paid whole, not as a deposit (R5).
           amount: held, description: Number(b.total_amount) > 0 && Number(b.total_amount) === deposit ? 'Stay payment' : 'Stay deposit',
         }, client)
@@ -853,7 +991,7 @@ async function emailClaimLink(w: any, token: string): Promise<void> {
   // 10/5 (Nic): what a long stay asks of them before they pay — the background
   // check's fee (R8, from stayNeeds) and the lease-or-stay choice (R2).
   const needs = await stayNeeds({
-    landlordId: slugRow.landlord_id, propertyId: w.property_id, email: w.guest_email,
+    landlordId: slugRow.landlord_id, propertyId: w.property_id, email: w.guest_email, guestName: w.guest_name,
     checkIn: w.check_in_ymd, checkOut: w.check_out_ymd,
   }).catch(err => { logger.error({ err, waitlist_id: w.id }, '[waitlist] long-stay rules for the claim email failed'); return null })
   const longStay = [

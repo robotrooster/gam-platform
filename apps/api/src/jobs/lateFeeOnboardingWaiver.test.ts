@@ -52,9 +52,12 @@ async function seedOverdue(opts: {
 
     const mkInvoice = async (daysAgo: number, stamped: boolean) => {
       const inv = await c.query<{ id: string }>(
+        // 10/12 (Nic): written before it came due, as the monthly run writes it
+        // (a bill written after its due date counts from the day it was written).
         `INSERT INTO invoices (landlord_id, lease_id, unit_id, invoice_number, due_date,
-                               subtotal_rent, total_amount, status, late_fee_exempt)
-         VALUES ($1,$2,$3,$4,(NOW() AT TIME ZONE $5)::date - $6::int, $7,$7,'pending',$8)
+                               subtotal_rent, total_amount, status, late_fee_exempt, created_at)
+         VALUES ($1,$2,$3,$4,(NOW() AT TIME ZONE $5)::date - $6::int, $7,$7,'pending',$8,
+                 NOW() - make_interval(days => $6::int + 3))
          RETURNING id`,
         [ll.landlordId, leaseId, unitId, `INV-${Math.random().toString(36).slice(2, 10)}`,
          TZ, daysAgo, rent, stamped])

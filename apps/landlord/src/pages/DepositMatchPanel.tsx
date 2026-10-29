@@ -9,8 +9,9 @@
 // the same rent, an amount identifies nobody, and a confident wrong answer books
 // one tenant's money onto another's ledger and then onto their credit file. So
 // every row here is a SHORTLIST with its reasoning shown, and the landlord picks
-// — except where a tenant reported the deposit themselves and the bank confirms
-// it, which settles before this screen ever sees it.
+// — a tenant's own report the bank shows included: 10/14 (Nic, answer 16, "no
+// guessing") it no longer settles before this screen sees it; it is picked
+// here (preselect) for the landlord to confirm.
 //
 // The "Not a rent payment" button matters more than it looks: without it, a
 // landlord staring at a list of tenants who did NOT pay this deposit has no

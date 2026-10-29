@@ -1,156 +1,101 @@
 /**
- * S655 money plan, Step 15: the "Money received" / "Money billed" switch.
+ * The screen math every report shares — one copy, so a card and the report it
+ * opens cannot add the same figures up two ways.
  *
- * Nic (10/2): "a landlord should be able to see how much money came in this
- * month, ACTUALLY came in, versus how much money actually was SCHEDULED to come
- * in... people need to be able to see it both ways."
- *
- * ONE switch, default Money received, drives every report, the dashboard's
- * income card, its trend and the property-health card. The choice is per
- * browser (a viewer's convenience, never shared state): it lives in
- * localStorage, every read and write is wrapped, and a page renders correctly
- * on the default when storage is missing, blocked or throws.
- *
- * The screen math the pages share lives here as small pure functions, so a
- * card and the report it opens cannot add the same figures up two ways.
+ * 10/12 (Nic): "NO 'Money received / Money billed' toggle anywhere — show
+ * Charged, Received and Owed side by side as columns, with a short line
+ * showing how they tie." The switch (S655, Step 15) is retired: every report
+ * reads both kinds of facts and the API sends the three columns, their tie
+ * line and the net on each money column (services/incomeBasis MoneyView). Its
+ * localStorage choice is no longer read or written.
  */
-import { useCallback, useEffect, useState } from 'react'
 import {
-  INCOME_BASES, DEFAULT_INCOME_BASIS, INCOME_BASIS_LABEL, INCOME_BASIS_NOTE,
   INCOME_LINES, INCOME_LINE_LABEL,
   BILLED_PARTS, BILLED_PART_LABEL, INCOME_CATEGORY_LABEL,
-  EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, humanize,
-  type IncomeBasis, type BilledPart, type IncomeCategory, type IncomeLine,
+  EXPENSE_CATEGORIES, EXPENSE_CATEGORY_LABEL, MONEY_COLUMNS, MONEY_COLUMN_LABEL, MONEY_COLUMN_NOTE, MONEY_COLUMN_NOTE_LEDGER, humanize,
+  type BilledPart, type IncomeCategory, type IncomeLine, type MoneyColumn,
 } from '@gam/shared'
-
-export type { IncomeBasis }
-
-export const INCOME_BASIS_STORAGE_KEY = 'gam_income_basis'
 
 const round2 = (n: number) => Math.round(n * 100) / 100
 
-// ─── The choice ──────────────────────────────────────────────────────────────
+// ─── The three columns ───────────────────────────────────────────────────────
 
-/** Anything that is not a known basis reads as the default (Money received). */
-export function parseBasis(raw: unknown): IncomeBasis {
-  const v = typeof raw === 'string' ? raw.trim().toLowerCase() : ''
-  return (INCOME_BASES as readonly string[]).includes(v) ? (v as IncomeBasis) : DEFAULT_INCOME_BASIS
+export interface MoneyThree { charged: number; received: number; owed: number }
+
+/**
+ * Received, Charged, Owed — in Nic's order (10/12, L2: Received leads), with
+ * their labels and plain notes (the shared words). 10/12 (ledger P8):
+ * `fromBooks` — the reports read the company's books, where Owed is what
+ * tenants still owed at the end of the period (MONEY_COLUMN_NOTE_LEDGER).
+ */
+export function moneyColumns(fromBooks = false): Array<{ key: MoneyColumn; label: string; note: string }> {
+  const notes = fromBooks ? MONEY_COLUMN_NOTE_LEDGER : MONEY_COLUMN_NOTE
+  return MONEY_COLUMNS.map(k => ({ key: k, label: MONEY_COLUMN_LABEL[k], note: notes[k] }))
 }
 
-type BasisStore = Pick<Storage, 'getItem' | 'setItem'>
+export interface MoneyViewLine extends MoneyThree { line: string; label: string }
+export interface MoneyViewCategory extends MoneyThree { category: string; label: string }
+/** 10/14 (Nic I1): a Detailed-view line (services/incomeBasis MoneyViewDetail) with its subtypes. */
+export interface MoneyViewDetail extends MoneyThree { key: string; label: string; category: string | null; subtypes: Array<MoneyThree & { name: string }> }
 
-/** The browser's storage, or null where touching it throws (private mode, blocked site data). */
-function browserStore(): BasisStore | null {
-  try {
-    return typeof window !== 'undefined' && window.localStorage ? window.localStorage : null
-  } catch {
-    return null
+/** The API's three-column view of a period (services/incomeBasis MoneyView). */
+export interface MoneyView extends MoneyThree {
+  collected: number
+  clearing: number
+  lines: MoneyViewLine[]
+  categories: MoneyViewCategory[]
+  uncategorized: MoneyViewLine[]
+  tie: {
+    charged: { collected: number; clearing: number; owed: number; other: number }
+    received: { forPeriodBills: number; forEarlierBills: number; paidAhead: number; noBill: number }
+    stillClearing: number
+  }
+  /** How the columns tie, in plain words — printed as is. */
+  tieText: string[]
+  /** In no column: work trade, deposits held, owner money in, chargeback costs, paid ahead not used yet. */
+  beside: BesideItem[]
+  /** 10/12 (Nic, review): 'ledger' when the view was read from the company's books (Owed is then a balance at the period's end). */
+  source?: 'ledger'
+  /** 10/14 (Nic I1): the Detailed view's lines (income itemized by space, home sales), when the books itemized it. */
+  details?: MoneyViewDetail[]
+}
+
+/** Add rows of the three columns to the cent. */
+export function sumThree(rows: ReadonlyArray<Partial<MoneyThree>>): MoneyThree {
+  return {
+    charged: round2(rows.reduce((s, r) => s + (Number(r.charged) || 0), 0)),
+    received: round2(rows.reduce((s, r) => s + (Number(r.received) || 0), 0)),
+    owed: round2(rows.reduce((s, r) => s + (Number(r.owed) || 0), 0)),
   }
 }
 
-/** The viewer's last choice; Money received when there is none or storage fails. */
-export function readIncomeBasis(store: BasisStore | null = browserStore()): IncomeBasis {
-  try {
-    return parseBasis(store?.getItem(INCOME_BASIS_STORAGE_KEY))
-  } catch {
-    return DEFAULT_INCOME_BASIS
+/** True when rows add up to a total in every column, to the cent. */
+export function threeAddUp(rows: ReadonlyArray<Partial<MoneyThree>>, total: Partial<MoneyThree>): boolean {
+  const s = sumThree(rows)
+  return MONEY_COLUMNS.every(k => Math.abs(s[k] - round2(Number(total[k]) || 0)) < 0.005)
+}
+
+/** Every split in the tie adds back to its column (the line under the table can be trusted). */
+export function tieAddsUp(v: Pick<MoneyView, 'charged' | 'received' | 'tie'>): boolean {
+  const c = v.tie.charged, r = v.tie.received
+  return Math.abs(round2(c.collected + c.clearing + c.owed + c.other) - round2(v.charged)) < 0.005
+    && Math.abs(round2(r.forPeriodBills + r.forEarlierBills + r.paidAhead + r.noBill) - round2(v.received)) < 0.005
+}
+
+/** The net on each money column: Charged less expenses, Received less expenses. */
+export function netsOf(view: Partial<MoneyThree> | null | undefined, expensesTotal: number): { charged: number; received: number } {
+  return {
+    charged: round2((Number(view?.charged) || 0) - (Number(expensesTotal) || 0)),
+    received: round2((Number(view?.received) || 0) - (Number(expensesTotal) || 0)),
   }
-}
-
-/** Remember the choice. A failure to save is silent: the page keeps working on the choice in hand. */
-export function writeIncomeBasis(basis: IncomeBasis, store: BasisStore | null = browserStore()): void {
-  try {
-    store?.setItem(INCOME_BASIS_STORAGE_KEY, basis)
-  } catch {
-    /* private mode or blocked storage — the switch still works for this visit */
-  }
-}
-
-// Every switch on the page moves together (the Reports page and a modal it
-// opens, say), and a change in another tab follows here too.
-const listeners = new Set<(b: IncomeBasis) => void>()
-let current: IncomeBasis | null = null
-
-function currentBasis(): IncomeBasis {
-  if (current === null) current = readIncomeBasis()
-  return current
-}
-
-export function setIncomeBasis(basis: IncomeBasis): void {
-  current = parseBasis(basis)
-  writeIncomeBasis(current)
-  for (const l of [...listeners]) l(current)
-}
-
-/** [basis, setBasis] — shared by every component on the page, remembered per browser. */
-export function useIncomeBasis(): [IncomeBasis, (b: IncomeBasis) => void] {
-  const [basis, setLocal] = useState<IncomeBasis>(currentBasis)
-  useEffect(() => {
-    const onChange = (b: IncomeBasis) => setLocal(b)
-    listeners.add(onChange)
-    const onStorage = (e: StorageEvent) => {
-      if (e.key !== INCOME_BASIS_STORAGE_KEY) return
-      current = parseBasis(e.newValue)
-      setLocal(current)
-    }
-    try { window.addEventListener('storage', onStorage) } catch { /* no window */ }
-    return () => {
-      listeners.delete(onChange)
-      try { window.removeEventListener('storage', onStorage) } catch { /* no window */ }
-    }
-  }, [])
-  const set = useCallback((b: IncomeBasis) => setIncomeBasis(b), [])
-  return [basis, set]
-}
-
-/** Add `basis=` to a report path, keeping any query it already has. */
-export function withBasis(path: string, basis: IncomeBasis): string {
-  return `${path}${path.includes('?') ? '&' : '?'}basis=${encodeURIComponent(basis)}`
-}
-
-export const basisLabel = (basis: IncomeBasis): string => INCOME_BASIS_LABEL[basis]
-export const basisNote = (basis: IncomeBasis): string => INCOME_BASIS_NOTE[basis]
-
-/**
- * The basis the figures ON SCREEN were counted under: the one the API echoed
- * back with them (meta.basis / the dashboard's basis), else the switch. A
- * screen that keeps the last answer up while a flip loads labels it by this,
- * so a figure never sits under the other basis's name.
- */
-export function figuresBasis(echoed: unknown, chosen: IncomeBasis): IncomeBasis {
-  const v = typeof echoed === 'string' ? echoed.trim().toLowerCase() : ''
-  return (INCOME_BASES as readonly string[]).includes(v) ? (v as IncomeBasis) : chosen
-}
-
-/**
- * True while a report on screen is out of date: it was counted under the other
- * basis (the switch has flipped and its re-run has not landed), or a run is in
- * flight. The screen dims it until the new answer lands.
- */
-export function resultIsStale(resultBasis: unknown, chosen: IncomeBasis, running: boolean): boolean {
-  return running || figuresBasis(resultBasis, chosen) !== chosen
-}
-
-/**
- * Does a statement list what became of its bills (Money billed, with parts)?
- * Then "collected so far" — made of those parts, inside the total — is not
- * listed again under "beside the total, not in it".
- */
-export function showsBillOutcome(basis: IncomeBasis, partsCount: number): boolean {
-  return basis === 'billed' && partsCount > 0
-}
-
-/** "Money received by month" / "Money billed by month". */
-export function perMonthTitle(basis: IncomeBasis): string {
-  return `${INCOME_BASIS_LABEL[basis]} by month`
 }
 
 // ─── Income lines ────────────────────────────────────────────────────────────
 
 /**
  * The income lines in report order. The reports API also emits
- * 'movedToCredit' (Money billed: rent or a stay deposit already counted and
- * moved to credit for a later bill), which the shared list does not carry yet.
+ * 'movedToCredit' (rent or a stay deposit already counted and moved to credit
+ * for a later bill), which the shared list does not carry yet.
  */
 export const INCOME_LINES_ORDER: readonly string[] = (INCOME_LINES as readonly string[]).includes('movedToCredit')
   ? INCOME_LINES
@@ -185,43 +130,43 @@ export function linesAddUp(items: ReadonlyArray<{ amount: number }>, total: numb
   return Math.abs(sumAmounts(items) - round2(Number(total) || 0)) < 0.005
 }
 
-// ─── The income card (dashboard, Reports overview) ──────────────────────────
+// ─── The money card (dashboard, Reports overview) ───────────────────────────
 
+/** The API's income card, both ways (lib/rentCollected IncomeCard). */
 export interface IncomeCardData {
   received?: { amount: number; paidAhead: number; clearing: number }
   billed?: { amount: number; collected: number; clearing: number; stillOwed: number }
 }
 
-export interface IncomeCardView {
-  label: string
-  amount: number
-  /** Plain lines shown under the figure, in order. */
+export interface MoneyCardView extends MoneyThree {
+  /** Plain lines under the three figures, in order. */
   notes: string[]
 }
 
 /**
- * §0.0 (Nic): Money received — "Money received this month $A", "incl. $X paid
- * ahead for later bills", "+ $Y still clearing" beside it (never inside).
- * Money billed — "Money billed this month $B", with collected so far, clearing
- * and still owed, which add up to $B.
+ * 10/12 (Nic): this month's Charged, Received and Owed side by side, from the
+ * card the dashboard and the Reports overview both read. The notes say how
+ * they tie: what became of what was charged, and what Received includes.
  */
-export function incomeCardView(
-  card: IncomeCardData | null | undefined, basis: IncomeBasis, period = 'this month',
+export function moneyCardView(
+  card: IncomeCardData | null | undefined,
   // To the cent: the parts under a whole-dollar figure must visibly add up to it.
   fmt: (n: number) => string = money,
-): IncomeCardView {
-  if (basis === 'billed') {
-    const b = card?.billed ?? { amount: 0, collected: 0, clearing: 0, stillOwed: 0 }
-    const parts = [`Collected so far ${fmt(b.collected)}`]
-    if (b.clearing) parts.push(`clearing ${fmt(b.clearing)}`)
-    parts.push(`still owed ${fmt(b.stillOwed)}`)
-    return { label: `Money billed ${period}`, amount: b.amount, notes: [parts.join(' · ')] }
-  }
+): MoneyCardView {
+  const b = card?.billed ?? { amount: 0, collected: 0, clearing: 0, stillOwed: 0 }
   const r = card?.received ?? { amount: 0, paidAhead: 0, clearing: 0 }
+  const charged = [`Of ${fmt(b.amount)} charged: ${fmt(b.collected)} collected`]
+  if (b.clearing) charged.push(`${fmt(b.clearing)} clearing`)
+  charged.push(`${fmt(b.stillOwed)} still owed`)
+  // 10/12 (Nic, L2): Received leads — what Received includes first, then
+  // what became of what was charged.
   const notes: string[] = []
-  if (r.paidAhead) notes.push(`incl. ${fmt(r.paidAhead)} paid ahead for later bills`)
-  if (r.clearing) notes.push(`+ ${fmt(r.clearing)} still clearing`)
-  return { label: `Money received ${period}`, amount: r.amount, notes }
+  const rec: string[] = []
+  if (r.paidAhead) rec.push(`Received includes ${fmt(r.paidAhead)} paid ahead for later bills`)
+  if (r.clearing) rec.push(`${fmt(r.clearing)} more is still clearing`)
+  if (rec.length) notes.push(rec.join(' · '))
+  notes.push(charged.join(' · '))
+  return { charged: Number(b.amount) || 0, received: Number(r.amount) || 0, owed: Number(b.stillOwed) || 0, notes }
 }
 
 /** Money billed: collected so far + clearing + still owed = the bill. */
@@ -233,104 +178,38 @@ export function billedPartsAddUp(b: { amount: number; collected: number; clearin
 
 export interface BesideItem { key: string; label: string; amount: number }
 
-/**
- * Money billed: of the API's beside figures, "still clearing" and "still owed"
- * are parts of the bills INSIDE the total (the basis note: "'Still owed' is
- * inside the total; 'Collected so far' is beside it"), and the three of them —
- * collected so far, still clearing, still owed — are what became of the bills,
- * adding up to the total.
- */
-const BILLED_OUTCOME_KEYS = ['collectedSoFar', 'clearing', 'stillOwed'] as const
-const INSIDE_TOTAL_WHEN_BILLED: ReadonlySet<string> = new Set(['clearing', 'stillOwed'])
-
-/**
- * What became of the bills (Money billed), for a screen that has no list of
- * its parts: collected so far, still clearing, still owed. Empty under Money
- * received, where none of them applies.
- */
-export function billedOutcome(items: readonly BesideItem[] | null | undefined, basis: IncomeBasis): BesideItem[] {
-  if (basis !== 'billed') return []
-  const list = items ?? []
-  return BILLED_OUTCOME_KEYS
-    .map(k => list.find(i => i.key === k))
-    .filter((i): i is BesideItem => !!i)
-}
-
 /** The API's key for paid-ahead money on hand at the period's last day. */
 export const PAID_AHEAD_ON_HAND_KEY = 'paidAheadUnused'
 
 /**
- * §0.0: under Money received, paid-ahead money counted in full on the day it
- * arrived (its own line, "Paid ahead for later bills") and counts $0 again
- * when it pays a bill. So what is still on hand is never "not in the total" —
- * a landlord told it is would think they hold that much more than the report
- * counted (Todd: $460 for October counted in September's $920).
+ * §0.0: paid-ahead money counts in Received in full on the day it arrived
+ * (its own line, "Paid ahead for later bills") and never again when it pays a
+ * bill. What is still on hand already counted — a landlord told otherwise
+ * would think they hold that much more than the report counted.
  */
-export const PAID_AHEAD_COUNTED_NOTE = 'Counted on the day it arrived; $0 again when it pays a bill.'
-
-/**
- * The figures to list under "beside the total, not in it". Money received:
- * all of them (money still clearing has not arrived, a credit you gave is not
- * income, ...) except the paid-ahead money on hand, which already counted on
- * the day it arrived (see `paidAheadOnHand`). Money billed: never "still
- * clearing" or "still owed" — they are inside the total — and not "collected
- * so far" either when the screen already shows what became of the bills
- * (`outcomeShown`). Paid-ahead money on hand stays here under Money billed: no
- * bill it will pay is in that total yet.
- */
-export function besideNotInTotal(
-  items: readonly BesideItem[] | null | undefined, basis: IncomeBasis, opts: { outcomeShown?: boolean } = {},
-): BesideItem[] {
-  const list = [...(items ?? [])]
-  if (basis !== 'billed') return list.filter(i => i.key !== PAID_AHEAD_ON_HAND_KEY)
-  return list.filter(i => !INSIDE_TOTAL_WHEN_BILLED.has(i.key) && !(opts.outcomeShown && i.key === 'collectedSoFar'))
-}
-
-/**
- * Money received only: the paid-ahead money not used yet by the period's last
- * day, shown on its own line with PAID_AHEAD_COUNTED_NOTE — never under "not
- * in it". Null under Money billed (it is listed beside that total) or when
- * there is none.
- */
-export function paidAheadOnHand(items: readonly BesideItem[] | null | undefined, basis: IncomeBasis): BesideItem | null {
-  if (basis === 'billed') return null
-  const item = (items ?? []).find(i => i.key === PAID_AHEAD_ON_HAND_KEY)
-  return item && Number(item.amount) ? item : null
-}
-
-/**
- * The tax summary's figures beside the year's totals: the paid-ahead money on
- * hand at year end (named by the server — "Paid ahead for next year's bills"
- * once the year is over) and work trade (never money). Split the way every
- * other statement is: under Money received the paid-ahead money is shown as
- * counted when it arrived, never "not in them"; work trade always is.
- */
-export function taxYearBeside(
-  paidAhead: { label?: string | null; amount?: number | string | null } | null | undefined,
-  workTradeValue: number | string | null | undefined,
-  basis: IncomeBasis,
-): { onHand: BesideItem | null; notIn: BesideItem[] } {
-  const items: BesideItem[] = []
-  const pa = Number(paidAhead?.amount || 0)
-  if (pa > 0) items.push({ key: PAID_AHEAD_ON_HAND_KEY, label: paidAhead?.label || 'Paid ahead, not used yet', amount: pa })
-  const wt = Number(workTradeValue || 0)
-  if (wt > 0) items.push({ key: 'workTrade', label: 'Covered by work trade (bartered, never money)', amount: wt })
-  return { onHand: paidAheadOnHand(items, basis), notIn: besideNotInTotal(items, basis) }
-}
+export const PAID_AHEAD_COUNTED_NOTE = 'Counted in Received on the day it arrived; never again when it pays a bill.'
 
 // ─── Property health ─────────────────────────────────────────────────────────
 
 /**
- * How much of this month's rent bills is paid (money still clearing counts:
- * the tenant has paid, the bank is moving it). The same under either switch —
- * "is rent getting paid" is a question about the bills. null when nothing is
- * billed yet.
+ * 10/17 (Nic): "the property health matches what was invoiced and what was
+ * paid. work trade isnt billed until a shortfall so it shouldnt apply here
+ * unless an invoice generates."
+ *
+ * So: how much of this month's rent bills is paid — the bills the API already
+ * leaves work trade out of, and paid once settled whatever settled it (money,
+ * money still clearing at the bank, an account credit, money paid ahead). It
+ * used to divide the Money billed figures, which answer "what was charged and
+ * what arrived": work-trade-held rent read as owed and credit-paid rent read as
+ * unpaid, so Mountain View said 67% in a month where only $2,061 was left to
+ * collect. Both figures come from one place now (the API's rentHealth, lib/
+ * rentCollected rentHealthMtd). null when nothing is invoiced yet.
  */
-export function rentBillsPaidRate(
-  rentBilled: { amount: number; collected: number; clearing: number } | null | undefined,
-): number | null {
-  if (!rentBilled || !(rentBilled.amount > 0)) return null
-  return (Number(rentBilled.collected) + Number(rentBilled.clearing)) / Number(rentBilled.amount)
+export interface RentHealthData { invoiced: number; paid: number; owed?: number; workTradeHeld?: number }
+
+export function rentBillsPaidRate(health: RentHealthData | null | undefined): number | null {
+  if (!health || !(Number(health.invoiced) > 0)) return null
+  return Number(health.paid) / Number(health.invoiced)
 }
 
 export type HealthStatus = 'awaiting' | 'full' | 'healthy' | 'attention'
@@ -347,6 +226,159 @@ export const HEALTH_STATUS_LABEL: Record<HealthStatus, string> = {
   attention: 'Needs attention',
 }
 
+// ─── The health block's own figures, printed as the subtraction they are ─────
+
+/**
+ * 10/18 (Nic): "We have a major problem because underneath the property health
+ * it's still showing that 9,683 is owed when I filter to Mountain View, but
+ * outstanding in the top KPI card only shows $1,415... $26,211.02 minus the
+ * received calculation of 19,483.98 in no way close equals 9,683.87. You're
+ * pulling numbers from different spots here. So that is a huge problem for a
+ * landlord to see incorrect numbers."
+ *
+ * Measured on Mountain View's October the morning he said it, every figure was
+ * right for its own question and nothing on the screen said which question it
+ * answered:
+ *
+ *   92%             the month's RENT BILLS, the ones on hold for work trade
+ *                   left out of both sides — $17,087 paid of $18,502 invoiced
+ *                   (the API's rentHealth, lib/rentCollected rentHealthMtd)
+ *   $9,683.87       the books' receivables balance at the end of October:
+ *                   every charge of every month still unpaid, work-trade-held
+ *                   bills included (MONEY_COLUMN_NOTE_LEDGER.owed)
+ *   $26,211.02 and  all money, every kind — October's bills, and the money
+ *   $19,483.98      that arrived in October whatever month it was billed for
+ *
+ * So the health figures are now printed as the subtraction they are, all four
+ * off one helper: invoiced, paid, still owed, and the percentage that divides
+ * the first two. The money table beside them says in words what it answers and
+ * that its three columns do not subtract to each other. Neither figure is bent
+ * to the other — "Money received" and "Money billed" keep their meanings, which
+ * the books' parity check leans on (services/ledgerParity).
+ */
+export const RENT_HEALTH_FIGURE_LABEL = {
+  invoiced: 'Rent invoiced this month',
+  paid: 'Rent paid',
+  owed: 'Still owed',
+} as const
+
+export type RentHealthFigureKey = keyof typeof RENT_HEALTH_FIGURE_LABEL
+
+export interface RentHealthFigures {
+  /** The three figures in reading order: invoiced, paid, still owed. */
+  figures: Array<{ key: RentHealthFigureKey; label: string; amount: number }>
+  /** The subtraction: "$18,502.00 invoiced − $17,087.00 paid = $1,415.00 still owed". */
+  tieText: string
+  /** Where the percentage comes from: "92% of this month's rent bills paid". */
+  rateText: string
+  /** 0–100, the same number the meter prints. */
+  pct: number
+  /** Named, never with a figure (S650 keeps work-trade balances off these cards). */
+  workTradeNote: string | null
+  /** Which months and which charges — the Outstanding card beside it counts others. */
+  scopeNote: string
+}
+
+/**
+ * 10/17: the health figures count THIS MONTH'S RENT and the Outstanding card
+ * sits above them counting every open charge of every month. Mountain View
+ * reads $1,415 either way today because nothing else of its is open; Oak Park's
+ * October rent owes $3,300 against $8,354.43 outstanding. Two numbers on one
+ * screen that must not read as one claim, so each says what it counts.
+ */
+export const RENT_HEALTH_SCOPE_NOTE =
+  "This counts this month's rent bills only. The Outstanding card above counts every open charge of every month, so the two are different numbers."
+
+/**
+ * Invoiced less paid is still owed, to the cent. An assertion helper, like
+ * billedPartsAddUp and threeAddUp above it: `rentHealthFigures` derives `owed`
+ * from the other two, so the screen cannot print a row that fails this — this
+ * is what the tests hold the API's reply to.
+ */
+export function rentHealthTies(health: RentHealthData | null | undefined): boolean {
+  if (!health) return false
+  const invoiced = Number(health.invoiced) || 0
+  const paid = Number(health.paid) || 0
+  const owed = Number(health.owed) || 0
+  return Math.abs(round2(invoiced - paid) - round2(owed)) < 0.005
+}
+
+/**
+ * The health block, in the words a landlord reads. null when nothing is
+ * invoiced yet (the meter says "Awaiting data" and there is nothing to tie).
+ */
+export function rentHealthFigures(
+  health: RentHealthData | null | undefined,
+  // To the cent: a subtraction printed on screen has to visibly come out.
+  fmt: (n: number) => string = money,
+): RentHealthFigures | null {
+  const rate = rentBillsPaidRate(health)
+  if (rate == null || !health) return null
+  const invoiced = round2(Number(health.invoiced) || 0)
+  const paid = round2(Number(health.paid) || 0)
+  // Read off the same two figures rather than taken from the reply, so the
+  // number printed is the number the subtraction leaves.
+  const owed = round2(invoiced - paid)
+  const pct = Math.round(rate * 100)
+  return {
+    figures: [
+      { key: 'invoiced', label: RENT_HEALTH_FIGURE_LABEL.invoiced, amount: invoiced },
+      { key: 'paid', label: RENT_HEALTH_FIGURE_LABEL.paid, amount: paid },
+      { key: 'owed', label: RENT_HEALTH_FIGURE_LABEL.owed, amount: owed },
+    ],
+    tieText: `${fmt(invoiced)} invoiced − ${fmt(paid)} paid = ${fmt(owed)} still owed`,
+    rateText: `${pct}% of this month's rent bills paid`,
+    pct,
+    workTradeNote: Number(health.workTradeHeld)
+      ? 'Rent covered by work trade is not counted here — it is not billed unless the hours fall short.'
+      : null,
+    scopeNote: RENT_HEALTH_SCOPE_NOTE,
+  }
+}
+
+// ─── The money table beside it ───────────────────────────────────────────────
+
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+] as const
+
+/** 'YYYY-MM' as its month's name — read as a calendar month, never shifted by a zone. */
+export function monthName(period: string | null | undefined): string {
+  const m = /^(\d{4})-(\d{2})/.exec(String(period ?? ''))
+  const n = m ? Number(m[2]) : 0
+  return n >= 1 && n <= 12 ? MONTH_NAMES[n - 1] : ''
+}
+
+/**
+ * 10/18 (Nic): the money table's own heading, so it cannot be read as the parts
+ * of the percentage above it. It answers a different question — every kind of
+ * money, not only rent — over a window of its own.
+ */
+export function allMoneyHeading(period: string | null | undefined): string {
+  const m = monthName(period)
+  return m
+    ? `All money in ${m} — every kind, not just rent`
+    : 'All money this month — every kind, not just rent'
+}
+
+/**
+ * 10/18 (Nic): "$26,211.02 minus the received calculation of 19,483.98 in no
+ * way close equals 9,683.87." It never did and it never will: Received is money
+ * on the day it arrived, Charged is the month's bills, and Owed is what was
+ * still unpaid at the end of it, every bill included. Said on the screen, above
+ * each column's own note, because three figures in a row invite a subtraction.
+ */
+export const MONEY_COLUMNS_DO_NOT_SUBTRACT =
+  'Different questions, so these three do not subtract to each other:'
+
+/**
+ * What the trace's beats are. The figure a hover prints is all the money
+ * received that month — which is where "19,483 for October versus 20,298 for
+ * September" came from, beside a percentage that counts neither.
+ */
+export const HEALTH_TRACE_NOTE = 'Each beat is all the money received that month, every kind.'
+
 // ─── Income by category (decision #4) ───────────────────────────────────────
 
 export interface CategoryRow {
@@ -357,6 +389,10 @@ export interface CategoryRow {
   clearing: number
   stillOwed: number
   amount: number
+  /** 10/12: the three columns (the API sends them on every breakdown). */
+  charged?: number
+  received?: number
+  owed?: number
 }
 
 export function categoryLabel(row: { category: string; label?: string }): string {
@@ -365,35 +401,17 @@ export function categoryLabel(row: { category: string; label?: string }): string
 
 /** The categories with any money in the period, in the report's order (the API's order). */
 export function activeCategories<T extends CategoryRow>(rows: readonly T[] | null | undefined): T[] {
-  return (rows ?? []).filter(r => r.billed || r.collected || r.clearing || r.stillOwed || r.amount)
+  return (rows ?? []).filter(r => r.billed || r.collected || r.clearing || r.stillOwed || r.amount
+    || r.charged || r.received || r.owed)
 }
 
-export interface CategoryColumn { key: 'billed' | 'collected' | 'clearing' | 'stillOwed'; label: string }
-
-/**
- * Billed vs collected under the switch. Money received: what was billed in the
- * period and what arrived in it. Money billed: the bills and what became of
- * them (collected so far, clearing, still owed — they add up to the bill).
- */
-export function categoryColumns(basis: IncomeBasis): CategoryColumn[] {
-  return basis === 'billed'
-    ? [
-        { key: 'billed', label: 'Billed' },
-        { key: 'collected', label: 'Collected so far' },
-        { key: 'clearing', label: 'Still clearing' },
-        { key: 'stillOwed', label: 'Still owed' },
-      ]
-    : [
-        { key: 'billed', label: 'Billed' },
-        { key: 'collected', label: 'Received' },
-      ]
-}
-
-/** The breakdown's total: every category's figure under the basis, plus the lines with no category. */
-export function breakdownTotal(
-  categories: readonly CategoryRow[], lines: ReadonlyArray<{ amount: number }>,
-): number {
-  return round2(sumAmounts(categories) + sumAmounts(lines))
+/** A category row's three columns (an older reply without them reads billed / collected / still owed). */
+export function categoryThree(r: CategoryRow): MoneyThree {
+  return {
+    charged: Number(r.charged ?? r.billed) || 0,
+    received: Number(r.received ?? r.collected) || 0,
+    owed: Number(r.owed ?? r.stillOwed) || 0,
+  }
 }
 
 // ─── Expenses ────────────────────────────────────────────────────────────────
@@ -403,15 +421,46 @@ export interface ExpenseFigures {
   maintenance: number
   lotRent?: number
   enteredExpenses?: number
+  /** 10/11: payment processing fees the landlord covers for tenants (in the P&L's expense total). */
+  processingFees?: number
+  /** 10/12 (Nic, G10): card fees guests got back with refunds of card sales (in the expense total). */
+  cardFeesRefunded?: number
+  /**
+   * 10/12 (Nic, ledger P8): once the company's books are live, each expense
+   * account with what was incurred in the period (beside Charged) and what
+   * was paid in it (beside Received).
+   */
+  byAccount?: Array<{ accountId: string; code: string; name: string; role?: string | null; incurred: number; paid: number }>
+  /** 10/12 (ledger P8): the expenses paid in the period (the Received net takes it). */
+  cashTotal?: number
 }
 
-/** The P&L's expenses as lines that add up to its expense total (platform fee always shown). */
-export function expenseLines(e: ExpenseFigures | null | undefined): Array<{ key: string; label: string; amount: number }> {
+/** One expense line; `paid` (on the books) is what the Received column takes, else the same amount. */
+export interface ExpenseLine { key: string; label: string; amount: number; paid?: number }
+
+/**
+ * The P&L's expenses as lines that add up to its expense total. The platform
+ * fee and (10/12, Nic) the payment processing fees always show — the
+ * processing-fee line is rendered wherever expenses are listed, $0 included,
+ * so a landlord always sees where the fees they cover for tenants go.
+ */
+export function expenseLines(e: ExpenseFigures | null | undefined): ExpenseLine[] {
   if (!e) return []
-  const out = [{ key: 'platformFee', label: 'GAM platform fee', amount: Number(e.platformFee) || 0 }]
+  // 10/12 (Nic, ledger P8): on the books, one line per expense account —
+  // incurred beside Charged, paid beside Received — and the processing fees
+  // you cover always listed.
+  if (e.byAccount) {
+    const out: ExpenseLine[] = e.byAccount.map(a => ({ key: a.accountId, label: a.name, amount: Number(a.incurred) || 0, paid: Number(a.paid) || 0 }))
+    if (!e.byAccount.some(a => a.role === 'processing_fees')) out.push({ key: 'processingFees', label: 'Payment processing fees', amount: 0, paid: 0 })
+    return out
+  }
+  const out: ExpenseLine[] = [{ key: 'platformFee', label: 'GAM platform fee', amount: Number(e.platformFee) || 0 }]
   if (Number(e.maintenance)) out.push({ key: 'maintenance', label: 'Maintenance', amount: Number(e.maintenance) })
   if (Number(e.lotRent)) out.push({ key: 'lotRent', label: 'Lot rent', amount: Number(e.lotRent) })
   if (Number(e.enteredExpenses)) out.push({ key: 'enteredExpenses', label: 'Your expenses', amount: Number(e.enteredExpenses) })
+  out.push({ key: 'processingFees', label: 'Payment processing fees', amount: Number(e.processingFees) || 0 })
+  // 10/12 (Nic, G10): "the customer gets the card fee back too; the landlord eats that fee."
+  if (Number(e.cardFeesRefunded)) out.push({ key: 'cardFeesRefunded', label: 'Card fees refunded', amount: Number(e.cardFeesRefunded) })
   return out
 }
 
@@ -437,19 +486,17 @@ export function expenseCategoryLabel(key: string): string {
 export interface ChargeRow {
   id: string
   /**
-   * The property's calendar day this entry counted ('YYYY-MM-DD'): Money
-   * received, the day its money arrived — or, for a dispute or bank return,
-   * the day the money was taken back; Money billed, the bill's due day. One
-   * charge can be listed on two days (a payment and its dispute in the same
-   * month), so `key` — not `id` — names an entry.
+   * The property's calendar day this entry counted ('YYYY-MM-DD'): the day
+   * its money arrived — or, for a dispute or bank return, the day the money
+   * was taken back. One charge can be listed on two days (a payment and its
+   * dispute in the same month), so `key` — not `id` — names an entry.
    */
   day?: string
   key?: string
   settledAt: string | null
   dueDate: string | null
-  /** What this charge put into the total under the basis. */
+  /** What this charge put into Received. */
   amount: number
-  /** Money billed: what became of it (paid, clearing, still owed, ...). */
   parts?: Partial<Record<BilledPart, number>>
 }
 
@@ -470,28 +517,56 @@ export function localDay(iso: string | null | undefined): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
 
-/**
- * The day an entry is filed under: the day it counted, from the report
- * itself (the property's calendar). An older reply without it falls back to
- * the bill's due day (Money billed) or the settle day (Money received).
- */
-export function chargeDay(r: ChargeRow, basis: IncomeBasis): string {
-  if (r.day) return String(r.day).slice(0, 10)
-  return basis === 'billed' ? String(r.dueDate ?? '').slice(0, 10) : localDay(r.settledAt)
+/** The day an entry is filed under: the day it counted, from the report itself (the property's calendar). */
+export function chargeDay(r: ChargeRow): string {
+  return r.day ? String(r.day).slice(0, 10) : localDay(r.settledAt)
 }
 
-/**
- * The day an entry's money arrived ('YYYY-MM-DD'), for the owner statement's
- * "Money arrived" column — a calendar day, never the UTC date of the settle
- * time (a 6 pm Arizona payment on Sep 29 is Sep 30 in UTC). Money received,
- * money in (a positive entry): the day it counted, from the report (the
- * property's calendar), so it always matches "Counted on". Otherwise (a bill
- * under Money billed, a dispute's take-back day): the settle time's own day.
- */
-export function arrivalDay(r: ChargeRow, basis: IncomeBasis): string {
-  if (!r.settledAt) return ''
-  if (basis === 'received' && Number(r.amount) > 0 && r.day) return String(r.day).slice(0, 10)
-  return localDay(r.settledAt)
+/** An entry's React key: one charge can be listed on two days. */
+export const chargeKey = (r: ChargeRow): string => r.key ?? (r.day ? `${r.id}:${r.day}` : r.id)
+
+/** "Paid $460.00 · Still owed $25.00" — what became of a bill, in report order. */
+export function partsText(parts: Partial<Record<BilledPart, number>> | null | undefined, fmt: (n: number) => string = money): string {
+  if (!parts) return ''
+  return BILLED_PARTS
+    .filter(p => Number(parts[p]))
+    .map(p => `${BILLED_PART_LABEL[p]} ${fmt(Number(parts[p]))}`)
+    .join(' · ')
+}
+
+/** The part of a total with no single charge behind it (paid ahead, register sales, other income, ...). */
+export function noChargeRemainder(total: number, rowsTotal: number): number {
+  return round2((Number(total) || 0) - (Number(rowsTotal) || 0))
+}
+
+// ─── One line per day (10/12, Nic) ───────────────────────────────────────────
+
+/** A day of the monthly P&L's list, as the API sends it. */
+export interface DayLine {
+  day: string
+  received: number
+  chargesTotal: number
+  noCharge: number
+  paymentCount: number
+  paymentKeys: string[]
+  expensesLogged: number
+  expenseCount: number
+}
+
+/** The payments behind one day (the screen expands a day to who paid). */
+export function dayRows<T extends ChargeRow>(day: Pick<DayLine, 'paymentKeys'>, payments: readonly T[]): T[] {
+  const keys = new Set(day.paymentKeys)
+  return payments.filter(p => keys.has(chargeKey(p)))
+}
+
+/** "You logged $2,000.00 of expenses" (Nic's words). */
+export function expensesLoggedText(amount: number, count: number, fmt: (n: number) => string = money): string {
+  return `You logged ${fmt(amount)} of expenses${count > 1 ? ` (${count})` : ''}`
+}
+
+/** The days add up to the month's Received, to the cent. */
+export function daysAddUp(days: ReadonlyArray<Pick<DayLine, 'received'>>, received: number): boolean {
+  return Math.abs(round2(days.reduce((s, d) => s + (Number(d.received) || 0), 0)) - round2(Number(received) || 0)) < 0.005
 }
 
 // ─── Calendar days for a request ─────────────────────────────────────────────
@@ -509,6 +584,12 @@ export function monthToDate(now: Date = new Date()): { monthStart: string; today
   return { monthStart: `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-01`, today: ymdLocal(now) }
 }
 
+/** Last month on the viewer's calendar, 'YYYY-MM' (the monthly report covers a finished month). */
+export function lastMonthKey(now: Date = new Date()): string {
+  const d = new Date(now.getFullYear(), now.getMonth() - 1, 1)
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`
+}
+
 /**
  * The last 12 complete months on the viewer's calendar (the T-12 convention:
  * a half-finished current month makes income look worse than it is). The last
@@ -518,40 +599,6 @@ export function lastTwelveMonths(now: Date = new Date()): { start: string; end: 
   const end = new Date(now.getFullYear(), now.getMonth(), 0)
   const start = new Date(end.getFullYear(), end.getMonth() - 11, 1)
   return { start: ymdLocal(start), end: ymdLocal(end) }
-}
-
-/** An entry's React key: one charge can be listed on two days. */
-export const chargeKey = (r: ChargeRow): string => r.key ?? (r.day ? `${r.id}:${r.day}` : r.id)
-
-/**
- * Money received: the charges grouped by the day their money counted (a
- * dispute of a September payment is filed on its October day, as a
- * negative). Money billed: grouped by the day each bill was due. Newest first.
- */
-export function groupCharges<T extends ChargeRow>(rows: readonly T[], basis: IncomeBasis): Array<{ date: string; rows: T[]; total: number }> {
-  const map = new Map<string, T[]>()
-  for (const r of rows) {
-    const key = chargeDay(r, basis)
-    const list = map.get(key)
-    if (list) list.push(r); else map.set(key, [r])
-  }
-  return [...map.entries()]
-    .sort(([a], [b]) => b.localeCompare(a))
-    .map(([date, list]) => ({ date, rows: list, total: sumAmounts(list) }))
-}
-
-/** "Paid $460.00 · Still owed $25.00" — what became of a bill, in report order. */
-export function partsText(parts: Partial<Record<BilledPart, number>> | null | undefined, fmt: (n: number) => string = money): string {
-  if (!parts) return ''
-  return BILLED_PARTS
-    .filter(p => Number(parts[p]))
-    .map(p => `${BILLED_PART_LABEL[p]} ${fmt(Number(parts[p]))}`)
-    .join(' · ')
-}
-
-/** The part of a total with no single charge behind it (paid ahead, register sales, other income, ...). */
-export function noChargeRemainder(total: number, rowsTotal: number): number {
-  return round2((Number(total) || 0) - (Number(rowsTotal) || 0))
 }
 
 // ─── A report that could not load ────────────────────────────────────────────
@@ -592,9 +639,8 @@ const AXIOS_WORDS = /^Network Error$|^Request failed with status code|^timeout o
 
 /**
  * Number each run of a report; only the newest run may put its answer on the
- * screen. Flipping the switch while a slower run under the other basis is
- * still out would otherwise let the old answer land last and sit under a
- * switch that says the opposite.
+ * screen. A slower earlier run answering last would otherwise sit under the
+ * settings of the newer one.
  */
 export function latestOnly(): { start: () => number; isLatest: (run: number) => boolean } {
   let n = 0

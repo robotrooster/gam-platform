@@ -24,6 +24,8 @@ const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 // the signer's device locale and corrupted any non-US date.
 const isoFromStored = documentDateToIso
 const tok = () => localStorage.getItem('gam_tenant_token')
+/** A deposit figure as the signer reads it on paper. */
+const money = (n: number) => Number(n).toLocaleString('en-US', { style: 'currency', currency: 'USD' })
 /**
  * S629 (Nic): a signing link works WITHOUT a session. The path param is either
  * a document id (signing from inside the portal) or the signer's own 64-hex
@@ -1019,6 +1021,43 @@ export function SignPage() {
                       Your landlord has set a {Number(data.depositInterestContext.annualRatePct).toFixed(2)}% annual interest rate for held security deposits in {data.depositInterestContext.stateCode} ({data.depositInterestContext.effectiveYear}). Interest accrues monthly and is paid out with your refund at move-out.
                     </>
                   )}
+                </div>
+              </div>
+            )}
+
+            {/* ── 10/27 (Nic): LINK THE BANK BEFORE YOU SIGN ──────────────────
+                  "Before signing, they need to have a pop-up that says, in
+                   order to, it needs to not be blocking. It needs to tell them,
+                   hey, in order to do flex deposit, please link your bank
+                   account."
+
+                Why HERE and not after: the landlord signs first to lock the
+                terms, so this signature is the LAST one — it executes the lease
+                and writes the move-in invoice. There is no window afterwards.
+                And a bank is verified only by microdeposits, which take a day
+                or two, so being told after signing is being told too late.
+
+                NOT A GATE. It says what to do and gets out of the way; somebody
+                who does not want FlexDeposit signs straight past it. Shown only
+                where it could matter — the product is on, this lease has a
+                deposit, and their bank is neither verified nor already begun. */}
+            {data.flexDepositPrompt && (
+              <div style={{ padding:'13px 15px', background:'#fffaf0', border:'1px solid rgba(201,162,39,.45)', borderRadius:9, fontSize:'.8rem', color:'#1a1a1a', lineHeight:1.55, marginBottom:14 }}>
+                <div style={{ fontWeight:700, marginBottom:5 }}>
+                  Want to split your {money(Number(data.flexDepositPrompt.depositAmount))} deposit?
+                </div>
+                <div style={{ color:'#444' }}>
+                  FlexDeposit can split it into 2 or 4 payments instead of all at once. It needs a
+                  verified bank account, and verifying one takes a couple of days — so{' '}
+                  <strong>start linking your bank today, the same day you sign.</strong> If you wait,
+                  the deposit is simply owed in full.
+                  {' '}
+                  <a href="/payments" target="_blank" rel="noreferrer" style={{ color:'#8a6d1f', fontWeight:700 }}>
+                    Add your bank →
+                  </a>
+                </div>
+                <div style={{ color:'#777', fontSize:'.72rem', marginTop:6 }}>
+                  You can sign now either way — this does not hold up your lease.
                 </div>
               </div>
             )}

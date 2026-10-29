@@ -336,7 +336,12 @@ describe('login lock message: whose clock', () => {
     const all = propertyIds === 'all'
     const ids = all ? [] : propertyIds
     if (role === 'bookkeeper') {
-      await db.query(`INSERT INTO bookkeeper_scopes (user_id, landlord_id) VALUES ($1, $2)`, [u.id, landlordId])
+      // 10/11: a bookkeeper's boxes are ticked one by one; 'all' ticks every
+      // property the company owns now.
+      await db.query(
+        `INSERT INTO bookkeeper_scopes (user_id, landlord_id, property_ids)
+         VALUES ($1, $2, CASE WHEN $3::boolean THEN ARRAY(SELECT id FROM properties WHERE landlord_id = $2) ELSE $4::uuid[] END)`,
+        [u.id, landlordId, all, ids])
     } else {
       const table = { property_manager: 'property_manager_scopes', onsite_manager: 'onsite_manager_scopes',
                       maintenance: 'maintenance_worker_scopes' }[role]

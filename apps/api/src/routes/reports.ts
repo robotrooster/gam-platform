@@ -1,21 +1,40 @@
 import { Router } from 'express'
-import { collectedRentMtd, incomeCardFrom } from '../lib/rentCollected'
-import { occupancyRateFrom, INCOME_CATEGORY_LABEL, MANUAL_PAYMENT_METHOD_LABELS, MAINTENANCE_CATEGORY_LABEL, type IncomeBasis, type MaintenanceCategory } from '@gam/shared'
+// 10/12 (Nic, ledger P6, L5): which expenses count as a cost, and a repair's cost once (lib/liveExpense).
+import { liveExpenseSql, maintenanceCostNotBilledSql } from '../lib/liveExpense'
+import { z } from 'zod'
+// 10/18: Outstanding is ONE helper shared with the dashboard card — see below.
+import { collectedRentMtd, incomeCardFrom, rentHealthMtd, outstandingBalanceOf } from '../lib/rentCollected'
+import {
+  occupancyRateFrom, INCOME_CATEGORY_LABEL, MANUAL_PAYMENT_METHOD_LABELS, MAINTENANCE_CATEGORY_LABEL,
+  MONEY_COLUMNS, MONEY_COLUMN_LABEL, MONEY_COLUMN_NOTE, MONEY_COLUMN_NOTE_LEDGER, MONTHLY_REPORT_MAX_EXTRA_EMAILS,
+  type IncomeBasis, type MaintenanceCategory,
+} from '@gam/shared'
 import { query, queryOne } from '../db'
-import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
+import { requireAuth, requirePerm, getScopedPropertyIds, bookkeeperRequestScopeOf, propertyCutoffsOf } from '../middleware/auth'
+import { companyWideRefusal, cutoffsParam, withinCutoffsSql, MONTHLY_REPORT_REFUSAL, type PropertyCutoff } from '../lib/bookkeeperScope'
 import { AppError } from '../middleware/errorHandler'
+import { logger } from '../lib/logger'
 import { landlordScopeIds, resolveLandlordTarget, isEntityMember } from '../lib/landlordScope'
 import { platformFeesByPropertyForEntities, periodMonths } from '../services/platformFee'
-import { computeLandlordPL, landlordPLExpenses, landlordIncomeSql, landlordDepositSql } from '../services/landlordPL'
+import {
+  landlordPLExpenses, landlordPLFrom, enteredExpensesByDay, landlordIncomeSql, landlordDepositSql, processingFeesByProperty,
+} from '../services/landlordPL'
 import { seesGrandTotals } from '../services/openBalances'
 import {
-  parseIncomeBasis, basisMeta, incomeEvents, summarize, byMonth, categoryTotals, partList,
-  type IncomeEvent,
+  incomeBoth, summarize, byMonth, breakdownFrom, partList, moneyViewFrom, monthWords, cardFeesRefundedByProperty,
+  type IncomeEvent, type MoneyView,
 } from '../services/incomeBasis'
+import { householdMonths, householdOfRowSql } from '../services/householdMonths'
+// 10/12 (Nic, ledger P8): whether a viewer's reports read the books.
+import { ledgerReportsLive, ledgerPLExpensesByProperty, type LedgerPLExpenses } from '../services/ledgerReports'
+import {
+  buildMonthlyPropertyReport, monthBounds, previousMonth, companyTeam, recipientsOf, saveRecipients, lastSends,
+} from '../services/monthlyPropertyReport'
+import { renderMonthlyReportPdf, monthlyReportFilename } from '../services/monthlyReportPdf'
 import { todayIn, addDaysTo, monthStartOf, localDateTimeToUtc } from '../lib/timezone'
 import {
   runReport, REPORT_LEVELS, REPORT_BUCKETS,
-  type ReportLevel, type ReportBucket,
+  type ReportLevel, type ReportBucket, type ReportRow,
 } from '../services/reportEngine'
 
 export const reportsRouter = Router()
@@ -50,6 +69,70 @@ reportsRouter.use(async (req: any, _res, next) => {
 // S655: income itself is dated on each PROPERTY's own calendar day
 // (services/incomeBasis); these bounds are the days of the period.
 const REPORT_TZ = 'America/Phoenix'
+
+/**
+ * 10/12 (Nic): "NO Money received / Money billed toggle anywhere — show
+ * Charged, Received and Owed side by side as columns, with a short line
+ * showing how they tie." Every report below returns the three columns (`view`
+ * / `charged`, `received`, `owed`) and the tie line, from both kinds of facts
+ * (services/incomeBasis). ?basis= is accepted for one release and IGNORED; the
+ * fields that carried one basis (gross, lines, net, collected...) are Money
+ * received — the old default — for the callers that still read them.
+ */
+const LEGACY_BASIS: IncomeBasis = 'received'
+
+/**
+ * decisions #25 (Nic, 10/3): "front desk / on-site staff never see a GRAND
+ * TOTAL of what everyone owes ... (omitted server-side for everyone else, not
+ * just hidden)." The Owed column of a report IS such a total — what is still
+ * owed of every household's bills in the period — so for a viewer who sees no
+ * grand totals (services/openBalances seesGrandTotals: owners, property
+ * managers and bookkeepers do) it is left out of the reply, together with what
+ * it can be worked back from: Charged's split into collected / clearing /
+ * other (collected + clearing + owed + other = charged) and the tie line that
+ * says it in words. Charged, Received and the nets stay — they are not what
+ * anyone owes. The screens print "—" where a figure is absent.
+ */
+function dropOwed<T extends { owed: number }>(x: T): Omit<T, 'owed'> {
+  const { owed: _owed, ...rest } = x
+  return rest
+}
+
+/** A report's three columns as this viewer may see them (decisions #25). */
+export function viewForViewer(view: MoneyView, seesTotals: boolean) {
+  if (seesTotals) return view
+  // 10/12 (Nic, ledger P8): the ledger's proof strip starts and ends on what
+  // is owed, so it goes with the Owed column.
+  const { owed: _owed, collected: _collected, clearing: _clearing, tie, tieText, lines, categories, uncategorized, proof: _proof, details, ...rest } = view
+  return {
+    ...rest,
+    lines: lines.map(dropOwed),
+    categories: categories.map(dropOwed),
+    uncategorized: uncategorized.map(dropOwed),
+    // 10/14 (Nic I1): the Detailed view's lines, and their subtypes, without Owed too.
+    ...(details ? { details: details.map(d => ({ ...dropOwed(d), subtypes: d.subtypes.map(dropOwed) })) } : {}),
+    tie: { received: tie.received, stillClearing: tie.stillClearing },
+    // moneyTieText: the second line is what became of what was charged (it
+    // names what is still owed); the first says what the money received was
+    // for (10/12, Nic: Received leads), and a third, when there is one, what
+    // is still clearing.
+    tieText: tieText.filter((_, i) => i !== 1),
+  }
+}
+
+/** A report-engine row as this viewer may see it: no Owed (decisions #25). */
+function engineRowForViewer(r: ReportRow, seesTotals: boolean) {
+  return seesTotals ? r : { ...r, money: dropOwed(r.money) }
+}
+
+/** What each report says about its columns (meta.columns). */
+const MONEY_META = {
+  columns: MONEY_COLUMNS.map(c => ({ key: c, label: MONEY_COLUMN_LABEL[c], note: MONEY_COLUMN_NOTE[c] })),
+}
+/** 10/12 (Nic, ledger P8): the same, once the report reads the company's books (Owed at the period's end). */
+const LEDGER_MONEY_META = {
+  columns: MONEY_COLUMNS.map(c => ({ key: c, label: MONEY_COLUMN_LABEL[c], note: MONEY_COLUMN_NOTE_LEDGER[c] })),
+}
 
 /** S654: this calendar year by the Phoenix clock. */
 function thisYear(): number {
@@ -97,15 +180,59 @@ function round2(n: number): number {
  * must match). `p` is the SQL for the property id; `s`/`e` the period's first
  * and last day. Lot rent by its billing month; an entered expense by its date
  * (voided ones excluded) — as the P&L counts them.
+ *
+ * 10/12 review: and only the viewer's companies' rows (`l`, a uuid[]), each
+ * former property's cut at the day it left (`cut`, cutoffsParam). By property
+ * alone, a property bought from another company carried the SELLER's costs from
+ * before the sale onto the buyer's row (and to the buyer's bookkeeper), while
+ * its income (incomeEvents, by company) did not — so the row matched neither
+ * company's P&L. Now costs and income are read by the same companies.
  */
-function propertyLotRentSql(p: string, s: string, e: string): string {
+function propertyLotRentSql(p: string, s: string, e: string, l: string, cut: string): string {
   return `(SELECT COALESCE(SUM(lrc.amount), 0) FROM lot_rent_charges lrc
-            WHERE lrc.property_id = ${p} AND lrc.billing_month >= ${s}::date AND lrc.billing_month <= ${e}::date)`
+            WHERE lrc.property_id = ${p} AND lrc.landlord_id = ANY(${l}::uuid[])
+              AND lrc.billing_month >= ${s}::date AND lrc.billing_month <= ${e}::date
+              AND ${withinCutoffsSql('lrc.property_id', 'lrc.billing_month', cut)})`
 }
-function propertyEnteredExpensesSql(p: string, s: string, e: string): string {
+function propertyEnteredExpensesSql(p: string, s: string, e: string, l: string, cut: string): string {
   return `(SELECT COALESCE(SUM(lex.amount), 0) FROM landlord_expenses lex
-            WHERE lex.property_id = ${p} AND lex.status = 'active'
-              AND lex.expense_date >= ${s}::date AND lex.expense_date <= ${e}::date)`
+            WHERE lex.property_id = ${p} AND lex.landlord_id = ANY(${l}::uuid[]) AND ${liveExpenseSql('lex')}
+              AND lex.expense_date >= ${s}::date AND lex.expense_date <= ${e}::date
+              AND ${withinCutoffsSql('lex.property_id', 'lex.expense_date', cut)})`
+}
+
+/** 10/12: a property's day for a timestamp, on its own calendar (properties aliased `tz`). */
+const propertyDaySql = (ts: string, tz: string) => `((${ts}) AT TIME ZONE COALESCE(${tz}.timezone, 'America/Phoenix'))::date`
+
+/**
+ * 10/12 (Nic): a former property's platform fee only for the months that
+ * began by its last day — landlordPLExpenses's own rule (the fee is billed by
+ * the month; the month it left in was the company's).
+ */
+async function cutFormerPlatformFees(
+  feeMap: Map<string, number>, landlordIds: string[], months: string[], cutoffs: readonly PropertyCutoff[],
+): Promise<void> {
+  for (const c of cutoffs) {
+    if (!feeMap.has(c.propertyId)) continue
+    const kept = months.filter(m => String(m).slice(0, 10) <= c.lastDay)
+    feeMap.set(c.propertyId, kept.length
+      ? ((await platformFeesByPropertyForEntities(landlordIds, kept, c.propertyId)).get(c.propertyId) ?? 0)
+      : 0)
+  }
+}
+
+/**
+ * 10/12 (Nic, ledger P8): the properties' expenses from the books, once every
+ * company the report reads is live — the expense accounts by property
+ * (services/ledgerReports), in the buckets the By Property row and its drill-in
+ * show, plus what was PAID in the period (the Received net takes it). null
+ * while the report still reads the money records.
+ */
+async function ledgerExpensesByProperty(
+  landlordIds: string[], start: string, end: string, propertyIds: string[] | null, cutoffs: readonly PropertyCutoff[],
+): Promise<Map<string, LedgerPLExpenses> | null> {
+  if (!(await ledgerReportsLive(landlordIds))) return null
+  return ledgerPLExpensesByProperty({ landlordIds, propertyIds, cutoffs }, start, end)
 }
 
 /** 'YYYY-MM' → the month's first and last day. */
@@ -252,15 +379,42 @@ function reportEntity(user: any, explicit: unknown): string {
  * partial "company" document that is wrong on its face). Owners and team
  * members with every property pass. Books uses the same refusal for its own
  * company documents (P&L, cash flow, owner statements).
+ *
+ * 10/12 (Nic): a bookkeeper gets a company document by the company-wide box
+ * alone — the owner's own choice per bookkeeper, no longer inferred from
+ * "every property ticked". 10/12 (Nic, BK1): a document that is part of the
+ * Books ledger (`ledger: true` — the Books P&L) also opens with the ledger box,
+ * "May use the whole-company ledger".
  */
-export async function refuseScopedStaff(user: any, what: string): Promise<void> {
+export async function refuseScopedStaff(user: any, what: string, opts: { ledger?: boolean } = {}): Promise<void> {
+  if (user?.role === 'bookkeeper') {
+    const bk = await bookkeeperRequestScopeOf(user)
+    if (!bk.companyWide && !(opts.ledger && bk.ledger)) {
+      const w = `The ${what}`
+      throw new AppError(403, companyWideRefusal(w.charAt(0).toUpperCase() + w.slice(1)))
+    }
+    return
+  }
   if (await getScopedPropertyIds(user) !== null) {
     throw new AppError(403, `The ${what} covers the whole company, and you are assigned to some of its properties. Ask the owner for it.`)
   }
 }
 
+// ── LEDGER STATUS (10/12, Nic, ledger P8) ─────────────────────
+// GET /api/reports/ledger-status — do this viewer's reports read the books
+// (the ledger)? Every company the reports cover must be live
+// (services/ledgerReports ledgerReportsLive); the screens then say what Owed
+// means on the books (what tenants still owed at the end of the period, with
+// the strip that ties it). A yes or no about the viewer's own companies only.
+reportsRouter.get('/ledger-status', async (req, res, next) => {
+  try {
+    const ids = reportScope(req.user!)
+    res.json({ success: true, data: { live: await ledgerReportsLive(ids) } })
+  } catch (e) { next(e) }
+})
+
 // ── SUMMARY (S69) ─────────────────────────────────────────────
-// GET /api/reports/summary[?basis=received|billed]
+// GET /api/reports/summary
 // Backs the landlord ReportsPage. Per-landlord scoped (admin/super_admin
 // see the whole platform).
 //
@@ -271,16 +425,36 @@ export async function refuseScopedStaff(user: any, what: string): Promise<void> 
 //                      Money billed = collected so far of this month's rent
 //   collectedMtdClearing — money still clearing, beside it (never inside)
 //   incomeCard       — the dashboard's income card, both ways (every line)
-//   outstanding      — sum of unsettled invoice amounts (pending + partial)
+//   rentHealth       — 10/17 (Nic): the dashboard's payment-health figure, the
+//                      SAME helper so the two cannot drift: this month's rent
+//                      bills invoiced against paid, bills on hold for work
+//                      trade out of both sides (lib/rentCollected
+//                      rentHealthMtd). Not collectedMtd divided by anything —
+//                      see that helper for why those are different questions.
+//                      Left out for a viewer who sees no grand total, like
+//                      `outstanding`: `owed` is the same KIND of claim — a
+//                      total of what everyone owes (decisions #25). It is not
+//                      the same money as `outstanding`, which counts every
+//                      open charge of every month while this is the month's
+//                      rent; see rentHealthMtd.
+//   outstanding      — every open charge of every month, the one shared rule
+//                      (lib/rentCollected outstandingBalanceOf), the same
+//                      figure the dashboard's Outstanding card shows. 10/18.
 //   occupancyRate    — round(100 × active / total) across landlord's units
-//   monthly[]        — last 6 months: collected (= that month's P&L total),
-//                      rent, disbursed, fees, net
+//   monthly[]        — last 6 months: charged / received / owed and the net
+//                      on each (10/12), collected (= received), rent,
+//                      disbursed, fees, net
+//   thisMonth, ytd   — 10/12 (Nic): Charged / Received / Owed this month (with
+//                      the tie line) and this year
 //   ownerVsManager   — split of landlord's manager_fee vs owner_share
 //                      ledger entries this month (16a)
 reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const basis = parseIncomeBasis(req.query.basis)
+    const basis = LEGACY_BASIS
     const isAdmin = req.user!.role === 'admin' || req.user!.role === 'super_admin'
+    // decisions #25: the Outstanding Balance and every Owed figure below are
+    // grand totals of what everyone owes (viewForViewer).
+    const seesTotals = seesGrandTotals(req.user)
     // S633: spans every entity the account owns. Scoped to one entity, the
     // headline figures on the Reports page silently excluded the other
     // company's rent — a number that is wrong with no sign that it is wrong.
@@ -288,6 +462,8 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
     // S655 (gam-audience-data-isolation): a team member assigned to some
     // properties sees those properties' money only — every figure below.
     const scopedIds = isAdmin ? null : await getScopedPropertyIds(req.user)
+    // 10/12 (Nic): a bookkeeper's former property stops at the day it left.
+    const cutoffs = await propertyCutoffsOf(req.user)
     const userId = req.user!.userId
 
     // S655: each month's figure IS that month's P&L total under the basis —
@@ -297,12 +473,23 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
     const today = todayIn(null)
     const yearStart = `${today.slice(0, 4)}-01-01`
     const windowStart = months[0] + '-01' < yearStart ? months[0] + '-01' : yearStart
-    const events = await incomeEvents({
-      landlordIds, start: windowStart, end: monthDays(months[months.length - 1]).last, basis,
-      propertyIds: scopedIds,
+    // 10/12 (Nic, review): one decision for the whole account — the books only
+    // when EVERY company reads them — passed to every reader below, so no
+    // company's month mixes the books and the money records (Oak Park and
+    // Mountain View share one account).
+    const source = landlordIds && await ledgerReportsLive(landlordIds) ? 'ledger' as const : 'records' as const
+    // 10/12 (Nic): both kinds of facts — Charged, Received and Owed side by side.
+    const both = await incomeBoth({
+      landlordIds, start: windowStart, end: monthDays(months[months.length - 1]).last,
+      propertyIds: scopedIds, cutoffs, source,
     })
-    const perMonth = byMonth(events)
+    const perMonth = byMonth(both.received)
+    const perMonthBilled = byMonth(both.billed)
     const monthTotals = (ym: string) => summarize(perMonth.get(ym) ?? [], basis)
+    const monthView = (ym: string) => {
+      const d = monthDays(ym)
+      return moneyViewFrom(perMonthBilled.get(ym) ?? [], perMonth.get(ym) ?? [], { start: d.first, end: d.last, label: monthWords(ym) })
+    }
 
     const disbursementRows = isAdmin
       ? await query<any>(`
@@ -335,79 +522,98 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
     // run's fees, which matched nothing the row opens. The admin lens (every
     // landlord) has no one P&L to net against: null.
     const monthExpenses = new Map<string, number>()
+    // 10/12 (Nic, ledger P8): on the books, the Received net takes the
+    // expenses PAID in the month (cashTotal), the Charged net those incurred.
+    const monthPaid = new Map<string, number>()
     if (landlordIds) {
       await Promise.all(months.map(async ym => {
         const [y, m] = ym.split('-').map(Number)
         const { start, end } = monthRange(y, m)
         const perCompany = await Promise.all(landlordIds.map(lid =>
-          landlordPLExpenses(lid, start, end, periodMonths(y, m), scopedIds)))
+          landlordPLExpenses(lid, start, end, periodMonths(y, m), scopedIds, cutoffs, source)))
         monthExpenses.set(ym, round2(perCompany.reduce((s, e) => s + e.total, 0)))
+        monthPaid.set(ym, round2(perCompany.reduce((s, e) => s + (e.cashTotal ?? e.total), 0)))
       }))
     }
     const monthly = [...months].reverse().map(month => {
       const t = monthTotals(month)
+      const v = monthView(month)
       const d = disb.get(month) ?? { disbursed: 0, fees: 0 }
       const expenses = landlordIds ? (monthExpenses.get(month) ?? 0) : null
+      const paid = landlordIds ? (monthPaid.get(month) ?? 0) : null
       return {
         month,
+        // 10/12 (Nic): the three columns, and the net on each money column.
+        charged: v.charged,
+        received: v.received,
+        ...(seesTotals ? { owed: v.owed } : {}),
+        netCharged: expenses == null ? null : round2(v.charged - expenses),
+        netReceived: paid == null ? null : round2(v.received - paid),
         collected: t.total,
         rent: t.lines.rent,
         disbursed: d.disbursed,
         fees: d.fees,
         expenses,
-        net: expenses == null ? null : round2(t.total - expenses),
+        net: paid == null ? null : round2(t.total - paid),
       }
     })
 
     // S642/S655: the dashboard's cards, from the same facts and the same rules
     // (lib/rentCollected), so Reports and the dashboard cannot disagree. Money
     // still clearing is its own figure beside what arrived.
-    const [rentCard, allCard] = await Promise.all([
-      collectedRentMtd(landlordIds, scopedIds, { scope: 'rent', basis }),
-      collectedRentMtd(landlordIds, scopedIds, { scope: 'all', basis }),
+    const [rentCard, allCard, rentHealth] = await Promise.all([
+      collectedRentMtd(landlordIds, scopedIds, { scope: 'rent', basis, cutoffs }),
+      collectedRentMtd(landlordIds, scopedIds, { scope: 'all', basis, cutoffs }),
+      // 10/17 (Nic): the payment-health figure the dashboard shows, from the
+      // one helper — invoiced against paid, work trade out of both sides.
+      rentHealthMtd(landlordIds, scopedIds, { cutoffs }),
     ])
-    const incomeCard = incomeCardFrom(allCard, basis)
+    const fullIncomeCard = incomeCardFrom(allCard, basis)
+    // decisions #25: Money billed's collected / clearing / still owed add up to
+    // what was charged, so only the charged amount is left for a viewer who
+    // sees no grand totals.
+    const incomeCard = seesTotals ? fullIncomeCard
+      : { ...fullIncomeCard, billed: { amount: fullIncomeCard.billed.amount } }
     const collectedMtd = basis === 'received' ? rentCard.collected : rentCard.billed.collected
     const collectedMtdClearing = basis === 'received' ? rentCard.inFlight : rentCard.billed.clearing
 
-    // Outstanding = invoice total minus settled payments matched to that invoice.
-    // pending|partial invoices only — settled invoices net to zero.
-    // S640 (Nic): work-trade charges are suspended, not owed — they settle in
-    // hours at month close. Netted here for the same reason as on the dashboard
-    // and the balances page: this figure and those two are the same claim about
-    // the same money, and Reports is where a landlord goes to check the others.
-    const OUTSTANDING_PAID = `
-              SELECT invoice_id,
-                     SUM(amount) FILTER (WHERE status IN ('settled', 'processing')) AS paid,
-                     SUM(amount) FILTER (WHERE status NOT IN ('settled', 'processing')
-                                           AND work_trade_suspended_at IS NOT NULL) AS traded
-                FROM payments WHERE invoice_id IS NOT NULL
-               GROUP BY invoice_id`
-    // S654: suspended lines sit OUTSIDE total_amount (the S634 shape, every
-    // writer); subtracting `traded` again clamped a partly covered bill to $0.
-    const OUTSTANDING_SUM =
-      `COALESCE(SUM(GREATEST(i.total_amount - COALESCE(p.paid, 0), 0)), 0)::numeric AS amount`
+    // ── 10/18 (Nic): THIS CARD AND THE DASHBOARD'S ARE ONE FIGURE ─────────
+    //
+    //   "You're pulling numbers from different spots here. So that is a huge
+    //    problem for a landlord to see incorrect numbers."
+    //
+    // This card ("Outstanding Balance / every month still owed") and the
+    // dashboard's Outstanding card answer the same question, and the dashboard
+    // card is where a landlord lands before clicking through to here. Each used
+    // to sum its own copy of the same defective SQL — an invoice's total_amount
+    // less what was paid against it — which drops every accrued late fee and
+    // takes a settled one off a total it was never in. Measured read-only
+    // against production 10/18, the two cards would have printed $13,070.08 and
+    // $11,970.08 under the same words.
+    //
+    // One helper now, read by both: lib/rentCollected outstandingBalanceOf,
+    // which reads the ONE shared open-charge rule (services/openBalances) that
+    // the balances page this card opens, the tenant portal, Pay Now, the 7am
+    // overdue digest and the agents already read. The defect in dollars, what
+    // the rule leaves out, and why GAM's own fees are not a landlord's
+    // receivable are all written there.
+    //
+    // A bookkeeper's cutoffs ride along (10/12: a former property's bills due
+    // by the day they left); the dashboard passes none, because that endpoint
+    // is the account owner's and an admin's.
+    //
     // decisions #25 (Nic, 10/3): a GRAND TOTAL of what everyone owes is for
     // account owners and property managers only — left out of the reply for
     // anyone else (front desk / on-site staff with "View all payments"), not
     // just hidden on the screen, and not even computed. One rule:
     // services/openBalances seesGrandTotals.
-    const showOutstanding = seesGrandTotals(req.user)
-    const outstandingRow = !showOutstanding ? null : isAdmin
-      ? await queryOne<any>(`
-          SELECT ${OUTSTANDING_SUM}
-            FROM invoices i
-            LEFT JOIN (${OUTSTANDING_PAID}) p ON p.invoice_id = i.id
-           WHERE i.status IN ('pending', 'partial')
-        `)
-      : await queryOne<any>(`
-          SELECT ${OUTSTANDING_SUM}
-            FROM invoices i
-            LEFT JOIN (${OUTSTANDING_PAID}) p ON p.invoice_id = i.id
-           WHERE i.landlord_id = ANY($1::uuid[]) AND i.status IN ('pending', 'partial')
-             AND ($2::uuid[] IS NULL OR i.unit_id IN (SELECT id FROM units WHERE property_id = ANY($2::uuid[])))
-        `, [landlordIds, scopedIds])
-    const outstanding = parseFloat(outstandingRow?.amount ?? '0')
+    // 10/12 (Nic): a bookkeeper who keeps no property's money (the
+    // company-wide box alone) has no Outstanding Balance to read — a "$0"
+    // card would say nobody owes anything. The card is left out for them.
+    const keepsNoPropertyMoney = req.user!.role === 'bookkeeper' && Array.isArray(scopedIds) && scopedIds.length === 0
+    const showOutstanding = seesTotals && !keepsNoPropertyMoney
+    const outstanding = !showOutstanding ? 0
+      : (await outstandingBalanceOf(isAdmin ? null : landlordIds, scopedIds, { cutoffs })).outstanding
 
     // S616 (Nic): occupancy counts SHORT STAYS — "aggregate thirty nights of
     // bookings as well" — and excludes service points, which are a neighbor's
@@ -458,20 +664,42 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
     `, [userId])
 
     // YTD: each month of this year (to date), the same month totals.
-    const ytdMonthly: Array<{ month: string; collected: number }> = []
+    // 10/12: Charged and Owed beside Received (collected) for every month.
+    const ytdMonthly: Array<{ month: string; collected: number; charged: number; owed?: number }> = []
     for (let m = 1; m <= Number(today.slice(5, 7)); m++) {
       const ym = `${today.slice(0, 4)}-${String(m).padStart(2, '0')}`
-      const t = monthTotals(ym)
-      if (t.total !== 0) ytdMonthly.push({ month: ym, collected: t.total })
+      const v = monthView(ym)
+      if (v.received !== 0 || v.charged !== 0) {
+        ytdMonthly.push({ month: ym, collected: v.received, charged: v.charged, ...(seesTotals ? { owed: v.owed } : {}) })
+      }
     }
     const ytdCollected = round2(ytdMonthly.reduce((s, m) => s + m.collected, 0))
+    // 10/12 (Nic, review): on the books a month's Owed is a balance at its end
+    // (a bill unpaid since January is in every month's), so the year's Owed is
+    // the balance at the end of this month, never the months added up.
+    const ytdOwed = source === 'ledger'
+      ? monthView(today.slice(0, 7)).owed
+      : round2(ytdMonthly.reduce((s, m) => s + (m.owed ?? 0), 0))
+    const ytd = {
+      charged: round2(ytdMonthly.reduce((s, m) => s + m.charged, 0)),
+      received: ytdCollected,
+      ...(seesTotals ? { owed: ytdOwed } : {}),
+    }
+    const cur = viewForViewer(monthView(today.slice(0, 7)), seesTotals) as Partial<MoneyView> & Pick<MoneyView, 'charged' | 'received' | 'tieText'>
+    const thisMonth = {
+      month: today.slice(0, 7), charged: cur.charged, received: cur.received,
+      ...(seesTotals ? { owed: cur.owed, collected: cur.collected, clearing: cur.clearing } : {}),
+      tieText: cur.tieText,
+    }
 
     res.json({ success: true, data: {
       collectedMtd,
       collectedMtdClearing,
       incomeCard,
       ytdCollected,
-      ...(showOutstanding ? { outstanding } : {}),
+      ytd,
+      thisMonth,
+      ...(showOutstanding ? { outstanding, rentHealth } : {}),
       occupancyRate,
       occupiedUnits: active,
       totalUnits: total,
@@ -481,15 +709,21 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
         ownerShare: parseFloat(splitRow?.owner_share ?? '0'),
         managerFee: parseFloat(splitRow?.manager_fee ?? '0'),
       },
-      meta: { basis: basisMeta(basis) },
+      meta: MONEY_META,
     } })
   } catch (e) { next(e) }
 })
 
 // ── MONTHLY P&L DRILL-IN (S512 #20) ───────────────────────────
-// GET /api/reports/monthly-pl?year=YYYY&month=M[&basis=received|billed]
+// GET /api/reports/monthly-pl?year=YYYY&month=M
 // Backs the clickable drill-in on the landlord ReportsPage monthly
 // table. One month's profit-and-loss:
+//   view      — 10/12 (Nic): Charged / Received / Owed by line and category,
+//               with the tie line; nets = each money column less expenses
+//   days[]    — 10/12 (Nic): "the money by the day it arrived" as ONE line per
+//               day with that day's total, and under it the expenses logged
+//               that day; paymentKeys name the payments[] behind the day (the
+//               screen expands a day to who paid; the printout shows totals)
 //   gross     — income by line (services/landlordPL → incomeBasis)
 //   lines     — every non-zero income line, labeled (paid ahead, register
 //               sales, credits given, returned, ...); they add up to gross.total
@@ -504,7 +738,7 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
 //               rowsTotal is their sum.
 reportsRouter.get('/monthly-pl', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const basis = parseIncomeBasis(req.query.basis)
+    const basis = LEGACY_BASIS
     // S654: "this month" by the Phoenix calendar, not the server clock's zone.
     const today = todayIn(null)
     const year  = parseInt(req.query.year as string)  || Number(today.slice(0, 4))
@@ -520,12 +754,20 @@ reportsRouter.get('/monthly-pl', requirePerm('payments.view_all'), async (req, r
     // so a team member assigned to some properties sees those properties'
     // P&L — the same scope /summary's row was built with.
     const scopedIds = await getScopedPropertyIds(req.user)
+    // 10/12 (Nic): a bookkeeper's former property stops at the day it left.
+    const cutoffs = await propertyCutoffsOf(req.user)
 
-    const pl = await computeLandlordPL(landlordId, String(start), String(end), periodMonths(year, month), basis, scopedIds)
-    const events = await incomeEvents({
-      landlordIds: [landlordId], start: String(start).slice(0, 10), end: String(end).slice(0, 10), basis,
-      propertyIds: scopedIds,
-    })
+    // 10/12: the facts read once — both kinds — for the P&L, its three
+    // columns, the payments behind it and its days.
+    const first = String(start).slice(0, 10), last = String(end).slice(0, 10)
+    const ym = `${year}-${String(month).padStart(2, '0')}`
+    const [both, expenses, expensesByDay] = await Promise.all([
+      incomeBoth({ landlordIds: [landlordId], start: first, end: last, propertyIds: scopedIds, cutoffs }),
+      landlordPLExpenses(landlordId, String(start), String(end), periodMonths(year, month), scopedIds, cutoffs),
+      enteredExpensesByDay(landlordId, first, last, scopedIds, cutoffs),
+    ])
+    const pl = landlordPLFrom(both, expenses, { start: first, end: last, label: monthWords(ym) }, basis)
+    const events = both.received
     const { rows: paymentRows, rowsTotal, chargeCount } = await chargesBehind(events)
     const summary = summarize(events, basis)
 
@@ -541,15 +783,54 @@ reportsRouter.get('/monthly-pl', requirePerm('payments.view_all'), async (req, r
       paymentCount: chargeCount,
       payments: paymentRows,
       rowsTotal,
-      meta: { basis: pl.basis },
+      view: viewForViewer(pl.view, seesGrandTotals(req.user)),
+      nets: pl.nets,
+      days: dailyLines(events, paymentRows, expensesByDay),
+      meta: MONEY_META,
     } })
   } catch (e) { next(e) }
 })
 
+/**
+ * 10/12 (Nic): "the monthly P&L's 'money by the day it arrived' list
+ * collapses to ONE line per day with that day's total, and under each day any
+ * expenses logged that day ('You logged $2,000 of expenses')."
+ *
+ * One entry per day that had money arrive or an expense logged, newest first.
+ * `received` is every fact of the day in the Received total — so the days add
+ * up to the month's Received — and `chargesTotal` the part with a charge
+ * behind it (`paymentKeys`, the payments[] rows a screen expands to); the rest
+ * (`noCharge`) is money with no single charge (paid ahead, register sales,
+ * stays, other income). Expenses are the P&L's "Your expenses" by their date.
+ */
+export function dailyLines(
+  events: readonly IncomeEvent[],
+  rows: ReadonlyArray<{ id: string; key: string; day: string; amount: number }>,
+  expensesByDay: ReadonlyMap<string, { amount: number; count: number }>,
+): Array<{
+  day: string; received: number; chargesTotal: number; noCharge: number; paymentCount: number; paymentKeys: string[]
+  expensesLogged: number; expenseCount: number
+}> {
+  const totals = new Map<string, number>()
+  for (const e of events) if (e.inTotal) totals.set(e.day, (totals.get(e.day) ?? 0) + e.amount)
+  const days = new Set<string>([...totals.keys(), ...expensesByDay.keys()])
+  return [...days].sort((a, b) => b.localeCompare(a)).map(day => {
+    const dayRows = rows.filter(r => r.day === day)
+    const received = round2(totals.get(day) ?? 0)
+    const chargesTotal = round2(dayRows.reduce((s, r) => s + r.amount, 0))
+    const exp = expensesByDay.get(day)
+    return {
+      day, received, chargesTotal, noCharge: round2(received - chargesTotal),
+      paymentCount: new Set(dayRows.map(r => r.id)).size, paymentKeys: dayRows.map(r => r.key),
+      expensesLogged: exp?.amount ?? 0, expenseCount: exp?.count ?? 0,
+    }
+  })
+}
+
 // ── MONTHLY OWNER STATEMENT ───────────────────────────────────
 reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const basis = parseIncomeBasis(req.query.basis)
+    const basis = LEGACY_BASIS
     // S654: the default is LAST month (a statement covers a finished month),
     // read off the Phoenix calendar. The old getMonth() shortcut handed back
     // month 0 in January.
@@ -613,7 +894,13 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
     // landlord's income is listed — GAM's own rows, held paid-ahead money and
     // FlexPay pulls are not the landlord's. Deposits held are their own list:
     // never income.
-    const statementEvents = await incomeEvents({ landlordIds: [landlordId], start: first, end: last, basis })
+    // 10/12: both kinds of facts and the P&L's expenses, read once; the P&L,
+    // its three columns and the payments behind it come off them.
+    const [both, plExpenses] = await Promise.all([
+      incomeBoth({ landlordIds: [landlordId], start: first, end: last }),
+      landlordPLExpenses(landlordId, String(start), String(end), periodMonths(year, month)),
+    ])
+    const statementEvents = both.received
     const { rows: payments, rowsTotal } = await chargesBehind(statementEvents)
     const depositRows = await query<any>(`
       SELECT p.id, p.amount, p.status, p.due_date::text AS due_date, p.settled_at,
@@ -636,15 +923,27 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
       tenantFirst: d.tenant_first ?? null, tenantLast: d.tenant_last ?? null,
       tenantName: [d.tenant_first, d.tenant_last].filter(Boolean).join(' ') || null,
     }))
-    // Bills due this month that are open: late (past due, not paid) and failed.
-    const openCounts = await queryOne<{ late: number; failed: number }>(`
-      SELECT COUNT(*) FILTER (WHERE p.status = 'pending' AND p.due_date < $4::date)::int AS late,
-             COUNT(*) FILTER (WHERE p.status = 'failed')::int AS failed
-        FROM payments p
-       WHERE p.landlord_id = $1 AND ${landlordIncomeSql('p')}
-         AND p.work_trade_suspended_at IS NULL
-         AND p.due_date BETWEEN $2::date AND $3::date`,
-      [landlordId, first, last, todayIn(null)])
+    // 10/12 (Nic): late and failed count HOUSEHOLDS, never lines — a $5
+    // daily late fee is not five late bills. Late = a household past its
+    // grace period on the month's bills (services/householdMonths, the Rent
+    // Roll's stamps: paid late, outstanding, or partly paid past grace);
+    // failed = a household with a payment that failed on the month's bills.
+    const ym = `${year}-${String(month).padStart(2, '0')}`
+    const hhMonths = await householdMonths({ landlordIds: [landlordId], from: ym, through: ym })
+    const stampCount = (st: string) => hhMonths.filter(m => m.stamp === st).length
+    const pastGrace = hhMonths.filter(m => m.stamp === 'paid_late' || m.stamp === 'outstanding'
+      || (m.stamp === 'partial' && m.days_past_grace > 0)).length
+    const failedRow = await queryOne<{ failed: number }>(`
+      SELECT COUNT(DISTINCT hh)::int AS failed FROM (
+        SELECT ${householdOfRowSql('p', 'inv')} AS hh
+          FROM payments p
+          LEFT JOIN invoices inv ON inv.id = p.invoice_id
+         WHERE p.landlord_id = $1 AND ${landlordIncomeSql('p')}
+           AND p.status = 'failed'
+           AND COALESCE(inv.due_date, p.due_date) BETWEEN $2::date AND $3::date) f
+       WHERE hh IS NOT NULL`,
+      [landlordId, first, last])
+    const openCounts = { late: pastGrace, failed: failedRow?.failed ?? 0 }
 
     // Maintenance costs for the month
     const maintenance = await query<any>(`
@@ -679,7 +978,7 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
     // ── P&L calculations ──────────────────────────────────────
     // S654: the statement's P&L IS the monthly P&L (computeLandlordPL), so the
     // two can never disagree for the same month.
-    const pl = await computeLandlordPL(landlordId, String(start), String(end), periodMonths(year, month), basis)
+    const pl = landlordPLFrom(both, plExpenses, { start: first, end: last, label: monthWords(ym) }, basis)
     const rentCollected      = pl.gross.rent
     const feesCollected      = pl.gross.fees
     const utilitiesCollected = pl.gross.utilities
@@ -704,17 +1003,23 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
 
     // Expenses — the P&L's: platform fee (actual billed accruals), actual
     // maintenance cost (the maintenance platform fee is never surfaced), lot
-    // rent and the landlord's entered expenses.
+    // rent, the landlord's entered expenses and (10/11) the payment processing
+    // fees the landlord covers for tenants — every figure in totalExpenses has
+    // its own field, so the statement's lines add up to it.
     const totalPlatformFees = pl.expenses.platformFee
     const totalMaintCost    = pl.expenses.maintenance
     const lotRent           = pl.expenses.lotRent
     const enteredExpenses   = pl.expenses.enteredExpenses
+    const processingFees    = pl.expenses.processingFees
+    // 10/12 (Nic, G10): the card fees guests got back with refunds of card sales.
+    const cardFeesRefunded  = pl.expenses.cardFeesRefunded
 
     // S86: PM subsystem superseded by 16a (DEFERRED Item 13). pmFee always 0.
     const pmFee = 0
 
     const totalExpenses = round2(pl.expenses.total + pmFee)
-    const netToOwner    = round2(totalIncome - totalExpenses)
+    // 10/12 (Nic, ledger P8): on the books, income received less the expenses PAID in the month.
+    const netToOwner    = round2(totalIncome - ((pl.expenses.cashTotal ?? pl.expenses.total) + pmFee))
 
     res.json({
       success: true,
@@ -730,16 +1035,26 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
           balancesCollected, bankedOtherIncome, otherIncome,
           depositsCollected, totalIncome, totalCollected,
           // expenses
-          totalPlatformFees, totalMaintCost, lotRent, enteredExpenses, pmFee, totalExpenses,
+          totalPlatformFees, totalMaintCost, lotRent, enteredExpenses, processingFees, cardFeesRefunded, pmFee, totalExpenses,
           netToOwner,
           // occupancy + payment counts
           occupiedUnits:  units.filter((u:any) => u.is_occupied).length,
           vacantUnits:    units.filter((u:any) => !u.is_occupied).length,
           settledPayments: settledRows.length,
-          latePayments:    openCounts?.late ?? 0,
-          failedPayments:  openCounts?.failed ?? 0,
+          // 10/12: households, not lines (see openCounts).
+          latePayments:    openCounts.late,
+          failedPayments:  openCounts.failed,
+          households: {
+            counted: hhMonths.filter(m => m.stamp).length,
+            paidOnTime: stampCount('paid_on_time'), paidLate: stampCount('paid_late'), partial: stampCount('partial'),
+            outstanding: stampCount('outstanding'), due: stampCount('due'),
+            pastGrace, failed: openCounts.failed,
+          },
         },
-        meta: { basis: pl.basis },
+        // 10/12 (Nic): Charged / Received / Owed side by side, with the tie.
+        view: viewForViewer(pl.view, seesGrandTotals(req.user)),
+        nets: pl.nets,
+        meta: MONEY_META,
       }
     })
   } catch (e) { next(e) }
@@ -761,7 +1076,7 @@ export function paidAheadLeftoverLabel(year: number, today: string = todayIn(nul
 // $0 again next year when it pays them).
 reportsRouter.get('/tax-summary', requirePerm('books.view'), async (req, res, next) => {
   try {
-    const basis = parseIncomeBasis(req.query.basis)
+    const basis = LEGACY_BASIS
     const year = parseInt(req.query.year as string) || thisYear()   // S654: Phoenix year
     const start = `${year}-01-01`
     const end   = `${year}-12-31`
@@ -779,9 +1094,15 @@ reportsRouter.get('/tax-summary', requirePerm('books.view'), async (req, res, ne
 
     // The year's P&L (income under the basis; expenses: GAM platform fee,
     // maintenance actual cost, lot rent, entered expenses).
-    const pl = await computeLandlordPL(landlordId, start, end, periodMonths(year, null), basis)
-    const events = await incomeEvents({ landlordIds: [landlordId], start, end, basis })
+    // 10/12: both kinds of facts read once — the P&L, its three columns and the months.
+    const [both, plExpenses] = await Promise.all([
+      incomeBoth({ landlordIds: [landlordId], start, end }),
+      landlordPLExpenses(landlordId, start, end, periodMonths(year, null)),
+    ])
+    const pl = landlordPLFrom(both, plExpenses, { start, end, label: String(year) }, basis)
+    const events = both.received
     const perMonth = byMonth(events)
+    const perMonthBilled = byMonth(both.billed)
     const countedCharges = new Set(events.filter(e => e.inTotal && e.paymentId).map(e => e.paymentId))
 
     const maintStats = await queryOne<any>(`
@@ -851,14 +1172,21 @@ reportsRouter.get('/tax-summary', requirePerm('books.view'), async (req, res, ne
          AND ${landlordIncomeSql()}
        GROUP BY 1`, [landlordId, start, end])
     const failedBy = new Map<number, number>(failedRows.map((r: any) => [r.month, r.failed]))
-    const monthlyBreakdown: Array<{ month: number; collected: number; paid: number; failed: number }> = []
+    const seesTotals = seesGrandTotals(req.user)
+    const monthlyBreakdown: Array<{ month: number; collected: number; paid: number; failed: number; charged: number; received: number; owed?: number }> = []
     for (let m = 1; m <= 12; m++) {
       const ym = `${year}-${String(m).padStart(2, '0')}`
       const evs = perMonth.get(ym) ?? []
       const t = summarize(evs, basis)
+      // 10/12 (Nic): Charged and Owed beside Received for every month.
+      const d = monthDays(ym)
+      const v = moneyViewFrom(perMonthBilled.get(ym) ?? [], evs, { start: d.first, end: d.last, label: monthWords(ym) })
       const paid = new Set(evs.filter(e => e.inTotal && e.paymentId).map(e => e.paymentId)).size
       const failed = failedBy.get(m) ?? 0
-      if (t.total !== 0 || paid || failed) monthlyBreakdown.push({ month: m, collected: t.total, paid, failed })
+      if (t.total !== 0 || v.charged !== 0 || paid || failed) {
+        // decisions #25: Owed only for a viewer who sees grand totals (viewForViewer).
+        monthlyBreakdown.push({ month: m, collected: t.total, paid, failed, charged: v.charged, received: v.received, ...(seesTotals ? { owed: v.owed } : {}) })
+      }
     }
 
     const workTradeVal = workTradeStats.reduce((s:number, w:any) => s + parseFloat(w.credit_value||0), 0)
@@ -885,6 +1213,10 @@ reportsRouter.get('/tax-summary', requirePerm('books.view'), async (req, res, ne
           maintExpenses: pl.expenses.maintenance,
           lotRent: pl.expenses.lotRent,
           enteredExpenses: pl.expenses.enteredExpenses,
+          // 10/11: in pl.net (netIncome below), so listed with the rest.
+          processingFees: pl.expenses.processingFees,
+          // 10/12 (G10): in pl.net too.
+          cardFeesRefunded: pl.expenses.cardFeesRefunded,
           maintRequestCount: parseInt(maintStats?.request_count || 0),
           workTradeValue: workTradeVal,
         },
@@ -903,10 +1235,15 @@ reportsRouter.get('/tax-summary', requirePerm('books.view'), async (req, res, ne
         workTrade: workTradeStats,
         monthlyBreakdown,
         // S655: the net IS the P&L's net (income − platform fee − maintenance −
-        // lot rent − entered expenses), so the tax page and the P&L agree.
+        // lot rent − entered expenses − processing fees the landlord covers),
+        // so the tax page and the P&L agree.
         netIncome: pl.net,
+        // 10/12 (Nic): Charged / Received / Owed for the year, with the tie,
+        // and the net on each money column.
+        view: viewForViewer(pl.view, seesTotals),
+        nets: pl.nets,
         w2099Threshold: workTradeStats.filter((w:any) => parseFloat(w.credit_value||0) >= 600),
-        meta: { basis: pl.basis },
+        meta: MONEY_META,
       }
     })
   } catch (e) { next(e) }
@@ -915,7 +1252,8 @@ reportsRouter.get('/tax-summary', requirePerm('books.view'), async (req, res, ne
 // ── PER-PROPERTY P&L ──────────────────────────────────────────
 reportsRouter.get('/property-pl', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const basis = parseIncomeBasis(req.query.basis)
+    const basis = LEGACY_BASIS
+    const seesTotals = seesGrandTotals(req.user)
     const year  = parseInt(req.query.year as string)  || thisYear()   // S654: Phoenix year
     const month = req.query.month ? parseInt(req.query.month as string) : null
     if (month !== null && (month < 1 || month > 12)) throw new AppError(400, 'month must be 1-12')
@@ -928,6 +1266,21 @@ reportsRouter.get('/property-pl', requirePerm('payments.view_all'), async (req, 
     const scopedIds = await getScopedPropertyIds(req.user)
     const start = month ? `${year}-${String(month).padStart(2,'0')}-01` : `${year}-01-01`
     const end   = month ? lastDayOfMonth(year, month) : `${year}-12-31`
+    // 10/12 (Nic): the clean cut at a sale — a bookkeeper's former property's
+    // rows after the day it left are never read ([] for everyone else).
+    const cutoffs = await propertyCutoffsOf(req.user)
+    // 10/12 review: a bookkeeper's former properties (sold or moved out while
+    // they kept them) are rows here too, read only, up to the day each left.
+    // The overview and the P&L count that history (incomeEvents, by company),
+    // so without these rows the table did not add up to the P&L it opens: a
+    // bookkeeper whose only property sold saw $500 on the overview and an
+    // empty table. Their figures are the company's own (the companies this
+    // report reads, $1), never the new owner's.
+    const former = req.user?.role === 'bookkeeper'
+      ? (await bookkeeperRequestScopeOf(req.user)).former
+          .filter(f => scopedIds === null || scopedIds.includes(f.propertyId))
+      : []
+    const formerIds = former.map(f => f.propertyId)
 
     // Scalar subqueries per concern — NOT multiple LEFT JOINs of payments +
     // maintenance onto units. Joining two one-to-many tables to the same unit
@@ -936,6 +1289,9 @@ reportsRouter.get('/property-pl', requirePerm('payments.view_all'), async (req, 
     // 10/11 (Nic): only what the By Property table shows. `p.*` sent every
     // property's lease signer, office email and phone, owner ids and fee
     // settings to whoever opened the report — a bookkeeper included.
+    // 10/12 review: every cost is the companies of this report's own ($1), as
+    // its income is (helpers above) — a repair the seller paid before a sale is
+    // not the buyer's.
     const properties = await query<any>(`
       SELECT p.id, p.name, p.city, p.state, p.type, p.landlord_id,
         -- S616: a service point carries a neighbor's utility bill and is not
@@ -948,53 +1304,96 @@ reportsRouter.get('/property-pl', requirePerm('payments.view_all'), async (req, 
           WHERE u.property_id = p.id AND vuo.is_occupied) AS occupied_units,
         (SELECT COALESCE(SUM(mr.actual_cost), 0) FROM maintenance_requests mr
            JOIN units u ON u.id = mr.unit_id
-          WHERE u.property_id = p.id
+          WHERE u.property_id = p.id AND mr.landlord_id = ANY($1::uuid[])
+            AND ${maintenanceCostNotBilledSql('mr')}
             -- S654: the bare-date end is the whole last day, as the P&L counts it.
-            AND mr.completed_at >= $2 AND mr.completed_at < ($3::date + 1)) AS maint_cost,
+            AND mr.completed_at >= $2 AND mr.completed_at < ($3::date + 1)
+            AND ${withinCutoffsSql('p.id', propertyDaySql('mr.completed_at', 'p'), '$6')}) AS maint_cost,
         -- S655: the drill-in's own lot rent and entered expenses, so the row's
         -- net equals the drill-in's net.
-        ${propertyLotRentSql('p.id', '$2', '$3')} AS lot_rent,
-        ${propertyEnteredExpensesSql('p.id', '$2', '$3')} AS entered_expenses
+        ${propertyLotRentSql('p.id', '$2', '$3', '$1', '$6')} AS lot_rent,
+        ${propertyEnteredExpensesSql('p.id', '$2', '$3', '$1', '$6')} AS entered_expenses
       FROM properties p
-      WHERE p.landlord_id = ANY($1::uuid[])
-        AND ($4::uuid[] IS NULL OR p.id = ANY($4::uuid[]))
+      WHERE (p.landlord_id = ANY($1::uuid[])
+             AND ($4::uuid[] IS NULL OR p.id = ANY($4::uuid[])))
+         OR p.id = ANY($5::uuid[])
       ORDER BY p.name`,
-      [landlordIds, start, end, scopedIds])
+      [landlordIds, start, end, scopedIds, formerIds, cutoffsParam(cutoffs)])
 
-    // S655: income per property from the one set of money facts, under the basis.
-    const events = await incomeEvents({ landlordIds, start, end, basis, propertyIds: scopedIds })
-    const incomeBy = new Map<string, IncomeEvent[]>()
-    for (const e of events) {
-      if (!e.propertyId) continue
-      const l = incomeBy.get(e.propertyId)
-      if (l) l.push(e); else incomeBy.set(e.propertyId, [e])
+    // S655: income per property from the one set of money facts.
+    // 10/12 (Nic): both kinds — Charged, Received and Owed per property.
+    const both = await incomeBoth({ landlordIds, start, end, propertyIds: scopedIds, cutoffs })
+    const events = both.received
+    const groupBy = (list: readonly IncomeEvent[]) => {
+      const m = new Map<string, IncomeEvent[]>()
+      for (const e of list) {
+        if (!e.propertyId) continue
+        const l = m.get(e.propertyId)
+        if (l) l.push(e); else m.set(e.propertyId, [e])
+      }
+      return m
     }
+    const incomeBy = groupBy(events)
+    const billedBy = groupBy(both.billed)
+    const periodLabel = month ? monthWords(`${year}-${String(month).padStart(2, '0')}`) : String(year)
 
     // Platform fee per property = GAM's actual billed income over the period
     // (accruals + live estimate for un-accrued months), period-based and
     // short-stay-aware. The maintenance platform fee is never surfaced.
     // S655: landlord net = income − platform fee − maintenance − lot rent −
     // entered expenses: the drill-in's net, line for line.
-    const feeMap = await platformFeesByPropertyForEntities(landlordIds, periodMonths(year, month))
+    const feeMonths = periodMonths(year, month)
+    const feeMap = await platformFeesByPropertyForEntities(landlordIds, feeMonths)
+    await cutFormerPlatformFees(feeMap, landlordIds, feeMonths, cutoffs)
+    // 10/11: and the payment processing fees the landlord covers for tenants,
+    // as the company P&L subtracts them — so the rows still add up to it.
+    const procMap = await processingFeesByProperty(landlordIds, start, end, scopedIds, cutoffs)
+    // 10/12 (Nic, G10): and the card fees guests got back with refunds.
+    const refundFeeMap = await cardFeesRefundedByProperty(landlordIds, start, end, scopedIds, cutoffs)
+    // 10/12 (Nic, ledger P8): on the books, each property's expense accounts.
+    const booksExpenses = await ledgerExpensesByProperty(landlordIds, start, end, scopedIds, cutoffs)
 
     const result = properties.map((p:any) => {
       const inc = summarize(incomeBy.get(p.id) ?? [], basis)
-      const maint    = round2(parseFloat(p.maint_cost || 0))
-      const platFee  = round2(feeMap.get(p.id) ?? 0)
-      const lotRent  = round2(parseFloat(p.lot_rent || 0))
-      const entered  = round2(parseFloat(p.entered_expenses || 0))
-      const expensesTotal = round2(platFee + maint + lotRent + entered)
-      const netIncome = round2(inc.total - expensesTotal)
-      return { ...p,
+      const le = booksExpenses ? booksExpenses.get(p.id) : null
+      const maint    = booksExpenses ? round2(le?.maintenance ?? 0) : round2(parseFloat(p.maint_cost || 0))
+      const platFee  = booksExpenses ? round2(le?.platformFee ?? 0) : round2(feeMap.get(p.id) ?? 0)
+      const lotRent  = booksExpenses ? round2(le?.lotRent ?? 0) : round2(parseFloat(p.lot_rent || 0))
+      const entered  = booksExpenses ? round2(le?.enteredExpenses ?? 0) : round2(parseFloat(p.entered_expenses || 0))
+      const proc     = round2(procMap.get(p.id) ?? 0)
+      const cardBack = round2(refundFeeMap.get(p.id) ?? 0)
+      const expensesTotal = round2(platFee + maint + lotRent + entered + proc + cardBack)
+      // On the books the Received net takes the expenses PAID in the period.
+      const expensesPaid = booksExpenses ? round2(le?.cashTotal ?? 0) : expensesTotal
+      const netIncome = round2(inc.total - expensesPaid)
+      // 10/12 (Nic): the three columns and the net on each money column.
+      const v = moneyViewFrom(billedBy.get(p.id) ?? [], incomeBy.get(p.id) ?? [], { start, end, label: periodLabel })
+      // decisions #25: Owed only for a viewer who sees grand totals (viewForViewer).
+      const cols = {
+        charged: v.charged, received: v.received, ...(seesTotals ? { owed: v.owed } : {}),
+        net_charged: round2(v.charged - expensesTotal), net_received: round2(v.received - expensesPaid),
+        ...(booksExpenses ? { expenses_paid: expensesPaid } : {}),
+      }
+      // 10/12: a former property's row is its history: no units or occupancy
+      // today (those are the new owner's), and the last day it was theirs.
+      const left = former.find(f => f.propertyId === p.id)
+      if (left) {
+        return { ...p, landlord_id: landlordIds[0],
+          total_units: null, occupied_units: null, occupancy_rate: null, left_on: left.lastDay,
+          rent_collected: inc.total, income_total: inc.total, rent_line: inc.lines.rent,
+          maint_cost: maint, platform_fees: platFee, lot_rent: lotRent, entered_expenses: entered,
+          processing_fees: proc, card_fees_refunded: cardBack, expenses_total: expensesTotal, net_income: netIncome, ...cols }
+      }
+      return { ...p, ...cols,
         // Kept under its old name: this is the property's income under the basis.
         rent_collected: inc.total, income_total: inc.total, rent_line: inc.lines.rent,
         maint_cost: maint, platform_fees: platFee, lot_rent: lotRent, entered_expenses: entered,
-        expenses_total: expensesTotal, net_income: netIncome,
+        processing_fees: proc, card_fees_refunded: cardBack, expenses_total: expensesTotal, net_income: netIncome, left_on: null,
         occupancy_rate: parseInt(p.total_units||0) > 0
           ? Math.round((parseInt(p.occupied_units||0) / parseInt(p.total_units||0)) * 100) : 0 }
     })
 
-    res.json({ success: true, data: { year, month, period: { start, end }, properties: result, meta: { basis: basisMeta(basis) } } })
+    res.json({ success: true, data: { year, month, period: { start, end }, properties: result, meta: MONEY_META } })
   } catch (e) { next(e) }
 })
 
@@ -1019,7 +1418,7 @@ reportsRouter.get('/site-downtime', requirePerm('payments.view_all'), async (req
 })
 
 // ── PER-PROPERTY DETAIL DRILL-IN ──────────────────────────────
-// GET /api/reports/property-detail?propertyId=UUID&year=YYYY[&month=M][&basis=]
+// GET /api/reports/property-detail?propertyId=UUID&year=YYYY[&month=M]
 // Backs the click-into-a-property drill-in on the By Property tab. Same
 // period semantics as /property-pl (month omitted = full calendar year) so
 // the modal reconciles with the row the user clicked.
@@ -1039,7 +1438,7 @@ reportsRouter.get('/site-downtime', requirePerm('payments.view_all'), async (req
 // Scoped to the caller's landlord; a property owned by anyone else returns 404.
 reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const basis = parseIncomeBasis(req.query.basis)
+    const basis = LEGACY_BASIS
     const propertyId = req.query.propertyId as string
     if (!propertyId) throw new AppError(400, 'propertyId is required')
     const year  = parseInt(req.query.year as string)  || thisYear()   // S654: Phoenix year
@@ -1052,6 +1451,14 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
     // S655: a team member assigned to other properties gets the same 404 as a stranger.
     const scopedIds = await getScopedPropertyIds(req.user)
     if (scopedIds && !scopedIds.includes(propertyId)) throw new AppError(404, 'Property not found')
+    // 10/12 review: a bookkeeper's former property (sold or moved out while they
+    // kept it) opens too — its history up to the day it left, read only, from
+    // the company's own rows (the By Property row it is opened from).
+    const left = req.user?.role === 'bookkeeper'
+      ? (await bookkeeperRequestScopeOf(req.user)).former.find(f => f.propertyId === propertyId) ?? null
+      : null
+    const cutoffs = await propertyCutoffsOf(req.user)
+    const cut = cutoffsParam(cutoffs)
 
     const start = month ? `${year}-${String(month).padStart(2,'0')}-01` : `${year}-01-01`
     const end   = month ? lastDayOfMonth(year, month) : `${year}-12-31`
@@ -1068,49 +1475,91 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
            JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
           WHERE u.property_id = p.id AND vuo.is_occupied) AS occupied_units
       FROM properties p
-      WHERE p.id = $1 AND p.landlord_id = ANY($2::uuid[])`, [propertyId, landlordIds])
+      WHERE p.id = $1 AND (p.landlord_id = ANY($2::uuid[]) OR $3::boolean)`, [propertyId, landlordIds, !!left])
     if (!property) throw new AppError(404, 'Property not found')
 
     const occupied = parseInt(property.occupied_units || '0', 10)
     const totalUnits = parseInt(property.total_units || '0', 10)
-    const scope = { landlordIds: [property.landlord_id], propertyIds: [propertyId] }
+    // 10/12 review: the facts are the companies of this report's own — the
+    // same ones the By Property row reads (/property-pl: incomeEvents and every
+    // cost by $1) — so the drill-in's net is the row's net. It read the
+    // property's CURRENT owner only, so for a property moved between two of the
+    // account's companies the row and the drill-in disagreed, and a former
+    // property (now someone else's) would have read the new owner's money.
+    const scope = { landlordIds, propertyIds: [propertyId], cutoffs }
 
-    // 1. Income by category, billed vs collected, under the switch.
-    const breakdown = await categoryTotals({ ...scope, start, end, basis })
+    // 1. Income by category — 10/12 (Nic): Charged, Received and Owed side by
+    // side (both kinds of facts, read once for the breakdown, the payments
+    // behind it and the three columns).
+    const both = await incomeBoth({ ...scope, start, end })
+    const breakdown = breakdownFrom(basis, both.billed, both.received)
+    const periodLabel = month ? monthWords(`${year}-${String(month).padStart(2, '0')}`) : String(year)
+    const view = moneyViewFrom(both.billed, both.received, { start, end, label: periodLabel }, both.paidAheadUnused)
 
     // 2. Expenses as line items.
     // Platform fee = GAM's actual billed income for this property over the period
     // (accruals + live estimate for un-accrued months) — period-based and
     // short-stay-aware, so a property that earned rent never shows a $0 fee. The
     // maintenance platform fee is never surfaced; landlord pays only actual cost.
-    const feeMap = await platformFeesByPropertyForEntities(landlordIds, periodMonths(year, month), propertyId)
+    const feeMonths = periodMonths(year, month)
+    const feeMap = await platformFeesByPropertyForEntities(landlordIds, feeMonths, propertyId)
+    await cutFormerPlatformFees(feeMap, landlordIds, feeMonths, cutoffs)
     const platformFee = round2(feeMap.get(propertyId) ?? 0)
+    // 10/12 review: the companies' own repairs (a repair the seller paid before
+    // a sale is not the buyer's), cut at a former property's last day.
     const maintenance = await query<any>(`
       SELECT mr.id, mr.title, mr.category, mr.status, mr.actual_cost, mr.completed_at,
         u.unit_number
       FROM maintenance_requests mr
       JOIN units u ON u.id = mr.unit_id
-      WHERE u.property_id = $1
+      JOIN properties mp ON mp.id = u.property_id
+      WHERE u.property_id = $1 AND mr.landlord_id = ANY($4::uuid[])
         -- S654: the bare-date end is the whole last day, as the P&L counts it.
         AND mr.completed_at >= $2 AND mr.completed_at < ($3::date + 1)
         AND mr.actual_cost IS NOT NULL
-      ORDER BY mr.completed_at DESC`, [propertyId, start, end])
+        -- 10/12 review (Nic L6): a repair with a live bill counts once, on the
+        -- bill (in entered expenses below), as the By Property row counts it.
+        AND ${maintenanceCostNotBilledSql('mr')}
+        AND ${withinCutoffsSql('u.property_id', propertyDaySql('mr.completed_at', 'mp'), '$5')}
+      ORDER BY mr.completed_at DESC`, [propertyId, start, end, landlordIds, cut])
     const maintCost = round2(maintenance.reduce((s: number, m: any) => s + parseFloat(m.actual_cost || 0), 0))
     // The same lot rent and entered expenses the By Property row subtracts.
     const otherCosts = await queryOne<{ lot: string; entered: string }>(`
-      SELECT ${propertyLotRentSql('$1::uuid', '$2', '$3')}::text AS lot,
-             ${propertyEnteredExpensesSql('$1::uuid', '$2', '$3')}::text AS entered`,
-      [propertyId, start, end])
+      SELECT ${propertyLotRentSql('$1::uuid', '$2', '$3', '$4', '$5')}::text AS lot,
+             ${propertyEnteredExpensesSql('$1::uuid', '$2', '$3', '$4', '$5')}::text AS entered`,
+      [propertyId, start, end, landlordIds, cut])
     const lotRent = round2(parseFloat(otherCosts?.lot ?? '0'))
     const enteredExpenses = round2(parseFloat(otherCosts?.entered ?? '0'))
-    const expensesTotal = round2(platformFee + maintCost + lotRent + enteredExpenses)
+    // 10/11: the processing fees the landlord covers, as the By Property row
+    // and the company P&L subtract them.
+    const processingFees = round2(
+      (await processingFeesByProperty(landlordIds, start, end, [propertyId], cutoffs)).get(propertyId) ?? 0)
+    // 10/12 (Nic, G10): the card fees guests got back with refunds, as the row and the P&L subtract them.
+    const cardFeesRefunded = round2(
+      (await cardFeesRefundedByProperty(landlordIds, start, end, [propertyId], cutoffs)).get(propertyId) ?? 0)
+    // 10/12 (Nic, ledger P8): on the books, the property's expense accounts —
+    // the same figures its By Property row takes.
+    const booksExpenses = (await ledgerExpensesByProperty(landlordIds, start, end, [propertyId], cutoffs))?.get(propertyId) ?? null
+    const onBooks = !!(await ledgerReportsLive(landlordIds))
+    const ex = onBooks
+      ? {
+          platformFee: round2(booksExpenses?.platformFee ?? 0), maintenance: round2(booksExpenses?.maintenance ?? 0),
+          lotRent: round2(booksExpenses?.lotRent ?? 0), enteredExpenses: round2(booksExpenses?.enteredExpenses ?? 0),
+        }
+      : { platformFee, maintenance: maintCost, lotRent, enteredExpenses }
+    const expensesTotal = round2(ex.platformFee + ex.maintenance + ex.lotRent + ex.enteredExpenses + processingFees + cardFeesRefunded)
+    const expensesPaid = onBooks ? round2(booksExpenses?.cashTotal ?? 0) : expensesTotal
 
     // 3. Net.
-    const net = round2(breakdown.total - expensesTotal)
+    const net = round2(breakdown.total - expensesPaid)
 
     // The lists, after the breakdown.
     const isBookkeeper = req.user?.role === 'bookkeeper'
-    const units = isBookkeeper ? [] : await query<any>(`
+    // 10/11 (Nic): the property's rent roll — unit, status, rent, occupied and
+    // the tenant's NAME — is a bookkeeper's too (names are allowed wherever the
+    // books need them). No contact column is selected, so none can reach them.
+    // 10/12: a former property's units today are the new owner's — none here.
+    const units = left ? [] : await query<any>(`
       SELECT u.id, u.unit_number, u.status, u.bedrooms, u.bathrooms, u.rent_amount,
         vuo.is_occupied,
         vuo.primary_first_name AS tenant_first, vuo.primary_last_name AS tenant_last
@@ -1119,35 +1568,47 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
       WHERE u.property_id = $1
       ORDER BY u.unit_number`, [propertyId])
 
-    const events = await incomeEvents({ ...scope, start, end, basis })
+    const events = both.received
     const { rows: paymentRows } = await chargesBehind(events)
     const depositsHeld = summarize(events, basis).beside.depositsHeld
 
-    // Calendar-year income per month under the basis — the modal's mini trend.
-    const yearEvents = month === null
-      ? events
-      : await incomeEvents({ ...scope, start: yearStart, end: yearEnd, basis })
-    const trend = [...byMonth(yearEvents).entries()]
-      .map(([m, evs]) => ({ month: m, collected: summarize(evs, basis).total }))
-      .filter(t => t.collected !== 0)
+    // Calendar-year income per month — the modal's mini trend. 10/12: Charged
+    // beside Received for each month.
+    const yearBoth = month === null ? both : await incomeBoth({ ...scope, start: yearStart, end: yearEnd })
+    const yearBilledBy = byMonth(yearBoth.billed)
+    const yearReceivedBy = byMonth(yearBoth.received)
+    const trend = [...new Set([...yearReceivedBy.keys(), ...yearBilledBy.keys()])]
+      .map(m => ({
+        month: m,
+        collected: summarize(yearReceivedBy.get(m) ?? [], basis).total,
+        charged: summarize(yearBilledBy.get(m) ?? [], 'billed').total,
+      }))
+      .filter(t => t.collected !== 0 || t.charged !== 0)
       .sort((x, y) => x.month.localeCompare(y.month))
 
     res.json({ success: true, data: {
       property: {
         id: property.id, name: property.name, city: property.city, state: property.state, type: property.type,
-        totalUnits, occupiedUnits: occupied,
-        occupancyRate: totalUnits > 0 ? Math.round(100 * occupied / totalUnits) : 0,
+        // 10/12: a former property's history carries no units or occupancy
+        // today (the new owner's), and says the last day it was theirs.
+        totalUnits: left ? null : totalUnits, occupiedUnits: left ? null : occupied,
+        occupancyRate: left ? null : (totalUnits > 0 ? Math.round(100 * occupied / totalUnits) : 0),
+        leftOn: left?.lastDay ?? null,
       },
       period: { year, month, start, end },
       breakdown: { categories: breakdown.categories, lines: breakdown.lines, total: breakdown.total },
-      expenses: { platformFee, maintenance: maintCost, lotRent, enteredExpenses, total: expensesTotal },
+      expenses: {
+        ...ex, processingFees, cardFeesRefunded, total: expensesTotal,
+        // 10/12 (ledger P8): on the books, what was paid in the period and each account.
+        ...(onBooks ? { paid: expensesPaid, byAccount: booksExpenses?.byAccount ?? [] } : {}),
+      },
       net,
+      // 10/12 (Nic): Charged / Received / Owed, the tie, and the net on each money column.
+      view: viewForViewer(view, seesGrandTotals(req.user)),
+      nets: { charged: round2(view.charged - expensesTotal), received: round2(view.received - expensesPaid) },
       // Kept for the existing screen: collected = the breakdown's total under the basis.
-      summary: { collected: breakdown.total, maintCost, platformFee, net, depositsHeld },
-      // 10/11 (Nic): a bookkeeper never sees who lives where or what a unit
-      // rents for — the property's rent roll stays on the server. The counts
-      // above (totalUnits, occupiedUnits, occupancyRate) carry the figures.
-      units: isBookkeeper ? [] : units.map((u: any) => ({
+      summary: { collected: breakdown.total, maintCost: ex.maintenance, platformFee: ex.platformFee, net, depositsHeld },
+      units: units.map((u: any) => ({
         id: u.id, unitNumber: u.unit_number, status: u.status,
         bedrooms: u.bedrooms, bathrooms: parseFloat(u.bathrooms),
         rent: parseFloat(u.rent_amount || 0), isOccupied: !!u.is_occupied,
@@ -1167,7 +1628,7 @@ reportsRouter.get('/property-detail', requirePerm('payments.view_all'), async (r
         return isBookkeeper ? cost : { ...cost, title: m.title }
       }),
       monthlyTrend: trend,
-      meta: { basis: basisMeta(basis), listsAfterBreakdown: true },
+      meta: { ...MONEY_META, listsAfterBreakdown: true },
     } })
   } catch (e) { next(e) }
 })
@@ -1235,14 +1696,15 @@ reportsRouter.get('/work-trade-1099', requirePerm('books.view'), async (req, res
 // Every endpoint above is a fixed-shape report. These two run the shared engine
 // (services/reportEngine.ts) so a new report is a set of PARAMETERS, not a new
 // endpoint: any date range × portfolio|property|unit × total|monthly|daily.
-// S655: both take ?basis= (Money received, the default, or Money billed).
+// 10/12 (Nic): no switch. Income is Money received; every row also carries
+// Charged and Owed (row.money) and the net on Charged (row.netCharged).
 // ============================================================
 
 // GET /api/reports/query — the general engine.
-//   ?start=YYYY-MM-DD&end=YYYY-MM-DD&level=property&bucket=monthly[&basis=]
+//   ?start=YYYY-MM-DD&end=YYYY-MM-DD&level=property&bucket=monthly
 reportsRouter.get('/query', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const basis = parseIncomeBasis(req.query.basis)
+    const basis = LEGACY_BASIS
     // S633: an analytical rollup is about the ACCOUNT, so it spans every company
     // it owns. Scoped to one entity, every figure here silently omitted the
     // other company's money.
@@ -1273,20 +1735,25 @@ reportsRouter.get('/query', requirePerm('payments.view_all'), async (req, res, n
     const scopedIds = await getScopedPropertyIds(req.user)
 
     const result = await runReport({ landlordIds, start, end, level, bucket, propertyIds: scopedIds, basis })
+    // decisions #25: Owed only for a viewer who sees grand totals (viewForViewer).
+    const sees = seesGrandTotals(req.user)
     res.json({
       success: true,
       data: {
-        ...result,
+        rows: result.rows.map(r => engineRowForViewer(r, sees)),
+        totals: engineRowForViewer(result.totals, sees),
         meta: {
           start, end, level, bucket,
-          basis: basisMeta(basis),
+          ...(result.source === 'ledger' ? LEDGER_MONEY_META : MONEY_META),
           // Stated, not silent: the platform fee accrues monthly per property,
           // so a daily bucket cannot attribute it to a day without inventing
           // precision. Callers must show this rather than imply $0 of fee.
-          platformFeeIncluded: bucket !== 'daily',
+          // 10/12 (ledger P8): on the books each GAM charge has its own day.
+          platformFeeIncluded: bucket !== 'daily' || result.source === 'ledger',
           // S655: lot rent is billed by the month too — the same rule.
-          lotRentIncluded: bucket !== 'daily',
+          lotRentIncluded: bucket !== 'daily' || result.source === 'ledger',
           occupancyBasis: 'current',
+          ...(result.source ? { source: result.source } : {}),
         },
       },
     })
@@ -1300,7 +1767,7 @@ reportsRouter.get('/query', requirePerm('payments.view_all'), async (req, res, n
 // the landlord's own P&L.
 reportsRouter.get('/t12', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
-    const basis = parseIncomeBasis(req.query.basis)
+    const basis = LEGACY_BASIS
     // S633: an analytical rollup is about the ACCOUNT, so it spans every company
     // it owns. Scoped to one entity, every figure here silently omitted the
     // other company's money.
@@ -1333,19 +1800,172 @@ reportsRouter.get('/t12', requirePerm('payments.view_all'), async (req, res, nex
       landlordIds, start: iso(startD), end: iso(endD),
       level: 'property', bucket: 'monthly', propertyIds, basis,
     })
-    const bm = basisMeta(basis)
+    // decisions #25: Owed only for a viewer who sees grand totals (viewForViewer).
+    const sees = seesGrandTotals(req.user)
     res.json({
       success: true,
       data: {
-        ...result,
+        rows: result.rows.map(r => engineRowForViewer(r, sees)),
+        totals: engineRowForViewer(result.totals, sees),
         meta: {
           report: 'T-12', start: iso(startD), end: iso(endD),
           months: 12, level: 'property', bucket: 'monthly',
-          basis: bm,
+          ...(result.source === 'ledger' ? LEDGER_MONEY_META : MONEY_META),
           platformFeeIncluded: true, lotRentIncluded: true, occupancyBasis: 'current',
-          note: `Trailing twelve complete months. The current partial month is excluded. ${bm.label}: ${bm.note}`,
+          ...(result.source ? { source: result.source } : {}),
+          // 10/12 (Nic): no switch — income is the money that arrived; Charged and Owed are beside it.
+          // 10/12 (ledger P8): on the books, Owed is what was still owed at each month's end.
+          note: `Trailing twelve complete months. The current partial month is excluded. Income is money received, on the day it arrived; ${MONEY_COLUMN_LABEL.charged} (${MONEY_COLUMN_NOTE.charged.toLowerCase()}) and ${MONEY_COLUMN_LABEL.owed} ${result.source === 'ledger' ? '(what tenants still owed at each month\'s end) ' : ''}are shown beside it.`,
         },
       },
     })
+  } catch (e) { next(e) }
+})
+
+// ============================================================
+// 10/12 (Nic) — THE MONTHLY PROPERTY REPORT
+//
+//   All four groups — tenants & leases, payments, money, operations — for each
+//   property, on screen (the Reports page's Monthly report tab) and as a PDF,
+//   and emailed at month close with the PDF to the recipients the owner picks
+//   (jobs/monthlyPropertyReportEmail). services/monthlyPropertyReport builds
+//   it from the services that own each figure.
+// ============================================================
+
+/** ?month=YYYY-MM, else last month on GAM's home calendar (a report covers a finished month). */
+function reportMonthOf(raw: unknown): string {
+  const today = todayIn(null)
+  if (raw === undefined || raw === null || raw === '') return previousMonth(today)
+  const m = String(Array.isArray(raw) ? raw[0] : raw)
+  monthBounds(m)   // 400 unless YYYY-MM
+  if (m > today.slice(0, 7)) throw new AppError(400, 'That month has not started yet.')
+  return m
+}
+
+/**
+ * One company (a report carries its name), and the properties this caller may
+ * see in it — a team member assigned to some properties gets those only
+ * (gam-audience-data-isolation) — narrowed to ?propertyId when one is named.
+ *
+ * 10/12 (Nic): a bookkeeper sees it only with the owner's box ("Sees the
+ * monthly property report on screen"), and only for the properties they keep
+ * that the company owns today. A whole-company bookkeeper's properties are
+ * named one by one rather than read as "the whole company", so the report's
+ * line for money outside the listed properties (which holds a sold
+ * property's) is never built for them.
+ */
+async function monthlyReportScope(req: any): Promise<{ landlordId: string; propertyIds: string[] | null }> {
+  const landlordId = reportEntity(req.user!, req.query.landlordId)
+  let scoped = await getScopedPropertyIds(req.user)
+  if (req.user?.role === 'bookkeeper') {
+    const bk = await bookkeeperRequestScopeOf(req.user)
+    if (!bk.seesMonthlyReport || bk.keepsNothing) throw new AppError(403, MONTHLY_REPORT_REFUSAL)
+    scoped = bk.currentIds ?? (await query<{ id: string }>(
+      `SELECT id FROM properties WHERE landlord_id = $1 ORDER BY name, id`, [landlordId])).map(r => r.id)
+  }
+  const one = req.query.propertyId ? String(req.query.propertyId) : null
+  if (!one) return { landlordId, propertyIds: scoped }
+  if (!/^[0-9a-f-]{36}$/i.test(one)) throw new AppError(400, 'propertyId is not valid')
+  if (scoped && !scoped.includes(one)) throw new AppError(404, 'Property not found')
+  return { landlordId, propertyIds: [one] }
+}
+
+// GET /api/reports/monthly-report?month=YYYY-MM[&landlordId][&propertyId]
+// 10/12 review: the report opens on its own permission — the Monthly report
+// tab's ("reports.tab.monthly", sensitive) — the key the Reports page shows the
+// tab for. Gated on "View all payments" it refused the staffer the tab was
+// granted to and opened to one it was not. Owners pass. 10/12 (Nic): a
+// bookkeeper holds the key only with the owner's box (lib/bookkeeperAccess
+// bookkeeperHasPerm), and monthlyReportScope checks the box again and keeps
+// them to their current properties. Property scope still applies.
+reportsRouter.get('/monthly-report', requirePerm('reports.tab.monthly'), async (req, res, next) => {
+  try {
+    const month = reportMonthOf(req.query.month)
+    const { landlordId, propertyIds } = await monthlyReportScope(req)
+    const report = await buildMonthlyPropertyReport({ landlordId, month, propertyIds })
+    res.json({ success: true, data: { ...report, meta: MONEY_META } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/reports/monthly-report/pdf?month=YYYY-MM[&landlordId][&propertyId] — the same report, as the emailed PDF.
+reportsRouter.get('/monthly-report/pdf', requirePerm('reports.tab.monthly'), async (req, res, next) => {
+  try {
+    const month = reportMonthOf(req.query.month)
+    const { landlordId, propertyIds } = await monthlyReportScope(req)
+    const report = await buildMonthlyPropertyReport({ landlordId, month, propertyIds })
+    const pdf = await renderMonthlyReportPdf(report)
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="${monthlyReportFilename(report)}"`)
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.send(pdf)
+  } catch (e) { next(e) }
+})
+
+/** 10/12 (Nic): "owner/admin only to edit" the recipient list. */
+const RECIPIENT_EDITOR_ROLES = new Set(['landlord', 'admin', 'super_admin'])
+function assertRecipientEditor(user: any): void {
+  if (!RECIPIENT_EDITOR_ROLES.has(user?.role)) {
+    throw new AppError(403, 'Only the account owner chooses who gets the monthly report.')
+  }
+}
+
+async function recipientsReply(landlordId: string) {
+  // 10/12 (Nic): a send stuck at 'sending' reads "Not sent — stuck, GAM was
+  // alerted" on this list (lastSends) — so GAM is told before it says so: the
+  // stuck-send notice, once per send, for this company (the hourly job raises
+  // the same one; whichever comes first). Never stops the list from loading.
+  // 10/12 (Nic, review): when it fails, no notice exists, and the list says
+  // "Not sent — stuck" — "GAM was alerted" only where the notice is on record
+  // (services/monthlyPropertyReport lastSends).
+  try {
+    const { noticeStuckSends } = await import('../jobs/monthlyPropertyReportEmail')
+    await noticeStuckSends(new Date(), [landlordId])
+  } catch (e) {
+    logger.error({ err: e, landlordId }, '[monthly-report] could not check for stuck sends')
+  }
+  const team = await companyTeam(landlordId)
+  const list = await recipientsOf(landlordId, team)
+  return {
+    canEdit: true,
+    isDefault: list.isDefault,
+    recipients: list.recipients.map(r => ({
+      kind: r.kind, userId: r.userId, email: r.email, name: r.name, roleLabel: r.roleLabel,
+      allProperties: r.propertyIds === null, propertyCount: r.propertyIds ? r.propertyIds.length : null,
+    })),
+    leftTeam: list.leftTeam,
+    // Everyone the owner can pick from their own team, with how much of the company each one sees.
+    team: team.map(m => ({
+      userId: m.userId, name: m.name, email: m.email, roleLabel: m.roleLabel,
+      allProperties: m.propertyIds === null, propertyCount: m.propertyIds ? m.propertyIds.length : null,
+    })),
+    lastSends: await lastSends(landlordId),
+    maxExtraEmails: MONTHLY_REPORT_MAX_EXTRA_EMAILS,
+  }
+}
+
+// GET /api/reports/monthly-report/recipients[?landlordId] — owner / admin only.
+reportsRouter.get('/monthly-report/recipients', async (req, res, next) => {
+  try {
+    assertRecipientEditor(req.user)
+    const landlordId = reportEntity(req.user!, req.query.landlordId)
+    res.json({ success: true, data: await recipientsReply(landlordId) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/reports/monthly-report/recipients — owner / admin only. The whole
+// list: the team members picked and any other addresses. A recipient dropped
+// is stamped removed (keep everything); an empty list sends to nobody.
+const MonthlyRecipientsBody = z.object({
+  landlordId: z.string().uuid().optional(),
+  teamMemberIds: z.array(z.string().uuid()).max(500),
+  emails: z.array(z.string().trim().max(254)).max(MONTHLY_REPORT_MAX_EXTRA_EMAILS),
+})
+reportsRouter.post('/monthly-report/recipients', async (req, res, next) => {
+  try {
+    assertRecipientEditor(req.user)
+    const body = MonthlyRecipientsBody.parse(req.body ?? {})
+    const landlordId = reportEntity(req.user!, body.landlordId ?? req.query.landlordId)
+    await saveRecipients(landlordId, req.user!.userId, body.teamMemberIds, body.emails)
+    res.json({ success: true, data: await recipientsReply(landlordId) })
   } catch (e) { next(e) }
 })

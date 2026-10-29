@@ -22,6 +22,7 @@ import { PROCESSING_FEES } from '@gam/shared'
 import {
   bankCostFor, debitLandlordForCharges, settleGamDebit, ACH_DEBIT_FLAT,
 } from './landlordGamDebit'
+import { outstandingForLandlord } from './landlordGamAccount'
 
 let landlordId: string
 
@@ -71,6 +72,7 @@ describe('the gates on a landlord debit', () => {
   })
 
   beforeEach(async () => {
+    await query(`DELETE FROM landlord_gam_charge_collections`)
     await query(`DELETE FROM landlord_gam_debits WHERE landlord_id = $1`, [landlordId])
     await query(`DELETE FROM landlord_gam_charges WHERE landlord_id = $1`, [landlordId])
     await query(
@@ -98,8 +100,8 @@ describe('the gates on a landlord debit', () => {
     await owe(500, '44444444-4444-4444-4444-444444444444')
     await query(
       `INSERT INTO landlord_gam_debits
-         (landlord_id, charges_amount, bank_cost_amount, total_amount, status)
-       VALUES ($1, 500, 4, 504, 'pending')`, [landlordId])
+         (landlord_id, charges_amount, bank_cost_amount, total_amount, status, stripe_payment_intent_id)
+       VALUES ($1, 500, 4, 504, 'pending', 'pi_settling')`, [landlordId])
     expect((await debitLandlordForCharges(landlordId)).reason).toBe('debit_in_flight')
   })
 
@@ -124,6 +126,7 @@ describe('settling a pull', () => {
     try { ({ landlordId } = await seedLandlord(client)) } finally { client.release() }
   })
   beforeEach(async () => {
+    await query(`DELETE FROM landlord_gam_charge_collections`)
     await query(`DELETE FROM landlord_gam_debits WHERE landlord_id = $1`, [landlordId])
     await query(`DELETE FROM landlord_gam_charges WHERE landlord_id = $1`, [landlordId])
   })
@@ -144,6 +147,33 @@ describe('settling a pull', () => {
          FROM landlord_gam_charges WHERE id = $1`, [chargeId])
     expect(parseFloat(c.collected)).toBe(82)
     expect(c.collected_at).toBeTruthy()
+  })
+
+  it('records what the pull collected on each charge, against the pull (10/12, ledger P0)', async () => {
+    // A charge half-netted from a payout before the pull: the pull collects
+    // only the half still owed, and its records add up to what it pulled.
+    const fee = (await owe(48, '5aaaaaaa-5555-5555-5555-555555555555'))!
+    await query(`UPDATE landlord_gam_charges SET collected_amount = 20 WHERE id = $1`, [fee])
+    const cost = (await chargeLandlord(null, {
+      landlordId, kind: 'bank_debit_cost', amount: 6, sourceType: 'gam_bank_debit_cost', sourceId: null,
+    }))!
+    const [d] = await query<{ id: string }>(
+      `INSERT INTO landlord_gam_debits
+         (landlord_id, charges_amount, bank_cost_amount, total_amount, status,
+          stripe_payment_intent_id, charge_ids)
+       VALUES ($1, 28, 6, 34, 'pending', 'pi_rec', $2) RETURNING id`,
+      [landlordId, [fee, cost]])
+
+    await settleGamDebit('pi_rec', true)
+    await settleGamDebit('pi_rec', true)   // a replay records nothing more
+
+    const rows = await query<any>(
+      `SELECT charge_id, amount::text AS amount, landlord_gam_debit_id, platform_transfer_intent_id
+         FROM landlord_gam_charge_collections c ORDER BY c.amount DESC`)
+    expect(rows).toEqual([
+      { charge_id: fee, amount: '28.00', landlord_gam_debit_id: d.id, platform_transfer_intent_id: null },
+      { charge_id: cost, amount: '6.00', landlord_gam_debit_id: d.id, platform_transfer_intent_id: null },
+    ])
   })
 
   it('leaves the charges owed when the bank refuses', async () => {
@@ -226,6 +256,7 @@ describe('the bank cost is charged as its own line', () => {
     try { ({ landlordId } = await seedLandlord(client)) } finally { client.release() }
   })
   beforeEach(async () => {
+    await query(`DELETE FROM landlord_gam_charge_collections`)
     await query(`DELETE FROM landlord_gam_debits WHERE landlord_id = $1`, [landlordId])
     await query(`DELETE FROM landlord_gam_charges WHERE landlord_id = $1`, [landlordId])
   })
@@ -262,5 +293,155 @@ describe('the bank cost is charged as its own line', () => {
       .toEqual(['subscription', 'subscription', 'bank_debit_cost'])
     expect(parseFloat(lines[2].amount)).toBe(6)
     vi.doUnmock('../lib/stripe')
+  })
+
+  it('a pull Stripe refuses on the spot voids ITS cost line and keeps it (10/12, ledger P0: never deleted)', async () => {
+    vi.resetModules()
+    vi.doMock('../lib/stripe', () => ({
+      getStripe: () => ({
+        // Stripe answered and refused (lib/stripeRefusal): a definite refusal.
+        paymentIntents: { create: async () => { throw Object.assign(new Error('bank account closed'), { type: 'StripeCardError', statusCode: 402 }) } },
+      }),
+    }))
+    const { debitLandlordForCharges: debit } = await import('./landlordGamDebit')
+    // Another cost line, raised minutes ago for an earlier pull, that the old
+    // ten-minute DELETE would have taken with it.
+    const other = (await chargeLandlord(null, {
+      landlordId, kind: 'bank_debit_cost', amount: 6, sourceType: 'gam_bank_debit_cost', sourceId: null,
+    }))!
+    await query(`UPDATE landlord_gam_charges SET collected_amount = 6 WHERE id = $1`, [other])
+    await withLinkedBank()
+    await owe(120, '8aaaaaaa-8888-8888-8888-888888888888')
+    const out = await debit(landlordId)
+    expect(out).toMatchObject({ status: 'skipped', reason: 'stripe_failed' })
+
+    const lines = await query<any>(
+      `SELECT id, kind, voided_at IS NOT NULL AS voided, void_reason FROM landlord_gam_charges
+        WHERE landlord_id = $1 AND kind = 'bank_debit_cost' ORDER BY created_at`, [landlordId])
+    expect(lines).toHaveLength(2)
+    expect(lines.find((l: any) => l.id === other)).toMatchObject({ voided: false, void_reason: null })
+    expect(lines.find((l: any) => l.id !== other)).toMatchObject({ voided: true, void_reason: 'bank_debit_not_made' })
+    // Owed again: only the fee — the voided cost is owed by nobody.
+    expect(await outstandingForLandlord(landlordId)).toBe(120)
+    const [d] = await query<any>(`SELECT status FROM landlord_gam_debits WHERE id = $1`, [out.debitId])
+    expect(d.status).toBe('failed')
+    vi.doUnmock('../lib/stripe')
+  })
+
+  it('pulls what is owed when it claims the charges, never a voided one', async () => {
+    vi.resetModules()
+    vi.doMock('../lib/stripe', () => ({
+      getStripe: () => ({ paymentIntents: { create: async () => ({ id: 'pi_claim' }) } }),
+    }))
+    const { debitLandlordForCharges: debit } = await import('./landlordGamDebit')
+    await withLinkedBank()
+    await owe(90, '9aaaaaaa-9999-9999-9999-999999999999')
+    const gone = (await owe(40, '9bbbbbbb-9999-9999-9999-999999999999'))!
+    await query(
+      `UPDATE landlord_gam_charges SET voided_at = NOW(), void_reason = 'screening_payment_taken_back' WHERE id = $1`, [gone])
+    await owe(20, '9ccccccc-9999-9999-9999-999999999999')
+    const out = await debit(landlordId)
+    expect(out).toMatchObject({ status: 'debited', chargesAmount: 110, bankCost: 6, total: 116 })
+    const [d] = await query<any>(`SELECT charge_ids FROM landlord_gam_debits WHERE id = $1`, [out.debitId])
+    expect(d.charge_ids).not.toContain(gone)
+    vi.doUnmock('../lib/stripe')
+  })
+})
+
+describe('10/12 review: a pull whose answer from Stripe was lost', () => {
+  beforeAll(async () => {
+    const client = await getClient()
+    try { ({ landlordId } = await seedLandlord(client)) } finally { client.release() }
+  })
+  beforeEach(async () => {
+    await query(`DELETE FROM landlord_gam_charge_collections`)
+    await query(`DELETE FROM landlord_gam_debits WHERE landlord_id = $1`, [landlordId])
+    await query(`DELETE FROM landlord_gam_charges WHERE landlord_id = $1`, [landlordId])
+    await query(`DELETE FROM admin_notifications WHERE category LIKE 'gam_debit%'`)
+  })
+
+  const timeout = () => Object.assign(new Error('Request timed out'), { type: 'StripeConnectionError' })
+
+  async function withStripe(m: { create?: (...a: any[]) => Promise<any>; search?: (...a: any[]) => Promise<any> }) {
+    const create = vi.fn(m.create ?? (async () => ({ id: 'pi_unused', status: 'processing' })))
+    const search = vi.fn(m.search ?? (async () => ({ data: [] })))
+    vi.resetModules()
+    vi.doMock('../lib/stripe', () => ({ getStripe: () => ({ paymentIntents: { create, search } }) }))
+    const mod = await import('./landlordGamDebit')
+    return { mod, create, search }
+  }
+
+  it('a timeout after Stripe made the pull leaves it pending, its cost line owed; the webhook finds it by its own id and settles it, and nothing is pulled twice', async () => {
+    const { mod, create } = await withStripe({ create: async () => { throw timeout() } })
+    await withLinkedBank()
+    await owe(150, 'a1111111-1111-1111-1111-111111111111')
+    const first = await mod.debitLandlordForCharges(landlordId)
+    expect(first).toMatchObject({ status: 'skipped', reason: 'stripe_failed' })
+    // Asked under the pull's own key.
+    expect(create.mock.calls[0][1]).toEqual({ idempotencyKey: `gam_debit_${first.debitId}` })
+    const [d] = await query<any>(`SELECT status, stripe_payment_intent_id, failure_reason FROM landlord_gam_debits WHERE id = $1`, [first.debitId])
+    expect(d).toMatchObject({ status: 'pending', stripe_payment_intent_id: null, failure_reason: 'Request timed out' })
+    const cost = await query<any>(`SELECT voided_at FROM landlord_gam_charges WHERE landlord_id = $1 AND kind = 'bank_debit_cost'`, [landlordId])
+    expect(cost).toHaveLength(1)
+    expect(cost[0].voided_at).toBeNull()
+
+    // The pull Stripe had made lands: found by gam_debit_id, stamped, settled.
+    await mod.settleGamDebit('pi_really_made', true, undefined, first.debitId)
+    const [after] = await query<any>(`SELECT status, stripe_payment_intent_id FROM landlord_gam_debits WHERE id = $1`, [first.debitId])
+    expect(after).toEqual({ status: 'succeeded', stripe_payment_intent_id: 'pi_really_made' })
+    expect(await outstandingForLandlord(landlordId)).toBe(0)
+    // The records add up to what the bank took: no mismatch told to anyone.
+    expect((await query(`SELECT 1 FROM admin_notifications WHERE category LIKE 'gam_debit_%collected'`)).length).toBe(0)
+    // Next night: nothing owed, nothing pulled.
+    expect((await mod.debitLandlordForCharges(landlordId)).reason).toBe('nothing_owed')
+    expect(create).toHaveBeenCalledTimes(1)
+    vi.doUnmock('../lib/stripe')
+  })
+
+  it('the next sweep asks Stripe again: a pull it finds by the pull\'s id is stamped, never made twice', async () => {
+    const { mod, create, search } = await withStripe({
+      create: async () => { throw timeout() },
+    })
+    await withLinkedBank()
+    await owe(150, 'a2222222-1111-1111-1111-111111111111')
+    const first = await mod.debitLandlordForCharges(landlordId)
+    search.mockResolvedValueOnce({ data: [{ id: 'pi_found', status: 'processing' }] })
+    const again = await mod.debitLandlordForCharges(landlordId)
+    expect(again).toMatchObject({ status: 'skipped', reason: 'debit_in_flight', debitId: first.debitId })
+    expect(search.mock.calls[0][0]).toEqual({ query: `metadata['gam_debit_id']:'${first.debitId}'`, limit: 10 })
+    expect(create).toHaveBeenCalledTimes(1)
+    const [d] = await query<any>(`SELECT status, stripe_payment_intent_id FROM landlord_gam_debits WHERE id = $1`, [first.debitId])
+    expect(d).toEqual({ status: 'pending', stripe_payment_intent_id: 'pi_found' })
+    vi.doUnmock('../lib/stripe')
+  })
+
+  it('…and one Stripe never received is sent again with the same request under the same key', async () => {
+    let n = 0
+    const { mod, create } = await withStripe({
+      create: async () => { n++; if (n === 1) throw timeout(); return { id: 'pi_second_ask', status: 'processing' } },
+    })
+    await withLinkedBank()
+    await owe(150, 'a3333333-1111-1111-1111-111111111111')
+    const first = await mod.debitLandlordForCharges(landlordId)
+    await mod.debitLandlordForCharges(landlordId)
+    expect(create).toHaveBeenCalledTimes(2)
+    expect(create.mock.calls[1]).toEqual(create.mock.calls[0])       // same request, same key
+    const [d] = await query<any>(`SELECT status, stripe_payment_intent_id FROM landlord_gam_debits WHERE id = $1`, [first.debitId])
+    expect(d).toEqual({ status: 'pending', stripe_payment_intent_id: 'pi_second_ask' })
+    vi.doUnmock('../lib/stripe')
+  })
+
+  it('a pull that took more than its charges still owed says so, with the difference', async () => {
+    const chargeId = await owe(82, 'a4444444-1111-1111-1111-111111111111')
+    await query(
+      `INSERT INTO landlord_gam_debits
+         (landlord_id, charges_amount, bank_cost_amount, total_amount, status, stripe_payment_intent_id, charge_ids)
+       VALUES ($1, 82, 0, 82, 'pending', 'pi_over', ARRAY[$2::uuid])`, [landlordId, chargeId])
+    // Netted $30 of it by a payout of the old code while the pull was in flight.
+    await query(`UPDATE landlord_gam_charges SET collected_amount = 30 WHERE id = $1`, [chargeId])
+    await settleGamDebit('pi_over', true)
+    const notes = await query<any>(`SELECT category, context FROM admin_notifications WHERE category = 'gam_debit_overcollected'`)
+    expect(notes).toHaveLength(1)
+    expect(notes[0].context).toMatchObject({ pulled: 82, recorded: 52 })
   })
 })

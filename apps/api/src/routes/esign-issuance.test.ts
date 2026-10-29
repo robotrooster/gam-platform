@@ -397,9 +397,14 @@ describe('voiding a lease the landlord already signed', () => {
     expect(inv.length).toBeGreaterThan(0)                  // kept, as a record
     expect(inv.every((i: any) => i.status === 'void')).toBe(true)
 
+    // 10/12 (Nic): the charges are voided as records, never deleted — none
+    // is owed, and every one is kept with why.
     const charges = await db.query(
-      `SELECT COUNT(*)::int AS n FROM payments WHERE lease_id=$1`, [lease.id])
-    expect(charges.rows[0].n).toBe(0)
+      `SELECT COUNT(*) FILTER (WHERE status <> 'voided')::int AS live,
+              COUNT(*) FILTER (WHERE status = 'voided' AND void_reason IS NOT NULL)::int AS voided
+         FROM payments WHERE lease_id=$1`, [lease.id])
+    expect(charges.rows[0].live).toBe(0)
+    expect(charges.rows[0].voided).toBeGreaterThan(0)
 
     const lt = await db.query(`SELECT status FROM lease_tenants WHERE lease_id=$1`, [lease.id])
     expect(lt.rows.every((r: any) => r.status === 'void')).toBe(true)
@@ -461,7 +466,12 @@ describe('voiding a lease the landlord already signed', () => {
 
   it('puts released utility back on hold, and a re-signed lease picks it up again', async () => {
     const f = await fixture()
-    await openInvite(f)
+    // S649: a held pre-lease share releases onto an ONBOARDING resident's lease
+    // — they lived there during the cycle. For a genuine new move-in it is
+    // somebody else's usage and is closed out instead, so this scenario has to
+    // say which it is. It used to be left to the 28-day trigger (dropped
+    // 10/19 — it was overriding the landlord's own answer on an invite).
+    await openInvite(f, { is_existing_tenancy: true })
     const m = await db.query<{ id: string }>(
       `INSERT INTO utility_meters (property_id, utility_type, label, billing_method)
        VALUES ($1,'electric','E','submeter') RETURNING id`, [f.propertyId])
@@ -483,15 +493,19 @@ describe('voiding a lease the landlord already signed', () => {
     const held = (await db.query(
       `SELECT released_at FROM suspended_utility_charges WHERE unit_id=$1`, [f.unitId])).rows[0]
     expect(held.released_at).toBeNull()
+    // 10/12 (Nic, G8 — keep everything): the bill is voided and kept, out of
+    // its cycle slot, never deleted.
     const gone = await db.query(
-      `SELECT COUNT(*)::int AS n FROM utility_bills WHERE unit_id=$1`, [f.unitId])
+      `SELECT COUNT(*)::int AS n FROM utility_bills WHERE unit_id=$1 AND voided_at IS NULL`, [f.unitId])
     expect(gone.rows[0].n).toBe(0)
+    expect((await db.query(`SELECT status FROM utility_bills WHERE unit_id=$1 AND voided_at IS NOT NULL`, [f.unitId])).rows)
+      .toEqual([{ status: 'void' }])
 
     // Re-draft at the right terms and sign again: the $21 comes back, once.
     const second = await unsignedDoc(f)
     await signAs(second, f.landlordToken)
     const again = await db.query(
-      `SELECT charge_amount::float AS amt FROM utility_bills WHERE unit_id=$1`, [f.unitId])
+      `SELECT charge_amount::float AS amt FROM utility_bills WHERE unit_id=$1 AND voided_at IS NULL`, [f.unitId])
     expect(again.rows).toHaveLength(1)
     expect(again.rows[0].amt).toBe(21)
   })
@@ -503,15 +517,25 @@ describe('voiding a lease the landlord already signed', () => {
 // skipped any meter that did not move.
 describe('a stuck meter when the lease is signed', () => {
   async function stuckMeter(f: Fixture, opts: { existing: boolean }) {
-    // An invite inside a landlord's first 28 days is an onboarding (existing)
-    // tenancy by trigger. A genuine new move-in needs a landlord past that.
-    if (!opts.existing) {
-      await db.query(`UPDATE landlords SET created_at = NOW() - INTERVAL '90 days' WHERE id=$1`,
-        [f.landlordId])
-    }
+    // 10/19: the invite says which kind of tenancy this is — the landlord's own
+    // answer, and nothing else, decides it (migration 20261021160000 drops the
+    // trigger that used to override it for a landlord's first 28 days).
+    //
+    // The flag is INSERTed and then written again. That reads redundant and is
+    // not: the trigger it replaces is BEFORE INSERT, so until the migration
+    // reaches production and schema.sql is re-dumped, the suite's own database
+    // still has it and still forces this row TRUE for a fresh landlord. This
+    // file is about stuck meters, so it pins the value it means instead of
+    // depending on which side of that deploy you are running on — and it keeps
+    // passing, unchanged, once the trigger is gone. (The earlier version aged
+    // the landlord 90 days to dodge the trigger; that stopped being the lever
+    // the moment the route started writing the flag itself.)
     await db.query(
       `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id, property_id, is_existing_tenancy)
        VALUES ($1,$2,$3,$4,$5)`, [f.landlordId, f.tenantId, f.unitId, f.propertyId, opts.existing])
+    await db.query(
+      `UPDATE pending_tenant_intents SET is_existing_tenancy = $2 WHERE unit_id = $1`,
+      [f.unitId, opts.existing])
     // S648: estimating is the landlord's per-property choice.
     await db.query(`UPDATE properties SET estimates_stuck_meters = TRUE WHERE id=$1`, [f.propertyId])
     await db.query(

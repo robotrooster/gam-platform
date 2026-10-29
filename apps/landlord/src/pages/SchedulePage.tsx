@@ -5,14 +5,17 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Search, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, priceStay, stayLowerRateWords, stayNightsBetween, addStayDays, addCalendarMonths, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, type BookingStatus, camelizeKeys, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms, longCalendarDate } from '@gam/shared'
-import { toast, appConfirm, appPrompt } from '../components/dialogs'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, priceStay, stayLowerRateWords, stayNightsBetween, addStayDays, addCalendarMonths, rvSiteFactsLabel, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, isRigTooLongForSite, MAX_RIG_LENGTH_FT, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType, BOOKING_STATUSES, BOOKING_STATUS_LABEL, BOOKING_SOURCES, BOOKING_SOURCE_LABEL, stayHoldWords, stayDepositAsk, type BookingStatus, type BookingSource, camelizeKeys, STAY_TERMS, STAY_TERMS_LABEL, type StayTerms, longCalendarDate, typingPhone } from '@gam/shared'
+import { toast, appConfirm, appPrompt, appChoose } from '../components/dialogs'
+import { pastEndChoices, pastEndQuestion } from '../lib/earlyCheckOut'
 import { RequiredPropertySelect, usePropertyScope } from '../components/ListControls'
 import { OutOfOrderModal } from './OutOfOrderModal'
 import { EarlyCheckOutModal } from '../components/EarlyCheckOutModal'
 import { WorkTradeTermsFields, defaultWorkTradeTerms, workTradeTermsPayload, workTradeTermsFrom, workTradeLine, workTradeEditPayload, type WorkTradeTerms } from '../components/WorkTradeTermsFields'
 import { ReturningGuestChoice, useReturningGuestOffer, RETURNING_GUEST_WORDS, RETURNING_GUEST_DETAIL, type ReturningOffer } from '../components/ReturningGuestChoice'
 import { NeverMovedInBody, type NeverMovedInPreview, refreshAfterLeaseClose } from './LeasesPage'
+import { ReservationImportModal, MIGRATED_DOOR_LABEL, stayLockWords } from './ReservationImport'
+import { sentence } from '../lib/meterReadToast'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -155,6 +158,22 @@ const RESV_STATUS_BADGE: Record<string, string> = {
 }
 
 // Date-only strings render at noon to dodge TZ off-by-one.
+/**
+ * 10/18 (review) — WHAT A LINK HANDED BACK ACTUALLY ASKS FOR.
+ *
+ * A reservation can have more than one pay link out, and they ask for
+ * different money: the link that created the stay (its whole price), an "Add a
+ * month" link, the arrival-day balance, and its deposit link. The window names
+ * the link and its amount so nobody reads "$286.08" down the phone as a $57
+ * deposit. Empty when the server did not say (the reservation form's own send).
+ */
+const linkAsksFor = (l: { label?: string | null; amount?: number | null }): string => {
+  if (!l.label && l.amount == null) return ''
+  if (l.amount == null) return ` — “${l.label}”`
+  if (!l.label) return ` for ${fmt(l.amount)}`
+  return ` — “${l.label}”, ${fmt(l.amount)}`
+}
+
 const fmtDate = (d: string | null | undefined) => {
   if (!d) return '—'
   try { return new Date(`${d.slice(0, 10)}T12:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) }
@@ -280,6 +299,456 @@ function GuestAccessModal({ booking, onClose }: { booking: ResvBooking; onClose:
   )
 }
 
+/**
+ * 10/18 (Nic) — WHAT A BAR'S COLOR SAYS, AND WHAT IT STILL LETS YOU DRAG.
+ *
+ * "I want the color to be yellow when they're not checked in and green when
+ * they're checked in. And they can stay blue when they have a lease. And when
+ * they are checked out, you know, the blue ones are locked. You can't adjust
+ * the dates on them because they're tied to the lease. But the stays that are
+ * green, once they've been here and gone and they're checked out, those also
+ * need to be locked. So I can't move it around. I can't change the dates
+ * accidentally. It's that reservation becomes locked as part of the history."
+ *
+ * Until today every stay on the calendar painted the same green whatever its
+ * status, so a site nobody has arrived at looked exactly like a site with
+ * somebody living on it — and a stay that ended last spring could still be
+ * dragged onto new dates by a stray mouse. One reading of the booking now
+ * decides both things, so they can never disagree: the color it paints, and
+ * whether its dates are still the calendar's to change.
+ *
+ * Locked means the BOARD will not move it: a finished stay does not drag, has
+ * no edge grips, and right-click opens its window instead of dropping into the
+ * date editor. That is the accident Nic named — "I can't change the dates
+ * accidentally" — and it is all the lock covers.
+ *
+ * 10/18 (review): what it deliberately does NOT do is take away the deliberate
+ * correction. Open the stay and Edit is still there, because the desk that
+ * typed Sep 30 for an Oct 1 arrival sold and priced a night nobody stayed, and
+ * no other screen in the portal can put that right (the check-out screen never
+ * asks for a date on a stay that has already checked out). The server knows the
+ * difference: it reprices a re-dated checked-out stay and refuses the edit in
+ * words once a refund has gone out. Clicking a locked bar still opens its
+ * window — reading a stay is never the thing we take away.
+ */
+export type ScheduleBarKind = 'lease' | 'reserved' | 'reserved_part_paid' | 'reserved_paid_full' | 'checked_in' | 'checked_out' | 'no_show'
+
+/**
+ * 10/24 (Nic) — HAS THIS ONE PAID ME, OR HAVEN'T THEY.
+ *
+ *   "Does the color shift to a reservation that's made and secured with a
+ *    deposit? ... I don't know what, more of a purplish color that won't be too
+ *    close to anything."
+ *
+ * Every un-arrived reservation was one amber, paid or not, and the money was
+ * readable in exactly one place: inside the reservation's own window, after you
+ * clicked it. So the only way to know who still owed for a site was to open
+ * every bar on the board one at a time.
+ *
+ * Money in hand is any of the three ways it arrives: the deposit cleared, the
+ * whole balance cleared, or they paid at the register on the way in (a walk-in
+ * carries a register sale and no deposit row at all). Any one of them means the
+ * site is secured, so any one of them turns the bar purple.
+ *
+ * Amber stays the one that has NOT paid, deliberately: amber already means
+ * "deal with this" everywhere else in GAM, so the bar that still owes money is
+ * the one that catches the eye across a 100-space board.
+ */
+export function stayIsSecured(booking: any): boolean {
+  return !!(booking?.depositPaidAt || booking?.balancePaidAt || booking?.posTransactionId)
+}
+
+/**
+ * 10/24 (Nic) — PAID IN FULL IS ITS OWN COLOUR, AND WHY IT EARNS ONE.
+ *
+ * I argued a third shade did not change anything at the counter, because a
+ * part-paid and a fully-paid reservation both mean "do not give this site
+ * away". Nic:
+ *
+ *   "Both paid in part or paid in full means we can't give the spot away, but
+ *    it does add a distinction that changes what we do at the counter. We don't
+ *    take money at the counter if they're paid in full."
+ *
+ * That is the whole point: the fill tells the desk whether to reach for the
+ * card reader when somebody walks up. Nothing else on the board says it, and
+ * the difference between $15 down on a three-night stay and the whole thing
+ * paid is exactly what a clerk needs before they start asking for money.
+ *
+ * balance_paid_at is the column that MEANS the balance is settled — a register
+ * sale for a stay sets it alongside balance_billed_at (routes/pos), and so does
+ * a pay link that covers the rest. So it is the one thing read here; a deposit
+ * or a register id without it is money in hand with more still owed.
+ */
+export function stayIsPaidInFull(booking: any): boolean {
+  return !!booking?.balancePaidAt
+}
+
+export function scheduleBarKind(booking: any): ScheduleBarKind {
+  // A lease row is the one that carries a start date (the schedule's leases
+  // come from the lease, stays come from the booking).
+  if (booking?.isLease || booking?.startDate) return 'lease'
+  const status = booking?.status as BookingStatus | undefined
+  if (status === 'checked_in') return 'checked_in'
+  if (status === 'checked_out') return 'checked_out'
+  if (status === 'no_show') return 'no_show'
+  // Tentative and confirmed are the same thing to the eye: booked, nobody has
+  // arrived. (Canceled stays never reach the calendar at all.) What DOES show
+  // is whether the money came in — see stayIsSecured above.
+  if (stayIsPaidInFull(booking)) return 'reserved_paid_full'
+  return stayIsSecured(booking) ? 'reserved_part_paid' : 'reserved'
+}
+
+export const SCHEDULE_BAR_COLOR: Record<ScheduleBarKind, string> = {
+  lease: 'var(--blue)',
+  reserved: 'var(--amber)',
+  // 10/24 (Nic): secured by money. Purple was the one direction with open space
+  // in BOTH themes — a yellow bright enough to read apart from amber on dark
+  // has to darken to roughly #ca8a04 on light, which is brand gold (#c9a227) to
+  // the eye. #a855f7 is already GAM's purple in Books, so the platform is not
+  // growing a sixth hue, and it is lighter as well as a different hue from the
+  // blue lease bar it sits beside. Both values in SCHEDULE_BAR_THEME_CSS below.
+  reserved_part_paid: 'var(--sched-fill-reserved-paid)',
+  // 10/24 (Nic): "I don't know if paid in full would be like a lime green type
+  // of color or something, slime green, like that Nickelodeon slime color."
+  //
+  // #a4d233 measured against every other fill before it was picked: 38.8 deltaE
+  // from the checked-in green on the dark theme and 51.8 on the light, 40.8 from
+  // the brand gold — against a 25 threshold, where the green pair Nic could not
+  // tell apart measured 14.9. It is the ONE fill besides the lease bar that does
+  // not flip with the theme: bright with near-black ink reads at 9.3:1 on both,
+  // and every darker lime that could carry white ink landed ~23 from the
+  // checked-in green, which is the collision this board already learned to fear.
+  reserved_paid_full: '#a4d233',
+  checked_in: 'var(--green)',
+  // 10/18 (review) — WHY FINISHED HISTORY DOES NOT JUST REUSE --green-dim.
+  //
+  // These two fills are the only ones that share a hue with a LIVE state, so
+  // they are the two that have to be told apart by lightness alone. --green-dim
+  // and --red-dim are dark-theme values the light theme never redefines, while
+  // --green does: on light it darkens to a forest green that lands a hair away
+  // from --green-dim (1.40:1 — barely a shade apart). So a site somebody is
+  // living on and a stay that ended last spring painted the same dark green for
+  // every landlord on light mode, and the difference Nic asked for was gone.
+  //
+  // Finished history now fades TOWARD THE PAGE in whichever theme is on: darker
+  // on the dark theme, paler on the light one. Same stay, visibly over, either
+  // way. Both values ship in SCHEDULE_BAR_THEME_CSS below, and the test resolves
+  // them to real colors off globals.css rather than trusting the token names.
+  checked_out: 'var(--sched-fill-checked-out)',
+  // History too, and it must never read as a live green stay.
+  no_show: 'var(--sched-fill-no-show)',
+}
+
+/**
+ * Name color that stays readable on each of those backgrounds.
+ *
+ * Only the lease bar is the same color in both themes — blue stays dark, so it
+ * keeps light ink. Every other fill flips. Yellow and bright green are light
+ * fills on the dark theme and darken on the light one (amber to a deep orange,
+ * green to a forest green), so they want near-black ink on dark and white on
+ * light. The two finished fills flip the other way — dark on dark, pale on
+ * light — so their ink flips with them. All four read it from
+ * SCHEDULE_BAR_THEME_CSS below, so the theme switch carries the ink instead of
+ * a second copy of this table.
+ */
+export const SCHEDULE_BAR_TEXT: Record<ScheduleBarKind, string> = {
+  lease: '#e6ecff',
+  reserved: 'var(--sched-ink-reserved)',
+  reserved_part_paid: 'var(--sched-ink-reserved-paid)',
+  // Dark ink on a bright fill, in both themes — see the fill above.
+  reserved_paid_full: '#17210a',
+  checked_in: 'var(--sched-ink-checked-in)',
+  checked_out: 'var(--sched-ink-checked-out)',
+  no_show: 'var(--sched-ink-no-show)',
+}
+
+/** The floating name's drop shadow — light behind dark ink, dark behind light. */
+export const SCHEDULE_BAR_SHADOW: Record<ScheduleBarKind, string> = {
+  lease: '0 1px 2px rgba(0,0,0,.6)',
+  reserved: 'var(--sched-shadow-reserved)',
+  reserved_part_paid: 'var(--sched-shadow-reserved-paid)',
+  reserved_paid_full: '0 1px 2px rgba(255,255,255,.55)',
+  checked_in: 'var(--sched-shadow-checked-in)',
+  checked_out: 'var(--sched-shadow-checked-out)',
+  no_show: 'var(--sched-shadow-no-show)',
+}
+
+/**
+ * The half of the bar palette that has to flip with the theme, as the timeline
+ * ships it.
+ *
+ * Two things live here. The ink (and its drop shadow) for every fill that is
+ * light in one theme and dark in the other. And the two FINISHED fills, because
+ * "faded" is not one color: on the dark theme a finished stay fades DOWN toward
+ * the page, on the light theme it fades UP toward the white. The dark values are
+ * the palette tokens we already had; only the light ones are new.
+ */
+export const SCHEDULE_BAR_THEME_CSS = `
+:root{
+  --sched-ink-reserved:#1a1200;
+  --sched-ink-checked-in:#07210f;
+  --sched-fill-reserved-paid:#a855f7;
+  --sched-ink-reserved-paid:#1b0a2e;
+  --sched-shadow-reserved-paid:0 1px 2px rgba(255,255,255,.55);
+  --sched-shadow-reserved:0 1px 2px rgba(255,255,255,.6);
+  --sched-shadow-checked-in:0 1px 2px rgba(255,255,255,.55);
+  --sched-fill-checked-out:var(--green-dim);
+  --sched-ink-checked-out:#eafbf0;
+  --sched-shadow-checked-out:0 1px 2px rgba(0,0,0,.6);
+  --sched-fill-no-show:var(--red-dim);
+  --sched-ink-no-show:#ffecec;
+  --sched-shadow-no-show:0 1px 2px rgba(0,0,0,.6);
+}
+:root[data-theme="light"]{
+  --sched-ink-reserved:#ffffff;
+  --sched-ink-checked-in:#ffffff;
+  --sched-fill-reserved-paid:#7e22ce;
+  --sched-ink-reserved-paid:#ffffff;
+  --sched-shadow-reserved-paid:0 1px 2px rgba(0,0,0,.5);
+  --sched-shadow-reserved:0 1px 2px rgba(0,0,0,.5);
+  --sched-shadow-checked-in:0 1px 2px rgba(0,0,0,.5);
+  --sched-fill-checked-out:#8ec4a3;
+  --sched-ink-checked-out:#0b2a16;
+  --sched-shadow-checked-out:0 1px 2px rgba(255,255,255,.55);
+  --sched-fill-no-show:#dca0a0;
+  --sched-ink-no-show:#3a0d0d;
+  --sched-shadow-no-show:0 1px 2px rgba(255,255,255,.55);
+}`
+
+/**
+ * 10/24 (Nic) — WHO IS IT FOR, WITHOUT TYPING THEM OUT AGAIN.
+ *
+ *   "If somebody's making a reservation that has been here before, we need a way
+ *    to have it just select a previous person instead of typing out their full
+ *    name. Like if I'm typing the name William maybe it pre-populates from a
+ *    drop-down list of any other Williams in the system, and I can just click
+ *    the right one. Or maybe start with the phone number and if they've been
+ *    here before, it pre-populates them."
+ *
+ * The four guest fields, with the platform's people search behind the name and
+ * phone boxes. Typing two characters in any of them lists matches; clicking one
+ * fills all four and the dropdown goes away.
+ *
+ * WHERE THE PEOPLE COME FROM. GET /pos/people — the same search the register's
+ * History tab uses, not a second one: this property's residents, every register
+ * customer in the account's book, and (10/2, settled) everybody else on GAM by
+ * part of a name or a whole phone number. A person from another company comes
+ * back as a name and their phone only (10/24, Nic: "they are all customers of
+ * GAM. So sharing that information between landlords when it's just a name and
+ * phone number and no other sensitive information is okay") — never their
+ * company, site, lease, balance, payment history or ids.
+ *
+ * NOTHING IS WRITTEN BY PICKING. A reservation keeps the guest's name, email and
+ * phone on the booking itself, so a pick only FILLS THE BOXES — it creates no
+ * customer record and links no accounts. Whatever the clerk does next is still
+ * the clerk's to change.
+ *
+ * ONE COPY. These fields were written out twice — once in the waitlist block and
+ * once under "Who is it for" — so a change to either drifted from the other.
+ */
+function GuestFields(props: {
+  propertyId: string | null | undefined
+  first: string; last: string; email: string; phone: string
+  setFirst: (v: string) => void
+  setLast: (v: string) => void
+  setEmail: (v: string) => void
+  setPhone: (v: string) => void
+}) {
+  const { propertyId } = props
+  // Which box is being typed in, and what is in it. One dropdown, under that box.
+  const [lookingIn, setLookingIn] = useState<'first' | 'last' | 'phone' | null>(null)
+  const [typed, setTyped] = useState('')
+  const [debounced, setDebounced] = useState('')
+  const [dismissed, setDismissed] = useState(false)
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(typed), 250)
+    return () => clearTimeout(t)
+  }, [typed])
+
+  // The server wants two characters and refuses over 120; it also limits how
+  // often one person may look outside their own company. Asking only once the
+  // typing settles keeps a name like "William" to one search, not seven.
+  const term = debounced.trim()
+  const askable = !!propertyId && term.length >= 2 && term.length <= 120 && !dismissed
+  const { data: found, isFetching } = useQuery(
+    ['guest-lookup', propertyId, term],
+    () => apiGet(`/pos/people?propertyId=${propertyId}&q=${encodeURIComponent(term)}`),
+    { enabled: askable, keepPreviousData: true, staleTime: 30_000 },
+  )
+  const hits: any[] = askable && Array.isArray(found?.data) ? found!.data : []
+
+  const take = (h: any) => {
+    props.setFirst(String(h.firstName ?? '').trim())
+    props.setLast(String(h.lastName ?? '').trim())
+    // Only overwrite what the pick actually knows — a clerk who already typed an
+    // email for somebody whose record has none does not lose it.
+    if (h.email) props.setEmail(String(h.email))
+    if (h.phone) props.setPhone(typingPhone(String(h.phone)))
+    setLookingIn(null); setTyped(''); setDebounced(''); setDismissed(true)
+  }
+
+  // A box the clerk is typing in drives the search; changing anything by hand
+  // after a pick starts a fresh one.
+  const watch = (which: 'first' | 'last' | 'phone', v: string) => {
+    setLookingIn(which); setTyped(v); setDismissed(false)
+  }
+
+  const Found = () => (
+    <div style={{position:'absolute',top:'calc(100% + 4px)',left:0,right:0,zIndex:30,minWidth:240,maxHeight:260,overflowY:'auto',
+                 background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:8,boxShadow:'0 10px 30px rgba(0,0,0,.45)'}}>
+      {hits.map((h) => (
+        <button key={h.key} type="button" onClick={() => take(h)}
+          style={{display:'block',width:'100%',textAlign:'left',padding:'8px 10px',background:'transparent',
+                  border:'none',borderBottom:'1px solid var(--border-1)',cursor:'pointer',color:'var(--text-0)'}}>
+          <div style={{fontSize:'.8rem',fontWeight:600}}>{h.name}</div>
+          {h.hint && <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:1}}>{h.hint}</div>}
+        </button>
+      ))}
+      <button type="button" onClick={() => { setLookingIn(null); setDismissed(true) }}
+        style={{display:'block',width:'100%',textAlign:'left',padding:'7px 10px',background:'transparent',border:'none',
+                cursor:'pointer',color:'var(--text-3)',fontSize:'.7rem'}}>
+        Nobody here — keep what I typed
+      </button>
+    </div>
+  )
+
+  const box = (which: 'first' | 'last' | 'phone', el: any) => (
+    <div style={{position:'relative'}}>
+      {el}
+      {lookingIn === which && hits.length > 0 && <Found />}
+    </div>
+  )
+
+  return (
+    <>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+        {box('first',
+          <input className="form-input" placeholder="First name" style={{width:'100%'}}
+            value={props.first}
+            onChange={e => { props.setFirst(e.target.value); watch('first', e.target.value) }} />)}
+        {box('last',
+          <input className="form-input" placeholder="Last name" style={{width:'100%'}}
+            value={props.last}
+            onChange={e => { props.setLast(e.target.value); watch('last', e.target.value) }} />)}
+        <input className="form-input" type="email" placeholder="Email" style={{width:'100%'}}
+          value={props.email} onChange={e => props.setEmail(e.target.value)} />
+        {box('phone',
+          // 10/24 (Nic): "I don't want to have to type dashes or parentheses on
+          // everything." typingPhone is the platform's one formatter — digits in,
+          // (520) 903-8134 out, and an eleventh digit will not go in.
+          <input className="form-input" type="tel" placeholder="Phone" style={{width:'100%'}}
+            value={props.phone}
+            onChange={e => { const v = typingPhone(e.target.value); props.setPhone(v); watch('phone', v) }} />)}
+      </div>
+      {/* Said once, under the boxes, so the desk knows the list is there without
+          a dropdown having to appear to tell them. */}
+      <div style={{fontSize:'.68rem',color:'var(--text-3)',marginTop:5}}>
+        {isFetching && askable
+          ? 'Looking…'
+          : 'Been here before? Start typing their phone number or name and pick them from the list.'}
+      </div>
+    </>
+  )
+}
+
+/** One floating name, pinned over its bar (S575) — see nameOverlays. */
+type NameOverlay = {
+  key: string; left: number; top: number; height: number; width: number
+  label: string; kind: ScheduleBarKind; locked: boolean
+}
+
+/**
+ * Locked = the dates are no longer the calendar's to change.
+ *
+ * 10/24: this list was written out twice — here and again in nameOverlays for
+ * the floating name's padlock — so adding a bar kind meant finding both. One
+ * list now, read by both. A SECURED reservation is deliberately NOT on it: the
+ * money being in hand does not settle the dates, and a paid guest who calls to
+ * move a day still gets moved (see stayIsSecured).
+ */
+export const LOCKED_BAR_KINDS: readonly ScheduleBarKind[] = ['lease', 'checked_out', 'no_show']
+
+export function isScheduleBarLocked(booking: any): boolean {
+  return LOCKED_BAR_KINDS.includes(scheduleBarKind(booking))
+}
+
+/**
+ * 10/20 (Nic, his own catch) — THE SITE IS LOCKED EVEN THOUGH THE DATES ARE NOT.
+ *
+ *   "They may have already gotten a confirmation on a space number. Our system
+ *    with compression and expansion is going to kind of screw that up if they
+ *    think they're locked to a specific site already."
+ *
+ * A pinned stay is a different kind of locked from the one above. Its DATES are
+ * still the calendar's to change — a snowbird adds a month all the time — so it
+ * is not isScheduleBarLocked and its bar still drags. What is not the board's to
+ * change is its SPACE, because a space number is already in the guest's hands.
+ * So a cross-site drop asks first (commitDrag) and the server refuses an
+ * unconfirmed one outright (routes/units, code 'locked_site').
+ */
+export function isScheduleBarSiteLocked(booking: any): boolean {
+  return scheduleBarKind(booking) !== 'lease' && booking?.lockedToUnit === true
+}
+
+/**
+ * 10/20 (Nic) — WHAT THE PANEL SAYS ABOUT A STAY SOMEBODY MOVED BY HAND.
+ *
+ * A stay moved off a promised space is still pinned, but nobody promised the
+ * space it is on now, so the import's two reasons no longer describe it (the
+ * booking PATCH rewrites the stored reason the moment the move goes through —
+ * see migration 20261022140000). These are the words for that third reason;
+ * they live here because this screen is the only place that causes it, and the
+ * fact they have to carry is the one the desk needs: there is a stale space
+ * number out there, and somebody may still have to say so.
+ */
+export const SITE_MOVED_BY_HAND_REASON = 'moved_off_promised_site'
+export const SITE_MOVED_BY_HAND_WORDS =
+  'Moved here by hand, off the space they were promised — the space in their confirmation is no longer theirs'
+export const scheduleStayLockWords = (lockReason: string | null | undefined): string =>
+  lockReason === SITE_MOVED_BY_HAND_REASON ? SITE_MOVED_BY_HAND_WORDS : stayLockWords(lockReason)
+
+// ── 10/20 (Nic, his own catch): MOVING A STAY OFF THE SPACE IT WAS PROMISED ──
+//
+//   "They may have already gotten a confirmation on a space number. Our system
+//    with compression and expansion is going to kind of screw that up if they
+//    think they're locked to a specific site already."
+//
+// Every move GAM makes itself refuses a pinned stay. A person may move one —
+// the guest agreed on the phone, the site flooded, the rig is too long — but
+// never quietly, because the cost of quiet is a rig pulling in to find somebody
+// parked on the space in its confirmation.
+/** Why the stay is pinned, in the clause the question reads out. */
+const LOCK_HELD_BECAUSE: Record<string, string> = {
+  promised_before_gam: 'was promised this space before GAM, in the old system',
+  promised_at_the_counter: 'was promised this space at the desk',
+  [SITE_MOVED_BY_HAND_REASON]: 'was already moved here by hand, off the space they were promised',
+}
+/** A lock with no reason recorded: somebody ticked the box (S547's snowbird). */
+const LOCK_HELD_FALLBACK = 'is pinned to this space by hand'
+
+/**
+ * The question asked before a person drags a pinned stay to another space.
+ *
+ * The server refuses an unconfirmed move (409 'locked_site') and sends these
+ * same words back, so a page that loaded before the stay was pinned gets the
+ * question too — the screen is not the guard. Asking here as well means a drag
+ * the screen can already see coming is answered in one press, not two.
+ *
+ * Three things, because all three decide whether a rig arrives at the right
+ * space: which number is in the guest's hand, where they are going, and
+ * whether GAM can tell them it changed.
+ */
+export function promisedSiteWords(b: any, toUnitNumber: string): string {
+  const who = (b?.guestName || '').trim() || 'This guest'
+  const from = b?.unitNumber || 'their site'
+  const tell = (b?.guestEmail || '').trim()
+    ? `We will email them that their site is now ${toUnitNumber}.`
+    : 'We have no email address for them, so somebody has to call them — GAM cannot tell them.'
+  return `${who} ${LOCK_HELD_BECAUSE[b?.lockReason as string] || LOCK_HELD_FALLBACK}, so ${from} is the number they have. `
+    + `Moving them to ${toUnitNumber} means ${from} is no longer theirs. ${tell}`
+}
+
 export function SchedulePage() {
   const qc = useQueryClient()
   const { can } = usePerms()
@@ -314,6 +783,8 @@ export function SchedulePage() {
   const [typeForm, setTypeForm] = useState<any>({})
   const [customAmenity, setCustomAmenity] = useState('')
   const [newResvOpen, setNewResvOpen] = useState(false)
+  // 10/20: the "Bring in reservations" door (./ReservationImport).
+  const [importOpen, setImportOpen] = useState(false)
   const [detailBooking, setDetailBooking] = useState<any>(null)
   // 10/5 (Nic, R2): lease or no lease — asked when a save makes a stay 30+
   // nights in a row. The answer rides on the same save, sent again.
@@ -327,6 +798,10 @@ export function SchedulePage() {
   // link emailed to the guest, or the register. The pick rides on the same save.
   const [feeRoute, setFeeRoute] = useState<{ message: string; canSendLink: boolean; returning: ReturningOffer | null; resend: (m: 'link' | 'register' | 'returning') => void } | null>(null)
   const payRouteAnswer = useRef<'link' | 'register' | 'returning' | null>(null)
+  // 10/17 (Nic): which of the two the save that just went out actually asked
+  // for, so a save that comes back with neither a link nor a ticket is reported
+  // as a failure instead of looking like a quiet success (sayPayRouteDone).
+  const sentPayRoute = useRef<'link' | 'register' | null>(null)
   // 10/5 (Nic, R9): a check-in refused because the background check isn't
   // back and decided yet — shown in its own window, with no override.
   const [screeningWait, setScreeningWait] = useState<{ message: string; waitingOn: string } | null>(null)
@@ -336,7 +811,7 @@ export function SchedulePage() {
   // confirm is open (it reads, fresh, what canceling it changes).
   const [cancelFor, setCancelFor] = useState<any>(null)
   // Edit mode for an existing reservation (the detail panel). null = view-only.
-  const [editForm, setEditForm] = useState<{guestName:string; guestEmail:string; guestPhone:string; checkIn:string; checkOut:string; unitId:string; notes:string; requiredSiteLayout:string; requiredAmpService:string; avoid:string} | null>(null)
+  const [editForm, setEditForm] = useState<{guestName:string; guestEmail:string; guestPhone:string; checkIn:string; checkOut:string; unitId:string; notes:string; requiredSiteLayout:string; requiredAmpService:string; rigLengthFt:number|null; avoid:string} | null>(null)
   const [editError, setEditError] = useState('')
   const [resvError, setResvError] = useState('')
   const [resvFirst, setResvFirst] = useState('')
@@ -356,6 +831,51 @@ export function SchedulePage() {
   const [pickedUnit, setPickedUnit] = useState<any | null>(null)
   const [lockSite, setLockSite] = useState(false)
   const [payMode, setPayMode] = useState<'link' | 'register'>('link')
+  // 10/17 (Nic) — THE PER-SITE "+ Book" FORM'S OWN ANSWER, AND ITS OWN DEFAULT.
+  //
+  // "when I go to add a reservation, it won't generate a pay link from doing
+  // the reservation." That form sent no pay route at all, so it could never
+  // produce a link or a ticket. But sending no route is also a real third
+  // outcome and the one it has always had: confirmed on the spot, outranking
+  // unpaid holds, because the money is being handled outside this form (they
+  // are paying now, they already paid, it is comped, it is an owner's block).
+  // So the choice is added and 'none' is the default — nobody's reservation
+  // silently changes behavior, and nobody emails a caller by accident.
+  //
+  // Deliberately NOT the New Reservation flow's `payMode` above: that form has
+  // only the two money exits and always has; sharing one piece of state made
+  // closing one form reach into the other.
+  const [bookPayMode, setBookPayMode] = useState<'none' | 'link' | 'register'>('none')
+  // 10/17 (Nic): "when I go to add a reservation, it won't generate a pay link
+  // from doing the reservation." The link WAS being made; nothing on this screen
+  // ever said so, and there was nowhere to read it. This holds the link a save
+  // just produced, so the desk can read it to the caller still on the phone.
+  // 10/18 (Nic): `emailedNow` false = the link was already out, so it is shown
+  // again to read down the phone and the guest was NOT emailed a second time.
+  // 10/18: what came back when a deposit was asked for — and, since a
+  // reservation can already have a link out that asks for OTHER money (the one
+  // that created it, an "Add a month" link, the arrival-day balance), WHICH
+  // link this is and what it asks for. The window says it in words rather than
+  // calling every URL "the deposit link".
+  const [resvLink, setResvLink] = useState<{
+    url: string; emailedTo: string | null; guest: string
+    /** An email went out on this press. */
+    emailedNow?: boolean
+    /** The link is made and payable, but the email did not go out. */
+    emailFailed?: boolean
+    /** False = this is another link already out for the reservation, not its deposit link. */
+    isDeposit?: boolean
+    label?: string | null
+    amount?: number | null
+    neverExpires?: boolean
+    /**
+     * 10/24 (Nic): this window opened straight off MAKING the reservation, so
+     * it carries no link to copy — the desk's next move is the next guest, not
+     * a URL. Opened by asking a reservation that already exists for its deposit
+     * link, it is false and the link is handed over.
+     */
+    justBooked?: boolean
+  } | null>(null)
   // 10/6 (Nic): "Returning guest — they've stayed with us before" (no
   // background check) and "Work trade" on the new-reservation form.
   const [resvReturning, setResvReturning] = useState(false)
@@ -377,6 +897,10 @@ export function SchedulePage() {
     enabled: !!editForm && !!detailBooking && !detailBooking.isLease && !detailBooking.returningGuestAt,
   })
   const [resvAmp, setResvAmp] = useState<string>('none')
+  // 10/24 (Nic): "I'm trying to make a reservation right now where somebody's got
+  // a 37 foot camper. They can't go in the small sites, right?" How long their
+  // rig is, as a string so the box can be empty (= they did not say).
+  const [resvRig, setResvRig] = useState<string>('')
   const [selectedCell, setSelectedCell] = useState<{unitId:string; date:string}|null>(null)
   // Booking-guest access: the link a no-account guest uses to reach their
   // stay assistant. Generated on demand per booking.
@@ -490,6 +1014,24 @@ export function SchedulePage() {
     { staleTime: 30000, keepPreviousData: true, enabled: !!schedulePropertyId }
   )
 
+  // ── 10/24 (Nic): A MARK ON THE BARS OF PEOPLE WORTH ASKING ───────────────
+  //
+  // He asked for "both" surfaces and then the front desk too. Here it is a mark
+  // on the bar itself, because the schedule is where somebody is deciding who
+  // goes where, and a stay that might end is a site that might open.
+  //
+  // Empty unless a park is down to 3 or fewer usable short-stay sites
+  // (services/stayFollowUps), so nothing is drawn on an ordinary day — this
+  // board only just got readable and must not grow permanent decoration.
+  const { data: followUpsRaw } = useQuery<any[]>(
+    'stay-followups', () => apiGet<any[]>('/landlords/me/stay-followups'),
+    { staleTime: 60_000, keepPreviousData: true })
+  // Null-safe: a refused or empty read draws nothing rather than throwing.
+  const askIfStaying = useMemo(() => {
+    const list: any[] = Array.isArray(followUpsRaw) ? followUpsRaw : []
+    return new Set(list.map(f => String(f.tenantId ?? '')).filter(Boolean))
+  }, [followUpsRaw])
+
   const { data: history = [] } = useQuery(
     'schedule-history',
     () => apiGet('/units/schedule/history?limit=150'),
@@ -507,6 +1049,9 @@ export function SchedulePage() {
         excludeBookingId: detailBooking.id,
         requiredSiteLayout: editForm.requiredSiteLayout || 'none',
         requiredAmpService: editForm.requiredAmpService || 'none',
+        // 10/24: a stay being moved keeps its rig, so the sites offered for the
+        // move are only the ones it fits on.
+        ...(editForm.rigLengthFt ? { rigLengthFt: String(editForm.rigLengthFt) } : {}),
       })}`
     : null
   const { data: editAvailableUnits } = useQuery(
@@ -590,7 +1135,6 @@ export function SchedulePage() {
         nightlyRate: num(bpCfg.nightlyRate),
         weeklyRate: num(bpCfg.weeklyRate),
         monthlyRate: num(bpCfg.monthlyRate),
-        shortTermTaxRate: Number(bpCfg.shortTermTaxRate) || 0,
       })
       setBpCfg(updated)
       setBpMsg('Saved.')
@@ -697,6 +1241,9 @@ export function SchedulePage() {
   // 10/4 (decisions #38): the Check out window — opened from a stay, or from
   // the owner's to-do / notification (?checkout=<booking>&unit=<site>).
   const [checkOutFor, setCheckOutFor] = useState<{ unitId: string; bookingId: string } | null>(null)
+  // 10/22 (Nic): the day a leased resident is leaving, so the site stops being
+  // blocked out indefinitely and can take reservations after it.
+  const [leaveDateFor, setLeaveDateFor] = useState<any>(null)
   const location = useLocation()
   const navigate = useNavigate()
   useEffect(() => {
@@ -721,8 +1268,34 @@ export function SchedulePage() {
   // this screen), no fee, no lease-type dropdown: the billing type is implied
   // by stay length (≥30 monthly, ≥7 weekly, else nightly), clamped to the
   // unit's allowed list.
+  // 10/24 (Nic) — THE RESERVATION WINDOW DOES NOT CLOSE BY ACCIDENT.
+  //
+  //   "I want to make it where I can't click off of that window unless I click
+  //    confirm or abandon the reservation. Clicking anywhere else on the screen
+  //    on GAM's website should not close out of that pop-up window. That way I
+  //    can't accidentally undo a middle of a reservation with an accidental
+  //    button push."
+  //
+  // The backdrop used to close it, and closing wipes every field — so one stray
+  // click half way through typing a guest in threw the lot away with nothing
+  // asked and nothing kept. Nothing had been written to the server (the form
+  // only exists in the browser until Create), so the cost was never a bad
+  // record; it was the typing, which is the thing the desk actually spends.
+  //
+  // Now: the backdrop does nothing at all, and the ✕ asks first — but only when
+  // there is something to lose. An untouched form closes on one click, because
+  // making somebody confirm away a blank form teaches them to click through
+  // the prompt that matters.
+  const bookingFormDirty = () =>
+    !!(bookFirst.trim() || bookLast.trim() || newBooking.guestEmail.trim() || newBooking.guestPhone.trim()
+       || newBooking.checkIn || newBooking.checkOut || newBooking.totalAmount.trim() || newBooking.notes.trim())
+  const [abandonAsk, setAbandonAsk] = useState(false)
+  const askCloseBookModal = () => { if (bookingFormDirty()) setAbandonAsk(true); else closeBookModal() }
   const closeBookModal = () => {
+    setAbandonAsk(false)
     setBookingModal({show:false,unit:null})
+    // 10/17: back to "no money here", which is what this form has always done.
+    setBookPayMode('none')
     setBookFirst(''); setBookLast('')
     setNewBooking({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
   }
@@ -747,7 +1320,11 @@ export function SchedulePage() {
     const m = payRouteAnswer.current ?? fallback
     payRouteAnswer.current = null
     // 10/6 (Nic): the third choice — no background check, so nothing to pay for it.
-    if (m === 'returning') return { returningGuest: true, ...(fallback ? { sendDepositLink: fallback === 'link', payAtRegister: fallback === 'register' } : {}) }
+    if (m === 'returning') {
+      sentPayRoute.current = fallback
+      return { returningGuest: true, ...(fallback ? { sendDepositLink: fallback === 'link', payAtRegister: fallback === 'register' } : {}) }
+    }
+    sentPayRoute.current = m === 'link' || m === 'register' ? m : null
     return m ? { sendDepositLink: m === 'link', payAtRegister: m === 'register' } : {}
   }
   const askFeeRouteIf = (e: any, resend: () => void): boolean => {
@@ -781,6 +1358,60 @@ export function SchedulePage() {
     }
     if (stay.workTrade?.rentTraded) toast('Work trade — the site is covered, so there is nothing to pay for it.')
   }
+  // 10/17 (Nic) — SAY WHAT THE SAVE ACTUALLY DID WITH THE MONEY.
+  //
+  // "when I go to add a reservation, it won't generate a pay link from doing the
+  // reservation... So we have some important things to address there before the
+  // schedule starts getting convoluted."
+  //
+  // The link and the register ticket were both being created and this screen
+  // threw the answer away: it closed the form, refreshed the calendar, and the
+  // desk had no way to tell a sent link from a failed one. Worse, the server
+  // deliberately does NOT roll a reservation back when the hand-off fails (the
+  // site is held and somebody has been told they have it), so a silent failure
+  // left a held site, no link and nobody aware of it.
+  //
+  // `asked` is the route the desk picked, so a save that came back with neither
+  // a link nor a ticket is reported as the failure it is, in words that say what
+  // IS true: the reservation stands, the site is held, the money part did not
+  // happen.
+  const sayPayRouteDone = (data: any, asked: 'link' | 'register' | null) => {
+    const guest = data?.guestName || 'the guest'
+    if (data?.depositLink?.url) {
+      // 10/18 (review): the server says whether the guest really got the email.
+      setResvLink({
+        url: data.depositLink.url, emailedTo: data?.guestEmail || null, guest,
+        isDeposit: true, neverExpires: true,
+        emailedNow: data.depositLink.emailed !== false,
+        emailFailed: data.depositLink.emailed === false,
+        // 10/24 (Nic): straight off making the reservation. No link on screen
+        // here — see the window below.
+        justBooked: true,
+      })
+      return
+    }
+    if (data?.registerTicketId) {
+      toast(`A ticket for ${guest} is waiting at the register — ringing it up confirms this reservation.`)
+      return
+    }
+    // Nothing to collect is not a failure: this park takes no deposit on a stay
+    // like this, so there was never a link to send.
+    if (asked === 'link' && data?.stay?.depositNothingOwed) {
+      toast(`${guest} owes no deposit on this stay, so no link was sent — the site is held for them.`)
+      return
+    }
+    // Both of these name something that exists today. 10/18: the schedule now
+    // HAS a send of its own — "Ask for the deposit" on the reservation — so a
+    // link that did not go out is a button away instead of a trip to the
+    // register.
+    if (asked === 'link') {
+      toast.error(`The reservation is on the schedule and the site is held, but no deposit link went out to ${guest}. `
+        + 'Open the reservation and press "Ask for the deposit", or take it at the register.')
+    } else if (asked === 'register') {
+      toast.error(`The reservation is on the schedule and the site is held, but no register ticket was made for ${guest}. `
+        + 'Ring the stay up at the register with the site and the dates.')
+    }
+  }
   const createBookingMut = useMutation(
     () => {
       const nights = Math.round((new Date(newBooking.checkOut+'T12:00:00').getTime() - new Date(newBooking.checkIn+'T12:00:00').getTime())/86400000)
@@ -794,11 +1425,18 @@ export function SchedulePage() {
         leaseType, checkIn: newBooking.checkIn, checkOut: newBooking.checkOut,
         source: 'direct',
         ...withTerms(),
-        ...withPayRoute(null),
+        // 10/17 (Nic): "when I go to add a reservation, it won't generate a pay
+        // link from doing the reservation." THIS is the reservation he means —
+        // the per-site "+ Book" button. It passed no pay route at all, so the
+        // stay went straight to confirmed with no link and no ticket, and the
+        // only way either flag ever reached the server was as a side effect of
+        // the background-check question (which only a 22+ night stay asks). Now
+        // the desk is asked, and 'none' keeps what this form always did.
+        ...withPayRoute(bookPayMode === 'none' ? null : bookPayMode),
       })
     },
     {
-      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); sayStaySaved(r?.data?.stay); closeBookModal() },
+      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); sayStaySaved(r?.data?.stay); sayPayRouteDone(r?.data, sentPayRoute.current); closeBookModal() },
       onError: (e: any) => {
         if (askTermsIf(e, () => createBookingMut.mutate())) return
         if (askFeeRouteIf(e, () => createBookingMut.mutate())) return
@@ -841,7 +1479,7 @@ export function SchedulePage() {
   // database on the way here, so there is nothing to unwind — only screen state
   // to drop, and all of it goes.
   const closeNewResv = () => {
-    setNewResvOpen(false); setResvError(''); setResvFirst(''); setResvLast(''); setResvLayout('none'); setResvAmp('none'); setResvAvoid('')
+    setNewResvOpen(false); setResvError(''); setResvFirst(''); setResvLast(''); setResvLayout('none'); setResvAmp('none'); setResvRig(''); setResvAvoid('')
     setShowAvail(false); setPickedUnit(null); setLockSite(false); setPayMode('link')
     setResvReturning(false); setResvWorkTrade(false); setResvWt(defaultWorkTradeTerms())
     setNewBooking({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
@@ -849,12 +1487,16 @@ export function SchedulePage() {
   // Combined RV-requirement mismatch reasons for a unit (layout + amp). Empty =
   // compatible. Used by the new-reservation cards, drag-move, and edit panel so
   // one guardrail covers both constraints with a single warning/confirm.
-  const rvMismatchReasons = (reqLayout: any, reqAmp: any, u: any): string[] => {
+  const rvMismatchReasons = (reqLayout: any, reqAmp: any, u: any, rigFt?: any): string[] => {
     const r: string[] = []
     if (isSiteLayoutMismatch(reqLayout, u?.rvSiteLayout))
       r.push(`needs ${RV_SITE_LAYOUT_LABEL[reqLayout as keyof typeof RV_SITE_LAYOUT_LABEL]}, unit is ${RV_SITE_LAYOUT_LABEL[(u?.rvSiteLayout||'none') as keyof typeof RV_SITE_LAYOUT_LABEL]}`)
     if (isAmpServiceMismatch(reqAmp, u?.rvAmpService))
       r.push(`needs ${RV_AMP_SERVICE_LABEL[reqAmp as keyof typeof RV_AMP_SERVICE_LABEL]}, unit is ${RV_AMP_SERVICE_LABEL[(u?.rvAmpService||'none') as keyof typeof RV_AMP_SERVICE_LABEL]}`)
+    // 10/24 (Nic): said in feet, because that is the thing the clerk has to
+    // repeat to the guest — "that spot is 30 foot, your rig is 37".
+    if (isRigTooLongForSite(rigFt, u?.rvMaxRigLengthFt))
+      r.push(`rig is ${Number(rigFt)} ft, this site takes ${Number(u?.rvMaxRigLengthFt)} ft`)
     return r
   }
   // Picking a unit submits the reservation with the stay total computed for it.
@@ -869,6 +1511,7 @@ export function SchedulePage() {
       totalAmount:stayPriceForUnit(u).total, source:'direct',
       requiredSiteLayout: resvLayout,
       requiredAmpService: resvAmp,
+      rigLengthFt: resvRig.trim() === '' ? null : Number(resvRig),
       // S652: movable unless the counter promised them that exact space.
       lockedToUnit: lockSite,
       // S653: the sites they asked not to have, at the property this stay is at.
@@ -884,7 +1527,7 @@ export function SchedulePage() {
       ...(resvWorkTrade ? { workTrade: workTradeTermsPayload(resvWt) } : {}),
     }),
     {
-      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); sayStaySaved(r?.data?.stay); closeNewResv() },
+      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); sayStaySaved(r?.data?.stay); sayPayRouteDone(r?.data, sentPayRoute.current); closeNewResv() },
       onError: (e: any, u: any) => {
         if (askTermsIf(e, () => createResvMut.mutate(u))) return
         if (askFeeRouteIf(e, () => createResvMut.mutate(u))) return
@@ -962,20 +1605,56 @@ export function SchedulePage() {
   }
   const avoidedWords = (b: any, unitNumber: string) =>
     `${(b?.guestName || '').trim() || 'This guest'} asked not to be on ${unitNumber}.`
+  // The same question when the server is the one that asked it — a page that
+  // loaded before the stay was pinned, or an Edit that changed the site.
+  const askLockedIf = (e: any, resend: () => void): boolean => {
+    const body = e?.response?.data
+    if (e?.response?.status !== 409 || body?.code !== 'locked_site') return false
+    appConfirm(body.error, { confirmLabel: 'Move them there' }).then(ok => { if (ok) resend() })
+    return true
+  }
+  // 10/12 (Nic, G6): a shorter stay past rent a payment was tried on — the
+  // landlord chooses here, at the moment: take those charges off (anything
+  // paid on them goes back to the guest as credit), or keep them owed. The
+  // change is sent again with the answer; Cancel saves nothing.
+  // 10/13 evening (Nic): "Take those charges off" is for "anyone who can schedule
+  // reservations and take payments" (and the owner) — the server sends only the answers this person may
+  // give (and says why when "Take those charges off" is not one of them).
+  const askShortenedIf = (e: any, resend: (choice: string) => void): boolean => {
+    const body = e?.response?.data
+    if (e?.response?.status !== 409 || body?.code !== 'stay_shortened_attempted') return false
+    // Only the answers the server offered; "Keep them owed" always (lib/earlyCheckOut).
+    appChoose(pastEndQuestion(body.error, body.voidRefused), {
+      title: 'Rent a payment was tried on',
+      choices: pastEndChoices(body?.choices),
+    }).then(choice => { if (choice) resend(choice) })
+    return true
+  }
 
   const moveBookingMut = useMutation(
-    (payload: {bookingId:string; unitId:string; checkIn:string; checkOut:string; overrideAvoided?: boolean}) =>
+    (payload: {bookingId:string; unitId:string; checkIn:string; checkOut:string; overrideAvoided?: boolean; overrideLocked?: boolean; pastEndAttempted?: string}) =>
       apiPatch(`/units/${payload.unitId}/bookings/${payload.bookingId}`, {
         unitId: payload.unitId, checkIn: payload.checkIn, checkOut: payload.checkOut, ...withTerms(),
         ...(payload.overrideAvoided ? { overrideAvoided: true } : {}),
+        // 10/20 (Nic): confirmed after "… so RV 14 is the number they have" (askLockedIf).
+        ...(payload.overrideLocked ? { overrideLocked: true } : {}),
+        ...(payload.pastEndAttempted ? { pastEndAttempted: payload.pastEndAttempted } : {}),
       }),
     {
       // 10/5 (M3): a drag that made the stay need a background check says what was sent.
-      onSuccess: (r: any) => { qc.invalidateQueries('schedule'); sayStaySaved(r?.stay) },
+      onSuccess: (r: any) => {
+        qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history')
+        sayStaySaved(r?.stay)
+        // 10/20 (Nic): a pinned stay moved by hand — whether the guest has
+        // been told their space number changed, or a call is owed.
+        if (r?.siteMoved) toast(r.siteMoved)
+      },
       onError: (e: any, payload) => {
         if (takeLatestIfChanged(e)) return
         if (askTermsIf(e, () => moveBookingMut.mutate(payload))) return
+        if (askLockedIf(e, () => moveBookingMut.mutate({ ...payload, overrideLocked: true }))) return
         if (askAvoidedIf(e, () => moveBookingMut.mutate({ ...payload, overrideAvoided: true }))) return
+        if (askShortenedIf(e, (choice) => moveBookingMut.mutate({ ...payload, pastEndAttempted: choice }))) return
         toast.error(saveError(e, 'Cannot move reservation — date conflict on that unit.'))
       }
     }
@@ -1019,12 +1698,22 @@ export function SchedulePage() {
     if (!checkInPrompt) return
     setCheckInBusy(true)
     try {
+      // 10/20: keep what the answer says about each read. A closing read taken
+      // at check-in can come back billing nothing — the cycle was already billed
+      // off the monthly run, or the figure is one the landlord has to look at
+      // first — and this screen discarded that and said "Read recorded" either
+      // way. ONE line for the whole check-in, not one per meter.
+      const notes: string[] = []
       for (const m of checkInPrompt.meters) {
-        await apiPost(`/utility/meters/${m.meterId}/reads`, { readingValue: Number(values[m.meterId]), reason: m.reason, ...(m.leaseId ? { leaseId: m.leaseId } : {}) })
+        const r: any = await apiPost(`/utility/meters/${m.meterId}/reads`, { readingValue: Number(values[m.meterId]), reason: m.reason, ...(m.leaseId ? { leaseId: m.leaseId } : {}) })
+        const note = r?.data?.billingNote
+        if (note && !notes.includes(note)) notes.push(note)
       }
       await doCheckIn(checkInPrompt.booking)
       qc.invalidateQueries('schedule')
-      toast('Read recorded — guest checked in')
+      toast(notes.length
+        ? `Read recorded — guest checked in. ${notes.map(sentence).join(' ')}`
+        : 'Read recorded — guest checked in')
       setCheckInPrompt(null); setDetailBooking(null)
     } catch (e: any) {
       if (takeLatestIfChanged(e)) { setCheckInPrompt(null); return }
@@ -1048,6 +1737,54 @@ export function SchedulePage() {
     }
     finally { setCheckInBusy(false) }
   }
+
+  // 10/18 (Nic) — ASK A RESERVATION THAT IS ALREADY ON THE BOARD FOR ITS DEPOSIT.
+  //
+  //   "yeah, let's add a button so that we can collect deposits from people
+  //    that haven't done it for their stays."
+  //
+  // A deposit link could only ever go out at the one moment a reservation was
+  // made, so the phone calls and the soft holds had no way to be asked
+  // afterwards — and an unpaid reservation is the one a paying guest can take.
+  // Same server path as the reservation form, so there is one deposit figure
+  // and one link.
+  //
+  // Pressing it again hands back the link that is already out instead of
+  // emailing the guest twice, and the window below says which happened.
+  const askDepositMut = useMutation(
+    (b: any) => apiPost(`/units/${b.unitId}/bookings/${b.id}/deposit-link`, {}),
+    {
+      onSuccess: (r: any, b: any) => {
+        qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history')
+        const sent = r?.data
+        if (!sent?.link?.url) {
+          toast.error('The deposit link did not come back — take the deposit at the register.')
+          return
+        }
+        setResvLink({
+          // 10/24 (Nic): asked FOR from a reservation that already exists —
+          // somebody went looking for this link, so this is the one window that
+          // hands it over.
+          justBooked: false,
+          url: sent.link.url,
+          emailedTo: sent.sentTo || b?.guestEmail || null,
+          guest: sent.guestName || b?.guestName || 'the guest',
+          emailedNow: sent.emailedNow !== false,
+          emailFailed: sent.emailFailed === true,
+          // 10/18 (review): the server says whether what came back IS this
+          // reservation's deposit link, so a link for the whole stay is never
+          // read down the phone as the deposit.
+          isDeposit: sent.link.isDeposit !== false,
+          label: sent.link.label ?? null,
+          amount: sent.link.amount ?? null,
+          neverExpires: sent.link.neverExpires !== false,
+        })
+        // Out of the way, so the link is the thing on screen.
+        setDetailBooking(null)
+      },
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not send the deposit link.'),
+    }
+  )
 
   // S547: snowbird lock toggle — pins the stay to its site, exempt from the
   // compressor / relocation / extend-fallback movers.
@@ -1085,7 +1822,7 @@ export function SchedulePage() {
   // Edit an existing reservation (guest contact, dates, unit, notes). The
   // backend reprices on a date/unit change and COALESCEs unchanged fields.
   const editBookingMut = useMutation(
-    (vars: {orig:any; form:NonNullable<typeof editForm>; overrideAvoided?: boolean}) =>
+    (vars: {orig:any; form:NonNullable<typeof editForm>; overrideAvoided?: boolean; overrideLocked?: boolean; pastEndAttempted?: string}) =>
       apiPatch(`/units/${vars.orig.unitId}/bookings/${vars.orig.id}`, {
         guestName: vars.form.guestName.trim() || null,
         guestEmail: vars.form.guestEmail.trim() || null,
@@ -1096,6 +1833,7 @@ export function SchedulePage() {
         notes: vars.form.notes.trim() || null,
         requiredSiteLayout: vars.form.requiredSiteLayout,
         requiredAmpService: vars.form.requiredAmpService,
+        rigLengthFt: vars.form.rigLengthFt,
         // S653: typed numbers → ids at the stay's property; [] clears the list.
         avoidedUnitIds: (() => {
           const toks = vars.form.avoid.split(/[,;\n]|\band\b/i).map(t => t.trim().toLowerCase().replace(/\s+/g, '')).filter(Boolean)
@@ -1105,6 +1843,10 @@ export function SchedulePage() {
         ...withTerms(),
         // 10/6: confirmed after "They asked not to be on …" (askAvoidedIf).
         ...(vars.overrideAvoided ? { overrideAvoided: true } : {}),
+        // 10/20 (Nic): confirmed after "… so RV 14 is the number they have" (askLockedIf).
+        ...(vars.overrideLocked ? { overrideLocked: true } : {}),
+        // 10/12 (G6): the landlord's answer for rent a payment was tried on (askShortenedIf).
+        ...(vars.pastEndAttempted ? { pastEndAttempted: vars.pastEndAttempted } : {}),
         // 10/6 (Nic): returning guest, and the stay's work trade — ticked,
         // changed, or taken off (null). Left out when nothing about it changed.
         ...(editReturning && !vars.orig.returningGuestAt ? { returningGuest: true } : {}),
@@ -1126,11 +1868,16 @@ export function SchedulePage() {
         sayStaySaved(b?.stay)
         // 10/6 (review): a returning guest's check fee that had already gone out came off.
         if (b?.returningFeeNote) toast(b.returningFeeNote)
+        // 10/20 (Nic): the Edit form changes the site too, so it says the same
+        // thing a drag does about a pinned stay that just moved.
+        if (b?.siteMoved) toast(b.siteMoved)
       },
       onError: (e:any, vars) => {
         if (takeLatestIfChanged(e, { inForm: true })) return
         if (askTermsIf(e, () => editBookingMut.mutate(vars))) return
+        if (askLockedIf(e, () => editBookingMut.mutate({ ...vars, overrideLocked: true }))) return
         if (askAvoidedIf(e, () => editBookingMut.mutate({ ...vars, overrideAvoided: true }))) return
+        if (askShortenedIf(e, (choice) => editBookingMut.mutate({ ...vars, pastEndAttempted: choice }))) return
         setEditError(e?.response?.data?.error || e?.message || 'Could not save changes.')
       },
     }
@@ -1145,6 +1892,7 @@ export function SchedulePage() {
       checkIn: dayOnly(d.checkIn), checkOut: dayOnly(d.checkOut), unitId: d.unitId, notes: d.notes || '',
       requiredSiteLayout: d.requiredSiteLayout || 'none',
       requiredAmpService: d.requiredAmpService || 'none',
+      rigLengthFt: d.rigLengthFt ?? null,
       avoid: (d.avoidedUnitIds || []).map((id:string)=>unitNumberOf(id)).filter(Boolean).join(', '),
     })
     setEditReturning(false)
@@ -1244,13 +1992,14 @@ export function SchedulePage() {
   }, [filteredUnits.length, days.length, isLoading, view])
 
   const nameOverlays = useMemo(() => {
-    if (view !== 'timeline' || !days.length || !rowGeom.length) return [] as { key: string; left: number; top: number; height: number; width: number; label: string; isLease: boolean }[]
+    if (view !== 'timeline' || !days.length || !rowGeom.length) return [] as NameOverlay[]
     const dFirst = days[0], dLast = days[days.length - 1]
-    const out: { key: string; left: number; top: number; height: number; width: number; label: string; isLease: boolean }[] = []
+    const out: NameOverlay[] = []
     filteredUnits.forEach((unit: any, rowIdx: number) => {
       const rg = rowGeom[rowIdx]
       if (!rg) return
-      const add = (id: string, startRaw: string, endRaw: string | null, isLease: boolean, label: string) => {
+      const add = (id: string, startRaw: string, endRaw: string | null, kind: ScheduleBarKind, label: string) => {
+        const isLease = kind === 'lease'
         const start = dayOnly(startRaw)
         // Booking check-out is EXCLUSIVE (last night = checkout − 1); lease end is
         // INCLUSIVE — mirror the bar-painting convention so labels align exactly.
@@ -1267,14 +2016,18 @@ export function SchedulePage() {
           top: rg.top,
           height: rg.h,
           width: (eIdx - sIdx + 1) * colW,
-          label, isLease,
+          label, kind,
+          // 10/18 (Nic): the lock marker is not a lease marker — a checked-out
+          // stay and a no-show wear it too, because their dates are just as
+          // settled as a lease's.
+          locked: LOCKED_BAR_KINDS.includes(kind),
         })
       }
-      bookings.forEach((b: any) => { if (b.unitId === unit.id) add(b.id, b.checkIn, b.checkOut, false, b.guestName || 'Guest') })
+      bookings.forEach((b: any) => { if (b.unitId === unit.id) add(b.id, b.checkIn, b.checkOut, scheduleBarKind(b), b.guestName || 'Guest') })
       leases.forEach((l: any) => {
         if (l.unitId !== unit.id) return
         const nm = (l.guestName || [l.firstName, l.lastName].filter(Boolean).join(' ')).trim() || 'Tenant'
-        add(l.id, l.startDate, l.endDate, true, nm)
+        add(l.id, l.startDate, l.endDate, 'lease', nm)
       })
     })
     return out
@@ -1480,11 +2233,23 @@ export function SchedulePage() {
     if (oooOverlaps(tUnitId, newCheckIn, newCheckOut)) { toast.error('That site is out of order for those dates.'); return }
     // 10/6 (Nic): a site the guest asked not to have is a plain question, never a quiet move.
     const avoided = !sameUnit && ((b.avoidedUnitIds || []) as string[]).includes(tUnitId)
+    // 10/20 (Nic, his own catch): and neither is a space the guest was already
+    // promised. The server refuses this move without overrideLocked, so the
+    // question is asked here rather than sending a drag out to be rejected.
+    const siteLocked = !sameUnit && isScheduleBarSiteLocked(b)
     const doMove = () => moveBookingMut.mutate({ bookingId: b.id, unitId: tUnitId, checkIn: newCheckIn, checkOut: newCheckOut,
-      ...(avoided ? { overrideAvoided: true } : {}) })
+      ...(avoided ? { overrideAvoided: true } : {}),
+      ...(siteLocked ? { overrideLocked: true } : {}) })
     const mismatchReasons = sameUnit ? [] : rvMismatchReasons(b.requiredSiteLayout, b.requiredAmpService, targetUnit)
+    // Everything the person pressing needs to know, in the order it matters:
+    // the promised space first (a rig arrives at the wrong one), then the space
+    // they asked not to have, then whether the site even fits the rig.
+    const lockedAsk = siteLocked ? promisedSiteWords(b, targetUnit.unitNumber) : ''
     if (mismatchReasons.length) {
-      appConfirm(`${avoided ? `${avoidedWords(b, targetUnit.unitNumber)}\n\n` : ''}Unit ${targetUnit.unitNumber} doesn't match this reservation:\n· ${mismatchReasons.join('\n· ')}\n\nMove ${avoided ? 'them there' : 'it'} anyway?`, { confirmLabel: avoided ? 'Move them there' : 'Move it' }).then(ok => { if (ok) doMove() })
+      const asks = [lockedAsk, avoided ? avoidedWords(b, targetUnit.unitNumber) : ''].filter(Boolean)
+      appConfirm(`${asks.length ? `${asks.join('\n\n')}\n\n` : ''}Unit ${targetUnit.unitNumber} doesn't match this reservation:\n· ${mismatchReasons.join('\n· ')}\n\nMove ${avoided || siteLocked ? 'them there' : 'it'} anyway?`, { confirmLabel: avoided || siteLocked ? 'Move them there' : 'Move it' }).then(ok => { if (ok) doMove() })
+    } else if (siteLocked) {
+      appConfirm(`${lockedAsk}${avoided ? `\n\n${avoidedWords(b, targetUnit.unitNumber)}` : ''}\n\nMove them there anyway?`, { confirmLabel: 'Move them there' }).then(ok => { if (ok) doMove() })
     } else if (avoided) {
       appConfirm(`${avoidedWords(b, targetUnit.unitNumber)} Move them there anyway?`, { confirmLabel: 'Move them there' }).then(ok => { if (ok) doMove() })
     } else {
@@ -1496,7 +2261,8 @@ export function SchedulePage() {
   // keeps that day under the cursor (subtract grabOffset on drop) instead of
   // snapping check-in to the drop cell — fixes the "first day jumps" / off-by-one.
   const onDragStart = (e: React.DragEvent, bk: any, grabbedDate: string, mode: 'move'|'resize-start'|'resize-end') => {
-    if (bk.isLease) { e.preventDefault(); return }   // leases are read-only
+    // Leases are read-only, and so is a stay that is already history (10/18).
+    if (isScheduleBarLocked(bk)) { e.preventDefault(); return }
     if (mode !== 'move') e.stopPropagation()         // edge grip → resize, not move
     dragInfo.current = { booking: bk, mode, grabOffset: mode === 'move' ? daysBetween(bk.checkIn, grabbedDate) : 0 }
     dragTargetRef.current = null
@@ -1693,6 +2459,14 @@ export function SchedulePage() {
           <RequiredPropertySelect value={schedulePropertyId} onChange={setSchedulePropertyId}
             properties={schedulePropertyOptions} />
           <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>{filteredUnits.length} units · {bookings.length} reservations</span>
+          {/* 10/20 (Nic): the reservations that ALREADY EXIST — the old system's
+              schedule first, then the ones out of his text threads. Its own
+              door, beside this one, because nothing about it is a new
+              reservation: the guest has been told, may have paid, and may have
+              been promised a space. Nobody is emailed by it. */}
+          {can('schedule.create_reservation') && schedulePropertyId && (
+            <button className="btn btn-primary btn-sm" onClick={()=>setImportOpen(true)}>Bring in reservations</button>
+          )}
           {can('schedule.create_reservation') && <button className="btn btn-primary btn-sm" onClick={()=>setNewResvOpen(true)}>+ New Reservation</button>}
         </div>
       </div>
@@ -1818,6 +2592,15 @@ export function SchedulePage() {
                     const booking = getBookingForDate(unit.id, d)
                     const isBooked = !!booking
                     const isLease = !!(booking && booking.startDate)
+                    // 10/18 (Nic): one reading of the booking decides the bar's
+                    // color AND whether its dates can still be dragged — see
+                    // scheduleBarKind above. Finished history locks like a lease.
+                    const barKind = booking ? scheduleBarKind(booking) : 'reserved'
+                    const barLocked = !!booking && isScheduleBarLocked(booking)
+                    // 10/20 (Nic): pinned to its space. Its dates still drag —
+                    // that is why this is not barLocked — but dropping it on
+                    // another site asks first (commitDrag).
+                    const barSiteLocked = !!booking && isScheduleBarSiteLocked(booking)
                     const isStart = booking && (dayOnly(booking.checkIn) === d || dayOnly(booking.startDate) === d)
                     // Last cell of this reservation within the grid, so the bar
                     // rounds only at its true ends. S527 W-21: conventions differ —
@@ -1864,10 +2647,14 @@ export function SchedulePage() {
                         data-unit={unit.id}
                         data-date={d}
                         style={{borderBottom:'1px solid var(--border-1)',borderLeft:'1px solid var(--border-1)',padding:'6px 0',textAlign:'center',width:colW,minWidth:colW,maxWidth:colW,
-                          background: isDragTarget ? (preview?.mismatch ? 'rgba(224,168,0,.16)' : 'rgba(201,162,39,.18)') : d===today ? 'rgba(201,162,39,.04)' : '',
-                          outline: selectedCell?.unitId===unit.id && selectedCell?.date===d ? '2px solid var(--gold)' : isDragTarget ? `2px solid ${preview?.mismatch?'var(--amber)':'var(--gold)'}` : 'none',
+                          // 10/18 (Nic): amber is now what an un-arrived stay paints
+                          // at rest, so a drop that does not fit the stay's
+                          // requirements warns in RED — the two can never be read as
+                          // each other. The gold valid-target tint is unchanged.
+                          background: isDragTarget ? (preview?.mismatch ? 'rgba(239,68,68,.16)' : 'rgba(201,162,39,.18)') : d===today ? 'rgba(201,162,39,.04)' : '',
+                          outline: selectedCell?.unitId===unit.id && selectedCell?.date===d ? '2px solid var(--gold)' : isDragTarget ? `2px solid ${preview?.mismatch?'var(--red)':'var(--gold)'}` : 'none',
                           outlineOffset: '-2px',
-                          cursor: isBooked && !isLease ? 'grab' : unit.isBookable && !isBooked ? 'pointer' : 'default'
+                          cursor: isBooked && !barLocked ? 'grab' : unit.isBookable && !isBooked ? 'pointer' : 'default'
                         }}
                         onDragOver={e => onDragOver(e, unit.id, d)}
                         onDrop={onDrop}
@@ -1880,7 +2667,7 @@ export function SchedulePage() {
                         }}
                       >
                         {showPreviewBlock ? (
-                          <div style={{background: preview?.mismatch ? 'var(--amber)' : 'var(--gold)',borderRadius:3,height:24,opacity:.7,display:'flex',alignItems:'center',justifyContent:'center',fontSize:'.6rem',color:'#000',fontWeight:700}}>
+                          <div style={{background: preview?.mismatch ? 'var(--red)' : 'var(--gold)',borderRadius:3,height:24,opacity:.7,display:'flex',alignItems:'center',justifyContent:'center',fontSize:'.6rem',color:'#000',fontWeight:700}}>
                             {isPreviewStart ? (dragInfo.current?.booking?.guestName || '↔').slice(0,8) : ''}
                           </div>
                         ) : isBooked ? (
@@ -1905,10 +2692,20 @@ export function SchedulePage() {
                             const bk = { ...booking, unitId: unit.id, unitNumber: unit.unitNumber, propertyName: unit.propertyName, isLease }
                             return (
                               <div
+                                // 10/18: the bar says which reservation it belongs to and what
+                                // kind of bar it is, so the color/lock rules can be read off
+                                // the page (and tested) instead of guessed from a style string.
+                                data-bar-id={booking.id}
+                                data-bar-kind={barKind}
+                                data-bar-locked={barLocked ? 'true' : 'false'}
+                                // 10/20 (Nic): the space is pinned even when
+                                // the dates are not, so the board says which
+                                // bars a cross-site drop will stop to ask about.
+                                data-bar-site-locked={barSiteLocked ? 'true' : 'false'}
                                 // 10/3 (fix pass 2): moving or stretching a stay is an edit. A desk
                                 // person who may only check guests in or out does not get a bar
                                 // that drags only to be refused.
-                                draggable={!isLease && can('schedule.edit_reservation')}
+                                draggable={!barLocked && can('schedule.edit_reservation')}
                                 onDragStart={e => {
                                   // Mode from grab position: the outer ~10px of a start/end
                                   // cell resizes that edge; anywhere else moves the stay.
@@ -1927,29 +2724,38 @@ export function SchedulePage() {
                                 onContextMenu={e => {
                                   // S559 (Nic): right-click a reservation to jump straight into
                                   // edit. Leases edit on the Leases page — just open their detail.
+                                  // 10/18 (Nic): a checked-out stay or a no-show is history, so
+                                  // right-click opens its window and stops there — correcting
+                                  // its dates is the deliberate Edit press inside that window,
+                                  // not a shortcut the mouse can land on.
                                   e.preventDefault(); e.stopPropagation()
                                   setDetailBooking(bk)
-                                  if (!isLease && can('schedule.edit_reservation')) startEdit(bk)
+                                  if (!barLocked && can('schedule.edit_reservation')) startEdit(bk)
                                 }}
                                 style={{
                                   // The dragged bar's cells that fall in the new target
                                   // range tint gold (preview of the overlap with the
                                   // original); cells outside the new range dim (ghost).
-                                  background: isLease ? 'var(--blue)'
-                                    : (isGhostCell && isDragTarget) ? (preview?.mismatch ? 'var(--amber)' : 'var(--gold)')
-                                    : 'var(--green)',
+                                  background: (!barLocked && isGhostCell && isDragTarget)
+                                    ? (preview?.mismatch ? 'var(--red)' : 'var(--gold)')
+                                    : SCHEDULE_BAR_COLOR[barKind],
                                   // Round only at the reservation's true ends so adjacent
                                   // day-cells merge into one continuous bar (no beading).
                                   borderRadius:`${isStart?6:0}px ${isEnd?6:0}px ${isEnd?6:0}px ${isStart?6:0}px`,
                                   height:26,
                                   display:'flex', alignItems:'center', justifyContent:'flex-start',
                                   // S527 W-17: names readable at a glance.
-                                  fontSize:'.72rem', fontWeight:700, color: (isGhostCell && isDragTarget) ? '#000' : '#fff', overflow:'visible',
+                                  fontSize:'.72rem', fontWeight:700, color: (isGhostCell && isDragTarget) ? '#000' : SCHEDULE_BAR_TEXT[barKind], overflow:'visible',
                                   whiteSpace:'nowrap', paddingLeft: isStart?7:0,
                                   opacity: (isGhostCell && !isDragTarget) ? 0.2 : 0.92,
-                                  cursor: isLease ? 'default' : 'grab',
+                                  cursor: barLocked ? 'default' : 'grab',
                                   position:'relative', zIndex: showsLabel?2:1,
-                                  border: needsAck ? '1px solid var(--amber)' : 'none',
+                                  // 10/18 (Nic): "it's almost highlighted like you have it
+                                  // clicked on." The acknowledgment-pending border was drawn
+                                  // on EVERY day cell of the bar — a yellow rectangle around
+                                  // every square, which reads as a selection outline. The dot
+                                  // at the bar's start is the whole signal now.
+                                  border: 'none',
                                   userSelect: 'none',
                                 }}
                                 title={
@@ -1964,26 +2770,57 @@ export function SchedulePage() {
                                   <span
                                     style={{
                                       position:'absolute',
-                                      top:-3, right:-3,
-                                      width:8, height:8,
+                                      top:-4, right:-4,
+                                      // 10/18 (review): an un-arrived stay is now amber itself,
+                                      // so the dot needs a dark ring to stay visible on top of
+                                      // it — and the dot GREW to pay for the ring. Everything in
+                                      // this app is border-box, so a 2px ring eats 4px out of an
+                                      // 8px dot and leaves a 4px amber core: a WEAKER pending
+                                      // signal than before, on the green and blue bars that were
+                                      // never part of the complaint. 10px keeps the 6px core it
+                                      // always had and adds the ring on the outside.
+                                      width:10, height:10,
                                       borderRadius:'50%',
                                       background:'var(--amber)',
-                                      border:'1px solid var(--bg-1)',
+                                      border:'2px solid var(--bg-1)',
+                                    }}
+                                  />
+                                )}
+                                {/* ── 10/24 (Nic): "ASK THEM IF THEY'RE STAYING" ──────────
+                                    A hollow ring at the bar's start when this person's
+                                    STATED stay is nearly up and the park is nearly full
+                                    (services/stayFollowUps decides both; with room to
+                                    spare the list is empty and nothing is drawn). Hollow,
+                                    and only at the start, so it reads as a question
+                                    rather than competing with the solid amber
+                                    acknowledgment dot beside it. */}
+                                {isStart && askIfStaying.has(String(booking.tenantId ?? '')) && (
+                                  <span
+                                    title={`${booking.guestName || [booking.firstName, booking.lastName].filter(Boolean).join(' ') || 'They'} said how long when they applied and it is nearly up — ask whether they are staying on. Their answer changes nothing on the lease.`}
+                                    style={{
+                                      position:'absolute',
+                                      bottom:-4, right:-4,
+                                      width:10, height:10,
+                                      borderRadius:'50%',
+                                      background:'transparent',
+                                      border:'2px solid var(--bg-1)',
+                                      boxShadow:'0 0 0 2px var(--amber, #d9a441)',
                                     }}
                                   />
                                 )}
                                 {/* Edge grips — drag to extend/shorten the stay by its edge
-                                    (left = check-in, right = check-out). Reservations only. */}
+                                    (left = check-in, right = check-out). Reservations that are
+                                    not yet history; a locked bar shows no grips at all. */}
                                 {/* Visual resize-handle cues only — the bar's own onDragStart
                                     reads the grab position to choose resize vs move, so these
                                     must not intercept the pointer. */}
-                                {!isLease && isStart && (
+                                {!barLocked && isStart && (
                                   <span aria-hidden
                                     title="Drag this edge to change check-in"
                                     style={{position:'absolute', left:0, top:0, bottom:0, width:10, cursor:'ew-resize', borderRadius:'6px 0 0 6px', background:'rgba(0,0,0,.3)', pointerEvents:'none'}}
                                   />
                                 )}
-                                {!isLease && isEnd && (
+                                {!barLocked && isEnd && (
                                   <span aria-hidden
                                     title="Drag this edge to change check-out"
                                     style={{position:'absolute', right:0, top:0, bottom:0, width:10, cursor:'ew-resize', borderRadius:'0 6px 6px 0', background:'rgba(0,0,0,.3)', pointerEvents:'none'}}
@@ -2028,8 +2865,8 @@ export function SchedulePage() {
           <div aria-hidden style={{position:'absolute',top:0,left:0,zIndex:2,pointerEvents:'none'}}>
             {nameOverlays.filter(o => o.key !== dragging).map(o => (
               <div key={o.key} style={{position:'absolute',left:o.left,top:o.top,width:o.width,height:o.height,display:'flex',alignItems:'center',pointerEvents:'none'}}>
-                <div style={{position:'sticky',left:STICKY_LEFT,maxWidth:o.width,boxSizing:'border-box',padding:'0 6px',fontSize:'.72rem',fontWeight:700,lineHeight:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',color:o.isLease?'#e6ecff':'#fff',textShadow:'0 1px 2px rgba(0,0,0,.6)'}}>
-                  {o.isLease ? '🔒 ' : ''}{o.label}
+                <div data-testid={`bar-name-${o.key}`} data-kind={o.kind} style={{position:'sticky',left:STICKY_LEFT,maxWidth:o.width,boxSizing:'border-box',padding:'0 6px',fontSize:'.72rem',fontWeight:700,lineHeight:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',color:SCHEDULE_BAR_TEXT[o.kind],textShadow:SCHEDULE_BAR_SHADOW[o.kind]}}>
+                  {o.locked ? '🔒 ' : ''}{o.label}
                 </div>
               </div>
             ))}
@@ -2040,6 +2877,10 @@ export function SchedulePage() {
         {/* S575: always-visible horizontal scrollbar hovering just above the legend
             — for mouse users who can't swipe sideways (see updateHbar/dragHbar). */}
         <style>{`.hbar-thumb:hover{background:var(--gold)!important;} .hbar-thumb:active{background:var(--gold)!important;cursor:grabbing!important;}`}</style>
+        {/* 10/18: the halves of the bar palette that invert between the dark
+            and light themes — the ink on a yellow or bright-green bar, and the
+            faded fill a finished stay paints. See SCHEDULE_BAR_THEME_CSS. */}
+        <style>{SCHEDULE_BAR_THEME_CSS}</style>
         {hbar.show && (
           <div
             ref={hbarTrackRef}
@@ -2056,12 +2897,41 @@ export function SchedulePage() {
           </div>
         )}
         <div ref={legendRef} style={{padding:'10px 14px 14px',fontSize:'.72rem',color:'var(--text-3)',display:'flex',flexWrap:'wrap',gap:16,borderTop:'1px solid var(--border-1)',background:'var(--bg-2)',borderRadius:'0 0 12px 12px',flexShrink:0}}>
-          <span><span style={{display:'inline-block',width:12,height:12,background:'var(--green)',borderRadius:2,marginRight:4}}/>Reservation (draggable)</span>
+          {/* 10/18 (Nic): the colors mean something now, so the strip says what.
+              Status wording comes from the shared labels — never a raw enum. */}
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--blue)',borderRadius:2,marginRight:4}}/>🔒 Lease (managed on Leases page)</span>
+          {/* 10/18 (review): yellow is EVERY stay nobody has arrived at, and a
+              tentative hold is yellow too — an unpaid hold a paying guest is
+              allowed to take. Naming the amber swatch "Confirmed" told the desk
+              a soft hold was locked in, and a clerk reading the board would
+              turn away a walk-in who would have paid for that site. It names
+              both statuses instead, so the color claims nothing the bar does
+              not say. 10/24 (Nic) answered that call: the money splits the amber
+              in two, so amber is now the un-arrived stay that has NOT paid and
+              purple is the one that has. The wording follows the fills. */}
+          <span><span style={{display:'inline-block',width:12,height:12,background:'var(--amber)',borderRadius:2,marginRight:4}}/>Booked, nothing paid yet ({BOOKING_STATUS_LABEL.tentative} or {BOOKING_STATUS_LABEL.confirmed})</span>
+          {/* Reads the same theme-aware fill the bar does, so the strip cannot
+              drift from the board it explains. */}
+          <span><span style={{display:'inline-block',width:12,height:12,background:SCHEDULE_BAR_COLOR.reserved_part_paid,borderRadius:2,marginRight:4}}/>Deposit in — balance still due at arrival</span>  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
+          {/* 10/24 (Nic): the one the desk acts on — "we don't take money at the
+              counter if they're paid in full." */}
+          <span><span style={{display:'inline-block',width:12,height:12,background:SCHEDULE_BAR_COLOR.reserved_paid_full,borderRadius:2,marginRight:4}}/>Paid in full — take no money at the counter</span>  // wire-ok: a schedule bar-kind key on a shared map, not a field off an API response
+          <span><span style={{display:'inline-block',width:12,height:12,background:'var(--green)',borderRadius:2,marginRight:4}}/>{BOOKING_STATUS_LABEL.checked_in}</span>  // wire-ok: a booking-status key on a shared map, not a field off an API response
+          {/* The two faded swatches read the same theme-aware fill the bars do,
+              so the strip can never drift from the board it explains. */}
+          <span><span style={{display:'inline-block',width:12,height:12,background:SCHEDULE_BAR_COLOR.checked_out,borderRadius:2,marginRight:4}}/>🔒 {BOOKING_STATUS_LABEL.checked_out}</span>  // wire-ok: a booking-status key on a shared map, not a field off an API response
+          <span><span style={{display:'inline-block',width:12,height:12,background:SCHEDULE_BAR_COLOR.no_show,borderRadius:2,marginRight:4}}/>🔒 {BOOKING_STATUS_LABEL.no_show}</span>  // wire-ok: a booking-status key on a shared map, not a field off an API response
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--gold)',borderRadius:2,opacity:.3,marginRight:4}}/>Today</span>
           <span><span style={{display:'inline-block',width:12,height:12,borderRadius:2,opacity:.6,marginRight:4,background:'repeating-linear-gradient(45deg, var(--red) 0 3px, transparent 3px 6px)'}}/>Out of order (faded = was out, now back)</span>
-          <span><span style={{display:'inline-block',width:8,height:8,borderRadius:'50%',background:'var(--amber)',marginRight:4,verticalAlign:'middle'}}/>Ack pending</span>
-          <span>· Double-click empty cell to book · Drag block to move · Drag an edge to extend/shorten</span>
+          <span><span style={{display:'inline-block',width:10,height:10,borderRadius:'50%',background:'var(--amber)',border:'2px solid var(--bg-1)',marginRight:4,verticalAlign:'middle'}}/>Ack pending</span>
+          {/* 10/24 (Nic): only appears when a park is nearly full, so the strip
+              explains it rather than leaving an unexplained ring on a bar. */}
+          <span><span style={{display:'inline-block',width:10,height:10,borderRadius:'50%',background:'transparent',border:'2px solid var(--bg-1)',boxShadow:'0 0 0 2px var(--amber, #d9a441)',marginRight:5,marginLeft:2,verticalAlign:'middle'}}/>Ask if they are staying</span>
+          {/* 10/18 (review): say where a locked bar's dates CAN be changed —
+              "keeps its dates" read as "nothing can change them," and a desk
+              with a wrong arrival day on a finished stay needs the one place
+              that still corrects it. */}
+          <span>· Double-click empty cell to book · Drag block to move · Drag an edge to extend/shorten · A 🔒 bar won't drag — open it and press Edit to correct its dates</span>
         </div>
         </div>
       )}
@@ -2229,13 +3099,14 @@ export function SchedulePage() {
               </div>
               <div>
                 <label style={{ display: 'block', fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Source</label>
+                {/* 10/17 (Nic): every door, not only the travel sites. This
+                    offered Direct and four booking sites, so a stay rung at the
+                    register, taken on the park's own booking site, or held by
+                    an emailed link showed in the list but could not be filtered
+                    for (BOOKING_SOURCES). */}
                 <select value={resvSource} onChange={e => setResvSource(e.target.value)} className="input">
                   <option value="">All</option>
-                  <option value="direct">Direct</option>
-                  <option value="airbnb">Airbnb</option>
-                  <option value="vrbo">VRBO</option>
-                  <option value="booking_com">Booking.com</option>
-                  <option value="other">Other</option>
+                  {BOOKING_SOURCES.map(s => <option key={s} value={s}>{BOOKING_SOURCE_LABEL[s]}</option>)}
                 </select>
               </div>
               <div>
@@ -2315,7 +3186,9 @@ export function SchedulePage() {
                       <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(b.totalAmount)}</td>
                       <td>
                         <span style={{ fontSize: '.72rem', color: 'var(--text-2)' }}>
-                          {humanize(b.source)}
+                          {/* The column is not constrained, so an imported
+                              stay can carry a word GAM does not know. */}
+                          {BOOKING_SOURCE_LABEL[b.source as BookingSource] ?? humanize(b.source)}
                         </span>
                       </td>
                       <td>
@@ -2484,9 +3357,20 @@ export function SchedulePage() {
                   </div>
                 </div>
 
-                <label className="form-label">Short-term lodging tax (% — applied to stays under 30 nights; 30+ is tax-exempt)</label>
-                <input className="input" type="number" min={0} max={100} value={bpCfg.shortTermTaxRate ?? 0}
-                  onChange={e => setBpCfg((c: any) => ({ ...c, shortTermTaxRate: e.target.value }))} style={{ marginBottom: 16, maxWidth: 140 }} />
+                <label className="form-label">Short-term lodging tax (applied to stays under 30 nights; 30+ is tax-exempt)</label>
+                {/* 10/17 (Nic, one home for a tax rate): this was an editable box, and it was
+                    the one that actually priced a stay — it sat at 6.35% for three weeks after
+                    the company's own tax list was changed to 6.6%. It is a figure now, not a
+                    box: it follows the tax ticked "charged on a stay here" in the register's
+                    Taxes screen, so the two can never disagree again. */}
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: '1.05rem', fontWeight: 600 }}>{Number(bpCfg.shortTermTaxRate ?? 0).toFixed(2)}%</div>
+                  <div style={{ fontSize: '.78rem', color: 'var(--text-3)', lineHeight: 1.5, maxWidth: 520 }}>
+                    {(bpCfg.shortTermTaxNames || []).length
+                      ? `From ${(bpCfg.shortTermTaxNames || []).join(' + ')} in your list of taxes. Change the rate there and every stay here is priced with it — the booking site, a pay link and the front desk.`
+                      : 'No tax is charged on stays here yet. Add one on the Taxes screen and tick "Charged on a stay here", and this figure follows it.'}
+                  </div>
+                </div>
 
                 <div style={{ borderTop: '1px solid var(--border-1)', margin: '6px 0 14px' }} />
                 <label className="form-label">Deposit for short stays (% of stay total — stays under 30 nights)</label>
@@ -2614,6 +3498,11 @@ export function SchedulePage() {
 
       {/* ── RESERVATION DETAIL ── click a bar to view */}
       {oooUnit && <OutOfOrderModal unit={oooUnit} onClose={() => setOooUnit(null)} />}
+      {leaveDateFor && (
+        <LeaseLeaveDateModal lease={leaveDateFor}
+          onClose={()=>setLeaveDateFor(null)}
+          onSaved={()=>{ setLeaveDateFor(null); setDetailBooking(null); qc.invalidateQueries('schedule'); qc.invalidateQueries('leases') }} />
+      )}
       {checkOutFor && (
         <EarlyCheckOutModal unitId={checkOutFor.unitId} bookingId={checkOutFor.bookingId}
           onClose={() => {
@@ -2667,7 +3556,7 @@ export function SchedulePage() {
         // (the mismatch warning below covers it if it no longer qualifies).
         const availIds = editAvailableUnits ? new Set((editAvailableUnits as any[]).filter((u:any)=>u.isBookable).map((u:any)=>u.id)) : null
         const unitOptions = units.filter((u:any)=> (availIds ? availIds.has(u.id) : u.isBookable) || u.id===editForm?.unitId)
-        const editReasons = isEditing ? rvMismatchReasons(editForm!.requiredSiteLayout, editForm!.requiredAmpService, eu) : []
+        const editReasons = isEditing ? rvMismatchReasons(editForm!.requiredSiteLayout, editForm!.requiredAmpService, eu, editForm!.rigLengthFt) : []
         return (
         <div className="modal-overlay" onClick={closeDetail}>
           <div className="modal" style={{maxWidth:440}} onClick={e=>e.stopPropagation()}>
@@ -2697,6 +3586,16 @@ export function SchedulePage() {
                         {RV_AMP_SERVICES.filter(a=>a!=='both').map(a=><option key={a} value={a}>{a==='none'?'No preference':RV_AMP_SERVICE_LABEL[a]}</option>)}
                       </select>
                     </div>
+                    <div>
+                      {/* 10/24 (Nic): correctable here, because a rig gets
+                          measured wrong at the counter and the number decides
+                          every later move the schedule may make for this stay. */}
+                      <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Rig length (feet)</div>
+                      <input className="form-input" type="number" min={1} max={MAX_RIG_LENGTH_FT} style={{width:'100%'}}
+                        placeholder="not given"
+                        value={editForm!.rigLengthFt ?? ''}
+                        onChange={e=>setEditForm(s=>s&&({...s,rigLengthFt: e.target.value===''?null:Number(e.target.value)}))} />
+                    </div>
                   </div>
                   {editReasons.length>0 && <div style={{fontSize:'.7rem',color:'var(--amber)'}}>⚠ Unit {eu?.unitNumber}: {editReasons.join('; ')}. You can still save.</div>}
                   <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Sites to avoid</div>
@@ -2708,7 +3607,7 @@ export function SchedulePage() {
                   <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Guest name</div><input className="form-input" style={{width:'100%'}} value={editForm!.guestName} onChange={e=>setEditForm(s=>s&&({...s,guestName:e.target.value}))} /></div>
                   <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
                     <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Email</div><input className="form-input" style={{width:'100%'}} value={editForm!.guestEmail} onChange={e=>setEditForm(s=>s&&({...s,guestEmail:e.target.value}))} /></div>
-                    <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" style={{width:'100%'}} value={editForm!.guestPhone} onChange={e=>setEditForm(s=>s&&({...s,guestPhone:e.target.value}))} /></div>
+                    <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" type="tel" style={{width:'100%'}} value={editForm!.guestPhone} onChange={e=>setEditForm(s=>s&&({...s,guestPhone:typingPhone(e.target.value)}))} /></div>
                   </div>
                   <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Notes</div><textarea className="form-input" style={{width:'100%',minHeight:54}} value={editForm!.notes} onChange={e=>setEditForm(s=>s&&({...s,notes:e.target.value}))} /></div>
                   {/* 10/6 (Nic): the stay's work trade — ticked, changed or taken off. */}
@@ -2764,7 +3663,84 @@ export function SchedulePage() {
                     )}
                   </div></>
                 )}
-                <div style={{color:'var(--text-3)'}}>Status</div><div>{isLease ? humanize(d.status) : bookingStatusWords(d.status)}</div>
+                <div style={{color:'var(--text-3)'}}>Status</div>
+                <div>
+                  {isLease ? humanize(d.status) : bookingStatusWords(d.status)}
+                  {/* 10/17 (Nic): "reservations are only locked in with deposits.
+                      still reserved without deposits but can be booted when space
+                      is limited by other paying people." The badge said
+                      "Tentative" and left the desk to infer the consequence; this
+                      is the consequence, in a sentence. Not a third status — the
+                      software already decides it by whether a deposit is paid. */}
+                  {!isLease && stayHoldWords(d.status as BookingStatus, !!d.depositPaidAt) && (
+                    <div style={{fontSize:'.74rem',color:d.depositPaidAt?'var(--text-3)':'var(--amber)',marginTop:2,lineHeight:1.45}}>
+                      {stayHoldWords(d.status as BookingStatus, !!d.depositPaidAt)}
+                    </div>
+                  )}
+                </div>
+                {/* 10/20 (Nic): WHY THIS STAY CANNOT BE MOVED, where the desk
+                    reads the stay. "They may have already gotten a confirmation
+                    on a space number. Our system with compression and expansion
+                    is going to kind of screw that up if they think they're
+                    locked to a specific site already." A lock with no reason on
+                    screen is a lock somebody unlocks to free up a space, and
+                    then a guest who was promised 14 arrives to find a rig on
+                    it. */}
+                {/* 10/20 (Nic, his own catch): and never a reason that lies.
+                    This read "Locked to RV 09 — Promised this space before GAM"
+                    after somebody dragged Dale off RV 14 — a sentence about a
+                    promise nobody made, with the one fact that mattered (the
+                    number in his hand is wrong now) nowhere on the screen.
+                    scheduleStayLockWords reads the reason the move itself
+                    wrote. */}
+                {!isLease && d.lockedToUnit && (
+                  <><div style={{color:'var(--text-3)'}}>Locked to {d.unitNumber}</div>
+                  <div data-testid="stay-lock-reason" style={{color:'var(--gold)',lineHeight:1.45}}>{scheduleStayLockWords(d.lockReason)}</div></>
+                )}
+                {/* Where this reservation came from, when it was not taken here.
+                    The guest has already been told, so GAM does not confirm
+                    them again (routes/bookings) — and the desk can see why no
+                    confirmation has gone out. */}
+                {!isLease && d.migratedDoor && (
+                  <><div style={{color:'var(--text-3)'}}>Came from</div>
+                  <div style={{lineHeight:1.45}}>
+                    {MIGRATED_DOOR_LABEL[d.migratedDoor] ?? 'Brought in from somewhere else'}
+                    {/* 10/20: what GAM has and has not sent this guest. This said
+                        GAM had not emailed them while the morning-of site reveal
+                        was emailing them a site number anyway; the reveal now
+                        reads the same fact this line reports (jobs/scheduler
+                        revealTodaysSites), so the two can no longer disagree. */}
+                    {d.confirmationSentAt ? (
+                      <div style={{fontSize:'.74rem',color:'var(--text-3)',marginTop:2}}>
+                        We emailed them their confirmation on{' '}
+                        {new Date(d.confirmationSentAt).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}
+                        {' '}— their site follows on the morning they arrive.
+                      </div>
+                    ) : (
+                      <div style={{fontSize:'.74rem',color:'var(--text-3)',marginTop:2}}>
+                        {d.toldOutsideGam ? 'Already told they have this reservation, so' : ''}
+                        GAM has emailed them nothing — not even their site on the morning
+                        they arrive — until somebody sends the confirmation.
+                      </div>
+                    )}
+                    {d.depositOffPlatformMethod && (
+                      <div style={{fontSize:'.74rem',color:'var(--text-3)',marginTop:2}}>
+                        Their deposit was paid outside GAM — written down here, never processed by us.
+                      </div>
+                    )}
+                  </div></>
+                )}
+                {/* 10/18 (Nic): the guest HAS been asked, so nobody asks them a
+                    fourth time — and the desk can see the ask went out even
+                    though the deposit has not landed. */}
+                {!isLease && d.depositLinkSentAt && !d.depositPaidAt && (
+                  <><div style={{color:'var(--text-3)'}}>Deposit link</div>
+                  {/* The desk's own clock, with the hour: a second press
+                      inside the hour never emails again, so "how long ago"
+                      is the thing they need to read (the same shape as the
+                      change-history rows above). */}
+                  <div>Emailed to {d.guestEmail || 'the guest'} · {new Date(d.depositLinkSentAt).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</div></>
+                )}
                 {/* 10/5 (Nic, R2): lease or stay — the desk's answer for a stay of 30+ nights. */}
                 {!isLease && (d.stayLeaseId || d.stayTerms) && (
                   <><div style={{color:'var(--text-3)'}}>Lease or stay</div>
@@ -2795,11 +3771,86 @@ export function SchedulePage() {
                 {d.notes && <><div style={{color:'var(--text-3)'}}>Notes</div><div>{d.notes}</div></>}
               </div>
               {isLease ? (
-                <div style={{marginTop:16,fontSize:'.78rem',color:'var(--text-3)'}}>Leases are managed on the Leases page.</div>
+                /* 10/22 (Nic): "I need to be able to just click on it on the
+                    reservation list and move to check them out. Clicking it only
+                    pulls up a view only page... That should kind of pull up the
+                    same menu on the leases."
+                    And the reason it matters, in his words: "people with a lease
+                    right now, it's blocked out indefinitely. But if somebody tells
+                    me with notice, hey, I'm going to be leaving in about 2 weeks,
+                    I should be able to edit that lease so that that spot can be
+                    freed up for reservations, especially if we're in a busy season
+                    with a tight window."
+                    Checking out is NOT rebuilt here. The register's Checkout tab
+                    already closes a lease (routes/pos due-out takes
+                    kind: 'stay' | 'lease') and it is the only place that reads the
+                    final meters, so this sends him there rather than growing a
+                    second way to do the same thing badly. */
+                <div style={{display:'flex',flexWrap:'wrap',gap:8,marginTop:18}}>
+                  <button className="btn btn-ghost btn-sm" onClick={()=>navigate(`/leases?open=${d.id}`)}>
+                    Open the lease
+                  </button>
+                  {can('leases.edit') && (
+                    <button className="btn btn-primary btn-sm" onClick={()=>setLeaveDateFor(d)}>
+                      {d.endDate ? 'Change the move-out date' : 'They gave notice'}
+                    </button>
+                  )}
+                  {can('guests.check_out') && (
+                    <button className="btn btn-primary btn-sm"
+                      onClick={()=>navigate(`/pos?tab=checkout&property=${d.propertyId || ''}`)}>
+                      Check out
+                    </button>
+                  )}
+                </div>
               ) : (
                 <div style={{display:'flex',flexWrap:'wrap',gap:8,marginTop:18}}>
                   {can('guest_access') && <button className="btn btn-ghost btn-sm" onClick={()=>copyStayLink(d)}>Copy stay link</button>}
-                  {can('schedule.edit_reservation') && d.status!=='cancelled' && <button className="btn btn-ghost btn-sm" onClick={()=>startEdit(d)}>Edit</button>}
+                  {/* 10/18 (Nic): "that reservation becomes locked as part of the
+                      history." Nic's words are about the dates not moving by
+                      ACCIDENT — "I can't change the dates accidentally" — and
+                      the bar itself delivers that now: a finished stay will not
+                      drag, carries no edge grips, and right-click opens its
+                      window instead of dropping into the date editor.
+                      10/18 (review): Edit STAYS on a finished stay, because it
+                      is the deliberate press and the only place its dates can be
+                      put right. A desk that typed Sep 30 for an Oct 1 arrival
+                      sold and priced six nights instead of five, and the
+                      check-out screen cannot fix that — it never asks for a date
+                      on a stay that has already checked out. The server treats
+                      this as a deliberate re-date, reprices the stay to the new
+                      length, and refuses it in words once a refund has gone out,
+                      so nothing moves money quietly behind it. */}
+                  {can('schedule.edit_reservation') && d.status!=='cancelled' && (
+                    <button className="btn btn-ghost btn-sm"
+                      title={isScheduleBarLocked(d)
+                        ? 'This stay is history, so its dates never move on the board. '
+                          + 'Change them here only to correct what was recorded — the stay is repriced to match.'
+                        : undefined}
+                      onClick={()=>startEdit(d)}>Edit</button>
+                  )}
+                  {/* 10/18 (Nic): "let's add a button so that we can collect
+                      deposits from people that haven't done it for their
+                      stays." Offered on exactly what the server will accept
+                      (@gam/shared stayDepositAsk: still holding its site,
+                      nobody's money on it, an email to send to), to whoever may
+                      take a reservation AND take payments — the same pair a
+                      shortened stay's charges ask for (10/14, Nic: "anyone who
+                      can schedule reservations and take payments"). */}
+                  {(can('schedule.create_reservation') || can('schedule.edit_reservation'))
+                    && (can('take_payment') || can('pos.ring_sale'))
+                    && stayDepositAsk(d) === 'ask' && (
+                    <button className="btn btn-primary btn-sm" disabled={askDepositMut.isLoading}
+                      /* 10/18 (review): "Show the deposit link" promised more
+                         than the button does — a link the guest's card declined
+                         on and the clerk closed is gone, and pressing it then
+                         sends a fresh one. "Ask again" is true either way. */
+                      title={d.depositLinkSentAt
+                        ? 'Shows the link already out for this reservation to read out, or sends a fresh one if that link was closed. The guest is never emailed twice within the hour.'
+                        : 'Email the guest a link for the deposit. Paid, it locks this reservation in so nobody can take the site.'}
+                      onClick={()=>askDepositMut.mutate(d)}>
+                      {askDepositMut.isLoading ? '…' : d.depositLinkSentAt ? 'Ask again' : 'Ask for the deposit'}
+                    </button>
+                  )}
                   {/* S559: front-desk check-in (guard prompts a closing read if the prior guest's meter is unread). */}
                   {can('guests.check_in') && ['tentative','confirmed'].includes(d.status) && (
                     <button className="btn btn-primary btn-sm" disabled={checkInMut.isLoading} onClick={()=>checkInMut.mutate(d)}>
@@ -2854,6 +3905,18 @@ export function SchedulePage() {
         </div>
         )
       })()}
+
+      {/* 10/20 (Nic): bringing in the old system's schedule, and the texted ones
+          after it. It sends nothing; the schedule simply refetches when it is
+          done so the new bars appear. */}
+      {importOpen && schedulePropertyId && (
+        <ReservationImportModal
+          propertyId={schedulePropertyId}
+          propertyName={schedulePropertyOptions.find((p: any) => p.id === schedulePropertyId)?.name || 'this park'}
+          onClose={() => setImportOpen(false)}
+          onDone={() => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); setImportOpen(false) }}
+        />
+      )}
 
       {cancelFor && (
         <CancelReservationModal booking={cancelFor}
@@ -2916,7 +3979,16 @@ export function SchedulePage() {
           a browser than anything else." No draft, no held site, no row. */}
       {newResvOpen && (() => {
         const validEmail = /.+@.+\..+/.test(newBooking.guestEmail.trim())
-        const hasContact = !!resvFirst.trim() && !!resvLast.trim() && validEmail && !!newBooking.guestPhone.trim()
+        // 10/17 (Nic) — A PHONE NUMBER WAS NEVER NEEDED TO EMAIL A LINK.
+        //
+        // This gate also demanded a phone number, so a desk taking a
+        // reservation over the phone from somebody who gives a name and an
+        // email met a gold button that did nothing — no toast, no refusal, just
+        // a dead button under a line of gray text. It is a third reason "I
+        // cannot get either option to do anything": the save never left the
+        // browser. The server asks for the email and nothing else (routes/units
+        // wantsDeposit), and this now asks for exactly what the server does.
+        const hasContact = !!resvFirst.trim() && !!resvLast.trim() && validEmail
         const offered = freeUnits.length ? freeUnits : heldUnpaidUnits
         const lastResort = freeUnits.length === 0 && heldUnpaidUnits.length > 0
         return (
@@ -2951,6 +4023,18 @@ export function SchedulePage() {
                     <select className="form-select" style={{width:'100%'}} value={resvAmp} onChange={e=>setResvAmp(e.target.value)}>
                       {RV_AMP_SERVICES.filter(a=>a!=='both').map(a=><option key={a} value={a}>{a==='none'?'Any service':RV_AMP_SERVICE_LABEL[a]}</option>)}
                     </select>
+                  </div>
+                  <div>
+                    {/* 10/24 (Nic): how long their rig is. Sites too short for it
+                        drop out of the list below, so the counter is never offered
+                        a pad the trailer does not fit on — and because the length
+                        is stored with the stay, the nightly compression will not
+                        move them onto one later either. */}
+                    <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:4}}>Rig length (optional)</div>
+                    <input className="form-input" type="number" min={1} max={MAX_RIG_LENGTH_FT}
+                      style={{width:'100%'}} placeholder="feet, e.g. 37"
+                      value={resvRig}
+                      onChange={e=>{ setResvRig(e.target.value); setPickedUnit(null) }} />
                   </div>
                 </div>
 
@@ -2990,11 +4074,14 @@ export function SchedulePage() {
                   <div style={{padding:'12px',background:'var(--bg-3)',borderRadius:8}}>
                     <div style={{fontSize:'.82rem',color:'var(--amber)',fontWeight:600,marginBottom:8}}>Nothing is free for those dates.</div>
                     <div style={{fontSize:'.76rem',color:'var(--text-3)',marginBottom:10}}>Take their details and put them on the waitlist — they get a 1-hour claim link the moment something opens.</div>
-                    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
-                      <input className="form-input" placeholder="First name" value={resvFirst} onChange={e=>setResvFirst(e.target.value)} />
-                      <input className="form-input" placeholder="Last name" value={resvLast} onChange={e=>setResvLast(e.target.value)} />
-                      <input className="form-input" type="email" placeholder="Email" value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} />
-                      <input className="form-input" placeholder="Phone" value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} />
+                    <div style={{marginBottom:10}}>
+                      <GuestFields
+                        propertyId={schedulePropertyId}
+                        first={resvFirst} last={resvLast}
+                        email={newBooking.guestEmail} phone={newBooking.guestPhone}
+                        setFirst={setResvFirst} setLast={setResvLast}
+                        setEmail={(v)=>setNewBooking(s=>({...s,guestEmail:v}))}
+                        setPhone={(v)=>setNewBooking(s=>({...s,guestPhone:v}))} />
                     </div>
                     {!validEmail
                       ? <div style={{fontSize:'.74rem',color:'var(--amber)'}}>An email address is where the claim link goes.</div>
@@ -3005,7 +4092,7 @@ export function SchedulePage() {
                 ) : (
                   <div style={{display:'grid',gap:8,maxHeight:280,overflowY:'auto'}}>
                     {offered.map((u:any)=>{
-                      const reasons = rvMismatchReasons(resvLayout, resvAmp, u)
+                      const reasons = rvMismatchReasons(resvLayout, resvAmp, u, resvRig)
                       const mismatch = reasons.length > 0
                       const facts = u.unitType==='rv_spot' ? rvSiteFactsLabel(u) : ''
                       const price = stayPriceForUnit(u)
@@ -3049,12 +4136,13 @@ export function SchedulePage() {
                 <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--gold)',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:8}}>
                   3 · Who is it for · {pickedUnit.unitNumber}
                 </div>
-                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-                  <input className="form-input" placeholder="First name" value={resvFirst} onChange={e=>setResvFirst(e.target.value)} />
-                  <input className="form-input" placeholder="Last name" value={resvLast} onChange={e=>setResvLast(e.target.value)} />
-                  <input className="form-input" type="email" placeholder="Email" value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} />
-                  <input className="form-input" placeholder="Phone" value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} />
-                </div>
+                <GuestFields
+                  propertyId={pickedUnit.propertyId || schedulePropertyId}
+                  first={resvFirst} last={resvLast}
+                  email={newBooking.guestEmail} phone={newBooking.guestPhone}
+                  setFirst={setResvFirst} setLast={setResvLast}
+                  setEmail={(v)=>setNewBooking(s=>({...s,guestEmail:v}))}
+                  setPhone={(v)=>setNewBooking(s=>({...s,guestPhone:v}))} />
 
                 {/* S652 (Nic): movable by default. The nightly compression can
                     shuffle this stay onto an equivalent site to close gaps —
@@ -3130,7 +4218,7 @@ export function SchedulePage() {
                           || !resvGuestName || createResvMut.isLoading
                           || (resvWorkTrade && (!resvWt.coveredCharges.length || !validEmail))}
                         onClick={async ()=>{
-                          const reasons = rvMismatchReasons(resvLayout, resvAmp, pickedUnit)
+                          const reasons = rvMismatchReasons(resvLayout, resvAmp, pickedUnit, resvRig)
                           if (reasons.length && !(await appConfirm(`${pickedUnit.unitNumber} doesn't match:\n· ${reasons.join('\n· ')}\n\nReserve it anyway?`, { confirmLabel: 'Reserve it' }))) return
                           setResvError(''); createResvMut.mutate(pickedUnit)
                         }}>
@@ -3142,7 +4230,7 @@ export function SchedulePage() {
                 {resvWorkTrade && !validEmail &&
                   <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A work trade is made for the guest's own account, so it needs their email.</div>}
                 {payMode==='link' && !hasContact && !(resvWorkTrade && resvWt.coveredCharges.includes('rent')) &&
-                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name, an email and a phone number — the email is where the deposit link goes.</div>}
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name and an email — the email is where the deposit link goes.</div>}
                 {payMode==='register' && !resvGuestName &&
                   <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:6}}>A name is enough when they are paying here.</div>}
                 {!(resvWorkTrade && resvWt.coveredCharges.includes('rent')) &&
@@ -3273,20 +4361,30 @@ export function SchedulePage() {
           ? stayNightsBetween(newBooking.checkIn, newBooking.checkOut)
           : 0
         const bkEmailValid = /.+@.+\..+/.test(newBooking.guestEmail.trim())
-        const bkReady = bkNights > 0 && !!bookFirst.trim() && !!bookLast.trim() && bkEmailValid && !!newBooking.guestPhone.trim()
+        // 10/17 (Nic): a name is enough for somebody standing at the desk — the
+        // same rule the New Reservation flow already uses. An emailed deposit
+        // link needs the email it goes to (the server will not send one
+        // without it, and used to confirm the stay silently instead).
+        // A phone number is not needed to email anybody a link, and demanding
+        // one here left the button dead with no explanation.
+        const bkReady = bkNights > 0 && !!bookFirst.trim() && !!bookLast.trim()
+          && (bookPayMode !== 'link' || bkEmailValid)
+        // 10/24 (Nic): the overlay has NO onClick — clicking anywhere outside
+        // this window does nothing at all. Confirm or abandon are the only ways
+        // out of a reservation half typed.
         return (
-        <div className="modal-overlay" onClick={closeBookModal}>
+        <div className="modal-overlay">
           <div className="modal" style={{maxWidth:480}} onClick={e=>e.stopPropagation()}>
             <div className="modal-header">
               <span className="modal-title">New Reservation — {bookingModal.unit?.unitNumber}</span>
-              <button className="btn btn-ghost btn-sm" onClick={closeBookModal}>✕</button>
+              <button className="btn btn-ghost btn-sm" onClick={askCloseBookModal}>✕</button>
             </div>
             <div style={{padding:'0 24px 24px',display:'grid',gap:12}}>
               <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>First name</div><input className="form-input" style={{width:'100%'}} value={bookFirst} onChange={e=>setBookFirst(e.target.value)} /></div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Last name</div><input className="form-input" style={{width:'100%'}} value={bookLast} onChange={e=>setBookLast(e.target.value)} /></div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Email</div><input className="form-input" type="email" style={{width:'100%'}} value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} /></div>
-                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" type="tel" style={{width:'100%'}} value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} /></div>
+                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" type="tel" style={{width:'100%'}} value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:typingPhone(e.target.value)}))} /></div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-in</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkIn} onChange={e=>setNewBooking(s=>({...s,checkIn:e.target.value}))} /></div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-out</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkOut} onChange={e=>setNewBooking(s=>({...s,checkOut:e.target.value}))} /></div>
               </div>
@@ -3304,9 +4402,47 @@ export function SchedulePage() {
                   </div>
                 )
               })()}
+              {/* 10/17 (Nic): the money, asked here instead of assumed. Three
+                  real outcomes, and the first is what this button has always
+                  done — so an answer has to be given for anything to be sent,
+                  and nothing changes for a desk that just wants it on the
+                  board. */}
+              <div style={{fontSize:'.75rem',color:'var(--text-3)'}}>The deposit</div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:6}}>
+                {([['none','Nothing to collect'],['link','Email a deposit link'],['register','Paying at the counter']] as const).map(([m,label])=>(
+                  <button key={m} onClick={()=>setBookPayMode(m)}
+                    style={{padding:'8px 4px',border:'1px solid '+(bookPayMode===m?'var(--gold)':'var(--border-1)'),
+                            background:bookPayMode===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',
+                            cursor:'pointer',fontSize:'.74rem',fontWeight:bookPayMode===m?700:400,
+                            color:bookPayMode===m?'var(--gold)':'var(--text-2)'}}>{label}</button>
+                ))}
+              </div>
+              {abandonAsk && (
+                <div style={{padding:'10px 12px',borderRadius:8,background:'rgba(245,158,11,.08)',
+                             border:'1px solid rgba(245,158,11,.3)',marginBottom:10}}>
+                  <div style={{fontSize:'.82rem',color:'var(--text-1)',lineHeight:1.5,marginBottom:10}}>
+                    Abandon this reservation? Nothing has been saved and nothing is held — what you have typed
+                    is lost and the site stays free.
+                  </div>
+                  <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+                    <button className="btn btn-ghost btn-sm" onClick={()=>setAbandonAsk(false)}>Keep editing</button>
+                    <button className="btn btn-primary btn-sm" onClick={closeBookModal}>Abandon it</button>
+                  </div>
+                </div>
+              )}
               <button className="btn btn-primary" onClick={()=>createBookingMut.mutate()} disabled={!bkReady||createBookingMut.isLoading}>
-                {createBookingMut.isLoading?'Creating...':'Create Reservation'}
+                {createBookingMut.isLoading ? (bookPayMode==='none'?'Creating...':'Holding the site…')
+                  : bookPayMode==='register' ? 'Hold it and send to the register'
+                  : bookPayMode==='link' ? 'Reserve and email the deposit link'
+                  : 'Create Reservation'}
               </button>
+              <div style={{fontSize:'.72rem',color:'var(--text-3)',lineHeight:1.5}}>
+                {bookPayMode==='register'
+                  ? 'The site comes off the board now and a ticket appears on the register. Ringing it up confirms this same reservation.'
+                  : bookPayMode==='link'
+                  ? 'The site is held for them with no deadline. If it is still unpaid when the park fills up, they get moved to another site — or told, if there is nothing else.'
+                  : 'Nothing is sent and nothing is asked for — the reservation is confirmed and the site is theirs. Use this when they are paying now, have already paid, or the site is not being sold.'}
+              </div>
             </div>
           </div>
         </div>
@@ -3346,6 +4482,76 @@ export function SchedulePage() {
                   )}
                 </>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 10/17 (Nic): the deposit link the reservation just produced. It is
+          emailed on its own, but the desk is usually still on the phone with
+          the person it was made for, so the URL is here to read out or paste
+          into a text. */}
+      {resvLink && (
+        <div className="modal-overlay" onClick={()=>setResvLink(null)}>
+          <div className="modal" style={{maxWidth:440}} onClick={e=>e.stopPropagation()}>
+            <div className="modal-header">
+              <span className="modal-title">
+                {resvLink.isDeposit === false ? 'A link is already out'
+                  : resvLink.emailFailed ? 'Deposit link made'
+                  : resvLink.emailedNow === false ? 'Deposit link'
+                  : 'Deposit link sent'}
+              </span>
+              <button className="btn btn-ghost btn-sm" onClick={()=>setResvLink(null)}>✕</button>
+            </div>
+            <div style={{padding:'0 20px 20px'}}>
+              <div style={{fontSize:'.82rem',color:'var(--text-2)',marginBottom:12,lineHeight:1.5}}>
+                {/* 10/18 (Nic): pressed a second time, the same link comes back
+                    and the guest is NOT emailed again — said plainly, or the
+                    desk thinks the first send failed and keeps pressing.
+                    10/18 (review): and what the link ASKS FOR is named, because
+                    a reservation can already have a link out for other money —
+                    the whole stay, a month added to it, the arrival-day balance
+                    — and reading one of those out as "the deposit" quotes the
+                    guest the wrong number. */}
+                {resvLink.isDeposit === false
+                  ? <>There is already a link out for this reservation{linkAsksFor(resvLink)}, so nothing was emailed. Read that one out, or close it on the Pay Links screen and ask again.</>
+                  : resvLink.emailFailed
+                    ? <>The link is made{linkAsksFor(resvLink)} and {resvLink.guest} can pay it, but we could not email it. Read it out or copy it below — or send it again from the Pay Links screen.</>
+                    : resvLink.emailedNow === false
+                      ? <>Already emailed to <b>{resvLink.emailedTo || 'the guest'}</b>, so we did not email again — this is the same link{linkAsksFor(resvLink)}. The site is held for {resvLink.guest} until they pay it.</>
+                      : resvLink.emailedTo
+                        ? <>Emailed to <b>{resvLink.emailedTo}</b>{linkAsksFor(resvLink)}. The site is held for {resvLink.guest} until they pay it.</>
+                        : <>The site is held for {resvLink.guest} until this is paid.</>}
+              </div>
+              {/* 10/24 (Nic) — NO LINK ON THE WINDOW THAT JUST MADE A BOOKING.
+                    "if the email didn't go through, like, how am I going to
+                     show them the link? If they were here, I would just send
+                     them the pay link or use the point of sale... the
+                     reservation just needs to be completed and move on. If they
+                     end up not getting the link, then we can access it from the
+                     reservation."
+                  The desk has just taken a booking and the next thing it does is
+                  the next guest. A URL to copy is only any use to somebody who
+                  went looking for it, and that door already exists: open the
+                  reservation and ask for the deposit again, which hands back the
+                  same link rather than emailing twice. So the link shows there
+                  and not here. */}
+              {!resvLink.justBooked && (
+                <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:10}}>
+                  <input readOnly value={resvLink.url}
+                    style={{flex:1,fontSize:'.72rem',padding:'6px 8px',background:'var(--bg-1)',border:'1px solid var(--border-1)',borderRadius:6,color:'var(--text-2)'}}
+                    onFocus={e=>e.currentTarget.select()} />
+                  <button className="btn btn-primary btn-sm" onClick={()=>{navigator.clipboard?.writeText(resvLink.url); toast('Link copied.')}}>Copy</button>
+                </div>
+              )}
+              <div style={{fontSize:'.72rem',color:'var(--text-3)',lineHeight:1.5}}>
+                {/* 10/18 (review): a deposit link never expires, but a link the
+                    register sent does — so this does not promise otherwise
+                    about a link handed back from there. */}
+                {resvLink.neverExpires === false
+                  ? <>This link was sent from the register, so it stops working on its own date — the Pay Links screen shows what is still out. Until it is paid, a guest who pays can take this site.</>
+                  : <>The link never expires. Until it is paid, a guest who pays can take this site — the reservation is only locked in once the deposit lands.</>}
+              </div>
             </div>
           </div>
         </div>
@@ -3459,11 +4665,26 @@ export function StayDatesFields({ checkIn, checkOut, onChange }: {
         <button type="button" className="btn btn-primary btn-sm" disabled={!checkIn} onClick={()=>add('week')}>Add a week</button>
         <button type="button" className="btn btn-primary btn-sm" disabled={!checkIn} onClick={()=>add('month')}>Add a month</button>
       </div>
-      {valid && (
-        <div data-testid="resv-nights" style={{fontSize:'.86rem',fontWeight:700,color:'var(--text-1)',marginTop:8}}>
-          {nights} night{nights===1?'':'s'} — leaving {leavingDayLabel(checkOut)}
-        </div>
-      )}
+      {/* 10/24 (Nic) — THE SPACE FOR THIS LINE IS ALWAYS THERE, EVEN EMPTY.
+            "the text that pops up under it saying 5 nights leaving Tuesday,
+             November, whatever, that resizes the window... If I have to add 2
+             days, I click add a day twice. I have to click once and then move
+             the mouse ever so slightly and click it again. And that just bugs
+             the shit out of me."
+          The line appears BELOW the buttons, so it never pushed them down — the
+          window grew, and a centred dialog that grows moves up by half of what
+          it gained, sliding the buttons out from under the pointer between two
+          clicks of Add a day. So the row keeps its height whether the line is
+          in it or not, and the window stops changing size.
+          The line itself is still absent until the dates make sense; only the
+          room it will take is reserved. */}
+      <div style={{marginTop:8,minHeight:'1.3rem'}}>
+        {valid && (
+          <div data-testid="resv-nights" style={{fontSize:'.86rem',fontWeight:700,color:'var(--text-1)'}}>
+            {nights} night{nights===1?'':'s'} — leaving {leavingDayLabel(checkOut)}
+          </div>
+        )}
+      </div>
     </>
   )
 }
@@ -3769,6 +4990,157 @@ function AddMonthModal({ booking, onClose, onDone }: {
           ))}
           {quote && !asking && (
             <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => send()}>{busy ? 'Adding…' : 'Add the month'}</button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+/**
+ * 10/22 (Nic) — THEY TOLD YOU THEY ARE LEAVING.
+ *
+ *   "people with a lease right now, it's blocked out indefinitely. But if
+ *    somebody tells me with notice, hey, I'm going to be leaving in about 2
+ *    weeks, I should be able to edit that lease so that that spot can be freed
+ *    up for reservations, especially if we're in a busy season with a tight
+ *    window."
+ *
+ * The whole value is the site becoming bookable from the day after they go. An
+ * open-ended lease paints across the board forever, so a busy-season week that
+ * is actually free reads as taken.
+ *
+ * It sets the END DATE and nothing else. It does not end the tenancy, move
+ * anybody out, settle any money or read a meter — the register's Checkout tab
+ * does all of that, and it is the only place that reads the final meters. This
+ * is a date on a lease, which is exactly what giving notice is.
+ */
+function LeaseLeaveDateModal({ lease, onClose, onSaved }: {
+  lease: any
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const existing = lease.endDate ? dayOnly(lease.endDate) : ''
+  const [date, setDate] = useState<string>(existing || '')
+  const [err, setErr] = useState('')
+  const start = lease.startDate ? dayOnly(lease.startDate) : null
+  const who = `${lease.firstName || ''} ${lease.lastName || ''}`.trim() || 'This resident'
+
+  const save = useMutation(
+    (endDate: string | null) => apiPatch(`/leases/${lease.id}`, { endDate }),
+    {
+      onSuccess: onSaved,
+      onError: (e: any) => setErr(e?.message || 'That did not save — try again in a moment.'),
+    })
+
+  const tooEarly = !!(date && start && date < start)
+
+  /* 10/22 (Nic) — WHAT THE MONEY DOES, SHOWN BEFORE ANYTHING IS SAVED.
+     "if they used more than half the month, we're not going to prorate them. We
+     would just either wash the electric or other utilities. And if they are
+     leaving before half the paid for time, then we could prorate a refund back
+     to their payment method on file."
+     Worked out for the day TYPED IN THIS BOX, not for today — which is the
+     whole point of being able to set a day that has already passed. */
+  const { data: money } = useQuery<any>(
+    ['departure-money', lease.id, date],
+    () => apiGet(`/leases/${lease.id}/departure-money?leftOn=${date}`),
+    { enabled: !!date && !tooEarly })
+
+  const adjust = useMutation(
+    () => apiPost(`/leases/${lease.id}/departure-money/adjust`, { leftOn: date }),
+    { onSuccess: onSaved, onError: (e: any) => setErr(e?.message || 'That did not save — try again.') })
+
+  const fmt = (n: number) => '$' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  /* Three shapes, and each says what will happen rather than naming a rule:
+     an unpaid month that can be re-priced here, a paid month with money to go
+     back, and the wash. */
+  /* 10/22 (Nic): the halfway point decides the WASH and nothing else — "that's
+     just one factor for the wash on electric, but that's not a factor for
+     whether or not there's a refund at all." So the figure to hand back is
+     shown whenever there IS one, including on a departure that washes. */
+  const canAdjust = money && money.which !== 'nothing' && money.unpaid > 0 && money.paid === 0
+  const owesThemMoney = money?.canRefund === true
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{maxWidth:460}} onClick={e=>e.stopPropagation()}>
+        <div className="modal-title">Last day · {who}</div>
+        <div style={{fontSize:'.82rem',color:'var(--text-3)',marginBottom:14}}>
+          The last day they are on site {lease.unitNumber ? `${lease.unitNumber}` : 'this site'}.
+          It opens for reservations the day after. A day that has already passed is fine —
+          somebody who drove out on Sunday is settled as Sunday.
+        </div>
+        <input type="date" className="form-input" value={date}
+          min={start || undefined}
+          onChange={e=>{ setDate(e.target.value); setErr('') }} />
+        {tooEarly && (
+          <div style={{color:'var(--amber)',fontSize:'.78rem',marginTop:8}}>
+            That is before they moved in{start ? ` on ${start}` : ''}.
+          </div>
+        )}
+        {money && money.which !== 'nothing' && !tooEarly && (
+          <div style={{marginTop:14,padding:'10px 12px',borderRadius:8,background:'var(--surface-2)',
+                       fontSize:'.8rem',lineHeight:1.5,color:'var(--text-2)'}}>
+            <div style={{color:'var(--text-1)',fontWeight:600,marginBottom:4}}>
+              {money.nightsUsed} of {money.daysInPeriod} nights used
+            </div>
+            {money.which === 'wash' ? (
+              <>
+                <div>{money.why}</div>
+                {money.canRefund && (
+                  <div style={{marginTop:6,color:'var(--gold)'}}>
+                    {fmt(money.refundDue)} can still go back to them if you want it to — a refund
+                    turns the wash off, so their final utility would bill as usual.
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <div>
+                  Their {money.nightsUsed} nights come to {fmt(money.worth)}
+                  {money.lodgingTax > 0 && <> plus {fmt(money.lodgingTax)} lodging tax — {fmt(money.repricedTotal)}</>}
+                  {money.plan && <> ({money.plan})</>}.
+                </div>
+                {owesThemMoney && (
+                  <div style={{marginTop:6,color:'var(--gold)'}}>
+                    {fmt(money.paid)} was paid, so {fmt(money.refundDue)} can go back to them —
+                    your call. Send it from their Payments page.
+                  </div>
+                )}
+                {money.paid > 0 && !owesThemMoney && money.whyNoRefund && (
+                  <div style={{marginTop:6}}>{money.whyNoRefund}</div>
+                )}
+                {canAdjust && (
+                  <div style={{marginTop:6}}>
+                    Their bill of {fmt(money.unpaid)} becomes {fmt(money.repricedTotal)},
+                    and the late fees on it come off.
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+        {err && <div style={{color:'var(--red)',fontSize:'.78rem',marginTop:8}}>{err}</div>}
+        <div style={{display:'flex',gap:8,justifyContent:'flex-end',marginTop:18,flexWrap:'wrap'}}>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
+          {existing && (
+            <button className="btn btn-ghost btn-sm" disabled={save.isLoading}
+              onClick={()=>save.mutate(null)}>
+              They are staying after all
+            </button>
+          )}
+          <button className="btn btn-primary btn-sm"
+            disabled={!date || tooEarly || save.isLoading}
+            onClick={()=>save.mutate(date)}>
+            {save.isLoading ? 'Saving…' : 'Save'}
+          </button>
+          {canAdjust && (
+            <button className="btn btn-primary btn-sm" disabled={adjust.isLoading || save.isLoading}
+              onClick={()=>{ save.mutate(date); adjust.mutate() }}>
+              {adjust.isLoading ? 'Adjusting…' : `Save and adjust the bill to ${fmt(money.repricedTotal)}`}
+            </button>
           )}
         </div>
       </div>

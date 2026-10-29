@@ -89,41 +89,14 @@ export function localDayOf(v: string | null | undefined): string | null {
 }
 
 /**
- * How on time one charge was, for the tenant page's timeliness window (W-25):
- * a paid charge by the day it settled against its due day; a charge still
- * open and past due by how long it has been overdue. Every other status says
- * what it is in words (a payment clearing is not late; a charge paid from the
- * deposit is paid) — never the raw status.
+ * decisions #29: how late, honoring the grace period (the server counts it).
+ * 10/12 (Nic): "'Days late' = days past the grace period everywhere", and the
+ * words say so. 0 → null: nothing to say.
  */
-export function chargeTimeliness(
-  p: { status: string; dueDate?: string | null; settledAt?: string | null },
-  today: string = localToday(),
-): { due: string | null; settled: string | null; late: number; label: string; tone: 'good' | 'warn' | 'bad' | 'info' | 'muted' } {
-  const due = calendarDay(p.dueDate)
-  const settled = p.status === 'settled' ? localDayOf(p.settledAt) : null
-  const days = (a: string, b: string) => Math.round((Date.UTC(+b.slice(0, 4), +b.slice(5, 7) - 1, +b.slice(8, 10))
-    - Date.UTC(+a.slice(0, 4), +a.slice(5, 7) - 1, +a.slice(8, 10))) / 86400000)
-  const word = PAYMENT_STATUS_LABEL[p.status as PaymentStatus] ?? 'Unknown'
-  if (p.status === 'settled' && due && settled) {
-    const late = Math.max(0, days(due, settled))
-    return late === 0
-      ? { due, settled, late, label: 'On time', tone: 'good' }
-      : { due, settled, late, label: `${late} day${late === 1 ? '' : 's'} late`, tone: late <= 7 ? 'warn' : 'bad' }
-  }
-  if (p.status === 'failed' || p.status === 'returned') return { due, settled, late: 0, label: word, tone: 'bad' }
-  if (p.status === 'processing') return { due, settled, late: 0, label: word, tone: 'info' }
-  if (p.status === 'pending' && due && due < today) {
-    const late = days(due, today)
-    return { due, settled, late, label: `${late} day${late === 1 ? '' : 's'} overdue`, tone: 'bad' }
-  }
-  return { due, settled, late: 0, label: word, tone: p.status === 'pending' ? 'warn' : 'muted' }
-}
-
-/** decisions #29: "N days late" honoring the grace period (the server counts it). 0 → null: nothing to say. */
 export function daysLateText(days: number | null | undefined): string | null {
   const n = Math.max(0, Math.floor(Number(days ?? 0)))
   if (n === 0) return null
-  return `${n} day${n === 1 ? '' : 's'} late`
+  return `${n} day${n === 1 ? '' : 's'} past grace`
 }
 
 // ─── The credit beside a balance ─────────────────────────────────────────────
@@ -433,6 +406,25 @@ export interface DeskQuoteRow {
   propertyName: string | null
 }
 
+/**
+ * 10/14 (Nic): one open bill — "the itemized lines of that invoice", paid
+ * together and whole ("each separate invoice is its own thing"). The desk
+ * picks the bills the money pays; nothing is picked for it.
+ */
+export interface DeskQuoteBill {
+  id: string
+  /** The space (lease) the bill is on. */
+  leaseId: string | null
+  unitNumber: string | null
+  dueDate: string
+  total: number
+  creditAlreadyApplied: number
+  owed: number
+  /** The older open bills of the same space: "October waits for September". */
+  olderBillIds: string[]
+  rows: DeskQuoteRow[]
+}
+
 /** A card payment of the household's waiting on its card's bank, as the desk quote carries it. */
 export interface AwaitingCardAtDesk {
   amount: number
@@ -484,7 +476,17 @@ export interface DeskQuote {
   anchorPaymentId: string
   anchorOpen: boolean
   paymentsPaused: boolean
+  /** What the desk takes now: the lines of the bills picked (10/14). */
   rows: DeskQuoteRow[]
+  /**
+   * 10/14 (Nic): every open bill the desk takes, oldest first — what the desk
+   * picks from (read with ?bills=). Absent: an older server (rows is everything).
+   */
+  bills?: DeskQuoteBill[]
+  /** The bills picked that are still open (null when none were named). */
+  pickedBillIds?: string[] | null
+  /** Why the pick cannot be recorded as it is ("pick the September bill too"), or null. */
+  pickRefusal?: string | null
   currentTotal: number
   oldBalance: DeskQuoteRow[]
   oldBalanceTotal: number
@@ -514,6 +516,13 @@ export interface DeskQuote {
    * fees still apply). Absent or false: pay in full.
    */
   partialPaymentsAllowed?: boolean
+  /**
+   * 10/26 (Nic): the landlord turned "let residents save credit for later" OFF
+   * at every property this credit would pay on, so there is no Use/Save
+   * question — the credit goes on the bill and the window says where it went.
+   * Absent or false: ask, as before.
+   */
+  creditMustBeUsed?: boolean
   /** 10/5 (Nic): read with ?depositedOn= — late fees charged after that day, off this bill when the deposit pays it in full. */
   lateFeesOffIfPaidInFull?: number
   /** 10/5: the same, bill by bill — a bill the deposit pays only in part keeps its own. */
@@ -551,8 +560,27 @@ export function onboardingLateFeeBoxApplies(
 export type CreditChoice = 'use' | 'save' | null
 
 /** Must the desk answer Use or Save before recording? Whenever any credit could pay part of this bill. */
-export function creditChoiceNeeded(q: Pick<DeskQuote, 'creditAvailable'>): boolean {
-  return toCents(q.creditAvailable) > 0
+export function creditChoiceNeeded(q: Pick<DeskQuote, 'creditAvailable' | 'creditMustBeUsed'>): boolean {
+  // 10/26 (Nic): where the landlord's answer is "use it", the desk is not
+  // asked. Credit still lands on the bill — see creditCoversBill, which is the
+  // question every figure depends on.
+  return toCents(q.creditAvailable) > 0 && q.creditMustBeUsed !== true
+}
+
+/**
+ * Whether the credit actually lands on this bill — true when the desk said Use,
+ * and true WITHOUT being asked where the landlord turned saving off.
+ *
+ * Kept separate from creditChoiceNeeded on purpose: "is there a question to
+ * ask" and "is the credit being spent" stopped being the same thing on 10/26,
+ * and collapsing them would show the desk the owed-if-SAVED figure while the
+ * server spent the credit.
+ */
+export function creditCoversBill(
+  q: Pick<DeskQuote, 'creditAvailable' | 'creditMustBeUsed'>, choice: CreditChoice,
+): boolean {
+  if (toCents(q.creditAvailable) <= 0) return false
+  return q.creditMustBeUsed === true || choice === 'use'
 }
 
 /**
@@ -562,9 +590,16 @@ export function creditChoiceNeeded(q: Pick<DeskQuote, 'creditAvailable'>): boole
  * longer matches the server's and the server refuses with a 409, so the payer
  * is asked again instead of having a different amount spent silently.
  */
-export function creditToUseFor(q: Pick<DeskQuote, 'creditAvailable'>, choice: CreditChoice, shownCents?: number | null): number | undefined {
-  if (!creditChoiceNeeded(q)) return undefined
-  if (choice === 'use') return toDollars(shownCents ?? toCents(q.creditAvailable))
+export function creditToUseFor(
+  q: Pick<DeskQuote, 'creditAvailable' | 'creditMustBeUsed'>, choice: CreditChoice, shownCents?: number | null,
+): number | undefined {
+  const usable = toCents(q.creditAvailable)
+  if (usable <= 0) return undefined
+  // 10/26: nobody was asked, so send the figure the window displayed. The
+  // server still refuses a figure that no longer matches, so a credit that
+  // moved while the window was open is asked about rather than spent silently.
+  if (q.creditMustBeUsed === true) return toDollars(shownCents ?? usable)
+  if (choice === 'use') return toDollars(shownCents ?? usable)
   if (choice === 'save') return 0
   return undefined
 }
@@ -602,8 +637,10 @@ export function figuresMovedMessage(before: DeskFigures, after: DeskFigures): st
 }
 
 /** Money owed now for the bill the desk takes, after the Use / Save answer. */
-export function deskOwedCents(q: Pick<DeskQuote, 'owedIfUsed' | 'owedIfSaved' | 'creditAvailable'>, choice: CreditChoice): number {
-  return choice === 'use' && creditChoiceNeeded(q) ? toCents(q.owedIfUsed) : toCents(q.owedIfSaved)
+export function deskOwedCents(
+  q: Pick<DeskQuote, 'owedIfUsed' | 'owedIfSaved' | 'creditAvailable' | 'creditMustBeUsed'>, choice: CreditChoice,
+): number {
+  return creditCoversBill(q, choice) ? toCents(q.owedIfUsed) : toCents(q.owedIfSaved)
 }
 
 /** What the old (carried-forward) balance still owes. */
@@ -612,9 +649,97 @@ export function oldBalanceOwedCents(q: Pick<DeskQuote, 'oldBalance'>): number {
 }
 
 /** The charge Record posts to: the one the window opened on while it is still open, else the oldest one the desk takes. */
-export function postAnchor(q: Pick<DeskQuote, 'anchorOpen' | 'anchorPaymentId' | 'rows' | 'oldBalance'>): string | null {
+export function postAnchor(q: Pick<DeskQuote, 'anchorOpen' | 'anchorPaymentId' | 'rows' | 'oldBalance'> & Pick<Partial<DeskQuote>, 'bills'>): string | null {
   if (q.anchorOpen) return q.anchorPaymentId
-  return q.rows[0]?.id ?? q.oldBalance[0]?.id ?? null
+  // 10/14: the anchor only says whose balance it is — any open bill will do.
+  return q.rows[0]?.id ?? q.oldBalance[0]?.id ?? q.bills?.[0]?.rows[0]?.id ?? null
+}
+
+// ─── THE OPEN BILLS, AS A STATEMENT ────────────────────────────────────────
+//
+// 10/14 (Nic) gave the desk a tick box per bill: "we also need to be able to
+// log each separate bill as one payment ... the only thing I wanted paid
+// together was the itemized lines of that invoice."
+//
+// 10/27 (Nic) took the boxes back out: "that checkbox beside each bill before
+// cash check or money order can turn on, that is something you decided.
+// That's not what I want at all. That's clunky. That adds an extra step to
+// things that just need to be smooth. Disable that checkbox. There's no reason
+// for it to exist." It had just stopped a resident's cash at the counter.
+//
+// So the desk takes the whole balance and the server lands it oldest bill
+// first — the platform's standing rule either way (10/15: "money gets applied
+// to the most outstanding balance first"). What is left here is the grouping
+// that made the bills readable; the choosing is gone, with it
+// canPickBill / togglePick / picksStillOpen / quoteMatchesPick.
+
+/** The open bills, by space, in the quote's order (oldest first). */
+export function billsBySpace(bills: readonly DeskQuoteBill[]): Array<{ key: string; label: string | null; bills: DeskQuoteBill[] }> {
+  const out: Array<{ key: string; label: string | null; bills: DeskQuoteBill[] }> = []
+  for (const b of bills) {
+    const key = b.leaseId ?? 'none'
+    let g = out.find(x => x.key === key)
+    if (!g) { g = { key, label: b.unitNumber ? `Space ${b.unitNumber}` : null, bills: [] }; out.push(g) }
+    g.bills.push(b)
+  }
+  return out
+}
+
+/**
+ * ── 10/27: THE AMOUNT SAYS WHICH BILLS IT PAYS ──────────────────────────────
+ *
+ * With the tick boxes gone, something still has to answer the question they
+ * answered: a household owing September and October hands over one month's
+ * rent — is that a part payment of their balance (refused where the property
+ * is pay-in-full) or payment in full of September (which is all 10/14's boxes
+ * ever did)?
+ *
+ * The amount answers it. Bills are paid oldest first, so money that comes to
+ * exactly the oldest bill, or the oldest two, or the oldest three, pays those
+ * bills WHOLE and leaves nothing half-paid — no rent part-collected, no
+ * eviction clock reset, which is what the pay-in-full rule protects. Anything
+ * else really is a part payment and the rule still refuses it.
+ *
+ * Returns the ids of the bills the amount clears whole, oldest first — empty
+ * when it clears none of them exactly. services/manualPaymentSettle applies
+ * the same rule server-side; this mirrors it so the window says yes to the
+ * same amounts the server will take.
+ */
+export function billsClearedByAmount(
+  bills: readonly Pick<DeskQuoteBill, 'id' | 'owed'>[] | null | undefined,
+  tenderedCents: number,
+): string[] {
+  if (!bills || bills.length === 0 || tenderedCents <= 0) return []
+  const ids: string[] = []
+  let run = 0
+  for (const b of bills) {
+    run += toCents(b.owed)
+    ids.push(b.id)
+    if (run === tenderedCents) return ids
+    if (run > tenderedCents) return []
+  }
+  return []
+}
+
+/**
+ * The amounts that DO pay whole bills, oldest first — what the desk can be
+ * told when the amount handed over clears none of them: "$457.07 pays the
+ * September bill, $902.29 pays the first two, $1,272.42 pays all of it."
+ * Every running total, smallest first, the full balance last.
+ */
+export function wholeBillAmountsCents(
+  bills: readonly Pick<DeskQuoteBill, 'owed'>[] | null | undefined,
+): number[] {
+  if (!bills || bills.length === 0) return []
+  const out: number[] = []
+  let run = 0
+  for (const b of bills) { run += toCents(b.owed); out.push(run) }
+  return out
+}
+
+/** "September bill" — a bill by its month, for the list of bills. */
+export function pickBillName(b: Pick<DeskQuoteBill, 'dueDate'>): string {
+  return billName(b.dueDate, 'bill')
 }
 
 const METHOD_WORD: Record<ManualPaymentMethod, string> = MANUAL_PAYMENT_METHOD_WORD
@@ -889,6 +1014,24 @@ export function partialPlan(q: DeskQuote, choice: CreditChoice, tenderedC: numbe
 }
 
 /**
+ * What to add to a "that is short" refusal where whole bills WOULD be taken:
+ * the amounts that pay the oldest bill, the oldest two, and so on. Empty when
+ * there is only one bill (the owed figure already says it), or when credit is
+ * being spent (the bills' own figures are not what is owed then).
+ */
+function wholeBillAmountsText(q: DeskQuote, creditUsedCents: number): string {
+  if (creditUsedCents > 0) return ''
+  const bills = q.bills ?? []
+  if (bills.length < 2) return ''
+  const runs = wholeBillAmountsCents(bills)
+  const words = runs.map((c, i) => `${money(toDollars(c))} pays ${
+    i === 0 ? `the ${pickBillName(bills[0])}`
+    : i === runs.length - 1 ? 'all of it'
+    : `the oldest ${i + 1} bills`}`)
+  return ` Whole bills can be taken: ${words.join('; ')}.`
+}
+
+/**
  * THE DESK'S QUESTIONS, ASKED BEFORE RECORD (services/manualPaymentSettle is
  * the authority; this mirrors it so the window asks instead of being refused):
  *   - Use or Save, whenever credit could pay part of the bill (Nic, 10/2);
@@ -905,7 +1048,7 @@ export function partialPlan(q: DeskQuote, choice: CreditChoice, tenderedC: numbe
 export function planTender(q: DeskQuote, input: TenderInput): TenderPlan {
   const isCash = input.method === 'cash'
   const usableC = toCents(q.creditAvailable)
-  const creditUsedC = input.choice === 'use' && usableC > 0 ? usableC : 0
+  const creditUsedC = creditCoversBill(q, input.choice) ? usableC : 0
   const owedC = deskOwedCents(q, input.choice)
   const oldOwedC = oldBalanceOwedCents(q)
   const hasRows = (q.rows ?? []).length > 0
@@ -925,7 +1068,9 @@ export function planTender(q: DeskQuote, input: TenderInput): TenderPlan {
     return stop('credit_moved', figuresMovedMessage(
       { ...deskFigures(q), credit: input.answeredCreditCents }, deskFigures(q)))
   }
-  if (usableC > 0 && input.choice === null) {
+  // 10/26: only asked where the landlord allows saving; otherwise the credit
+  // is already on the bill and the window states it.
+  if (creditChoiceNeeded(q) && input.choice === null) {
     return stop('choose_credit',
       `They have ${money(toDollars(usableC))} of credit that can pay part of this bill. Choose Use or Save first.`)
   }
@@ -933,9 +1078,16 @@ export function planTender(q: DeskQuote, input: TenderInput): TenderPlan {
   // 10/6 (Nic): the credit goes on the bill even when it pays only part of it
   // and nothing is handed over — the pay-in-full rule is about their own money.
   const creditOnlyPart = tenderedC === 0 && creditUsedC > 0 && tenderedC < owedC
-  if (tenderedC < owedC && !q.partialPaymentsAllowed && !creditOnlyPart) {
+  // 10/27: money that comes to exactly the oldest bill, or the oldest few,
+  // pays those bills whole — not a part payment (billsClearedByAmount). Only
+  // where no credit is being spent: with credit on the bill the amount owed is
+  // no longer the bills' own figures, so the old rule stands and the desk is
+  // asked for the lot.
+  const clearsWholeBills = creditUsedC === 0 && billsClearedByAmount(q.bills, tenderedC).length > 0
+  if (tenderedC < owedC && !q.partialPaymentsAllowed && !creditOnlyPart && !clearsWholeBills) {
     return stop('short',
-      `That is ${money(toDollars(owedC - tenderedC))} short — ${money(toDollars(tenderedC))} against ${money(toDollars(owedC))} owed. Rent is paid in full.`)
+      `That is ${money(toDollars(owedC - tenderedC))} short — ${money(toDollars(tenderedC))} against ${money(toDollars(owedC))} owed. Rent is paid in full.`
+      + wholeBillAmountsText(q, creditUsedC))
   }
   // 10/5 (Nic): the property takes part payments — "there's really no way to
   // stop somebody from going into the bank and making a partial".
@@ -1127,6 +1279,13 @@ export interface ReaderQuote extends ReaderFigures {
   outstanding: number
   usableCredit: number
   needsCreditChoice: boolean
+  /**
+   * 10/26 (Nic): the property turned "let residents save credit for later"
+   * OFF, so the reader is not asked either — the credit is on the bill and the
+   * block states it. The server already applied it when working this quote out,
+   * so needsCreditChoice comes back false alongside this.
+   */
+  creditMustBeUsed?: boolean
   useCredit: boolean
   creditUsed: number
   creditApplied: number
@@ -1139,9 +1298,17 @@ export interface ReaderQuote extends ReaderFigures {
 }
 
 /** What a reader quote, charge and show are told: the Use/Save answer with the figure shown, and any old-balance amount. */
-export function readerChoiceParams(usableCredit: number, choice: CreditChoice, towardOldCents: number | null): Record<string, unknown> {
+export function readerChoiceParams(
+  usableCredit: number, choice: CreditChoice, towardOldCents: number | null, mustUse = false,
+): Record<string, unknown> {
   const out: Record<string, unknown> = {}
-  if (toCents(usableCredit) > 0 && choice !== null) {
+  // 10/26: nobody is asked where saving is off, but the figure still goes with
+  // the charge so a credit that moved since the quote is refused rather than a
+  // different amount spent quietly.
+  if (toCents(usableCredit) > 0 && mustUse && choice === null) {
+    out.useCredit = true
+    out.expectedCredit = toDollars(toCents(usableCredit))
+  } else if (toCents(usableCredit) > 0 && choice !== null) {
     out.useCredit = choice === 'use'
     out.expectedCredit = toDollars(toCents(usableCredit))
   }
@@ -1166,7 +1333,11 @@ export function readerReady(
   choice: CreditChoice,
 ): { ready: boolean; reason: string | null } {
   if (!q) return { ready: false, reason: null }
-  if (toCents(q.usableCredit) > 0 && choice === null) {
+  // 10/26 (Nic): where the landlord turned saving off there is no question to
+  // put, so the reader is ready without one — asking would hold the payment on
+  // an answer the server has already made.
+  const mustUse = (q as Partial<ReaderQuote>).creditMustBeUsed === true
+  if (toCents(q.usableCredit) > 0 && choice === null && !mustUse) {
     return { ready: false, reason: `Ask whether to use their ${money(q.usableCredit)} credit or save it, before sending the amount to the reader.` }
   }
   if (!(toCents(q.total) > 0)) {
@@ -1196,12 +1367,15 @@ export interface ReaderSpace { leaseId: string; anchorId: string; unitNumber: st
  * other space keeps its name.
  */
 export function readerLeases(
-  q: Pick<DeskQuote, 'rows' | 'oldBalance'>,
+  q: Pick<DeskQuote, 'rows' | 'oldBalance'> & Pick<Partial<DeskQuote>, 'bills'>,
   taken: readonly ReaderSpace[] = [],
 ): Array<ReaderSpace & { label: string | null }> {
   const seen = new Map<string, ReaderSpace>()
   for (const s of taken) if (s?.leaseId && !seen.has(s.leaseId)) seen.set(s.leaseId, s)
-  for (const r of [...(q.rows ?? []), ...(q.oldBalance ?? [])]) {
+  // 10/14: the reader takes a space at a time on its own quote — every open
+  // bill's space, whatever is ticked for cash.
+  const open = q.bills ? q.bills.flatMap(b => b.rows) : (q.rows ?? [])
+  for (const r of [...open, ...(q.oldBalance ?? [])]) {
     if (!r.leaseId || seen.has(r.leaseId)) continue
     seen.set(r.leaseId, { leaseId: r.leaseId, anchorId: r.id, unitNumber: r.unitNumber ?? null })
   }
@@ -1285,39 +1459,27 @@ export function tenantCreditHeadline(c: TenantCredit | null | undefined): string
 /** The one sentence on how credit is used, everywhere a landlord reads about it (decisions, 10/2). */
 export const CREDIT_USE_RULE =
   // 10/6 (Nic): "a credit against the entire balance", not line by line.
-  'Money they paid ahead goes on their balance by itself, oldest bill first — on part of a bill when it cannot pay all of it. '
-  + 'Credit you give them is offered when they pay ("Use" or "Save it for later") and pays a bill by itself only when it covers that whole bill.'
+  'Money they paid ahead goes on their balance by itself, oldest bill first — on part of a bill when it cannot pay all of it, '
+  // 10/18 (Nic): "it does need to go on the October bill for the other spot" —
+  // but only for credit YOU give. Money they paid ahead stays with the space
+  // they paid it for.
+  + 'and only on the space they paid it for. '
+  // 10/15 (Nic): "money gets applied to the most outstanding balance first" —
+  // credit you give goes on the balance the same way, so none of it sits there
+  // while they owe. Only what is over the whole balance waits for a next bill.
+  + 'Credit you give them goes on their oldest bill first across every space they hold with you, '
+  + 'so credit never sits on an account while they still owe.'
+
+/**
+ * Why part of the credit on an account cannot pay what is owed right now.
+ * 10/18: a credit you gave is no longer one of the reasons — it crosses spaces
+ * by due date now — so the line names the two kinds of money that do stay put.
+ */
+export const CREDIT_REST_NOT_USABLE =
+  ' The rest cannot pay these bills: money they paid ahead stops at its monthly limit and pays only the space they paid it for, '
+  + 'interest on a deposit pays only that space, and credit pays only your own rent, utilities, late fees and fees.'
 
 // ─── The Payments ledger (decisions #26, #29, #35.1, #36.A) ──────────────────
-
-const LINE_ITEMS_KEY = 'gam.payments.showLineItems'
-
-export interface FlagStore { getItem(k: string): string | null; setItem(k: string, v: string): void }
-
-function browserStore(): FlagStore | null {
-  try {
-    return typeof window !== 'undefined' && window.localStorage ? window.localStorage : null
-  } catch {
-    return null
-  }
-}
-
-/** decisions #26: "each person's choice is remembered" — per signed-in person, on this device (there is no server preference). Off by default. */
-export function readShowLineItems(userId: string | null | undefined, store: FlagStore | null = browserStore()): boolean {
-  try {
-    return store?.getItem(`${LINE_ITEMS_KEY}.${userId ?? 'anyone'}`) === '1'
-  } catch {
-    return false
-  }
-}
-
-export function writeShowLineItems(userId: string | null | undefined, on: boolean, store: FlagStore | null = browserStore()): void {
-  try {
-    store?.setItem(`${LINE_ITEMS_KEY}.${userId ?? 'anyone'}`, on ? '1' : '0')
-  } catch {
-    /* blocked storage: the toggle still works for this visit */
-  }
-}
 
 export interface LedgerPayment {
   id: string
@@ -1325,7 +1487,8 @@ export interface LedgerPayment {
   unitNumber: string | null
   propertyName: string | null
   paidOn: string
-  owed: number
+  /** 10/12: what this payment put toward the month's bills (money plus credit) — never "owed". */
+  applied: number
   amount: number
   creditApplied: number
   returned: number
@@ -1437,17 +1600,4 @@ export async function readChargesById<T extends { id: string }>(
     if (got.length < pageSize) return { rows, complete: true }
   }
   return { rows, complete: missing.size === 0 }
-}
-
-/** Search the ledger by who, where, or what it paid for. */
-export function ledgerMatches(p: Pick<LedgerPayment, 'name' | 'unitNumber' | 'propertyName' | 'paidFor'>, q: string): boolean {
-  const s = q.trim().toLowerCase()
-  if (!s) return true
-  return [p.name, p.unitNumber, p.propertyName, p.paidFor].some(v => String(v ?? '').toLowerCase().includes(s))
-}
-
-/** The current month's pointer (decisions #29): a count, never dollars. Null when there is nothing to say. */
-export function stillOweLine(n: number | null | undefined): string | null {
-  if (n == null || !(n > 0)) return null
-  return `${n} household${n === 1 ? '' : 's'} still owe${n === 1 ? 's' : ''} — see Outstanding Balances`
 }

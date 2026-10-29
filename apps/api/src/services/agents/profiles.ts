@@ -27,6 +27,19 @@ import type { AgentProfile } from './types'
  * Every rule Nic gave is still here; the incident narratives that explained
  * WHY each rule exists live in git history (see the S630/S629/S628 commits),
  * not in the prompt the model reads on every turn.
+ *
+ * 10/20 (Nic): "There should be no state law warnings anywhere in the system.
+ * At least not right now. Just hide all that stuff." The law-questions rule
+ * below used to LICENSE that warning in the prompt itself: it permitted "the
+ * $100/day fee is above the $5/day figure in the statute" and held that
+ * sentence up as the example to copy -- the same sentence that was coming off
+ * every page. Hiding the banners in code and leaving the license in the prose
+ * would have moved the warning from the page into the chat, because the figure
+ * is not remembered: it arrives inside the statute text the retrieval tools
+ * still return, so the companion rule (never cite a statute from memory) never
+ * blocked it. The rule now forbids the comparison outright and keeps the
+ * retrieval. An agent hands over what the statute says and leaves the reading
+ * of it to the person and their attorney.
  */
 const BASE_GUARDRAILS = `
 Core rules you must always follow:
@@ -56,7 +69,7 @@ Hard stops — call your escalation tool in the same reply, don't try to handle 
   • a request to move, refund or adjust money ("refund me" escalates before you investigate; you may look up payments for context but never promise the outcome). Explaining what something costs is NOT a hard stop — answer it.
   • changing permissions, access or account security.
   • a legal dispute or intent to take legal action.
-Law questions (information, not disputes): GAM gives legal information, not legal advice or interpretation. Use the law tools, never cite a statute from memory. You may state an objective mismatch a tool returns ("the $100/day fee is above the $5/day figure in the statute"), never judge enforceability or tell them what to do, and always say the law may have changed and to consult a licensed attorney in their state. If GAM has no statute on file for that state, say so and point them to the state legislature's site.
+Law questions (information, not disputes): GAM gives legal information, not legal advice, interpretation or comparison. Use the law tools, never cite a statute from memory. NEVER MEASURE THEIR NUMBER AGAINST THE LAW: not "that is over the figure", not "that is within it", not a hint either way, even when the statute text you just pulled holds the figure and theirs is plainly bigger. Give them what the statute says, tell them GAM does not read it for them, and that the law may have changed, so a licensed attorney in their state is who tells them where they stand. If GAM has no statute on file for that state, say so and point them to the state legislature's site.
 - Stay within your scope; hand up what you can't see or do.
 
 VAGUE OR PARTIAL
@@ -177,6 +190,37 @@ function composePrompt(roleBlock: string, extra?: string): string {
   return `${roleBlock.trim()}${mid}\n\n${BASE_GUARDRAILS}`
 }
 
+/**
+ * The law tools every tenant and landlord profile holds.
+ *
+ * One list, because all four carry the same set -- and because 10/20 took one
+ * away from all four at once.
+ *
+ * check_against_law is NOT in it. Nic: "There should be no state law warnings
+ * anywhere in the system. At least not right now. Just hide all that stuff."
+ * That tool's whole answer IS a warning -- a verdict on someone's number
+ * against a statute -- and it refuses every call while the switch in
+ * services/stateLaw is off. But a tool the model can see is a tool the model
+ * offers: it reads the description ("compare a 2-month deposit against the
+ * state statute"), promises the check in the same breath, calls it, and gets a
+ * refusal. That is the offer-then-retract these guardrails forbid, and it
+ * spends roughly 90 tokens of description on every turn for an answer that
+ * cannot change ([[gam-agent-prompt-length-cliff]]). Hidden means not offered,
+ * not offered-then-withdrawn.
+ *
+ * Statute RETRIEVAL stays, and it is the four below: what a state's act says,
+ * the verbatim section text, real-estate law, the property-tax facts. Someone
+ * who asks what the law says still gets it. GAM just does not weigh their
+ * number against it.
+ *
+ * TO BRING IT BACK: flip system_features.state_law_warnings_enabled AND put
+ * 'check_against_law' back in this list. The flag alone restores the banners
+ * the routes compute; what the model is told it can do is decided here.
+ */
+const LAW_TOOLS = [
+  'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts',
+] as const
+
 const TENANT_ENTRY: AgentProfile = {
   id: 'tenant_entry',
   agentType: 'customer_service',
@@ -205,7 +249,7 @@ const TENANT_ENTRY: AgentProfile = {
     'request_early_termination', 'cancel_early_termination',
     'cancel_my_amenity_reservation', 'withdraw_deposit_report',
     'respond_to_landlord_interest', 'reapply_after_denial', 'record_hardship_context',
-    'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
+    ...LAW_TOOLS, 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
   name: 'Ava',
   label: 'Tenant — Entry',
@@ -255,7 +299,7 @@ const TENANT_ESCALATION: AgentProfile = {
     'request_early_termination', 'cancel_early_termination',
     'cancel_my_amenity_reservation', 'withdraw_deposit_report',
     'respond_to_landlord_interest', 'reapply_after_denial', 'record_hardship_context',
-    'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
+    ...LAW_TOOLS, 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
   name: 'Samantha',
   label: 'Tenant — Escalation',
@@ -306,7 +350,7 @@ const LANDLORD_ENTRY: AgentProfile = {
     'update_book_transaction', 'reconcile_book_transaction', 'add_ledger_account',
     'update_ledger_account', 'retire_ledger_account', 'seed_chart_of_accounts',
     'post_journal_entry', 'void_journal_entry', 'add_employee', 'update_employee',
-    'add_contractor', 'update_contractor', 'approve_payroll_run', 'void_payroll_run',
+    'approve_payroll_run', 'void_payroll_run',   // 10/12: contractors are vendors (add_vendor)
     // S628: charging and forgiving, and the maintenance side of the business.
     // S630 DIRECTIVE (Nic): MONEY ON A TENANT'S ACCOUNT IS THE LANDLORD'S OWN
     // ACT. "The assistant cannot waive the late fee. The landlord has to waive
@@ -319,7 +363,11 @@ const LANDLORD_ENTRY: AgentProfile = {
     // charge) and where to do it; it does not raise, credit or void money.
     // add_one_off_charge / cancel_one_off_charge / issue_tenant_credit /
     // void_tenant_credit are DELIBERATELY ABSENT.
-    'clock_in', 'clock_out', 'create_daily_task', 'complete_daily_task', 'add_inventory_item',
+    // 10/20 (Nic): create_daily_task / complete_daily_task are GONE — the old
+    // landlord-wide Tasks tab they wrote to is retired, its open lines folded onto
+    // the parks they belong to, and the park's own list is not an agent's to write
+    // (see portalActions.ts and actionGap's DELIBERATE).
+    'clock_in', 'clock_out', 'add_inventory_item',
     'update_inventory_item', 'remove_inventory_item', 'request_purchase',
     'approve_purchase_request', 'deny_purchase_request', 'schedule_recurring_maintenance',
     'complete_scheduled_maintenance',
@@ -377,7 +425,7 @@ const LANDLORD_ENTRY: AgentProfile = {
     'create_unit_booking', 'update_unit_booking', 'send_guest_access', 'revoke_guest_access',
     'acknowledge_booking_rules', 'resolve_pending_tenant', 'reach_out_to_applicant',
     'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
-    'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
+    ...LAW_TOOLS, 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
   name: 'David',
   label: 'Landlord — Entry',
@@ -424,7 +472,7 @@ const LANDLORD_ESCALATION: AgentProfile = {
     'update_book_transaction', 'reconcile_book_transaction', 'add_ledger_account',
     'update_ledger_account', 'retire_ledger_account', 'seed_chart_of_accounts',
     'post_journal_entry', 'void_journal_entry', 'add_employee', 'update_employee',
-    'add_contractor', 'update_contractor', 'approve_payroll_run', 'void_payroll_run',
+    'approve_payroll_run', 'void_payroll_run',   // 10/12: contractors are vendors (add_vendor)
     // S628: charging and forgiving, and the maintenance side of the business.
     // S630 DIRECTIVE (Nic): MONEY ON A TENANT'S ACCOUNT IS THE LANDLORD'S OWN
     // ACT. "The assistant cannot waive the late fee. The landlord has to waive
@@ -437,7 +485,11 @@ const LANDLORD_ESCALATION: AgentProfile = {
     // charge) and where to do it; it does not raise, credit or void money.
     // add_one_off_charge / cancel_one_off_charge / issue_tenant_credit /
     // void_tenant_credit are DELIBERATELY ABSENT.
-    'clock_in', 'clock_out', 'create_daily_task', 'complete_daily_task', 'add_inventory_item',
+    // 10/20 (Nic): create_daily_task / complete_daily_task are GONE — the old
+    // landlord-wide Tasks tab they wrote to is retired, its open lines folded onto
+    // the parks they belong to, and the park's own list is not an agent's to write
+    // (see portalActions.ts and actionGap's DELIBERATE).
+    'clock_in', 'clock_out', 'add_inventory_item',
     'update_inventory_item', 'remove_inventory_item', 'request_purchase',
     'approve_purchase_request', 'deny_purchase_request', 'schedule_recurring_maintenance',
     'complete_scheduled_maintenance',
@@ -495,7 +547,7 @@ const LANDLORD_ESCALATION: AgentProfile = {
     'create_unit_booking', 'update_unit_booking', 'send_guest_access', 'revoke_guest_access',
     'acknowledge_booking_rules', 'resolve_pending_tenant', 'reach_out_to_applicant',
     'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
-    'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
+    ...LAW_TOOLS, 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
   name: 'Sonny',
   label: 'Landlord — Escalation',

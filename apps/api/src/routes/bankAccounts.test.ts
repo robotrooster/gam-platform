@@ -3,7 +3,7 @@
  *
  * Covered routes (4):
  *   - GET   /api/bank-accounts
- *   - POST  /api/bank-accounts
+ *   - POST  /api/bank-accounts   (10/12: refuses every new entry)
  *   - PATCH /api/bank-accounts/:id
  *   - POST  /api/bank-accounts/:id/archive
  *
@@ -131,6 +131,11 @@ describe('GET /api/bank-accounts', () => {
 // ─── POST /api/bank-accounts ───────────────────────────────
 
 describe('POST /api/bank-accounts', () => {
+  // 10/12 (Nic): "Remove the old form." This catalog never set up a payout
+  // (rent pays out only through Stripe Connect) and never reached Stripe, so
+  // a bank typed in here got no verification and no microdeposits — Country
+  // Acres waited on exactly that. Every new entry is refused with where
+  // payouts ARE set up, whatever the body, and nothing is written.
   const happyPayload = () => ({
     nickname: 'Main Operating',
     accountHolderName: 'Acme LLC',
@@ -140,116 +145,47 @@ describe('POST /api/bank-accounts', () => {
     accountNumber: '1234567890',
   })
 
-  it('happy: 201 with last4 + no encrypted payload returned', async () => {
+  it('refuses a complete, valid entry by naming Bank setup — no row written', async () => {
     const f = await seed()
     const res = await request(buildApp()).post('/api/bank-accounts')
       .set('Authorization', `Bearer ${f.userATok}`)
       .send(happyPayload())
-    expect(res.status).toBe(201)
-    expect(res.body.data.account_number_last4).toBe('7890')
-    expect(res.body.data).not.toHaveProperty('account_number_encrypted')
-    expect(res.body.data.routing_number).toBe(VALID_ROUTING)
-    // DB row has the encrypted blob.
-    const { rows: [row] } = await db.query<any>(
-      `SELECT account_number_encrypted FROM user_bank_accounts WHERE id=$1`,
-      [res.body.data.id])
-    expect(row.account_number_encrypted).toBeTruthy()
-    expect(row.account_number_encrypted).not.toBe('1234567890')
+    expect(res.status).toBe(410)
+    expect(res.body.error).toBe('Payouts are set up with Stripe on the Bank page, under Bank setup.')
+    const { rows } = await db.query(`SELECT 1 FROM user_bank_accounts WHERE user_id=$1`, [f.userA])
+    expect(rows).toHaveLength(0)
   })
 
-  it('routing number with formatting (spaces / dashes) is stripped and validated', async () => {
+  it('refuses the same way with no body at all (nothing left to validate)', async () => {
     const f = await seed()
     const res = await request(buildApp()).post('/api/bank-accounts')
       .set('Authorization', `Bearer ${f.userATok}`)
-      .send({ ...happyPayload(), routingNumber: '011-000-015' })
-    expect(res.status).toBe(201)
-    expect(res.body.data.routing_number).toBe(VALID_ROUTING)
+      .send({})
+    expect(res.status).toBe(410)
+    expect(res.body.error).toMatch(/Bank setup/)
   })
 
-  it('invalid routing number checksum → 400', async () => {
+  it('leaves rows that already exist exactly as they were', async () => {
     const f = await seed()
-    const res = await request(buildApp()).post('/api/bank-accounts')
+    const c = await db.connect()
+    let existingId: string
+    try { existingId = await seedUserBankAccount(c, { userId: f.userA }) } finally { c.release() }
+    await request(buildApp()).post('/api/bank-accounts')
       .set('Authorization', `Bearer ${f.userATok}`)
-      .send({ ...happyPayload(), routingNumber: '011000019' })  // bad checksum
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/Invalid routing number/)
+      .send(happyPayload())
+    const { rows } = await db.query<any>(
+      `SELECT id, status FROM user_bank_accounts WHERE user_id=$1`, [f.userA])
+    expect(rows).toEqual([{ id: existingId!, status: 'active' }])
+    // ...and GET still lists it, for history.
+    const list = await request(buildApp()).get('/api/bank-accounts')
+      .set('Authorization', `Bearer ${f.userATok}`)
+    expect(list.status).toBe(200)
+    expect(list.body.data.map((r: any) => r.id)).toEqual([existingId!])
   })
 
-  it('routing number wrong length → 400', async () => {
-    const f = await seed()
-    const res = await request(buildApp()).post('/api/bank-accounts')
-      .set('Authorization', `Bearer ${f.userATok}`)
-      .send({ ...happyPayload(), routingNumber: '12345' })
-    expect(res.status).toBe(400)
-  })
-
-  it('account number < 4 digits → 400', async () => {
-    const f = await seed()
-    const res = await request(buildApp()).post('/api/bank-accounts')
-      .set('Authorization', `Bearer ${f.userATok}`)
-      .send({ ...happyPayload(), accountNumber: '123' })
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/4.*17 digits/)
-  })
-
-  it('account number > 17 digits → 400', async () => {
-    const f = await seed()
-    const res = await request(buildApp()).post('/api/bank-accounts')
-      .set('Authorization', `Bearer ${f.userATok}`)
-      .send({ ...happyPayload(), accountNumber: '1'.repeat(18) })
-    expect(res.status).toBe(400)
-  })
-
-  // S637 (Nic): the nickname is OPTIONAL and derived when blank. It was a
-  // required field with no asterisk and no error text, so Dusty Rhoades — adding
-  // the Wells Fargo account that Mountain View's rent pays into — clicked "Add
-  // account" and the form silently did nothing. Nic: "He's old school, and he
-  // may not have named the account."
-  it('S637: nickname optional — a blank one gets a generated label', async () => {
-    const f = await seed()
-    const res = await request(buildApp()).post('/api/bank-accounts')
-      .set('Authorization', `Bearer ${f.userATok}`)
-      .send({ ...happyPayload(), nickname: '' })
-    expect(res.status).toBe(201)
-    // Ben's exact form kept over my regex: the fixture is a checking account
-    // ending 7890, so the precise string is assertable and catches a wrong
-    // derivation that a pattern would wave through.
-    expect(res.body.data.nickname).toBe('Checking ••7890')
-  })
-
-  it('an omitted nickname is accepted too', async () => {
-    const f = await seed()
-    const { nickname, ...rest } = happyPayload() as any
-    const res = await request(buildApp()).post('/api/bank-accounts')
-      .set('Authorization', `Bearer ${f.userATok}`)
-      .send(rest)
-    expect(res.status).toBe(201)
-    expect(res.body.data.nickname).toBeTruthy()
-  })
-
-  it('invalid accountType enum → 400', async () => {
-    const f = await seed()
-    const res = await request(buildApp()).post('/api/bank-accounts')
-      .set('Authorization', `Bearer ${f.userATok}`)
-      .send({ ...happyPayload(), accountType: 'crypto' })
-    expect(res.status).toBe(400)
-  })
-
-  it('invalid accountHolderType enum → 400', async () => {
-    const f = await seed()
-    const res = await request(buildApp()).post('/api/bank-accounts')
-      .set('Authorization', `Bearer ${f.userATok}`)
-      .send({ ...happyPayload(), accountHolderType: 'pet' })
-    expect(res.status).toBe(400)
-  })
-
-  it('nickname is trimmed before insert', async () => {
-    const f = await seed()
-    const res = await request(buildApp()).post('/api/bank-accounts')
-      .set('Authorization', `Bearer ${f.userATok}`)
-      .send({ ...happyPayload(), nickname: '   Padded   ' })
-    expect(res.status).toBe(201)
-    expect(res.body.data.nickname).toBe('Padded')
+  it('still needs a signed-in caller', async () => {
+    const res = await request(buildApp()).post('/api/bank-accounts').send(happyPayload())
+    expect(res.status).toBe(401)
   })
 })
 

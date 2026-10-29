@@ -22,12 +22,12 @@ The GAM landlord portal groups its navigation into these sections. These are the
 **Financials** — one sidebar item that opens to these tabs:
 - **Payments** — rent and other payments coming in.
 - **Outstanding Balances** — who owes what right now.
-- **Rent Roll** — expected rent across your occupied units.
+- **Rent Roll** — every household by property: what each was charged, paid and still owes for the month, its payment health, and the last months at a glance.
 - **Disbursements** — what's paid out to you and how it's split, including on-demand withdrawals of your available balance.
 - **Reports** — reporting across your portfolio.
 - **Expenses** — record property expenses that feed your profit-and-loss.
 - **Bank Feed** — link your operating bank, match cash and check deposits to the rent they paid, check that what was collected in person reached the bank, and categorize spending.
-- **Bank Reconciliation** — reconcile and categorize bank charges.
+- **Bank Reconciliation** (also under Bookkeeping) — reconcile a bank account against its statement: enter the statement's last day and ending balance, lines the bank feed already matched arrive ticked, tick off the rest, and finish when the difference is $0.00. A bank charge the books don't have yet is added as an expense paid from that bank. Bookkeeping → **Close Month** locks a finished month once its linked bank accounts are reconciled; who may close and reopen a month is your choice in Books Settings.
 - **Banking** — your connected payout bank and identity verification.
 - **Lot Rent & Net** — lot rent and investor-operator net (appears when you have mobile-home / lot-rent units).
 
@@ -50,7 +50,7 @@ The GAM landlord portal groups its navigation into these sections. These are the
 - **Team** — your team members and their per-person permissions.
 - **Settings** — account and portfolio settings, including notification preferences.
 
-A few of the financial views (Rent Roll, Expenses, Bank Feed, Bank Reconciliation, Lot Rent & Net) are owner-only, so a team member with limited access may not see them.
+A few of the financial views (Expenses, Bank Feed, Bank Reconciliation, Lot Rent & Net) are owner-only, so a team member with limited access may not see them. The Rent Roll opens for the owner and for team members with the View all payments permission.
 
 Support isn't a sidebar section — it's the floating chat bubble available on every page (it's how you're talking to us right now).
 

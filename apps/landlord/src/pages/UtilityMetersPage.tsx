@@ -2,10 +2,11 @@ import { useState, useEffect, useMemo, useRef, CSSProperties, Fragment } from 'r
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPut, apiDelete, apiPatch, api } from '../lib/api'
-import { UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, METER_READING_DIGIT_OPTIONS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL } from '@gam/shared'
-import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil, Check } from 'lucide-react'
-import { toast, appConfirm, appPrompt } from '../components/dialogs'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, METER_READING_DIGIT_OPTIONS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL, UTILITY_USAGE_NOUN, meterWorksNoUseLabel } from '@gam/shared'
+import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil, Check, PowerOff } from 'lucide-react'
+import { toast, appConfirm } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
+import { readToast } from '../lib/meterReadToast'
 import { ReadingWalkModal } from '../../../../packages/shared-ui/MeterWalk'
 const walkApi = { get: apiGet, post: apiPost, upload: (url: string, form: FormData) => api.post(url, form).then(r => r.data) }
 
@@ -331,7 +332,10 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
                 <AlertTriangle size={16} style={{ color:'var(--amber, #d97706)' }}/> Readings to double-check
               </div>
               <div style={{ fontSize:'.75rem', color:'var(--text-3)', marginBottom:10 }}>
-                The reading run flagged these for a second look. Re-check the meter, then correct the value or confirm it.
+                {/* 10/20: not only the run any more — a closing read taken at
+                    the counter lands here too when the number needs a human,
+                    and that one is holding a departing household's final bill. */}
+                Flagged for a second look. Re-check the meter, then correct the value or confirm it — a move-out read waiting here has no final bill yet.
               </div>
               <div style={{ display:'grid', gap:6 }}>
                 {(flagged as any[]).map((r:any) => (
@@ -433,6 +437,19 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
             )}
           </div>
           </>)}
+          {/* 10/20 (Nic): there WAS a "Send a bill" card here and it is gone on
+              purpose. "I don't want a send a bill button on the utility page...
+              I want the bill to be in the POS. That's something that my front
+              desk has access to. That's not something they can see in the meter
+              reads or wherever utilities, like front desk doesn't have access to
+              that. They need to be able to do the things on checking people out
+              of their final situation."
+              Right on both counts: this screen is the landlord's meter setup,
+              and the person who needs to collect a last electric bill is at the
+              counter checking somebody out. The final bill is raised from the
+              register instead — the desk enters the move-out read there and the
+              charge, if there is one to make, lands on the ticket. */}
+
           {/* ── PROPANE (tank fills — gas for RVs) ─────────── */}
           <PropaneSection propertyId={propertyId} property={(properties as any[]).find((p:any)=>p.id===propertyId)} units={units as any[]} onChanged={invalidate} />
 
@@ -592,7 +609,14 @@ function SpecialReadModal({ preset, meters, onClose }: { preset: { meterId?: str
     // to-do picked.
     () => apiPost(`/utility/meters/${meterId}/reads`, { readingValue: Number(value), reason, reasonNote: note || undefined,
       ...(reason === 'move_out_final' && preset.leaseId && meterId === preset.meterId ? { leaseId: preset.leaseId } : {}) }),
-    { onSuccess: (r:any) => { toast(r?.data?.billed ? 'Read recorded — final bill created' : 'Reading recorded'); onClose() },
+    // 10/20: the answer has always said WHY a read did not bill — the cycle was
+    // already billed off the monthly run, the meter is on no unit, or the number
+    // is one the landlord has to look at before any final bill goes out — and
+    // NOTHING anywhere read that field. The desk saw a bare "Reading recorded"
+    // for all of it, which is how a dropped digit at a pull-out looked exactly
+    // like a clean read. The note never carries a figure or which way one was
+    // off: blind entry (S559) is only blind if a refusal cannot be read as a hint.
+    { onSuccess: (r:any) => { toast(readToast(r)); onClose() },
       onError: (e:any) => toast.error(e?.response?.data?.error || 'Could not record the reading') }
   )
   return (
@@ -1325,6 +1349,7 @@ function PropertyRatesCard({ propertyId }: { propertyId: string }) {
   )
 }
 
+
 function TaxRatesCard({ propertyId }: { propertyId: string }) {
   const qc = useQueryClient()
   const { data: rates = [] } = useQuery<any[]>(
@@ -1385,16 +1410,51 @@ function methodLabel(m: any): string {
  * wanna see that... that way we can measure how much utility wasn't billed back."
  *
  * Spent is what the property recorded paying for utilities; recovered is what it
- * billed out. The gap is the number. The owner-occupied slice is called out
- * because it is recorded as it happens — the rest of the gap (common areas, a
- * nightly stay with power in the rate, a vacancy, a lease that never passed it
- * through) is left unattributed rather than guessed at.
+ * billed out. The gap is the number.
  *
  * A utility with no expense recorded shows a dash, not a shortfall: with nothing
  * on the spent side there is nothing to subtract from, and printing the whole
  * recovery as "not recovered" would be a lie in the landlord's own report.
+ *
+ * 10/20 (Nic) — AND THE GAP IS SHOWN SPLIT THREE WAYS, because two of them are
+ * not the same question: "it needs to be separated between stuff that the
+ * property just generally uses, the property's own consumption, versus what
+ * somebody used that didn't get billed back."
+ *
+ *   The park used it — your own spaces, empty spaces. A cost of running the
+ *     place, and never what the kept money is measured against.
+ *   Somebody used it and was never billed — THE number, and the only one the
+ *     early-departure comparison faces.
+ *   Not accounted for — mostly the office, the shop, irrigation. The screen
+ *     says that is what it mostly is and also says nothing on file proves it,
+ *     because moving it into the park's column on a hunch would be the invented
+ *     number this whole report exists to avoid.
+ *
+ * And "billed to tenants" says which of the three doors it came through: a
+ * bill, a sale at the register or on a pay link, or a nightly rate that had the
+ * power in it all along.
+ *
+ * 10/20 (Nic): "I would like to keep track of money that wasn't refunded versus
+ * electric that should have been billed that wasn't charged to see how close we
+ * actually get to evening out... we try to be generous with it, but I want to
+ * make sure that it's somewhat fair." So the two halves of an early departure
+ * sit side by side here, and the leaning is shown signed rather than as a win —
+ * "you came out ahead" and "you came out short" are both printed plainly,
+ * because only one of them answers the question he asked.
+ *
+ * The money kept is shown NET of the short-term lodging tax that re-pricing
+ * those stays would owe — "even though they weren't charged the tax needs to be
+ * factored in" — with the subtraction spelled out underneath, because a figure
+ * that quietly dropped $35.51 a departure would look like a bug. On the two
+ * live Mountain View departures that is $102.00 in the till, $71.02 of tax, and
+ * $30.98 really ahead.
+ *
+ * The named slices live INSIDE the gap, never beside it. Each is a part of
+ * "charged but never billed", not an addition to it; the API carries the
+ * remainder as its own figure so they reconcile exactly and no dollar is
+ * counted twice.
  */
-function RecoveryCard({ propertyId }: { propertyId: string }) {
+export function RecoveryCard({ propertyId }: { propertyId: string }) {
   const thisYear = new Date().getFullYear()
   const [year, setYear] = useState(thisYear)
   const { data } = useQuery<any>(
@@ -1404,7 +1464,12 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
   )
   const lines: any[] = data?.lines ?? []
   const t = data?.totals
-  if (!t || (t.spent === 0 && t.recovered === 0)) return null
+  const ed = t?.earlyDepartures
+  // 10/20: a park can have early departures and nothing else — RV 10 and RV 11
+  // at Mountain View have no utility bill and no recorded expense between them,
+  // which is exactly the case this feature exists for. Hiding the card on an
+  // empty spent-and-billed pair would hide the only figures it has.
+  if (!t || (t.spent === 0 && t.recovered === 0 && !(ed?.departures > 0))) return null
   // S652 (Nic): "spent zero, billed back $1,588.65, and not recovered
   // $1,588.65… I want to fix this table so it's not confusing on anything."
   // Four plain numbers, in the order the money moves: what the utility charged
@@ -1419,6 +1484,15 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
     </div>
   )
   const th: React.CSSProperties = { textAlign: 'right' }
+  // 10/20 (Nic): three ways utility money comes back, named under the total so
+  // one number never silently means three different things. Only the ones that
+  // actually happened are listed — a park that has never rung a utility line up
+  // should not be told about a door it has never used.
+  const sourceHint = [
+    t.fromBills > 0 ? `${fmt(t.fromBills)} on bills` : null,
+    t.fromSales > 0 ? `${fmt(t.fromSales)} at the register or on a pay link` : null,
+    t.inTheRate > 0 ? `${fmt(t.inTheRate)} inside nightly and weekly rates` : null,
+  ].filter(Boolean).join(' · ') || undefined
   return (
     <div style={{ marginBottom: 28 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
@@ -1430,14 +1504,78 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
       </div>
       <div className="card" style={{ padding: 14 }}>
         <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', marginBottom: 12 }}>
-          {stat('Billed to tenants', fmt(t.recovered))}
+          {stat('Billed to tenants', fmt(t.recovered), undefined, sourceHint)}
           {stat('Tenants have paid', fmt(t.collected), 'var(--green)')}
           {t.workTrade > 0 && stat('Covered by work trade', fmt(t.workTrade), undefined, 'worked off, not owed')}
           {stat('Tenants still owe', fmt(t.stillOwed), t.stillOwed > 0 ? 'var(--gold)' : undefined)}
           {stat('The utility charged you', t.spent > 0 ? fmt(t.spent) : '—', undefined, t.spent > 0 ? undefined : 'none recorded yet')}
-          {t.notRecovered != null && stat('Charged but never billed', fmt(Math.max(0, t.notRecovered)), t.notRecovered > 0 ? 'var(--gold)' : undefined)}
-          {t.ownerOccupied > 0 && stat('Of that, your own units', fmt(t.ownerOccupied))}
         </div>
+        {/*
+          10/20 (Nic): the gap, split. The three parts are indented under the
+          whole so it reads as a breakdown and not as four more numbers to add
+          up — they live INSIDE "charged but never billed", they are not beside
+          it. Each one says plainly what it is for somebody who does not work
+          here.
+        */}
+        {t.notRecovered != null && (
+          <div style={{ borderTop: '1px solid var(--border-0)', paddingTop: 12, marginBottom: 14 }}>
+            <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+              {stat('Charged but never billed', fmt(Math.max(0, t.notRecovered)),
+                t.notRecovered > 0 ? 'var(--gold)' : undefined,
+                'what the utility charged you and nobody was billed for')}
+              <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap',
+                borderLeft: '2px solid var(--border-0)', paddingLeft: 18 }}>
+                {stat('The park used it', fmt(t.propertyUsed), undefined,
+                  'your own spaces and empty ones — a cost of running the place')}
+                {stat('Somebody used it, never billed', fmt(t.somebodysUsage),
+                  t.somebodysUsage > 0 ? 'var(--gold)' : undefined,
+                  'the part the money you kept is measured against')}
+                {stat('Not accounted for', t.unattributed == null ? '—' : fmt(t.unattributed), undefined,
+                  'mostly common areas, the office, the shop, watering — nothing on file says which')}
+              </div>
+            </div>
+          </div>
+        )}
+        {ed?.departures > 0 && (
+          <div style={{ borderTop: '1px solid var(--border-0)', paddingTop: 12, marginBottom: 14 }}>
+            <div style={{ fontSize: '.8rem', fontWeight: 600, marginBottom: 2 }}>
+              When someone leaves early and you keep the money
+            </div>
+            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 10 }}>
+              {ed.departures === 1 ? 'One person left' : `${ed.departures} people left`} before the day they had
+              paid through. You kept what they had paid ahead, and you never sent them a final utility bill.
+              Here is how close the two came to evening out.
+            </div>
+            <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
+              {stat('Money you kept', fmt(ed.moneyKept), undefined,
+                ed.lodgingTaxOwed > 0
+                  ? `${fmt(ed.moneyKeptBeforeTax)} left in the till, less ${fmt(ed.lodgingTaxOwed)} of lodging tax`
+                  : undefined)}
+              {stat('Utilities you never billed them', fmt(ed.utilityAbsorbed))}
+              {stat(
+                ed.evenedOutBy === 0 ? 'It evened out exactly'
+                  : ed.evenedOutBy > 0 ? 'You came out ahead by' : 'You came out short by',
+                fmt(Math.abs(ed.evenedOutBy)),
+                ed.evenedOutBy < 0 ? 'var(--gold)' : undefined,
+              )}
+            </div>
+            {ed.lodgingTaxOwed > 0 && (
+              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 8 }}>
+                A stay of a month or more pays no short-term lodging tax, but the shorter stay they
+                actually used does. If you ever go back and log these as the shorter stays they were,
+                that tax comes out of your pocket &mdash; so it is taken off here rather than counted
+                as money you kept.
+              </div>
+            )}
+            {ed.awaitingClosingRead > 0 && (
+              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 8 }}>
+                {ed.awaitingClosingRead === 1
+                  ? 'One of these is still waiting on its final utility amount, so it is not in these figures yet.'
+                  : `${ed.awaitingClosingRead} of these are still waiting on their final utility amount, so they are not in these figures yet.`}
+              </div>
+            )}
+          </div>
+        )}
         <table style={{ width: '100%', fontSize: '.78rem', borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ color: 'var(--text-3)', fontSize: '.68rem', textTransform: 'uppercase', letterSpacing: '.05em' }}>
@@ -1448,6 +1586,8 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
               <th style={th}>Still owed</th>
               <th style={th}>Utility charged you</th>
               <th style={th}>Never billed</th>
+              {t.propertyUsed > 0 && <th style={th}>The park used it</th>}
+              {t.somebodysUsage > 0 && <th style={th}>Somebody used it</th>}
             </tr>
           </thead>
           <tbody>
@@ -1465,16 +1605,30 @@ function RecoveryCard({ propertyId }: { propertyId: string }) {
                 <td className="mono" style={{ ...th, color: (l.notRecovered ?? 0) > 0 ? 'var(--gold)' : undefined }}>
                   {l.notRecovered == null ? '—' : fmt(Math.max(0, l.notRecovered))}
                 </td>
+                {t.propertyUsed > 0 && (
+                  <td className="mono" style={th}>{l.propertyUsed ? fmt(l.propertyUsed) : '—'}</td>
+                )}
+                {t.somebodysUsage > 0 && (
+                  <td className="mono" style={th}>{l.somebodysUsage ? fmt(l.somebodysUsage) : '—'}</td>
+                )}
               </tr>
             ))}
           </tbody>
         </table>
         <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 10, lineHeight: 1.6 }}>
-          &ldquo;Billed to tenants&rdquo; counts utility bills on invoices and utility lines sent on a pay link or rung
-          up at the register. &ldquo;The utility charged you&rdquo; comes from what you record under <strong>Expenses → Utilities</strong> for
-          this property. Until a bill is recorded there, the last two columns show a dash — there is nothing to
-          compare against. &ldquo;Never billed&rdquo; is common areas, stays with utilities in the rate, vacancies, and
-          anything a lease doesn&apos;t pass through.
+          &ldquo;Billed to tenants&rdquo; counts utility bills on invoices, utility lines sent on a pay link or rung
+          up at the register, a delivered propane fill, and power that was already inside a nightly or weekly
+          rate. Propane sold at the pump is a product, not a utility, so it is nowhere in this table.
+          &ldquo;The utility charged you&rdquo; comes from what you record under <strong>Expenses → Utilities</strong> for
+          this property. Until a bill is recorded there, the gap columns show a dash — there is nothing to
+          compare against.
+          {t.propertyUsed > 0 && <> &ldquo;The park used it&rdquo; is your own spaces and empty ones: a cost of
+          running the place, not money anyone owed you.</>}
+          {t.somebodysUsage > 0 && <> &ldquo;Somebody used it&rdquo; is power a person used that never reached a
+          bill &mdash; mostly somebody who moved out before the day they had paid through, where you kept their
+          money instead of refunding it and called it a wash. That is the one the comparison above is set
+          against.</>}
+          {' '}Both are already counted inside &ldquo;never billed&rdquo;, not added on top of it.
         </div>
       </div>
     </div>
@@ -1729,6 +1883,13 @@ function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
 }) {
   const [label, setLabel] = useState('')
   const [serviceAddress, setServiceAddress] = useState('')
+  // 10/20: WHAT KIND OF SPACE IT IS, which is what picks the late fee the
+  // space's unpaid bill takes — the property's policy for that class, the same
+  // one a lease for that class is drafted with. The type classifies, it never
+  // prices. This screen used to send nothing, so every space was written as an
+  // apartment, and a park whose recorded policies are for RV sites and mobile
+  // homes handed its neighbor an agreement with no late fee at all.
+  const [unitType, setUnitType] = useState('apartment')
   const [firstName, setFirstName] = useState('')
   const [lastName, setLastName] = useState('')
   const [email, setEmail] = useState('')
@@ -1745,6 +1906,7 @@ function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
     () => apiPost('/utility/service-agreements', {
       propertyId,
       label: label.trim(),
+      unitType,
       serviceAddress: serviceAddress.trim() || undefined,
       billingDueDay: Number(billingDueDay) || 1,
       householdSize: Number(householdSize) || 1,
@@ -1785,6 +1947,19 @@ function AddServicedSpaceModal({ propertyId, onClose, onSaved }: {
         <input className="form-input" value={serviceAddress} maxLength={200}
           placeholder="1442 W Second St"
           onChange={e => setServiceAddress(e.target.value)} />
+
+        <label style={{ ...lbl, marginTop: 10 }}>What kind of space is it</label>
+        <select className="form-select" value={unitType}
+          onChange={e => setUnitType(e.target.value)}>
+          {UNIT_TYPES.map(t => (
+            <option key={t} value={t}>{UNIT_TYPE_LABEL[t]}</option>
+          ))}
+        </select>
+        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 6, lineHeight: 1.5 }}>
+          This picks the late fee their unpaid bill takes — your policy for that kind of space at
+          this property, the same one a lease for it would use. If you haven&apos;t set a policy for
+          that kind of space, their bill carries no late fee.
+        </div>
 
         <div style={{ marginTop: 16, marginBottom: 8, fontWeight: 700, fontSize: '.82rem', color: 'var(--text-0)' }}>
           Who pays the bill
@@ -1871,6 +2046,9 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
   const [editMeter, setEditMeter] = useState<any>(null)
   // S609: the meter whose units are being picked (null = picker closed).
   const [pickFor, setPickFor] = useState<any>(null)
+  // 10/12 (Nic), M1: the broken meter being put back in service — "Repaired"
+  // or "Works, tenant uses no power" (null = closed).
+  const [backInService, setBackInService] = useState<any>(null)
   const unitLabel = (id: string) => { const u = units.find(x => x.id === id); return u ? `Unit ${u.unitNumber}` : id.slice(0, 8) }
   // S613: the flat-charge amount lives on the PROPERTY rate, so a card that says
   // "flat $25/mo" has to read it from there — the meter row deliberately has no
@@ -1976,24 +2154,27 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
   const assign = useMutation(({ id, unitId }: any) => apiPost(`/utility/meters/${id}/units`, { unitId }),
     { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || e?.message || 'Could not assign unit') })
   const unassign = useMutation(({ id, unitId }: any) => apiDelete(`/utility/meters/${id}/units/${unitId}`), { onSuccess: onChanged })
-  const setBroken = useMutation(({ id, broken, startingReading }: any) => apiPatch(`/utility/meters/${id}`, {
-      outOfService: broken,
-      ...(startingReading != null ? { repairedStartingReading: startingReading } : {}),
-    }),
+  // Marks a meter broken. Back into service goes through MeterBackInServiceModal.
+  const setBroken = useMutation(({ id, broken }: any) => apiPatch(`/utility/meters/${id}`, { outOfService: broken }),
     { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not update the meter') })
+  // 10/12 (Nic, review): take "Works, tenant uses no power" back. On a master or
+  // a flat-rate meter nothing else could ("Mark broken" is a submeter's alone),
+  // so one press or a mis-click stayed on the meter for good. The same button,
+  // lit while it stands, asks and takes it back.
+  const withdrawNoUse = useMutation((id: string) => apiPatch(`/utility/meters/${id}`, { zeroUseWithdrawn: true }),
+    { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not update the meter') })
+  const askWithdrawNoUse = (m: any) => appConfirm(
+    `Take back "${meterWorksNoUseLabel(m.utilityType)}" on ${m.label}? `
+      + (m.billingMethod === 'submeter'
+        ? 'From now on, a read that does not move while somebody lives there is treated as a stuck meter again.'
+        // 10/13 (Nic): a flat charge stopped with it starts again.
+        : m.billingMethod === 'flat_rate' && m.zeroUseStopsFlatCharge
+        ? 'Its flat charge starts again with the next bill.'
+        : 'How this meter bills does not change.'),
+    { confirmLabel: 'Take it back' }).then(ok => { if (ok) withdrawNoUse.mutate(m.id) })
   // S648 (Nic): a repaired or replaced meter starts from what it reads NOW —
-  // 0 for a new one, whatever is on the dial for a refurbished one.
-  const markRepaired = (m: any) => {
-    appPrompt(
-      'What does the repaired or replaced meter read right now? Enter 0 for a brand-new meter. Its next bill is measured from this number.',
-      { title: `Mark ${m.label} repaired` },
-    ).then(v => {
-      if (v == null) return
-      const n = Number(String(v).replace(/[,\s]/g, ''))
-      if (String(v).trim() === '' || !Number.isFinite(n) || n < 0) { toast.error('Enter the number shown on the meter.'); return }
-      setBroken.mutate({ id: m.id, broken: false, startingReading: n })
-    })
-  }
+  // 0 for a new one, whatever is on the dial for a refurbished one. 10/12 (Nic,
+  // M1): beside it, "Works, tenant uses no power" (MeterBackInServiceModal).
   // S613 (Nic): a meter can be configured perfectly and bill nothing, because a
   // unit bills a utility only where its LEASE passes it through. Assigning
   // twenty-seven units to a brand-new trash charge hits that on twenty-seven
@@ -2124,9 +2305,44 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <span style={{ fontSize: '1.15rem' }}>{UTILITY_ICONS[m.utilityType]}</span>
           <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>{m.label}</div>
+            <div style={{ fontWeight: 700, color: 'var(--text-0)', display:'flex', alignItems:'center', gap:6 }}>
+              {m.label}
+              {m.outOfService && <span className="badge badge-amber" style={{ fontSize:'.62rem' }}>out of service</span>}
+              {!m.outOfService && m.zeroUseConfirmedAt && (
+                <span className="badge badge-muted" style={{ fontSize:'.62rem' }}
+                  title={`Confirmed working with nobody using any — ${worksNoUseEffect(m)}.`}>
+                  uses no {UTILITY_USAGE_NOUN[m.utilityType as UtilityType] ?? 'power'}
+                </span>
+              )}
+            </div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{methodLabel(m)}</div>
           </div>
+          {/* 10/12 (Nic): "Works, tenant uses no power" — "Any meter", the
+              master too: put back in service when marked broken, or say it
+              while in service. */}
+          {m.outOfService && (
+            <button className="btn btn-ghost btn-sm"
+              title={`Put back in service — Repaired, or ${meterWorksNoUseLabel(m.utilityType)}`}
+              onClick={() => setBackInService(m)}>
+              <Wrench size={13} style={{ color: 'var(--gold)' }} />
+            </button>
+          )}
+          {!m.outOfService && !m.zeroUseConfirmedAt && (
+            <button className="btn btn-ghost btn-sm"
+              title={`${meterWorksNoUseLabel(m.utilityType)} — ${worksNoUseEffect(m)}`}
+              onClick={() => setBackInService(m)}>
+              <PowerOff size={13} style={{ color: 'var(--text-3)' }} />
+            </button>
+          )}
+          {/* 10/12 (Nic, review): ...and taken back with the same button. */}
+          {!m.outOfService && m.zeroUseConfirmedAt && (
+            <button className="btn btn-ghost btn-sm"
+              title={`Take back "${meterWorksNoUseLabel(m.utilityType)}"`}
+              disabled={withdrawNoUse.isLoading}
+              onClick={() => askWithdrawNoUse(m)}>
+              <PowerOff size={13} style={{ color: 'var(--gold)' }} />
+            </button>
+          )}
           {/* S609 (Nic): a meter used to be uneditable once created — a typo in
               the label meant deleting a master and losing its unit assignments. */}
           <button className="btn btn-ghost btn-sm" title="Edit this meter" onClick={() => setEditMeter(m)}>
@@ -2239,6 +2455,14 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
             <div style={{ fontWeight: 700, color: 'var(--text-0)', display:'flex', alignItems:'center', gap:6 }}>
               {m.label}
               {m.outOfService && <span className="badge badge-amber" style={{ fontSize:'.62rem' }}>out of service</span>}
+              {/* 10/12 (Nic), M1: confirmed working with nobody using any —
+                  says why its flat reads bill $0 instead of being flagged. */}
+              {!m.outOfService && m.zeroUseConfirmedAt && (
+                <span className="badge badge-muted" style={{ fontSize:'.62rem' }}
+                  title={`Confirmed working with nobody using any — ${worksNoUseEffect(m)}.`}>
+                  uses no {UTILITY_USAGE_NOUN[m.utilityType as UtilityType] ?? 'power'}
+                </span>
+              )}
               {/* S605 (Nic): the failure this exists to stop is a SILENT one —
                   a submeter with no opening read bills nothing and says nothing
                   until the cycle has already closed. */}
@@ -2251,15 +2475,42 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
               {m.outOfService && (m.estimatesStuckMeters
                 ? <> · billed from the lowest comparable spot until repaired</>
                 : <> · not billing until repaired</>)}
+              {!m.outOfService && m.zeroUseConfirmedAt && <> · {worksNoUseEffect(m)}</>}
             </div>
             {(m.hasBaseline === false || m.openingRead) && <BaselineFixer m={m} />}
           </div>
-          {m.billingMethod === 'submeter' && (
+          {/* 10/12 (Nic): "Works, tenant uses no power" is on any meter, so a
+              meter of any kind marked broken can be put back here too. Only a
+              submeter is offered "Mark broken" (as before). */}
+          {(m.billingMethod === 'submeter' || m.outOfService) && (
             <button className="btn btn-ghost btn-sm"
-              title={m.outOfService ? 'Mark repaired — enter the new reading'
+              title={m.outOfService ? `Put back in service — Repaired, or ${meterWorksNoUseLabel(m.utilityType)}`
                 : m.estimatesStuckMeters ? 'Mark broken — bills from comparable spots' : 'Mark broken — stops billing until repaired'}
-              onClick={() => m.outOfService ? markRepaired(m) : setBroken.mutate({ id: m.id, broken: true })}>
+              onClick={() => m.outOfService ? setBackInService(m) : setBroken.mutate({ id: m.id, broken: true })}>
               <Wrench size={13} style={{ color: m.outOfService ? 'var(--gold)' : 'var(--text-3)' }} />
+            </button>
+          )}
+          {/* 10/12 (Nic), Q-d: "Works, tenant uses no power" is usable on a meter
+              any time — not only once it has been flagged. Beside "Mark broken"
+              on a meter in service, so a landlord can say it before the flat
+              reads flag it (a resident who is away). */}
+          {/* 10/12 (Nic): "Any meter" — not only a submeter. */}
+          {!m.outOfService && !m.zeroUseConfirmedAt && (
+            <button className="btn btn-ghost btn-sm"
+              title={`${meterWorksNoUseLabel(m.utilityType)} — ${worksNoUseEffect(m)}`}
+              onClick={() => setBackInService(m)}>
+              <PowerOff size={13} style={{ color: 'var(--text-3)' }} />
+            </button>
+          )}
+          {/* 10/12 (Nic, review): lit while it stands; pressed, it is taken
+              back — on a master the landlord pays or a flat-rate meter, the
+              only way to (they have no "Mark broken"). */}
+          {!m.outOfService && m.zeroUseConfirmedAt && (
+            <button className="btn btn-ghost btn-sm"
+              title={`Take back "${meterWorksNoUseLabel(m.utilityType)}"`}
+              disabled={withdrawNoUse.isLoading}
+              onClick={() => askWithdrawNoUse(m)}>
+              <PowerOff size={13} style={{ color: 'var(--gold)' }} />
             </button>
           )}
           <button className="btn btn-ghost btn-sm" title="Edit this meter" onClick={() => setEditMeter(m)}>
@@ -2352,6 +2603,231 @@ function MeterConfigSection({ propertyId, meters, units, onChanged, initialType 
         unitHasSubmeter={unitHasSubmeter} unitLabel={unitLabel}
         conflictingMeterFor={conflictingMeterFor}
         onClose={() => setPickFor(null)} onSaved={onChanged} />}
+      {backInService && <MeterBackInServiceModal meter={backInService}
+        onClose={() => setBackInService(null)} onSaved={onChanged} />}
+    </div>
+  )
+}
+
+/**
+ * 10/12 (Nic), M1: "ADD 'Works, tenant uses no power' choice next to
+ * 'Repaired' (Gerald specifically is gone, not plugged in, paying for
+ * occupancy)."
+ *
+ * A meter marked broken — it read the same number twice while the space was
+ * occupied (S648) — comes back into service one of two ways:
+ *   Repaired — fixed or replaced. It starts again from what it reads now (S648:
+ *     0 for a brand-new meter, whatever is on the dial for a refurbished one).
+ *   Works, tenant uses no power — it was never broken; the household on it uses
+ *     none. No new reading. Zero use bills $0 and is not flagged (or estimated)
+ *     again until the meter moves, the household leaves, or it is marked
+ *     broken by hand — or taken back (10/12 review: the same button, lit).
+ *
+ * 10/12 (Nic), Q-f: "past estimates when picking 'Works': LANDLORD'S CHOICE at
+ * that moment (void unpaid estimated charges from the flagged period, or leave
+ * them)." When the property billed estimates while this meter was flagged and
+ * some are still unpaid, "Works" asks before it saves: "Also void the N unpaid
+ * estimated charges from while it was flagged ($X)?" Voided charges stay on
+ * record; paid ones are never touched.
+ *
+ * 10/12 (Nic), Q-d: "usable on ANY meter, any time." Opened on a meter still in
+ * service (its own button beside "Mark broken"), the window offers only "Works,
+ * tenant uses no power": nothing was broken, so there is nothing to repair and
+ * no flagged period to ask about.
+ */
+/**
+ * 10/12 (Nic): "Works, tenant uses no power" is on any meter ("Any meter").
+ * What it does to the bill depends on the meter: on a submeter a flat read
+ * bills $0 instead of being flagged (the stuck-meter test is a submeter's
+ * alone); on a master or a flat-rate meter it is recorded and nothing about
+ * how the meter bills changes.
+ */
+function worksNoUseEffect(m: { billingMethod?: string; zeroUseStopsFlatCharge?: boolean }): string {
+  if (m.billingMethod === 'submeter') return 'zero use bills $0 until it moves'
+  // 10/13 (Nic): "Stop the flat charge too?" answered yes.
+  if (m.billingMethod === 'flat_rate' && m.zeroUseStopsFlatCharge) return 'flat charge stopped while nobody uses it'
+  return 'confirmed working, nobody using it'
+}
+
+function MeterBackInServiceModal({ meter, onClose, onSaved }: {
+  meter: any; onClose: () => void; onSaved: () => void
+}) {
+  const [reading, setReading] = useState('')
+  // 10/12 (Q-f): the "also void the estimates?" question, open once "Works" is pressed.
+  const [askVoid, setAskVoid] = useState(false)
+  // 10/13 (Nic): "Flat-rate meter marked 'Works, nobody using it': LANDLORD'S
+  // CHOICE, asked at the moment of marking ('Stop the flat charge too?')." Asked
+  // first on a flat-rate meter; the answer rides the save (and the estimates
+  // question after it, when there is one).
+  const flatRate = meter.billingMethod === 'flat_rate'
+  const [askStop, setAskStop] = useState(false)
+  const [stopAnswer, setStopAnswer] = useState<boolean | undefined>(undefined)
+  const digits = Number(meter.digits) || METER_READING_DEFAULT_DIGITS
+  const readingOk = new RegExp(`^\\d{1,${digits}}$`).test(reading)
+  const worksLabel = meterWorksNoUseLabel(meter.utilityType)
+  const noun = UTILITY_USAGE_NOUN[meter.utilityType as UtilityType] ?? 'power'
+  // 10/12 (Nic), Q-d: on a meter in service the window offers only "Works,
+  // tenant uses no power" — nothing was broken, so nothing to repair and no
+  // estimates to ask about.
+  const flagged = !!meter.outOfService
+  // The unpaid estimates from while it was flagged — the same list the void takes off.
+  const { data: estimates, isLoading: estimatesLoading, isError: estimatesFailed, refetch: refetchEstimates } = useQuery(['meter-flagged-estimates', meter.id],
+    () => apiGet<{ count: number; amount: number; charges: Array<{ id: string; state: string; cycleMonth: string; amount: number; invoiceNumber: string | null }> }>(
+      `/utility/meters/${meter.id}/flagged-estimates`),
+    { enabled: flagged, staleTime: 0 })
+  const waiting = estimates?.count ?? 0
+  const save = useMutation((body: {
+    outOfService: false; repairedStartingReading?: number; zeroUseConfirmed?: true; voidFlaggedEstimates?: boolean
+    voidEstimateIds?: string[]; stopFlatCharge?: boolean
+  }) => apiPatch(`/utility/meters/${meter.id}`, body), {
+    onSuccess: (r: any, body) => {
+      const v = r?.flaggedEstimatesVoided
+      const plural = (n: number) => `${n} estimated charge${n === 1 ? '' : 's'}`
+      const voidedWords = v?.voided?.count
+        ? ` Voided ${plural(v.voided.count)} (${fmt(v.voided.amount)}).`
+        : ''
+      // 10/12 (review): say why each one stayed — it was not always a payment.
+      const k = v?.keptBy ?? {}
+      const keptWords = [
+        k.paid?.count ? ` ${plural(k.paid.count)} (${fmt(k.paid.amount)}) stayed: a payment reached ${k.paid.count === 1 ? 'it' : 'them'} first.` : '',
+        k.heldByRecord?.count ? ` ${plural(k.heldByRecord.count)} (${fmt(k.heldByRecord.amount)}) stayed: account credit, a bank match or a receipt is tied to ${k.heldByRecord.count === 1 ? 'it' : 'them'}.` : '',
+        k.changed?.count ? ` ${plural(k.changed.count)} (${fmt(k.changed.amount)}) had already changed (taken off or moved onto a bill).` : '',
+        k.failed?.count ? ` ${plural(k.failed.count)} (${fmt(k.failed.amount)}) could not be voided just now — nothing about ${k.failed.count === 1 ? 'it' : 'them'} changed; try again from the meter.` : '',
+      ].join('')
+      const effect = worksNoUseEffect({ ...meter, zeroUseStopsFlatCharge: body.stopFlatCharge === true })
+      toast(body.zeroUseConfirmed
+        ? (flagged
+          ? `${meter.label} is back in service — ${effect}.${voidedWords}${keptWords}`
+          : `${meter.label} confirmed working — ${effect}.`)
+        : `${meter.label} marked repaired — its next bill is measured from ${body.repairedStartingReading}`)
+      onSaved()
+      onClose()
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not update the meter'),
+  })
+  // "Yes, void them" sends the charges this window showed — only those come off.
+  const works = (voidFlaggedEstimates?: boolean, stopFlatCharge?: boolean) => save.mutate({
+    outOfService: false, zeroUseConfirmed: true,
+    ...(voidFlaggedEstimates !== undefined ? { voidFlaggedEstimates } : {}),
+    ...(voidFlaggedEstimates ? { voidEstimateIds: (estimates?.charges ?? []).map(c => c.id) } : {}),
+    ...(stopFlatCharge !== undefined ? { stopFlatCharge } : {}),
+  })
+  // 10/13: the flat-charge answer, then the estimates question when one waits.
+  const answerStop = (stop: boolean) => {
+    if (waiting > 0) { setStopAnswer(stop); setAskStop(false); setAskVoid(true) }
+    else works(undefined, stop)
+  }
+  const spaces = (meter.assignedUnitIds || []).length
+  const choice: CSSProperties = { border: '1px solid var(--border-1)', borderRadius: 'var(--r-md)', padding: 12, marginBottom: 10 }
+  const why: CSSProperties = { fontSize: '.76rem', color: 'var(--text-3)', margin: '4px 0 10px', lineHeight: 1.45 }
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 460 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {flagged
+            ? <><Wrench size={16} style={{ color: 'var(--gold)' }} /> Put {meter.label} back in service</>
+            : <><PowerOff size={16} style={{ color: 'var(--gold)' }} /> Confirm {meter.label} works</>}
+        </div>
+        {/* 10/12: a flat charge (or trash) has no dial to read, so there is no
+            "Repaired" reading to take — only "Works". */}
+        {flagged && meter.billingMethod !== 'flat_rate' && meter.utilityType !== 'trash' && <div style={choice}>
+          <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>Repaired</div>
+          <div style={why}>
+            It was fixed or replaced. Enter what it reads right now — 0 for a brand-new meter. Its next bill is
+            measured from this number.
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <input className="form-input mono" type="text" inputMode="numeric" maxLength={digits} autoComplete="off"
+              value={reading} onChange={e => setReading(e.target.value.replace(/\D/g, '').slice(0, digits))}
+              placeholder={`up to ${digits} digits`} style={{ flex: 1, minWidth: 0, letterSpacing: '.12em' }} />
+            <button className="btn btn-primary" disabled={!readingOk || save.isLoading}
+              onClick={() => save.mutate({ outOfService: false, repairedStartingReading: Number(reading) })}>
+              Repaired
+            </button>
+          </div>
+        </div>}
+        <div style={choice}>
+          <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>{worksLabel}</div>
+          <div style={why}>
+            {flatRate
+              ? <>The meter works — nobody on it uses any {noun}. {flagged ? 'No new reading: it goes back in service. ' : ''}It
+                is recorded on the meter, and you choose next whether its flat charge stops too.</>
+              : meter.billingMethod !== 'submeter'
+              ? <>The meter works — nobody on it uses any {noun}. {flagged ? 'No new reading: it goes back in service. ' : ''}It
+                is recorded on the meter; how this meter bills does not change.</>
+              : flagged
+              ? <>The meter was never broken — the household on it uses no {noun}. No new reading: zero use bills $0 and is
+                not flagged again until the meter moves.</>
+              : <>The meter works — the household on it uses no {noun} (away, not plugged in). Zero use bills $0 and is not
+                flagged until the meter moves.</>}
+          </div>
+          {/* 10/12 (review): if the estimates could not be read, "Works" waits —
+              saving without asking would take the landlord's choice away for
+              good (the meter is no longer flagged once it is back). */}
+          {flagged && estimatesFailed && !askVoid && (
+            <div style={{ ...why, color: 'var(--red)' }}>
+              Could not check for estimated charges from while it was flagged.{' '}
+              <button className="btn btn-primary btn-sm" onClick={() => refetchEstimates()}>Try again</button>
+            </div>
+          )}
+          {!askVoid && !askStop && (
+            <button className="btn btn-primary" disabled={save.isLoading || (flagged && (estimatesLoading || estimatesFailed))}
+              onClick={() => flatRate ? setAskStop(true) : waiting > 0 ? setAskVoid(true) : works()}>
+              {worksLabel}
+            </button>
+          )}
+          {askStop && (
+            <div>
+              <div style={{ fontWeight: 600, color: 'var(--text-0)', fontSize: '.85rem', lineHeight: 1.45 }}>
+                Stop the flat charge too?
+              </div>
+              <div style={{ ...why, margin: '6px 0 8px' }}>
+                Yes: {meter.label} bills nothing to the {spaces} space{spaces === 1 ? '' : 's'} on it while it is marked
+                unused, and starts again once it is not. No: it keeps billing as it does now.
+              </div>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button className="btn btn-primary" disabled={save.isLoading} onClick={() => answerStop(true)}>
+                  Yes, stop it
+                </button>
+                <button className="btn btn-primary" disabled={save.isLoading} onClick={() => answerStop(false)}>
+                  No, keep billing it
+                </button>
+              </div>
+            </div>
+          )}
+          {askVoid && estimates && (
+            <div>
+              <div style={{ fontWeight: 600, color: 'var(--text-0)', fontSize: '.85rem', lineHeight: 1.45 }}>
+                Also void the {waiting} unpaid estimated charge{waiting === 1 ? '' : 's'} from while it was
+                flagged ({fmt(estimates.amount)})?
+              </div>
+              <div style={{ ...why, margin: '6px 0 8px' }}>
+                {estimates.charges.map((c, i) => (
+                  <div key={i}>
+                    {monthLabel(c.cycleMonth)} estimate — {fmt(c.amount)}
+                    {c.invoiceNumber ? ` on ${c.invoiceNumber}`
+                      : c.state === 'held' ? ' (held until the lease is signed)' : ' (not on a bill yet)'}
+                  </div>
+                ))}
+                <div style={{ marginTop: 6 }}>
+                  Voided charges stay on record and nobody owes them. Anything already paid is never touched.
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button className="btn btn-primary" disabled={save.isLoading} onClick={() => works(true, stopAnswer)}>
+                  Yes, void {waiting === 1 ? 'it' : 'them'}
+                </button>
+                <button className="btn btn-primary" disabled={save.isLoading} onClick={() => works(false, stopAnswer)}>
+                  No, leave {waiting === 1 ? 'it' : 'them'}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end' }}>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+        </div>
+      </div>
     </div>
   )
 }

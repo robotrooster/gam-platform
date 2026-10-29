@@ -1,17 +1,59 @@
 import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from 'react-query'
-import { humanize, PAYMENT_STATUS_LABEL, type PaymentStatus } from '@gam/shared'
+import {
+  humanize, PAYMENT_STATUS_LABEL, LEASE_STATUS_LABEL, LEASE_DOCUMENT_STATUS_LABEL,
+  type PaymentStatus, type LeaseStatus, type LeaseDocumentStatus,
+} from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
+import { useAuth } from '../context/AuthContext'
 import { PostPaymentForm } from '../components/RecordPaymentWindow'
 import {
-  money, tenantCreditHeadline, tenantCreditLines, toCents, localToday, dayWord, monthTitle, calendarDay, chargeTimeliness,
-  CREDIT_USE_RULE, serverMessage, type TenantCredit,
+  money, tenantCreditHeadline, tenantCreditLines, toCents, localToday, dayWord, monthTitle, calendarDay,
+  CREDIT_USE_RULE, CREDIT_REST_NOT_USABLE, serverMessage, type TenantCredit,
 } from '../lib/creditDesk'
+import { healthColor, healthWord, healthText } from '../lib/paymentStamps'
 import '../styles/credit-desk.css'
+
+/**
+ * 10/14 (Nic): "Only the landlord can fix a birthday." The tenant's birthday
+ * (copied off their signed lease; GAM's happy-birthday email reads it), shown
+ * to the landlord — the owner of a company the person has had a lease with —
+ * with Fix. The tenant cannot change it. Anyone else is refused by the server,
+ * and the row is not shown.
+ */
+function BirthdayRow({ tenantId }: { tenantId: string }) {
+  const { data, isError, refetch } = useQuery(['tenant-birthday', tenantId],
+    () => apiGet<{ dateOfBirth: string | null }>(`/tenants/${tenantId}/birthday`), { retry: false })
+  const [editing, setEditing] = useState(false)
+  const [value, setValue] = useState('')
+  const save = useMutation((dateOfBirth: string | null) => apiPatch(`/tenants/${tenantId}/birthday`, { dateOfBirth }), {
+    onSuccess: () => { setEditing(false); refetch(); toast('Birthday saved.') },
+    onError: (e: any) => toast.error(e?.response?.data?.error || e?.message || 'Could not save the birthday.'),
+  })
+  if (isError || !data) return null
+  const dob = data.dateOfBirth
+  return (
+    <div className="data-row">
+      <span className="data-key">Birthday</span>
+      {editing ? (
+        <span className="data-val" style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input className="input" type="date" value={value} onChange={e => setValue(e.target.value)} aria-label="Birthday" />
+          <button className="btn btn-primary btn-sm" disabled={save.isLoading || !value} onClick={() => save.mutate(value)}>Save</button>
+          <button className="btn btn-ghost btn-sm" onClick={() => setEditing(false)}>Cancel</button>
+        </span>
+      ) : (
+        <span className="data-val" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {dob ? new Date(dob + 'T12:00:00').toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' }) : 'Not on file'}
+          <button className="btn btn-primary btn-sm" onClick={() => { setValue(dob ?? ''); setEditing(true) }}>{dob ? 'Fix' : 'Add'}</button>
+        </span>
+      )}
+    </div>
+  )
+}
 
 /**
  * A charge's status color, one per status. Amber is owed (not paid yet, being
@@ -35,17 +77,48 @@ const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minim
 // view isn't the right surface anymore. Dedicated landlord
 // FlexCharge dashboard lands in S254.
 
+/** 10/13 (Nic): one lease's payment health on the profile (GET /tenants/:id/profile stats.healthByLease). */
+interface LeaseHealthRow {
+  leaseId: string
+  unitNumber: string | null
+  propertyName: string | null
+  current: boolean
+  /** The lease's own status (shared LEASE_STATUSES). */
+  status?: LeaseStatus
+  health: { percent: number | null; onTime: number; counted: number; paidLate: number; partial: number; outstanding: number; label: string; onboardingLeftOut?: boolean } | null
+}
+
+/**
+ * Where one lease stands, beside its health: Current (active), not signed yet
+ * (pending — 10/13 review: a new lease waiting for signatures read "Ended"),
+ * else Ended.
+ */
+export function LeaseHealthBadge({ lease }: { lease: Pick<LeaseHealthRow, 'current' | 'status'> }) {
+  if (lease.current) return <span className="badge badge-green">Current</span>
+  if (lease.status === 'pending') return <span className="badge badge-gold">{LEASE_STATUS_LABEL.pending}</span>
+  return <span className="badge badge-muted">Ended</span>
+}
+
 export function TenantDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const [showPaymentDetail, setShowPaymentDetail] = useState(false)
+  // 10/12: the payment report opens for the owner or "View all payments" (the
+  // route's gate, GET /tenants/:id/payment-report). Staff who see the health
+  // card through the books permission are not offered a report they cannot open.
+  const { can } = usePerms()
+  const opensReport = can('payments.view_all')
   // 10/6 (Nic): the late fee being deleted from the Payment History (one at a time).
   const [deletingFee, setDeletingFee] = useState<string | null>(null)
+  // 10/12 (Nic): the household's Payment History, a page at a time (no 36-row cap).
+  const [historyPage, setHistoryPage] = useState(1)
   // S252: per-tenant FlexCharge query removed alongside the legacy
   // panel. New flex_charge_accounts schema is (customer, property)
   // keyed; consult the FlexCharge dashboard (S254) for per-property
   // account management.
-  const { data, isLoading, error, refetch, isFetching } = useQuery(['tenant-profile', id], () => apiGet<any>(`/tenants/${id}/profile`), {
+  const { data, isLoading, error, refetch, isFetching } = useQuery(['tenant-profile', id, historyPage],
+    () => apiGet<any>(`/tenants/${id}/profile${historyPage > 1 ? `?historyPage=${historyPage}` : ''}`), {
+    // Turning a page keeps the page on screen until the next one arrives.
+    keepPreviousData: true,
     // A refusal or a missing person will not change on a retry: say it once.
     retry: (count: number, e: any) => {
       const status = e?.response?.status
@@ -105,8 +178,23 @@ export function TenantDetailPage() {
   // money figures from the server; the payment cards are left out for them.
   const paymentsHidden = !!data.paymentsHidden
   const currentUnit = units?.find((u: any) => u.isCurrent)
-  const onTimeColor = stats.onTimeRate >= 90 ? 'var(--green)' : stats.onTimeRate >= 75 ? 'var(--amber)' : 'var(--red)'
-  const onTimeLabel = stats.onTimeRate >= 90 ? 'Excellent' : stats.onTimeRate >= 75 ? 'Good' : 'Needs Attention'
+  // 10/12 (Nic): the one payment-health figure — the household's months paid
+  // on time, all time since it joined GAM (null until a month is judged).
+  // 10/13 (Nic): "Tenants list + tenant profile: split health BY LEASE" — each
+  // lease the person is on is its own household with its own figure (the
+  // server's stats.healthByLease, current leases first). One lease: its
+  // figure. Several: each, side by side. None on file: the household's.
+  const byLease: LeaseHealthRow[] = stats.healthByLease ?? []
+  const health = byLease.length === 1 ? (byLease[0].health ?? null) : (stats.health ?? null)
+  const rate: number | null = byLease.length === 1 ? (byLease[0].health?.percent ?? null) : (stats.onTimeRate ?? null)
+  const onTimeColor = healthColor(rate)
+  // 10/13 (Nic): "Keep it out, but say so" — nothing counted yet says why
+  // ("Onboarding month — not counted"), never a bare dash.
+  const onTimeLabel = healthWord(rate, health)
+  const severalLeases = byLease.length > 1
+  /** The report for one lease (that lease's household), or the person's whole one. */
+  const reportFor = (leaseId?: string | null) => `/tenants/${id}/report${leaseId ? `?leaseId=${encodeURIComponent(leaseId)}` : ''}`
+  const singleLeaseId = byLease.length === 1 ? byLease[0].leaseId : null
   return (
     <div>
       <div className="page-header">
@@ -141,12 +229,20 @@ export function TenantDetailPage() {
               { label: 'Tenant Since', val: calendarDay(stats.firstPayment) ? monthTitle(calendarDay(stats.firstPayment)!) : '--', color: 'var(--text-0)' },
               { label: 'Months With You', val: stats.tenantMonths + ' mo', color: 'var(--text-0)' },
               { label: 'Total Paid', val: fmt(stats.totalPaid), color: 'var(--gold)' },
-              { label: 'On-Time Rate', val: stats.onTimeRate + '%', color: onTimeColor, sub: onTimeLabel },
+              severalLeases
+                ? { label: 'Payment Health', val: byLease.map(l => `${l.unitNumber ?? '—'} ${healthText(l.health)}`).join(' · '),
+                    color: 'var(--text-0)', sub: 'by lease' }
+                : rate === null
+                  // Nothing counted yet: the words in the figure's place (no dash, no repeat under it).
+                  ? { label: 'Payment Health', val: onTimeLabel, color: onTimeColor, small: true }
+                  : { label: 'Payment Health', val: rate + '%', color: onTimeColor, sub: onTimeLabel },
               { label: 'Units With You', val: stats.unitsOccupied, color: 'var(--text-0)' },
             ]).map(s => (
               <div key={s.label} className="card" style={{ padding: '14px 16px' }}>
                 <div style={{ fontSize: '.65rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 6 }}>{s.label}</div>
-                <div style={{ fontFamily: 'var(--font-mono)', fontSize: '1rem', fontWeight: 700, color: s.color }}>{s.val}</div>
+                <div style={(s as any).small
+                  ? { fontFamily: 'var(--font-body)', fontSize: '.8rem', fontWeight: 700, color: 'var(--text-2)' }
+                  : { fontFamily: 'var(--font-mono)', fontSize: '1rem', fontWeight: 700, color: s.color }}>{s.val}</div>
                 {(s as any).sub && <div style={{ fontSize: '.65rem', color: s.color, marginTop: 2 }}>{(s as any).sub}</div>}
               </div>
             ))}
@@ -166,29 +262,72 @@ export function TenantDetailPage() {
                   <span className="data-val" style={{ color: (row as any).color }}>{row.val}</span>
                 </div>
               ))}
+              {id && <BirthdayRow tenantId={id} />}
             </div>
-            {/* W-25 (S531): the health card drills into per-payment lateness —
-                aggregate health hides whether "late" meant 2 days or 3 weeks. */}
-            {!paymentsHidden && (
-            <div className="card" style={{ cursor: 'pointer' }} onClick={() => setShowPaymentDetail(true)} title="See how late each payment actually was">
+            {/* W-25 (S531): the health card drills into how late — aggregate
+                health hides whether "late" meant 2 days or 3 weeks. 10/12
+                (Nic): it opens the household's payment report (days past
+                grace, the pattern, partials, every charge). */}
+            {!paymentsHidden && severalLeases && (
+            <div className="card">
+              <div className="card-title" style={{ marginBottom: 14 }}>Payment Health — by lease</div>
+              {byLease.map(l => {
+                const pct = l.health?.percent ?? null
+                const color = healthColor(pct)
+                return (
+                  <div key={l.leaseId} data-lease={l.leaseId} style={{ padding: '10px 0', borderTop: '1px solid var(--border-0)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <div style={{ width: 44, height: 44, borderRadius: '50%', background: 'var(--bg-3)', border: '3px solid ' + color, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.78rem', fontWeight: 800, color }}
+                          title={pct === null ? healthText(l.health) : undefined}>{pct === null ? '—' : `${pct}%`}</span>
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: '.84rem', fontWeight: 700, color: 'var(--text-0)' }}>
+                          {l.unitNumber ?? 'Lease'}{l.propertyName ? ` · ${l.propertyName}` : ''}{' '}
+                          <LeaseHealthBadge lease={l} />
+                        </div>
+                        <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
+                          {/* Nothing counted yet: why, beside the ring's dash (healthText). */}
+                          {l.health?.percent == null ? healthText(l.health) : l.health.label} · since joining GAM
+                          {l.health?.percent != null && l.health.onboardingLeftOut && ' · onboarding month not counted'}
+                          {l.health && ` · ${l.health.paidLate} late, ${l.health.partial} partial, ${l.health.outstanding} outstanding`}
+                        </div>
+                      </div>
+                      {opensReport && (
+                        <button className="btn btn-primary btn-sm" onClick={() => navigate(reportFor(l.leaseId))}>Report</button>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            )}
+            {!paymentsHidden && !severalLeases && (
+            <div className="card" style={{ cursor: opensReport ? 'pointer' : undefined }}
+              onClick={opensReport ? () => navigate(reportFor(singleLeaseId)) : undefined}
+              title={opensReport ? 'Open the full payment report' : undefined}>
               <div className="card-title" style={{ marginBottom: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
                 <span>Payment Health</span>
-                <span style={{ fontSize: '.68rem', color: 'var(--gold)', fontWeight: 600 }}>View detail →</span>
+                {opensReport && <span style={{ fontSize: '.68rem', color: 'var(--gold)', fontWeight: 600 }}>Full report →</span>}
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 16 }}>
-                <div style={{ width: 56, height: 56, borderRadius: '50%', background: onTimeColor + '18', border: '3px solid ' + onTimeColor, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.9rem', fontWeight: 800, color: onTimeColor }}>{stats.onTimeRate}%</span>
+                <div style={{ width: 56, height: 56, borderRadius: '50%', background: 'var(--bg-3)', border: '3px solid ' + onTimeColor, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.9rem', fontWeight: 800, color: onTimeColor }}>{rate === null ? '—' : `${rate}%`}</span>
                 </div>
                 <div>
                   <div style={{ fontSize: '.85rem', fontWeight: 700, color: onTimeColor }}>{onTimeLabel}</div>
-                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>On-time payment rate</div>
+                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
+                    {/* Nothing counted yet: the words above say why; no repeat. */}
+                    {rate === null ? 'Since joining GAM' : `${health?.label ?? 'Months paid on time'} · since joining GAM`}
+                    {rate !== null && health?.onboardingLeftOut && ' · onboarding month not counted'}
+                  </div>
                 </div>
               </div>
               {[
-                { label: 'Settled', val: stats.settledCount },
-                { label: 'Late', val: stats.lateCount },
-                { label: 'Failed', val: stats.failedCount },
-                { label: 'Avg Payment', val: fmt(stats.avgPayment) },
+                { label: 'Months on time', val: health ? `${health.onTime} of ${health.counted}` : '—' },
+                { label: 'Paid late', val: health?.paidLate ?? 0 },
+                { label: 'Partial', val: health?.partial ?? 0 },
+                { label: 'Outstanding', val: health?.outstanding ?? 0 },
               ].map(row => (
                 <div key={row.label} className="data-row">
                   <span className="data-key">{row.label}</span>
@@ -224,22 +363,32 @@ export function TenantDetailPage() {
 
           <PhotosAndNoticesCard tenantId={id!} />
 
-          <CreditCard credit={data.credit ?? null} />
+          <SendForSignatureCard tenantId={id!} />
+
+          <CreditCard credit={data.credit ?? null} tenantId={id!} />
           <PostPaymentCard tenantId={id!} hasUnit={!!currentUnit} name={`${tenant.firstName ?? ''} ${tenant.lastName ?? ''}`.trim() || 'this tenant'} />
           <OneOffChargesCard tenantId={id!} hasUnit={!!currentUnit} />
 
           {!paymentsHidden && (
           <div className="card" style={{ marginBottom: 16 }}>
-            <div className="card-title" style={{ marginBottom: 14 }}>Payment History</div>
+            {/* 10/12 (Nic): "The profile Payment History also gets the 'What it's
+                for' column and covers the household." Every charge, newest first,
+                a page at a time; the full report has them all on one page. */}
+            <div className="card-title" style={{ marginBottom: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+              <span>Payment History — household</span>
+              {opensReport && <button className="btn btn-primary btn-sm" onClick={() => navigate(reportFor(singleLeaseId))}>Full report</button>}
+            </div>
             {payments?.length === 0 ? (
               <div style={{ color: 'var(--text-3)', fontSize: '.82rem' }}>No payments yet.</div>
             ) : (
+              <div style={{ overflowX: 'auto' }}>
               <table className="data-table">
-                <thead><tr><th>Date</th><th>Property</th><th>Unit</th><th>Amount</th><th>Status</th></tr></thead>
+                <thead><tr><th>Date</th><th>What it's for</th><th>Property</th><th>Unit</th><th>Amount</th><th>Status</th></tr></thead>
                 <tbody>
                   {payments?.map((p: any) => (
                     <tr key={p.id}>
                       <td className="mono" style={{ fontSize: '.72rem' }}>{dayWord(p.dueDate, '')}</td>
+                      <td style={{ fontSize: '.78rem' }}>{p.label ?? humanize(p.type)}{p.detail && <div style={{ fontSize: '.66rem', color: 'var(--text-3)' }}>{p.detail}</div>}</td>
                       <td style={{ fontSize: '.78rem' }}>{p.propertyName}</td>
                       <td className="mono">{p.unitNumber}</td>
                       <td className="mono">{fmt(p.amount)}</td>
@@ -256,7 +405,9 @@ export function TenantDetailPage() {
                   ))}
                 </tbody>
               </table>
+              </div>
             )}
+            <HistoryPager page={data.paymentsPage} busy={isFetching} onPage={setHistoryPage} />
           </div>
           )}
 
@@ -285,71 +436,6 @@ export function TenantDetailPage() {
         </div>
       )}
 
-      {showPaymentDetail && (
-        <PaymentTimelinessModal payments={payments || []} tenantName={`${tenant.firstName} ${tenant.lastName}`} onClose={() => setShowPaymentDetail(false)} />
-      )}
-    </div>
-  )
-}
-
-// W-25 (S531): per-payment timeliness drill-in. Days late = settled_at vs
-// due_date (day-sliced per the date-serialization rule); unpaid past-due rows
-// show days overdue against today.
-function PaymentTimelinessModal({ payments, tenantName, onClose }: { payments: any[]; tenantName: string; onClose: () => void }) {
-  // The day it settled is read on this device's calendar (a payment at 6 pm in
-  // Phoenix is already "tomorrow" in UTC), the due day as the calendar day it
-  // is; a payment still clearing, or paid from the deposit, is never "overdue",
-  // and every status is said in words (lib/creditDesk chargeTimeliness).
-  const TONE_BADGE = { good: 'badge-green', warn: 'badge-amber', bad: 'badge-red', info: 'badge-blue', muted: 'badge-muted' } as const
-  const rows = payments.map((p: any) => {
-    const t = chargeTimeliness(p)
-    return { ...p, due: t.due, settled: t.settled, late: t.late, label: t.label, cls: TONE_BADGE[t.tone] }
-  })
-  const settledRows = rows.filter(r => r.status === 'settled' && r.due && r.settled)
-  const onTime = settledRows.filter(r => r.late === 0).length
-  const worst = settledRows.reduce((m, r) => Math.max(m, r.late), 0)
-  const avgLate = (() => {
-    const lateOnes = settledRows.filter(r => r.late > 0)
-    if (!lateOnes.length) return 0
-    return Math.round(lateOnes.reduce((s2, r) => s2 + r.late, 0) / lateOnes.length)
-  })()
-
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ maxWidth: 640 }} onClick={e => e.stopPropagation()}>
-        <div className="modal-title">Payment Timeliness — {tenantName}</div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10, marginBottom: 14 }}>
-          {[
-            { label: 'Paid on time', val: `${onTime} of ${settledRows.length}`, color: 'var(--green)' },
-            { label: 'Avg days late (when late)', val: avgLate ? `${avgLate}d` : '—', color: avgLate > 7 ? 'var(--red)' : 'var(--amber)' },
-            { label: 'Worst', val: worst ? `${worst}d late` : '—', color: worst > 7 ? 'var(--red)' : worst ? 'var(--amber)' : 'var(--text-3)' },
-          ].map(k => (
-            <div key={k.label} style={{ background: 'var(--bg-3)', borderRadius: 10, padding: '10px 12px' }}>
-              <div style={{ fontSize: '.62rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>{k.label}</div>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.95rem', fontWeight: 700, color: k.color }}>{k.val}</div>
-            </div>
-          ))}
-        </div>
-        <div style={{ maxHeight: 380, overflowY: 'auto' }}>
-          <table className="data-table">
-            <thead><tr><th>Due</th><th>Paid</th><th>Amount</th><th>Type</th><th>Timeliness</th></tr></thead>
-            <tbody>
-              {rows.map((r: any) => (
-                <tr key={r.id}>
-                  <td className="mono" style={{ fontSize: '.72rem' }}>{r.due ? dayWord(r.due, '') : '—'}</td>
-                  <td className="mono" style={{ fontSize: '.72rem' }}>{r.settled ? dayWord(r.settled, '') : '—'}</td>
-                  <td className="mono">{r.amount != null ? `$${Number(r.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })}` : '—'}</td>
-                  <td style={{ fontSize: '.72rem', textTransform: 'uppercase', color: 'var(--text-3)' }}>{humanize(r.type)}</td>
-                  <td><span className={`badge ${r.cls}`}>{r.label}</span></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <div className="modal-footer">
-          <button className="btn btn-ghost" onClick={onClose}>Close</button>
-        </div>
-      </div>
     </div>
   )
 }
@@ -539,16 +625,67 @@ function AddChargeModal({ tenantId, onClose, onSaved }: {
 
 /**
  * S655 (Nic, 10/2): "ALL the credit on their account, and what of it would pay
- * their bills right now" — they differ (paid-ahead money stops at a monthly
- * draw limit, credit pays only your own rent, utilities and fees, and credit
- * tied to one lease pays only that lease). The balance itself is never netted;
- * the credit is used when they (or the desk, for them) say so, and pays a bill
- * by itself only when it covers that whole bill. Only a viewer who may see
- * payments, or the desk that takes them, is sent these figures (tenants.ts).
+ * their bills right now" — they differ (money paid ahead stops at a monthly
+ * draw limit and pays only the space it was paid for, deposit interest only
+ * that space, and credit pays only your own rent, utilities and fees). The
+ * balance itself is never netted; the credit is used when they (or the desk,
+ * for them) say so, and pays a bill by itself only when it covers that whole
+ * bill. Only a viewer who may see payments, or the desk that takes them, is
+ * sent these figures (tenants.ts).
+ *
+ * 10/18 (Nic): "we need to undo credit, but no undoing payments that were
+ * actually real money handed over." Under the figures, every credit this
+ * company gave this person, with Undo on each one that can still be taken back
+ * — the owner or a property manager only, and the server refuses in plain
+ * words the moment real money has landed on a bill the credit paid.
  */
-function CreditCard({ credit }: { credit: TenantCredit | null }) {
+/** One credit this company gave this person, as the credits list serves it. */
+interface GivenCredit {
+  id: string
+  amountOriginal: number | string
+  createdAt: string
+  reason: string | null
+  canUndo: boolean
+}
+
+function CreditCard({ credit, tenantId }: { credit: TenantCredit | null; tenantId: string }) {
   const headline = tenantCreditHeadline(credit)
-  if (!credit || !headline) return null
+  const { isOwner } = usePerms()
+  const { user } = useAuth()
+  // The same authority as issuing one (routes/tenantCredits): owner or property
+  // manager. A bookkeeper never acts on a tenant's account (10/12, Nic).
+  const canUndoHere = isOwner || user?.role === 'property_manager'
+  const given = useQuery<GivenCredit[]>(['tenant-credits-given', tenantId],
+    () => apiGet<GivenCredit[]>(`/tenant-credits?tenantId=${tenantId}`),
+    { enabled: canUndoHere, retry: false })
+  const undoable = (given.data ?? []).filter(c => c.canUndo === true)
+  // 10/18 review fix: the credit that MOST needs undoing is the one that is
+  // gone — since 10/15 a credit lands on the open balance the moment it is
+  // given, so a credit that paid bills leaves nothing on the account. The
+  // figures card hides itself when nothing is left; the list of credits you
+  // gave must not hide with it, or the only way back is the green notice on
+  // the Payments page and it is gone as soon as you navigate away.
+  return (
+    <>
+      {credit && headline && <AccountCreditFigures credit={credit} headline={headline} />}
+      {undoable.length > 0 && (
+        <div className="card cd-credit-card" style={{ marginBottom: 16 }}>
+          <div className="card-title" style={{ marginBottom: 10 }}>Credit you gave</div>
+          <div className="cd-note" style={{ marginBottom: 8 }}>
+            Taking one back puts whatever it has already paid back to owed. It is refused if real money has
+            landed on any of those bills.
+          </div>
+          {undoable.map(c => (
+            <UndoCreditRow key={c.id} credit={c} onDone={() => { void given.refetch() }} />
+          ))}
+        </div>
+      )}
+    </>
+  )
+}
+
+/** The figures themselves: all the credit on the account, and what of it could pay a bill now. */
+function AccountCreditFigures({ credit, headline }: { credit: TenantCredit; headline: string }) {
   const lines = tenantCreditLines(credit)
   // Part of it can pay their bills and part cannot: say why the rest cannot.
   const someNotUsable = toCents(credit.usable) > 0 && toCents(credit.usable) < toCents(credit.total)
@@ -564,8 +701,50 @@ function CreditCard({ credit }: { credit: TenantCredit | null }) {
       ))}
       <div className="cd-note" style={{ marginTop: 10 }}>
         {CREDIT_USE_RULE}
-        {someNotUsable && ' The rest cannot pay these bills: paid-ahead money stops at its monthly limit, credit pays only your own rent, utilities and fees, and credit tied to one lease pays only that lease.'}
+        {someNotUsable && CREDIT_REST_NOT_USABLE}
       </div>
+    </div>
+  )
+}
+
+/**
+ * One credit the landlord gave, with Undo. 10/18 (Nic): the whole credit comes
+ * back or none of it does, so there is one button and no amount box — and the
+ * question names what it will do, because what the credit already paid goes
+ * back to owed.
+ */
+function UndoCreditRow({ credit, onDone }: { credit: GivenCredit; onDone: () => void }) {
+  const [busy, setBusy] = useState(false)
+  const undo = async () => {
+    const ok = await appConfirm(
+      `Undo the ${money(credit.amountOriginal)} credit? `
+      + 'Whatever it has already paid goes back to owed, and those bills are late from their own due dates again — '
+      + 'as if the credit had never been given. It is refused if real money has landed on any of them.',
+      { title: 'Undo this credit', confirmLabel: 'Undo the credit', danger: true },
+    )
+    if (!ok) return
+    setBusy(true)
+    try {
+      const r = await apiPost<any>(`/tenant-credits/${credit.id}/undo`, {})
+      toast(r?.data?.message ?? 'The credit was undone.')
+      onDone()
+    } catch (e) {
+      toast.error(serverMessage(e, 'Could not undo the credit.'))
+    } finally { setBusy(false) }
+  }
+  const reason = String(credit.reason ?? '').trim()
+  return (
+    <div className="data-row">
+      <span className="data-key">
+        {dayWord(calendarDay(credit.createdAt), '')}
+        {reason ? ` — ${reason}` : ''}
+      </span>
+      <span className="data-val" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <span className="mono">{money(credit.amountOriginal)}</span>
+        <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => { void undo() }}>
+          {busy ? 'Undoing…' : 'Undo'}
+        </button>
+      </span>
     </div>
   )
 }
@@ -605,6 +784,217 @@ function PostPaymentCard({ tenantId, hasUnit, name }: { tenantId: string; hasUni
 }
 
 
+
+/**
+ * ─────────────────────────────────────────────────────────────
+ * 10/20 (Nic) — SEND A DOCUMENT FOR SIGNATURE, FROM THE RESIDENT'S OWN FILE
+ * ─────────────────────────────────────────────────────────────
+ *
+ * Blu built a work-trade form for Mattoon with a landlord box and a tenant box
+ * and could not get it signed. Nic, on how he would expect to do it: "can he
+ * just go into Curtis's file, add a template that way, and have it signed to
+ * him? Like, there's some sort of broken flow there that we need to get fixed."
+ *
+ * So: the form, and press send. GAM fills the seats — the resident is the
+ * Primary Tenant, whoever signs for the landlord is the Landlord, the rest of
+ * their household takes the co-tenant boxes — because knowing what a signer
+ * role is was the old price of getting a document signed, and it is not a thing
+ * a park manager should ever have to learn.
+ *
+ * Everything this card says about who signs comes from the server
+ * (GET /esign/resident-forms/:tenantId), which is the same reading the create
+ * runs. A form whose boxes cannot be filled from here — one with a witness, a
+ * seller — is shown as not sendable from this page, with the screen that CAN
+ * send it named. A box offered is a box somebody can be put in.
+ */
+interface ResidentFormSeat { role: string; label: string; name: string }
+interface ResidentForm {
+  id: string
+  name: string
+  purposeLabel: string | null
+  suggestedTitle: string
+  willSign: ResidentFormSeat[]
+  leftOff: Array<{ role: string; label: string }>
+  sendable: boolean
+  reason: string | null
+}
+interface ResidentSigning {
+  resident: { name: string; unitLabel: string | null; propertyName: string | null }
+  forms: ResidentForm[]
+  documents: Array<{ id: string; title: string; status: string; waitingOn: string | null; createdAt: string }>
+}
+
+const SIGNING_DOC_BADGE: Record<string, string> = {
+  pending: 'badge-muted',
+  sent: 'badge-amber',
+  in_progress: 'badge-amber',
+  completed: 'badge-green',
+  execution_failed: 'badge-red',
+}
+
+function SendForSignatureCard({ tenantId }: { tenantId: string }) {
+  const { can } = usePerms()
+  const maySend = can('esign.send')
+  const [sending, setSending] = useState(false)
+  const { data, refetch } = useQuery<ResidentSigning>(
+    ['resident-signing', tenantId],
+    () => apiGet<ResidentSigning>(`/esign/resident-forms/${tenantId}`),
+    { enabled: maySend, retry: false },
+  )
+  if (!maySend) return null
+
+  const forms = data?.forms ?? []
+  const docs = data?.documents ?? []
+
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card-title" style={{ marginBottom: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+        <span>Documents for signature</span>
+        <button className="btn btn-primary btn-sm" onClick={() => setSending(true)}>Send a document for signature</button>
+      </div>
+      {docs.length === 0 ? (
+        <div style={{ color: 'var(--text-3)', fontSize: '.82rem' }}>
+          Nothing out for signature. Agreements you send from here — a work-trade agreement, park
+          rules, any form of yours — show up in this list. A lease is sent from the Leases screen.
+        </div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {docs.map(d => (
+            <div key={d.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderRadius: 10, background: 'var(--bg-2)', border: '1px solid var(--border-0)' }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.title}</div>
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
+                  {new Date(d.createdAt).toLocaleDateString()}
+                  {d.status !== 'completed' && d.waitingOn ? ` · waiting on ${d.waitingOn}` : ''}
+                </div>
+              </div>
+              <span className={`badge ${SIGNING_DOC_BADGE[d.status] ?? 'badge-muted'}`}>
+                {LEASE_DOCUMENT_STATUS_LABEL[d.status as LeaseDocumentStatus] ?? humanize(d.status)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {sending && (
+        <SendForSignatureModal
+          tenantId={tenantId}
+          residentName={data?.resident?.name ?? 'this resident'}
+          forms={forms}
+          onClose={() => setSending(false)}
+          onSent={() => { setSending(false); refetch() }}
+        />
+      )}
+    </div>
+  )
+}
+
+function SendForSignatureModal({ tenantId, residentName, forms, onClose, onSent }: {
+  tenantId: string
+  residentName: string
+  forms: ResidentForm[]
+  onClose: () => void
+  onSent: () => void
+}) {
+  const sendable = forms.filter(f => f.sendable)
+  const [formId, setFormId] = useState(sendable.length === 1 ? sendable[0].id : '')
+  const [title, setTitle] = useState(sendable.length === 1 ? sendable[0].suggestedTitle : '')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const chosen = forms.find(f => f.id === formId) ?? null
+
+  const pick = (f: ResidentForm) => {
+    if (!f.sendable) return
+    setFormId(f.id)
+    setTitle(f.suggestedTitle)
+  }
+
+  const send = async () => {
+    if (!chosen) return
+    setBusy(true); setError('')
+    try {
+      const created: any = await apiPost('/esign/resident-documents', {
+        tenantId, templateId: chosen.id, title: title.trim() || undefined,
+      })
+      // The same second step New Contract takes: sending is what mails each
+      // signer their link, and what invites anyone who has not set a password.
+      await apiPost(`/esign/documents/${created.data.id}/send`, {})
+      const who = (created.data.willSign ?? chosen.willSign).map((s: ResidentFormSeat) => s.name).join(' and ')
+      toast(`Sent for signature to ${who}.`)
+      onSent()
+    } catch (e: any) {
+      setError(e?.response?.data?.error || e?.message || 'Could not send that document.')
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal" style={{ maxWidth: 520, maxHeight: '90vh', overflowY: 'auto' }}>
+        <div className="modal-title">Send a document for signature</div>
+        <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.6 }}>
+          Pick one of your forms. {residentName} is filled in as the tenant and you as the landlord,
+          so there is nothing to set up — press send and each of you gets a link to sign.
+        </div>
+
+        {forms.length === 0 ? (
+          <div style={{ fontSize: '.8rem', color: 'var(--text-2)', lineHeight: 1.6 }}>
+            You have no forms to send yet. Build one in GoldSign → Templates — upload the PDF and
+            place a signature box for you and one for the tenant — then come back here.
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 14 }}>
+            {forms.map(f => (
+              <label key={f.id}
+                style={{ display: 'flex', alignItems: 'flex-start', gap: 9, padding: '9px 11px', borderRadius: 10,
+                         background: f.id === formId ? 'var(--bg-3)' : 'var(--bg-2)',
+                         border: `1px solid ${f.id === formId ? 'var(--gold)' : 'var(--border-0)'}`,
+                         cursor: f.sendable ? 'pointer' : 'default', opacity: f.sendable ? 1 : .72 }}>
+                <input type="radio" name="resident-form" style={{ marginTop: 3 }}
+                  checked={f.id === formId} disabled={!f.sendable} onChange={() => pick(f)} />
+                <span style={{ minWidth: 0 }}>
+                  <span style={{ fontSize: '.82rem', fontWeight: 600, color: 'var(--text-0)' }}>{f.name}</span>
+                  {f.purposeLabel && (
+                    <span style={{ fontSize: '.7rem', color: 'var(--text-3)', marginLeft: 6 }}>{f.purposeLabel}</span>
+                  )}
+                  <span style={{ display: 'block', fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2, lineHeight: 1.5 }}>
+                    {f.sendable
+                      ? `Signed by ${f.willSign.map(s => `${s.name} (${s.label})`).join(' and ')}.`
+                      : f.reason}
+                  </span>
+                  {f.sendable && f.leftOff.length > 0 && (
+                    <span style={{ display: 'block', fontSize: '.72rem', color: 'var(--amber)', marginTop: 2, lineHeight: 1.5 }}>
+                      {f.leftOff.map(r => r.label).join(' and ')} {f.leftOff.length === 1 ? 'has' : 'have'} nobody
+                      on this lease, so {f.leftOff.length === 1 ? 'that box is' : 'those boxes are'} left off.
+                    </span>
+                  )}
+                </span>
+              </label>
+            ))}
+          </div>
+        )}
+
+        {chosen && (
+          <>
+            <label style={{ fontSize: '.75rem', color: 'var(--text-3)', margin: '0 0 4px', display: 'block' }}>
+              What to call it <span style={{ color: 'var(--text-3)' }}>(both of you see this)</span>
+            </label>
+            <input className="form-input" value={title} maxLength={160}
+              onChange={e => setTitle(e.target.value)} />
+          </>
+        )}
+
+        {error && <div style={{ marginTop: 12, fontSize: '.78rem', color: 'var(--red)' }}>{error}</div>}
+
+        <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>
+          <button className="btn btn-primary" disabled={!chosen || busy || !title.trim()} onClick={send}>
+            {busy ? 'Sending…' : 'Send for signature'}
+          </button>
+          <button className="btn btn-ghost" disabled={busy} onClick={onClose}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // S652 (Nic): the posted notices and record photos on this resident's file —
 // what a maintenance worker (or anyone with the permission) added from the
 // Photos & Notices screen. Read here; taken there.
@@ -639,6 +1029,32 @@ function PhotosAndNoticesCard({ tenantId }: { tenantId: string }) {
           ))}
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * 10/12 (Nic): which charges of the household's Payment History are showing,
+ * and the way to the newer or older ones (the server sends a page at a time).
+ */
+export function HistoryPager({ page, busy, onPage }: {
+  page?: { page: number; pageSize: number; total: number } | null
+  busy: boolean
+  onPage: (n: number) => void
+}) {
+  if (!page || page.total <= page.pageSize) return null
+  const pages = Math.max(1, Math.ceil(page.total / page.pageSize))
+  const first = (page.page - 1) * page.pageSize + 1
+  const last = Math.min(page.total, page.page * page.pageSize)
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginTop: 12, flexWrap: 'wrap' }}>
+      <span style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>
+        {first > page.total ? `No charges on this page — ${page.total} in all` : `Charges ${first}–${last} of ${page.total}, newest first`}
+      </span>
+      <span style={{ display: 'flex', gap: 8 }}>
+        <button className="btn btn-primary btn-sm" disabled={busy || page.page <= 1} onClick={() => onPage(page.page - 1)}>Newer</button>
+        <button className="btn btn-primary btn-sm" disabled={busy || page.page >= pages} onClick={() => onPage(page.page + 1)}>Older</button>
+      </span>
     </div>
   )
 }

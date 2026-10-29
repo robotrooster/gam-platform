@@ -79,6 +79,8 @@ import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
+import { readFileSync } from 'fs'
+import { join } from 'path'
 import { db, query } from '../db'
 import { PERMISSION_CATALOG, priceStay, processingFeeFor, STAY_REFUND_PART_STATUSES } from '@gam/shared'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
@@ -392,6 +394,106 @@ describe('the quote: one question, decided on the server', () => {
     expect((await request(app()).post(`/api/pos/transactions/${mixed}/refund`).set('Authorization', `Bearer ${g.token}`)
       .send({ amount: 100, refundMethod: 'cash' })).status).toBe(200)
     expect((await getQuote(g, b2)).body.data).toMatchObject({ paid: 300, question: 'overpaid', unused: 60, maxRefund: 300 })
+  })
+})
+
+// ─── A long-term guest leaving part-way into a month ──────────────────────────
+
+/**
+ * 10/18 (Nic): "if somebody stays for, I don't know, six months or so, and
+ * they're at the monthly rate, when they go to move out, I want that prorated
+ * amount to be divided by the 30 days or whatever ... it would need to be
+ * about a 50% refund, not calculated off the weekly rate. Because I don't want
+ * to do that to people that are, you know, long-term good customers."
+ *
+ * The days a guest who has been here whole months actually stayed are those
+ * months plus a prorated share of the one they left part-way into, whenever
+ * that comes to less than the weeks-and-nights ladder (shared
+ * priceNightsStayed). The site Nic was looking at: $55 a night, $286 a week,
+ * $589 a month.
+ */
+describe("a long-term guest's last days are prorated, not re-rated", () => {
+  const SITE = { nightly: 55, weekly: 286, monthly: 589 }
+  /** The seeded site, at Nic's rates. */
+  const atNicsRates = (f: F) =>
+    query(`UPDATE units SET nightly_rate = 55, weekly_rate = 286, monthly_rate = 589 WHERE id = $1`, [f.unitId])
+
+  it('four months in, leaving 14 days into the fifth: about half a month back, not $17', async () => {
+    const f = await seed()
+    await atNicsRates(f)
+    // In May 18, booked to Oct 18 — five whole months, $2,945, paid up front.
+    const booked = priceStay(SITE, 0, '2026-05-18', 153).total
+    expect(booked).toBe(2945)
+    const b = await stay(f, { checkIn: '2026-05-18', checkOut: '2026-10-18', total: booked, leaseType: 'month_to_month' })
+    await paySale(f, b, { method: 'cash', toward: booked })
+
+    // They leave today, 137 nights in: four whole months (123 nights) and 14
+    // days of the fifth. Those 14 days used to be re-rated as two weeks at
+    // $286 = $572, which left $17.00 to give back. They are now 14 ÷ 30 of the
+    // month (Sep 18 → Oct 18 is 30 days) = $274.87.
+    expect(priceStay(SITE, 0, '2026-05-18', 137).total).toBe(2928)
+    const q = (await getQuote(f, b)).body.data
+    expect(q).toMatchObject({
+      early: true, question: 'overpaid', paid: 2945,
+      booked: { checkOut: '2026-10-18', nights: 153, price: 2945 },
+      stayed: { checkOut: TODAY, nights: 137, worth: 2630.87 },
+      unused: 314.13, maxRefund: 2945,
+    })
+    // About half a month ($294.50), as Nic asked — not the $17.00 the ladder left.
+    expect(q.choices.map((c: any) => [c.choice, c.label])).toEqual([
+      ['no_refund', 'No refund (keep the price as booked)'],
+      ['refund_unused', 'Refund the unused nights ($314.13)'],
+      ['refund_other', 'Refund a different amount'],
+    ])
+
+    const out = await decide(f, b, { choice: 'refund_unused' })
+    expect(out.status, JSON.stringify(out.body)).toBe(200)
+    expect(out.body.data.words[0]).toBe('Hand back $314.13 in cash now.')
+    expect(await parts(b)).toEqual([
+      expect.objectContaining({ kind: 'cash', status: 'handed_back', amount: '314.13' }),
+    ])
+    expect(await decisions(b)).toEqual([
+      { status: 'decided', question: 'overpaid', choice: 'refund_unused', b: '2945.00', s: '2630.87', p: '2945.00', refunded: '314.13' },
+    ])
+    // A refund re-prices nothing, and the stay closes with nothing owed.
+    expect(await row(b)).toMatchObject({ status: 'checked_out', check_out: TODAY, total: '2945.00' })
+    expect(await owed(b)).toBe(0)
+  })
+
+  it('the same guest still owing: "Charge only the nights stayed" sells the months plus the prorated days', async () => {
+    const f = await seed()
+    await atNicsRates(f)
+    const b = await stay(f, { checkIn: '2026-05-18', checkOut: '2026-10-18', total: 2945, leaseType: 'month_to_month' })
+    // They have paid the four months they used, nothing toward the fifth.
+    await paySale(f, b, { method: 'cash', toward: 2356 })
+    const q = (await getQuote(f, b)).body.data
+    expect(q).toMatchObject({ question: 'owes', paid: 2356, stayed: { nights: 137, worth: 2630.87 } })
+    expect(q.choices.map((c: any) => [c.choice, c.label, c.result])).toEqual([
+      ['keep_price', 'Keep the price as booked', 'They will owe $589.00'],
+      // The prorated days, not two weeks: $274.87 to settle, not $572.00.
+      ['nights_only', 'Charge only the nights stayed (137 nights, $2,630.87)', 'They will owe $274.87'],
+    ])
+    expect((await decide(f, b, { choice: 'nights_only' })).status).toBe(200)
+    expect(await row(b)).toMatchObject({ total: '2630.87', booked_check_out: TODAY, check_out: TODAY })
+    expect(await owed(b)).toBe(274.87)
+  })
+
+  it('a stay that never reached a whole month is unchanged, and the booked price is still the ceiling', async () => {
+    // 14 nights from day one are still two weeks at $286 — Nic: "No, that's fine."
+    const f = await seed()
+    await atNicsRates(f)
+    const b = await stay(f, { checkIn: '2026-09-25', checkOut: '2026-10-09', total: 572 })
+    await paySale(f, b, { method: 'cash', toward: 572 })
+    // Left today, 7 nights in: one week, $286.
+    expect((await getQuote(f, b)).body.data).toMatchObject({ stayed: { nights: 7, worth: 286 }, unused: 286 })
+
+    // The ceiling (#38 Q7): a site whose rates were raised after the stay was
+    // sold never makes the nights stayed worth more than the booked price.
+    const g = await seed()
+    await atNicsRates(g)
+    const b2 = await stay(g, { checkIn: '2026-05-18', checkOut: '2026-10-18', total: 1200, leaseType: 'month_to_month' })
+    await paySale(g, b2, { method: 'cash', toward: 1200 })
+    expect((await getQuote(g, b2)).body.data).toMatchObject({ stayed: { nights: 137, worth: 1200 }, question: 'none' })
   })
 })
 
@@ -1161,7 +1263,9 @@ describe('a long stay on a lease', () => {
     expect(out.body.data.next).toBe('decide')
     const lease = await query<any>(`SELECT to_char(end_date, 'YYYY-MM-DD') AS end_date FROM leases WHERE id = $1`, [leaseId])
     expect(lease[0].end_date).toBe(TODAY)
-    expect(await query(`SELECT 1 FROM payments WHERE lease_id = $1 AND due_date = '2026-11-01'`, [leaseId])).toHaveLength(0)
+    // 10/12 (Nic): November's rent is voided as a record, never deleted.
+    expect(await query(`SELECT status FROM payments WHERE lease_id = $1 AND due_date = '2026-11-01'`, [leaseId]))
+      .toEqual([{ status: 'voided' }])
     const fresh = out.body.data.quote
     expect(fresh).toMatchObject({ checkedOut: true, question: 'overpaid', unused: 1451.61 })
     // The newest rent payment first: October's card.
@@ -1201,6 +1305,72 @@ describe('a long stay on a lease', () => {
     expect(h.refundsCreate).not.toHaveBeenCalled()
     await settle()
   })
+  /**
+   * 10/18 (Nic): "if the landlord does refunds at all at that property."
+   * 10/19 (review): the sentence the clerk reads BEFORE confirming promised a
+   * refund at every property — and at a park that gives none the very next
+   * screen said the opposite, after the guest had already been told. And a
+   * question already open there could never be answered at all: no choices, no
+   * button, and an owner to-do that never cleared.
+   *
+   * 20261020120000 has not reached production, so it is applied here the way
+   * the runner will. It is idempotent.
+   */
+  const noMoneyBackHere = async (f: F) => {
+    await query(readFileSync(join(__dirname, '..', 'db', 'migrations',
+      '20261020120000_leaving_early_is_the_propertys_call.sql'), 'utf8'))
+    await query(`UPDATE properties SET early_departure_refunds = FALSE WHERE id = $1`, [f.propertyId])
+  }
+
+  it('refunds OFF: the clerk is never told a refund is coming, and the money simply stays on account', async () => {
+    const f = await seed()
+    const { b, leaseId } = await longStay(f)
+    await noMoneyBackHere(f)
+    expect((await getQuote(f, b)).body.data.lease).toEqual({ id: leaseId, endsOn: TODAY,
+      words: 'Checking Jane Doe out ends their lease on October 2, 2026, the day they left, and their final bill '
+        + 'is made. Rent already paid past that day stays on their account as money paid ahead and pays that '
+        + 'bill first — this property does not give money back when someone leaves early.' })
+
+    const out = await decide(f, b, { choice: null })
+    expect(out.status, JSON.stringify(out.body)).toBe(200)
+    // Nothing waits, no to-do, and the money paid ahead is where it already was.
+    expect(await decisions(b)).toEqual([])
+    expect(await query(`SELECT 1 FROM notifications WHERE landlord_id = $1 AND type = 'stay_money_decision'`,
+      [f.landlordId])).toHaveLength(0)
+    expect(await query<any>(`SELECT amount_remaining::text FROM lease_prepaid_credits WHERE lease_id = $1`, [leaseId]))
+      .toEqual([{ amount_remaining: '1451.61' }])
+    const after = (await getQuote(f, b)).body.data
+    expect(after).toMatchObject({ question: 'none', choices: [] })
+    expect(after.noRefunds).toBe(
+      'Jane Doe had paid $1,451.61 of rent past the day they left. This property does not give money back '
+      + 'when someone leaves early, so it stays on their account as money paid ahead and pays their final bill '
+      + "first. The property's settings are where that changes.")
+    expect(h.refundsCreate).not.toHaveBeenCalled()
+  })
+
+  it('refunds turned OFF after the question was asked: the owner can still clear it, and no money goes out', async () => {
+    const f = await seed()
+    const { b, leaseId } = await longStay(f)
+    // A clerk who cannot issue refunds checks them out: the money waits, and
+    // the owner gets a to-do.
+    const desk = await staff(f, { 'guests.check_out': true })
+    expect((await decide(f, b, { choice: null }, desk)).body.data.next).toBe('waits')
+    expect(await decisions(b)).toEqual([expect.objectContaining({ status: 'pending', question: 'overpaid' })])
+
+    await noMoneyBackHere(f)
+    const q = (await getQuote(f, b)).body.data
+    expect(q).toMatchObject({ checkedOut: true, question: 'overpaid', unused: 1451.61, maxRefund: 0 })
+    expect(q.choices.map((c: any) => c.choice)).toEqual(['no_refund'])
+    expect(q.noRefunds).toContain('does not give money back')
+
+    const out = await decide(f, b, { choice: 'no_refund' })
+    expect(out.status, JSON.stringify(out.body)).toBe(200)
+    expect(await decisions(b)).toEqual([expect.objectContaining({ status: 'decided', choice: 'no_refund', refunded: '0.00' })])
+    expect(await query<any>(`SELECT amount_remaining::text, voided_at IS NULL AS live FROM lease_prepaid_credits WHERE lease_id = $1`, [leaseId]))
+      .toEqual([{ amount_remaining: '1451.61', live: true }])
+    expect(h.refundsCreate).not.toHaveBeenCalled()
+  })
+
   it('if the lease cannot be ended that day, nobody is told it was: GAM and the owner are told once, and opening the stay ends it', async () => {
     const f = await seed()
     const { b, leaseId } = await longStay(f)
@@ -1552,5 +1722,296 @@ describe('one list of refund part statuses', () => {
       `SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conname = 'stay_refund_parts_status_check'`))[0].d
     const allowed = [...def.matchAll(/'([a-z_]+)'::text/g)].map((m) => m[1]).sort()
     expect(allowed).toEqual([...STAY_REFUND_PART_STATUSES].sort())
+  })
+})
+
+// ─── 10/18 (Nic): the two departure answers are the PROPERTY's ───────────────
+
+/**
+ * "refunds are pro rated to the next price down ... if the landlord does
+ * refunds at all at that property. the only way it is different is for longer
+ * term people for rent pro ration. moving in or out at the middle of a month
+ * and also only if the landlord allows the pro rate. these should all be
+ * property level settings."
+ *
+ * Both answers default to what every property already does — money back, and
+ * proration — so every test above this line is a property at the default and
+ * asserts today's behavior unchanged. These cover a park that answers No.
+ *
+ * The migration that adds the columns (20261020120000) has NOT been applied to
+ * production, so it is applied here the way the runner will — the same pattern
+ * stayTaxOneHomeMigration.test.ts uses. It is idempotent, so running it before
+ * each test in this block is a no-op after the first.
+ */
+describe('when someone leaves early, the property decides', () => {
+  const DEPARTURE_RULES_MIGRATION = join(__dirname, '..', 'db', 'migrations',
+    '20261020120000_leaving_early_is_the_propertys_call.sql')
+
+  beforeEach(async () => {
+    await query(readFileSync(DEPARTURE_RULES_MIGRATION, 'utf8'))
+  })
+
+  /** Nic's site: $55 a night, $286 a week, $589 a month. */
+  const SITE = { nightly: 55, weekly: 286, monthly: 589 }
+  const atNicsRates = (f: F) =>
+    query(`UPDATE units SET nightly_rate = 55, weekly_rate = 286, monthly_rate = 589 WHERE id = $1`, [f.unitId])
+  const answers = (f: F, a: { refunds?: boolean; prorates?: boolean }) =>
+    query(`UPDATE properties SET early_departure_refunds = COALESCE($2, early_departure_refunds),
+                                 prorates_mid_month_rent = COALESCE($3, prorates_mid_month_rent)
+            WHERE id = $1`, [f.propertyId, a.refunds ?? null, a.prorates ?? null])
+
+  it('a brand new property answers Yes to both — nothing changes until the landlord says otherwise', async () => {
+    const f = await seed()
+    const row = (await query<any>(
+      `SELECT early_departure_refunds, prorates_mid_month_rent FROM properties WHERE id = $1`, [f.propertyId]))[0]
+    expect(row).toEqual({ early_departure_refunds: true, prorates_mid_month_rent: true })
+  })
+
+  // ── "if the landlord does refunds at all at that property" ────────────────
+
+  it('refunds OFF: no refund is offered, the price stands, and the desk is told why', async () => {
+    const f = await seed()
+    await answers(f, { refunds: false })
+    // A week paid at $286; they leave after 4 nights, worth $220 at the nightly
+    // rate (the next price down). At a park that gives money back that is $66
+    // to decide; here it is nothing.
+    const b = await stay(f, { checkIn: '2026-09-28', checkOut: '2026-10-05', total: 286 })
+    await query(`UPDATE units SET nightly_rate = 55, weekly_rate = 286 WHERE id = $1`, [f.unitId])
+    await paySale(f, b, { method: 'cash', toward: 286 })
+
+    const q = (await getQuote(f, b)).body.data
+    expect(q).toMatchObject({
+      early: true, question: 'none', choices: [], paid: 286,
+      booked: { checkOut: '2026-10-05', price: 286 },
+      stayed: { nights: 4, worth: 220 },
+    })
+    expect(q.noRefunds).toBe(
+      'Jane Doe paid $66.00 more than the nights they stayed are worth, but this property does not give '
+      + 'money back when a guest leaves early — so nothing goes back and the price as booked, $286.00, '
+      + "stands. Check them out and the stay closes. The property's settings are where that changes.")
+
+    // Checking them out is still just that: no decision row, no refund, no
+    // owner to-do, and the stay keeps the price it was booked at.
+    const out = await decide(f, b, { choice: null })
+    expect(out.status, JSON.stringify(out.body)).toBe(200)
+    expect(out.body.data).toMatchObject({ checkedOut: true, next: 'done', words: ['Jane Doe is checked out.'] })
+    expect(await row(b)).toMatchObject({ status: 'checked_out', check_out: TODAY, total: '286.00' })
+    expect(await decisions(b)).toEqual([])
+    expect(await parts(b)).toEqual([])
+    expect(h.refundsCreate).not.toHaveBeenCalled()
+    expect(await owed(b)).toBe(0)
+  })
+
+  /**
+   * 10/19 (review): "paid more than the nights stayed are worth" is not "paid
+   * in full". A guest can be over against the days they used and still short
+   * against the price as booked — and at a park where that price STANDS, the
+   * rest is still owed. The desk was told the stay closes, the figure was
+   * nowhere on screen, and the booking stayed stamped paid in full.
+   */
+  it('refunds OFF, still short of the booked price: the sentence says what is owed, and it stays askable', async () => {
+    const f = await seed()
+    await answers(f, { refunds: false })
+    await query(`UPDATE units SET nightly_rate = 55, weekly_rate = 286 WHERE id = $1`, [f.unitId])
+    // A $286 week paid in cash at the counter; $50 of that sale was later
+    // refunded at the register, which never touches a reservation (#23). So
+    // $236 is still with the landlord against a $286 price.
+    const b = await stay(f, { checkIn: '2026-09-28', checkOut: '2026-10-05', total: 286 })
+    const { saleId } = await paySale(f, b, { method: 'cash', toward: 286 })
+    await query(`INSERT INTO pos_refunds (transaction_id, landlord_id, amount, refund_method) VALUES ($1, $2, 50, 'cash')`,
+      [saleId, f.landlordId])
+
+    const q = (await getQuote(f, b)).body.data
+    expect(q).toMatchObject({ question: 'none', choices: [], paid: 236, stayed: { nights: 4, worth: 220 }, owedAsBooked: 50 })
+    expect(q.noRefunds).toBe(
+      'Jane Doe paid $16.00 more than the nights they stayed are worth, but this property does not give '
+      + 'money back when a guest leaves early — so nothing goes back and the price as booked, $286.00, '
+      + "stands. $50.00 of that price is still owed and stays on the stay after they are checked out. "
+      + "The property's settings are where that changes.")
+
+    // And the $50 is really still askable: the paid flags stop claiming the
+    // stay is paid in full, so the counter and a pay link can collect it.
+    expect((await decide(f, b, { choice: null })).status).toBe(200)
+    expect(await row(b)).toMatchObject({ status: 'checked_out', total: '286.00', balance_paid_at: null })
+    expect(await owed(b)).toBe(50)
+  })
+
+  it('refunds OFF, paid in full: the sentence still says the stay closes', async () => {
+    const f = await seed({ taxPct: 6.35 })
+    await answers(f, { refunds: false })
+    await query(`UPDATE units SET nightly_rate = 49, weekly_rate = 269, monthly_rate = 589 WHERE id = $1`, [f.unitId])
+    // Mountain View's own stay, $9.00 short of the month: 14 nights are worth
+    // $572.16, they paid $580, so they are $7.84 over the days they used and
+    // $9.00 under the price that stands.
+    const b = await stay(f, { checkIn: '2026-09-18', checkOut: '2026-10-18', total: 589, leaseType: 'month_to_month' })
+    await paySale(f, b, { method: 'cash', toward: 580 })
+    const q = (await getQuote(f, b)).body.data
+    expect(q).toMatchObject({ question: 'none', paid: 580, stayed: { nights: 14, worth: 572.16 }, owedAsBooked: 9 })
+    expect(q.noRefunds).toContain('$9.00 of that price is still owed')
+    expect(await owed(b)).toBe(9)
+  })
+
+  /**
+   * 10/19 (review): the setting decides what is OFFERED. A question already
+   * raised — here by a clerk who cannot issue refunds — is never retracted, or
+   * the owner's to-do can never be cleared by anybody. It showed "$0.00" in the
+   * question above a single choice while the sentence beside it quoted $66.00.
+   */
+  it('refunds turned OFF after the question was asked: it stays answerable, with the real figure', async () => {
+    const f = await seed()
+    await query(`UPDATE units SET nightly_rate = 55, weekly_rate = 286 WHERE id = $1`, [f.unitId])
+    const b = await stay(f, { checkIn: '2026-09-28', checkOut: '2026-10-05', total: 286 })
+    await paySale(f, b, { method: 'cash', toward: 286 })
+    // A clerk who can check guests out but not issue refunds: the money waits.
+    const desk = await staff(f, { 'guests.check_out': true })
+    expect((await decide(f, b, { choice: null }, desk)).body.data.next).toBe('waits')
+    expect(await decisions(b)).toEqual([expect.objectContaining({ status: 'pending', question: 'overpaid' })])
+    expect(await query(`SELECT 1 FROM notifications WHERE landlord_id = $1 AND type = 'stay_money_decision'`,
+      [f.landlordId])).toHaveLength(1)
+
+    // The landlord then answers No to refunds. The question is still there, with
+    // $66.00 in it, and "No refund" is the only answer this park honors.
+    await answers(f, { refunds: false })
+    const q = (await getQuote(f, b)).body.data
+    expect(q).toMatchObject({ question: 'overpaid', unused: 66, maxRefund: 0 })
+    expect(q.choices.map((c: any) => [c.choice, c.result])).toEqual([['no_refund', 'Nothing goes back']])
+    expect(q.noRefunds).toContain('does not give money back when a guest leaves early')
+
+    const out = await decide(f, b, { choice: 'no_refund' })
+    expect(out.status, JSON.stringify(out.body)).toBe(200)
+    expect(await decisions(b)).toEqual([expect.objectContaining({ status: 'decided', choice: 'no_refund', refunded: '0.00' })])
+    expect(h.refundsCreate).not.toHaveBeenCalled()
+  })
+
+  it('refunds OFF: a refund choice is refused by the server, not just hidden', async () => {
+    const f = await seed()
+    await answers(f, { refunds: false })
+    const b = await stay(f, { checkIn: '2026-09-28', checkOut: '2026-10-05', total: 286 })
+    await query(`UPDATE units SET nightly_rate = 55, weekly_rate = 286 WHERE id = $1`, [f.unitId])
+    await paySale(f, b, { method: 'cash', toward: 286 })
+    const out = await decide(f, b, { choice: 'refund_unused' })
+    expect(out.status).toBe(409)
+    expect(await parts(b)).toEqual([])
+    expect(h.refundsCreate).not.toHaveBeenCalled()
+  })
+
+  it('refunds OFF: the refund preview refuses rather than quoting a figure', async () => {
+    // Reached only by a stale window or a hand-made call — the screen offers no
+    // "Refund a different amount" at a park that does not give money back.
+    const f = await seed()
+    await answers(f, { refunds: false })
+    const b = await stay(f, { checkIn: '2026-09-28', checkOut: '2026-10-05', total: 286 })
+    await query(`UPDATE units SET nightly_rate = 55, weekly_rate = 286 WHERE id = $1`, [f.unitId])
+    await paySale(f, b, { method: 'cash', toward: 286 })
+    const r = await request(app()).get(url(f, b, '/refund-preview?amount=66'))
+      .set('Authorization', `Bearer ${f.token}`)
+    expect(r.status, JSON.stringify(r.body)).toBe(409)
+    expect(r.body.error).toContain('does not give money back when someone leaves early')
+  })
+
+  it('refunds OFF never touches what a guest who has NOT paid is charged', async () => {
+    // "Charge only the nights stayed" is pricing, not giving money back.
+    const f = await seed()
+    await answers(f, { refunds: false })
+    const b = await stay(f, { checkIn: '2026-09-28', checkOut: '2026-10-06', total: 480 })
+    await paySale(f, b, { method: 'cash', toward: 120 })
+    const q = (await getQuote(f, b)).body.data
+    expect(q).toMatchObject({ question: 'owes', noRefunds: null, paid: 120 })
+    expect(q.choices.map((c: any) => c.choice)).toEqual(['keep_price', 'nights_only'])
+  })
+
+  it('refunds OFF on a lease: rent paid past the day they left stays on their account', async () => {
+    const f = await seed()
+    await answers(f, { refunds: false })
+    const b = await stay(f, { checkIn: '2026-09-28', checkOut: '2026-10-05', total: 286 })
+    await query(`UPDATE units SET nightly_rate = 55, weekly_rate = 286 WHERE id = $1`, [f.unitId])
+    await paySale(f, b, { method: 'cash', toward: 286 })
+    await decide(f, b, { choice: null })
+    // Nothing went back and nothing waits: the money is simply still theirs on
+    // account, which is where money paid ahead already sits.
+    const after = (await getQuote(f, b)).body.data
+    expect(after).toMatchObject({ question: 'none', choices: [] })
+    expect(await decisions(b)).toEqual([])
+  })
+
+  // ── "only if the landlord allows the pro rate" ────────────────────────────
+
+  it('proration OFF: a long-term guest\'s last days price off the ladder, as before 10/18', async () => {
+    const f = await seed()
+    await atNicsRates(f)
+    await answers(f, { prorates: false })
+    // Four months in (123 nights), leaving 14 days into the fifth. Nic's park
+    // prorates and gives $314.13 back; a park that says a whole month is a
+    // whole month re-rates those 14 days as two weeks ($572) and gives $17.00.
+    const b = await stay(f, { checkIn: '2026-05-18', checkOut: '2026-10-18', total: 2945, leaseType: 'month_to_month' })
+    await paySale(f, b, { method: 'cash', toward: 2945 })
+    const q = (await getQuote(f, b)).body.data
+    expect(q).toMatchObject({
+      question: 'overpaid', paid: 2945, stayed: { nights: 137, worth: 2928 }, unused: 17,
+    })
+    expect(priceStay(SITE, 0, '2026-05-18', 137).total).toBe(2928)
+    expect(q.choices.find((c: any) => c.choice === 'refund_unused').label).toBe('Refund the unused nights ($17.00)')
+  })
+
+  it('proration ON (the default) is the 10/18 answer, untouched', async () => {
+    const f = await seed()
+    await atNicsRates(f)
+    const b = await stay(f, { checkIn: '2026-05-18', checkOut: '2026-10-18', total: 2945, leaseType: 'month_to_month' })
+    await paySale(f, b, { method: 'cash', toward: 2945 })
+    expect((await getQuote(f, b)).body.data).toMatchObject({
+      question: 'overpaid', stayed: { nights: 137, worth: 2630.87 }, unused: 314.13,
+    })
+  })
+
+  /**
+   * THE TWO LIVE CHECK-OUTS, read off production 10/19: Mountain View RV Ranch,
+   * RV 10 and RV 11 — $49 a night / $269 a week / $589 a month, lodging tax
+   * 6.35%, booked Sep 18 → Oct 18 (a whole calendar month, $589, untaxed), gone
+   * after 14 nights. Both decisions say stayed_worth $572.16 and paid $589.00,
+   * so $16.84 was unused. This is the figure Nic approved ("So, okay. No,
+   * that's fine.") and neither answer to either question may move it.
+   */
+  it("Mountain View's own 14-night check-out stays at $572.16 / $16.84, at EITHER answer", async () => {
+    for (const prorates of [true, false]) {
+      const f = await seed({ taxPct: 6.35 })
+      await query(`UPDATE units SET nightly_rate = 49, weekly_rate = 269, monthly_rate = 589 WHERE id = $1`, [f.unitId])
+      await answers(f, { prorates })
+      const b = await stay(f, { checkIn: '2026-09-18', checkOut: '2026-10-18', total: 589, leaseType: 'month_to_month' })
+      await paySale(f, b, { method: 'cash', toward: 589 })
+      const q = (await getQuote(f, b)).body.data
+      expect(q, `prorates=${prorates}`).toMatchObject({
+        question: 'overpaid', paid: 589,
+        booked: { checkOut: '2026-10-18', nights: 30, price: 589 },
+        stayed: { nights: 14, worth: 572.16 },
+        unused: 16.84,
+      })
+      expect(q.choices.find((c: any) => c.choice === 'refund_unused').label).toBe('Refund the unused nights ($16.84)')
+    }
+  })
+
+  it('and with refunds answered No, that same stay is offered nothing at all', async () => {
+    const f = await seed({ taxPct: 6.35 })
+    await query(`UPDATE units SET nightly_rate = 49, weekly_rate = 269, monthly_rate = 589 WHERE id = $1`, [f.unitId])
+    await answers(f, { refunds: false })
+    const b = await stay(f, { checkIn: '2026-09-18', checkOut: '2026-10-18', total: 589, leaseType: 'month_to_month' })
+    await paySale(f, b, { method: 'cash', toward: 589 })
+    const q = (await getQuote(f, b)).body.data
+    expect(q).toMatchObject({ question: 'none', choices: [], stayed: { worth: 572.16 } })
+    expect(q.noRefunds).toContain('Jane Doe paid $16.84 more than the nights they stayed are worth')
+    expect(q.noRefunds).toContain('the price as booked, $589.00, stands')
+  })
+
+  it('neither answer ever charges a guest MORE than the same stay charges today', async () => {
+    // The invariant the whole change is held to: a setting may give more back,
+    // never less of a stay's days priced higher.
+    const f = await seed()
+    await atNicsRates(f)
+    for (const prorates of [true, false]) {
+      await answers(f, { prorates })
+      const b = await stay(f, { checkIn: '2026-05-18', checkOut: '2026-10-18', total: 2945, leaseType: 'month_to_month' })
+      const q = (await getQuote(f, b)).body.data
+      expect(q.stayed.worth, `prorates=${prorates}`).toBeLessThanOrEqual(priceStay(SITE, 0, '2026-05-18', 137).total)
+      expect(q.stayed.worth).toBeLessThanOrEqual(q.booked.price)
+    }
   })
 })

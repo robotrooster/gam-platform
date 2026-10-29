@@ -312,3 +312,26 @@
 }
 .fin-host .tab-btn:hover { color: var(--text-1); }
 .fin-host .tab-btn.active { color: var(--gold); border-bottom-color: var(--gold); }
+
+/* 10/26 (Nic) — PRINT IS ALWAYS LIGHT.
+   A balance summary printed in dark mode came out a solid black sheet with
+   white text: "that wasted so much ink on a brand new cartridge." The real
+   work is done by installPrintLightTheme() (packages/shared/src/printTheme.ts),
+   which flips the document to data-theme="light" for the print so every light
+   rule applies. This is the backstop for a print that happens before that
+   script runs: a white page with dark text, so the worst case is plain rather
+   than a full-bleed black page. */
+@media print {
+  html, body {
+    background: #ffffff !important;
+    color: #12151c !important;
+  }
+  /* Keep the browser's default of dropping decorative backgrounds; a rule
+     elsewhere forcing them on would paint the dark ground again. */
+  *, *::before, *::after {
+    -webkit-print-color-adjust: economy !important;
+    print-color-adjust: economy !important;
+    box-shadow: none !important;
+    text-shadow: none !important;
+  }
+}

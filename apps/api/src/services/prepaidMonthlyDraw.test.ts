@@ -20,6 +20,7 @@ import { householdQuote, planCredit, applyCredit } from './creditUse'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 
 async function fixture(monthlyDraw: number | null) {
@@ -72,9 +73,15 @@ const remaining = async (leaseId: string) => Number((await db.query(
 const status = async (id: string) => (await db.query(`SELECT status FROM payments WHERE id=$1`, [id])).rows[0].status
 
 beforeAll(async () => {
-  await db.query(
-    `INSERT INTO platform_processing_rates (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-     SELECT 'ach', 6, 0, 0, 0.5 WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'ach')`)
+  // 10/17: the rate this file's figures are worked out on, STATED rather than
+  // seeded-if-missing: one row is open per method and cleanupAllSchema leaves the
+  // rate card alone, so an insert-if-missing took whatever an earlier file left.
+  await setEffectiveProcessingRate(db, {
+    paymentMethod: 'ach',
+    customerFacingFlat: 6, customerFacingPercent: 0,
+    stripeCostFlat: 0, stripeCostPercent: 0.5,
+    notes: 'prepaidMonthlyDraw.test.ts ACH rate',
+  })
 })
 beforeEach(async () => { await cleanupAllSchema() })
 

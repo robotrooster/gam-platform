@@ -17,6 +17,7 @@ import { query, queryOne } from '../db'
 import { getStripe } from '../lib/stripe'
 import { logger } from '../lib/logger'
 import { AppError } from '../middleware/errorHandler'
+import { inBook, askingAs, type BookCaller } from './registerBook'
 
 export interface CardIdentity {
   fingerprint: string
@@ -84,10 +85,57 @@ export function cardLabel(card: { brand?: string | null; last4?: string | null }
   return `${names[b] ?? 'Card'} ••${card.last4}`
 }
 
-/** "JANE DOE" → Jane Doe; "DOE/JANE" (some issuers) → Jane Doe; blank → Card Customer. */
-export function nameFromCard(holder: string | null | undefined): { first: string; last: string } {
+/**
+ * 10/24 (Nic): "we just had one sale earlier today that says Visa card holder.
+ * Did it not pull their name off the card and add them as a customer into the
+ * system?"
+ *
+ * It did add them, and it did read the name off the card — the CARD said
+ * "VISA CARDHOLDER". Plenty of debit cards and tokenized wallet taps put a
+ * generic string in the cardholder-name field instead of a person, and this
+ * passed it through and title-cased it, so Mountain View ended up with five
+ * customer records all called Visa Cardholder: indistinguishable from each
+ * other in a list, and matching nothing anybody would type into a search.
+ *
+ * A placeholder is not a name. Recognized here so the card itself can name the
+ * customer instead (brand and last four, which is what the clerk sees on the
+ * screen and what Nic asked to be able to search by).
+ */
+const CARD_NAME_PLACEHOLDERS = [
+  'cardholder', 'card holder', 'cardmember', 'card member', 'acctholder', 'account holder',
+  'customer', 'card customer', 'valued customer', 'unknown', 'n/a', 'na', 'none', 'no name',
+]
+
+export function cardNameIsAPlaceholder(holder: string | null | undefined): boolean {
+  const clean = (holder ?? '').replace(/[^a-z ]/gi, ' ').replace(/\s+/g, ' ').trim().toLowerCase()
+  if (!clean) return true
+  // Strip a leading brand, which is how issuers write them: "VISA CARDHOLDER",
+  // "MASTERCARD CARD MEMBER".
+  const bare = clean.replace(/^(visa|mastercard|master card|amex|american express|discover|diners|jcb|unionpay|interac|debit|credit|card)\s+/i, '').trim()
+  return CARD_NAME_PLACEHOLDERS.includes(clean) || CARD_NAME_PLACEHOLDERS.includes(bare)
+}
+
+/**
+ * "JANE DOE" → Jane Doe; "DOE/JANE" (some issuers) → Jane Doe.
+ *
+ * No real name on the card names them by the card instead — "Visa" / "••4242" —
+ * so two unnamed taps are two tellable-apart records and the last four is
+ * searchable. Without a card to fall back on it stays Card Customer, which is
+ * what every caller before 10/24 got.
+ */
+export function nameFromCard(
+  holder: string | null | undefined,
+  card?: { brand?: string | null; last4?: string | null } | null,
+): { first: string; last: string } {
   const clean = (holder ?? '').replace(/\s+/g, ' ').trim()
-  if (!clean) return { first: 'Card', last: 'Customer' }
+  if (!clean || cardNameIsAPlaceholder(clean)) {
+    const label = cardLabel(card)
+    if (label) {
+      const i = label.lastIndexOf(' ')
+      return { first: label.slice(0, i), last: label.slice(i + 1) }
+    }
+    return { first: 'Card', last: 'Customer' }
+  }
   const title = (w: string) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
   if (clean.includes('/')) {
     const [l, f] = clean.split('/')
@@ -98,36 +146,72 @@ export function nameFromCard(holder: string | null | undefined): { first: string
   return { first: parts.slice(0, -1).join(' '), last: parts[parts.length - 1] }
 }
 
+/**
+ * IS THIS NAME A STAND-IN RATHER THAN A PERSON? — ONE DEFINITION.
+ *
+ * 10/24: there were three hand-written copies of this question (posPeople's own
+ * helper, an inline test in the sale route deciding whether to ask the reader
+ * for a name, and the fallback in nameFromCard), and the moment an unnamed card
+ * started being called "Visa ••4242" instead of "Card Customer" two of them
+ * quietly answered wrong — the register stopped asking a phone-wallet customer
+ * for their name, because the record now "had" one. Same class of bug as the
+ * enum drift CLAUDE.md warns about, so it gets the same cure: one definition
+ * everything imports.
+ */
+export const nameIsAPlaceholder = (first?: string | null, last?: string | null): boolean => {
+  const f = String(first ?? '').trim()
+  const l = String(last ?? '').trim()
+  if (!f && !l) return true
+  if (f === 'Card' && l === 'Customer') return true
+  // A card-label name: "Visa" / "••4242".
+  if (/^\u2022\u2022\d{4}$/.test(l)) return true
+  return cardNameIsAPlaceholder(`${f} ${l}`.trim())
+}
+
 export interface CardCustomer { customerId: string; isNew: boolean; cardSaved: boolean; firstName: string; lastName: string }
 
-/** The customer this card belongs to — made on the spot the first time it is seen at this company. */
-export async function findOrCreateCustomerForCard(client: PoolClient, opts: { landlordId: string; card: CardIdentity }): Promise<CardCustomer> {
+/** The customer this card belongs to — made on the spot the first time this account sees it. */
+export async function findOrCreateCustomerForCard(client: PoolClient, opts: { landlordId: string; card: CardIdentity; caller: BookCaller }): Promise<CardCustomer> {
   // A card row belongs to one company once (UNIQUE landlord_id, fingerprint), so
   // it is read whatever state its customer is in: a row left on a closed record
   // is moved to the new one below, never inserted twice.
+  //
+  // 10/20 (review): read across the ACCOUNT's companies (services/registerBook),
+  // because a man who taps the same card at Mountain View and at Oak Park — two
+  // LLCs, one account — is one customer with one card, not two of each. The row
+  // is still WRITTEN under the company whose reader took the tap, so the UNIQUE
+  // it rides on is untouched; a live record wins over a closed one, then the
+  // card last seen.
+  const fp: unknown[] = [opts.landlordId, opts.card.fingerprint]
+  const wf = askingAs(fp, opts.caller)
   const existing = await client.query<any>(
     `SELECT c.pos_customer_id, c.stripe_payment_method_id, p.first_name, p.last_name, p.archived_at
        FROM pos_customer_cards c JOIN pos_customers p ON p.id = c.pos_customer_id
-      WHERE c.landlord_id = $1 AND c.fingerprint = $2`,
-    [opts.landlordId, opts.card.fingerprint])
+      WHERE ${inBook('c.landlord_id', '$1', wf)} AND c.fingerprint = $2
+      ORDER BY (p.archived_at IS NOT NULL), c.last_seen_at DESC LIMIT 1`,
+    fp)
   if (existing.rows[0] && !existing.rows[0].archived_at) {
+    const p: unknown[] = [opts.landlordId, opts.card.fingerprint, opts.card.last4, opts.card.brand]
+    const w = askingAs(p, opts.caller)
     await client.query(
       `UPDATE pos_customer_cards SET last_seen_at = NOW(), last4 = COALESCE($3, last4), brand = COALESCE($4, brand)
-        WHERE landlord_id = $1 AND fingerprint = $2`,
-      [opts.landlordId, opts.card.fingerprint, opts.card.last4, opts.card.brand])
+        WHERE ${inBook('landlord_id', '$1', w)} AND fingerprint = $2`,
+      p)
     const r = existing.rows[0]
     return { customerId: r.pos_customer_id, isNew: false, cardSaved: !!r.stripe_payment_method_id, firstName: r.first_name, lastName: r.last_name }
   }
-  const { first, last } = nameFromCard(opts.card.cardholderName)
+  const { first, last } = nameFromCard(opts.card.cardholderName, opts.card)
   const created = await client.query<{ id: string }>(
     `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, created_from)
      VALUES ($1, $2, $3, NULL, 'card_reader') RETURNING id`, [opts.landlordId, first, last])
   const customerId = created.rows[0].id
   if (existing.rows[0]) {
+    const p: unknown[] = [opts.landlordId, opts.card.fingerprint, customerId, opts.card.last4, opts.card.brand]
+    const w = askingAs(p, opts.caller)
     await client.query(
       `UPDATE pos_customer_cards SET pos_customer_id = $3, last_seen_at = NOW(), last4 = COALESCE($4, last4), brand = COALESCE($5, brand)
-        WHERE landlord_id = $1 AND fingerprint = $2`,
-      [opts.landlordId, opts.card.fingerprint, customerId, opts.card.last4, opts.card.brand])
+        WHERE ${inBook('landlord_id', '$1', w)} AND fingerprint = $2`,
+      p)
     return { customerId, isNew: true, cardSaved: !!existing.rows[0].stripe_payment_method_id, firstName: first, lastName: last }
   }
   await client.query(
@@ -246,11 +330,13 @@ export async function readSaveCardAnswer(stripeReaderId: string): Promise<SaveCa
 }
 
 /** Keep the card: attach the tap's reusable card to the customer's Stripe record and make it their card on file. */
-export async function saveCardForCustomer(opts: { landlordId: string; customerId: string; generatedCard: string; fingerprint: string }): Promise<void> {
+export async function saveCardForCustomer(opts: { landlordId: string; customerId: string; generatedCard: string; fingerprint: string; caller: BookCaller }): Promise<void> {
   const stripe = getStripe()
+  const find: unknown[] = [opts.customerId, opts.landlordId]
+  const wf = askingAs(find, opts.caller)
   const c = await queryOne<any>(
-    `SELECT id, first_name, last_name, email, stripe_customer_id FROM pos_customers WHERE id = $1 AND landlord_id = $2`,
-    [opts.customerId, opts.landlordId])
+    `SELECT id, first_name, last_name, email, stripe_customer_id FROM pos_customers WHERE id = $1 AND ${inBook('landlord_id', '$2', wf)}`,
+    find)
   if (!c) throw new Error('customer not found')
   let stripeCustomerId: string | null = c.stripe_customer_id
   if (!stripeCustomerId) {
@@ -267,10 +353,12 @@ export async function saveCardForCustomer(opts: { landlordId: string; customerId
   // The Yes IS the consent: the kept card may be shown to them next time.
   await stripeForm('POST', `/v1/payment_methods/${opts.generatedCard}`, { allow_redisplay: 'always' }).catch((e: unknown) =>
     logger.warn({ err: e, paymentMethod: opts.generatedCard }, '[reader] allow_redisplay'))
+  const keep: unknown[] = [opts.generatedCard, opts.landlordId, opts.fingerprint]
+  const wk = askingAs(keep, opts.caller)
   await query(
     `UPDATE pos_customer_cards SET stripe_payment_method_id = $1, saved_at = NOW()
-      WHERE landlord_id = $2 AND fingerprint = $3`,
-    [opts.generatedCard, opts.landlordId, opts.fingerprint])
+      WHERE ${inBook('landlord_id', '$2', wk)} AND fingerprint = $3`,
+    keep)
 }
 
 /**
@@ -290,27 +378,73 @@ export interface MergeRecord {
 }
 
 /**
+ * Both ways of saying "these two are different companies' records" — one
+ * sentence, said by the route (which knows whether both companies are the
+ * caller's own) and by the fold itself (which does not).
+ */
+export const MERGE_ACROSS_COMPANIES = (ofYours: boolean): string =>
+  `Those two records are kept by different companies${ofYours ? ' of yours' : ''}, so they stay apart — press Cancel. If a sale is on the wrong one, open it in History and pick the right person.`
+
+/**
  * S654 (Nic): fold one customer record into another. Purchases, cards, open
  * tickets, pay links, register sessions, invitations and the charge account
  * move; the survivor keeps its own email/phone and takes the other's when it
  * had none; the folded record is archived, never deleted (its email moves
  * with the survivor when taken, because an address belongs to one live record
- * per company). Throws 409 when both hold something only one can. Returns what
- * it did (MergeRecord), so a fold made by a wrong pick can be put back.
+ * per company). Throws 409 when both hold something only one can, when they are
+ * two different residents, and when they are two different companies' records
+ * (see the company line below). Returns what it did (MergeRecord), so a fold
+ * made by a wrong pick can be put back.
  */
-export async function mergePosCustomers(client: PoolClient, opts: { landlordId: string; loserId: string; into: string }): Promise<MergeRecord> {
+export async function mergePosCustomers(client: PoolClient, opts: { landlordId: string; loserId: string; into: string; caller: BookCaller; ownsCompany?: (landlordId: string) => boolean }): Promise<MergeRecord> {
   if (opts.loserId === opts.into) throw new AppError(400, 'That is the same customer — pick a different one to merge into.')
-  const both = await client.query<any>(
-    `SELECT id, email, phone, notes, stripe_customer_id, tenant_id, elsewhere_ref FROM pos_customers
-      WHERE id = ANY($1::uuid[]) AND landlord_id = $2 AND archived_at IS NULL FOR UPDATE`,
-    [[opts.loserId, opts.into], opts.landlordId])
-  if (both.rows.length !== 2) throw new AppError(404, 'One of those customers was already merged or closed — open the Customers tab again and pick from the fresh list.')
-  const loser = both.rows.find((r: any) => r.id === opts.loserId)
-  const survivor = both.rows.find((r: any) => r.id === opts.into)
+  const both: unknown[] = [[opts.loserId, opts.into], opts.landlordId]
+  const wb = askingAs(both, opts.caller)
+  const rows = await client.query<any>(
+    `SELECT id, landlord_id, email, phone, notes, stripe_customer_id, tenant_id, elsewhere_ref, created_from FROM pos_customers
+      WHERE id = ANY($1::uuid[]) AND ${inBook('landlord_id', '$2', wb)} AND archived_at IS NULL FOR UPDATE`,
+    both)
+  if (rows.rows.length !== 2) throw new AppError(404, 'One of those customers was already merged or closed — open the Customers tab again and pick from the fresh list.')
+  const loser = rows.rows.find((r: any) => r.id === opts.loserId)
+  const survivor = rows.rows.find((r: any) => r.id === opts.into)
   // 10/2: a record that is a resident's carries them. Two different residents
   // are two people, whatever their records say, and are never folded together.
   if (loser.tenant_id && survivor.tenant_id && loser.tenant_id !== survivor.tenant_id) {
     throw new AppError(409, 'Those are two different residents, so their records stay apart — press Cancel. If a sale is on the wrong one, open it in History and pick the right person.')
+  }
+  // 10/20 (second review) — THE COMPANY LINE, UNDER THE SAME ROW LOCKS.
+  //
+  // The book this reads is the ACCOUNT's (services/registerBook: one register
+  // book per account), which is right for FINDING a person and wrong as the only
+  // limit on a fold: it hands this function two records kept by two different
+  // LLCs of one account and folds them, archiving one company's live record and
+  // repointing its sales, cards, tickets, links, invitations and charge account
+  // onto the other company's. Nic, 10/20, widening the book: "Do NOT merge,
+  // rewrite or repoint existing customer records" — what each company holds
+  // ABOUT a person stays that company's.
+  //
+  // The route had a refusal for this and it did not fire, because it asked
+  // whether the CALLER OWNS the other company. That is false for precisely the
+  // person who has to be stopped: an on-site manager is scoped to one company,
+  // so the account's other company reads as "not hers" and the fold went
+  // through. It also compared the survivor against the SESSION's company, which
+  // left the fold the other way round open. So the rule lives here, beside the
+  // rows it protects and inside their FOR UPDATE, where no future door can
+  // forget it; ownership decides only which sentence the clerk reads.
+  //
+  // THE ONE CROSSING ALLOWED, and why it is not a hole: a record the card reader
+  // minted that nobody has confirmed — no email, no phone, no resident — is not
+  // a company's book, it is a placeholder for whoever tapped. A man who taps a
+  // new card at Oak Park and is named at the Mountain View counter next week is
+  // one man with one record, which is the whole of the 10/20 lane; refusing that
+  // fold would leave the stand-in live and split him again, per company this
+  // time. It carries one tap and no money relationship, and the sales on it keep
+  // their own company's landlord_id either way.
+  const unconfirmedStandIn = (r: any) => r.created_from === 'card_reader' && !r.email && !r.phone && !r.tenant_id
+  if (loser.landlord_id !== survivor.landlord_id && !unconfirmedStandIn(loser)) {
+    const bothCompaniesAreTheirs = !!opts.ownsCompany
+      && opts.ownsCompany(loser.landlord_id) && opts.ownsCompany(survivor.landlord_id)
+    throw new AppError(409, MERGE_ACROSS_COMPANIES(bothCompaniesAreTheirs))
   }
   const tenantId: string | null = survivor.tenant_id ?? loser.tenant_id ?? null
   const takeEmail = !survivor.email && !!loser.email

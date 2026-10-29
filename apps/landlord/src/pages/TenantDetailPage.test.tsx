@@ -11,10 +11,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from 'react-query'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 
 const server = vi.hoisted(() => ({
   profile: null as any,
+  /** The credits this company gave this person (GET /tenant-credits?tenantId=). */
+  credits: [] as any[],
   gets: [] as string[],
   posts: [] as { url: string; body: any }[],
   /** When set, a POST waits on it (in flight). */
@@ -24,7 +26,8 @@ const server = vi.hoisted(() => ({
 vi.mock('../lib/api', () => ({
   apiGet: async (url: string) => {
     server.gets.push(url)
-    if (url === '/tenants/t1/profile') return JSON.parse(JSON.stringify(server.profile))
+    if (url === '/tenants/t1/profile' || url.startsWith('/tenants/t1/profile?')) return JSON.parse(JSON.stringify(server.profile))
+    if (url.startsWith('/tenant-credits?')) return JSON.parse(JSON.stringify(server.credits))
     return []
   },
   apiPost: async (url: string, body: any) => {
@@ -34,7 +37,8 @@ vi.mock('../lib/api', () => ({
   },
   apiPatch: async () => ({ success: true, data: {} }),
 }))
-vi.mock('../context/AuthContext', () => ({ useAuth: () => ({ user: { role: 'landlord', permissions: {} } }) }))
+const auth = vi.hoisted(() => ({ user: { role: 'landlord', permissions: {} as Record<string, boolean> } }))
+vi.mock('../context/AuthContext', () => ({ useAuth: () => ({ user: auth.user }) }))
 vi.mock('../components/dialogs', () => ({
   toast: Object.assign(vi.fn(), { error: vi.fn() }),
   appConfirm: vi.fn(async () => false),
@@ -61,7 +65,8 @@ const profile = (over: any = {}) => ({
 let host: HTMLDivElement
 let root: Root
 beforeEach(() => {
-  server.gets = []; server.posts = []; server.postHold = null; server.profile = profile()
+  server.gets = []; server.posts = []; server.postHold = null; server.profile = profile(); server.credits = []
+  auth.user = { role: 'landlord', permissions: {} }
   host = document.createElement('div')
   document.body.appendChild(host)
   root = createRoot(host)
@@ -77,11 +82,18 @@ async function render() {
     root.render(
       <QueryClientProvider client={qc}>
         <MemoryRouter initialEntries={['/tenants/t1']}>
-          <Routes><Route path="/tenants/:id" element={<TenantDetailPage />} /></Routes>
+          <Routes>
+            <Route path="/tenants/:id" element={<TenantDetailPage />} />
+            <Route path="/tenants/:id/report" element={<ReportProbe />} />
+          </Routes>
         </MemoryRouter>
       </QueryClientProvider>)
   })
   await until(() => text().includes('Glenda Moss'), 'the page')
+}
+function ReportProbe() {
+  const loc = useLocation()
+  return <div className="report-probe">REPORT {loc.pathname}{loc.search}</div>
 }
 const text = () => host.textContent ?? ''
 const btn = (re: RegExp) => [...host.querySelectorAll('button')].find(b => re.test(b.textContent ?? ''))
@@ -106,11 +118,108 @@ describe('the account credit card', () => {
     expect(card.textContent).toContain('Paid ahead$200.00')
     expect(card.textContent).toContain('Credit you gave$100.00')
     expect(card.textContent).not.toContain('Statutory interest')
-    expect(card.textContent).toContain('pays a bill by itself only when it covers that whole bill')
+    // 10/15 (Nic): "money gets applied to the most outstanding balance first...
+    // somebody can't go put $1,000 credit and not pay a $2,000 existing bill."
+    // The card used to say credit waits for a bill it can cover whole; it now
+    // says the opposite, because that is what the money does.
+    expect(card.textContent).toContain('oldest bill first')
+    expect(card.textContent).toContain('credit never sits on an account while they still owe')
   })
   it('is left out when there is no credit', async () => {
     await render()
     expect(host.querySelector('.cd-credit-card')).toBeNull()
+  })
+
+  // 10/18 (Nic): which money crosses spaces and which does not, on the card.
+  it('says a credit you gave crosses every space and money they paid ahead does not', async () => {
+    server.profile = profile({ credit: { total: 300, usable: 120, paidAhead: 200, fromLandlord: 100, depositInterest: 0 } })
+    await render()
+    const card = host.querySelector('.cd-credit-card')!
+    expect(card.textContent).toContain('only on the space they paid it for')
+    expect(card.textContent).toContain('oldest bill first across every space they hold with you')
+    // Part of it cannot pay these bills: the card says which money stays put.
+    expect(card.textContent).toContain('pays only the space they paid it for')
+    expect(card.textContent).toContain('interest on a deposit pays only that space')
+  })
+})
+
+/**
+ * 10/18 (Nic): "we need to undo credit, but no undoing payments that were
+ * actually real money handed over." Under the figures, the credits this company
+ * gave, each with Undo while it can still be taken back.
+ */
+describe('undoing a credit the landlord gave', () => {
+  const credit = (over: any = {}) => ({
+    id: 'c1', amountOriginal: '50.00', amountRemaining: '0.00', amountUsable: '0.00', category: 'goodwill',
+    reason: 'typed by mistake', status: 'active', createdAt: '2026-10-17T18:00:00.000Z', voidedAt: null,
+    undoneAt: null, canUndo: true, ...over,
+  })
+  const withCredit = { total: 300, usable: 120, paidAhead: 200, fromLandlord: 100, depositInterest: 0 }
+
+  /** Every credit card on the page: the figures, and the credits you gave. */
+  const cards = () => [...host.querySelectorAll('.cd-credit-card')].map(c => c.textContent ?? '').join(' | ')
+
+  it('offers Undo on a credit that can still be taken back, and says what it will do before doing it', async () => {
+    server.profile = profile({ credit: withCredit })
+    server.credits = [credit()]
+    await render()
+    await until(() => !!btn(/^Undo$/), 'the Undo button')
+    expect(cards()).toContain('typed by mistake')
+    // Asked first, in words that say the bills go back to owed — and nothing
+    // is sent while the answer is no.
+    ;(appConfirm as any).mockResolvedValueOnce(false)
+    await act(async () => { btn(/^Undo$/)!.click() })
+    const asked = (appConfirm as any).mock.calls.at(-1)
+    expect(asked[0]).toContain('Whatever it has already paid goes back to owed')
+    expect(asked[0]).toContain('late from their own due dates again')
+    expect(asked[0]).toContain('refused if real money has landed on any of them')
+    expect(asked[1]).toMatchObject({ confirmLabel: 'Undo the credit', danger: true })
+    expect(server.posts.filter(p => p.url.includes('/undo'))).toEqual([])
+
+    ;(appConfirm as any).mockResolvedValueOnce(true)
+    await act(async () => { btn(/^Undo$/)!.click() })
+    await until(() => server.posts.some(p => p.url === '/tenant-credits/c1/undo'), 'the undo')
+  })
+
+  /**
+   * 10/18 review fix: the credit that MOST needs undoing is the one that is
+   * gone. Since 10/15 a credit lands on the open balance the moment it is
+   * given, so a credit that paid bills leaves NOTHING on the account — and the
+   * figures card hides itself when nothing is left. The list of credits you
+   * gave used to live inside that card, so the normal case had no Undo at all
+   * once you left the green notice on the Payments page.
+   */
+  it('is reachable when the credit has spent itself and nothing is left on the account', async () => {
+    server.profile = profile()
+    server.credits = [credit({ amountRemaining: '0.00' })]
+    await render()
+    await until(() => !!btn(/^Undo$/), 'the Undo button')
+    expect(cards()).toContain('Credit you gave')
+    expect(cards()).toContain('typed by mistake')
+    // The figures card itself stays away: there is no credit to show.
+    expect(cards()).not.toContain('on their account')
+    ;(appConfirm as any).mockResolvedValueOnce(true)
+    await act(async () => { btn(/^Undo$/)!.click() })
+    await until(() => server.posts.some(p => p.url === '/tenant-credits/c1/undo'), 'the undo')
+  })
+
+  it('shows no Undo on a credit the server says cannot be taken back', async () => {
+    server.profile = profile({ credit: withCredit })
+    server.credits = [credit({ canUndo: false }), credit({ id: 'c2', canUndo: false, category: 'deposit_interest' })]
+    await render()
+    await until(() => (host.querySelector('.cd-credit-card')?.textContent ?? '').includes('on their account'), 'the card')
+    expect(btn(/^Undo$/)).toBeUndefined()
+  })
+
+  // A bookkeeper never acts on a tenant's account (10/12, Nic), and the route
+  // refuses anyone else — so the list is not even asked for.
+  it('a bookkeeper is not offered it, and the credits are never read for them', async () => {
+    auth.user = { role: 'bookkeeper', permissions: {} }
+    server.profile = profile({ credit: withCredit })
+    server.credits = [credit()]
+    await render()
+    expect(btn(/^Undo$/)).toBeUndefined()
+    expect(server.gets.some(u => u.startsWith('/tenant-credits?'))).toBe(false)
   })
 })
 
@@ -195,5 +304,143 @@ describe('10/6 (Nic): "Delete this late fee" on the Payment History', () => {
     await act(async () => { btn(/^Delete this late fee$/)!.click() })
     await until(() => server.posts.length === 1, 'the delete')
     expect(server.posts[0].url).toBe('/payments/lf1/delete-late-fee')
+  })
+})
+
+describe('10/12 (Nic): the Payment History is the household\'s, with what each charge is for, a page at a time', () => {
+  const charge = (i: number) => ({ id: `c${i}`, type: 'rent', label: i % 2 ? 'Electric' : 'Rent', detail: null, dueDate: '2026-10-01',
+    propertyName: 'Oak Park', unitNumber: 'MH 04', amount: 460, status: 'pending' })
+
+  it('says what each charge is for, and turns pages from the server — no 36-row cap', async () => {
+    server.profile = profile({
+      payments: Array.from({ length: 50 }, (_, i) => charge(i)),
+      paymentsPage: { page: 1, pageSize: 50, total: 57 },
+    })
+    await render()
+    expect(text()).toContain("What it's for")
+    expect(text()).toContain('Electric')
+    expect(text()).toContain('Charges 1–50 of 57, newest first')
+    const older = btn(/^Older$/)!
+    expect(older.className).toContain('btn-primary')
+    expect(btn(/^Newer$/)!.disabled).toBe(true)
+    server.profile = profile({ payments: Array.from({ length: 7 }, (_, i) => charge(50 + i)), paymentsPage: { page: 2, pageSize: 50, total: 57 } })
+    await act(async () => { older.click() })
+    await until(() => server.gets.includes('/tenants/t1/profile?historyPage=2'), 'page two')
+    await until(() => text().includes('Charges 51–57 of 57'), 'page two on screen')
+    expect(btn(/^Older$/)!.disabled).toBe(true)
+  })
+
+  it('one page needs no pager', async () => {
+    server.profile = profile({ payments: [charge(1)], paymentsPage: { page: 1, pageSize: 50, total: 1 } })
+    await render()
+    expect(text()).not.toContain('newest first')
+    expect(btn(/^Older$/)).toBeUndefined()
+  })
+
+  it('the health card shows the one figure in the shared color and opens the full report', async () => {
+    server.profile = profile({ stats: { ...profile().stats, onTimeRate: 72,
+      health: { percent: 72, onTime: 8, counted: 11, paidLate: 2, partial: 1, outstanding: 0, label: '72%, 8 of 11 months' } } })
+    await render()
+    expect(text()).toContain('72%, 8 of 11 months')
+    // 10/12 (Nic): all time, since the household joined GAM — never "last 12 months".
+    expect(text()).toContain('since joining GAM')
+    expect(text()).not.toContain('last 12 months')
+    expect(text()).toContain('Needs attention')
+    expect(text()).toContain('8 of 11')
+    expect(btn(/^Full report$/)!.className).toContain('btn-primary')
+  })
+
+  // 10/12: the report's gate is "View all payments". Staff who see the health
+  // through the books permission are not offered a report they cannot open.
+  it('staff with only the books permission see the health but no way into the report', async () => {
+    auth.user = { role: 'property_manager', permissions: { 'books.view': true } }
+    server.profile = profile({ stats: { ...profile().stats, onTimeRate: 72,
+      health: { percent: 72, onTime: 8, counted: 11, paidLate: 2, partial: 1, outstanding: 0, label: '72%, 8 of 11 months' } } })
+    await render()
+    expect(text()).toContain('72%, 8 of 11 months')
+    expect(text()).not.toContain('Full report')
+    expect(btn(/^Full report$/)).toBeUndefined()
+  })
+})
+
+// 10/13 (Nic): "Tenants list + tenant profile: split health BY LEASE."
+describe('payment health, lease by lease', () => {
+  const leaseHealth = (leaseId: string, unitNumber: string, percent: number | null, current = true, status = current ? 'active' : 'expired') => ({
+    leaseId, unitNumber, propertyName: 'Mountain View', current, status, startDate: '2026-01-01', endDate: null,
+    health: percent === null ? null : {
+      percent, onTime: percent === 100 ? 1 : 0, counted: 1, paidLate: percent === 100 ? 0 : 1, partial: 0, outstanding: 0,
+      label: `${percent}%, ${percent === 100 ? 1 : 0} of 1 month`,
+    },
+  })
+  const click = async (el: Element | null | undefined) => { await act(async () => { (el as HTMLElement).click() }) }
+
+  it('a person on two leases sees each lease\'s own health, each opening its own report — never one number for both', async () => {
+    server.profile = profile({ stats: { ...profile().stats, onTimeRate: 50,
+      health: { percent: 50, onTime: 1, counted: 2, paidLate: 1, partial: 0, outstanding: 0, label: '50%, 1 of 2 months' },
+      healthByLease: [leaseHealth('L30', 'RV 30', 100), leaseHealth('L31', 'RV 31', 0)] } })
+    await render()
+    expect(text()).toContain('Payment Health — by lease')
+    const blocks = [...host.querySelectorAll('[data-lease]')]
+    expect(blocks.map(b => b.getAttribute('data-lease'))).toEqual(['L30', 'L31'])
+    expect(blocks[0].textContent).toContain('RV 30 · Mountain View')
+    expect(blocks[0].textContent).toContain('100%, 1 of 1 month')
+    expect(blocks[1].textContent).toContain('0%, 0 of 1 month')
+    expect(blocks[1].textContent).toContain('1 late, 0 partial, 0 outstanding')
+    // The tile names each lease; the household's one number is not shown.
+    expect(text()).toContain('RV 30 100% · RV 31 0%')
+    expect(text()).not.toContain('50%, 1 of 2 months')
+    await click([...blocks[1].querySelectorAll('button')].find(b => b.textContent === 'Report'))
+    await until(() => text().includes('REPORT /tenants/t1/report?leaseId=L31'), 'that lease\'s report')
+  })
+
+  // 10/13 review: Arturo Melendez's new MH 15 lease, waiting for signatures,
+  // read "Ended" beside his MH 23.
+  it('each lease says where it stands: Current, Pending (not signed yet) or Ended', async () => {
+    server.profile = profile({ stats: { ...profile().stats,
+      healthByLease: [leaseHealth('L23', 'MH 23', 100), leaseHealth('L15', 'MH 15', null, false, 'pending'), leaseHealth('L09', 'MH 09', 0, false)] } })
+    await render()
+    const badge = (lease: string) => host.querySelector(`[data-lease="${lease}"] .badge`)!
+    expect([badge('L23').textContent, badge('L15').textContent, badge('L09').textContent]).toEqual(['Current', 'Pending', 'Ended'])
+    expect(badge('L15').className).toBe('badge badge-gold')
+    expect(host.querySelector('[data-lease="L15"]')!.textContent).toContain('No months to judge yet')
+  })
+
+  // 10/13 (Nic), the onboarding month paid late: "Keep it out, but say so" —
+  // nothing counted yet is said in words, never a bare dash.
+  it('one lease whose only judged month is the onboarding month: the words, in the tile and on the card — no dash', async () => {
+    const onb = { percent: null, onTime: 0, counted: 0, paidLate: 0, partial: 0, outstanding: 0,
+      label: 'Onboarding month — not counted', onboardingLeftOut: true }
+    server.profile = profile({ stats: { ...profile().stats, onTimeRate: null, health: onb,
+      healthByLease: [{ ...leaseHealth('L27', 'RV 27', 100), health: onb }] } })
+    await render()
+    const tile = [...host.querySelectorAll('.card')].find(c => c.textContent?.startsWith('Payment Health') && !c.textContent.includes('Full report'))!
+    expect(tile.textContent).toBe('Payment HealthOnboarding month — not counted')
+    // The card: the words beside the ring, said once.
+    expect(text().match(/Onboarding month — not counted/g)).toHaveLength(2)
+    expect(text()).toContain('Since joining GAM')
+  })
+
+  it('two leases, one with nothing counted yet: its words in the tile and its block, never a dash', async () => {
+    const onb = { percent: null, onTime: 0, counted: 0, paidLate: 0, partial: 0, outstanding: 0,
+      label: 'Onboarding month — not counted', onboardingLeftOut: true }
+    server.profile = profile({ stats: { ...profile().stats,
+      healthByLease: [{ ...leaseHealth('L27', 'RV 27', 100), health: onb },
+                      { ...leaseHealth('L30', 'RV 30', 100), health: { ...leaseHealth('L30', 'RV 30', 100).health!, onboardingLeftOut: true } }] } })
+    await render()
+    expect(text()).toContain('RV 27 Onboarding month — not counted · RV 30 100%')
+    expect(host.querySelector('[data-lease="L27"]')!.textContent).toContain('Onboarding month — not counted · since joining GAM')
+    // Beside a percentage, the onboarding month left out is said too.
+    expect(host.querySelector('[data-lease="L30"]')!.textContent).toContain('100%, 1 of 1 month · since joining GAM · onboarding month not counted')
+  })
+
+  it('one lease: its figure on the card, and the full report opens for that lease', async () => {
+    server.profile = profile({ stats: { ...profile().stats, onTimeRate: 72,
+      health: { percent: 72, onTime: 8, counted: 11, paidLate: 2, partial: 1, outstanding: 0, label: '72%, 8 of 11 months' },
+      healthByLease: [leaseHealth('L4', 'MH 04', 100)] } })
+    await render()
+    expect(text()).not.toContain('by lease')
+    expect(text()).toContain('100%, 1 of 1 month')
+    await click(btn(/^Full report$/))
+    await until(() => text().includes('REPORT /tenants/t1/report?leaseId=L4'), 'the lease\'s report')
   })
 })

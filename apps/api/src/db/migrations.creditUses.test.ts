@@ -55,6 +55,8 @@ interface ChargeOpts {
   unitId?: string | null; leaseId?: string | null; tenantId?: string; landlordId?: string
   intent?: string | null; chargeId?: string | null; manualMethod?: string | null
   platformHeld?: boolean; dueDate?: string
+  /** When GAM wrote the row (default now). 10/12 (Nic, LF2): lateness counts from the later of the due date and this. */
+  writtenAt?: string
 }
 // Rent is unique per lease and due date (ux_payments_rent_idempotent), so every
 // charge gets its own day unless a test names one.
@@ -69,9 +71,9 @@ async function charge(c: PoolClient, f: Household, o: ChargeOpts = {}): Promise<
     `INSERT INTO payments
        (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description,
         due_date, revenue_owner, lease_fee_id, reversal_id, work_trade_suspended_at,
-        stripe_payment_intent_id, stripe_charge_id, manual_method, platform_held, settled_at)
+        stripe_payment_intent_id, stripe_charge_id, manual_method, platform_held, settled_at, created_at)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::date,$10,$11,$12,$13,$14,$15,$16,$17,
-             CASE WHEN $7 = 'settled' THEN now() END)
+             CASE WHEN $7 = 'settled' THEN now() END, COALESCE($18::timestamptz, now()))
      RETURNING id`,
     [o.unitId === undefined ? f.unitId : o.unitId,
      o.leaseId === undefined ? f.leaseId : o.leaseId,
@@ -79,19 +81,23 @@ async function charge(c: PoolClient, f: Household, o: ChargeOpts = {}): Promise<
      o.type ?? 'rent', o.amount ?? 460, status, o.entry ?? 'RENT',
      o.dueDate ?? nextDue(), o.owner ?? 'landlord', o.leaseFeeId ?? null, o.reversalId ?? null,
      o.workTrade ? new Date() : null, o.intent ?? null, o.chargeId ?? null, o.manualMethod ?? null,
-     o.platformHeld ?? false])
+     o.platformHeld ?? false, o.writtenAt ?? null])
   return r.rows[0].id
 }
 
 async function issued(
   c: PoolClient, f: Household, amount: number,
-  o: { leaseId?: string | null; category?: string; tenantId?: string; landlordId?: string } = {},
+  o: { leaseId?: string | null; category?: string; tenantId?: string; landlordId?: string
+       /** false = a credit GAM wrote itself (a late fee cancelled or refunded), which is never undone. */
+       byLandlord?: boolean } = {},
 ): Promise<string> {
   const r = await c.query<{ id: string }>(
-    `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, reason)
-     VALUES ($1,$2,$3,$4,$4,$5,'test') RETURNING id`,
+    `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, reason,
+                                 issued_by_landlord)
+     VALUES ($1,$2,$3,$4,$4,$5,'test',$6) RETURNING id`,
     [o.landlordId ?? f.landlordId, o.tenantId ?? f.tenantId,
-     o.leaseId === undefined ? f.leaseId : o.leaseId, amount, o.category ?? 'goodwill'])
+     o.leaseId === undefined ? f.leaseId : o.leaseId, amount, o.category ?? 'goodwill',
+     o.byLandlord !== false && (o.category ?? 'goodwill') !== 'deposit_interest'])
   return r.rows[0].id
 }
 
@@ -210,7 +216,6 @@ describe('S655 credit_uses: what a use may be', () => {
         await charge(c, f, { type: 'fee', entry: 'FLEXPAY', amount: 485 }),
         await charge(c, f, { type: 'fee', entry: 'DEPOSIT', amount: 120 }),          // move-out shortfall
         await charge(c, f, { type: 'deposit', entry: 'DEPOSIT', amount: 460 }),      // the security deposit itself
-        await charge(c, f, { type: 'home_payment', entry: 'HOMEPMT', amount: 200 }),
         await charge(c, f, { type: 'platform_fee', entry: 'SUBSCRIP', owner: 'gam', amount: 2 }),
         await charge(c, f, { type: 'fee', entry: 'OTHERFEE', owner: 'held', amount: 460 }),
       ]
@@ -220,6 +225,34 @@ describe('S655 credit_uses: what a use may be', () => {
       }
       expect(await remaining(c, 'tenant_credits', credit)).toBe(1000)
       expect(await remaining(c, 'lease_prepaid_credits', paidAheadId)).toBe(1000)
+    })
+  })
+
+  /**
+   * 10/26 (Nic): "let their own overpayment pay a trailer payment." A home
+   * payment is the one charge whose eligibility depends on WHICH KIND of credit
+   * is being spent — the tenant's own overpayment may, a credit the landlord
+   * issued may not. Kim Bowman's $10.40 of change could not reach the $100 he
+   * owed, so the money was stuck on both sides while the net was right.
+   */
+  it("a home payment takes the tenant's own overpayment, and no other credit", async () => {
+    await withRollback(async c => {
+      const f = await household(c)
+      const credit = await issued(c, f, 1000)
+      const paidAheadId = await paidAhead(c, f, 1000)
+      const home = await charge(c, f, { type: 'home_payment', entry: 'HOMEPMT', amount: 200 })
+
+      // Credit the landlord issued: refused, as before.
+      await refusedUse(c, { tenantCreditId: credit, paymentId: home, leaseId: f.leaseId, amount: 1 },
+        /not an eligible landlord charge/)
+      expect(await remaining(c, 'tenant_credits', credit)).toBe(1000)
+
+      // The tenant's own overpayment: taken, and only part of the line.
+      await c.query(
+        `INSERT INTO credit_uses (prepaid_credit_id, payment_id, lease_id, amount, billing_month, source, status, applied_at)
+         VALUES ($1, $2, $3, 10.40, date_trunc('month', CURRENT_DATE)::date, 'whole_bill', 'applied', NOW())`,
+        [paidAheadId, home, f.leaseId])
+      expect(await remaining(c, 'lease_prepaid_credits', paidAheadId)).toBe(989.60)
     })
   })
 
@@ -234,18 +267,28 @@ describe('S655 credit_uses: what a use may be', () => {
     })
   })
 
-  it("a use on another lease or a neighbor's utility is refused", async () => {
+  it("money paid ahead stays on its own lease, and a neighbor's utility is nobody's credit", async () => {
     await withRollback(async c => {
       const f = await household(c)
       const second = await household(c, { landlord: { landlordId: f.landlordId, userId: f.userId }, propertyId: f.propertyId, tenantId: f.tenantId })
       const neighbor = await seedLandlord(c)
-      const leaseCredit = await issued(c, f, 100)                 // tied to lease 1
+      const leaseCredit = await issued(c, f, 100)                 // issued on lease 1
       const money = await paidAhead(c, f, 100)                     // lease 1's paid-ahead money
       const otherLeaseRent = await charge(c, second)
-      // Paid-ahead money pays only its own lease, however the use is labeled.
+      // Money the tenant paid ahead pays only the space they paid it for
+      // (10/17), however the use is labeled.
       await refusedUse(c, { prepaidCreditId: money, paymentId: otherLeaseRent, leaseId: second.leaseId, amount: 10 }, /pays only its own lease/)
       await refusedUse(c, { prepaidCreditId: money, paymentId: otherLeaseRent, leaseId: f.leaseId, amount: 10 }, /not an eligible landlord charge/)
-      await refusedUse(c, { tenantCreditId: leaseCredit, paymentId: otherLeaseRent, leaseId: second.leaseId, amount: 10 }, /belongs to another lease/)
+      // 10/18 (Nic): a credit the landlord GAVE is the household's — the space
+      // it was issued on is a record of where he gave it, not a fence — so it
+      // pays this person's other space with this company.
+      await use(c, { tenantCreditId: leaseCredit, paymentId: otherLeaseRent, leaseId: second.leaseId, amount: 10 })
+      expect(await remaining(c, 'tenant_credits', leaseCredit)).toBe(90)
+      // Deposit interest still stays on its own lease: it goes back with THAT deposit.
+      const interest = await issued(c, f, 50, { category: 'deposit_interest' })
+      await refusedUse(c, { tenantCreditId: interest, paymentId: await charge(c, second), leaseId: second.leaseId, amount: 10 },
+        /Deposit interest belongs to another lease/)
+      expect(await remaining(c, 'tenant_credits', interest)).toBe(50)
       // A neighbor landlord's utility on this tenant's converged invoice is not on this lease.
       const neighborWater = await charge(c, f, { type: 'utility', entry: 'UTILITY', amount: 40, leaseId: null, landlordId: neighbor.landlordId })
       await refusedUse(c, { prepaidCreditId: money, paymentId: neighborWater, leaseId: f.leaseId, amount: 10 }, /not an eligible landlord charge/)
@@ -286,14 +329,21 @@ describe('S655 credit_uses: what a use may be', () => {
     })
   })
 
-  it("a lease-tied credit stamped with another landlord cannot pay this lease's bills", async () => {
+  it("a credit stamped with another landlord cannot pay this lease's bills", async () => {
     await withRollback(async c => {
       const f = await household(c)
       const stranger = await seedLandlord(c)
       const wrongLandlord = await issued(c, f, 100, { landlordId: stranger.landlordId })   // lease_id = this lease
+      // 10/18: a credit the landlord gave is checked by the household rule now
+      // (its own tenant, with the company that gave it), so this is refused in
+      // those words instead of the lease's.
       await refusedUse(c, { tenantCreditId: wrongLandlord, paymentId: await charge(c, f), leaseId: f.leaseId, amount: 10 },
-        /given by another landlord/)
+        /pays only its own tenant's bills with the landlord who gave it/)
       expect(await remaining(c, 'tenant_credits', wrongLandlord)).toBe(100)
+      // Deposit interest keeps its own lease's refusal.
+      const interest = await issued(c, f, 50, { landlordId: stranger.landlordId, category: 'deposit_interest' })
+      await refusedUse(c, { tenantCreditId: interest, paymentId: await charge(c, f), leaseId: f.leaseId, amount: 10 },
+        /given by another landlord/)
     })
   })
 
@@ -722,6 +772,66 @@ describe('S655 credit_uses: status moves the balance exactly once', () => {
     })
   })
 
+  /**
+   * 10/18 (Nic): "we need to undo credit, but no undoing payments that were
+   * actually real money handed over." A credit the landlord gave comes back off
+   * the bill it paid — the whole amount back on the credit, the bill's own
+   * amount untouched (that is the shortened-stay give-back alone) — and only
+   * for a credit he funded.
+   */
+  it('a credit the landlord gave is taken back off a bill it paid: the credit is whole again and the bill keeps its own amount', async () => {
+    await withRollback(async c => {
+      const f = await household(c)
+      const credit = await issued(c, f, 300)
+      const row = await charge(c, f, { amount: 300 })
+      const spent = await use(c, { tenantCreditId: credit, paymentId: row, leaseId: f.leaseId, amount: 300 })
+      await c.query(`UPDATE payments SET status = 'settled', settled_at = now() WHERE id = $1`, [row])
+      const spentAt = (await c.query(`SELECT applied_at FROM credit_uses WHERE id = $1`, [spent])).rows[0].applied_at
+      expect(await remaining(c, 'tenant_credits', credit)).toBe(0)
+      expect(await issuedOn(c, row)).toBe(300)
+
+      await c.query(`UPDATE credit_uses SET status = 'released', released_at = now(), release_reason = 'credit_undone' WHERE id = $1`, [spent])
+      expect(await remaining(c, 'tenant_credits', credit)).toBe(300)
+      expect(await issuedOn(c, row)).toBe(0)
+      // The bill is whole: it owes its own $300 again (only a shortened stay
+      // takes a row's amount down with the credit).
+      expect(Number((await c.query(`SELECT amount FROM payments WHERE id = $1`, [row])).rows[0].amount)).toBe(300)
+      expect(Number((await c.query(`SELECT money_part FROM v_payment_money WHERE payment_id = $1`, [row])).rows[0].money_part)).toBe(300)
+      const u = (await c.query(`SELECT applied_at, release_reason FROM credit_uses WHERE id = $1`, [spent])).rows[0]
+      expect(u.applied_at).toEqual(spentAt)
+      expect(u.release_reason).toBe('credit_undone')
+      // It never goes back to spent, and writing it again moves nothing twice.
+      await c.query(`UPDATE credit_uses SET status = 'released' WHERE id = $1`, [spent])
+      expect(await remaining(c, 'tenant_credits', credit)).toBe(300)
+      await refused(c, `UPDATE credit_uses SET status = 'applied', released_at = NULL, release_reason = NULL WHERE id = $1`,
+        [spent], /cannot go from released to applied/)
+    })
+  })
+
+  it('only a credit the landlord gave is taken back that way: deposit interest and money paid ahead are refused', async () => {
+    await withRollback(async c => {
+      const f = await household(c)
+      const undo = `UPDATE credit_uses SET status = 'released', released_at = now(), release_reason = 'credit_undone' WHERE id = $1`
+      // Interest on a deposit is owed to the tenant by law, not the landlord's to take back.
+      const interest = await use(c, { tenantCreditId: await issued(c, f, 20, { category: 'deposit_interest' }),
+        paymentId: await charge(c, f), leaseId: f.leaseId, amount: 20 })
+      await refused(c, undo, [interest], /Only a credit the landlord typed himself, spent on a bill/)
+      // Money the tenant handed over is never undone — it is refunded.
+      const money = await use(c, { prepaidCreditId: await paidAhead(c, f, 50), paymentId: await charge(c, f), leaseId: f.leaseId, amount: 50 })
+      await refused(c, undo, [money], /Only a credit the landlord typed himself, spent on a bill/)
+      // 10/18 review fix: and never a credit GAM wrote itself — the one that
+      // cancels a late fee the bank shows was never owed. Putting that fee back
+      // would reinstate a charge the system already decided was not owed.
+      const gamWrote = await use(c, { tenantCreditId: await issued(c, f, 5, { category: 'late_fee_refund', byLandlord: false }),
+        paymentId: await charge(c, f), leaseId: f.leaseId, amount: 5 })
+      await refused(c, undo, [gamWrote], /Only a credit the landlord typed himself, spent on a bill/)
+      // Credit only set aside for a payment in flight is given back the ordinary way.
+      const held = await use(c, { tenantCreditId: await issued(c, f, 10), paymentId: await charge(c, f), leaseId: f.leaseId,
+        amount: 10, status: 'held', remittanceId: await remittance(c, f, 450) })
+      await refused(c, undo, [held], /credit_uses_status_stamps/)
+    })
+  })
+
   it('issued_credit_amount follows applied landlord-issued uses and ignores deposit interest', async () => {
     await withRollback(async c => {
       const f = await household(c)
@@ -1090,7 +1200,9 @@ describe('S655 expand migrations', () => {
       await c.query(`UPDATE units SET status = 'active' WHERE id = $1`, [f.unitId])
       // $460 of saved credit used to hide a $460 late rent entirely.
       await issued(c, f, 460)
-      const late = await charge(c, f, { dueDate: '2026-01-01' })
+      // Written before it was due: a bill GAM wrote today for 1/1 would count its
+      // lateness from today (10/12, Nic, LF2 — migration 20261013120000).
+      const late = await charge(c, f, { dueDate: '2026-01-01', writtenAt: '2025-12-25T12:00:00Z' })
       expect((await c.query(`SELECT status FROM units WHERE id = $1`, [f.unitId])).rows[0].status).toBe('delinquent')
       // Paying the rent clears it.
       await c.query(`UPDATE payments SET status = 'settled', settled_at = now() WHERE id = $1`, [late])

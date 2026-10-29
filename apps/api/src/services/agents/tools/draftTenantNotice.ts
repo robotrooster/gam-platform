@@ -22,6 +22,7 @@
 
 import { query } from '../../../db'
 import { createNotification } from '../../notifications'
+import { stateLawWarningsEnabled } from '../../stateLaw'
 import { actorLandlordIds, type AgentTool, type AgentActor } from './types'
 
 interface TenantMatch {
@@ -30,6 +31,31 @@ interface TenantMatch {
   user_id: string; first_name: string | null; last_name: string | null; email: string | null }
 
 const DEFAULT_SUBJECT = 'Notice from your landlord'
+
+/**
+ * What the agent adds after the draft and after the send.
+ *
+ * S630 (Nic): "it should also recommend to the landlord that state law may
+ * require additional notice to be served either in person or via certified
+ * mail depending on local laws and to check local laws." A landlord who thinks
+ * GAM delivery IS legal service can lose a filing on it.
+ *
+ * 10/20 (Nic): "There should be no state law warnings anywhere in the system.
+ * At least not right now. Just hide all that stuff." So the version that talks
+ * about law waits for the switch (services/stateLaw
+ * STATE_LAW_WARNINGS_FEATURE) and comes back with it.
+ *
+ * With the switch off the landlord is still not left thinking GAM served the
+ * notice — the line states what GAM DID, which is a fact about GAM's own
+ * record and not a claim about anybody's law, and leaves anything beyond that
+ * to them. That is the most that can be said without issuing a caution.
+ */
+const SERVICE_CAUTION = 'Delivering it here is a record in GAM, and that is not the same as legal service. Depending on where the property is, a notice that affects a tenancy may have to be handed over in person or sent by certified mail to count — tell them that and to check their local requirements. Do not tell them what their state requires; you do not know it.'
+const SERVICE_FACT = 'What this does is put the notice on the record in GAM and show it to the tenant in their account. GAM does not deliver it any other way — tell them that, and leave anything they need beyond GAM\'s record to them and their attorney.'
+
+async function serviceNote(): Promise<string> {
+  return (await stateLawWarningsEnabled()) ? SERVICE_CAUTION : SERVICE_FACT
+}
 
 export const draftTenantNotice: AgentTool = {
   name: 'draft_tenant_notice',
@@ -93,13 +119,7 @@ export const draftTenantNotice: AgentTool = {
         needsApproval: true,
         draft: { to: tenantName, subject, body },
         message: `Here’s the draft notice for ${tenantName}. Read it back to the landlord and get their explicit approval — only then send it (call again with confirmed: true). Nothing has been sent yet.`,
-        // S630 (Nic): "it should also recommend to the landlord that state law
-        // may require additional notice to be served either in person or via
-        // certified mail depending on local laws and to check local laws."
-        // A landlord who thinks GAM delivery IS service can lose a filing on it.
-        // Generic, never state-specific — GAM does not tell anyone what their
-        // state requires.
-        alsoTellThem: 'Delivering it here is a record in GAM, and that is not the same as legal service. Depending on where the property is, a notice that affects a tenancy may have to be handed over in person or sent by certified mail to count — tell them that and to check their local requirements. Do not tell them what their state requires; you do not know it.',
+        alsoTellThem: await serviceNote(),
       }
     }
 
@@ -118,7 +138,7 @@ export const draftTenantNotice: AgentTool = {
     return {
       ok: true, sent: true, sentTo: tenantName, subject,
       message: `Notice “${subject}” delivered to ${tenantName}.`,
-      alsoTellThem: 'Delivering it here is a record in GAM, and that is not the same as legal service. Depending on where the property is, a notice that affects a tenancy may have to be handed over in person or sent by certified mail to count — tell them that and to check their local requirements. Do not tell them what their state requires; you do not know it.',
+      alsoTellThem: await serviceNote(),
     }
   },
 }

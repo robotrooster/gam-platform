@@ -38,6 +38,73 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── 10/20: the park's task list, which is a person's list on purpose ───────
+  // Blu wants a checklist the maintenance person consults and ticks off,
+  // "stuff assigned by the landlord himself". Both halves of that are reasons
+  // an assistant stays out of it. Ticking is somebody saying they were at the
+  // meter and it is fixed, and done_by_user_id keeps that name for good — an
+  // agent ticking a line would record work as done that nobody did, which is
+  // the same rule that keeps an agent off signatures. And a list an assistant
+  // writes is a list the landlord did not decide, which is the one thing Nic
+  // said this list is. Worth revisiting for ADDING a line once the assistants
+  // are back on; the tick is not worth revisiting.
+  'propertyTaskList POST /:propertyId':
+    'adds a line to a property\'s task list. Nic 10/20, relaying Blu: "it\'s stuff assigned by the landlord himself, not necessarily requests coming from the tenant, or work orders or whatever" — a list the assistant composes is a list nobody decided, which is the whole thing this list is meant to be.',
+  // 10/21: and the two ways back from a stray click. Both are the OWNER
+  // correcting their own screen — "I clicked on it and it highlighted and I
+  // couldn't unclick it… I tried to X out of it and it deleted it from the
+  // list". An assistant un-ticking a line erases a worker's record of having
+  // done the work, which is the done rule read backwards; an assistant putting
+  // a line back puts a job in front of somebody that the owner took away.
+  'propertyTaskList POST /:propertyId/items/:itemId/undone':
+    'un-ticks a task. The tick carries the name of whoever said they did the work, so clearing it is as much a person\'s act as pressing it was — see the done rule above.',
+  'propertyTaskList POST /:propertyId/items/:itemId/unhide':
+    'puts a line the owner took off the park\'s list back on it. The owner\'s own correction; an assistant doing it hands the maintenance person a job the owner had decided against.',
+  'propertyTaskList POST /:propertyId/items/:itemId/done':
+    'ticks a task off as done, and the row keeps who ticked it for good. That name is somebody saying they were there and did the work; an assistant pressing it records work nobody did. Same reason an agent never signs.',
+  'propertyTaskList POST /:propertyId/items/:itemId/hide':
+    'takes a line off the park\'s list. The landlord\'s own press — a task that can be made to disappear is a task that never has to be done, and the maintenance person is the one person it must not be removable by.',
+  // ── 10/19: a mobile home changing hands with a debt on the spot ────────────
+  // Every one of these moves money between two people, and the whole design is
+  // that the landlord sees four figures BEFORE anything is written (what
+  // carries, what stays the departing resident's, what late fees are dropped,
+  // and that the lease closes). An assistant pressing any of them would be
+  // making exactly the money decision those screens exist to put in front of a
+  // person. Nic's rule for the last one is sharper still — taking the balance
+  // on is a condition of moving in, not a request ("If Jacob declines, he's not
+  // moving into the park"), so it is the landlord's call on the landlord's
+  // screen, never a thing settled mid-conversation. The read-only preview is
+  // reachable; only the writes are named here.
+  'leases POST /:id/space-carryforward/close-out':
+    'closes a departing resident out of a tenant-owned mobile home space: moves the unpaid space rent onto the space, voids the late fees, and ends the lease. Four figures the owner reads first, on a screen that writes nothing until pressed (services/spaceRentCarryforward); the assistant makes no money decision (#38 Q6).',
+  'leases POST /:id/space-carryforward/take-off':
+    'writes off a space\'s carried balance — the landlord deciding to eat somebody else\'s unpaid rent. A deliberate press with the figure and whose debt it was on screen, and what was already paid stays recorded.',
+  'leases PUT /:id/space-carryforward/arrangement':
+    'sets what a resident is asked for each month against a carried balance ($50, $100, whatever the landlord lands on). A payment plan on a debt that is not even theirs — the owner\'s judgment about a person, not an assistant\'s.',
+  'spaceCarryforward POST /:id/assumption':
+    'records that the incoming resident is taking on the balance left on the space, by name and date. Nic 10/19: it is a condition of moving in, so it is answered on the invite with the amount and the previous owner\'s name in front of the landlord — never agreed to on their behalf.',
+  // ── 10/19: a policy answer and an undo, both the owner's own press ────────
+  // Nic, 10/18: refunds on an early departure and mid-month proration are
+  // "property level settings" — a standing answer about his own money that a
+  // park gives once, not something to decide mid-conversation on a phone call.
+  // And undoing a credit puts a bill that reads PAID back to owed, which makes
+  // the nightly run charge every late day since its due date and re-scores the
+  // resident's payment mark. Both are a deliberate press on a screen showing
+  // what is about to change, by a person who can be asked "are you sure".
+  'properties PATCH /:id/departure-rules':
+    'sets whether a property gives money back when someone leaves early and whether it prorates a mid-month move (Nic 10/18: "these should all be property level settings"). A standing policy answer about the landlord\'s own money, given once on the property\'s page — never an assistant\'s call in the middle of a conversation.',
+  // 10/22: the departure adjustment. It re-prices a month to the days somebody
+  // actually used and voids the late fees that came of waiting on it — and the
+  // whole figure hangs off ONE fact the desk establishes, the day they drove
+  // out ("those guys actually ended up leaving about 2 days ago... somebody
+  // leaves on a Sunday when the office is closed and we don't check them out
+  // till Monday"). An assistant cannot know that day; it is told it. The quote
+  // (GET /:id/departure-money) is open to anybody who can read the lease, so an
+  // assistant can say what it would come to — it just does not press it.
+  'leases POST /:id/departure-money/adjust':
+    'adjusts a departing resident\'s unpaid month down to the days they used and voids the late fees it carried. The figure turns on the day they left, which the desk establishes and nobody can infer; pressed on a screen showing the old bill, the new one and the fees coming off, by a person who can be asked "are you sure" (#38 Q6).',
+  'tenantCredits POST /:id/undo':
+    'takes back a credit whole: every bill it settled goes back to owed, so the late-fee run charges the days since each due date and the resident\'s payment history is re-scored. The owner\'s or a property manager\'s press, with the bills it reopens on screen; an assistant makes no money decision (#38 Q6).',
   // ── 10/4: move-out money, check-outs, and a card waiting on its bank ───────
   // Every one of these moves money or says where money went, and each is a
   // press on a screen that read the figures fresh at that moment (a 409 reads
@@ -137,6 +204,28 @@ const DELIBERATE = new Map(Object.entries({
   // the lines on screen, never from a spoken figure.
   'posPayLinks PATCH /:id':
     'changes the lines and total of an unpaid link. Done from the outstanding list with every line on screen; a misheard number is a real charge.',
+  // ── 10/20: a utility bill sent as a link ─────────────────────────────────
+  'posPayLinks POST /utility-bills':
+    'emails a person a card page for their utility bills — most often the final bill of somebody who has already left. Same reason as every other pay link: it is a real charge sent to a real address, and the bills are picked from a list on screen beside who they belong to. The figures come off the bills, so there is nothing for a spoken number to get wrong; who it goes to is the part that would be.',
+  // ── 10/20 (Nic): the confirmation and the old schedule coming in ─────────
+  //
+  // These three are not withheld because they are risky to get wrong. They are
+  // withheld because a PERSON pressing them is the whole feature. Nic:
+  // "the imports should not send anybody anything", and the confirmation exists
+  // as a deliberate act precisely so a 150-row season file cannot become 150
+  // emails. An agent that could press them would be the auto-send the design
+  // forbids, however carefully it asked first.
+  'bookings POST /:id/confirmation':
+    'emails a guest their reservation with a deposit offer. Deliberately a human act: the whole reason it is a separate button is that bringing the old schedule in must never email anybody, and Nic reads the wording before the first one goes out.',
+  'bookings POST /import/validate':
+    'reads an export from another park-management system and shows what it would do. Takes a file, which an agent does not hold, and its answer is a screen a person reads row by row before committing.',
+  'bookings POST /import/commit':
+    'puts a whole season of reservations on the board, taking sites in file order. Reviewed row by row on screen first; a batch nobody read is a board nobody can trust, and the guests in it were promised their sites somewhere else.',
+  // ── 10/20 (Nic): the same person twice ───────────────────────────────────
+  'duplicatePeople POST /:id/same-person':
+    "folds two records into one person, moving an email address and repointing their reservations. Nic: \"always have the landlord check that the customer is the same.\" The two people are shown side by side with what each actually has; a wrong answer joins two real people's histories.",
+  'duplicatePeople POST /:id/not-duplicate':
+    'answers that two records are different people, and the pair is never raised again. The same landlord call as the merge, in the other direction — a dismissal nobody made would hide a real duplicate for good.',
   // ── S652: posting a check that arrived before its bill ────────────────────
   'payments POST /post-payment':
     'writes down cash, a check or a money order handed over at the office and banks what is beyond the open balance as paid ahead. Done at the desk with the check in hand — the amount, the check number and the date come off the paper, and a misheard figure is money the books say arrived and did not. The agent records a payment against an open charge (record_cash_payment); money ahead of any bill is the desk\'s to post.',
@@ -185,6 +274,19 @@ const DELIBERATE = new Map(Object.entries({
   'pos POST /reader-orders': 'ordering hardware to a property is the landlord\'s own act, with their address',
   'pos POST /reader-orders/:id/cancel': 'the counterpart of that request',
   'admin PATCH /reader-orders/:id': 'GAM\'s own desk',
+  // 10/12 (Nic): GAM's actual cost of a reader (base, tax, shipping), typed from the shop receipt.
+  'admin POST /reader-orders/:id/cost': 'GAM\'s own desk — what a card reader cost GAM, typed by GAM from the shop receipt; no landlord or tenant has anything to do with it',
+  // 10/21 (Nic): the link to run a background check at a park, emailed.
+  'properties POST /:id/apply-link/send':
+    'sends the park\'s own application link to an address spoken out loud. Nothing is charged and nothing is '
+    + 'committed to — the applicant pays GAM themselves on the page — but an address misheard on a call sends a '
+    + 'landlord\'s application link to a stranger, and the person who should type it is the one reading it off '
+    + 'a screen or a form. The QR on the desk is the version that needs no typing at all.',
+  // 10/21 (Nic): where somebody dragged their own nav items and dashboard widgets.
+  'uiLayout PUT /:surface':
+    'moves things around on somebody else\'s screen. It is theirs, it is done by dragging, and the only '
+    + 'way to know it came out right is to be looking at it — there is nothing here for an assistant to do '
+    + 'that the person is not already doing with their hand on the mouse.',
   'properties PATCH /:id/meter-photo-config': 'a landlord setting about their own crew\'s walk — not an agent\'s call',
   'utility POST /reading-runs/:id/meters/:meterId/photo': 'a camera on a phone at the meter — nothing an agent can do',
   'properties PATCH /:id/maintenance-config':
@@ -219,7 +321,18 @@ const DELIBERATE = new Map(Object.entries({
     'the required applicant notice is the landlord\'s to send, same directive',
   'background POST /payment-intent': 'Stripe payment entry, which belongs to Stripe\'s own elements',
   'background POST /pool/match/:matchId/payment-intent': 'Stripe payment entry, which belongs to Stripe\'s own elements',
+  'background POST /waiting/:id/resend':
+    'the point of the button is CORRECTING a mistyped email address before it sends again, and an '
+    + 'address heard in a conversation is exactly the thing not to take dictation on — whoever fixes it '
+    + 'should be looking at the list, reading the one that bounced, and typing the right one',
   'background POST /upload-id': 'an identity document is uploaded by the person, not the agent',
+  // 10/26: the same applicant, the same envelope. Optional proof of income
+  // attached to a screening application, served back only to them or the
+  // company screening them (the serve is a GET, so this guard never counts
+  // it — its identity-document twin, GET /id-files/:filename, is unnamed for
+  // the same reason).
+  'background POST /upload-income':
+    'proof of income is a file the applicant attaches themselves, the same act as the identity document above — a document in somebody\'s hand, not a thing an agent hands over on their behalf',
   'background POST /submit': 'the applicant enters their own SSN and identity details',
   'scopes POST /:roleType/invite': 'permissions and access are a hard stop in every profile',
   'scopes PATCH /:roleType/:userId/permissions': 'changing what somebody can see or do is a hard stop in every profile',
@@ -236,7 +349,9 @@ const DELIBERATE = new Map(Object.entries({
   'landlords POST /pos-customers': 'POS is its own product and stays isolated',
   'landlords DELETE /pos-customers/:id': 'POS is its own product and stays isolated',
   'landlords POST /pos-customers/:id/send-onboarding': 'POS is its own product and stays isolated',
-  'bankAccounts POST /': 'adding an account takes a routing and account number — entered by the person, never through the agent',
+  // 10/12 (Nic): the endpoint refuses every new entry — payouts are set up
+  // with Stripe on the Bank page's Bank setup tab, inside Stripe's own form.
+  'bankAccounts POST /': 'refuses every new entry (10/12): the payout bank is entered inside Stripe\'s verification on the Bank page\'s Bank setup tab, by the person',
   'properties POST /units/:id/photos': 'unit photos are files the landlord uploads',
   'properties DELETE /units/:id/photos/:photoId': 'removing a photo is done looking at it',
   'documents POST /': 'a document is a file the person uploads',
@@ -261,7 +376,26 @@ const DELIBERATE = new Map(Object.entries({
   'properties PATCH /:id/tenants-deposit-at-bank':
     'whether tenants may deposit rent at the landlord\'s bank is the landlord\'s money policy for the property (10/6), set on the property screen beside the payment settings; it decides what the bank feed may match by itself',
   'properties PATCH /:id/partial-payments': 'accepting part of the rent is a landlord\'s money policy, set on the property screen beside its local-laws note',
+  // 10/23 (Nic): "that needs to be turned on or off if a property chooses to
+  // accept checks. A lot of places don't accept them." The same shape as the
+  // two above — a standing answer about what the front counter may take in,
+  // given once on the property's own screen.
+  'properties PATCH /:id/accepts-checks':
+    'whether the front counter takes a check is a property\'s own answer about what it accepts as payment (10/23), set on the property screen beside the other payment settings; the register reads it to decide whether to offer a Check button and the sale route reads it again to refuse one either way',
   'landlords POST /me/pending-tenants/:intentId/document': 'the lease PDF is a file the landlord uploads',
+
+  // ── 10/26: "Are you on a fixed income?" ───────────────────────────────────
+  // One question on a banner in the resident's own portal, asked once and
+  // answered in place. Nic: "If yes, it takes them to the descriptor of
+  // FlexPay. If they click no, then boom, they're just flagged no." So the
+  // answer is a fact about somebody's income that routes them toward a money
+  // product, only they can know it, and the first answer is the one that
+  // sticks — re-answering is refused so a closed banner stays closed. An
+  // assistant recording it would be stating somebody's circumstances for
+  // them, which is the emergency-contact confirm rule exactly. The banner is
+  // one tap on the screen they are already looking at.
+  'tenants POST /me/fixed-income':
+    'the resident\'s own yes or no to "are you on a fixed income?", and a yes sends them to the FlexPay explainer. Only they can know the answer, so an assistant recording it manufactures a fact about somebody\'s income (the same reason a staff-side agent cannot confirm an emergency contact), and there is no correcting it after — the first answer is kept. One tap in their own portal.',
 
   // A SIGNATURE IS THE PERSON'S. The agent never signs, never declines a
   // signature, and never accepts terms on somebody's behalf — an acceptance
@@ -305,6 +439,39 @@ const DELIBERATE = new Map(Object.entries({
   'bankFeed POST /deposit-slips/:id/match': 'the owner says a bank deposit IS this slip, which settles money',
   'bankFeed POST /deposits/:id/undo': 'takes a bank-deposit match back, which un-settles charges',
   'bankFeed POST /transactions/:id/undo-auto-file': 'takes back a deposit the bank feed filed by itself; the owner decides',
+  // 10/12 (Nic): "if a deposit is multiple sources it should be split for record keeping."
+  'bankFeed POST /transactions/:id/split':
+    'files one bank line as several parts, each its own category and unit or property, adding up to the bank\'s amount to the cent, and replaces a filing already made. Entered on the Bank page with the line, every part and the amount still unassigned on screen; a misheard part puts money in the wrong category on every report.',
+  'bankFeed POST /transactions/:id/split/undo':
+    'takes a split back: its parts are voided and the bank line returns to review. The one-button back-out beside the split on the Bank page.',
+  // 10/12 (Nic): "every bank filing (hand-filed too) can be undone (kept on record)."
+  'bankFeed POST /transactions/:id/undo-filing':
+    'takes back how a bank line is filed (one category, a filing the feed made itself, a split, or an Ignore): what it booked is voided and the line returns to review. The Undo beside the filed line on the Bank page, confirmed with that line and what comes out of the books on screen.',
+  // 10/12 (Nic, ledger P6, L5): "money out = ONE record" — a bank line going
+  // out matches the record it paid first (services/bankMoneyOut).
+  'bankFeed POST /transactions/:id/match-expenses':
+    'says which open bills (or checks already written) a bank line going out paid, which marks them paid from the bank. Picked on the Bank page from the open expenses offered beside the line, adding up to it to the cent; in a company with several bills of the same amount an amount names nobody, and the assistant makes no money decision (#38 Q6).',
+  'bankFeed POST /transactions/:id/match-record':
+    'says a bank line going out IS GAM\'s fee debit, a register refund check, a refund check, a transfer to another of the company\'s accounts or a payment on one of its loans (split into principal, interest and escrow), or that money coming in IS a loan\'s money arriving, which clears it from what is owed to the bank. Picked on the Bank page from the records of the same amount offered beside the line (a loan payment\'s split checked against the lender\'s statement); a wrong match books the money twice, and the assistant makes no money decision (#38 Q6).',
+  // 10/14 (Nic, answer 15): a check the bank returned out of a bigger deposit,
+  // when GAM could not be sure which check it was.
+  'bankFeed POST /transactions/:id/returned-check':
+    'the owner says which check (or money order) in a deposit is the one the bank returned on a line going out, which takes that payment back off the bills it paid, owes them again with late fees and bills the returned-check fee. Picked on the Bank page from the checks of that amount listed beside the line; a wrong pick reopens another tenant\'s rent, and the assistant makes no money decision (#38 Q6).',
+  // 10/14 (Nic, answer 16): "no guessing" — a deposit of a payout's amount whose memo does not name GAM.
+  'bankFeed POST /transactions/:id/match-payout':
+    'the owner says a deposit IS the payout GAM sent, offered beside a deposit of that amount whose memo does not name GAM, which keeps the money from being filed as income a second time. The button beside the deposit on the Bank page, with the payout\'s amount and day on screen; the assistant makes no money decision (#38 Q6).',
+  // 10/12 (Nic, L5): "just let bookkeeper/landlord create custom labels or categories to charge things off to."
+  'expenses POST /categories':
+    'the owner or bookkeeper makes a category of their own and, optionally, points it at an account of the chart, which decides whether its money counts on the Profit & Loss. Done on the Categories page with the chart on screen; an assistant never picks where a company\'s money posts.',
+  'expenses PATCH /categories/:id':
+    'renames, archives or brings back a category, or points it at another account of the chart (postings from today on move to it). The Categories page, with the category, its account and how many rows use it on screen.',
+  'expenses POST /:id/payments':
+    'records what was paid on a bill and how (cash from the office, a check, a card, the owner personally, the bank). Entered on the Expenses page with the bill, what is still owed and the day on screen; a misheard amount or method puts money in the wrong place on the books, and the assistant makes no money decision (#38 Q6).',
+  'expenses POST /:id/payments/:paymentId/void':
+    'takes back a payment recorded on a bill by mistake (kept on record), so the bill is owed again. The press beside that payment on the Expenses page, with it on screen.',
+  // 10/12 (Nic, L6): "a repair closed with a cost → landlord's choice (auto unpaid bill vs 'Record as bill' button)".
+  'expenses POST /repairs/:requestId/bill':
+    'the "Record as bill" button: a completed repair\'s cost becomes an unpaid bill on Expenses. Pressed on the Maintenance costs page beside that repair and its cost; the owner chose the button over automatic bills, so it is a person\'s press.',
 
   // ADMIN-ONLY, DEV-ONLY, OR ANOTHER SURFACE ENTIRELY.
   'payments POST /initiate-rent-collection': 'requireAdmin — platform operations',
@@ -314,7 +481,6 @@ const DELIBERATE = new Map(Object.entries({
   'background POST /dev-reset': 'dev-only, requireAdmin',
   'background POST /pool/match/:matchId/purchase-report': 'buys a screening report — a purchase',
   'featureRequests PATCH /:id': 'requireSuperAdmin — the GAM team triaging',
-  'books POST /bookkeeper/assign': 'granting a bookkeeper access is a permissions change',
   'books DELETE /bookkeeper/revoke': 'revoking a bookkeeper is a permissions change, same hard stop as granting one',
   'scopes PATCH /property_manager/:userId/direct-deposit': 'somebody else\'s bank details',
   'utility POST /bills/:id/pay': 'deprecated at S178 — utilities are line items on the rent invoice',
@@ -336,12 +502,74 @@ const DELIBERATE = new Map(Object.entries({
   'workTrade POST /jobs/:jobId/take': 'a work trader claiming a repair commits their own hands to it; they claim it on the job list where they can see the job',
   'workTrade POST /jobs/:jobId/done': 'saying physical work is finished is the worker\'s own attestation, never the agent\'s',
   'workTrade POST /jobs/:jobId/check': 'confirming someone else\'s repair was done right is a person\'s judgment on site, never the agent\'s',
+  // 10/12 (Nic): paid extra hours are wages the LANDLORD pays a person — by
+  // hand, or through GAM Books payroll / a contractor payment. Saying a person
+  // was paid, or queuing their pay, is never the assistant's (#38 Q6: the
+  // assistant makes no money decision).
+  // 10/12 (Nic): it also records that pay as a paid expense under "Work trade
+  // labor" in GAM Books — still the landlord's own act, never the assistant's.
+  'workTrade POST /extra-hours/:payableId/mark-paid':
+    'says the landlord paid a work trader for extra hours by check or cash, and records that pay as a paid expense in GAM Books — the landlord pays a person, not the assistant; pressed on the Work Trade page with the hours, rate and amount on screen',
+  'workTrade POST /extra-hours/:payableId/send-to-books':
+    'queues a work trader\'s extra-hours pay for GAM Books payroll (W-2) or a contractor payment (1099) — the landlord pays a person, not the assistant; pressed on the Work Trade page with the hours, rate and amount on screen',
+  // 10/12 (Nic, ledger P7): the GAM Books side of the same pay.
+  'books POST /work-trade-pay/:id/contractor-payment':
+    'turns a work trader\'s extra hours sent to GAM Books as a contractor payment (1099) into an unpaid bill to the vendor who is that person, counted toward their 1099. The person paying confirms it on the Run Payroll page with the hours, amount and vendor on screen; the landlord pays a person, not the assistant (#38 Q6).',
+  'books POST /journal/:id/reverse':
+    'a bookkeeper\'s reversing entry: takes back a posted journal entry on a later day (an accrual reversed on the first of the next month), changing two months\' books. Done on the Journal page with the entry and the reversal date on screen; the assistant can already void a wrong entry (void_journal_entry) and post a corrected one (post_journal_entry).',
   'esign PUT /sleeves/:id/cover': 'says which of their own documents already contain a document slot on the Templates page — page bookkeeping, done where the slots and documents are side by side',
   'esign DELETE /templates/:id/fields/:fieldId': 'field geometry on a PDF — removed visually, not described',
   'esign POST /documents': 'takes a hand-assembled signer list; draft_household_lease is the safe path',
   'esign POST /standalone-documents': 'takes the same hand-assembled signer list as POST /documents',
+  // ── 10/20: the door on the resident's own page ───────────────────────
+  //
+  // This IS the door Nic asked for — "can he just go into Curtis's file, add a
+  // template that way, and have it signed to him? Like, there's some sort of
+  // broken flow there that we need to get fixed." It stays a press on that page
+  // for a reason that is measured rather than judged.
+  //
+  // The call is named by two uuids in the BODY: which resident, and which of the
+  // landlord's own PDFs. The dispatcher turns a spoken name into an id for
+  // unitId, leaseId and propertyId only, and only where they sit in the PATH
+  // (portalDispatch.resolveHumanId), and no agent tool reads lease_templates at
+  // all — so a templateId could only ever be a number the model filled in, and
+  // agentRunner refuses an id this conversation never saw (idTraceability). An
+  // action here would be refused on every single call: the registry would read
+  // closed while the door was a dead end, which is exactly the trap S630 found
+  // sitting behind every "from a lookup" parameter.
+  //
+  // And the pick is the feature anyway. The list on the resident's page shows
+  // each form beside who would sign it and, where a box cannot be filled from
+  // that page, the words saying so and the screen that can send it (D9, 10/20);
+  // the whole point is that nobody has to know what a signer role is. What this
+  // door sends is the paper whose signed PDF IS the instrument — park rules, a
+  // disclosure, a work-trade agreement — so the wrong form is a real signed
+  // agreement, not a draft somebody corrects. The agent still draws up the ones
+  // it can name in a sentence, Blu's own case among them
+  // (draft_work_trade_addendum, draft_household_lease), and still sends and
+  // voids what is drafted.
+  'esign POST /resident-documents':
+    'raises one of the landlord\'s own forms for a resident to sign, picked off the list on that resident\'s page that names who would sign each one (D9, 10/20). The call is named by two uuids in the body and nothing an agent can call returns a template id, so every one it made would carry an invented id and be refused — a registry that reads closed over a door that is a dead end. The agent draws up the papers it can name instead (draft_work_trade_addendum, draft_household_lease) and sends and voids what is drafted.',
   'esign POST /documents/addendum-terms/batch': 'the batch form of an action the agent already has one at a time',
   'homeSale POST /': 'creates a financed sale contract with an amortisation schedule — a lending instrument',
+  // 10/25 (Nic): the terms on a signed installment contract — whether it
+  // charges a late fee, and whether its bills take a card. Both are the
+  // landlord's own money decisions on a document somebody signed: turning fees
+  // on starts charging a resident money, and the card flag exists because
+  // Dominic Gonzalez's installment is the trust's and a chargeback on it would
+  // have to be unwound across two sets of books. An assistant changing either
+  // would be changing the terms of an agreement, which is the same rule that
+  // keeps an agent off signatures ([[gam-agent-never-signs-or-accepts-terms]]).
+  // 10/25 (Nic): marking a tracked installment paid. "When that payment comes
+  // in, we will mark that it was paid, but it stays off the books." Someone is
+  // saying money arrived that GAM never saw and can never check — there is no
+  // bill, no receipt and no bank record behind it, only the mark. An assistant
+  // pressing it writes off a payment nobody made, which is the done rule
+  // (propertyTaskList above) with money attached.
+  'homeSale PATCH /:id/installments/mark':
+    'records that an off-the-books home payment arrived, on a contract GAM tracks but does not bill. Nothing GAM can see confirms it — the mark IS the record — so it is a person saying they received the money, never an assistant.',
+  'homeSale PATCH /:id/terms':
+    'sets whether a signed installment contract charges a late fee and whether its bills take a card. Both change what a resident owes, or how money on an agreement somebody signed may be paid — a landlord\'s decision on a signed document, never an assistant\'s.',
 
   // FILE IMPORTS. A CSV is a file the landlord uploads and reviews; there is
   // nothing for an agent to supply and a bad import lands on hundreds of rows.
@@ -378,6 +606,76 @@ const DELIBERATE = new Map(Object.entries({
   'payments POST /:id/pay': 'pay_my_balance settles the lease balance and is the path the agent takes',
   'credit POST /score/:subjectId/recompute': 'requireLendingService — an internal service, not a person',
   'portfolio POST /onboarding/resend': 'the sales-rep portfolio surface, not a landlord or tenant one',
+
+  // 10/12 (Nic): who gets the monthly property report — "owner/admin only to edit".
+  'reports POST /monthly-report/recipients':
+    'chooses who receives the company\'s books every month (names and money of every resident, attached as a PDF), including outside addresses the owner types. The owner\'s own choice on the Reports page with the team and the list on screen; an assistant that mishears an address mails the company\'s books to a stranger.',
+
+  // 10/13 (Nic): the Rent Roll's moved-out setting is removed ("Remove the
+  // 'keep moved-out households' setting entirely") — its PUT is gone with it.
+
+  // 10/12 (Nic): the company's books settings and opening balances — "landlord's
+  // choice" each (routes/booksSettings.ts, the Books Settings and Opening
+  // Balances pages). Owner-only presses with the effect on screen.
+  'booksSettings PATCH /settings':
+    'the owner\'s own accounting choices for the company\'s books (where the books start, how home sales, work trade, register stock and company-level costs count, who may close, reopen and write off). Nic 10/12: each is the landlord\'s choice, picked on the Books Settings page with each choice explained on screen and a note to ask their accountant; a start date moves what the bank feed sets aside and what opens as a starting balance. An assistant never picks an accounting method for anyone; the start date alone stays reachable on its own (set_books_start_date, the Bank page\'s save of the same date).',
+  'booksSettings POST /opening-balances':
+    'the owner types what the books start with — a bank balance off a statement, a deposit a tenant paid before GAM, another account\'s balance. Figures copied from paper on the Opening Balances page with the suggestion and the account on screen; a misheard figure is a wrong balance sheet from day one, and the assistant makes no money decision (#38 Q6).',
+  'booksSettings POST /opening-balances/chart':
+    'the owner sets up the chart of accounts the automatic postings use, so another opening balance has an account to name. Part of entering opening balances on that page (above); it changes the company\'s chart, which is the owner\'s to set up.',
+  'booksSettings POST /opening-balances/:id/void':
+    'the owner voids an opening balance entered by mistake, saying why (kept on record, never removed). The press beside that balance on the Opening Balances page, with its figure on screen; it changes what the books start with.',
+  // 10/12 (Nic): loans (principal / interest / escrow per payment) and fixed
+  // assets with depreciation (routes/booksLoansAssets.ts). Every figure here is
+  // copied off the lender's statement or the owner's own records, or is an
+  // accounting choice the owner (or their accountant) makes — the life an
+  // asset is spread over, what was already taken, which part of a payment is
+  // interest. A misheard figure is a wrong balance sheet and a wrong tax
+  // deduction for years; the assistant makes no money decision (#38 Q6). The
+  // vendor list stays reachable (add_vendor, update_vendor).
+  'booksLoansAssets POST /loans':
+    'adds a loan to the books: what was borrowed, the rate, the regular payment and its escrow part, where the money went, or what was still owed on the books start date — figures off the lender\'s statement, typed on the Loans page with the books start date on screen. A misheard balance is a wrong balance sheet from that day on; the assistant makes no money decision (#38 Q6).',
+  'booksLoansAssets PATCH /loans/:id':
+    'changes a loan\'s figures (the amount borrowed, the rate, the opening balance, where its money went), which re-posts the loan and every payment on it. Done on the Loans page with the loan and its payments on screen, against the lender\'s statement.',
+  'booksLoansAssets POST /loans/:id/void':
+    'voids a loan entered by mistake, with every payment on it, saying why (kept on record, never removed). The press on the loan itself on the Loans page, with its payments on screen; it takes the loan off the balance sheet.',
+  'booksLoansAssets POST /loans/:id/payments':
+    'records a loan payment split into principal, interest and escrow — the split comes off the lender\'s statement and the person checks it against GAM\'s suggestion on the Loans page. A misheard split moves money between a debt, a tax deduction and escrow; the assistant makes no money decision (#38 Q6).',
+  'booksLoansAssets POST /loans/:id/payments/:paymentId/void':
+    'voids a loan payment entered by mistake, saying why (kept on record). The press beside that payment on the Loans page, with its figures on screen; one that is a bank line is undone on the Bank page instead.',
+  'booksLoansAssets POST /fixed-assets':
+    'adds a fixed asset: its cost, the day it went into service, the life in years its cost is spread over and what was already taken — the owner\'s (or their accountant\'s) accounting choices, typed on the Fixed assets page. The assistant never picks an accounting method or a depreciation life for anyone.',
+  'booksLoansAssets POST /fixed-assets/from-expense/:expenseId':
+    'turns an expense filed under a capital-improvement category into a fixed asset depreciated over a life the owner chooses. Pressed beside that expense on the Fixed assets page with its cost and day on screen; the life is the owner\'s or their accountant\'s choice, never the assistant\'s.',
+  'booksLoansAssets PATCH /fixed-assets/:id':
+    'changes a fixed asset\'s cost, life, salvage value or depreciation already taken, which re-posts every month of its depreciation. The owner\'s accounting choice, made on the Fixed assets page with the schedule\'s figures on screen.',
+  'booksLoansAssets POST /fixed-assets/:id/void':
+    'voids a fixed asset entered by mistake, saying why (kept on record, never removed), taking back its opening and every month of depreciation. The press on the asset on the Fixed assets page, with its figures on screen.',
+  // 10/12 (Nic, ledger P9): closing a month and reconciling a bank account on
+  // the ledger (routes/booksClose.ts). Closing is the owner's choice of who may
+  // do it (L3); every one of these is a person's press with the checklist, the
+  // statement and its lines on screen. The assistant can START a reconciliation
+  // at the figure printed on a statement (record_bank_reconciliation).
+  'booksClose POST /check':
+    'posts whatever of the company\'s money is still waiting to reach the books, then shows the close-month checklist again — the "Check again" button on the Close month page. It changes nothing a person decided, and it only matters to someone looking at the checklist.',
+  'booksClose POST /':
+    'closes the company\'s books through a month: from then on anything dated in it lands in the next open month as a correction. Pressed on the Close month page with what blocks, what only warns and who may close (the owner\'s Books Settings choice, L3) on screen; the warnings it closes past are kept on the close. The assistant makes no accounting decision for anyone.',
+  'booksClose POST /reopen':
+    'reopens a closed month and every month after it, always saying why — the owner\'s (or whoever the owner allowed in Books Settings) press on the Close month page, with the history of closes on screen. It changes which months the books may restate.',
+  'booksClose POST /accounts/:accountId/start':
+    'starts a statement on the Bank Reconciliation page — the same start the assistant makes through record_bank_reconciliation (/api/bank-reconciliations), here pressed by the owner or bookkeeper who has the statement in hand.',
+  'booksClose PATCH /:id':
+    'changes the last day or ending balance of the statement being reconciled, on the Bank Reconciliation page with the statement in hand; ticks after a new, earlier day come off.',
+  'booksClose POST /:id/tick':
+    'ticks lines of the books off the bank statement, one by one, against the paper — the person reading the statement decides what is on it. A misheard tick hides a missing deposit or a duplicate charge.',
+  'booksClose POST /:id/finish':
+    'finishes a bank reconciliation at a $0.00 difference and freezes every line cleared on it. Pressed on the Bank Reconciliation page with the statement, the cleared balance and the difference on screen; a month cannot close until its linked banks are reconciled.',
+  'booksClose POST /:id/undo':
+    'sets aside a statement being reconciled, or undoes the latest reconciled one (never inside a closed month), saying why; its lines are let go and the record is kept. The press on the Bank Reconciliation page with that statement on screen.',
+  // 10/14 (Nic): "Only the landlord can fix a birthday" (routes/tenants.ts,
+  // services/tenantBirthday) — the tenant's profile shows it read-only.
+  'tenants PATCH /:id/birthday':
+    'the owner corrects a resident\'s birthday (copied off their signed lease; GAM\'s happy-birthday email reads it). Typed on the resident\'s page with the date on screen, by the owner only; a misheard day or year is a wrong age on record and a birthday email on the wrong day.',
 }))
 
 /** router variable -> route-file area. */

@@ -15,8 +15,10 @@ import jwt from 'jsonwebtoken'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import { utilityServiceAgreementsRouter } from './utilityServiceAgreements'
+import { generateLateFeesForTimezone } from '../jobs/lateFees'
 import { errorHandler } from '../middleware/errorHandler'
 import { camelCaseKeys } from '../lib/caseConversion'
+import { expectNoFigures } from '../test/noLeaks'
 
 const { emailUtilityServiceInviteMock } = vi.hoisted(() => ({
   emailUtilityServiceInviteMock: vi.fn(async (..._a: any[]) => undefined),
@@ -49,7 +51,31 @@ beforeEach(async () => {
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_svcagr'
 })
 
-async function seed(lateFee: { initial?: number; grace?: number } = {}) {
+const TZ = 'America/Phoenix'
+
+/**
+ * A park with a REAL late-fee policy: per (property, unit type), the row a
+ * lease is drafted from. 10/20 (Nic): that is the only place a late fee lives.
+ * The property's own late_fee_* figure columns are set to junk on purpose —
+ * nothing may read them, and $99 showing up on an agreement is the regression.
+ *
+ * `policy: null` records no policy for the class at all, which is the state
+ * every one of Nic's parks is in for a class nobody has been asked about.
+ */
+type Policy = {
+  unitType?: string
+  graceDays?: number
+  initialAmount?: number
+  initialType?: 'flat' | 'percent_of_rent'
+  accrualAmount?: number | null
+  accrualType?: 'flat' | 'percent_of_rent'
+  accrualPeriod?: 'daily' | 'weekly' | 'monthly'
+  accrualFrom?: 'grace_end' | 'due_date' | 'due_date_inclusive'
+  capAmount?: number | null
+  capType?: 'flat' | 'percent_of_rent'
+}
+
+async function seed(opts: { policy?: Policy | null; policies?: Policy[] } = {}) {
   const c = await db.connect()
   try {
     await c.query('BEGIN')
@@ -57,13 +83,36 @@ async function seed(lateFee: { initial?: number; grace?: number } = {}) {
     const propertyId = await seedProperty(c, {
       landlordId, ownerUserId: userId, managedByUserId: userId,
     })
+    // The master switch (the one property-level late-fee column the resolver
+    // still reads) plus the park's clock, which the nightly engine fires on.
+    // The figures are deliberate junk: a dead column nothing may read.
     await c.query(
-      `UPDATE properties SET late_fee_enabled = true,
-                             late_fee_grace_days = $2,
-                             late_fee_initial_amount = $3,
+      `UPDATE properties SET late_fee_enabled = true, timezone = $2,
+                             late_fee_grace_days = 11,
+                             late_fee_initial_amount = 99,
                              late_fee_initial_type = 'flat'
-        WHERE id = $1`,
-      [propertyId, lateFee.grace ?? 5, lateFee.initial ?? 25])
+        WHERE id = $1`, [propertyId, TZ])
+    const list = opts.policies
+      ?? (opts.policy === null ? [] : [opts.policy ?? {}])
+    for (const p of list) {
+      await c.query(
+        `INSERT INTO property_unit_type_late_fees
+           (property_id, unit_type, late_fee_grace_days,
+            late_fee_initial_amount, late_fee_initial_type,
+            late_fee_accrual_amount, late_fee_accrual_type,
+            late_fee_accrual_period, late_fee_accrual_from,
+            late_fee_cap_amount, late_fee_cap_type)
+         VALUES ($1,$2,$3,$4,$5,$6,
+                 CASE WHEN $6::numeric IS NULL THEN NULL ELSE $10::text END,
+                 CASE WHEN $6::numeric IS NULL THEN NULL ELSE $7::text END,
+                 $8,$9,
+                 CASE WHEN $9::numeric IS NULL THEN NULL ELSE $11::text END)`,
+        [propertyId, p.unitType ?? 'apartment', p.graceDays ?? 5,
+         p.initialAmount ?? 25, p.initialType ?? 'flat',
+         p.accrualAmount ?? null, p.accrualPeriod ?? 'daily',
+         p.accrualFrom ?? 'due_date_inclusive', p.capAmount ?? null,
+         p.accrualType ?? 'flat', p.capType ?? 'flat'])
+    }
     await c.query('COMMIT')
     return {
       userId, landlordId, propertyId,
@@ -124,8 +173,14 @@ describe('POST /api/utility/service-agreements (S615)', () => {
 
   // S558's rule: the instrument is the charge. A policy change next March must
   // not silently reprice a bill this person already agreed to.
-  it('stamps the property late-fee policy onto the agreement', async () => {
-    const f = await seed({ initial: 40, grace: 3 })
+  it("inherits exactly the property's policy for that class of space", async () => {
+    // Nic's parks, verified in production on 10/20: $0 to start, $5 a day from
+    // the due date itself, no cap. The property's own columns say $99 / 11
+    // days; if either shows up on the agreement, it read the dead columns.
+    const f = await seed({ policy: {
+      graceDays: 5, initialAmount: 0, accrualAmount: 5,
+      accrualPeriod: 'daily', accrualFrom: 'due_date_inclusive',
+    } })
     const res = await request(buildApp())
       .post('/api/utility/service-agreements')
       .set('Authorization', `Bearer ${f.token}`)
@@ -134,19 +189,140 @@ describe('POST /api/utility/service-agreements (S615)', () => {
 
     const { rows: [sa] } = await db.query<any>(
       `SELECT late_fee_enabled, late_fee_grace_days,
-              late_fee_initial_amount::text AS amt, late_fee_initial_type
+              late_fee_initial_amount::text AS initial, late_fee_initial_type,
+              late_fee_accrual_amount::text AS accrual, late_fee_accrual_type,
+              late_fee_accrual_period, late_fee_accrual_from,
+              late_fee_cap_amount, late_fee_cap_type
          FROM utility_service_agreements WHERE id = $1`, [res.body.data.id])
-    expect(sa.late_fee_enabled).toBe(true)
-    expect(sa.late_fee_grace_days).toBe(3)
-    expect(Number(sa.amt)).toBe(40)
+    expect(sa).toMatchObject({
+      late_fee_enabled: true,
+      late_fee_grace_days: 5,
+      late_fee_initial_type: 'flat',
+      late_fee_accrual_type: 'flat',
+      late_fee_accrual_period: 'daily',
+      // The agreement column defaults to 'grace_end'. Taking that default
+      // would start Nic's $5/day five days late, so the policy's own answer is
+      // stamped explicitly.
+      late_fee_accrual_from: 'due_date_inclusive',
+      late_fee_cap_amount: null,
+      late_fee_cap_type: null,
+    })
+    expect(Number(sa.initial)).toBe(0)
+    expect(Number(sa.accrual)).toBe(5)
 
-    // Changing property policy afterwards leaves the stamp alone.
+    // And the answer tells the landlord what this space's overdue bill costs.
+    expect(res.body.data.lateFee).toMatchObject({
+      source: 'unit_type_policy', unitType: 'apartment', enabled: true,
+      graceDays: 5, accrualPeriod: 'daily', accrualFrom: 'due_date_inclusive',
+    })
+  })
+
+  // Nic, on the two live agreements made on 10/6 (RV 10 and RV 11 at Mountain
+  // View, both holding the invented $15 flat with a 5-day grace): their stored
+  // values ARE the agreement. S558's rule — the instrument is the charge.
+  it('a policy changed afterwards does not reprice an agreement already made', async () => {
+    const f = await seed({ policy: { graceDays: 3, initialAmount: 40 } })
+    const res = await request(buildApp())
+      .post('/api/utility/service-agreements')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, label: 'Next door B', payer })
+    expect(res.status).toBe(201)
+
     await db.query(
-      `UPDATE properties SET late_fee_initial_amount = 99 WHERE id = $1`, [f.propertyId])
+      `UPDATE property_unit_type_late_fees
+          SET late_fee_initial_amount = 250, late_fee_grace_days = 0
+        WHERE property_id = $1`, [f.propertyId])
+
     const { rows: [after] } = await db.query<any>(
-      `SELECT late_fee_initial_amount::text AS amt FROM utility_service_agreements
-        WHERE id = $1`, [res.body.data.id])
-    expect(Number(after.amt)).toBe(40)
+      `SELECT late_fee_grace_days, late_fee_initial_amount::text AS initial
+         FROM utility_service_agreements WHERE id = $1`, [res.body.data.id])
+    expect(after.late_fee_grace_days).toBe(3)
+    expect(Number(after.initial)).toBe(40)
+  })
+
+  // The decision, named: with no policy recorded for the class, the agreement
+  // is CREATED WITH NO LATE FEE and says so. It does not refuse (a lease is
+  // drafted in this state too — S577 retired the forced-decision gate) and it
+  // does not invent a figure, which is the whole point of the 10/19 removal.
+  it('creates it with no late fee when the class has no policy, and says so', async () => {
+    const f = await seed({ policy: null })
+    const res = await request(buildApp())
+      .post('/api/utility/service-agreements')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, label: 'Next door C', payer })
+    expect(res.status).toBe(201)
+    expect(res.body.data.lateFee).toMatchObject({
+      source: 'none', enabled: false,
+      graceDays: null, initialAmount: null, accrualAmount: null, capAmount: null,
+    })
+
+    const { rows: [sa] } = await db.query<any>(
+      `SELECT late_fee_enabled, late_fee_grace_days, late_fee_initial_amount,
+              late_fee_accrual_amount, late_fee_cap_amount
+         FROM utility_service_agreements WHERE id = $1`, [res.body.data.id])
+    expect(sa).toEqual({
+      late_fee_enabled: false,
+      late_fee_grace_days: null,
+      late_fee_initial_amount: null,
+      late_fee_accrual_amount: null,
+      late_fee_cap_amount: null,
+    })
+  })
+
+  // 10/20: EVERY AMOUNT SHIPS WITH THE TYPE THAT GIVES IT MEANING. The answer
+  // used to carry accrualAmount and capAmount with no accrualType or capType,
+  // so $5 a day and 5% of rent a day were the same number on the wire and the
+  // screen this is for would have printed "$5 a day" for a percentage. Every
+  // policy recorded in production today is flat, so nothing was wrong on
+  // screen yet — the contract was.
+  it('the answer names the TYPE of every figure, so a percent is not read as dollars', async () => {
+    const f = await seed({ policy: {
+      graceDays: 5, initialAmount: 0,
+      accrualAmount: 5, accrualType: 'percent_of_rent', accrualPeriod: 'daily',
+      capAmount: 20, capType: 'percent_of_rent',
+    } })
+    const res = await request(buildApp())
+      .post('/api/utility/service-agreements')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, label: 'Next door E', payer })
+    expect(res.status).toBe(201)
+    expect(res.body.data.lateFee).toMatchObject({
+      source: 'unit_type_policy', enabled: true,
+      initialType: 'flat',
+      accrualAmount: '5.00', accrualType: 'percent_of_rent', accrualPeriod: 'daily',
+      capAmount: '20.00', capType: 'percent_of_rent',
+    })
+    // And the agreement itself holds the same two types, which is what the
+    // engine reads when the bill goes unpaid.
+    const { rows: [sa] } = await db.query<any>(
+      `SELECT late_fee_accrual_type, late_fee_cap_type
+         FROM utility_service_agreements WHERE id = $1`, [res.body.data.id])
+    expect(sa).toEqual({ late_fee_accrual_type: 'percent_of_rent', late_fee_cap_type: 'percent_of_rent' })
+  })
+
+  // A space next door is not always an apartment. The type classifies; the
+  // figures still come from that class's policy row.
+  it("takes the stated space type's policy, not another class's", async () => {
+    const f = await seed({ policies: [
+      { unitType: 'apartment', initialAmount: 25, graceDays: 5 },
+      { unitType: 'rv_spot', initialAmount: 0, accrualAmount: 5, graceDays: 2 },
+    ] })
+    const res = await request(buildApp())
+      .post('/api/utility/service-agreements')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, label: 'Next door D', unitType: 'rv_spot', payer })
+    expect(res.status).toBe(201)
+
+    const { rows: [u] } = await db.query<any>(
+      `SELECT unit_type FROM units WHERE id = $1`, [res.body.data.unitId])
+    expect(u.unit_type).toBe('rv_spot')
+    const { rows: [sa] } = await db.query<any>(
+      `SELECT late_fee_grace_days, late_fee_initial_amount::text AS initial,
+              late_fee_accrual_amount::text AS accrual
+         FROM utility_service_agreements WHERE id = $1`, [res.body.data.id])
+    expect(sa.late_fee_grace_days).toBe(2)
+    expect(Number(sa.initial)).toBe(0)
+    expect(Number(sa.accrual)).toBe(5)
   })
 
   // S614: same person, same login, no duplicate account.
@@ -406,7 +582,8 @@ describe('S654: POST /api/utility/service-agreements and password links', () => 
               payer: { firstName: 'Made', lastName: 'Up', email: 'z.elsewhere@test.dev', phone: '+10000000000' } })
     expect(res.status).toBe(409)
     expect(res.body.error).toMatch(ALREADY_ON_GAM)
-    expect(JSON.stringify(res.body)).not.toMatch(/Zelda|Secretname|6025559999|alreadyOnPlatform/)
+    expect(JSON.stringify(res.body)).not.toMatch(/Zelda|Secretname|alreadyOnPlatform/)
+    expectNoFigures(res.body, ['6025559999'])
     expect(await counts()).toEqual(was)
     expect(await notesFor(z.userId)).toEqual([])
 
@@ -415,7 +592,8 @@ describe('S654: POST /api/utility/service-agreements and password links', () => 
       .set('Authorization', `Bearer ${b.token}`)
     expect(list.status).toBe(200)
     expect(list.body.data).toEqual([])
-    expect(JSON.stringify(list.body)).not.toMatch(/Zelda|Secretname|6025559999/)
+    expect(JSON.stringify(list.body)).not.toMatch(/Zelda|Secretname/)
+    expectNoFigures(list.body, ['6025559999'])
   })
 
   it('a resident with their own password, even one tied to no company: refused, nothing created', async () => {
@@ -536,5 +714,105 @@ describe('S654: POST /api/utility/service-agreements and password links', () => 
       .set('Authorization', `Bearer ${session}`)
     expect(res.status).toBe(200)
     expect(res.body.data.map((r: any) => r.email)).toEqual(['mine@example.test'])
+  })
+})
+
+/**
+ * 10/20 — THE STAMPED TERMS ARE REAL MONEY.
+ *
+ * The point of taking the late fee from the per-unit-type policy is what the
+ * utility customer is actually charged when their bill goes unpaid, so the
+ * nightly engine runs here against an agreement this door created and the
+ * fees are counted.
+ *
+ * Nic's parks: nothing to start, $5 a day counted from the due date itself, no
+ * cap. Eight days' worth by the eighth day — the due date and the seven days
+ * after it. On the old property-column stamp this bill charged nothing at all
+ * (the figures are empty now), and had the agreement taken its accrual_from
+ * from its own column default of 'grace_end' it would charge $10 instead of
+ * $40: the five grace days and the due date would go uncharged.
+ */
+describe('the late-fee engine charges what the policy says (10/20)', () => {
+  async function overdueBill(f: any, agreement: any, daysAgo: number) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { rows: [d] } = await c.query<{ due: string }>(
+        `SELECT ((NOW() AT TIME ZONE $1)::date - $2::int)::text AS due`, [TZ, daysAgo])
+      const { rows: [inv] } = await c.query<{ id: string }>(
+        `INSERT INTO invoices (landlord_id, tenant_id, unit_id, service_agreement_id,
+                               invoice_number, due_date, subtotal_utilities, total_amount,
+                               status, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6::date,60,60,'pending',
+                 ($6::date - 3 + TIME '12:00') AT TIME ZONE $7)
+         RETURNING id`,
+        [f.landlordId, agreement.tenantId, agreement.unitId, agreement.id,
+         `INV-${Math.random().toString(36).slice(2, 10)}`, d.due, TZ])
+      await c.query(
+        `INSERT INTO payments (invoice_id, unit_id, tenant_id, landlord_id, type, amount,
+                               status, due_date, entry_description)
+         VALUES ($1,$2,$3,$4,'utility',60,'pending',$5::date,'UTILITY')`,
+        [inv.id, agreement.unitId, agreement.tenantId, f.landlordId, d.due])
+      await c.query('COMMIT')
+      return { invoiceId: inv.id, due: d.due }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  const fees = async (invoiceId: string) => (await db.query<{ amount: string; due_date: string }>(
+    `SELECT amount::text AS amount, due_date::text AS due_date FROM payments
+      WHERE invoice_id = $1 AND type = 'late_fee' ORDER BY due_date`, [invoiceId])).rows
+
+  async function createAgreement(f: any, label: string, unitType?: string) {
+    const res = await request(buildApp())
+      .post('/api/utility/service-agreements')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, label, unitType, payer })
+    expect(res.status).toBe(201)
+    return res.body.data
+  }
+
+  it("charges the park's $5 a day from the due date — eight days, $40", async () => {
+    const f = await seed({ policy: {
+      graceDays: 5, initialAmount: 0, accrualAmount: 5,
+      accrualPeriod: 'daily', accrualFrom: 'due_date_inclusive',
+    } })
+    const agreement = await createAgreement(f, 'Next door A')
+    const bill = await overdueBill(f, agreement, 7)
+
+    await generateLateFeesForTimezone(TZ)
+
+    const rows = await fees(bill.invoiceId)
+    expect(rows).toHaveLength(8)
+    expect(rows[0].due_date).toBe(bill.due)
+    expect(rows.reduce((s, r) => s + Number(r.amount), 0)).toBe(40)
+  })
+
+  it("charges Blu's $50 flat, capped at $50, once", async () => {
+    const f = await seed({ policy: {
+      graceDays: 5, initialAmount: 50, accrualAmount: null, capAmount: 50,
+    } })
+    const agreement = await createAgreement(f, 'Next door B')
+    const bill = await overdueBill(f, agreement, 20)
+
+    await generateLateFeesForTimezone(TZ)
+    await generateLateFeesForTimezone(TZ)
+
+    const rows = await fees(bill.invoiceId)
+    expect(rows).toHaveLength(1)
+    expect(Number(rows[0].amount)).toBe(50)
+  })
+
+  // The item-2 decision, stated in money: no policy for the class means no
+  // late fee — not a figure nobody chose, and not a refusal to bill the
+  // neighbor's electric at all.
+  it('charges nothing when the class has no policy recorded', async () => {
+    const f = await seed({ policy: null })
+    const agreement = await createAgreement(f, 'Next door C')
+    expect(agreement.lateFee.source).toBe('none')
+    const bill = await overdueBill(f, agreement, 30)
+
+    await generateLateFeesForTimezone(TZ)
+
+    expect(await fees(bill.invoiceId)).toEqual([])
   })
 })

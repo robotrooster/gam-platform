@@ -53,6 +53,32 @@ export async function isExistingTenancyDocument(c: Exec, documentId: string): Pr
   return r.rows[0]?.existing === true
 }
 
+/**
+ * 10/19 — ONE ANSWER TO "IS THIS AN ONBOARDING RESIDENT", FOR A WHOLE DOCUMENT.
+ *
+ * The signing page and the sign-time proration check both have to decide this,
+ * and since the proration box is derived and locked they have to agree exactly:
+ * the page writes the figure, and the server refuses anything else. They were
+ * two separate expressions that happened to match — the page excluded every
+ * document type but an original lease, the check excluded renewals — so an
+ * addendum carrying a prorated-rent line over a unit with an onboarding
+ * resident would have been a document nobody could ever sign: the page writes
+ * the real proration, the server wants $0, and there is no editor to change.
+ *
+ * Both exclusions, in one function, asked by both.
+ *   - Only an original lease papers a move-in at all.
+ *   - A renewal is not a move-in either: its rent carries on, on the
+ *     household's own due dates, and page 8 bills none of it.
+ */
+export async function documentExistingTenancy(
+  c: Exec,
+  doc: { id: string; document_type?: string | null; renews_lease_id?: string | null },
+): Promise<boolean> {
+  if (doc.document_type !== 'original_lease') return false
+  if (doc.renews_lease_id) return false
+  return isExistingTenancyDocument(c, doc.id)
+}
+
 export async function restampMoveInBoxes(c: Exec, documentId: string): Promise<void> {
   const rows = (await c.query(
     `SELECT id, lease_column, value, signed_at FROM lease_document_fields

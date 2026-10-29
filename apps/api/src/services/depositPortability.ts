@@ -85,7 +85,7 @@ export async function detectPortabilityEligible(args: {
   }>(
     `SELECT id, total_amount::text, held_by
        FROM security_deposits
-      WHERE lease_id = $1
+      WHERE lease_id = $1 AND status <> 'voided'
       ORDER BY created_at DESC
       LIMIT 1`,
     [args.leaseId],
@@ -191,8 +191,10 @@ export async function authorizeDepositPortability(args: {
     id: string; tenant_id: string; lease_id: string;
     portability_status: string; portability_target_lease_id: string | null;
   }>(
+    // 10/12 (Nic) review, G8: a voided deposit record (only ever a pending
+    // line, nothing collected, kept as a record) is not a deposit to carry.
     `SELECT id, tenant_id, lease_id, portability_status, portability_target_lease_id
-       FROM security_deposits WHERE id = $1`,
+       FROM security_deposits WHERE id = $1 AND status <> 'voided'`,
     [args.depositId],
   )
   if (!dep) throw new AppError(404, 'Deposit not found')
@@ -289,6 +291,26 @@ export async function declineDepositPortability(args: {
  *
  * Idempotent: re-running on a 'carried_forward' deposit no-ops.
  */
+/**
+ * The two routes and what each costs, for the notice GAM reads when a forward
+ * leaves a top-up owed. Read from the price tables, never written here, so a
+ * re-price reaches the desk the day it takes effect.
+ */
+async function topUpRoutesLine(depositId: string): Promise<string> {
+  try {
+    const { quoteFlexDepositTopUp } = await import('./flexDeposit')
+    const q = await quoteFlexDepositTopUp(depositId)
+    if (!q) return ''
+    const money = (n: number) => `$${n.toFixed(2)}`
+    const splits = q.splits.map(s =>
+      `${s.payments} payments of ${money(s.installment)} (${money(s.fee)} + ${money(s.movementFee)} movement)`)
+    return `One pull: ${money(q.topUpAmount)} + ${money(q.payInFull.fee)}. Split: ${splits.join('; ')}.`
+  } catch {
+    // A price that cannot be read must not cost GAM the notification.
+    return ''
+  }
+}
+
 export async function executeDepositPortability(args: {
   depositId: string
 }): Promise<{ status: 'carried_forward' | 'pending_transfer'; new_lease_id: string }> {
@@ -307,10 +329,11 @@ export async function executeDepositPortability(args: {
               held_by, total_amount::text, collected_amount::text,
               flex_deposit_enabled
          FROM security_deposits
-        WHERE id = $1
+        WHERE id = $1 AND status <> 'voided'
         FOR UPDATE`,
       [args.depositId],
     ).then(r => r.rows[0])
+    // 10/12 (Nic) review, G8: never a voided record (it is kept, and refuses to move).
     if (!dep) throw new AppError(404, 'Deposit not found')
     if (dep.portability_status === 'carried_forward') {
       await client.query('ROLLBACK')
@@ -338,7 +361,7 @@ export async function executeDepositPortability(args: {
          LEFT JOIN LATERAL (
            SELECT id, total_amount, flex_deposit_enabled, collected_amount
              FROM security_deposits
-            WHERE lease_id = l.id
+            WHERE lease_id = l.id AND status <> 'voided'
             ORDER BY created_at DESC LIMIT 1
          ) td ON TRUE
         WHERE l.id = $1
@@ -368,8 +391,13 @@ export async function executeDepositPortability(args: {
     // Remove the target lease's own untouched deposit row so the carried
     // (funded) row becomes the canonical deposit for the target lease — no
     // duplicate, no double-charge. Never delete a touched target row.
+    // 10/12 (Nic, G8 — keep everything): voided and kept, never deleted.
     if (target.target_dep_id && target.target_dep_id !== dep.id && !target.target_touched) {
-      await client.query(`DELETE FROM security_deposits WHERE id = $1`, [target.target_dep_id])
+      await client.query(
+        `UPDATE security_deposits
+            SET status = 'voided', voided_at = NOW(), updated_at = NOW(),
+                void_reason = 'Voided: the deposit carried from the tenant''s previous lease took its place'
+          WHERE id = $1 AND status <> 'voided' AND COALESCE(collected_amount, 0) = 0`, [target.target_dep_id])
     }
 
     // Re-point the carried row onto the target lease, set its required amount.
@@ -406,11 +434,19 @@ export async function executeDepositPortability(args: {
           [args.depositId],
         )
       } else {
+        // ── 10/27 (Nic): A TOP-UP IS OWED, AND NOTHING IS CHARGED YET ───────
+        //
         // Larger deposit at the new property → a top-up is owed. The deposit
-        // stays under-funded; custody fee continues. For a FlexDeposit, spread
-        // the difference into installments the cron auto-collects (option 1,
-        // fee stays); the tenant may pay it off via pay-ahead (option 2, fee
-        // stops). For a non-FlexDeposit gam_escrow deposit, just flag it.
+        // stays under-funded and the custody fee continues, which is the
+        // custody model's own normal state: no debt, no acceleration.
+        //
+        // This used to SCHEDULE A SPLIT right here, so a resident ended up on a
+        // payment plan nobody offered them, at a fee priced as if the top-up
+        // were a new deposit. There are two routes now — one pull for $25, or
+        // 2/4 payments at the grid price plus $5 — and a plan is a thing people
+        // accept, so the charge waits for the election
+        // (flexDeposit electFlexDepositTopUp). The notification below carries
+        // both prices so whoever is standing with the resident can say them.
         topUpOwed = difference
         if (dep.flex_deposit_enabled) {
           await client.query(
@@ -420,8 +456,6 @@ export async function executeDepositPortability(args: {
               WHERE id = $1`,
             [args.depositId],
           )
-          const { scheduleFlexDepositTopUp } = await import('./flexDeposit')
-          await scheduleFlexDepositTopUp(client, { depositId: args.depositId, topUpAmount: difference })
         } else {
           await client.query(
             `UPDATE security_deposits
@@ -441,8 +475,8 @@ export async function executeDepositPortability(args: {
         await createAdminNotification({
           severity: 'info',
           category: 'deposit_portability_topup_owed',
-          title:    `FlexDeposit forward — top-up of $${topUpOwed.toFixed(2)} scheduled — tenant ${dep.tenant_id}`,
-          body:     `Deposit ${args.depositId} carried forward to lease ${target.id}; the new property's required deposit is $${topUpOwed.toFixed(2)} more than the carried balance. ${dep.flex_deposit_enabled ? 'Top-up installments scheduled (auto-collected monthly); the tenant may pay it off early via pay-ahead, which stops the custody fee.' : 'Custody fee continues until funded.'}`,
+          title:    `FlexDeposit forward — top-up of $${topUpOwed.toFixed(2)} owed — tenant ${dep.tenant_id}`,
+          body:     `Deposit ${args.depositId} carried forward to lease ${target.id}; the new property's required deposit is $${topUpOwed.toFixed(2)} more than the carried balance. ${dep.flex_deposit_enabled ? `Nothing is charged yet: the resident chooses to pay it in one pull or split it into 2 or 4. ${await topUpRoutesLine(args.depositId)}` : 'Custody fee continues until funded.'}`,
           context:  { deposit_id: args.depositId, tenant_id: dep.tenant_id, new_lease_id: target.id, top_up_owed: topUpOwed },
         })
       } catch (e) {

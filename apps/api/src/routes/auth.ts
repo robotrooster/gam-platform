@@ -4,14 +4,18 @@ import crypto from 'crypto'
 import { z } from 'zod'
 import { db, query, queryOne } from '../db'
 import { UserRole, PASSWORD_MIN_LEN as SHARED_PASSWORD_MIN_LEN, SIGN_IN_PORTAL_VALUES, type SignInPortal, FALLBACK_TIMEZONE } from '@gam/shared'
+// 10/13 (Nic): the roles an emailed team invitation creates (sessionFromTeamInvitation).
+import { LANDLORD_ASSIGNABLE_ROLES } from '@gam/shared'
 import { signSessionToken, renewSessionToken, sessionPolicyFor } from '../lib/sessionToken'
 import { createFoundingLandlordEntity, claimInvitationsOnProvenAddress } from '../services/coOwnerInvites'
 import { requireAuth, forgetSessionCutoff } from '../middleware/auth'
+import { bookkeeperScopesOf } from '../lib/bookkeeperScope'
 import { AppError } from '../middleware/errorHandler'
 import { sendPasswordResetEmail, sendEmailVerification, sendLandlordSignupHeadsUp,
          sendEmailChangeConfirmation, sendEmailChangeNotice } from '../services/email'
 import { isDisposableEmail } from '../lib/email'
 import { logger } from '../lib/logger'
+import { dateIn } from '../lib/timezone'
 import { signTotpSessionToken, signTotpEnrollToken } from './totp'
 import { MANDATORY_TOTP_ROLES } from '../lib/totp'
 import { signEmailOtpSessionToken, issueEmailOtp, verifyEmailFactorToken } from './emailOtp'
@@ -54,44 +58,67 @@ async function getScopeForUser(userId: string, role: string):
       permissions: r.permissions || {},
     } : null
   }
-  if (role === 'property_manager') {
-    const r = await queryOne<any>(
-      `SELECT landlord_id, permissions, direct_deposit_enabled, property_ids, all_properties
-         FROM property_manager_scopes WHERE user_id = $1 LIMIT 1`,
+  // 10/22 — A WORKER CAN WORK FOR SEVERAL COMPANIES, so the pass is built from
+  // EVERY grant they hold, not from whichever row came back first.
+  //
+  // What the pass carries is ADMISSION: requirePerm opens a route on it. The
+  // authority on whether a permission was granted where it is being used is
+  // middleware/auth assertPropertyInScope, which reads the set the property's
+  // own company granted, fresh, on the request. Those are two different
+  // questions and this is the looser one — union, so a second company's grant
+  // is not lost at the door, with the narrow check done at the property.
+  //
+  // `landlordId` stays the first company, because for a worker at one company
+  // it is exactly what it always was, and nothing is allowed to resolve a
+  // company FROM it (S654: none is a default).
+  if (role === 'property_manager' || role === 'onsite_manager' || role === 'maintenance') {
+    const table = role === 'property_manager' ? 'property_manager_scopes'
+      : role === 'onsite_manager' ? 'onsite_manager_scopes' : 'maintenance_worker_scopes'
+    const rows = await query<any>(
+      `SELECT landlord_id, permissions, property_ids, all_properties${
+         role === 'property_manager' ? ', direct_deposit_enabled' : ''}
+         FROM ${table} WHERE user_id = $1 ORDER BY created_at, landlord_id`,
       [userId])
-    return r ? {
-      landlordId: r.landlord_id,
-      permissions: r.permissions || {},
-      directDepositEnabled: !!r.direct_deposit_enabled,
-      propertyIds: r.property_ids || [],
-      allProperties: !!r.all_properties,
-    } : null
-  }
-  if (role === 'onsite_manager') {
-    const r = await queryOne<any>(
-      `SELECT landlord_id, permissions, property_ids, all_properties FROM onsite_manager_scopes WHERE user_id = $1 LIMIT 1`,
-      [userId])
-    return r ? { landlordId: r.landlord_id, permissions: r.permissions || {}, propertyIds: r.property_ids || [], allProperties: !!r.all_properties } : null
-  }
-  if (role === 'maintenance') {
-    const r = await queryOne<any>(
-      `SELECT landlord_id, permissions, property_ids, all_properties FROM maintenance_worker_scopes WHERE user_id = $1 LIMIT 1`,
-      [userId])
-    return r ? { landlordId: r.landlord_id, permissions: r.permissions || {}, propertyIds: r.property_ids || [], allProperties: !!r.all_properties } : null
+    if (!rows.length) return null
+    // Deep merge: a permission set is nested in places ({ payments: { view_all:
+    // true } }) and flat dotted keys in others, and both shapes are read. A
+    // grant from either company is a grant, so true wins at any depth.
+    const grant = (into: Record<string, any>, from: Record<string, any>) => {
+      for (const [k, v] of Object.entries(from || {})) {
+        if (v && typeof v === 'object' && !Array.isArray(v)) {
+          if (!into[k] || typeof into[k] !== 'object') into[k] = {}
+          grant(into[k], v as Record<string, any>)
+        } else if (v === true || into[k] === undefined) {
+          into[k] = v === true ? true : (into[k] ?? v)
+        }
+      }
+    }
+    const permissions: Record<string, any> = {}
+    const propertyIds = new Set<string>()
+    for (const r of rows) {
+      grant(permissions, r.permissions || {})
+      for (const id of (r.property_ids || [])) propertyIds.add(id)
+    }
+    return {
+      landlordId: rows[0].landlord_id,
+      permissions,
+      ...(role === 'property_manager' ? { directDepositEnabled: rows.some((r: any) => r.direct_deposit_enabled) } : {}),
+      propertyIds: [...propertyIds],
+      allProperties: rows.every((r: any) => r.all_properties),
+    }
   }
   if (role === 'bookkeeper') {
-    const r = await queryOne<any>(
-      // 10/11: oldest assignment first, so the company on the pass is the same
-      // one requireAuth falls back to (middleware/auth bookkeeperScopeFor).
-      `SELECT landlord_id, access_level, property_ids FROM bookkeeper_scopes
-        WHERE user_id = $1 ORDER BY created_at, id LIMIT 1`,
-      [userId])
-    // property_ids NULL = the whole company (allProperties); else only these.
+    // 10/11: oldest assignment first, so the company on the pass is the same
+    // one requireAuth falls back to (middleware/auth bookkeeperScopeFor). Their
+    // properties are worked out against what the company owns right now
+    // (lib/bookkeeperScope): allProperties only while every property the
+    // company owns today is ticked; propertyIds = the ticked ones still its own.
+    const [r] = await bookkeeperScopesOf(userId)
     return r ? {
       landlordId: r.landlord_id,
       permissions: { access_level: r.access_level },
-      propertyIds: r.property_ids ?? [],
-      allProperties: r.property_ids == null,
+      propertyIds: r.kept_ids,
+      allProperties: r.covers_all,
     } : null
   }
   return null
@@ -569,6 +596,73 @@ async function sessionClaimsFor(user: any) {
   return { scope, profileId, landlordIds, businessId, staffRole, claims }
 }
 
+/**
+ * ── 10/13 (Nic): THE INVITE LINK COUNTS AS PROOF OF EMAIL ──────────────────
+ *
+ * "After creating the account from the invite link, SKIP the code step once
+ * (the invite link counts as proof of email) — sign straight in."
+ *
+ * Earlier on 10/13 a new team member went from Create account to the emailed
+ * code box, then to her pages. The code proves one thing: that the person
+ * reads that mailbox. The invitation link already proved it — its token is 32
+ * random bytes that went only to that address, by email, and it works once.
+ * The same reasoning let a sign-in through a bill's own emailed link skip the
+ * code in S654 (the emailFactor branch of /login). The password she chose a
+ * moment ago is the other factor.
+ *
+ * So the new account gets a full session here, built exactly as /login builds
+ * one (loadUserForSession + sessionClaimsFor, the same policy as a landlord-
+ * portal sign-in). Only for this:
+ *   - only a team role (an invitation can create no other kind of account);
+ *   - only once: the accept route calls this only for the account it just
+ *     created, in the same request that moved the invitation from pending to
+ *     accepted under a row lock, so opening the link again signs nobody in;
+ *   - email_2fa_enabled stays TRUE (set when the account was created), so every
+ *     later sign-in is password + emailed code, as for everyone (S578).
+ *
+ * Call it after the account (and its team row) has committed. If it throws,
+ * the account still exists; the caller sends the person to sign in normally.
+ */
+export async function sessionFromTeamInvitation(userId: string): Promise<{ token: string; user: Record<string, unknown> }> {
+  const user = await loadUserForSession('id', userId)
+  if (!user) throw new AppError(404, 'Account not found')
+  if (!(LANDLORD_ASSIGNABLE_ROLES as readonly string[]).includes(user.role)) {
+    throw new AppError(403, 'Only a team account set up from its invitation signs in this way.')
+  }
+  // Same order as /login: who they are and what they may reach, from the
+  // database (a worker with no team row is refused here as it is there).
+  const { scope, profileId, businessId, staffRole, claims } = await sessionClaimsFor(user)
+  const token = signSessionToken(claims, sessionPolicyFor(user.role, null, false))
+  // A sign-in, recorded as /login records one. Never blocks it.
+  try {
+    await db.query(`UPDATE users SET last_login_at = NOW() WHERE id = $1`, [user.id])
+  } catch (err) {
+    logger.warn({ err, userId: user.id }, '[auth] signed in from a team invitation; last_login_at not stamped')
+  }
+  db.query(
+    `INSERT INTO product_events (portal, event, user_id, role, meta)
+     VALUES ('auth', 'login', $1, $2, '{"via":"team_invitation"}'::jsonb)`,
+    [user.id, user.role],
+  ).catch(() => {})
+  return {
+    token,
+    // The shape /login answers with, so the page needs nothing else.
+    user: {
+      id: user.id, email: user.email, role: user.role,
+      firstName: user.first_name, lastName: user.last_name,
+      profileId,
+      landlordId: scope?.landlordId || null,
+      businessId,
+      staffRole,
+      permissions: scope?.permissions || null,
+      directDepositEnabled: scope?.directDepositEnabled ?? false,
+      propertyIds: scope?.propertyIds ?? null,
+      allProperties: scope?.allProperties ?? false,
+      mustEnrollTotp: false,
+    },
+  }
+}
+
 authRouter.post('/login', async (req, res, next) => {
   try {
     const { email, password, portal, keepSignedIn, emailFactor } = loginSchema.parse(req.body)
@@ -761,9 +855,8 @@ authRouter.post('/login', async (req, res, next) => {
 })
 
 // GET /api/auth/me
-// S67: bank_account_ready is derived from active user_bank_accounts rows
-// (the 16a per-user catalog) rather than landlords.stripe_bank_verified
-// (the pre-16a Stripe Connect flag, slated for deletion).
+// bank_account_ready = the landlord's Stripe Connect payouts are live
+// (10/12 — see the column below; the S67 legacy-catalog derivation is gone).
 // S82: includes landlordId + permissions for worker roles so the
 // landlord-portal nav can perm-filter on page load. Source of truth is
 // the scope table (re-fetched, not cached on the JWT) so toggle changes
@@ -776,6 +869,9 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
          -- S630: so the account screen can show a change awaiting confirmation
          -- rather than looking like the request was lost.
          u.pending_email,
+         -- 10/13 (Nic): a landlord's own birthday (Settings → Account), for
+         -- the happy-birthday email. Text, so no time zone can shift the day.
+         to_char(u.date_of_birth, 'YYYY-MM-DD') AS date_of_birth,
          COALESCE(l.id, t.id, b.id) AS profile_id,
          l.business_name, l.onboarding_complete,
          b.id   AS business_id,
@@ -793,15 +889,13 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
          -- GAM can pay you.
          --
          -- The same fix landed on /me/todos in S605 and this endpoint was
-         -- missed. The legacy catalog still counts, for the multi-owner
-         -- allocation-split case that genuinely uses it.
-         (
-           COALESCE(l.connect_payouts_enabled, FALSE)
-           OR EXISTS (
-             SELECT 1 FROM user_bank_accounts ba
-              WHERE ba.user_id = u.id AND ba.status = 'active'
-           )
-         ) AS bank_account_ready,
+         -- missed.
+         --
+         -- 10/12 (Nic): ONLY Connect. A row in the legacy bank catalog used to
+         -- count as ready too — the old Add Bank Account form, which never set
+         -- up payouts (Country Acres typed a bank in on 10/5 and waited for
+         -- microdeposits that could never come). That form is removed.
+         COALESCE(l.connect_payouts_enabled, FALSE) AS bank_account_ready,
          -- Gates the "Lot Rent & Net" nav item. Owner landlords only; l.id is
          -- NULL for non-landlord roles so the flag is false for them.
          --
@@ -952,17 +1046,51 @@ authRouter.post('/refresh', requireAuth, async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+/**
+ * 10/13 (Nic): a landlord's own birthday, for the happy-birthday email
+ * (jobs/birthdayEmails.ts). `dateOfBirth` absent → unchanged; null or '' →
+ * cleared; otherwise a real calendar date (YYYY-MM-DD), in the past, no
+ * earlier than 1900. Only a landlord account keeps one here. "In the past" is
+ * by Phoenix's calendar — the same "today" the birthday job greets on — not
+ * UTC's, which turns over at 5 pm Phoenix time and would let today's date in.
+ */
+export function ownBirthdayFrom(body: any, role: string, now: Date = new Date()): { given: boolean; value: string | null } {
+  if (!body || !Object.prototype.hasOwnProperty.call(body, 'dateOfBirth')) return { given: false, value: null }
+  if (role !== 'landlord') throw new AppError(403, 'Only a landlord account keeps its birthday here.')
+  const raw = body.dateOfBirth
+  if (raw === null || raw === '') return { given: true, value: null }
+  const m = typeof raw === 'string' ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw) : null
+  const d = m ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])) : null
+  if (!m || !d || d.getUTCFullYear() !== +m[1] || d.getUTCMonth() !== +m[2] - 1 || d.getUTCDate() !== +m[3]) {
+    throw new AppError(400, 'Enter your birthday as a date, like 1980-04-23.')
+  }
+  if (+m[1] < 1900) throw new AppError(400, 'That birthday is before 1900 — check the year.')
+  if (raw >= dateIn(FALLBACK_TIMEZONE, now)) {
+    throw new AppError(400, 'That birthday is not a date in the past.')
+  }
+  return { given: true, value: raw }
+}
+
 // PATCH /api/auth/me — update user profile
 authRouter.patch('/me', requireAuth, async (req, res, next) => {
   try {
     const { firstName, lastName, phone } = req.body
-    await query(`UPDATE users SET first_name=COALESCE($1,first_name), last_name=COALESCE($2,last_name), phone=COALESCE($3,phone), updated_at=NOW() WHERE id=$4`,
-      [firstName||null, lastName||null, phone||null, req.user!.userId])
+    // 10/13 (Nic): "emailing tenants on their birthday ... happy birthday from
+    // GAM" — tenants AND landlords, and landlords need a birthday on their
+    // profile. A landlord types their own here (Settings → Account); absent
+    // leaves it alone, null clears it. A tenant's comes from their signed lease
+    // (tenants.date_of_birth), so no other account sets one here.
+    const birthday = ownBirthdayFrom(req.body, req.user!.role)
+    await query(`UPDATE users SET first_name=COALESCE($1,first_name), last_name=COALESCE($2,last_name), phone=COALESCE($3,phone),
+        date_of_birth = CASE WHEN $5::boolean THEN $6::date ELSE date_of_birth END,
+        updated_at=NOW() WHERE id=$4`,
+      [firstName||null, lastName||null, phone||null, req.user!.userId, birthday.given, birthday.value])
     // Return ONLY safe columns — `SELECT *` here leaked password_hash, the
     // reset/verify tokens, and 2FA fields back to the client on every profile
     // save (GET /me already scopes its columns; this path did not).
     const user = await queryOne<any>(
-      `SELECT id, email, role, first_name, last_name, phone, created_at, updated_at
+      `SELECT id, email, role, first_name, last_name, phone,
+              to_char(date_of_birth, 'YYYY-MM-DD') AS date_of_birth, created_at, updated_at
          FROM users WHERE id=$1`, [req.user!.userId])
     res.json({ success: true, data: user })
   } catch(e) { next(e) }

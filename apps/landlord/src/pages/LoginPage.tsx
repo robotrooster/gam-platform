@@ -1,7 +1,46 @@
 import { useState } from 'react'
-import { useNavigate, Link } from 'react-router-dom'
+import { useNavigate, useLocation, useSearchParams, Link, type NavigateFunction } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { useAuth } from '../context/AuthContext'
+
+// ── 10/13 (Nic): A NEW TEAM MEMBER, AND THE WAY BACK ─────────────────────────
+//
+// "It told her to sign in and then something about it not going anywhere."
+// A bookkeeper who had just created her account from the owner's invitation was
+// told to go sign in elsewhere with the password she had typed seconds before.
+// 10/13 evening (Nic): "the invite link counts as proof of email" — Create
+// account now signs her straight in (AcceptInvitePage), so she does not come
+// here at all. She comes here only when the account was set up but could not
+// be signed in from the link: the sign-in form, her address filled in, saying
+// the account is set up. An existing account asked to sign in to accept comes
+// back to the invitation (?next=), not to a dashboard with the invitation
+// dropped.
+const PENDING_CODE_KEY = 'gam.otp.landlord.login'
+
+/** What the invitation page hands over (router state): who just set up an account. */
+export interface JoinedHandoff {
+  joined: { email: string }
+}
+
+/**
+ * 10/13: from the invitation page to this page's sign-in form, with the "your
+ * account is set up" line. Replaces the invitation in history, so Back does not
+ * reopen a used form.
+ */
+export function continueToSignIn(navigate: NavigateFunction, handoff: JoinedHandoff): void {
+  navigate('/login', { replace: true, state: handoff })
+}
+
+/**
+ * 10/13: where to go after signing in, when the page that sent someone here
+ * asked (?next=). Only a path inside this portal — never another site, never
+ * back to this page.
+ */
+export function safeNextPath(raw: string | null | undefined): string | null {
+  if (!raw || !raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\')) return null
+  if (raw === '/login' || raw.startsWith('/login?')) return null
+  return raw
+}
 
 // ── S639: THE CODE STEP MUST SURVIVE LEAVING THE PAGE ────────────────────────
 //
@@ -39,13 +78,21 @@ function usePendingOtpSession(key: string): [string | null, (v: string | null) =
 export function LoginPage() {
   const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp } = useAuth()
   const navigate = useNavigate()
+  const location = useLocation()
+  const [searchParams] = useSearchParams()
+  // 10/13: an invitation page that sent someone here to sign in gets them back.
+  const next = safeNextPath(searchParams.get('next'))
+  const signedInGoTo = () => navigate(next ?? '/', { replace: true })
+  // 10/13: a team member who just set up their account (the invitation page).
+  const handoff = (location.state ?? null) as JoinedHandoff | null
+  const joined = handoff?.joined ?? null
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
   const [totpSession, setTotpSession] = useState<string | null>(null)
-  const [emailOtpSession, setEmailOtpSession] = usePendingOtpSession('gam.otp.landlord.login')
+  const [emailOtpSession, setEmailOtpSession] = usePendingOtpSession(PENDING_CODE_KEY)
   const [resent, setResent] = useState(false)
   const [code, setCode] = useState('')
-  const { register, handleSubmit } = useForm<{email:string;password:string}>()
+  const { register, handleSubmit } = useForm<{email:string;password:string}>({ defaultValues: { email: joined?.email ?? '' } })
 
   const onSubmit = async (d: {email:string;password:string}) => {
     setLoading(true); setErr('')
@@ -53,7 +100,7 @@ export function LoginPage() {
       const r = await login(d.email, d.password)
       if (r.kind === 'totp_required') { setTotpSession(r.totpSession); setCode('') }
       else if (r.kind === 'email_otp_required') { setEmailOtpSession(r.emailOtpSession); setCode(''); setResent(false) }
-      else navigate('/')
+      else signedInGoTo()
     }
     catch (e: any) {
       // S605: distinguish "the server said no" from "we never reached the
@@ -72,7 +119,7 @@ export function LoginPage() {
 
   const onTotpSubmit = async (e: React.FormEvent) => {
     e.preventDefault(); setLoading(true); setErr('')
-    try { await loginWithTotp(totpSession!, code.trim()); navigate('/') }
+    try { await loginWithTotp(totpSession!, code.trim()); signedInGoTo() }
     catch (ex: any) {
       const msg = ex.response?.data?.error || 'Invalid code.'
       setErr(msg)
@@ -85,7 +132,7 @@ export function LoginPage() {
   // S574: email-code 2FA (mandatory for landlords). Verify the emailed code.
   const onEmailOtpSubmit = async (e: React.FormEvent) => {
     e.preventDefault(); setLoading(true); setErr('')
-    try { await loginWithEmailOtp(emailOtpSession!, code.trim()); setEmailOtpSession(null); navigate('/') }
+    try { await loginWithEmailOtp(emailOtpSession!, code.trim()); setEmailOtpSession(null); signedInGoTo() }
     catch (ex: any) {
       const msg = ex.response?.data?.error || 'Invalid code.'
       setErr(msg)
@@ -215,6 +262,8 @@ export function LoginPage() {
         </div>
         <div className="card" style={{padding:28}}>
           <h2 style={{marginBottom:24,fontSize:'1.2rem'}}>Sign In</h2>
+          {/* 10/13: an account set up on an invitation that could not be signed in from the link. */}
+          {joined && !err && <div className="alert alert-success" style={{marginBottom:16}}>Your account is set up. Sign in with {joined.email} and the password you just chose.</div>}
           {err && <div className="alert alert-danger" style={{marginBottom:16}}>{err}</div>}
           <form onSubmit={handleSubmit(onSubmit)}>
             <div className="form-group">

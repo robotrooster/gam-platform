@@ -1,0 +1,239 @@
+/* 10/12 (Nic): the Rent Roll and the tenant payment report — the payment
+   stamps (one per household per bill month) and the folders they sit in.
+   Every class the two pages use has its rule here; colors are theme tokens
+   (the two stamp colors the palette lacks are defined below for both themes). */
+
+:root {
+  --rr-yellow: #eab308;
+  --rr-yellow-bg: rgba(234, 179, 8, .12);
+  --rr-orange: #f97316;
+  --rr-orange-bg: rgba(249, 115, 22, .12);
+}
+:root[data-theme="light"] {
+  --rr-yellow: #a16207;
+  --rr-yellow-bg: rgba(234, 179, 8, .18);
+  --rr-orange: #c2410c;
+  --rr-orange-bg: rgba(249, 115, 22, .14);
+}
+
+/* ── Stamps: color AND a letter, so they read without color ── */
+
+.rr-flag { display: inline-block; margin-left: 4px; padding: 1px 6px; border-radius: 999px; font-size: .62rem; font-weight: 700;
+  background: var(--red-bg); color: var(--red); white-space: nowrap; }
+.rr-flag.muted { background: var(--bg-4); color: var(--text-2); }
+
+/* ── The bar and the summary ── */
+
+/* ── Folders ── */
+
+/* The name column sits BESIDE the columns that scroll, never stuck over them
+   (a sticky column flashes on fast scroll — the Schedule lesson). Two tables
+   side by side, every row the same fixed height so they line up. 10/12: the
+   scrolling side carries the month's figures and then every month since the
+   first bill, newest first — the newest in view, older months to the right. */
+.rr-split { display: flex; align-items: flex-start; }
+.rr-fixed { flex: 0 0 auto; width: 250px; border-right: 1px solid var(--border-1); }
+.rr-scroll { flex: 1 1 auto; min-width: 0; overflow-x: auto; }
+.rr-scroll:focus-visible, .rr-card-stamps:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
+.rr-table { width: 100%; border-collapse: collapse; }
+.rr-scroll .rr-table { min-width: 760px; }
+.rr-table th, .rr-table td {
+  height: 54px; padding: 0 10px; border-bottom: 1px solid var(--border-0);
+  font-size: .8rem; color: var(--text-1); white-space: nowrap; vertical-align: middle; text-align: left;
+}
+.rr-table thead th {
+  height: 46px; font-size: .64rem; font-weight: 700; color: var(--text-3); text-transform: uppercase;
+  letter-spacing: .06em; background: var(--bg-1);
+}
+.rr-table tfoot td { height: 64px; background: var(--bg-1); font-size: .66rem; color: var(--text-3); vertical-align: top; padding-top: 6px; }
+.rr-table .num { text-align: right; font-family: var(--font-mono); }
+.rr-sub { display: block; font-size: .66rem; color: var(--text-3); font-weight: 400; font-family: var(--font-body); line-height: 1.3; }
+.rr-owed { color: var(--gold); font-weight: 700; }
+.rr-zero { color: var(--text-3); }
+.rr-name-link {
+  background: none; border: none; padding: 0; color: var(--text-0); font-weight: 600; font-size: .82rem;
+  font-family: var(--font-body); cursor: pointer; text-align: left; overflow: hidden; text-overflow: ellipsis; max-width: 170px;
+}
+.rr-name-link:hover { color: var(--gold); text-decoration: underline; }
+.rr-space { display: block; font-family: var(--font-mono); font-size: .72rem; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; max-width: 190px; }
+
+/* The picked month's lines, under the folder. */
+
+/* ── Phones: one card per household ── */
+.rr-cards { display: none; }
+.rr-card { padding: 12px 14px; border-bottom: 1px solid var(--border-0); }
+.rr-card:last-child { border-bottom: none; }
+.rr-card-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.rr-card-figs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 8px 0; font-size: .74rem; color: var(--text-2); }
+.rr-card-figs strong { display: block; font-family: var(--font-mono); font-size: .86rem; color: var(--text-0); }
+/* 10/12: every month, newest first, scrolling sideways inside the card (the page never does). */
+.rr-card-stamps { display: flex; gap: 4px; flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; }
+.rr-card-stamp { flex: 0 0 auto; text-align: center; }
+.rr-stamp-month { display: block; font-size: .56rem; font-weight: 600; color: var(--text-3); text-align: center; }
+
+@media (max-width: 640px) {
+  .rr-split { display: none; }
+  .rr-cards { display: block; }
+}
+
+/* ── The tenant payment report ── */
+.tr-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.tr-section { margin-bottom: 16px; }
+/* Section titles wear the card titles' look (the summary cards above them). */
+.tr-section h2.card-title { margin: 0 0 10px; }
+.tr-kv { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--border-0); font-size: .8rem; }
+.tr-kv:last-child { border-bottom: none; }
+.tr-k { color: var(--text-3); }
+.tr-v { color: var(--text-0); text-align: right; }
+.tr-health { display: flex; align-items: center; gap: 14px; }
+.tr-health-pct { font-family: var(--font-mono); font-size: 1.6rem; font-weight: 800; }
+/* 10/13 (Nic): "Keep it out, but say so" — nothing counted yet, in words; the onboarding month left out, said. */
+.tr-health-none { font-size: .95rem; font-weight: 700; color: var(--text-1); }
+.tr-health-note { color: var(--text-3); font-size: .72rem; }
+.tr-pattern { font-size: .95rem; font-weight: 700; color: var(--text-0); margin-bottom: 6px; }
+.tr-bars { display: flex; flex-direction: column; gap: 4px; }
+.tr-bar { display: grid; grid-template-columns: 150px 1fr 28px; gap: 8px; align-items: center; font-size: .74rem; color: var(--text-2); }
+.tr-bar-track { height: 8px; background: var(--bg-4); border-radius: 999px; overflow: hidden; }
+.tr-bar-fill { height: 100%; background: var(--rr-orange); border-radius: 999px; }
+/* Paid after the due date but inside grace is not late: green, not orange. */
+.tr-bar-fill.ok { background: var(--green); }
+.tr-history-wrap { overflow-x: auto; }
+.tr-history { width: 100%; border-collapse: collapse; font-size: .76rem; }
+.tr-history th, .tr-history td { padding: 7px 8px; border-bottom: 1px solid var(--border-0); text-align: left; white-space: nowrap; color: var(--text-1); }
+.tr-history th { font-size: .62rem; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); }
+.tr-history .num { text-align: right; font-family: var(--font-mono); }
+.tr-history tr.tr-fees td { background: var(--bg-3); color: var(--text-2); }
+.tr-fee-toggle { background: none; border: none; padding: 0; color: var(--gold); cursor: pointer; font-size: .7rem; font-family: var(--font-body); }
+@media (max-width: 640px) {
+  .tr-bar { grid-template-columns: 110px 1fr 24px; }
+}
+
+/* ── Print: the page alone, on white ── */
+@media print {
+  .sidebar, .topbar, .rr-noprint { display: none !important; }
+  .main-content { margin-left: 0 !important; height: auto !important; overflow: visible !important; }
+  .app-shell { height: auto !important; overflow: visible !important; display: block !important; }
+  .page-content { overflow: visible !important; }
+  .rr-scroll { overflow: visible !important; }
+  .rr-split { display: flex !important; }
+  .rr-cards { display: none !important; }
+  .tr-history-wrap { overflow: visible !important; }
+}
+
+/* ── 10/12 (Nic): who stays after moving out — the landlord's choice, per company ── */
+.rr-moved-out { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center; margin: -4px 0 14px; font-size: .76rem; color: var(--text-2); }
+
+/* ── 10/12 (Nic): the report's imported history — shown, labeled, never counted ── */
+.tr-note { font-size: .74rem; color: var(--text-3); margin: -4px 0 10px; line-height: 1.4; }
+.tr-imported-tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: .64rem; font-weight: 700;
+  background: var(--bg-4); color: var(--text-2); border: 1px solid var(--border-1); white-space: nowrap; }
+
+
+/* ── 10/27 (Nic): THE PRINTED STATEMENT ─────────────────────────────────────
+   "I want it to look like a fucking professional invoice, not just some shit
+   that you cobbled together."
+   So it is laid out as a document: letterhead, bill-to, a ruled column table
+   with Description / Period / Qty / Rate / Amount, and a balance due that is
+   the one figure you see first. Sized in points for paper, not pixels for a
+   screen. Printing is always light (installPrintLightTheme) — dark mode
+   printed a solid black sheet and cost a cartridge. */
+.inv { max-width: 7.5in; margin: 0 auto 34px; padding: 30px 34px; background: var(--bg-1, #12161f);
+  border: 1px solid var(--border-1, rgba(255,255,255,.08)); border-radius: 10px;
+  font-size: 10.5pt; line-height: 1.45; }
+
+.inv-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; }
+.inv-co { font-size: 15pt; font-weight: 800; color: var(--text-0); letter-spacing: -.01em; }
+.inv-from-line { font-size: 9pt; color: var(--text-2); }
+.inv-mark { text-align: right; }
+.inv-title { font-size: 19pt; font-weight: 800; letter-spacing: .09em; color: var(--gold); }
+.inv-meta { margin-left: auto; margin-top: 6px; border-collapse: collapse; }
+.inv-meta td { font-size: 9pt; padding: 1px 0 1px 14px; color: var(--text-2); }
+.inv-meta td:first-child { color: var(--text-3); text-transform: uppercase; letter-spacing: .05em; font-size: 7.5pt; }
+
+.inv-parties { display: flex; justify-content: space-between; align-items: flex-end; gap: 24px;
+  margin: 22px 0 16px; padding-top: 16px; border-top: 2px solid var(--gold); }
+.inv-label { font-size: 7.5pt; text-transform: uppercase; letter-spacing: .08em; color: var(--text-3); margin-bottom: 3px; }
+.inv-to-name { font-size: 12pt; font-weight: 700; color: var(--text-0); }
+.inv-due-box { text-align: right; }
+.inv-due { font-size: 20pt; font-weight: 800; color: var(--gold); font-family: var(--font-m, monospace); letter-spacing: -.02em; }
+
+.inv-table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+.inv-table thead th { font-size: 7.5pt; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--text-3); font-weight: 700; text-align: left; padding: 7px 0;
+  border-bottom: 1px solid var(--text-3); }
+.inv-table tbody td { padding: 8px 0; border-bottom: 1px solid var(--border-1, rgba(255,255,255,.07));
+  vertical-align: top; font-size: 10pt; color: var(--text-1); }
+.inv-table .inv-desc { width: 46%; padding-right: 12px; }
+.inv-table .inv-period { width: 28%; font-size: 9pt; color: var(--text-2); padding-right: 12px; }
+.inv-table .inv-num { text-align: right; white-space: nowrap; padding-left: 12px;
+  font-family: var(--font-m, monospace); font-size: 9.5pt; }
+.inv-table thead .inv-num { text-align: right; }
+.inv-amount { font-weight: 700; color: var(--text-0) !important; }
+.inv-detail { display: block; font-size: 8.5pt; color: var(--text-3); margin-top: 2px; }
+/* "Late fees" — a divider inside the table, not a second bill. */
+.inv-section td { padding: 16px 0 5px !important; border-bottom: none !important;
+  font-size: 7.5pt; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-3); font-weight: 700; }
+
+.inv-sum { display: flex; justify-content: flex-end; margin-top: 14px; }
+.inv-sum table { border-collapse: collapse; min-width: 2.9in; }
+.inv-sum td { padding: 4px 0; font-size: 10pt; color: var(--text-2); }
+.inv-sum td:last-child { text-align: right; padding-left: 26px;
+  font-family: var(--font-m, monospace); color: var(--text-1); }
+.inv-balance td { padding-top: 9px !important; border-top: 2px solid var(--gold);
+  font-size: 12pt; font-weight: 800; color: var(--text-0) !important; }
+
+.inv-foot { margin-top: 26px; padding-top: 12px; border-top: 1px solid var(--border-1, rgba(255,255,255,.07));
+  font-size: 8.5pt; color: var(--text-3); }
+
+@media print {
+  .inv { border: none; border-radius: 0; padding: 0; margin: 0 auto; max-width: 100%; background: none; }
+  .inv + .inv { page-break-before: always; }
+  .inv-table tbody tr { page-break-inside: avoid; }
+  .inv-sum, .inv-foot { page-break-inside: avoid; }
+}
+
+/* ── 10/27 (Nic): the paper bill ─────────────────────────────────────────────
+   One sheet per household, each starting its own page, so the stack comes off
+   the printer sorted into what goes under which door. Sized for a page rather
+   than a screen: the thing is read in somebody's hand, on paper.
+   Printing is always light (installPrintLightTheme) — dark mode printed a
+   solid black sheet. */
+.bill-sheet { max-width: 760px; margin: 0 auto 28px; padding: 22px 26px;
+  border: 1px solid var(--border-1, rgba(255,255,255,.08)); border-radius: 10px; }
+.bill-head { display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 18px; padding-bottom: 14px; border-bottom: 2px solid var(--gold); margin-bottom: 16px; }
+.bill-who { font-size: 1.25rem; font-weight: 800; color: var(--text-0); }
+.bill-where { font-size: .85rem; color: var(--text-2); margin-top: 2px; }
+.bill-owed { text-align: right; }
+.bill-owed-label { font-size: .7rem; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); }
+.bill-owed-amount { font-size: 1.6rem; font-weight: 800; color: var(--gold); font-family: var(--font-m, monospace); }
+.bill-block { margin-bottom: 18px; }
+.bill-block-head { display: flex; justify-content: space-between; font-size: .8rem;
+  font-weight: 700; color: var(--text-1); margin-bottom: 6px; }
+.bill-due { font-weight: 400; color: var(--text-3); }
+.bill-lines { width: 100%; border-collapse: collapse; }
+.bill-lines td { padding: 6px 0; border-bottom: 1px solid var(--border-1, rgba(255,255,255,.06)); vertical-align: top; }
+.bill-line-name { font-size: .88rem; color: var(--text-1); }
+.bill-line-detail { display: block; font-size: .74rem; color: var(--text-3); margin-top: 2px; }
+.bill-line-amount { font-size: .88rem; text-align: right; white-space: nowrap;
+  font-family: var(--font-m, monospace); font-weight: 600; }
+/* 10/27: the rate and the count behind a repeated charge — "$5.00 × 27". */
+.bill-line-qty { font-size: .78rem; text-align: right; white-space: nowrap; padding-right: 14px;
+  color: var(--text-3); font-family: var(--font-m, monospace); }
+/* Which bill these lines belong to. A heading, not a competing total. */
+.bill-period td { font-size: .72rem; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--text-3); padding-top: 14px; border-bottom: none; font-weight: 700; }
+.bill-sheet .bill-period:first-child td { padding-top: 0; }
+.bill-totals { margin-top: 10px; margin-left: auto; max-width: 320px; }
+.bill-totals > div { display: flex; justify-content: space-between; font-size: .84rem;
+  color: var(--text-2); padding: 3px 0; }
+.bill-totals > div > span:last-child { font-family: var(--font-m, monospace); }
+.bill-total-owed { font-weight: 800; color: var(--text-0) !important;
+  border-top: 1px solid var(--border-1, rgba(255,255,255,.12)); margin-top: 4px; padding-top: 6px !important; }
+
+@media print {
+  .bill-sheet { border: none; padding: 0; margin: 0 auto; max-width: 100%; }
+  .bill-sheet + .bill-sheet { page-break-before: always; }
+  .bill-block { page-break-inside: avoid; }
+}

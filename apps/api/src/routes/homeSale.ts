@@ -55,8 +55,10 @@ const createSchema = z.object({
   numberOfPayments:   z.number().int().positive().max(600).optional(),
   // S629 (Nic): send the purchase agreement for signature and let the SIGNATURE
   // start the billing. The contract is created holding the agreed terms with no
-  // schedule and nothing billed until that document completes. Optional so the
-  // existing direct-create path (a sale papered outside GAM) still works.
+  // schedule and nothing billed until the LANDLORD signs it (10/12, Nic: "we
+  // need people to be billed correctly regardless of signing status" — the
+  // buyer's signature no longer holds it back). Optional so the existing
+  // direct-create path (a sale papered outside GAM) still works.
   templateId:         z.string().uuid().optional(),
 })
 
@@ -130,7 +132,8 @@ homeSaleRouter.post('/', requireLandlord, requirePerm('leases.edit'), async (req
 
     // S629: draft the purchase agreement from the terms just agreed and bind
     // it to the contract. The document is the authority — the contract stays
-    // pending_signature, with no installments, until it comes back signed.
+    // pending_signature, with no installments, until the landlord signs it
+    // (10/12: his signature starts the billing, as it issues a lease).
     if (body.templateId) {
       // Imported here rather than at module scope: esign.ts imports
       // activateHomeSaleContract from services/homeSale, and a static import
@@ -217,7 +220,11 @@ homeSaleRouter.get('/unit/:unitId', async (req: any, res, next) => {
     }
     const schedule = await query<any>(
       `SELECT i.installment_number, i.billing_month, i.amount, i.principal_portion, i.interest_portion,
-              i.remaining_balance, i.payment_id, p.status AS payment_status
+              i.remaining_balance, i.payment_id, p.status AS payment_status,
+              -- 10/25: on a contract GAM tracks but does not bill, this stamp IS
+              -- the record that the payment arrived (there is no charge to read
+              -- a status from), so the ledger needs it to show paid from due.
+              i.settled_off_platform_at, i.reminded_at
          FROM home_sale_installments i
          LEFT JOIN payments p ON p.id = i.payment_id
         WHERE i.contract_id=$1 ORDER BY i.installment_number`, [contract.id])
@@ -227,6 +234,172 @@ homeSaleRouter.get('/unit/:unitId', async (req: any, res, next) => {
 
 // POST /api/home-sales/:id/cancel — stop future billing (soft: status=cancelled,
 // already-billed installments stay as the historical record).
+/**
+ * 10/25 (Nic): HOW THIS CONTRACT IS PAID — the landlord's own terms on it.
+ *
+ *   "A trailer bill could possibly have late fees. It's an installment contract
+ *    that may carry its own late terms. I don't have any specific to these
+ *    contracts, but we need to have the capability for landlords. We provide
+ *    the tools to do the job, whatever their job is."
+ *
+ *   "We need the ability to have the contract flagged as, you know, prevent
+ *    credit card payments on that bill. That's an exposure where we would have
+ *    to backtrack bookkeeping and stuff."
+ *
+ * Settable on an existing contract, not only at creation: a landlord who takes
+ * one of these on later (Dominic Gonzalez's, whose money goes to the trust)
+ * must be able to say so without re-papering the sale. Omitted fields are left
+ * exactly as they are.
+ *
+ * Late fees are OFF by default on every contract and stay off unless a
+ * landlord turns them on — a fee nobody signed for is never charged.
+ */
+const termsSchema = z.object({
+  lateFeeEnabled:       z.boolean().optional(),
+  lateFeeGraceDays:     z.number().int().min(0).max(60).nullable().optional(),
+  lateFeeInitialType:   z.enum(['flat', 'percent']).nullable().optional(),
+  lateFeeInitialAmount: z.number().min(0).nullable().optional(),
+  lateFeeAccrualType:   z.enum(['flat', 'percent']).nullable().optional(),
+  lateFeeAccrualAmount: z.number().min(0).nullable().optional(),
+  lateFeeAccrualPeriod: z.enum(['daily', 'weekly', 'monthly']).nullable().optional(),
+  lateFeeAccrualFrom:   z.enum(['grace_end', 'due_date']).nullable().optional(),
+  lateFeeCapType:       z.enum(['flat', 'percent']).nullable().optional(),
+  lateFeeCapAmount:     z.number().min(0).nullable().optional(),
+  cardPaymentsBlocked:  z.boolean().optional(),
+  /**
+   * 10/25 (Nic): GAM tracks this contract and reminds, but bills nothing —
+   * "it's just going to be a ledger that keeps track... it stays off the books."
+   */
+  trackedNotBilled:     z.boolean().optional(),
+}).refine(o => Object.keys(o).length > 0, { message: 'Nothing to change.' })
+
+const TERMS_COLUMNS: Record<string, string> = {
+  lateFeeEnabled: 'late_fee_enabled',
+  lateFeeGraceDays: 'late_fee_grace_days',
+  lateFeeInitialType: 'late_fee_initial_type',
+  lateFeeInitialAmount: 'late_fee_initial_amount',
+  lateFeeAccrualType: 'late_fee_accrual_type',
+  lateFeeAccrualAmount: 'late_fee_accrual_amount',
+  lateFeeAccrualPeriod: 'late_fee_accrual_period',
+  lateFeeAccrualFrom: 'late_fee_accrual_from',
+  lateFeeCapType: 'late_fee_cap_type',
+  lateFeeCapAmount: 'late_fee_cap_amount',
+  cardPaymentsBlocked: 'card_payments_blocked',
+  trackedNotBilled: 'tracked_not_billed',
+}
+
+// PATCH /api/home-sales/:id/terms
+homeSaleRouter.patch('/:id/terms', requireLandlord, requirePerm('leases.edit'), async (req: any, res, next) => {
+  try {
+    const body = termsSchema.parse(req.body)
+    const contract = await queryOne<any>(
+      `SELECT id, landlord_id, status FROM home_sale_contracts WHERE id=$1`, [req.params.id])
+    if (!contract) throw new AppError(404, 'Contract not found')
+    if (!canManageLandlordResource(req.user, contract.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (contract.status === 'paid_off' || contract.status === 'cancelled') {
+      throw new AppError(409, `This contract is ${contract.status} — its terms can no longer be changed.`)
+    }
+    const sets: string[] = []
+    const vals: any[] = [req.params.id]
+    for (const [field, column] of Object.entries(TERMS_COLUMNS)) {
+      if (!(field in body)) continue
+      vals.push((body as any)[field])
+      sets.push(`${column} = $${vals.length}`)
+    }
+    // A bill already written KEEPS the exemption it was written with (S558: the
+    // document is the charge), so turning fees on governs bills from here on
+    // and nothing existing is touched. No statement is needed for either
+    // direction, and one would be wrong in both:
+    //
+    //   ON  — every trailer bill on the platform is written exempt (fees
+    //         default off), so none has ever been fined. A back-fill guarded on
+    //         "has never been fined" therefore excludes nothing, and clearing
+    //         the exemption would fine every open past-due bill at once, with
+    //         daily accrual counted back to a due date the buyer was told
+    //         carried no fee. That is the one outcome this must not produce.
+    //   OFF — jobs/lateFees reads the contract's terms LIVE (its
+    //         home_sale_contracts join), so switching fees off stops any new
+    //         fee on the next run by itself. Marking bills exempt as well would
+    //         add nothing.
+    const updated = await queryOne<any>(
+      `UPDATE home_sale_contracts SET ${sets.join(', ')}, updated_at = NOW()
+        WHERE id = $1
+       RETURNING id, late_fee_enabled, late_fee_grace_days, late_fee_initial_type,
+                 late_fee_initial_amount, late_fee_accrual_type, late_fee_accrual_amount,
+                 late_fee_accrual_period, late_fee_accrual_from, late_fee_cap_type,
+                 late_fee_cap_amount, card_payments_blocked, tracked_not_billed`,
+      vals)
+    // 10/25: TURNING BILLING ON must not bill the months GAM was not billing.
+    // While a contract is tracked, its months pass unbilled by design; flipping
+    // it to billed would otherwise make the next run invoice every one of them
+    // at once — months the buyer may well have already paid off the books. So
+    // the past is stamped as settled outside GAM, which is what it was, and
+    // billing starts from the current month. The same rule as a property's
+    // first billing cycle: GAM bills from when it starts billing.
+    if (body.trackedNotBilled === false) {
+      await query(
+        `UPDATE home_sale_installments i
+            SET settled_off_platform_at = NOW()
+          WHERE i.contract_id = $1
+            AND i.payment_id IS NULL
+            AND i.settled_off_platform_at IS NULL
+            AND i.billing_month < date_trunc('month', CURRENT_DATE)::date`,
+        [req.params.id])
+      const { reconcileHomeSaleContract } = await import('../services/homeSale')
+      await reconcileHomeSaleContract(req.params.id)
+    }
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+/**
+ * 10/25 (Nic): "when that payment comes in, we will mark that it was paid, but
+ * it stays off the books." Only on a contract GAM tracks and does not bill —
+ * a payment GAM billed is marked on its own bill, through the desk or the
+ * payments page, so that money reaches the books the ordinary way.
+ */
+const markPaidSchema = z.object({
+  installmentNumber: z.number().int().positive(),
+  paid: z.boolean(),
+})
+
+// PATCH /api/home-sales/:id/installments/mark
+// 10/25 (Nic): 'take_payment', and NOT a lease permission.
+//
+//   "Lisa is not going to get permission to edit leases. That is a non-starter
+//    right there. Marking that somebody logged a payment for a contract that's
+//    being kept off the books has nothing to do with leases. You need to take a
+//    different route."
+//
+// He is right twice over. The concept is wrong — this is somebody at the counter
+// saying money changed hands, which is what 'take_payment' is for ("Record a
+// cash / check payment... cash, check, money order") — and naming leases.edit
+// here, even as an alternative, reads as though the desk needs lease rights to
+// do it. It does not and must not.
+//
+// It also would not have worked: Lisa's granted keys include take_payment and
+// do NOT include leases.edit. Owners and property managers still reach it,
+// because requirePerm lets owner roles through.
+//
+// requireLandlord is deliberately NOT here either: it is
+// requireRole('admin','super_admin','landlord'), so it refuses the front desk
+// outright — the 403 nobody would have understood. This follows the pattern the
+// desk's other money routes use (routes/payments: requireAuth on the router,
+// requirePerm per route), and the handler still checks the contract belongs to
+// the company the caller works for (canManageLandlordResource).
+homeSaleRouter.patch('/:id/installments/mark', requirePerm('take_payment'), async (req: any, res, next) => {
+  try {
+    const body = markPaidSchema.parse(req.body)
+    const contract = await queryOne<any>(
+      `SELECT id, landlord_id, status FROM home_sale_contracts WHERE id=$1`, [req.params.id])
+    if (!contract) throw new AppError(404, 'Contract not found')
+    if (!canManageLandlordResource(req.user, contract.landlord_id)) throw new AppError(403, 'Forbidden')
+    const { markTrackedInstallmentPaid } = await import('../services/homeSale')
+    const out = await markTrackedInstallmentPaid(req.params.id, body.installmentNumber, body.paid)
+    res.json({ success: true, data: out })
+  } catch (e) { next(e) }
+})
+
 homeSaleRouter.post('/:id/cancel', requireLandlord, requirePerm('leases.edit'), async (req: any, res, next) => {
   try {
     const contract = await queryOne<any>(`SELECT id, landlord_id, status FROM home_sale_contracts WHERE id=$1`, [req.params.id])

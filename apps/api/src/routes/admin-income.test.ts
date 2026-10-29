@@ -124,6 +124,20 @@ describe('GET /api/admin/income/projection', () => {
 })
 
 describe('GET /api/admin/onboarding/landlord/:id — detail + checklist', () => {
+  it('10/12: a legacy bank row alone does NOT tick the payout step', async () => {
+    const f = await seedAFixture()
+    const client = await db.connect()
+    try { await seedUserBankAccount(client, { userId: f.landlordUserId }) }
+    finally { client.release() }
+    const res = await request(buildApp())
+      .get(`/api/admin/onboarding/landlord/${f.landlordId}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(res.status).toBe(200)
+    const step = res.body.data.checklist.find((c: any) => c.key === 'bank_account_added')
+    expect(step).toMatchObject({ label: 'Payouts set up with Stripe', done: false })
+    expect(res.body.data.landlord.bank_account_ready).toBe(false)
+  })
+
   it('happy path: checklist reflects state (bank=false initially)', async () => {
     const f = await seedAFixture()
     const res = await request(buildApp())
@@ -139,12 +153,14 @@ describe('GET /api/admin/onboarding/landlord/:id — detail + checklist', () => 
     expect(checklist.onboarding_complete).toBe(false)  // landlords default
   })
 
-  it('checklist updates after seeding bank + property + unit', async () => {
+  // 10/12 (Nic): "bank" here means Stripe can pay them — connect payouts live
+  // — not a row in the legacy bank catalog (the removed Add Bank Account form).
+  it('checklist updates after Stripe payouts go live + property + unit', async () => {
     const f = await seedAFixture()
     const client = await db.connect()
     try {
       await client.query('BEGIN')
-      await seedUserBankAccount(client, { userId: f.landlordUserId })
+      await client.query(`UPDATE landlords SET connect_payouts_enabled = TRUE WHERE id = $1`, [f.landlordId])
       const propertyId = await seedProperty(client, {
         landlordId: f.landlordId, ownerUserId: f.landlordUserId,
         managedByUserId: f.landlordUserId,
@@ -615,6 +631,147 @@ describe('10/3: GAM\'s own money and the processing margin, from the routes', ()
     expect(res.body.data.gams_own).toBeNull()
     expect(res.body.data.reconciliation).toBeNull()
     expect(res.body.data.checkr_held).toBe(37.94)
+  })
+
+  // 10/12 (Nic, A3): "SHOW THE BRIDGE (earned − billed-not-collected + reader
+  // payments − payouts to GAM bank = money in Stripe)" — every timing item
+  // named, and the leftover must read $0.00.
+  it('10/12 (A3): the bridge walks from the earnings ledger to GAM\'s own, every line named, and leaves $0.00', async () => {
+    const f = await seedMoney()
+    // The fixture's ledger alone: the check's $5 + its $0.49 spread; the card
+    // payment's fee is not booked yet and Stripe's $10 is not trued up.
+    const base = (await balanceWith(f.superAdminToken, fakeStripe())).body.data.reconciliation.bridge
+    expect(base).toEqual({
+      // 10/12 (G5 review): the uncovered processing fee billed and not collected yet — none here.
+      earned: 5.49, platform_fees_not_collected: 0, processing_fees_not_collected: 0,
+      reader_bought: 0, reader_billed_not_collected: 0, reader_payments_collected: 0, reader_cost_repaid_collected: 0, reader_markup_collected: 0,
+      paid_out_to_gam_bank: 0,
+      timing: [{ key: 'processing', label: expect.stringMatching(/less what Stripe charged/), amount: 8.21 }],
+      gams_own: 13.70, on_balance: 13.70, leftover: 0,
+    })
+
+    // Platform fees billed: $48 netted from a payout, $24 still owed.
+    for (const [amt, collected] of [[48, 48], [24, 0]] as const) {
+      const { rows: [l] } = await db.query<{ ref: string }>(
+        `INSERT INTO platform_revenue_ledger (type, amount, balance_after, reference_id, reference_type, property_id)
+         VALUES ('platform_fee_subscription', $1, 0, gen_random_uuid(), 'platform_fee_accrual', $2) RETURNING reference_id AS ref`,
+        [amt, f.propertyId])
+      await db.query(
+        `INSERT INTO landlord_gam_charges (landlord_id, property_id, kind, amount, collected_amount, source_type, source_id)
+         VALUES ($1, $2, 'subscription', $3, $4, 'platform_fee_accrual', $5)`, [f.landlordId, f.propertyId, amt, collected, l.ref])
+    }
+    // A card reader's first $87.50, netted from a payout, on a reader with no cost entered (no order
+    // named, even): GAM's cash, and nowhere in the ledger — 10/13: named on its own line.
+    await db.query(
+      `INSERT INTO landlord_gam_charges (landlord_id, property_id, kind, amount, collected_amount, source_type, notes)
+       VALUES ($1, $2, 'device_installment', 87.50, 87.50, 'reader_order_installment', 'Card reader — payment 1 of 4')`,
+      [f.landlordId, f.propertyId])
+    // $100 paid out to GAM's own bank. The balance: + $48 + $87.50 kept from payouts, − $100 out.
+    const stripe: any = fakeStripe(97531 + 4800 + 8750 - 10000)
+    stripe.payouts = { list: async () => ({ data: [{ id: 'po_gam', amount: 10000, currency: 'usd', status: 'paid' }], has_more: false }) }
+    const d = (await balanceWith(f.superAdminToken, stripe)).body.data
+    expect(d.gams_own).toBe(49.20)
+    expect(d.reconciliation.gap).toBe(0)
+    expect(d.reconciliation.bridge).toEqual({
+      earned: 77.49, platform_fees_not_collected: 24, processing_fees_not_collected: 0,
+      reader_bought: 0, reader_billed_not_collected: 0, reader_payments_collected: 0, reader_cost_repaid_collected: 0, reader_markup_collected: 0,
+      paid_out_to_gam_bank: 100,
+      timing: [
+        { key: 'processing', label: expect.any(String), amount: 8.21 },
+        { key: 'reader_payments_not_in_ledger', label: expect.stringMatching(/not in the earnings ledger/), amount: 87.50 },
+      ],
+      gams_own: 49.20, on_balance: 49.20, leftover: 0,
+    })
+    // The bridge starts from the card's own "Earned, all time".
+    expect(d.revenue_all_time).toBe(77.49)
+
+    // A dollar nobody can name is the leftover, the same as the check's difference.
+    const extra = (await balanceWith(f.superAdminToken, { ...stripe, ...fakeStripe(97531 + 4800 + 8750 - 10000 + 125), payouts: stripe.payouts }))
+      .body.data.reconciliation
+    expect(extra.gap).toBe(1.25)
+    expect(extra.bridge.leftover).toBe(1.25)
+  })
+
+  // 10/12 (Nic, Q-g): "COST FIRST — pieces repay GAM's cost first; the markup
+  // lands in the last piece(s)." 10/13 (Nic, full purchase): "Book the $331.73
+  // as an expense the day we buy it, and each $87.50 payment as paying it back
+  // (lowers 'earned all time' until repaid)." The earnings ledger holds the
+  // purchase, the cost repaid and the markup; the bridge adds the purchase back
+  // (GAM paid Stripe's shop, not from the balance) and still ties.
+  async function readerOrder(f: any, pieces: number[]) {
+    const { rows: [o] } = await db.query<{ id: string }>(
+      `INSERT INTO pos_reader_orders (landlord_id, property_id, status, model, price, installments, installment_amount,
+                                      installments_raised, ship_name, ship_line1, ship_city, ship_state, ship_zip, ordered_at, shipped_at)
+       VALUES ($1, $2, 'registered', 'stripe_reader_s710', 350, 4, 87.5, $3, 'Lisa S', '1 Road', 'Amado', 'AZ', '85645',
+               '2026-09-28T21:36:53Z', '2026-09-29T22:04:28Z') RETURNING id`, [f.landlordId, f.propertyId, pieces.length])
+    await db.query(`INSERT INTO pos_reader_order_costs (reader_order_id, base_price, tax_and_shipping_amount, effective_on) VALUES ($1, 299, 32.73, '2026-09-28')`, [o.id])
+    for (const n of pieces) {
+      await db.query(
+        `INSERT INTO landlord_gam_charges (landlord_id, property_id, kind, amount, collected_amount, source_type, reader_order_id, installment_number)
+         VALUES ($1, $2, 'device_installment', 87.50, 87.50, 'reader_order_installment', $3, $4)`, [f.landlordId, f.propertyId, o.id, n])
+    }
+    const { bookReaderBook } = await import('../services/readerOrders')
+    const c = await db.connect()
+    try { await c.query('BEGIN'); const n = await bookReaderBook(c); await c.query('COMMIT'); return n } finally { c.release() }
+  }
+
+  it("10/13 (full purchase): Mountain View today — −$331.73 bought, +$87.50 repaid: 'earned all time' is lower until repaid, and the bridge still leaves $0.00", async () => {
+    const f = await seedMoney()
+    expect(await readerOrder(f, [1])).toBe(2)   // the purchase, and piece 1's cost repaid
+    // The balance: + $87.50 kept from a payout.
+    const d = (await balanceWith(f.superAdminToken, fakeStripe(97531 + 8750))).body.data
+    expect(d.revenue_all_time).toBe(-238.74)   // 5.49 − 331.73 + 87.50
+    expect(d.readers_in_earned).toEqual({ bought: -331.73, cost_repaid: 87.5, markup: 0 })
+    expect(d.reconciliation.gap).toBe(0)
+    expect(d.reconciliation.bridge).toMatchObject({
+      earned: -238.74, reader_bought: 331.73, reader_billed_not_collected: 0,
+      reader_payments_collected: 87.5, reader_cost_repaid_collected: 87.5, reader_markup_collected: 0, leftover: 0,
+    })
+    expect(d.reconciliation.bridge.timing.map((t: any) => t.key)).toEqual(['processing'])
+    // The pies: the purchase and the repayment are their own reader slices, never "Adjustments".
+    const comp = await request(buildApp()).get('/api/admin/income/composition?window=all')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    const src = (k: string) => comp.body.data.sources.find((s: any) => s.key === k)
+    expect(src('card_reader_purchases')).toMatchObject({ label: 'Card Readers Bought', amount: -331.73 })
+    expect(src('card_reader_repaid')).toMatchObject({ label: 'Card Reader Cost Repaid', amount: 87.5 })
+    expect(src('adjustments')).toMatchObject({ amount: 0 })
+    expect(src('other')).toBeUndefined()
+    expect(comp.body.data.gross).toBe(-238.74)
+    const bd = await request(buildApp()).get('/api/admin/income/breakdown?window=all')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    const bought = bd.body.data.sources.find((s: any) => s.key === 'card_reader_purchases')
+    expect(bought).toMatchObject({ count: 1, amount: -331.73 })
+    expect(bought.items[0].label).toMatch(/^Card reader bought — .*: GAM's cost \$331\.73/)
+    expect(bd.body.data.sources.find((s: any) => s.key === 'card_reader_repaid').items[0].label).toMatch(/^Card reader cost repaid — .*, payment 1 of 4/)
+  })
+
+  it('10/12 (Q-g) + 10/13: a reader paid off — the ledger comes to its $18.27 markup, the purchase is added back, $0.00 left over', async () => {
+    const f = await seedMoney()
+    expect(await readerOrder(f, [1, 2, 3, 4])).toBe(6)
+    // The balance: + $350 kept from payouts.
+    const d = (await balanceWith(f.superAdminToken, fakeStripe(97531 + 35000))).body.data
+    expect(d.revenue_all_time).toBe(23.76)
+    expect(d.readers_in_earned).toEqual({ bought: -331.73, cost_repaid: 331.73, markup: 18.27 })
+    expect(d.reconciliation.gap).toBe(0)
+    expect(d.reconciliation.bridge).toMatchObject({
+      earned: 23.76, reader_bought: 331.73, reader_billed_not_collected: 0, reader_payments_collected: 350,
+      reader_cost_repaid_collected: 331.73, reader_markup_collected: 18.27, leftover: 0,
+    })
+    expect(d.reconciliation.bridge.timing.map((t: any) => t.key)).not.toContain('readers')
+    // The earnings pie names each part.
+    const comp = await request(buildApp()).get('/api/admin/income/composition?window=all')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    const src = (k: string) => comp.body.data.sources.find((s: any) => s.key === k)
+    expect(src('card_reader_markup')).toMatchObject({ label: 'Card Reader Markup', amount: 18.27 })
+    expect(src('card_reader_purchases')).toMatchObject({ amount: -331.73 })
+    expect(src('card_reader_repaid')).toMatchObject({ amount: 331.73 })
+  })
+
+  it('10/12 (A3): with Stripe unreachable there is no bridge (it ends at the balance)', async () => {
+    const f = await seedMoney()
+    const res = await balanceWith(f.superAdminToken, { ...fakeStripe(), balance: { retrieve: async () => { throw new Error('Stripe is down') } } })
+    expect(res.body.data.reconciliation).toBeNull()
+    expect(res.body.data.revenue_all_time).toBe(5.49)
   })
 
   it('is for the super admin only', async () => {

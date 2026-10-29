@@ -14,7 +14,7 @@ import { addDaysTo } from '../lib/timezone'
 import { ownerPortfolio } from './ownerPortfolio'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease,
-  seedUserBankAccount, seedPmCompany,
+  seedUserBankAccount, seedPmCompany, seedTenant, seedLeaseTenant,
 } from '../test/dbHelpers'
 
 // S654: the portfolio window ends at CURRENT_DATE (Phoenix), so every "n days
@@ -39,11 +39,17 @@ async function park(client: any, o: { landlordId: string; userId: string },
   return propertyId
 }
 
-/** A unit with an active lease on it. */
+/** The household on each leased unit (10/12: timeliness is judged per household per bill month). */
+const householdOf = new Map<string, { leaseId: string; tenantId: string }>()
+
+/** A unit with an active lease on it, and its resident. */
 async function leasedUnit(client: any, propertyId: string, landlordId: string) {
   const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
-  await seedLease(client, {
+  const leaseId = await seedLease(client, {
     unitId, landlordId, rentAmount: 1000, status: 'active', startDate: daysAgo(200) })
+  const tenantId = await seedTenant(client)
+  await seedLeaseTenant(client, { leaseId, tenantId, role: 'primary' })
+  householdOf.set(unitId, { leaseId, tenantId })
   return unitId
 }
 
@@ -55,11 +61,12 @@ async function rentDue(client: any, unitId: string, landlordId: string, opts: {
   const settled = opts.lateDays == null
     ? null
     : daysAgo(opts.dueDaysAgo - opts.lateDays)
+  const hh = householdOf.get(unitId)
   await client.query(
-    `INSERT INTO payments (unit_id, landlord_id, type, amount, status, due_date,
-       entry_description, settled_at)
-     VALUES ($1,$2,'rent',1000,$4,$3::date,'RENT',$5::date)`,
-    [unitId, landlordId, due, settled ? 'settled' : 'pending', settled])
+    `INSERT INTO payments (unit_id, landlord_id, lease_id, tenant_id, type, amount, status, due_date,
+       entry_description, settled_at, created_at)
+     VALUES ($1,$2,$6,$7,'rent',1000,$4,$3::date,'RENT',($5::date + interval '12 hours'),$3::date)`,
+    [unitId, landlordId, due, settled ? 'settled' : 'pending', settled, hh?.leaseId ?? null, hh?.tenantId ?? null])
 }
 
 describe('one login, the whole book', () => {
@@ -148,7 +155,9 @@ describe('collecting on time', () => {
       expect(g.onTimeRatePct).toBe(100)
       expect(g.avgDaysLate).toBeNull()
       expect(s.onTimeRatePct).toBe(33.33)
-      expect(s.avgDaysLate).toBe(15)       // (10 + 20) / 2
+      // 10/12: days past the grace period (5 days: due day + 4) — paid 10 and
+      // 20 days after the due date is 6 and 16 days past grace.
+      expect(s.avgDaysLate).toBe(11)
       expect(s.rentDueCount).toBe(3)
     } finally { client.release() }
   })

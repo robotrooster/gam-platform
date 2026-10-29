@@ -1,0 +1,48 @@
+{
+ "about": "Built by apps/admin/scripts/build-census-saturation.mjs from American Community Survey five-year bulk table files (U.S. Census Bureau, public data). Do not edit by hand; re-run the script.",
+ "edition": "American Community Survey 2019–2023 five-year estimates (U.S. Census Bureau, public data)",
+ "numbers": [
+  {
+   "what": "total population",
+   "table": "B01003_E001"
+  },
+  {
+   "what": "all housing units",
+   "table": "B25001_E001"
+  },
+  {
+   "what": "renter-occupied homes",
+   "table": "B25003_E003"
+  }
+ ],
+ "levels": {
+  "state": {
+   "areas": 52,
+   "file": "state.json.gz"
+  },
+  "county": {
+   "areas": 3222,
+   "file": "county.json.gz"
+  },
+  "place": {
+   "areas": 32325,
+   "file": "place.json.gz"
+  },
+  "cd": {
+   "areas": 440,
+   "file": "cd.json.gz"
+  },
+  "sldu": {
+   "areas": 1964,
+   "file": "sldu.json.gz"
+  },
+  "sldl": {
+   "areas": 4880,
+   "file": "sldl.json.gz"
+  },
+  "zcta": {
+   "areas": 33772,
+   "file": "zcta.json.gz"
+  }
+ }
+}

@@ -8,6 +8,7 @@ import express from 'express'
 import cron from 'node-cron'
 import { db } from './db'
 import { propertiesDb } from './db/propertiesDb'
+import { ledgerDb } from './db/ledgerPool'
 import path from 'path'
 import fs from 'fs'
 // S86: scheduleOtpCron import removed. The cron's INSERT references the
@@ -62,6 +63,7 @@ import { vehiclesRouter } from './routes/vehicles'
 import { dumpLocationsRouter } from './routes/dumpLocations'
 import { tenantsRouter }      from './routes/tenants'
 import { propertiesRouter, publicPropertiesRouter } from './routes/properties'
+import { propertyTaskListRouter } from './routes/propertyTaskList'
 import { unitsRouter }        from './routes/units'
 import { stayCheckOutRouter }  from './routes/stayCheckOut'
 import { propertyBookingAdminRouter } from './routes/propertyBookingAdmin'
@@ -70,6 +72,7 @@ import { leasesRouter }       from './routes/leases'
 import { paidAheadChoiceRouter } from './routes/paidAheadChoice'
 import { homeSaleRouter }     from './routes/homeSale'
 import { homeOwnershipRouter } from './routes/homeOwnership'
+import { spaceCarryforwardRouter } from './routes/spaceCarryforward'
 import { lotRentRouter }      from './routes/lotRent'
 import { expensesRouter }     from './routes/expenses'
 import { financialsRouter }   from './routes/financials'
@@ -104,6 +107,7 @@ import { maintenancePortalRouter } from './routes/maintenance-portal'
 import { esignRouter }        from './routes/esign'
 import { signingPackagesRouter } from './routes/signingPackages'
 import { backgroundRouter }   from './routes/background'
+import { uiLayoutRouter }     from './routes/uiLayout'
 // S651: the renter's own view of the pool — places near THEM, no company involved.
 import { renterPoolRouter }   from './routes/renterPool'
 import { emergencyContactsRouter } from './routes/emergencyContacts'
@@ -113,10 +117,15 @@ import { tenantCreditsRouter }  from './routes/tenantCredits'
 import { propertyTaxRouter } from './routes/propertyTax'
 import { realEstateLawRouter } from './routes/realEstateLaw'
 import { booksRouter } from './routes/books'
+// 10/12 (Nic): the company's books settings and opening balances (landlord's choice each).
+import { booksSettingsRouter } from './routes/booksSettings'
+// 10/12 (Nic, ledger P9): close a month, reconcile a bank account on the ledger.
+import { booksCloseRouter, booksReconcileRouter } from './routes/booksClose'
 import { scopesRouter, invitationsRouter } from './routes/scopes'
 import { pmRouter } from './routes/pm'
 import { creditRouter }       from './routes/credit'
 import { bookingsRouter }     from './routes/bookings'
+import { duplicatePeopleRouter } from './routes/duplicatePeople'
 import { inspectionsRouter }  from './routes/inspections'
 import { commonAreasRouter }  from './routes/commonAreas'
 import { serviceInterruptionsRouter } from './routes/serviceInterruptions'
@@ -125,6 +134,8 @@ import { entryRequestsRouter } from './routes/entryRequests'
 import { notificationsRouter } from './routes/notifications'
 import { bankAccountsRouter } from './routes/bankAccounts'
 import { adminBankAccountsRouter } from './routes/admin/bankAccounts'
+// 10/12 (Nic): GAM Books ledger, the admin's read-only view (the ledger is dark).
+import { adminLedgerRouter } from './routes/admin/ledger'
 import { financesRouter }      from './routes/finances'
 import { fitnessRouter }      from './routes/fitness'
 import { schedulerInit }      from './jobs/scheduler'
@@ -396,6 +407,10 @@ app.use('/api/dump-locations', dumpLocationsRouter)
 app.use('/api/tenants',       tenantsRouter)
 app.use('/api/properties',    propertiesRouter)
 app.use('/api/public/properties', publicPropertiesRouter)
+// 10/20 (Blu, via Nic): the park's own checklist. Its own mount, not a branch of
+// /api/properties, because "sitting outside of it" is the request and a thing
+// mounted inside maintenance or property config drifts back into one.
+app.use('/api/property-task-list', propertyTaskListRouter)
 // 10/4 (decisions #38): checking a guest out and settling the money.
 app.use('/api/units',         stayCheckOutRouter)
 app.use('/api/units',         unitsRouter)
@@ -406,6 +421,9 @@ app.use('/api/leases',        paidAheadChoiceRouter)
 app.use('/api/leases',        leasesRouter)
 app.use('/api/home-sales',    homeSaleRouter)
 app.use('/api/home-ownerships', homeOwnershipRouter)
+// 10/19 (Nic): what a SPACE carries, for the moment there is no lease yet to
+// ask it by — the invite screen with a unit picked.
+app.use('/api/space-carryforward', spaceCarryforwardRouter)
 app.use('/api/lot-rent',      lotRentRouter)
 app.use('/api/expenses',      expensesRouter)
 // 10/11: the shared financial pages (landlord portal + GAM Books), owner and bookkeeper.
@@ -460,21 +478,30 @@ app.use('/api/tenant-credits', tenantCreditsRouter)
 app.use('/api/property-tax',   propertyTaxRouter)
 app.use('/api/real-estate-law', realEstateLawRouter)
   app.use('/api/background',    backgroundRouter)
+  app.use('/api/ui-layout',     uiLayoutRouter)
   // S640: the front desk's emergency contact list.
   app.use('/api/emergency-contacts', emergencyContactsRouter)
 app.use('/api/fitness',        fitnessRouter)
 app.use('/api/notifications',  notificationsRouter)
 app.use('/api/bank-accounts',  bankAccountsRouter)
+app.use('/api/admin',          adminLedgerRouter)
 app.use('/api/admin',          adminBankAccountsRouter)
 app.use('/api/users',          financesRouter)
+app.use('/api/books/setup',    booksSettingsRouter)   // ahead of the Books router: it answers /setup itself
+app.use('/api/books/close',    booksCloseRouter)      // ahead of the Books router: 10/12 (Nic, P9) close a month
+app.use('/api/books/reconcile', booksReconcileRouter) // ahead of the Books router: 10/12 (Nic, P9) reconcile on the ledger
 app.use('/api/books',          booksRouter)
 app.use('/api/renter-pool',    renterPoolRouter)
 app.use('/api/scopes',         scopesRouter)
-app.use('/api/invitations',    invitationsRouter)
+// 10/13 (Nic): accepting a team invitation now signs a new account straight
+// in (routes/scopes.ts), so it is held to the sign-in limit, as admin-invite is.
+app.use('/api/invitations',    authLimiter, invitationsRouter)
 app.use('/api/pm',             pmRouter)
 app.use('/api/pm/:pmCompanyId/agent-activity', pmAgentActivityRouter)
 app.use('/api/credit',         creditRouter)
 app.use('/api/bookings',       bookingsRouter)
+// 10/20 (Nic): "this looks like the same person" — proposals a landlord answers.
+app.use('/api/duplicate-people', duplicatePeopleRouter)
 app.use('/api/inspections',    inspectionsRouter)
 app.use('/api/common-areas',   commonAreasRouter)
 app.use('/api/service-interruptions', serviceInterruptionsRouter)
@@ -544,6 +571,7 @@ async function shutdown(signal: string) {
     try {
       await db.end()
       await propertiesDb.end()
+      await ledgerDb.end()
     } catch (e) {
       logger.error({ err: e }, 'pool close failed during shutdown')
     }

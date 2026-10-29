@@ -34,8 +34,26 @@ import '../styles/credit-desk.css'
  *
  * S634 (Nic): every name opens what makes up the balance. S654 (Nic): one
  * folder per property, closed until opened; alphabetical inside.
+ *
+ * 10/13 (Nic): "REMOVE the Outstanding Balances tab." It is no longer a menu
+ * entry and its address opens Payments (main.tsx). For the owner, property
+ * managers and staff with "View all payments", Payments — the rent roll for
+ * the open month — is where who owes and Record payment are now. Front-desk
+ * staff who take payments but may not see payment histories (S641: "I don't
+ * want her to see ... the payment histories from people") keep this list and
+ * its Record payment, under the Payments tab (PaymentsPage renders it for
+ * them, `title` "Payments").
+ *
+ * 10/14 (Nic): no longer rendered anywhere. The front desk sees the Payments
+ * page itself ("kind of the same way that I see it, but not with that top
+ * view" — PaymentsPage). Nothing imports this page; it and its test are left
+ * for removal.
  */
-export function BalancesPage() {
+export function BalancesPage({ title = 'Outstanding Balances', subtitle }: {
+  /** The page's heading (the Payments tab names it "Payments"). */
+  title?: string
+  subtitle?: string
+} = {}) {
   const qc = useQueryClient()
   const { can } = usePerms()
   const canTake = can('take_payment')
@@ -84,8 +102,8 @@ export function BalancesPage() {
     <div>
       <div className="page-header">
         <div>
-          <h1 className="page-title">Outstanding Balances</h1>
-          <p className="page-subtitle">Who owes, every unpaid month, and where you take a payment — open a property, then a name for the charges</p>
+          <h1 className="page-title">{title}</h1>
+          <p className="page-subtitle">{subtitle ?? 'Who owes, every unpaid month, and where you take a payment — open a property, then a name for the charges'}</p>
         </div>
         <div className="cd-page-actions">
           {totals && (

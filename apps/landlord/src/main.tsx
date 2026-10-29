@@ -13,7 +13,7 @@ import '@fontsource/inter/700.css'
 import '@fontsource/jetbrains-mono/400.css'
 import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
-import { installDatePickerAutoClose, startVersionWatch, unlockScrollIfStandalone } from '@gam/shared'
+import { installDatePickerAutoClose, startVersionWatch, unlockScrollIfStandalone, installPrintLightTheme } from '@gam/shared'
 import { AccountLockScreen } from './components/AccountLockScreen'
 import React, { useEffect, useState } from 'react'
 import { apiPost } from './lib/api'
@@ -59,7 +59,7 @@ function VersionWatch() {
 
 import { QueryClient, QueryClientProvider } from 'react-query'
 import { AuthProvider, useAuth } from './context/AuthContext'
-import { Layout, LAUNCH_HIDDEN, visibleNavItemsFor, HubTabLayout } from './components/layout/Layout'
+import { Layout, LAUNCH_HIDDEN, staffLandingPath, HubTabLayout } from './components/layout/Layout'
 import { LoginPage }       from './pages/LoginPage'
 import { RegisterPage }    from './pages/RegisterPage'
 import { ForgotPasswordPage } from './pages/ForgotPasswordPage'
@@ -76,9 +76,11 @@ import { UnitsPage }       from './pages/UnitsPage'
 import { UnitDetailPage }  from './pages/UnitDetailPage'
 import { TenantsPage }     from './pages/TenantsPage'
 import { TenantDetailPage } from './pages/TenantDetailPage'
+import { TenantPaymentReportPage } from './pages/TenantPaymentReportPage'
+import { BillPrintPage } from './pages/BillPrintPage'
+import DuplicatePeoplePage from './pages/DuplicatePeoplePage'
 import { PendingTenantsPage } from './pages/PendingTenantsPage'
 import { PaymentsPage }    from './pages/PaymentsPage'
-import { BalancesPage }    from './pages/BalancesPage'
 import { RentRollPage }    from './pages/RentRollPage'
 import { UtilityMetersPage } from './pages/UtilityMetersPage'
 import { DisbursementsPage } from './pages/DisbursementsPage'
@@ -88,11 +90,15 @@ import { LotRentPage } from './pages/LotRentPage'
 import { ExpensesPage } from './financials/ExpensesPage'
 import { IncomePage } from './financials/IncomePage'
 import { MaintenanceCostsPage } from './financials/MaintenanceCostsPage'
+// 10/17 (Nic): what was sold item by item, and each tax collected per agency.
+import { SalesTaxPage } from './financials/SalesTaxPage'
 import { BankActivityPage } from './financials/BankActivityPage'
 import { PayoutsPage } from './financials/PayoutsPage'
 import { MyManagersPage } from './pages/MyManagersPage'
 import { BankPage } from './pages/BankPage'
-import { BankingPage }      from './pages/BankingPage'
+// 10/19 (Nic): the Disbursement Account page is gone — its Stripe Connect step
+// is step 1 of Bank setup on /bank, and its address redirects there.
+import { BankSetupRedirect } from './pages/BankSetup'
 import { MaintenancePage } from './pages/MaintenancePage'
 import { DocumentsPage }   from './pages/DocumentsPage'
 import { TenantPhotosPage } from './pages/TenantPhotosPage'
@@ -136,6 +142,41 @@ import { PaidAheadChoicePage } from './pages/PaidAheadChoicePage'
 import { FlexChargePage } from './pages/FlexChargePage'
 import './styles/globals.css'
 import { FrontDeskPage } from './pages/FrontDeskPage'
+// 10/12 (Nic): "Bookkeeping" — GAM Books' own pages inside the portal, the
+// same files as GAM Books (src/bookkeeping, bookkeeping-parity.test.ts).
+import { BooksDashboardPage } from './bookkeeping/BooksDashboardPage'
+import { ChartOfAccountsPage } from './bookkeeping/ChartOfAccountsPage'
+import { EmployeesPage } from './bookkeeping/EmployeesPage'
+import { ContractorsPage } from './bookkeeping/ContractorsPage'
+import { VendorsPage } from './bookkeeping/VendorsPage'
+// 10/12 (Nic): loans and fixed assets (GAM Books' pages, the same bytes in apps/books).
+import { LoansPage } from './bookkeeping/LoansPage'
+import { FixedAssetsPage } from './bookkeeping/FixedAssetsPage'
+import { RunPayrollPage } from './bookkeeping/RunPayrollPage'
+import { PayHistoryPage } from './bookkeeping/PayHistoryPage'
+import { TaxFormsPage } from './bookkeeping/TaxFormsPage'
+import { JournalEntriesPage } from './bookkeeping/JournalEntriesPage'
+import { TransactionsPage } from './bookkeeping/TransactionsPage'
+import { BankReconcilePage } from './bookkeeping/BankReconcilePage'
+// 10/12 (Nic, ledger P9): close a month — GAM Books' page, in the Bookkeeping menu.
+import { CloseMonthPage } from './bookkeeping/CloseMonthPage'
+import { BillsPage } from './bookkeeping/BillsPage'
+import { CashFlowPage } from './bookkeeping/CashFlowPage'
+import { OwnerStatementsPage } from './bookkeeping/OwnerStatementsPage'
+import { TaxCenterPage } from './bookkeeping/TaxCenterPage'
+import { ProfitLossPage } from './bookkeeping/ProfitLossPage'
+import { BalanceSheetPage } from './bookkeeping/BalanceSheetPage'
+// 10/12 (Nic, ledger P8): the trial balance and the general ledger.
+import { TrialBalancePage } from './bookkeeping/TrialBalancePage'
+import { GeneralLedgerPage } from './bookkeeping/GeneralLedgerPage'
+import { BooksSettingsPage } from './bookkeeping/BooksSettingsPage'
+import { OpeningBalancesPage } from './bookkeeping/OpeningBalancesPage'
+// 10/12 (Nic, L5): the company's own categories for money out and in.
+import { CategoriesPage } from './bookkeeping/CategoriesPage'
+import ManagementPage from './pages/ManagementPage'
+import { BOOKS_PATHS } from './bookkeeping/adapter'
+// Which company's books, a cache of their own, and Books' look.
+import { BookkeepingHost } from './bookkeepingHost'
 
 class ErrorBoundary extends React.Component<{children: React.ReactNode}, {error: Error | null}> {
   constructor(props: any) { super(props); this.state = { error: null } }
@@ -166,10 +207,10 @@ function RoleRedirect() {
   // same visibility rule as the sidebar (was: hardcoded /pos, which dumped a
   // front-desk user with no POS access on an empty register). Zero grants →
   // /welcome explains what's missing.
-  // 10/11: a bookkeeper lands on the financial pages (Money in first).
+  // 10/11: a bookkeeper lands on the financial pages (Money in first —
+  // staffLandingPath keeps it so with Payments and the Rent Roll above it).
   if (user.role === 'onsite_manager' || user.role === 'maintenance' || user.role === 'property_manager' || user.role === 'bookkeeper') {
-    const first = visibleNavItemsFor(user)[0]
-    return <Navigate to={first ? first.to : '/welcome'} replace />
+    return <Navigate to={staffLandingPath(user)} replace />
   }
   if (user.onboardingComplete === false) return <Navigate to="/onboarding" replace />
   return <Navigate to="/dashboard" replace />
@@ -279,10 +320,23 @@ function App() {
               <Route path="property-onboarding" element={<PropertyOnboardingPage />} />
               <Route path="payment-history-onboarding" element={<PaymentHistoryOnboardingPage />} />
               <Route path="pm-invitations"  element={LAUNCH_HIDDEN.has('/pm-invitations') ? <Navigate to="/dashboard" replace /> : <PmInvitationsPage />} />
+              {/* 10/23: the management company's own side of the business, now
+                  that the PM portal folded in here (PM_FOLD_PLAN.md). */}
+              <Route path="management"      element={<ManagementPage />} />
               <Route path="units"          element={<UnitsPage />} />
               <Route path="units/:id"      element={<UnitDetailPage />} />
               <Route path="tenants"        element={<TenantsPage />} />
               <Route path="tenants/:id"      element={<TenantDetailPage />} />
+              {/* 10/12 (Nic): the household's payment report, printable — opened
+                  from a name on the Rent Roll or from the tenant profile. */}
+              <Route path="tenants/:id/report" element={<TenantPaymentReportPage />} />
+              {/* 10/27 (Nic): the paper bill — one sheet per household, printed
+                  for a door. ?propertyId= for every outstanding bill there,
+                  &tenantId= for one. */}
+              <Route path="bills/print" element={<BillPrintPage />} />
+              {/* 10/20 (Nic): "this looks like the same person" — the pairs GAM
+                  noticed, for a person to answer. */}
+              <Route path="duplicate-people" element={<DuplicatePeoplePage />} />
               <Route path="tenant-onboarding" element={<TenantOnboardingPage />} />
               {/* S639: the front counter's call list — same people as the
                   pending pool, shaped as "who do I ring and what do I say". */}
@@ -304,23 +358,69 @@ function App() {
                   route only wraps them in the shared sub-tab bar (HubTabLayout). */}
               <Route element={<HubTabLayout hub="financials" />}>
                 <Route path="payments"       element={<PaymentsPage />} />
-                <Route path="balances"       element={<BalancesPage />} />
+                {/* 10/13 (Nic): "REMOVE the Outstanding Balances tab." Its
+                    address (old links, bookmarks, Reports' Outstanding card)
+                    opens Payments, where who owes and Record payment are now. */}
+                <Route path="balances"       element={<Navigate to="/payments" replace />} />
                 <Route path="rent-roll"      element={<RentRollPage />} />
                 <Route path="disbursements"  element={<DisbursementsPage />} />
                 <Route path="income"         element={<IncomePage />} />
                 <Route path="reports"        element={<ReportsPage />} />
                 <Route path="expenses"       element={<ExpensesPage />} />
                 <Route path="maintenance-costs" element={<MaintenanceCostsPage />} />
+                <Route path="sales-tax"      element={<SalesTaxPage />} />
                 <Route path="bank-activity"  element={<BankActivityPage />} />
                 <Route path="payouts"        element={<PayoutsPage />} />
                 <Route path="my-managers"    element={<MyManagersPage />} />
                 {/* S605: one Bank tab. The old paths redirect so existing
-                    links and bookmarks don't 404. */}
+                    links and bookmarks don't 404.
+                    10/19 (Nic): and /banking — the old Disbursement Account
+                    address — opens the Bank setup tab, carrying its ?entity=
+                    through so a to-do still lands on the company it names.
+                    Blu has that address bookmarked; it keeps working.
+                    10/19 (review): each old address names the tab it meant. Sent
+                    to a bare /bank they got the Bank setup tab instead, because
+                    the page opens there when setup is unfinished and nothing in
+                    a bare address says otherwise. */}
                 <Route path="bank"           element={<BankPage />} />
-                <Route path="bank-feed"      element={<Navigate to="/bank" replace />} />
-                <Route path="bank-reconciliation" element={<Navigate to="/bank" replace />} />
-                <Route path="banking"        element={<BankingPage />} />
+                <Route path="bank-feed"      element={<Navigate to="/bank?tab=feed" replace />} />
+                <Route path="bank-reconciliation" element={<Navigate to="/bank?tab=reconcile" replace />} />
+                <Route path="banking"        element={<BankSetupRedirect />} />
                 <Route path="lot-rent"       element={<LotRentPage />} />
+              </Route>
+              {/* 10/12 (Nic): Bookkeeping — GAM Books' pages inside the portal,
+                  as sub-tabs like Financials (Layout.tsx). The host names the
+                  company whose books are open (bookkeepingHost.tsx). */}
+              <Route path="bookkeeping" element={<Navigate to={BOOKS_PATHS.dashboard} replace />} />
+              <Route element={<HubTabLayout hub="bookkeeping" />}>
+                <Route element={<BookkeepingHost />}>
+                  <Route path={BOOKS_PATHS.dashboard}       element={<BooksDashboardPage />} />
+                  <Route path={BOOKS_PATHS.employees}       element={<EmployeesPage />} />
+                  <Route path={BOOKS_PATHS.contractors}     element={<ContractorsPage />} />
+                  <Route path={BOOKS_PATHS.vendors}         element={<VendorsPage />} />
+                  <Route path={BOOKS_PATHS.loans}           element={<LoansPage />} />
+                  <Route path={BOOKS_PATHS.fixedAssets}     element={<FixedAssetsPage />} />
+                  <Route path={BOOKS_PATHS.runPayroll}      element={<RunPayrollPage />} />
+                  <Route path={BOOKS_PATHS.payHistory}      element={<PayHistoryPage />} />
+                  <Route path={BOOKS_PATHS.taxForms}        element={<TaxFormsPage />} />
+                  <Route path={BOOKS_PATHS.accounts}        element={<ChartOfAccountsPage />} />
+                  <Route path={BOOKS_PATHS.journal}         element={<JournalEntriesPage />} />
+                  <Route path={BOOKS_PATHS.transactions}    element={<TransactionsPage />} />
+                  <Route path={BOOKS_PATHS.reconcile}       element={<BankReconcilePage />} />
+                  <Route path={BOOKS_PATHS.closeMonth}      element={<CloseMonthPage />} />
+                  <Route path={BOOKS_PATHS.bills}           element={<BillsPage />} />
+                  <Route path={BOOKS_PATHS.profitLoss}      element={<ProfitLossPage />} />
+                  <Route path={BOOKS_PATHS.balanceSheet}    element={<BalanceSheetPage />} />
+                  <Route path={BOOKS_PATHS.trialBalance}    element={<TrialBalancePage />} />
+                  <Route path={BOOKS_PATHS.generalLedger}   element={<GeneralLedgerPage />} />
+                  <Route path={BOOKS_PATHS.cashFlow}        element={<CashFlowPage />} />
+                  <Route path={BOOKS_PATHS.ownerStatements} element={<OwnerStatementsPage />} />
+                  <Route path={BOOKS_PATHS.taxCenter}       element={<TaxCenterPage />} />
+                  {/* 10/12 (Nic): Books Settings and Opening Balances, in the Bookkeeping menu (Layout.tsx). */}
+                  <Route path={BOOKS_PATHS.booksSettings}   element={<BooksSettingsPage />} />
+                  <Route path={BOOKS_PATHS.openingBalances} element={<OpeningBalancesPage />} />
+                  <Route path={BOOKS_PATHS.categories}      element={<CategoriesPage />} />
+                </Route>
               </Route>
               {/* S575: Screening hub — Applicant Pool / Background Checks / Rental History. */}
               <Route element={<HubTabLayout hub="screening" />}>
@@ -371,6 +471,11 @@ function App() {
 }
 
 installDatePickerAutoClose()
+
+// 10/26 (Nic): a printed page is always the light theme, whatever the screen
+// is set to — he printed an eviction balance summary in dark mode and got a
+// solid black sheet. Installed once here; restores the viewer's theme after.
+installPrintLightTheme()
 
 // HMR guard: when Vite re-executes this entry module, calling createRoot on
 // the same container again STACKS a second mounted app under the first

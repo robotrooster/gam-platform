@@ -12,7 +12,7 @@ import { SentryErrorBoundary } from './lib/sentry'
 import React, { useState, useEffect, useCallback } from 'react'
 import ReactDOM from 'react-dom/client'
 import axios from 'axios'
-import { applyCamelizeInterceptor } from '@gam/shared'
+import { applyCamelizeInterceptor, installPrintLightTheme } from '@gam/shared'
 import { loadStripe } from '@stripe/stripe-js'
 import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js'
 
@@ -666,6 +666,11 @@ function App() {
     </>
   )
 }
+
+// 10/26 (Nic): a printed page is always the light theme, whatever the screen
+// is set to — he printed an eviction balance summary in dark mode and got a
+// solid black sheet. Installed once here; restores the viewer's theme after.
+installPrintLightTheme()
 
 const rootEl = document.getElementById('root')!
 const appRoot: ReturnType<typeof ReactDOM.createRoot> =

@@ -164,21 +164,116 @@ async function financedHome(s: { unitId: string; tenantId: string; landlordId: s
   return c.id
 }
 
-describe('S654 the home payment rides the rent invoice', () => {
-  it('this month\'s installment is a line on the invoice, counted in the total', async () => {
+/**
+ * 10/25 (Nic): THE HOME PAYMENT DOES NOT RIDE THE RENT INVOICE.
+ *
+ *   "Should trailer payments get their own invoice separately payable from lot
+ *    rent? Yeah, let's do that."
+ *
+ * S654 put the installment on the rent bill so every surface could see it. The
+ * cost was that it could not be paid on its own — and Lisa Scheeler, on work
+ * trade, gets no rent bill at all for it to ride. It is its own bill now.
+ */
+/**
+ * 10/25 (Nic): "Leave current properties set up as is. Let landlords choose how
+ * it gets bundled." A property can put the installment back on the rent bill.
+ */
+describe('a property that bundles the trailer payment onto the rent bill', () => {
+  const bundle = (unitId: string) => db.query(
+    `UPDATE properties SET home_payments_own_bill = FALSE
+      WHERE id = (SELECT property_id FROM units WHERE id = $1)`, [unitId])
+
+  it('rides the rent bill for the month that has one', async () => {
+    const s = await stack({ withTrade: false })
+    const contractId = await financedHome(s)
+    await bundle(s.unitId)
+    await generateInvoices(RUN_AT)
+
+    // The generator attaches it once the bill is committed.
+    const inv = await invoiceFor(s.leaseId)
+    expect(inv.subtotal_home_payments).toBe(200)
+    expect(inv.total).toBe(660)                  // $460 rent + $200 home payment
+    const home = (await rowsOf(inv.id)).find((r: any) => r.type === 'home_payment')
+    expect(home).toMatchObject({ amount: 200, status: 'pending', notes: 'Home payment 1 of 60' })
+
+    // The daily run adds nothing on top of that bill.
+    expect(await billDueHomeSaleInstallments(DUE)).toBe(0)
+    expect((await invoiceFor(s.leaseId)).total).toBe(660)
+
+    // The SECOND installment's month is long past and never had a rent bill of
+    // its own, so it is billed on its own bill rather than left unbilled —
+    // bundling is a preference, never a reason a payment goes uncharged.
+    const own = await db.query<any>(
+      `SELECT i.due_date::text AS due_date, i.total_amount::float AS total, p.notes
+         FROM invoices i JOIN payments p ON p.invoice_id = i.id
+        WHERE i.home_sale_contract_id = $1 ORDER BY i.due_date`, [contractId])
+    expect(own.rows).toEqual([
+      { due_date: '2026-04-01', total: 200, notes: 'Home payment 2 of 60' },
+    ])
+  })
+
+  it('waits for the rent bill rather than beating it to its own bill', async () => {
+    // The daily run is at 04:20 and the bills are written at 07:00 local, so a
+    // fallback here would take a bill of its own every month and the setting
+    // would never hold.
+    const s = await stack({ withTrade: false })
+    const contractId = await financedHome(s)
+    await bundle(s.unitId)
+
+    expect(await billDueHomeSaleInstallments(DUE)).toBe(0)
+    expect((await db.query(`SELECT 1 FROM payments WHERE type='home_payment'`)).rows).toHaveLength(0)
+    expect((await db.query(`SELECT 1 FROM invoices WHERE home_sale_contract_id=$1`, [contractId])).rows).toHaveLength(0)
+
+    // The bill arrives; now it has somewhere to go.
+    await generateInvoices(RUN_AT)
+    expect((await invoiceFor(s.leaseId)).total).toBe(660)
+  })
+
+  it('still gets its own bill when the month passed with no rent bill to ride', async () => {
+    // A work-trade month, a lease that ended — nothing to bundle into. The
+    // installment is billed anyway rather than left unbilled for good.
+    const s = await stack({ withTrade: false })
+    const contractId = await financedHome(s)
+    await bundle(s.unitId)
+    // Asked for from the following month: the month is over, so the fallback applies.
+    const nextMonth = (await db.query<{ m: string }>(
+      `SELECT ($1::date + INTERVAL '1 month')::date::text AS m`, [DUE])).rows[0].m
+    expect(await billDueHomeSaleInstallments(nextMonth)).toBeGreaterThanOrEqual(1)
+    const own = await db.query<any>(
+      `SELECT i.due_date::text AS due_date, i.total_amount::float AS total
+         FROM invoices i WHERE i.home_sale_contract_id = $1 ORDER BY i.due_date`, [contractId])
+    expect(own.rows[0]).toMatchObject({ due_date: DUE, total: 200 })
+  })
+})
+
+describe('the home payment is its own bill, never the rent invoice', () => {
+  /** The contract's own bill(s) and their lines. */
+  const ownBills = (contractId: string) => db.query<any>(
+    `SELECT i.due_date::text AS due_date, i.total_amount::float AS total,
+            i.subtotal_home_payments::float AS home, i.lease_id, i.late_fee_exempt,
+            p.amount::float AS amount, p.status, p.notes
+       FROM invoices i
+       JOIN payments p ON p.invoice_id = i.id
+      WHERE i.home_sale_contract_id = $1
+      ORDER BY i.due_date`, [contractId]).then(r => r.rows)
+
+  it('is on no rent invoice, and in none of its totals', async () => {
     const s = await stack({ withTrade: false })
     const contractId = await financedHome(s)
     await generateInvoices(RUN_AT)
 
     const inv = await invoiceFor(s.leaseId)
-    expect(inv.subtotal_home_payments).toBe(200)
-    expect(inv.total).toBe(660)                  // $460 rent + $200 home payment
-
+    expect(inv.subtotal_home_payments).toBe(0)
+    expect(inv.total).toBe(460)                  // the rent alone
     const rows = await rowsOf(inv.id)
-    const home = rows.find((r: any) => r.type === 'home_payment')
-    expect(home.amount).toBe(200)
-    expect(home.status).toBe('pending')
-    expect(home.notes).toBe('Home payment 1 of 60')
+    expect(rows.some((r: any) => r.type === 'home_payment')).toBe(false)
+
+    // The 4:20 job is what bills it, onto the contract's own bill.
+    expect(await billDueHomeSaleInstallments(DUE)).toBe(1)
+    expect(await ownBills(contractId)).toEqual([
+      { due_date: DUE, total: 200, home: 200, lease_id: null, late_fee_exempt: true,
+        amount: 200, status: 'pending', notes: 'Home payment 1 of 60' },
+    ])
 
     // Installment 1 is stamped with its payment; installment 2 waits its turn.
     const { rows: inst } = await db.query<any>(
@@ -189,17 +284,14 @@ describe('S654 the home payment rides the rent invoice', () => {
       `SELECT installments_billed FROM home_sale_contracts WHERE id=$1`, [contractId])
     expect(contract.installments_billed).toBe(1)
 
-    // The 4:20 job has nothing left to bill for this buyer — and would not
-    // have billed it standalone even if it had run first.
+    // Run again: billed once, one bill, no second line.
     expect(await billDueHomeSaleInstallments(DUE)).toBe(0)
-    const { rows: standalone } = await db.query(
-      `SELECT 1 FROM payments WHERE type='home_payment' AND invoice_id IS NULL AND tenant_id=$1`, [s.tenantId])
-    expect(standalone).toHaveLength(0)
+    expect(await ownBills(contractId)).toHaveLength(1)
   })
 
-  it('the 4:20 job leaves a leased buyer to the invoice, and still bills a buyer with no lease', async () => {
+  it('bills a leased buyer and a buyer with no lease exactly the same way', async () => {
     const leased = await stack({ withTrade: false })
-    await financedHome(leased)
+    const leasedContract = await financedHome(leased)
 
     // A buyer with no lease on the space: the investor's case.
     const c = await db.connect()
@@ -213,29 +305,47 @@ describe('S654 the home payment rides the rent invoice', () => {
       await c.query('COMMIT')
       noLease = { unitId, tenantId, landlordId: ll.landlordId }
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
-    await financedHome(noLease!)
+    const noLeaseContract = await financedHome(noLease!)
 
-    expect(await billDueHomeSaleInstallments(DUE)).toBe(1)
+    // 10/25: BOTH. This used to bill only the buyer with no lease, leaving the
+    // leased one to the rent bill — and a buyer who was on the lease but not
+    // its primary was skipped by both sides and never billed at all.
+    expect(await billDueHomeSaleInstallments(DUE)).toBe(2)
     const { rows } = await db.query<any>(
-      `SELECT tenant_id, invoice_id FROM payments WHERE type='home_payment'`)
-    expect(rows).toHaveLength(1)
-    expect(rows[0].tenant_id).toBe(noLease!.tenantId)
-    expect(rows[0].invoice_id).toBeNull()
+      `SELECT p.tenant_id, i.home_sale_contract_id IS NOT NULL AS own_bill
+         FROM payments p JOIN invoices i ON i.id = p.invoice_id
+        WHERE p.type='home_payment' ORDER BY p.tenant_id`)
+    expect(rows).toHaveLength(2)
+    expect(rows.every((r: any) => r.own_bill)).toBe(true)
+    expect(rows.map((r: any) => r.tenant_id).sort())
+      .toEqual([leased.tenantId, noLease!.tenantId].sort())
 
-    // ...and the leased buyer's installment arrives on the invoice as before.
+    // ...and the rent invoice carries the rent alone.
     await generateInvoices(RUN_AT)
     const inv = await invoiceFor(leased.leaseId)
-    expect(inv.total).toBe(660)
+    expect(inv.total).toBe(460)
+    expect(await ownBills(leasedContract)).toHaveLength(1)
+    expect(await ownBills(noLeaseContract)).toHaveLength(1)
   })
 
   it('a work-trade resident buying their home still owes the home payment', async () => {
-    const s = await stack({ waterBill: 40 })   // trade covers everything it can
-    await financedHome(s)
+    // Lisa Scheeler's case. The trade covers what it can of living there; the
+    // home is not a cost of living there, and hours worked do not buy a
+    // trailer — so the home payment is owed in full, on a bill of its own.
+    const s = await stack({ waterBill: 40 })
+    const contractId = await financedHome(s)
     await generateInvoices(RUN_AT)
     const inv = await invoiceFor(s.leaseId)
-    expect(inv.total).toBe(200)                  // rent + water suspended; the home is not a cost of living there
-    const rows = await rowsOf(inv.id)
-    const home = rows.find((r: any) => r.type === 'home_payment')
-    expect(home.suspended).toBe(false)
+    expect(inv.total).toBe(0)                    // rent + water suspended, nothing else on it
+    expect(await rowsOf(inv.id).then(r => r.some((x: any) => x.type === 'home_payment'))).toBe(false)
+
+    expect(await billDueHomeSaleInstallments(DUE)).toBe(1)
+    const own = await ownBills(contractId)
+    expect(own).toHaveLength(1)
+    expect(own[0]).toMatchObject({ total: 200, amount: 200, status: 'pending' })
+    // The trade never reaches it: not suspended, owed at face value.
+    const { rows: [line] } = await db.query<any>(
+      `SELECT work_trade_suspended_at FROM payments WHERE type='home_payment'`)
+    expect(line.work_trade_suspended_at).toBeNull()
   })
 })

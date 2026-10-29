@@ -96,6 +96,7 @@ function app() {
   return a
 }
 
+// 10/12: the work-trade extra-hours columns/table, until they reach schema.sql.
 beforeEach(async () => {
   await cleanupAllSchema()
   for (const m of Object.values(h)) m.mockClear()
@@ -185,10 +186,9 @@ const tradeOf = async (bookingId: string) => (await db.query(
   `SELECT id, status, unit_id, tenant_id, booking_id, to_char(start_date, 'YYYY-MM-DD') AS start_date,
           to_char(end_date, 'YYYY-MM-DD') AS end_date, covered_charges, trusted, tracks_hours, monthly_hours_target
      FROM work_trade_agreements WHERE booking_id = $1`, [bookingId])).rows[0]
-const feeFor = async (state: string | null) => {
-  const i = await screeningIntakeFee(state)
-  return Math.round((i.screening + i.gamFee + i.tax) * 100) / 100
-}
+// 10/21 (Nic): one price for a background check — the whole intake price, its
+// card processing already inside it, whoever pays and however it is collected.
+const feeFor = async (state: string | null) => (await screeningIntakeFee(state)).total
 const day = async (offset: number): Promise<string> =>
   (await db.query<{ d: string }>(`SELECT (CURRENT_DATE + $1::int)::text AS d`, [offset])).rows[0].d
 
@@ -693,7 +693,11 @@ describe('review fixes', () => {
     const made = await create(f, { guestEmail: g.email, checkIn: '2027-03-01', checkOut: '2027-03-08', workTrade: {} })
     const id = made.body.data.id
     const tradeId = (await tradeOf(id)).id
-    const paused = await request(app()).patch(`/api/work-trade/${tradeId}`).set(auth(f.token)).send({ status: 'paused' })
+    // 10/19: pausing says whether the space is still being used — the camper is
+    // on the site here, so hours keep counting. Setup only; what this test is
+    // about is that the pause survives a change to the stay.
+    const paused = await request(app()).patch(`/api/work-trade/${tradeId}`).set(auth(f.token))
+      .send({ status: 'paused', spaceOccupiedWhilePaused: true })
     expect(paused.status, JSON.stringify(paused.body)).toBe(200)
     expect((await patch(f, id, { checkOut: '2027-03-10' })).status).toBe(200)
     expect(await tradeOf(id)).toMatchObject({ status: 'paused', end_date: '2027-03-10' })

@@ -2,7 +2,7 @@ import { query, queryOne } from '../db'
 import { sendNotificationEmail } from './email'
 import { replyToProperty, type ReplyTo } from './replyRouting'
 import { logger } from '../lib/logger'
-import { isCriticalNotificationType } from '@gam/shared'
+import { isCriticalNotificationType, type NotificationType } from '@gam/shared'
 import { portalLink } from '../lib/portalUrls'
 
 // S536 (Nic): SMS is REMOVED platform-wide — notifications and
@@ -37,8 +37,65 @@ export function emailTemplate(title: string, body: string, cta?: { label: string
   </div></body></html>`
 }
 
+/**
+ * 10/20 (Nic): `type` is `NotificationType`, not `string` — the union derived
+ * from the one notification catalog in @gam/shared. A notification whose type is
+ * not in that catalog DOES NOT COMPILE, which is the whole reason the settings
+ * page can no longer be missing a type. Adding a notification means adding its
+ * catalog entry (label, when-it-fires, audience, group) first.
+ */
+/**
+ * ── 10/25 (Nic, DIRECTIVE) — A TEAM MEMBER GETS NO EMAIL FROM GAM ───────────
+ *
+ *   "You mentioned Lisa Scheeler getting the emails. Why is she getting emails?
+ *    She is a front desk employee. She looks at the screen when she's there, and
+ *    when she's clocked out at home, that's it. She is operating as a team
+ *    member, not as a landlord. She doesn't need the wake-up calls at 3 in the
+ *    morning... Lisa does not need any emails from GAM except for two-factor
+ *    authentication to log in or like changing a password if she ever requests
+ *    to do that. Because I've already had her be confused by emails. She's
+ *    gotten an email and said, well, I thought I already took care of this."
+ *
+ *   "This is what I'm telling you about designing it so that a monkey can do it
+ *    — any extra information is overloading these people. It needs to hold their
+ *    hand the whole way, only tell them what to do, not show them anything
+ *    extra."
+ *
+ * So staff get the IN-APP copy — which is the whole point, they read the screen
+ * on shift — and never the email. It overrides `critical` deliberately: the
+ * reason a type is critical is that the LANDLORD must not miss it, and a notice
+ * arriving in an employee's personal inbox at 3am is not how it reaches them.
+ * Nothing is lost; the same row is on their screen when they next look.
+ *
+ * Auth mail is unaffected because it never comes through here — verification,
+ * password reset and 2FA are direct sends in services/email.
+ *
+ * WHO ELSE: maintenance and the bookkeeper, added 10/25 for the same reason
+ * plus a second one — "we need to keep our resend count low". The owner and the
+ * property manager still get everything.
+ */
+// 10/25 (Nic): the front desk, maintenance and the bookkeeper. "They can log
+// into the portal to see any pertinent information to them. We need to keep our
+// resend count low."
+//
+// NOT property_manager, and that is the line: "The owner or property manager
+// gets emailed about leases, about refunds, about anything that needs to be
+// emailed." A property manager may be a third party running the place from
+// somewhere else, so their inbox IS their desk.
+//
+// Spelled as users_role_check allows — 'maintenance', not 'maintenance_worker'.
+// A role name that does not exist matches nobody and fails silently, which is
+// the worst way for a rule like this to be wrong.
+const NO_EMAIL_ROLES: readonly string[] = ['onsite_manager', 'maintenance', 'bookkeeper']
+
+/** Does this recipient read GAM on shift rather than in their inbox? */
+async function isTeamMember(userId: string): Promise<boolean> {
+  const u = await queryOne<{ role: string }>('SELECT role FROM users WHERE id=$1', [userId])
+  return !!u && NO_EMAIL_ROLES.includes(u.role)
+}
+
 export async function createNotification(p: {
-  userId: string; landlordId?: string; type: string; title: string; body: string; data?: any
+  userId: string; landlordId?: string; type: NotificationType; title: string; body: string; data?: any
   // S527 W-1: in-app deep-link — clicking the notification lands on the
   // SPECIFIC item (e.g. '/leases?open=<id>'), not a generic page. Optional;
   // the bell falls back to a per-type route when absent.
@@ -54,9 +111,16 @@ export async function createNotification(p: {
   try {
     const prefs = await queryOne<any>('SELECT * FROM notification_preferences WHERE user_id=$1 AND type=$2', [p.userId, p.type])
     // S570 (Nic): critical types (e.g. failed rent payment) always email — the
-    // pref can't turn it off (UI locks it too). Missing these causes real harm.
-    const emailOk = isCriticalNotificationType(p.type) ? true : (prefs ? prefs.email_enabled : true)
-    const inAppOk = prefs ? prefs.in_app_enabled : true
+    // pref can't turn it off (the page shows the box locked with the reason).
+    // Missing these causes real harm.
+    const critical = isCriticalNotificationType(p.type)
+    const emailOk = critical ? true : (prefs ? prefs.email_enabled : true)
+    // 10/20: and the in-app copy of a critical notice is forced on for the same
+    // reason. The comment here used to say "in-app is always on already", which
+    // was not true: in_app_enabled is a real stored column that the agent tool
+    // and a hand-written row can set FALSE, and this line honored it — so the
+    // one notice that must not be missed could be suppressed in both channels.
+    const inAppOk = critical ? true : (prefs ? prefs.in_app_enabled : true)
 
     // Capture the inserted notification id so the post-send flag updates can
     // target this exact row instead of the previously-broken
@@ -71,7 +135,9 @@ export async function createNotification(p: {
       )
       notificationId = ins?.id ?? null
     }
-    if (emailOk && p.sendEmail && p.emailTo) {
+    // 10/25 (Nic): staff read the screen, not their inbox. See NO_EMAIL_ROLES.
+    const teamMember = p.sendEmail && p.emailTo ? await isTeamMember(p.userId) : false
+    if (emailOk && p.sendEmail && p.emailTo && !teamMember) {
       // S106: routed through the central send() in services/email.ts so
       // every notification email writes to email_send_log and surfaces
       // in the failure dashboard. Pre-S106 the local stub just

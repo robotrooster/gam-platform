@@ -7,7 +7,9 @@
  * RV 35) and Josh Roby (MH 03 + RV 27) each showed up twice.
  *
  * Now it asks the same question the front desk asks (services/openBalances),
- * limited to bills five or more days late, with eviction-mode units left out as
+ * limited to households past their grace period (10/12: the one rule,
+ * services/openBalances — the 6th for rent due the 1st with the default 5
+ * days), with eviction-mode units left out as
  * before. One email per landlord ACCOUNT (two companies under one login get one
  * email), one line per person, the person's whole overdue balance.
  */
@@ -17,25 +19,17 @@ import { listOpenTenantBalances } from '../services/openBalances'
 import { addDaysTo, todayIn } from '../lib/timezone'
 import { logger } from '../lib/logger'
 
-/** Days past due before a balance goes in the morning email. */
-export const LATE_DIGEST_OVERDUE_DAYS = 5
-
 export interface LateDigestResult {
   accounts: number
   sent: number
   failed: number
 }
 
-/** Whole calendar days from `ymd` to `today` (both 'YYYY-MM-DD'). */
-function daysBetween(ymd: string, today: string): number {
-  const at = (d: string) => Date.UTC(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8, 10))
-  return Math.max(0, Math.round((at(today) - at(ymd)) / 86_400_000))
-}
-
 export async function runLateBalanceDigest(): Promise<LateDigestResult> {
-  // GAM's home calendar, so "five days late" is the same on any host.
+  // GAM's home calendar, so "past due" is the same on any host. Who is LATE
+  // is decided per household below (days past grace, the one rule).
   const today = todayIn(null)
-  const cutoff = addDaysTo(today, -LATE_DIGEST_OVERDUE_DAYS)
+  const cutoff = addDaysTo(today, -1)
 
   // Accounts (the founding owner's login) with at least one overdue open bill,
   // and every company that account owns — the Outstanding list reads them all,
@@ -61,23 +55,32 @@ export async function runLateBalanceDigest(): Promise<LateDigestResult> {
   const result: LateDigestResult = { accounts: 0, sent: 0, failed: 0 }
   for (const a of accounts) {
     if (!a.email) continue
+    // 10/12: only what is past its grace period — the email says each person
+    // has "a balance past its grace period", so a bill still inside its grace
+    // (October's rent on 10/2–10/5) is not in the amount.
     const owed = await listOpenTenantBalances({
       landlordIds: a.landlord_ids,
-      overdueDays: LATE_DIGEST_OVERDUE_DAYS,
+      overdueDays: 1,
       excludePaymentBlocked: true,
+      pastGraceOnly: true,
     })
-    if (!owed.length) continue
+    // 10/12 (Nic): "'Days late' = days past the grace period everywhere." A
+    // household still inside its grace period (a longer lease grace, or a bill
+    // GAM wrote after its due date) is not late yet, so it is not in the email.
+    const late = owed.filter(o => o.days_late > 0)
+    if (!late.length) continue
     result.accounts++
 
     const person = `${a.first_name || ''} ${a.last_name || ''}`.trim()
     // One company: greet it as before. Several: greet the person — no company
     // is the account's "default".
     const landlordName = (a.landlord_ids.length === 1 ? (a.business_names[0] || person) : person) || 'there'
-    const items = owed.map(o => ({
+    const items = late.map(o => ({
       tenantName:   `${o.first_name || ''} ${o.last_name || ''}`.trim() || 'Tenant',
       unitNumber:   o.unit_number || '—',
       propertyName: o.property_name || '—',
-      daysLate:     daysBetween(o.oldest_due_date, today),
+      // Days past the grace period (services/openBalances, the one rule).
+      daysLate:     o.days_late,
       amount:       Number(o.balance),
       tenantId:     o.tenant_id,
     }))

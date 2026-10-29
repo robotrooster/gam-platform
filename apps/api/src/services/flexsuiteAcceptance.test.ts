@@ -11,6 +11,12 @@
  *     post-commit PDF email by no-op'ing the Resend send when
  *     RESEND_API_KEY is unset — email-sender is best-effort and
  *     catches errors internally)
+ *   - renderReAcceptanceTerms (10/26): the FlexDeposit agreement now
+ *     states the one-time service fee the plan was SOLD at, read from
+ *     security_deposits.flex_deposit_service_fee. Covered both ways —
+ *     the stored price prints, and a plan with no price on record
+ *     refuses to re-render instead of printing "[Not Provided]" where
+ *     the price goes.
  *
  * All tests use the cleanupAllSchema + getClient pattern because
  * recordAcceptance + commitReAcceptance commit their own
@@ -73,12 +79,47 @@ async function seedFlexPayEnrolledTenant(): Promise<{
   } finally { client.release() }
 }
 
+// 10/26 — THE FIXTURE PLAN'S FIGURES COME FROM THE PRICE CARD.
+//
+// FlexDeposit's fee is no longer a constant: it is read from
+// flexdeposit_fee_schedule at enrollment and the price the plan was SOLD at is
+// stamped on security_deposits.flex_deposit_service_fee, so a later re-price
+// cannot restate what a tenant accepted. A fixture plan therefore has to be a
+// plan the price card can actually produce, or its stored fee is a price
+// nobody set.
+//
+//   deposit $1,000  the $1,000-1,499 bracket. Brackets are half-open, so
+//                   exactly $1,000 sits in this one, not in 0-999.
+//   4 payments      $93.00. FlexDeposit sells exactly two splits, 2 and 4;
+//                   the 3-payment plan this fixture used to seed has no row in
+//                   the grid at all, so no plan could have been sold at one and
+//                   no honest fee could be stamped on it.
+//   $1,000 / 4      $250.00 an installment, with no rounding residue to carry
+//                   on installment 1.
+//
+// Verified against gam_test.flexdeposit_fee_schedule (the 10/26 grid, seeded by
+// test/globalSetup.ts effective 2020-01-01), not taken from memory.
+const FIXTURE_DEPOSIT_TOTAL      = 1000
+const FIXTURE_SERVICE_FEE        = 93
+const FIXTURE_INSTALLMENT_AMOUNT = 250
+// Monthly from the lease start, the way enrollment lays a schedule out.
+const FIXTURE_INSTALLMENT_DUE_DATES = ['2026-01-01', '2026-02-01', '2026-03-01', '2026-04-01']
+const FIXTURE_INSTALLMENT_COUNT  = FIXTURE_INSTALLMENT_DUE_DATES.length  // 4 — see above
+
 // Seed a tenant who's enrolled in FlexDeposit (deposit row +
 // installments + active plan status). Required by
 // renderReAcceptanceTerms('flexdeposit').
-async function seedFlexDepositEnrolledTenant(): Promise<{
+async function seedFlexDepositEnrolledTenant(opts: {
+  /**
+   * The fee stamped on the plan. `null` seeds a plan with NO price on record —
+   * what a plan that predates the column looks like — which the re-render has
+   * to refuse. Omit it for a normally priced plan.
+   */
+  serviceFee?: number | null
+} = {}): Promise<{
   tenantId: string; userId: string; landlordId: string; depositId: string
 }> {
+  const serviceFee = opts.serviceFee === undefined ? FIXTURE_SERVICE_FEE : opts.serviceFee
   const client = await db.connect()
   try {
     await client.query('BEGIN')
@@ -95,7 +136,7 @@ async function seedFlexDepositEnrolledTenant(): Promise<{
     const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
     const leaseId = await seedLease(client, {
       unitId, landlordId, rentAmount: 1000, status: 'active',
-      startDate: '2026-01-01',
+      startDate: FIXTURE_INSTALLMENT_DUE_DATES[0],
     })
     await seedLeaseTenant(client, { leaseId, tenantId, role: 'primary' })
     const dep = await client.query<{ id: string }>(
@@ -103,24 +144,30 @@ async function seedFlexDepositEnrolledTenant(): Promise<{
          (unit_id, lease_id, tenant_id, total_amount, status, held_by,
           flex_deposit_enabled, flex_deposit_plan_status,
           installment_count, installment_amount, installments_paid,
-          installments_remaining, gam_advance_amount)
-       VALUES ($1, $2, $3, 1000, 'partial', 'gam_escrow',
+          installments_remaining, gam_advance_amount,
+          flex_deposit_service_fee)
+       VALUES ($1, $2, $3, $4, 'partial', 'gam_escrow',
                TRUE, 'active',
-               3, 333.33, 0, 3, 0)
+               $5, $6, 0, $5, 0,
+               $7)
        RETURNING id`,
-      [unitId, leaseId, tenantId],
+      [
+        unitId, leaseId, tenantId, FIXTURE_DEPOSIT_TOTAL,
+        FIXTURE_INSTALLMENT_COUNT, FIXTURE_INSTALLMENT_AMOUNT,
+        serviceFee,
+      ],
     )
     const depositId = dep.rows[0].id
-    await client.query(
-      `INSERT INTO flex_deposit_installments
-         (security_deposit_id, tenant_id, installment_number, installment_count,
-          amount, due_date, status)
-       VALUES
-         ($1, $2, 1, 3, 333.34, '2026-01-01', 'pending'),
-         ($1, $2, 2, 3, 333.33, '2026-02-01', 'pending'),
-         ($1, $2, 3, 3, 333.33, '2026-03-01', 'pending')`,
-      [depositId, tenantId],
-    )
+    for (const [i, dueDate] of FIXTURE_INSTALLMENT_DUE_DATES.entries()) {
+      await client.query(
+        `INSERT INTO flex_deposit_installments
+           (security_deposit_id, tenant_id, installment_number, installment_count,
+            amount, due_date, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+        [depositId, tenantId, i + 1, FIXTURE_INSTALLMENT_COUNT,
+         FIXTURE_INSTALLMENT_AMOUNT, dueDate],
+      )
+    }
     await client.query('COMMIT')
     return { tenantId, userId: tenantUserId, landlordId, depositId }
   } catch (e) {
@@ -252,7 +299,7 @@ describe('getPendingReAcceptances', () => {
       product:        'flexdeposit',
       currentVersion: '(none)',
       latestVersion:  FLEXDEPOSIT_TEMPLATE_VERSION,
-      flexdepositInstallmentCount: 3,
+      flexdepositInstallmentCount: FIXTURE_INSTALLMENT_COUNT,
     })
   })
 })
@@ -274,8 +321,46 @@ describe('renderReAcceptanceTerms', () => {
       tenantId, userId, product: 'flexdeposit', ip: null, userAgent: null,
     })
     expect(renderedText.length).toBeGreaterThan(0)
-    expect(populatedContent.installmentCount).toBe(3)
-    expect(populatedContent.installments).toHaveLength(3)
+    expect(populatedContent.installmentCount).toBe(FIXTURE_INSTALLMENT_COUNT)
+    expect(populatedContent.installments).toHaveLength(FIXTURE_INSTALLMENT_COUNT)
+    // 10/26: the agreement has to STATE the one-time fee, so pin the sentence
+    // that carries it. A document a resident accepts must never say
+    // "[Not Provided]" where the price goes.
+    expect(renderedText).toContain(`one-time service fee of $${FIXTURE_SERVICE_FEE}.00`)
+  })
+
+  // 10/26: the other half of the price guard. A plan enrolled before
+  // flex_deposit_service_fee existed has no price on record, and an agreement
+  // that printed "[Not Provided]" where the price belongs would be worse than
+  // no agreement — so the re-render refuses with a 409. Nothing covered this.
+  it('refuses to re-render a flexdeposit plan with no service fee on record', async () => {
+    // Identical to the plan above in every other respect — same deposit, same
+    // schedule, same active status. The missing price is the only difference.
+    const { tenantId, userId } = await seedFlexDepositEnrolledTenant({ serviceFee: null })
+    const err: any = await renderReAcceptanceTerms({
+      tenantId, userId, product: 'flexdeposit', ip: null, userAgent: null,
+    }).then(
+      () => { throw new Error('expected the re-render to refuse, but it produced an agreement') },
+      (e: unknown) => e,
+    )
+    expect(err.statusCode).toBe(409)
+    expect(err.message).toMatch(/no service fee on record/)
+  })
+
+  // 10/26: the fee is stamped at enrollment and NEVER re-quoted, so a plan sold
+  // at an older price keeps printing that price. $86 is a real grid figure from
+  // a DIFFERENT bracket ($1,500-1,999 split two ways), chosen so a render that
+  // re-quoted this plan from today's card would print $93 and fail here.
+  const FEE_THIS_PLAN_WAS_SOLD_AT = 86
+  it('prints the fee stored on the plan, not a fresh quote from the price card', async () => {
+    const { tenantId, userId } = await seedFlexDepositEnrolledTenant({
+      serviceFee: FEE_THIS_PLAN_WAS_SOLD_AT,
+    })
+    const { renderedText } = await renderReAcceptanceTerms({
+      tenantId, userId, product: 'flexdeposit', ip: null, userAgent: null,
+    })
+    expect(renderedText).toContain(`one-time service fee of $${FEE_THIS_PLAN_WAS_SOLD_AT}.00`)
+    expect(renderedText).not.toContain(`one-time service fee of $${FIXTURE_SERVICE_FEE}.00`)
   })
 
   it('throws 409 when product is flexpay but tenant not enrolled', async () => {

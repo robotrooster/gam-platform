@@ -124,8 +124,22 @@ describe('POST /api/background/:id/draft-lease', () => {
     expect(s[1].user_id).toBe(fx.applicantUserId)
     const vals = await fieldVals(docId)
     expect(vals.start_date).toBe(MOVE_IN)
-    expect(vals.end_date).toBe(MOVE_IN_PLUS_6_END)      // 6 months, month-end snapped
-    expect(vals.lease_type).toBe('Fixed term')
+    // ── 10/24 (Nic, DIRECTIVE) — THE APPLICANT'S "6 MONTHS" IS A NOTE ────────
+    //
+    //   "Every single lease on both of my properties is month to month... The 3
+    //    months becomes a note, not a contract term, and every drafted lease
+    //    starts month to month with no end date."
+    //
+    // This used to assert MOVE_IN_PLUS_6_END and 'Fixed term' — a hard end date
+    // computed from a number the applicant typed on a screening form before
+    // they had seen the place. James Fenton said "3 months" and got a binding
+    // lease ending 2027-01-31 on RV 15, the park's busiest month, which nothing
+    // disclosed and which would then have freed the space.
+    //
+    // A lease holds the space until somebody actually leaves. The move-in date
+    // they asked for IS honoured (above) — it is the TERM that no longer binds.
+    expect(vals.end_date).toBe('-')
+    expect(vals.lease_type).toBe('Month-to-month')
     expect(vals.rent_amount).toBe('725.00')
 
     // The household is on the space the way an invite puts them there.
@@ -143,6 +157,25 @@ describe('POST /api/background/:id/draft-lease', () => {
     const vals = await fieldVals(res.body.data.documentId)
     expect(vals.lease_type).toBe('Month-to-month')
     expect(vals.end_date).toBe('-')   // the document's own "no end date" mark
+  })
+
+  // 10/24 (Nic): the number is kept, it just does not bind. The follow-up
+  // prompt reads it from here, so a later change that stops passing it must not
+  // also stop STORING it — that is the half this test guards.
+  it('keeps what the applicant said about how long, even though it no longer sets a term', async () => {
+    const fx = await seedFixture({ withUnit: true, term: 3 })
+    const res = await draft(fx)
+    expect(res.status).toBe(200)
+    const vals = await fieldVals(res.body.data.documentId)
+    expect(vals.end_date).toBe('-')            // nothing hardened
+    expect(vals.lease_type).toBe('Month-to-month')
+    // ...and the answer is still on the screening, to ask them about later.
+    const check = (await db.query<any>(
+      `SELECT desired_term_months, desired_month_to_month, desired_move_in FROM background_checks WHERE id = $1`,
+      [fx.checkId])).rows[0]
+    expect(Number(check.desired_term_months)).toBe(3)
+    expect(check.desired_month_to_month).toBe(false)
+    expect(check.desired_move_in).toBeTruthy()
   })
 
   it('takes the unit the landlord picks for a walk-up who named none, and remembers it', async () => {

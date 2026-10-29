@@ -6,7 +6,7 @@ Getting your portfolio into GAM starts with adding a property, then filling it w
 
 To add a property, give it a name and address and choose its type (for example a standard residential building or an RV community). Each property has one choice for card and bank payment fees: pass them on, or cover them — the same for everyone who pays there. ACH payments are a flat $6 per payment, cards run 3.5% plus $0.55 per transaction, and non-US-issued cards add 1.5%. GAM never covers processing fees. You can change the choice later without rebuilding the property.
 
-This is also where you connect the bank account your payouts land in. GAM moves money through Stripe Connect, so you'll go through Stripe's onboarding (identity and banking verification, known as KYC) before payouts can flow. Funds reach you on a schedule once payments clear.
+Payouts for a property land in the bank account its company verified with Stripe on the **Bank** page's **Bank setup** tab — there is no per-property payout account to choose. GAM moves money through Stripe Connect, so you'll go through Stripe's onboarding (identity and banking verification, known as KYC) before payouts can flow. Funds reach you on a schedule once payments clear.
 
 Once the property exists, add units. You add units through a short wizard — a quantity field lets you create a numbered batch of identical units in one pass — pick the property, enter the unit number and details (bedrooms, bathrooms, square footage), set the rent and deposit, then review and create. New units start as vacant, and you're only billed the platform fee on occupied units — $2 per occupied unit per month, with a $10 monthly minimum per payout account. Vacant units cost nothing.
 

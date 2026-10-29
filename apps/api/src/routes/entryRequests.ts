@@ -16,7 +16,7 @@ import {
 import { logger } from '../lib/logger'
 import { applyEntryRequestResponse } from '../services/entryRequestRespond'
 import { humanize, MAINTENANCE_CATEGORY_LABEL } from '@gam/shared'
-import { checkAgainstStatute, type LawFlag } from '../services/stateLaw'
+import { checkAgainstStatute, stateLawWarningsEnabled, type LawFlag } from '../services/stateLaw'
 
 /**
  * S478: shared warning compute used by POST (at create time) and GET
@@ -53,8 +53,22 @@ async function computeEntryRequestWarnings(args: {
     if (!tzRow) return fallback
     const localHour = tzRow.local_hour
     const outsideTypicalHours = localHour < 8 || localHour >= 20
+    // 10/20 (Nic): "There should be no state law warnings anywhere in the
+    // system. At least not right now. Just hide all that stuff."
+    //
+    // The HOUR is a fact about this request and always shown — a 5am entry is
+    // worth both parties seeing. The sentence after it was not a fact: it told
+    // them what entry laws commonly require and sent them to read their local
+    // one, which is the same caution get_my_landlord_patterns used to end with.
+    // The state_law_warnings array beside it was already hidden (the engine
+    // gates itself), so leaving this one showing meant the screen still issued
+    // a law caution while the banner below it had been taken away — and the
+    // agent answering the same question would say something different.
+    // Both now wait for the one switch.
+    const sayTheLaw = outsideTypicalHours && await stateLawWarningsEnabled()
     const typicalHoursWarning = outsideTypicalHours
-      ? 'Outside typical daytime hours (8 AM–8 PM). Entry laws commonly require "reasonable times" — check your local law.'
+      ? 'Outside typical daytime hours (8 AM–8 PM).'
+        + (sayTheLaw ? ' Entry laws commonly require "reasonable times" — check your local law.' : '')
       : null
     const stateLawWarnings: LawFlag[] = []
     if (tzRow.state) {

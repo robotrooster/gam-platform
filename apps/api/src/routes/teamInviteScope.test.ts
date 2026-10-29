@@ -108,14 +108,16 @@ describe('S640 team invites survive the account/entity split', () => {
     expect(n.rows[0].c).toBe(0)
   })
 
-  // The one role with no property to derive from. An account with a single
-  // company still resolves; a two-company account is asked, in words.
-  it('a bookkeeper invite resolves for one company, and for the founding company when there are two', async () => {
+  // 10/11 (Nic): a bookkeeper ticks at least one property, so their company is
+  // derived from the property like everyone else's. An account with a single
+  // company still resolves; a request naming no property and no company on a
+  // two-company account is asked, in words.
+  it('a bookkeeper invite resolves for one company, and from the ticked property when there are two', async () => {
     const one = await seedAccount(1)
     const okRes = await request(buildApp())
       .post('/api/scopes/bookkeeper/invite').set('Authorization', `Bearer ${one.token}`)
-      .send({ email: 'books@example.com', scope: { accessLevel: 'read_only' } })
-    expect(okRes.status).toBe(201)
+      .send({ email: 'books@example.com', scope: { accessLevel: 'read_only', propertyIds: [one.propertyIds[0]] } })
+    expect(okRes.status, JSON.stringify(okRes.body)).toBe(201)
 
     const two = await seedAccount(2)
     const askRes = await request(buildApp())
@@ -127,9 +129,29 @@ describe('S640 team invites survive the account/entity split', () => {
     // is what the form sends.
     expect(askRes.status, JSON.stringify(askRes.body)).toBe(400)
     expect(String(askRes.body?.error)).toMatch(/more than one company/i)
+    const derived = await request(buildApp())
+      .post('/api/scopes/bookkeeper/invite').set('Authorization', `Bearer ${two.token}`)
+      .send({ email: 'books4@example.com', scope: { propertyIds: [two.propertyIds[1]] } })
+    expect(derived.status, JSON.stringify(derived.body)).toBe(201)
+    const inv = (await db.query<any>(
+      `SELECT landlord_id FROM invitations WHERE email='books4@example.com'`)).rows[0]
+    expect(inv.landlord_id).toBe(two.landlordIds[1])
     const namedRes = await request(buildApp())
       .post('/api/scopes/bookkeeper/invite').set('Authorization', `Bearer ${two.token}`)
-      .send({ email: 'books3@example.com', landlordId: two.landlordIds[0], scope: { accessLevel: 'read_only' } })
+      .send({ email: 'books3@example.com', landlordId: two.landlordIds[0],
+              scope: { accessLevel: 'read_only', propertyIds: [two.propertyIds[0]] } })
     expect(namedRes.status, JSON.stringify(namedRes.body)).toBe(201)
+  })
+
+  it('a bookkeeper invite that ticks nothing is refused, in words', async () => {
+    const one = await seedAccount(1)
+    for (const scope of [{}, { propertyIds: [] }, { propertyIds: null }]) {
+      const res = await request(buildApp())
+        .post('/api/scopes/bookkeeper/invite').set('Authorization', `Bearer ${one.token}`)
+        .send({ email: 'none@example.com', landlordId: one.landlordIds[0], scope })
+      expect(res.status, JSON.stringify(scope)).toBe(400)
+      expect(res.body.error).toBe('Tick at least one property or Company-wide.')
+    }
+    expect((await db.query<any>(`SELECT COUNT(*)::int AS c FROM invitations`)).rows[0].c).toBe(0)
   })
 })

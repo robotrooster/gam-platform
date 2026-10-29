@@ -19,9 +19,13 @@
  * (void), the invoices (void) and the document itself. GAM does not erase a
  * record that something happened.
  *
- * WHAT IT REMOVES. Charge rows that were never owed — nothing was signed by the
+ * WHAT IT VOIDS. Charge rows that were never owed — nothing was signed by the
  * person they bill — the same precedent bookingLeaseBilling follows for rent
- * that stopped being owed. And utility bills, which must LEAVE the
+ * that stopped being owed. 10/12 (Nic): they used to be DELETED; each is now
+ * voided as a record (status 'voided' with when and why, decisions #48.5 —
+ * services/chargeVoids), kept forever and in no balance or total. A charge a
+ * record points at stops the void in plain words, as the database's refusal
+ * to delete it did. WHAT IT REMOVES: utility bills, which must LEAVE the
  * one-per-meter-per-cycle slot: a voided bill left in place would make the
  * re-signed lease's release treat the charge as already accounted for, and drop
  * it. The charge itself is not lost — it goes back on hold (below).
@@ -74,12 +78,14 @@ import { depositCollectedBySql } from '../services/leaseFeesSync'
 import { recordBookingEvent } from '../services/bookingEvents'
 import { RESERVATION_PAID_SQL } from '../services/bookingLeaseDraft'
 import { BOOKING_STATUS_LABEL, LEASE_COLUMN_LABEL, chargeLabel, type PaymentType } from '@gam/shared'
+import { voidUnowedChargesOrRefuse } from '../services/chargeVoids'
 
 type Q = (text: string, params?: any[]) => Promise<{ rows: any[] }>
 
 /**
- * The charge rows this void removes: unpaid rows on the lease, on its
- * invoices, and the rows its utility bills point at. `$1` is the lease id,
+ * The charge rows this void takes off (voided as records since 10/12 —
+ * services/chargeVoids): unpaid rows on the lease, on its invoices, and the
+ * rows its utility bills point at. `$1` is the lease id,
  * `a` the payments alias.
  */
 function voidRemovesSql(a: string): string {
@@ -287,7 +293,7 @@ export async function returnDepositCountedOnce(q: Q, newLeaseId: string, endedLe
     `WITH rec AS (
        SELECT x.id, x.flex_deposit_enabled,
               COALESCE(x.collected_amount, 0) >= x.total_amount AS reads_funded
-         FROM security_deposits x WHERE x.lease_id = $1
+         FROM security_deposits x WHERE x.lease_id = $1 AND x.status <> 'voided'
         ORDER BY x.created_at DESC, x.id DESC LIMIT 1),
      own AS (
        -- Every deposit payment on the new lease that ever settled in a way
@@ -391,6 +397,23 @@ async function holdUtilityBillAgain(q: Q, b: any, why: { released: string; raise
      b.sewer_rate_per_unit, b.reading_start, b.reading_end,
      b.reading_start_date, b.reading_end_date, why.raised])
 }
+
+/**
+ * 10/12 (Nic, G8): why a record a lease that never happened leaves behind was
+ * voided (kept forever, never deleted) — a utility bill out of its cycle slot
+ * (its usage went back on hold), an empty pending deposit record, an open
+ * work-trade period. Plain words: they are read on the record.
+ */
+export const UTILITY_BILL_NEVER_MOVED_IN_VOID =
+  'Voided: the tenant it was billed to never moved in. The usage went back on hold for whoever the space is billed to next'
+export const UTILITY_BILL_LEASE_VOIDED_VOID =
+  'Voided: the lease it was billed to was voided before the tenant signed. The usage went back on hold for whoever the space is billed to next'
+export const DEPOSIT_NEVER_MOVED_IN_VOID =
+  'Voided: the tenant never moved in, and nothing was ever collected on this deposit'
+export const DEPOSIT_LEASE_VOIDED_VOID =
+  'Voided: the lease was voided before the tenant signed, and nothing was ever collected on this deposit'
+export const WORK_TRADE_PERIOD_LEASE_VOIDED_VOID =
+  'Voided: the lease was voided before the tenant signed, so this period has nothing left to credit'
 
 /** The note on every line of a move-in bill closed because the tenant never moved in (decisions #46.4). */
 export const NEVER_MOVED_IN_NOTE =
@@ -1199,8 +1222,9 @@ const RESERVATION_CANCELED_SUMMARY = (guest: string | null) =>
  * history stay) — a line a payment was tried on too, until the reports' Money
  * billed leaves 'voided' rows out (fix pass 2; see the UPDATE below). The bills are voided, a bank retry on them is stopped (its intent
  * returned to cancel after COMMIT), a utility charge goes back on hold so the
- * landlord does not lose it, and a deposit record that never had a dollar is
- * removed (as the void does). GAM's own fees and charges billed on purpose
+ * landlord does not lose it (its bill voided and kept, out of its cycle slot —
+ * 10/12, G8), and a deposit record that never had a dollar is voided and kept
+ * (as the void does; it used to be deleted). GAM's own fees and charges billed on purpose
  * stay owed, taken off the voided bill so they stand on their own. The stay
  * the lease came from, still showing as coming, is canceled too. When it does
  * not apply, nothing changes: an ordinary lease end, and what was owed stays
@@ -1239,8 +1263,13 @@ export async function closeNeverMovedInBill(
       released: 'held again: the tenant it was billed to never moved in',
       raised: 'held: the tenant this was billed to never moved in',
     })
-    await q(`UPDATE utility_bills SET payment_id = NULL WHERE id = $1`, [b.id])
-    await q(`DELETE FROM utility_bills WHERE id = $1`, [b.id])
+    // 10/12 (Nic, G8): voided and kept, never deleted — and out of its
+    // one-per-cycle slot (voided_at; migration 20261013235110), so the hold
+    // can be billed to whoever the space is billed to next.
+    await q(
+      `UPDATE utility_bills
+          SET payment_id = NULL, status = 'void', voided_at = NOW(), void_reason = $2, updated_at = NOW()
+        WHERE id = $1`, [b.id, UTILITY_BILL_NEVER_MOVED_IN_VOID])
   }
   if (ids.length > 0) {
     // Every line is zeroed with the note (its row and its history stay) —
@@ -1275,12 +1304,15 @@ export async function closeNeverMovedInBill(
               notes = LEFT(COALESCE(notes || E'\\n', '') || $2, 2000)
         WHERE id = ANY($1::uuid[])`, [a.invoiceIds, NEVER_MOVED_IN_NOTE])
   }
+  // 10/12 (Nic, G8): voided and kept, never deleted (status 'voided'; every
+  // reader of a lease's or a tenant's deposit leaves it out).
   await q(
-    `DELETE FROM security_deposits
+    `UPDATE security_deposits
+        SET status = 'voided', voided_at = NOW(), void_reason = $2, updated_at = NOW()
       WHERE lease_id = $1 AND status = 'pending'
         AND COALESCE(collected_amount, 0) = 0
         AND carried_from_deposit_id IS NULL
-        AND COALESCE(flex_deposit_enabled, FALSE) = FALSE`, [leaseId])
+        AND COALESCE(flex_deposit_enabled, FALSE) = FALSE`, [leaseId, DEPOSIT_NEVER_MOVED_IN_VOID])
   // Fix pass 2: the lease's own paperwork still waiting for signatures ends
   // with it. A lease the tenant signed and the landlord had not: left open,
   // the landlord's signature later issued it (buildLeaseFromDocument) and
@@ -1440,6 +1472,22 @@ export async function endLeaseNeverMovedIn(
   return closed
 }
 
+/** Why a charge on a lease voided before the tenant signed is not owed (payments.void_reason). */
+export const LEASE_VOIDED_CHARGE_REASON =
+  'The lease it was billed on was voided before the tenant signed, so it is not owed.'
+
+/**
+ * 10/12 (Nic): the void's unpaid charge rows are voided as records, never
+ * deleted (services/chargeVoids). A row another record points at is the one
+ * the database refused to delete — the whole void failed on it — so it still
+ * stops the void, now in plain words.
+ */
+async function voidLeaseCharges(q: Q, ids: string[]): Promise<void> {
+  await voidUnowedChargesOrRefuse(q, ids, LEASE_VOIDED_CHARGE_REASON,
+    'A record still points at a charge on this lease\'s bill, so the lease cannot be voided. ' +
+    'Create a superseding document instead.')
+}
+
 export async function unwindIssuedLease(
   q: Q,
   doc: { id: string; lease_id: string | null; issued_at: string | Date | null; unit_id: string | null },
@@ -1508,10 +1556,10 @@ export async function unwindIssuedLease(
   // Before the pending-deposit cleanup below, which would otherwise delete a
   // carried record that was never collected.
   if (renews) {
-    // The recorded charges the removed rows carried are released first — back
-    // to waiting to be billed — so the rows can go (the delete used to fail on
-    // them and take the whole void down), then follow the household to the
-    // lease they are on (below).
+    // The recorded charges the voided rows carried are released first — back
+    // to waiting to be billed — so the rows can be voided (a row a record
+    // points at stops the void, as the delete that used to fail on them did),
+    // then follow the household to the lease they are on (below).
     await q(
       `UPDATE tenant_one_off_charges
           SET status = 'pending', payment_id = NULL, billed_at = NULL, updated_at = NOW()
@@ -1536,16 +1584,14 @@ export async function unwindIssuedLease(
     // Their utility usage is real and theirs: it returns unbilled to their
     // lease rather than going on hold like a move-in that never happened.
     for (const b of (await q(
-      `SELECT id, payment_id FROM utility_bills WHERE lease_id = $1`, [leaseId])).rows) {
+      `SELECT id, payment_id FROM utility_bills WHERE lease_id = $1 AND voided_at IS NULL`, [leaseId])).rows) {
       await q(
         `UPDATE utility_bills
             SET lease_id = $2, payment_id = NULL,
                 status = CASE WHEN status = 'billed' THEN 'unbilled' ELSE status END,
                 updated_at = NOW()
           WHERE id = $1`, [b.id, renews])
-      if (b.payment_id) {
-        await q(`DELETE FROM payments WHERE id = $1 AND status IN ('pending','failed')`, [b.payment_id])
-      }
+      if (b.payment_id) await voidLeaseCharges(q, [b.payment_id])
     }
     await q(
       `UPDATE tenant_one_off_charges SET lease_id = $2, updated_at = NOW()
@@ -1581,7 +1627,7 @@ export async function unwindIssuedLease(
 
   // ── Utility: back on hold, out of the unique slot ────────────────────────
   const bills = (await q(
-    `SELECT * FROM utility_bills WHERE lease_id = $1`, [leaseId])).rows
+    `SELECT * FROM utility_bills WHERE lease_id = $1 AND voided_at IS NULL`, [leaseId])).rows
   for (const b of bills) {
     await holdUtilityBillAgain(q, b, {
       released: 'held again: the lease it was released onto was voided',
@@ -1590,25 +1636,32 @@ export async function unwindIssuedLease(
     // The bill points at its charge row, not the other way round.
     const paymentId = b.payment_id
     await q(`UPDATE utility_bills SET payment_id = NULL WHERE id = $1`, [b.id])
-    if (paymentId) {
-      await q(`DELETE FROM payments WHERE id = $1 AND status IN ('pending','failed')`, [paymentId])
-    }
-    await q(`DELETE FROM utility_bills WHERE id = $1`, [b.id])
+    if (paymentId) await voidLeaseCharges(q, [paymentId])
+    // 10/12 (Nic, G8): voided and kept, never deleted — out of its slot.
+    await q(
+      `UPDATE utility_bills
+          SET status = 'void', voided_at = NOW(), void_reason = $2, updated_at = NOW()
+        WHERE id = $1`, [b.id, UTILITY_BILL_LEASE_VOIDED_VOID])
   }
 
   // ── Charges and invoices ─────────────────────────────────────────────────
   const invoices = (await q(
     `SELECT id FROM invoices WHERE lease_id = $1`, [leaseId])).rows.map(r => r.id)
-  await q(
-    `DELETE FROM payments WHERE lease_id = $1 AND status IN ('pending','failed')`, [leaseId])
+  // 10/12 (Nic): the lease's unpaid rows and its bills' unpaid rows are voided
+  // as records, never deleted (services/chargeVoids).
+  await voidLeaseCharges(q, (await q(
+    `SELECT p.id FROM payments p
+      WHERE p.status IN ('pending','failed')
+        AND (p.lease_id = $1 OR p.invoice_id = ANY($2::uuid[]))
+      ORDER BY p.id`, [leaseId, invoices])).rows.map(r => r.id))
   if (invoices.length) {
-    await q(
-      `DELETE FROM payments WHERE invoice_id = ANY($1::uuid[]) AND status IN ('pending','failed')`,
-      [invoices])
     // A settlement period on a void invoice has nothing left to credit.
+    // 10/12 (Nic, G8): voided and kept, never deleted.
     await q(
-      `DELETE FROM work_trade_settlements WHERE invoice_id = ANY($1::uuid[]) AND status = 'open'`,
-      [invoices])
+      `UPDATE work_trade_settlements
+          SET status = 'voided', voided_at = NOW(), void_reason = $2, updated_at = NOW()
+        WHERE invoice_id = ANY($1::uuid[]) AND status = 'open'`,
+      [invoices, WORK_TRADE_PERIOD_LEASE_VOIDED_VOID])
     await q(
       `UPDATE invoices SET status = 'void', total_amount = 0, updated_at = NOW()
         WHERE id = ANY($1::uuid[])`, [invoices])
@@ -1618,11 +1671,13 @@ export async function unwindIssuedLease(
   // a deposit. (No .catch here or anywhere in this file: inside a transaction a
   // failed statement has already aborted it, so swallowing the error would only
   // hide why the void failed.)
+  // 10/12 (Nic, G8): voided and kept, never deleted.
   await q(
-    `DELETE FROM security_deposits
+    `UPDATE security_deposits
+        SET status = 'voided', voided_at = NOW(), void_reason = $2, updated_at = NOW()
       WHERE lease_id = $1 AND status = 'pending'
         AND COALESCE(collected_amount, 0) = 0
-        AND carried_from_deposit_id IS NULL`, [leaseId])
+        AND carried_from_deposit_id IS NULL`, [leaseId, DEPOSIT_LEASE_VOIDED_VOID])
 
   // ── The tenancy itself ───────────────────────────────────────────────────
   // The work-trade agreement this issuance created. Left active, a re-signed

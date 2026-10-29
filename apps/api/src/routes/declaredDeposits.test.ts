@@ -286,12 +286,14 @@ describe('what the tenant is told depends on whether GAM is reading the landlord
     expect(res.body.data).not.toHaveProperty('expiresInDays')
   })
 
-  it('bank linked and read: GAM watches the feed and applies it automatically, with the 7-day window', async () => {
+  // 10/14 (Nic, answer 16: "no guessing"): GAM finds the deposit; the landlord confirms it.
+  it('bank linked and read: GAM watches the feed and the landlord confirms the deposit, with the 7-day window', async () => {
     const f = await fixture()
     await linkBank(f.landlordId)
     const res = await report(f)
     expect(res.body.data.bankFeedLinked).toBe(true)
-    expect(res.body.data.message).toMatch(/apply it automatically/i)
+    expect(res.body.data.message).toMatch(/your landlord confirms it/i)
+    expect(res.body.data.message).not.toMatch(/automatically/i)
     expect(res.body.data.expiresInDays).toBe(7)
   })
 
@@ -311,14 +313,14 @@ describe('what the tenant is told depends on whether GAM is reading the landlord
     expect((await db.query(`SELECT count(*)::int AS n FROM tenant_declared_deposits`)).rows[0].n).toBe(1)
   })
 
-  it('reported twice, bank read: says it was already reported, and that GAM applies it, with the 7-day window', async () => {
+  it('reported twice, bank read: says it was already reported, and that the landlord confirms it, with the 7-day window', async () => {
     const f = await fixture()
     await linkBank(f.landlordId)
     const first = await report(f)
     const again = await report(f)
     expect(again.body.data).toMatchObject({ id: first.body.data.id, alreadyReported: true, bankFeedLinked: true })
     expect(again.body.data.message).toMatch(/^You already reported this deposit\. /)
-    expect(again.body.data.message).toMatch(/apply it automatically/i)
+    expect(again.body.data.message).toMatch(/your landlord confirms it/i)
     expect(again.body.data.message).not.toMatch(/Reported\./)
     expect(again.body.data.expiresInDays).toBe(7)
   })
@@ -385,8 +387,8 @@ describe('the tenant’s list of reports', () => {
 describe('a report whose deposit match is undone', () => {
   it('is waiting again, and the tenant may withdraw it', async () => {
     const f = await fixture()
-    const { autoSettleDeclaredDeposits } = await import('../services/bankFeed')
-    const { undoDepositMatch } = await import('../services/bankDepositConfirm')
+    const { reconcileDeposits } = await import('../services/bankFeed')
+    const { confirmDepositMatch, undoDepositMatch } = await import('../services/bankDepositConfirm')
     const rent = (await db.query(
       `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
        VALUES ($1,$2,$3,$4,'rent',250,'pending',$5::date,'RENT') RETURNING id`,
@@ -400,14 +402,21 @@ describe('a report whose deposit match is undone', () => {
     const txn = (await db.query(
       `INSERT INTO bank_transactions (bank_connection_id, landlord_id, external_id, posted_date, amount, description, status)
        VALUES ($1,$2,'d1',$3::date,250,'ATM CASH DEPOSIT','needs_review') RETURNING id`, [conn, f.landlordId, today()])).rows[0].id
-    expect(await autoSettleDeclaredDeposits(f.landlordId)).toBe(1)
+    // 10/14 (Nic, answer 16: "no guessing"): the report never settles it by
+    // itself — the landlord confirms it from the deposit review.
+    await reconcileDeposits(f.landlordId)
+    expect((await db.query(`SELECT status FROM tenant_declared_deposits WHERE id=$1`, [made.body.data.id])).rows[0].status).toBe('pending')
+    await confirmDepositMatch({
+      bankTransactionId: txn, chargeIds: [rent], method: 'cash', declarationId: made.body.data.id, confirmedByUserId: f.landlordUserId,
+    })
     expect((await db.query(`SELECT status FROM tenant_declared_deposits WHERE id=$1`, [made.body.data.id])).rows[0].status).toBe('confirmed')
 
     await undoDepositMatch({ bankTransactionId: txn, landlordId: f.landlordId, undoneBy: f.landlordUserId })
     expect((await db.query(`SELECT status FROM tenant_declared_deposits WHERE id=$1`, [made.body.data.id])).rows[0].status).toBe('pending')
     expect((await db.query(`SELECT status FROM payments WHERE id=$1`, [rent])).rows[0].status).toBe('pending')
-    // The feed never settles it again by itself — the landlord said no.
-    expect(await autoSettleDeclaredDeposits(f.landlordId)).toBe(0)
+    // The feed never settles it by itself.
+    await reconcileDeposits(f.landlordId)
+    expect((await db.query(`SELECT status FROM payments WHERE id=$1`, [rent])).rows[0].status).toBe('pending')
     const res = await request(buildApp())
       .delete(`/api/declared-deposits/${made.body.data.id}`)
       .set('Authorization', `Bearer ${f.token}`)

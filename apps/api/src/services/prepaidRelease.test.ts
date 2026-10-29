@@ -17,6 +17,7 @@ import { consumePrepaidCreditForInvoice } from './prepaidRelease'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 
 interface Fixture {
@@ -104,16 +105,17 @@ const ownerShare = async (paymentId: string): Promise<number | null> => {
 describe('S609 prepaid release', () => {
   let f: Fixture
 
-  // platform_processing_rates is deliberately NOT wiped between tests, so seed
-  // the ACH row once. Allocation reads it even on a release (the fee is then
-  // suppressed), so it has to be present.
+  // Allocation reads the ACH rate even on a release (the fee is then suppressed),
+  // so it has to be open — and it is STATED, not seeded-if-missing: one row is
+  // open per method and cleanupAllSchema leaves the rate card alone, so an
+  // insert-if-missing took whatever an earlier file left.
   beforeAll(async () => {
-    await db.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent,
-          stripe_cost_flat, stripe_cost_percent)
-       SELECT 'ach', 6, 0, 0, 0.5
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'ach')`)
+    await setEffectiveProcessingRate(db, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 6, customerFacingPercent: 0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: 'prepaidRelease.test.ts ACH rate',
+    })
   })
 
   beforeEach(async () => { await cleanupAllSchema(); f = await fixture() })

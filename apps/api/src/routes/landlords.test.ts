@@ -27,7 +27,7 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedAllocationRule, seedUnit, seedManager } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedAllocationRule, seedUnit, seedManager, seedLease } from '../test/dbHelpers'
 import { landlordsRouter } from './landlords'
 import { errorHandler } from '../middleware/errorHandler'
 
@@ -120,6 +120,8 @@ describe('GET /api/landlords/:id/dashboard', () => {
       const u1 = await seedUnit(client, { propertyId, landlordId: f.landlordId })
       const u2 = await seedUnit(client, { propertyId, landlordId: f.landlordId })
       await client.query(`UPDATE units SET status='active', rent_amount=1500 WHERE id=$1`, [u1])
+      // 10/12 (Nic): Expected Monthly Rent is the rent the active LEASE bills.
+      await seedLease(client, { unitId: u1, landlordId: f.landlordId, rentAmount: 1500 })
       await client.query(`UPDATE units SET status='vacant' WHERE id=$1`, [u2])
       await client.query('COMMIT')
     } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }

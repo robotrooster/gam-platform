@@ -5,6 +5,7 @@
  */
 
 import { query } from '../../../db'
+import { stateLawWarningsEnabled } from '../../stateLaw'
 import type { AgentTool, AgentActor } from './types'
 
 interface Row {
@@ -18,10 +19,13 @@ interface Row {
   entry_actual_at: string | null
 }
 
-// Landlord-configurable entry-notice policy + a NEUTRAL, non-state-specific
-// disclaimer. GAM does NOT assert what any jurisdiction legally requires (no
-// state-specific legal logic — see CLAUDE.md); it surfaces the landlord's own
-// setting and points the tenant to their local laws.
+// The landlord's own entry-notice setting is a FACT about this tenancy and is
+// always returned. The line telling the tenant that the required notice varies
+// by state and to go read their local law is a state-law caution, so it waits
+// for the switch (services/stateLaw STATE_LAW_WARNINGS_FEATURE) — 10/20 (Nic):
+// "There should be no state law warnings anywhere in the system. At least not
+// right now. Just hide all that stuff." With it off the tenant simply sees what
+// their landlord's standard notice is, which is what they asked for.
 const NOTICE_DISCLAIMER =
   'Required advance notice for entry varies by state and locality — check your local laws for what applies to you.'
 
@@ -62,7 +66,7 @@ export const getMyEntryRequests: AgentTool = {
       ok: true,
       count: rows.length,
       landlordNoticePolicyHours: policyHours, // landlord-configured standard, NOT a legal requirement
-      noticeDisclaimer: NOTICE_DISCLAIMER,
+      ...((await stateLawWarningsEnabled()) ? { noticeDisclaimer: NOTICE_DISCLAIMER } : {}),
       note: rows.length === 0 ? 'No entry requests on record for this unit.' : undefined,
       entryRequests: rows.map((r) => ({
         reason: r.reason, category: r.reason_category, status: r.status,

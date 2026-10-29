@@ -17,7 +17,7 @@ import { db, getClient } from '../db'
 import {
   createSlip, voidSlip, listSlips, cashProposalFor, findCashCombination, slipLastBankDay, matchSlipByHand,
 } from './depositSlips'
-import { reconcileDeposits, normalizeMerchant, upsertTransactions } from './bankFeed'
+import { reconcileDeposits, normalizeMerchant, namesAPayer, upsertTransactions, ignoreTransaction, undoFiling, categorizeTransaction } from './bankFeed'
 import { undoDepositMatch } from './bankDepositConfirm'
 import { bankFeedRouter } from '../routes/bankFeed'
 import { errorHandler } from '../middleware/errorHandler'
@@ -169,23 +169,34 @@ describe('the bank row arrives', () => {
     expect(inc).toMatchObject({ amount: 40, description: 'Laundry quarters', income_date: '2026-10-05', status: 'active', property_id: ctx.propertyId })
   })
 
-  it('deposited everything matches without a slip', async () => {
+  // 10/14 (Nic, answer 16): "if gam 100 percent knows who that money came from
+  // it can file it but no guessing." The office's cash worked out from what
+  // happens to add up is proposed for a person to accept — never matched by itself.
+  it('deposited everything is proposed, never matched by itself; the person accepting it matches it', async () => {
     const ctx = await build()
     const a = await receipt(ctx, 460, '2026-09-20')
     const b = await receipt(ctx, 250, '2026-09-28')
     const c = await receipt(ctx, 125.75, '2026-09-29')
     const t = await bankRow(ctx, 835.75, '2026-09-30')
     const r = await reconcileDeposits(ctx.landlordId)
-    expect(r.inferred).toBe(1)
+    expect(r.slips).toBe(0)
+    expect((await txnOf(t)).status).toBe('needs_review')
+    expect((await db.query(`SELECT 1 FROM bank_deposit_slips WHERE bank_transaction_id = $1`, [t])).rowCount).toBe(0)
+    const p = await cashProposalFor(db, ctx.landlordId, { amount: 835.75, posted_date: '2026-09-30' })
+    expect(p.kind).toBe('everything')
+    expect(p.items.map(i => i.id).sort()).toEqual([a.id, b.id, c.id].sort())
+    // The person accepts it ("Make a bank deposit", the proposal's Match it).
+    await createSlip({
+      landlordId: ctx.landlordId, depositDate: '2026-09-30', receiptIds: p.items.map(i => i.id),
+      expectedTotal: 835.75, bankTransactionId: t, createdBy: ctx.userId,
+    })
     expect((await txnOf(t)).status).toBe('matched')
     const slip = (await db.query(
-      `SELECT id, source, status, total::float AS total, created_by FROM bank_deposit_slips WHERE bank_transaction_id = $1`, [t])).rows[0]
-    expect(slip).toMatchObject({ source: 'inferred', status: 'matched', total: 835.75, created_by: null })
-    const items = (await db.query(`SELECT remittance_id FROM bank_deposit_slip_items WHERE slip_id = $1`, [slip.id])).rows
-    expect(items.map((i: any) => i.remittance_id).sort()).toEqual([a.id, b.id, c.id].sort())
+      `SELECT source, status, total::float AS total, created_by FROM bank_deposit_slips WHERE bank_transaction_id = $1`, [t])).rows[0]
+    expect(slip).toMatchObject({ source: 'staff', status: 'matched', total: 835.75, created_by: ctx.userId })
   })
 
-  it('exactly one combination within 10 days matches; anything else waits with the closest proposal', async () => {
+  it('exactly one combination within 10 days is proposed (never matched by itself); anything else waits with the closest proposal', async () => {
     // One combination: 300 + 125 = 425 (the 460 is too big; the 90 from 3 weeks ago is outside the window).
     const one = await build()
     await receipt(one, 90, '2026-09-05')
@@ -193,11 +204,11 @@ describe('the bank row arrives', () => {
     const r125 = await receipt(one, 125, '2026-09-27')
     await receipt(one, 460, '2026-09-28')
     const t1 = await bankRow(one, 425, '2026-09-30')
-    expect((await reconcileDeposits(one.landlordId)).inferred).toBe(1)
-    const items = (await db.query(
-      `SELECT i.remittance_id FROM bank_deposit_slip_items i JOIN bank_deposit_slips s ON s.id = i.slip_id
-        WHERE s.bank_transaction_id = $1`, [t1])).rows.map((x: any) => x.remittance_id).sort()
-    expect(items).toEqual([r300.id, r125.id].sort())
+    await reconcileDeposits(one.landlordId)
+    expect((await txnOf(t1)).status).toBe('needs_review')
+    const p1 = await cashProposalFor(db, one.landlordId, { amount: 425, posted_date: '2026-09-30' })
+    expect(p1.kind).toBe('one')
+    expect(p1.items.map(i => i.id).sort()).toEqual([r300.id, r125.id].sort())
 
     // Two combinations (100+50 and 75+75): waits, with one proposed.
     const two = await build()
@@ -207,7 +218,7 @@ describe('the bank row arrives', () => {
     await receipt(two, 75, '2026-09-28')
     await receipt(two, 400, '2026-09-28')
     const t2 = await bankRow(two, 150, '2026-09-30')
-    expect((await reconcileDeposits(two.landlordId)).inferred).toBe(0)
+    await reconcileDeposits(two.landlordId)
     expect((await txnOf(t2)).status).toBe('needs_review')
     const p2 = await cashProposalFor(db, two.landlordId, { amount: 150, posted_date: '2026-09-30' })
     expect(p2.kind).toBe('several')
@@ -219,7 +230,7 @@ describe('the bank row arrives', () => {
     await receipt(none, 100, '2026-09-26')
     await receipt(none, 60, '2026-09-27')
     const t3 = await bankRow(none, 150, '2026-09-30')
-    expect((await reconcileDeposits(none.landlordId)).inferred).toBe(0)
+    await reconcileDeposits(none.landlordId)
     expect((await txnOf(t3)).status).toBe('needs_review')
     const p3 = await cashProposalFor(db, none.landlordId, { amount: 150, posted_date: '2026-09-30' })
     expect(p3.kind).toBe('closest')
@@ -227,14 +238,16 @@ describe('the bank row arrives', () => {
     expect(p3.note).toMatch(/The closest is \$100\.00 — \$50\.00 short/)
   })
 
-  it('a Wells Fargo branch deposit, written with its time and street, is the office’s cash', async () => {
+  it('a Wells Fargo branch deposit, written with its time and street, is proposed as the office’s cash', async () => {
     const ctx = await build()
     await receipt(ctx, 460, '2026-09-14')
     await receipt(ctx, 323.39, '2026-09-15')
     const t = await bankRow(ctx, 783.39, '2026-09-15',
       'EDEPOSIT IN BRANCH 09/15/26 02:31:45 PM 123 W CONTINENTAL RD GREEN VALLEY AZ')
-    expect((await reconcileDeposits(ctx.landlordId)).inferred).toBe(1)
-    expect((await txnOf(t)).status).toBe('matched')
+    await reconcileDeposits(ctx.landlordId)
+    expect((await txnOf(t)).status).toBe('needs_review')
+    expect(namesAPayer(normalizeMerchant('EDEPOSIT IN BRANCH 09/15/26 02:31:45 PM 123 W CONTINENTAL RD GREEN VALLEY AZ'))).toBe(false)
+    expect((await cashProposalFor(db, ctx.landlordId, { amount: 783.39, posted_date: '2026-09-15' })).kind).toBe('everything')
   })
 
   it('DEPOSIT MADE IN A BRANCH/STORE is the office’s cash', async () => {
@@ -245,16 +258,19 @@ describe('the bank row arrives', () => {
     await receipt(ctx, 460, '2026-09-28')
     await receipt(ctx, 125.5, '2026-09-29')
     const t = await bankRow(ctx, 585.5, '2026-09-30', 'DEPOSIT MADE IN A BRANCH/STORE CHECK')
-    expect((await reconcileDeposits(ctx.landlordId)).inferred).toBe(1)
-    expect((await txnOf(t)).status).toBe('matched')
+    await reconcileDeposits(ctx.landlordId)
+    expect((await txnOf(t)).status).toBe('needs_review')
+    expect(namesAPayer(normalizeMerchant('DEPOSIT MADE IN A BRANCH/STORE CHECK'))).toBe(false)
+    expect((await cashProposalFor(db, ctx.landlordId, { amount: 585.5, posted_date: '2026-09-30' })).kind).toBe('everything')
   })
 
   it('a deposit whose memo names a payer is never taken for the office’s cash', async () => {
     const ctx = await build()
     await receipt(ctx, 48.39, '2026-09-30')
     const t = await bankRow(ctx, 48.39, '2026-10-01', 'Square Inc       SQ261001   261001 T3H80F2ZQ67M')
-    expect((await reconcileDeposits(ctx.landlordId)).inferred).toBe(0)
+    await reconcileDeposits(ctx.landlordId)
     expect((await txnOf(t)).status).toBe('needs_review')
+    expect(namesAPayer(normalizeMerchant('Square Inc       SQ261001   261001 T3H80F2ZQ67M'))).toBe(true)
   })
 
   it('a slip with a same-amount reported deposit goes to review', async () => {
@@ -268,7 +284,7 @@ describe('the bank row arrives', () => {
        VALUES ($1,$2,$3,250,'2026-09-29','cash')`, [t2.tenantId, t2.leaseId, ctx.landlordId])
     const t = await bankRow(ctx, 250, '2026-09-29')
     const r = await reconcileDeposits(ctx.landlordId)
-    expect(r.slips + r.declared + r.inferred + r.autoSettled).toBe(0)
+    expect(r.slips).toBe(0)
     expect((await txnOf(t)).status).toBe('needs_review')
     expect((await slipOf(slip.id)).status).toBe('open')
   })
@@ -284,7 +300,7 @@ describe('the bank row arrives', () => {
       [b.unitId, b.leaseId, b.tenantId, ctx.landlordId])).rows[0].id
     const t = await bankRow(ctx, 815, '2026-09-30')
     const r = await reconcileDeposits(ctx.landlordId)
-    expect(r.slips + r.autoSettled).toBe(0)
+    expect(r.slips).toBe(0)
     expect((await txnOf(t)).status).toBe('needs_review')
     expect((await slipOf(slip.id)).status).toBe('open')
     expect((await db.query(`SELECT status FROM payments WHERE id = $1`, [rent])).rows[0].status).toBe('pending')
@@ -362,6 +378,31 @@ describe('flags and undo', () => {
     expect((await slipOf(slip.id)).status).toBe('void')
   })
 
+  it('10/12 (Nic) review: a slip-matched deposit the owner ignored comes back MATCHED when the Ignore is undone — never filed or confirmed a second time', async () => {
+    const ctx = await build()
+    const a = await receipt(ctx, 460, '2026-09-25')
+    const slip = await createSlip({ landlordId: ctx.landlordId, depositDate: '2026-09-28', receiptIds: [a.id], createdBy: ctx.userId })
+    const t = await bankRow(ctx, 460, '2026-09-29')
+    await reconcileDeposits(ctx.landlordId)
+    expect((await txnOf(t)).status).toBe('matched')
+    await ignoreTransaction(ctx.landlordId, t)
+    expect((await txnOf(t)).status).toBe('ignored')
+    const back = await undoFiling(ctx.landlordId, t, { undoneBy: ctx.userId })
+    expect(back).toMatchObject({ kind: 'ignored', status: 'matched' })
+    const row = await txnOf(t)
+    expect(row.status).toBe('matched')
+    expect(row.auto_settle_undo.kind).toBe('deposit_slip')
+    expect((await slipOf(slip.id)).status).toBe('matched')
+    // Filing it as income would count the deposit a second time: refused.
+    await expect(categorizeTransaction(ctx.landlordId, t, { category: 'other', scopeKind: 'property_common', propertyId: ctx.propertyId } as any))
+      .rejects.toMatchObject({ statusCode: 409 })
+    expect((await db.query(`SELECT COUNT(*)::int AS n FROM landlord_other_income WHERE landlord_id = $1 AND status = 'active'`,
+      [ctx.landlordId])).rows[0].n).toBe(0)
+    // The slip's own Undo still works on it.
+    const undone = await undoDepositMatch({ bankTransactionId: t, landlordId: ctx.landlordId, undoneBy: ctx.userId })
+    expect(undone).toMatchObject({ kind: 'deposit_slip', slipReopened: true })
+  })
+
   it('a matched slip cannot be voided — the match is undone first', async () => {
     const ctx = await build()
     const a = await receipt(ctx, 70, '2026-09-25')
@@ -373,32 +414,80 @@ describe('flags and undo', () => {
 })
 
 describe('Step 12 review: the bank changes its mind, and two hands at once', () => {
-  it('when the bank voids a deposit matched to a slip, the owner is told the office’s deposit never came in', async () => {
+  // 10/13 evening (Nic): "Bank takes back a bounced deposit that was MATCHED to income: void what
+  // bounced." (10/13 review) GAM has no way yet to take back a payment recorded at the desk, so a bag
+  // with payments in it is left whole for the owner — its other money too (voiding only that would
+  // treat money from one bag two ways); the owner is told, as before, and Undo still works.
+  it('when the bank voids a deposit matched to a slip with payments in it, nothing is taken back by itself — the owner is told the office’s deposit never came in', async () => {
     const ctx = await build()
     const a = await receipt(ctx, 460, '2026-09-25')
     const b = await receipt(ctx, 75, '2026-09-26')
     const slip = await createSlip({
       landlordId: ctx.landlordId, depositDate: '2026-09-28', receiptIds: [a.id, b.id], createdBy: ctx.userId,
+      otherAmount: 20, otherNote: 'Laundry coins', otherIsNotRent: true,
     })
     await upsertTransactions(ctx.connectionId, ctx.landlordId, [
-      { externalId: 'bag_1', postedDate: '2026-09-29', amount: 535, description: 'BRANCH DEPOSIT' },
+      { externalId: 'bag_1', postedDate: '2026-09-29', amount: 555, description: 'BRANCH DEPOSIT' },
     ])
     expect((await slipOf(slip.id)).status).toBe('matched')
+    const income = (await db.query(`SELECT id, status FROM landlord_other_income WHERE landlord_id = $1`, [ctx.landlordId])).rows
+    expect(income.map((i: any) => i.status)).toEqual(['active'])
     await upsertTransactions(ctx.connectionId, ctx.landlordId, [
-      { externalId: 'bag_1', postedDate: '2026-09-29', amount: 535, description: 'BRANCH DEPOSIT', status: 'void' },
+      { externalId: 'bag_1', postedDate: '2026-09-29', amount: 555, description: 'BRANCH DEPOSIT', status: 'void' },
     ])
+    // Nothing taken back by itself: the slip stays matched, its other money and its payments as they were.
+    expect((await slipOf(slip.id)).status).toBe('matched')
+    expect((await db.query(`SELECT status FROM landlord_other_income WHERE id = $1`, [income[0].id])).rows[0].status).toBe('active')
+    expect((await db.query(`SELECT status FROM tenant_remittances WHERE id = ANY($1::uuid[]) ORDER BY amount`, [[a.id, b.id]])).rows
+      .map((r: any) => r.status)).toEqual(['settled', 'settled'])
+    const t = (await db.query(`SELECT id, status, bank_status FROM bank_transactions WHERE external_id = 'bag_1'`)).rows[0]
+    expect({ status: t.status, bank_status: t.bank_status }).toEqual({ status: 'matched', bank_status: 'void' })
     const n = (await db.query(`SELECT title, body, action_url FROM notifications WHERE user_id = $1 AND type = 'bank_deposit_voided'`,
       [ctx.userId])).rows
     expect(n).toEqual([{
       title: 'Your bank voided an office deposit',
-      body: 'Your bank voided the $535.00 deposit of 2026-09-29 that was matched to your deposit slip of 2026-09-28 (2 payments) — the money did not come in. ' +
+      body: 'Your bank voided the $555.00 deposit of 2026-09-29 that was matched to your deposit slip of 2026-09-28 (2 payments) — the money did not come in. ' +
         'Find out what happened to that bag. Then open the deposit on the Bank page and press Undo, so those payments show as not banked again.',
       action_url: '/bank',
     }])
     // Undo still works on the voided row, and the payments are waiting to be banked again.
-    const t = (await db.query(`SELECT id FROM bank_transactions WHERE external_id = 'bag_1'`)).rows[0].id
-    await undoDepositMatch({ bankTransactionId: t, landlordId: ctx.landlordId, undoneBy: ctx.userId })
+    await undoDepositMatch({ bankTransactionId: t.id, landlordId: ctx.landlordId, undoneBy: ctx.userId })
     expect((await slipOf(slip.id)).status).toBe('open')
+  })
+
+  // The question's own example ("say $200 of laundry cash"): a bag of other money alone is taken back by
+  // itself — the income it was filed as is voided (kept on record), the slip is open again for the bag.
+  it('when the bank voids a deposit matched to a slip of other money alone, that money is voided by itself and the owner is told', async () => {
+    const ctx = await build()
+    const slip = await createSlip({
+      landlordId: ctx.landlordId, depositDate: '2026-09-28', createdBy: ctx.userId, propertyIds: [ctx.propertyId],
+      otherAmount: 200, otherNote: 'Laundry cash', otherIsNotRent: true,
+    })
+    await upsertTransactions(ctx.connectionId, ctx.landlordId, [
+      { externalId: 'bag_2', postedDate: '2026-09-29', amount: 200, description: 'BRANCH DEPOSIT' },
+    ])
+    expect((await slipOf(slip.id)).status).toBe('matched')
+    const income = (await db.query(`SELECT id, status FROM landlord_other_income WHERE landlord_id = $1`, [ctx.landlordId])).rows
+    expect(income.map((i: any) => i.status)).toEqual(['active'])
+    await upsertTransactions(ctx.connectionId, ctx.landlordId, [
+      { externalId: 'bag_2', postedDate: '2026-09-29', amount: 200, description: 'BRANCH DEPOSIT', status: 'void' },
+    ])
+    // The income it was filed as is voided — kept on record.
+    expect((await db.query(`SELECT status, voided_at IS NOT NULL AS voided FROM landlord_other_income WHERE id = $1`, [income[0].id])).rows[0])
+      .toEqual({ status: 'voided', voided: true })
+    // The slip is open again for the bag; the line is set aside as the bank's void.
+    expect((await slipOf(slip.id)).status).toBe('open')
+    const line = (await db.query(`SELECT status, ignored_reason, landlord_other_income_id FROM bank_transactions WHERE external_id = 'bag_2'`)).rows[0]
+    expect(line).toEqual({ status: 'ignored', ignored_reason: 'bank_void', landlord_other_income_id: null })
+    const n = (await db.query(`SELECT title, body, action_url FROM notifications WHERE user_id = $1 AND type = 'bank_deposit_voided'`,
+      [ctx.userId])).rows
+    expect(n).toEqual([{
+      title: 'Your bank took back an office deposit',
+      body: 'Your bank voided the $200.00 deposit of Sep 29, 2026 that was matched to your deposit slip of Sep 28, 2026 — the money did not come in. ' +
+        'GAM voided the $200.00 (Laundry cash) it was filed as; it stays on record as voided. ' +
+        'The slip is open again for the deposit when it reaches the bank. Find out what happened to that deposit.',
+      action_url: '/bank',
+    }])
   })
 
   it('a person matching a slip while the sync holds the same deposit waits its turn — never a deadlock', async () => {

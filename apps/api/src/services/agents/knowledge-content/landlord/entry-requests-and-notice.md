@@ -20,4 +20,4 @@ When a request is generated, the tenant is notified with the reason, the propose
 - **Breached** — the recorded entry fell outside the window, or happened without a grant.
 - **Cancelled** — a request can be cancelled before the entry is recorded, and stale requests auto-cancel.
 
-Recording the actual entry closes the loop and timestamps that the visit happened as noticed. How much notice is required, and your rights around entry, depend on your local law — GAM surfaces general warnings, but check your local rules for your property.
+Recording the actual entry closes the loop and timestamps that the visit happened as noticed. How much notice is required, and your rights around entry, depend on your local law — GAM keeps the record of what notice you gave and how the tenant answered, and leaves the law itself to you. Read your local rules for your property, or ask your own counsel if you are unsure.

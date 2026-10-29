@@ -999,7 +999,9 @@ describe('POST /documents/:id/send', () => {
 // ─── POST /documents/:id/void ──────────────────────────────────
 
 describe('POST /documents/:id/void', () => {
-  it('happy path: void unsent draft document', async () => {
+  // 10/13 (Nic): "If it never completed, it doesn't exist." An unsent draft
+  // nothing touched is erased (lib/eraseUnfinishedDocument), not voided.
+  it('happy path: an unsent draft is erased, with its signers', async () => {
     const f = await seedFixture()
     const { documentId } = await seedDoc(f, { status: 'sent' })
     const res = await request(buildApp())
@@ -1007,6 +1009,23 @@ describe('POST /documents/:id/void', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ reason: 'Typo in unit number' })
     expect(res.status).toBe(200)
+    expect(res.body.data.deleted).toBe(true)
+    const row = await db.query(`SELECT 1 FROM lease_documents WHERE id = $1`, [documentId])
+    expect(row.rows).toHaveLength(0)
+    const signers = await db.query(`SELECT 1 FROM lease_document_signers WHERE document_id = $1`, [documentId])
+    expect(signers.rows).toHaveLength(0)
+  })
+
+  it('happy path: a document that issued a lease is voided, with the reason given', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedDoc(f, { status: 'sent' })
+    await db.query(`UPDATE lease_documents SET issued_at = NOW() WHERE id = $1`, [documentId])
+    const res = await request(buildApp())
+      .post(`/api/esign/documents/${documentId}/void`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ reason: 'Typo in unit number' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.deleted).toBe(false)
     const row = await db.query<{ status: string; void_reason: string }>(
       `SELECT status, void_reason FROM lease_documents WHERE id = $1`, [documentId],
     )
@@ -1037,11 +1056,17 @@ describe('POST /documents/:id/void', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({})
     expect(res.status).toBe(200)
-    const doc = await db.query<{ status: string }>(`SELECT status FROM lease_documents WHERE id=$1`, [documentId])
-    expect(doc.rows[0].status).toBe('voided')
+    // 10/13: it never issued, so nothing touched it — erased, not voided.
+    expect(res.body.data.deleted).toBe(true)
+    const doc = await db.query(`SELECT 1 FROM lease_documents WHERE id=$1`, [documentId])
+    expect(doc.rows).toHaveLength(0)
   })
 
-  it('S558: rejects voiding once a TENANT has signed (409 → supersede)', async () => {
+  // 10/14 (Nic, #2): "One co-tenant signed, other never, nothing billed: may
+  // be deleted." A tenant's signature alone no longer keeps a document; one
+  // whose lease billed the household is still refused (supersede) —
+  // lib/eraseUnfinishedDocument.test.
+  it('S558 → 10/14 #2: a document a TENANT signed that billed nobody is deleted, not refused', async () => {
     const f = await seedFixture()
     const { documentId } = await seedDoc(f, { status: 'in_progress', landlordSignerStatus: 'signed' })
     // Both landlord and the primary tenant have signed.
@@ -1053,8 +1078,9 @@ describe('POST /documents/:id/void', () => {
       .post(`/api/esign/documents/${documentId}/void`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({})
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/superseding/)
+    expect(res.status).toBe(200)
+    expect(res.body.data.deleted).toBe(true)
+    expect((await db.query(`SELECT 1 FROM lease_documents WHERE id = $1`, [documentId])).rows).toHaveLength(0)
   })
 
   it('cross-landlord rejected', async () => {
@@ -1351,6 +1377,28 @@ describe('GET /documents/:id', () => {
 
 // ─── GET /pending and /landlord-pending ────────────────────────
 
+/** A team member of this company, scoped to every property, holding exactly
+ *  these permissions — the kind of session that was polling the signing queue
+ *  all day. */
+async function staffToken(
+  f: SeedFixture,
+  role: 'property_manager' | 'onsite_manager',
+  permissions: Record<string, boolean>,
+): Promise<string> {
+  const u = await db.query<{ id: string }>(
+    `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+     VALUES ($1,'x',$2,'Team','Member',TRUE) RETURNING id`,
+    [`${role}-${randomUUID()}@test.dev`, role])
+  const table = role === 'property_manager' ? 'property_manager_scopes' : 'onsite_manager_scopes'
+  await db.query(
+    `INSERT INTO ${table} (user_id, landlord_id, all_properties) VALUES ($1,$2,TRUE)`,
+    [u.rows[0].id, f.landlordId])
+  return jwt.sign(
+    { userId: u.rows[0].id, role, email: 'team@test.dev', profileId: null,
+      landlordId: f.landlordId, permissions },
+    process.env.JWT_SECRET!, { expiresIn: '10m' })
+}
+
 describe('GET /pending — tenant pending list', () => {
   it('shows documents where signer.status IN (sent, viewed) and doc not terminal', async () => {
     const f = await seedFixture()
@@ -1398,6 +1446,35 @@ describe('GET /landlord-pending — landlord pending list', () => {
     const res = await request(buildApp())
       .get('/api/esign/landlord-pending')
       .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.body.data).toEqual([])
+  })
+
+  // 10/17 (Nic): "Yes, fix it." The register clerk's browser asked for this
+  // queue every 30 seconds and was refused every time — 2,389 refusals in one
+  // day, burying the ones that meant something. The refusal itself is right and
+  // stays right: who may sign is who may read the queue, and a document never
+  // names anyone else (services/leaseSigner). The banner is what changed — it
+  // asks only when the account holds Sign leases (Layout.tsx). These two pin
+  // the rule the screen now mirrors, so the poll can never come back for a
+  // person the door will turn away.
+  it('a company\'s on-site staff may not read the signing queue', async () => {
+    const f = await seedFixture()
+    await seedDoc(f, { status: 'sent', landlordSignerStatus: 'sent' })
+    const res = await request(buildApp())
+      .get('/api/esign/landlord-pending')
+      .set('Authorization', `Bearer ${await staffToken(f, 'onsite_manager', { 'pos.ring_sale': true })}`)
+    expect(res.status).toBe(403)
+  })
+
+  it('a manager who may sign reads their own queue', async () => {
+    const f = await seedFixture()
+    await seedDoc(f, { status: 'sent', landlordSignerStatus: 'sent' })
+    const res = await request(buildApp())
+      .get('/api/esign/landlord-pending')
+      .set('Authorization', `Bearer ${await staffToken(f, 'property_manager', { 'leases.sign': true })}`)
+    expect(res.status).toBe(200)
+    // The owner is the signer on this document, not the manager — the manager's
+    // own queue is empty, which is a queue, not a refusal.
     expect(res.body.data).toEqual([])
   })
 })

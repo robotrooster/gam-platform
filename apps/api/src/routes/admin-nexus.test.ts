@@ -3,6 +3,7 @@
  *   GET  /api/admin/nexus/dashboard  (super_admin) — read model
  *   POST /api/admin/nexus/recompute  (super_admin) — manual tally rebuild
  *   POST /api/admin/nexus/register   (super_admin) — flip collection gate + audit
+ *   POST /api/admin/nexus/measure-rule (super_admin) — what a state measures + audit
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import express from 'express'
@@ -27,6 +28,7 @@ async function clearCatalog() {
   await db.query('DELETE FROM state_tax_registrations')
   await db.query('DELETE FROM state_nexus_thresholds')
   await db.query('DELETE FROM state_screening_tax_rates')
+  await db.query('DELETE FROM state_nexus_measure_rules')
 }
 
 async function tokens() {
@@ -100,6 +102,70 @@ describe('POST /api/admin/nexus/register', () => {
       .set('Authorization', `Bearer ${superAdminToken}`)
       .send({ stateCode: 'TEXAS', registered: true })
     expect(res.status).toBeGreaterThanOrEqual(400)
+  })
+})
+
+// 10/17 (Nic): "if that state's not counting some of those, where are we
+// really at?" — recording a state's own measurement rule.
+describe('POST /api/admin/nexus/measure-rule', () => {
+  it('records what a state does not measure and writes an audit row', async () => {
+    const { superAdminToken } = await tokens()
+    const res = await request(buildApp())
+      .post('/api/admin/nexus/measure-rule')
+      .set('Authorization', `Bearer ${superAdminToken}`)
+      .send({ stateCode: 'TX', counts: { markup: false }, notes: 'TX measures taxable sales only' })
+    expect(res.status).toBe(200)
+    const rule = (await db.query<{ counts_markup: boolean; counts_screening: boolean }>(
+      `SELECT counts_markup, counts_screening FROM state_nexus_measure_rules WHERE state_code='TX'`
+    )).rows[0]
+    expect(rule.counts_markup).toBe(false)
+    expect(rule.counts_screening).toBe(true)
+    const audit = (await db.query<{ n: string }>(
+      `SELECT COUNT(*) n FROM admin_action_log WHERE action_type='nexus_measure_rule'`
+    )).rows[0]
+    expect(Number(audit.n)).toBe(1)
+  })
+
+  // The route passes no year, so the service has to pick the one the page
+  // reads — otherwise the save silently lands on a row nothing ever reads.
+  it('saves the rule at the catalog year the dashboard reads', async () => {
+    const { superAdminToken } = await tokens()
+    await db.query(
+      `INSERT INTO state_nexus_thresholds (state_code, effective_year, revenue_threshold_usd, txn_threshold, count_rule, status)
+       VALUES ('TX',2025,500000,NULL,'revenue_only','research')`
+    )
+    const res = await request(buildApp())
+      .post('/api/admin/nexus/measure-rule')
+      .set('Authorization', `Bearer ${superAdminToken}`)
+      .send({ stateCode: 'TX', counts: { markup: false } })
+    expect(res.status).toBe(200)
+    const rows = (await db.query<{ effective_year: number }>(
+      `SELECT effective_year FROM state_nexus_measure_rules WHERE state_code='TX'`
+    )).rows
+    expect(rows.map((r) => r.effective_year)).toEqual([2025])
+
+    const dash = await request(buildApp())
+      .get('/api/admin/nexus/dashboard')
+      .set('Authorization', `Bearer ${superAdminToken}`)
+    expect(dash.body.data.states.find((s: any) => s.stateCode === 'TX').measureRule.countsMarkup).toBe(false)
+  })
+
+  it('rejects a line item nobody has defined', async () => {
+    const { superAdminToken } = await tokens()
+    const res = await request(buildApp())
+      .post('/api/admin/nexus/measure-rule')
+      .set('Authorization', `Bearer ${superAdminToken}`)
+      .send({ stateCode: 'TX', counts: { rent: false } })
+    expect(res.status).toBeGreaterThanOrEqual(400)
+  })
+
+  it('rejects a non-super-admin', async () => {
+    const { landlordToken } = await tokens()
+    const res = await request(buildApp())
+      .post('/api/admin/nexus/measure-rule')
+      .set('Authorization', `Bearer ${landlordToken}`)
+      .send({ stateCode: 'TX', counts: { markup: false } })
+    expect(res.status).toBe(403)
   })
 })
 

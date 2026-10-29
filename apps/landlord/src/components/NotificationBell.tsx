@@ -21,6 +21,10 @@ const TYPE_ROUTES: Record<string, string> = {
   tenant_invite_accepted:   '/tenants',
   work_trade_reminder:      '/work-trade',
   bulk_message:             '/dashboard',
+  // 10/12 (Nic): the morning home-sale start (services/homeSale) — the signed
+  // installment contract lives on GoldSign.
+  home_sale_started:        '/esign',
+  home_sale_not_started:    '/esign',
 }
 
 const TYPE_ICONS: Record<string, string> = {
@@ -37,6 +41,8 @@ const TYPE_ICONS: Record<string, string> = {
   tenant_invite_accepted:'👤',
   work_trade_reminder:  '⚡',
   bulk_message:         '📢',
+  home_sale_started:    '🏠',
+  home_sale_not_started:'⚠️',
 }
 
 function timeAgo(date: string) {

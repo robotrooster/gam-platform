@@ -37,8 +37,20 @@ export async function draftLeaseFromApplication(
     applicantUserId: app.applicant_user_id,
     landlordScope: [app.landlord_id],
     startDate: app.move_in_date || null,
-    termMonths: Number(app.desired_term_months) > 0 ? Math.trunc(Number(app.desired_term_months)) : null,
-    monthToMonth: !(Number(app.desired_term_months) > 0),
+    // ── 10/24 (Nic, DIRECTIVE) — SAME RULE AS THE SCREENING DOOR ─────────────
+    //
+    //   "The 3 months becomes a note, not a contract term, and every drafted
+    //    lease starts month to month with no end date."
+    //
+    // The applicant's desired_term_months is their own guess on the application
+    // form. It used to be handed through as the lease term, which computed a
+    // hard month-end end date and set lease_type = 'fixed_term' — the same
+    // defect that put a 2027-01-31 end date on James Fenton's RV 15 lease via
+    // the screening door (routes/background draftLeaseForApprovedCheck). Both
+    // doors now draft month-to-month; the number stays on unit_applications,
+    // which is where the follow-up prompt reads it from.
+    termMonths: null,
+    monthToMonth: true,
     actorUserId: actorUserId ?? null,
   })
   logger.info({ applicationId, documentId: out.documentId }, '[application-lease-draft] packet drafted from application')

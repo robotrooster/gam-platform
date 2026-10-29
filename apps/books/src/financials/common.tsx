@@ -6,16 +6,28 @@
  */
 import { useState, type ReactNode } from 'react'
 import { useQuery } from 'react-query'
+import { RENT_ROLL_STAY_UNITS, stayQuantityText, type RentRollStayUnit } from '@gam/shared'
 import { finGet } from './adapter'
 import './financials.css'
 
-export interface FinProperty { id: string; name: string; landlordId: string }
+export interface FinProperty {
+  id: string; name: string; landlordId: string
+  /** 10/12 (Nic): a property sold or moved out while a bookkeeper kept it — the
+   *  last day its history is theirs (read only). null on a current property. */
+  leftOn?: string | null
+}
 export interface FinScope {
   viewer: 'owner' | 'bookkeeper'
   canRemoveExpenses: boolean
-  wholeCompany: boolean
+  /** 10/12 (Nic): the company-wide box — the bank account, payouts and payroll. */
+  companyWide: boolean
   companies: Array<{ id: string; name: string }>
   properties: FinProperty[]
+}
+
+/** 10/12: a property's name, and for a former one the last day its history is shown. */
+export function propertyLabel(p: FinProperty): string {
+  return p.leftOn ? `${p.name} (left ${dayName(p.leftOn)}, history only)` : p.name
 }
 
 /** Who is looking and which properties they keep (GET /financials/scope). */
@@ -47,6 +59,28 @@ export function instantDay(ts: string | null | undefined): string {
   const d = new Date(ts)
   return isNaN(d.getTime()) ? '—' : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
 }
+/**
+ * 10.6 → "10.6", 4 → "4". How many went out: gallons and kilowatt-hours come
+ * with decimals, so three of them are kept and trailing zeros are not printed.
+ */
+export function count(n: unknown): string {
+  const v = Number(n)
+  if (n == null || !isFinite(v)) return '—'
+  return v.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 3 })
+}
+
+/**
+ * How many of a sold item went out: "3 months" for something sold by the night,
+ * week or month, "10.6" for anything sold by a quantity of its own. 10/19: on
+ * both pages that print what was sold (Sales & tax, and Money in), so an item
+ * reads the same way on each.
+ */
+export function soldQuantity(qty: number, unit: string | null): string {
+  return unit && (RENT_ROLL_STAY_UNITS as readonly string[]).includes(unit)
+    ? stayQuantityText(qty, unit as RentRollStayUnit)
+    : count(qty)
+}
+
 const pad = (n: number) => String(n).padStart(2, '0')
 const ymdOf = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 
@@ -92,7 +126,7 @@ export function PropertyPicker({ value, onChange, properties }: {
       <span className="fin-field-label">Property</span>
       <select className="form-input fin-select" value={value} onChange={e => onChange(e.target.value)}>
         <option value="">All properties</option>
-        {properties.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+        {properties.map(p => <option key={p.id} value={p.id}>{propertyLabel(p)}</option>)}
       </select>
     </label>
   )
@@ -136,4 +170,28 @@ export function PageHead({ title, subtitle }: { title: string; subtitle: string 
 
 export function Notice({ children }: { children: ReactNode }) {
   return <div className="card fin-notice">{children}</div>
+}
+
+// ── Export ──────────────────────────────────────────────────────────────
+/**
+ * A spreadsheet of `rows` under `header`, saved to the viewer's device. 10/17:
+ * moved here from the Reports page — a Sales & tax breakdown is attached to a
+ * tax filing, so both pages save a spreadsheet the one same way.
+ */
+export function downloadCsv(filename: string, header: string[], rows: (string | number | null | undefined)[][]) {
+  // 10/12: a field that starts like a formula is opened as one by a
+  // spreadsheet (a resident named "=HYPERLINK(…)"), so it reads as text.
+  const esc = (v: any) => {
+    const raw = v == null ? '' : String(v)
+    const s = typeof v === 'string' && /^[=+\-@\t\r]/.test(v) ? `'${raw}` : raw
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+  }
+  const csv = [header, ...rows].map(r => r.map(esc).join(',')).join('\r\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
 }

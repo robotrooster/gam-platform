@@ -21,6 +21,7 @@ import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import { errorHandler } from '../middleware/errorHandler'
 import * as stripeConnect from '../services/stripeConnect'
@@ -80,14 +81,16 @@ async function fixture() {
     // cannot hand to the landlord. Tenant-payer matches the previous
     // no-rule default (null → tenant pays).
     await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
-    // platform_processing_rates survives cleanupAllSchema — guard the insert so
-    // repeated runs don't stack rows.
-    await client.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent,
-          stripe_cost_flat, stripe_cost_percent)
-       SELECT 'ach', 6, 0, 0, 0.5
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'ach')`)
+    // 10/17: the ACH rate every figure in this file is worked out on, STATED
+    // rather than seeded-if-missing — one row is open per method and
+    // cleanupAllSchema leaves the rate card alone, so an insert-if-missing took
+    // whatever an earlier file left open.
+    await setEffectiveProcessingRate(client, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 6, customerFacingPercent: 0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: 's537-payment-fifo.test.ts ACH rate',
+    })
     const unitId = await seedUnit(client, { propertyId, landlordId: ll.landlordId, withLateFeeDecision: true })
     const tenantId = await seedTenant(client)
     const tu = await client.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [tenantId])
@@ -399,27 +402,12 @@ describe('S581 POST /payments/pay-balance — per-lease charges', () => {
 describe('S539 GET /payments/remittances — per-line application display', () => {
   it('returns lines oldest-first with charge context (full-balance payment)', async () => {
     const f = await fixture()
-    // Settling a RENT row runs the allocation engine — it needs an
-    // allocation rule + active processing rate (unlike the fee-only
-    // pay-ahead test above).
-    {
-      const client = await db.connect()
-      try {
-        await client.query('BEGIN')
-        // (allocation rule + ACH rate now come from fixture() — S609)
-        // platform_processing_rates survives cleanupAllSchema — guard the
-        // insert (suite convention) so repeated runs don't stack rows.
-        await client.query(
-          `INSERT INTO platform_processing_rates
-             (payment_method, customer_facing_flat, customer_facing_percent,
-              stripe_cost_flat, stripe_cost_percent)
-           SELECT 'ach', 0, 1, 0, 0.5
-            WHERE NOT EXISTS (
-              SELECT 1 FROM platform_processing_rates
-               WHERE payment_method = 'ach' AND effective_until IS NULL)`)
-        await client.query('COMMIT')
-      } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
-    }
+    // Settling a RENT row runs the allocation engine — it needs an allocation rule
+    // and an open processing rate (unlike the fee-only pay-ahead test above).
+    // Both come from fixture(), which states the $6 flat ACH rate. 10/17: a
+    // second insert-if-missing of a 1% rate stood here and never once ran,
+    // because fixture() had already opened the $6 row; removed rather than
+    // turned into a statement, which WOULD have changed this test's rate.
     await seedCharge(f, 'late_fee', 60, '2026-06-06')
     await seedCharge(f, 'rent', 440, '2026-07-01')
 

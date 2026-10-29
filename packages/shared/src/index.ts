@@ -92,10 +92,30 @@ export const LANDLORD_ASSIGNABLE_ROLES = [
 export type LandlordAssignableRole = typeof LANDLORD_ASSIGNABLE_ROLES[number]
 export const LANDLORD_ASSIGNABLE_ROLE_LABEL: Record<LandlordAssignableRole, string> = {
   property_manager: 'Property Manager',
-  onsite_manager:   'On-Site Manager',
+  // ── 10/25 (Nic) — NOT "MANAGER" ─────────────────────────────────────────
+  //
+  //   "Lisa is not the on-site manager. Lisa is front desk help... She is not
+  //    given permission to do leases. She's not given permission to do refunds,
+  //    various other things. Manager is not a word I would label with her
+  //    permission set."
+  //
+  // He is right, and her grants say so: reservations, check-in and check-out,
+  // the register, meter reads, the front desk page — and no leases, no refunds,
+  // no property editing. The word was GAM's, never his.
+  //
+  // The KEY stays `onsite_manager`: it names the scope container
+  // (onsite_manager_scopes) and the JWT claim, and renaming it would be a
+  // migration plus a couple of hundred permission checks for no change anybody
+  // can see. This label is what every screen, invite and email actually shows.
+  onsite_manager:   'Front Desk',
   maintenance:      'Maintenance',
   bookkeeper:       'Bookkeeper',
 }
+
+// 10/13 (Nic): "team invites expire after 24 HOURS (fix the email that says 7
+// days)". How long a team invitation's link works, from when it is sent or
+// resent. One number for the invite route, the email and the Team page.
+export const TEAM_INVITATION_TTL_HOURS = 24
 
 // ---------- Service-business operator roles (S453) ----------
 // Distinct from landlord-side roles. Service businesses (trash hauling,
@@ -669,6 +689,17 @@ export const OTHER_INCOME_CATEGORY_LABEL: Record<OtherIncomeCategory, string> = 
   sale_proceeds: 'Sale proceeds', owner_contribution: 'Owner contribution', interest: 'Interest earned',
   other: 'Other income',
 }
+/**
+ * 10/11 (Nic): money in that a bank line can be filed as but that is NOT
+ * income. An owner putting their own money into the business
+ * (owner_contribution) is not something the business earned, and the proceeds
+ * of selling an asset (sale_proceeds) are not operating income. Both stay
+ * filed and visible — Bank activity says what each line was filed as, and the
+ * P&L shows them beside the total on their own lines — but they never count
+ * toward income (services/incomeBasis reads this list).
+ */
+export const OTHER_INCOME_NOT_INCOME_CATEGORIES = ['owner_contribution', 'sale_proceeds'] as const satisfies readonly OtherIncomeCategory[]
+export type OtherIncomeNotIncomeCategory = typeof OTHER_INCOME_NOT_INCOME_CATEGORIES[number]
 
 // S570 (Nic): bank feed (Stripe Financial Connections). A landlord links their
 // operating bank read-only; transactions sync in and get categorized into the
@@ -732,24 +763,57 @@ export const BANK_TXN_MATCH_KIND_LABEL: Record<BankTxnMatchKind, string> = BANK_
 // property as a common cost, or to the property split across its units.
 export const MERCHANT_RULE_SCOPES = ['unit', 'property_common', 'property_allocate'] as const
 export type MerchantRuleScope = typeof MERCHANT_RULE_SCOPES[number]
+// 10/13 (Nic): "each expense is chosen on the split or specific unit or
+// property at the time of logging" — a bank line going OUT may also be split
+// across the company's properties by units (BOOKS_COST_PLACES). Filing only:
+// never kept on a merchant rule, and never pre-filled on a money-out line.
+export const BANK_FILING_SCOPES = [...MERCHANT_RULE_SCOPES, 'split_by_units'] as const
+export type BankFilingScope = typeof BANK_FILING_SCOPES[number]
 
-// S570 (Nic): notification types that are too important to silence. Email is
-// FORCED on for these regardless of the user's preference (they can't toggle it
-// off in the UI), because missing them causes real harm (a failed rent payment
-// slipping to a late fee / eviction clock). In-app is always on already.
-// S609: a failed AUTOPAY pull belongs here for the same reason. The tenant
-// believes their rent is handled and has no reason to check — silence is the
-// worst possible outcome, and it ends in a late fee they never saw coming.
-// S655 (decisions #35.7(c)): FlexPay's money notices always send too — FlexPay
-// ended (the next bill is the tenant's own), FlexPay paid the bill (and what is
-// still due on it), and a FlexPay collection being tried again (have the money
-// in the account by that day).
-export const CRITICAL_NOTIFICATION_TYPES = [
-  'payment_failed', 'autopay_failed', 'flexpay_ended', 'flexpay_bill_covered', 'flexpay_pull_retry',
-] as const
-export type CriticalNotificationType = typeof CRITICAL_NOTIFICATION_TYPES[number]
-export const isCriticalNotificationType = (t: string): boolean =>
-  (CRITICAL_NOTIFICATION_TYPES as readonly string[]).includes(t)
+// 10/20 (Nic): "We need a way to link the bank account once and have it be
+// everything." Where a linked bank CAME FROM, because it decides what GAM may
+// do with it and what the Bank page is allowed to claim.
+//   landlord_link       the landlord signed in to their bank on the Bank page.
+//                       Held by GAM's platform customer, so GAM reads it
+//                       directly and can mint the fee-debit method from it.
+//   connect_onboarding  the link came from step one, inside Stripe's Connect
+//                       onboarding. Held by the CONNECTED ACCOUNT: every Stripe
+//                       read of it must carry the Stripe-Account header, and the
+//                       platform cannot build a payment method from it. Step two
+//                       must not ask for it again.
+// Backs bank_connections.source (migration 20261021190000).
+export const BANK_CONNECTION_SOURCES = ['landlord_link', 'connect_onboarding'] as const
+export type BankConnectionSource = typeof BANK_CONNECTION_SOURCES[number]
+
+// The Financial Connections permissions GAM asks for, and the one that decides
+// whether a link can serve the feed at all. Stripe fixes permissions AT LINK
+// TIME — "account data accessible to you is limited to the data you specified in
+// this parameter" — so a link made without `transactions` can never be read for
+// them, however long GAM waits. It has to be granted again.
+export const FC_TRANSACTIONS_PERMISSION = 'transactions'
+export const FC_BALANCES_PERMISSION = 'balances'
+export const FC_PAYMENT_METHOD_PERMISSION = 'payment_method'
+
+/** Can the feed read transactions through this link? */
+export function fcCanReadTransactions(permissions: readonly string[] | null | undefined): boolean {
+  return (permissions ?? []).includes(FC_TRANSACTIONS_PERMISSION)
+}
+
+// 10/20: every notification GAM can send, with its label, its one-line "when it
+// fires", the audience whose settings page it belongs on, and which five are
+// too important to silence — all in ONE list. CRITICAL_NOTIFICATION_TYPES used
+// to live here as a hand-kept array beside hand-kept settings pages; it is now
+// derived from that catalog so the page, the delivery decision and the list of
+// locked types cannot drift apart again.
+export * from './notificationCatalog'
+
+// 10/20 (Nic): the OTHER road out. Every email in GAM goes through one send()
+// in services/email.ts, and about fifty of its callers never touch
+// createNotification — so the notification catalog alone left them with no
+// switch anywhere. Each category is declared in emailCategories as either a
+// notification the recipient can decline or a transactional email with the
+// reason it always goes, and send() reads that declaration.
+export * from './emailCategories'
 
 // S568 (Nic): home-ownership tracking (who owns a tenant-owned home/RV — the
 // economic sublessor). Backs home_ownerships (migration 20260730210000).
@@ -758,6 +822,70 @@ export type HomeOwnershipAcquiredVia = typeof HOME_OWNERSHIP_ACQUIRED_VIA[number
 export const HOME_OWNERSHIP_ACQUIRED_VIA_LABEL: Record<HomeOwnershipAcquiredVia, string> = {
   recorded: 'Recorded', sale: 'Sale', transfer: 'Transfer', financed_payoff: 'Financed payoff',
 }
+
+// 10/19 (Nic): unpaid SPACE RENT left behind on a tenant-owned home is carried
+// by the SPACE. "The rent is owed by the trailer because it was the same
+// trailer there. It doesn't matter how many people cycle in and out." Tied to
+// the spot rather than the home, because "there's no VIN numbers that the
+// landlord is going to have access to". Backs space_rent_carryforwards.status
+// (migration 20261021100000).
+export const SPACE_CARRYFORWARD_STATUSES = ['open', 'settled', 'voided'] as const
+export type SpaceCarryforwardStatus = typeof SPACE_CARRYFORWARD_STATUSES[number]
+export const SPACE_CARRYFORWARD_STATUS_LABEL: Record<SpaceCarryforwardStatus, string> = {
+  open:    'Still owed',
+  settled: 'Paid off',
+  voided:  'Taken off',
+}
+
+// What an arrangement asked for in one cycle. Nothing is fined when it is
+// missed — Nic dropped late fees on a carried balance outright, and the ask is
+// a record rather than a second charge.
+export const SPACE_CARRYFORWARD_INSTALLMENT_STATUSES = ['asked', 'met', 'missed'] as const
+export type SpaceCarryforwardInstallmentStatus = typeof SPACE_CARRYFORWARD_INSTALLMENT_STATUSES[number]
+export const SPACE_CARRYFORWARD_INSTALLMENT_STATUS_LABEL: Record<SpaceCarryforwardInstallmentStatus, string> = {
+  asked:  'Asked for this month',
+  met:    'Paid',
+  missed: 'Not paid (no late fee)',
+}
+
+/**
+ * What the one carried charge is CALLED on the new resident's bill. Nic: it
+ * must be "plainly attributable to the previous owner of the home" and never
+ * folded into their rent.
+ */
+export const SPACE_CARRYFORWARD_CHARGE_NOTE =
+  'Unpaid space rent left on this space by the previous owner of the home'
+
+/**
+ * 10/19 (Nic): what every screen showing a carried balance must say about it,
+ * in one place so the three surfaces cannot drift. Two promises were decided
+ * outright and a resident reading the line has to be able to rely on both:
+ *
+ *   "Jacob, it was not possible for him to be late. So I would say on a carry
+ *    forward balance like that, just in the nature of being reasonable, we drop
+ *    the late fees."
+ *   "Don't count it on his, you know, payment health history, his late fees …
+ *    that's carried forward as Rashawn's."
+ *
+ * Both are true by construction rather than by copy — the charge is on no
+ * invoice, so jobs/lateFees cannot reach it, and a carried_balance is outside
+ * payment health by type (householdMonths BASE_CHARGE_TYPES) — and this is the
+ * sentence that tells a landlord so before he sets an arrangement on it.
+ */
+export const SPACE_CARRYFORWARD_NO_LATE_FEE_NOTE =
+  'This balance never gets a late fee, and it is not part of the resident\'s payment history.'
+
+/**
+ * The question at the invite, which is a CONDITION OF MOVING IN and not a
+ * request. Nic: "If Jacob declines, he's not moving into the park. ... he can
+ * buy the trailer all he wants, but he doesn't get to move in without
+ * following the rules of the park, without paying the bills."
+ */
+export const SPACE_CARRYFORWARD_INVITE_QUESTION =
+  'Is the new resident taking this balance on?'
+export const SPACE_CARRYFORWARD_INVITE_DECLINED_NOTE =
+  'Then they do not move onto this space. Space rent owed on a space is paid before anyone new lives on it — '
+  + 'buying the home does not settle it. Take the balance off first if you have decided to eat it.'
 
 export const RENT_COMPONENT_KINDS = ['space', 'trailer', 'other'] as const
 export type RentComponentKind = typeof RENT_COMPONENT_KINDS[number]
@@ -1642,9 +1770,10 @@ export type RouteStopStatus = typeof ROUTE_STOP_STATUSES[number]
 // per-route checks against these keys is its own dedicated session — see
 // DEFERRED.md item 8 follow-up "Wire sub-permission gates into routes."
 //
-// Bookkeeper is intentionally absent: bookkeeper access is a single
-// access_level toggle (read_only | read_write) on bookkeeper_scopes —
-// see BOOKKEEPER_ACCESS_LEVELS. Bookkeepers operate at landlord scope
+// Bookkeeper is intentionally absent: bookkeepers have no permission keys.
+// 10/12 (Nic): one level — every bookkeeper does full bookkeeping, never a
+// tenant's account; the owner's boxes on bookkeeper_scopes decide what they
+// keep (see BOOKKEEPER_ACCESS_LEVELS). Bookkeepers operate at landlord scope
 // (or property level), not within a property, so per-feature subdivision
 // doesn't fit the role.
 //
@@ -1847,6 +1976,11 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
           hint: 'Look through past sales and customers even without "Ring sales". Each day closes on its own overnight, so there is no button to press.' },
         { key: 'pos.manage_inventory', label: 'Create / edit items, tax, vendors',
           hint: 'Set up the store: items, prices, categories, tax rates, discounts, vendors, purchase orders, stock counts, and card readers (ordering a reader bills you). Also lets them change prices at the register.' },
+        // 10/17 (Nic, one home for a tax rate): "owner AND bookkeeper may
+        // change a rate." A bookkeeper holds this key by their role; an owner
+        // can hand it to their own staff without handing over the whole store.
+        { key: 'taxes.edit',           label: 'Change a tax rate',
+          hint: 'Lets them correct the percentage on a tax you already named, and see who changed it before. A lodging tax prices every stay, so a change moves the booking site, pay links and the front desk at once. Naming or removing one is owner-only.' },
       ]},
     ],
   },
@@ -1903,14 +2037,21 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
           hint: 'The Master Schedule change log: who booked, moved, or canceled which stay, and when.' },
       ]},
       { label: 'Actions', items: [
+        // 10/13 evening (Nic): "anyone who can schedule reservations and take
+        // payments can cancel. refund is separate permission." (lib/stayShortenedVoid)
+        // 10/13 (review): creating alone never shortens a stay — that is an
+        // edit (the booking PATCH) or an early check-out (routes/stayCheckOut),
+        // so this hint names the check-out it also takes.
+        // 10/14 (Nic): "take payments" is either kind — "Record a cash / check
+        // payment" or "Ring sales".
         { key: 'schedule.create_reservation', label: 'Create reservations',
-          hint: 'Book a site for a guest from the schedule, and email the guest a deposit link to hold it.' },
+          hint: 'Book a site for a guest from the schedule, and email the guest a deposit link to hold it. With "Record a cash / check payment" or "Ring sales", and "Check guests out" too, they may take off rent a payment was tried on when a guest leaves early.' },
         { key: 'schedule.edit_reservation',   label: 'Edit / move / cancel reservations',
-          hint: 'Change a booked stay: move it, change its dates, lock it to its site, or cancel it. Checking a guest in is not part of this.' },
+          hint: 'Change a booked stay: move it, change its dates, lock it to its site, or cancel it. With "Record a cash / check payment" or "Ring sales" too, they may also take off rent a payment was tried on when a stay is shortened. Not checking guests in.' },
         { key: 'guests.check_in',             label: 'Check guests in',
           hint: 'Mark a guest as arrived on the schedule. Taking a closing meter read on the site first may also be needed.' },
         { key: 'guests.check_out',            label: 'Check guests out',
-          hint: 'Mark a guest as gone, including leaving early, or correct the day they left. Refunding anything also needs "Issue refunds".' },
+          hint: 'Mark a guest as gone, including leaving early, or correct the day they left. Refunding also needs "Issue refunds". Taking off rent a payment was tried on needs a reservation permission and "Record a cash / check payment" or "Ring sales".' },
         { key: 'schedule.configure_unit',     label: 'Configure unit (rates, type, amenities)',
           hint: 'Set up a site: type, size, hookups, rent and nightly, weekly, and monthly rates, deposit, and whether guests can book it. Marking a site out of order stays owner-only.' },
         { key: 'guest_access',                label: 'Guest stay links',
@@ -2047,7 +2188,7 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     category: 'banking', label: 'Banking',
     sections: [{ label: 'Access', items: [
       { key: 'banking.view', label: 'View banking',
-        hint: 'Shows the Disbursement Account page for their own bank account, where any payouts to them land. It never shows or changes yours.' },
+        hint: 'Shows the Bank page for their own payout account, where any payouts to them land. It never shows or changes yours, and not your bank feed or reconciliation.' },
     ]}],
   },
   {
@@ -2055,6 +2196,12 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     sections: [{ label: 'Access & actions', items: [
       { key: 'payments.view',           label: 'View payments',
         hint: 'Shows the Payments page with only unpaid bills: no paid history and no work-trade lines. They can email a resident a reminder of what they owe. Taking money needs "Record a cash / check payment".' },
+      // 10/12 (Nic): "anyone allowed to see all payments" reaches the Rent Roll.
+      // The key gated the Rent Roll, the full Payments ledger and each
+      // resident's payment report (routes/balances, routes/tenants) but was
+      // never listed here, so nobody on a team could be given it.
+      { key: 'payments.view_all',       label: 'View all payments', sensitive: true,
+        hint: 'Every payment at the properties they are assigned to, paid and unpaid: the full Payments ledger, the Rent Roll, and each resident\'s payment history and report. Taking money needs "Record a cash / check payment".' },
       // ── S640 (Nic): THE FRONT DESK TAKES CASH ────────────────────────────
       //
       //   "She needs to be able to record payments for people that come in to
@@ -2069,17 +2216,27 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
       //
       // Issuing credit needs no key of its own — that route admits owners and
       // property managers only, and an onsite manager is neither.
+      //
+      // 10/13 evening (Nic): "anyone who can schedule reservations and take
+      // payments can cancel. refund is separate permission." With a
+      // reservation permission this one may take a shortened stay's rent off,
+      // which puts what was paid on it to the guest's credit — so the hint no
+      // longer says "no credit"; the reservation hints say when.
       { key: 'take_payment',            label: 'Record a cash / check payment',
-        hint: 'Take a payment at the counter: cash, check, money order, or a card on the reader. Also sets how much paid-ahead money each bill uses and, while you are moving onto GAM, marks a first rent as paid in your old system. No credit or refunds.' },
+        hint: 'Take a payment at the counter: cash, check, money order, or a card on the reader. Sets how much paid-ahead money each bill uses and, while moving onto GAM, marks a first rent as paid in your old system. No refunds. For stays, see Master Schedule.' },
       { key: 'payments.import_history', label: 'Import payment history', sensitive: true,
         hint: 'Upload a spreadsheet of residents\' past payments from your old system.' },
     ]}],
   },
   {
-    category: 'balances', label: 'Outstanding Balances',
+    // 10/13 (Nic): "REMOVE the Outstanding Balances tab" — the list of who owes
+    // is under Payments now (for staff without "View all payments").
+    category: 'balances', label: 'Who owes',
     sections: [{ label: 'Access', items: [
       { key: 'balances.view', label: 'View who owes + contact',
-        hint: 'Shows Outstanding Balances: who owes, their unit, how much, and their phone and email. Look only.' },
+        // 10/14 (Nic): the front desk sees the Payments page "the same way that
+        // I see it, but not with that top view" (no totals, no work trade).
+        hint: 'Shows the Payments page for this month at their properties: everyone who paid, paid late or still owes, with no totals and no work trade. Look only.' },
     ]}],
   },
   {
@@ -2099,6 +2256,11 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
         // assigned properties (the engine applies property scope server-side).
         { key: 'reports.tab.custom',    label: 'Custom & T-12',
           hint: 'Has no effect for staff: custom reports are owner-only.' },
+        // 10/12 (Nic): the monthly property report — tenants and leases,
+        // payments, money and operations — on screen and as a PDF. A staffer
+        // granted it sees only the properties they are assigned to.
+        { key: 'reports.tab.monthly',   label: 'Monthly report', sensitive: true,
+          hint: 'The monthly property report for the properties they are assigned to: leases started and ended, who paid on time or late (with names), what was charged, received and owed, expenses, and operations. Includes the printable copy.' },
       ]},
       { label: 'Actions', items: [
         { key: 'reports.export', label: 'Export / print',
@@ -2274,7 +2436,7 @@ export const PERMISSION_PRESETS: PermissionPreset[] = [
   {
     id: 'front_desk',
     label: 'Front Desk',
-    description: 'The occupancy picture + who owes: Reservations, Leases, Master Schedule, and Outstanding Balances (with contact info).',
+    description: 'The occupancy picture + who owes: Reservations, Leases, Master Schedule, and who owes on the Payments page (with contact info).',
     keys: [
       // Bookings ops now live as tabs inside Master Schedule (Reservations + Requests).
       'bookings.view', 'bookings.change_requests', 'bookings.resolve_change_request', 'bookings.acknowledge',
@@ -2358,26 +2520,153 @@ export interface MaintenanceWorkerScope {
   updatedAt:     Date
 }
 
+// 10/12 (Nic, ledger decision 2): "Full bookkeeping … never tenant-account
+// actions … One level, no per-bookkeeper switch." bookkeeper_scopes.access_level
+// keeps its two values (keep-everything; the CHECK lists them), but nothing
+// decides by it any more: every bookkeeper a company keeps does its full
+// bookkeeping (lib/bookkeeperScope bookkeeperMayWrite). New rows are written
+// 'read_write' (migration 20261014240000); the owner's boxes still decide WHAT
+// they keep (properties, company-wide, ledger, money coming in).
 export const BOOKKEEPER_ACCESS_LEVELS = ['read_only', 'read_write'] as const
 export type BookkeeperAccessLevel = typeof BOOKKEEPER_ACCESS_LEVELS[number]
+/** 10/12 (Nic): the one level every bookkeeper is written with. */
+export const BOOKKEEPER_ONE_LEVEL: BookkeeperAccessLevel = 'read_write'
 
 export interface BookkeeperScope {
   id:          string
   userId:      string
   landlordId:  string
   accessLevel: BookkeeperAccessLevel
-  /** 10/11: the company's properties they keep; null = all of them. */
-  propertyIds: string[] | null
+  /** 10/11 (Nic): the company's properties ticked for them — every property is
+   *  its own box, and a property the company adds later arrives unticked.
+   *  "Every property" is worked out per request against what the company owns
+   *  today, never stored (apps/api lib/bookkeeperScope). 10/12: may be empty
+   *  when companyWide is ticked. */
+  propertyIds: string[]
+  /** 10/12 (Nic): "Company-wide: bank account, payouts and payroll" — its own
+   *  box, the owner's choice; also opens the company's Books ledger and
+   *  reports (P&L, cash flow, owner statements). */
+  companyWide: boolean
+  /** 10/12 (Nic): "Show lease start and end dates" on their rent roll. */
+  showLeaseDates: boolean
+  /** 10/12 (Nic, BK1): "May use the whole-company ledger" — the GAM Books
+   *  ledger without the company-wide box (never the bank account or payouts). */
+  companyLedger: boolean
+  /** 10/12 (Nic, BK2): "Company reports show the whole company" — else only
+   *  their properties' money in the Books P&L, cash flow and owner statements. */
+  wholeCompanyReports: boolean
+  /** 10/12 (Nic): "Sees the monthly property report on screen". */
+  seesMonthlyReport: boolean
   createdAt:   Date
   updatedAt:   Date
 }
 
+/** 10/12: the boxes a bookkeeper summary is said from. */
+export interface BookkeeperAccessChoice {
+  /** How many property boxes are ticked. */
+  propertyCount: number
+  companyWide: boolean
+  showLeaseDates?: boolean
+  /** 10/12 (Nic, BK1): the whole-company Books ledger without the company-wide box. */
+  companyLedger?: boolean
+  /** 10/12 (Nic, BK2): the company reports carry the whole company's money. */
+  wholeCompanyReports?: boolean
+  /** 10/12 (Nic): the monthly property report on screen. */
+  seesMonthlyReport?: boolean
+}
+
 /**
- * 10/11 (Nic): what a bookkeeper gets, said once — the Team page's invite and
- * the accept page both show it. "Look + add expenses" was Nic's choice.
+ * 10/11 (Nic): what a bookkeeper gets, said once. Tenant names are allowed
+ * wherever the books need them; contact details, leases, documents and requests
+ * are not. Two readers, two wordings of the same access: the owner on the Team
+ * page (who ticks the boxes), and the person invited on the accept page (who
+ * ticks nothing, so "the properties you tick" would be wrong for them).
+ *
+ * 10/12 (Nic): a function of the boxes. Payroll and the bank account are named
+ * only when the company-wide box is ticked; lease dates only when that box is.
+ * 10/12 (Nic, ledger decision 2): one level — every bookkeeper does the full
+ * bookkeeping on what they keep and never touches a tenant's account; there is
+ * no read-only bookkeeper to describe.
  */
-export const BOOKKEEPER_ACCESS_SUMMARY =
-  'Sees money in (by type), money out, receipts and maintenance costs. Can add expenses. Never sees tenants or leases.'
+export function bookkeeperAccessSummary(choice: BookkeeperAccessChoice, reader: 'owner' | 'invitee' = 'owner'): string {
+  const owner = reader === 'owner'
+  const props = choice.propertyCount > 0
+  const money = 'money in and who paid it, money out and receipts, and maintenance costs'
+    + (choice.showLeaseDates ? ', with each lease\'s start and end dates' : '')
+  const parts: string[] = []
+  if (props) {
+    parts.push(owner
+      ? `Keeps the books for the properties you tick: ${money}.`
+      : `You keep the books for the properties the owner ticked for you: ${money}.`)
+  }
+  // 10/12 (Nic, BK2): whose money the company reports carry — the whole
+  // company's when that box is ticked, else the ticked properties' only.
+  const whole = choice.wholeCompanyReports === true
+  if (choice.companyWide) {
+    const wide = 'the company\'s bank account, payouts and payroll, and its company-level P&L, cash flow and owner statements'
+    // 10/12 review (Nic): the property money inside those company reports
+    // follows the property boxes (routes/books companyReportPropertyScope).
+    parts.push(whole
+      ? (props
+        ? (owner ? `Company-wide: also ${wide}, with the whole company's money in them.`
+                 : `You also see ${wide}, with the whole company's money in them.`)
+        : (owner ? `Company-wide only: ${wide}, with the whole company's money in them.`
+                 : `You keep the company-wide books: ${wide}, with the whole company's money in them.`))
+      : props
+        ? (owner ? `Company-wide: also ${wide}, with only the ticked properties' money in them.`
+                 : `You also see ${wide}, with only your properties' money in them.`)
+        : (owner ? `Company-wide only: ${wide} — no property's own money.` : `You keep the company-wide books: ${wide} — no property's own money.`))
+  } else if (choice.companyLedger) {
+    // 10/12 (Nic, BK1): the ledger on its own, never the bank or payouts.
+    const ledger = 'the company\'s Books ledger: chart of accounts, journal, bills, vendors, payroll, tax, P&L and balance sheet'
+    const inPl = whole ? 'the whole company\'s money in the P&L' : (owner ? 'only the ticked properties\' money in the P&L' : 'only your properties\' money in the P&L')
+    parts.push(owner
+      ? `Also uses ${ledger}, with ${inPl}. Never the bank account or payouts.`
+      : `You also use ${ledger}, with ${inPl}. Never the bank account or payouts.`)
+  }
+  // 10/12 (Nic): the monthly property report, their properties only.
+  if (choice.seesMonthlyReport && props) {
+    parts.push(owner ? 'Sees the monthly property report on screen for those properties.'
+                     : 'You see the monthly property report on screen for your properties.')
+  }
+  // 10/12 (Nic, ledger decision 2): "Full bookkeeping … never tenant-account
+  // actions … One level, no per-bookkeeper switch." What they do on what they
+  // keep, said from the same boxes (payroll and the bank only when a box gives
+  // them), and the one thing no bookkeeper ever does.
+  const does: string[] = []
+  if (props) does.push('expenses and bills')
+  if (choice.companyWide) does.push('the bank lines going out')
+  if (choice.companyWide || choice.companyLedger) does.push('vendors', 'payroll', 'journal entries')
+  if (does.length) {
+    const list = does.length === 1 ? does[0] : `${does.slice(0, -1).join(', ')} and ${does[does.length - 1]}`
+    parts.push(owner
+      ? `They do the full bookkeeping on what they keep (${list}), never a tenant's account: they never record a rent payment or give a credit, late fee or refund.`
+      : `You do the full bookkeeping on what you keep (${list}), never a tenant's account: you never record a rent payment or give a credit, late fee or refund.`)
+  }
+  if (!parts.length) {
+    parts.push(owner
+      ? 'Tick the properties they keep, Company-wide, or both.'
+      : 'Nothing is ticked for you yet.')
+  }
+  const never = choice.showLeaseDates
+    ? 'a lease\'s text or its documents, applications, maintenance requests, or tenants\' phone numbers and emails'
+    : 'leases, applications, documents, maintenance requests, or tenants\' phone numbers and emails'
+  parts.push(owner ? `Never sees ${never}.` : `You never see ${never}.`)
+  return parts.join(' ')
+}
+
+// 10/11: GAM Books' own lists — account types, payroll, contractors (W-9),
+// vendors — and the arithmetic the API and the Books screens share.
+export * from './booksLedger'
+// 10/12 (Nic, ledger P6): money out is one record — categories the landlord
+// makes, expense payments, bank lines matched to what GAM already has.
+export * from './booksMoneyOut'
+// 10/12 (Nic, ledger P6): one list of everyone the company pays (vendors, with
+// the 1099 box for contractors), loans and fixed assets with depreciation.
+export * from './booksVendorsLoans'
+// 10/17 (Nic): "we need more breakdown so we can see exactly how much of each
+// item was sold and how much of each tax separated by category was collected."
+export * from './booksSalesTax'
 
 // ── INVITATIONS & PLATFORM EVENTS ──────────────────────────
 // The platform-wide audit trail. Every meaningful state change
@@ -2441,6 +2730,8 @@ export interface MaintenanceWorkerScopePayload {
 
 export interface BookkeeperScopePayload {
   accessLevel: BookkeeperAccessLevel
+  /** 10/11: the properties ticked on the invitation (at least one). */
+  propertyIds: string[]
 }
 
 export type LandlordAssignableScopePayload =
@@ -2504,7 +2795,14 @@ export const ROLE_PERMISSIONS: Record<string, string[]> = {
 // LEASE (jobs/platformFeeAccrual.ts) — never charges it. A landlord cannot use
 // the status to dodge the fee on a real tenant, because a unit with no lease
 // also cannot collect rent through GAM.
-export const UNIT_STATUSES = ['vacant', 'available', 'active', 'delinquent', 'suspended', 'owner_use'] as const
+//
+// 10/12 (Nic): 'utility_service' joins the list. The units CHECK has carried it
+// since S614 (a space this landlord only bills utilities for — a service point,
+// never leased; routes/utilityServiceAgreements creates it), but the list here
+// stopped at owner_use, so the one source of truth had drifted from the
+// database. It is set only by creating a service agreement: PATCH
+// /api/units/:id/status refuses it (routes/units.ts).
+export const UNIT_STATUSES = ['vacant', 'available', 'active', 'delinquent', 'suspended', 'owner_use', 'utility_service'] as const
 export type UnitStatus = typeof UNIT_STATUSES[number]
 export const UNIT_STATUS_LABEL: Record<UnitStatus, string> = {
   vacant:     'Vacant',
@@ -2513,6 +2811,47 @@ export const UNIT_STATUS_LABEL: Record<UnitStatus, string> = {
   delinquent: 'Delinquent',
   suspended:  'Suspended',
   owner_use:  'Owner Use',
+  utility_service: 'Utility Service',
+}
+
+// ─── Payment health: one stamp per household per bill month (10/12, Nic) ────
+//
+// "Payment health = ONE definition everywhere, per HOUSEHOLD per BILL MONTH,
+//  never per line. Late fees are never a bill and never decide a month's color
+//  or health; $0 lines are ignored." The stamp a month earns is decided in ONE
+// place (apps/api/src/services/householdMonths.ts); every screen reads these
+// words and colors.
+//   paid_on_time  GREEN   every charge paid in full by the last grace day (a
+//                         month work trade covers in full is paid on time)
+//   partial       YELLOW  some money in, not paid in full (stays yellow past
+//                         grace; Owed shows what is left)
+//   paid_late     ORANGE  paid in full, after the grace period
+//   outstanding   RED     nothing paid and past the grace period
+//   due           GRAY    not yet past the grace period and nothing paid
+export const PAYMENT_STAMPS = ['paid_on_time', 'partial', 'paid_late', 'outstanding', 'due'] as const
+export type PaymentStamp = typeof PAYMENT_STAMPS[number]
+export const PAYMENT_STAMP_LABEL: Record<PaymentStamp, string> = {
+  paid_on_time: 'Paid on time',
+  partial:      'Partial',
+  paid_late:    'Paid late',
+  outstanding:  'Outstanding',
+  due:          'Due',
+}
+/** The letter on a stamp, so the strip reads without color. */
+export const PAYMENT_STAMP_LETTER: Record<PaymentStamp, string> = {
+  paid_on_time: 'P',
+  partial:      '½',
+  paid_late:    'L',
+  outstanding:  'O',
+  due:          '·',
+}
+/** Where a household's grace days come from: the lease, else the property, else GAM's default of 5. */
+export const GRACE_SOURCES = ['lease', 'property', 'default'] as const
+export type GraceSource = typeof GRACE_SOURCES[number]
+export const GRACE_SOURCE_LABEL: Record<GraceSource, string> = {
+  lease:    'from the lease',
+  property: 'from the property settings',
+  default:  'GAM default',
 }
 
 // Statuses that occupy a unit without producing rent. Excluded from
@@ -2782,6 +3121,13 @@ export interface PropertyUnitSubtype {
   bathrooms?: number | string | null
   rvSiteLayout?: string | null
   rvAmpService?: string | null
+  /**
+   * 10/24 (Nic): the longest rig this class of pad takes, in feet. Null means
+   * the park has stated no limit and every rig fits (isRigTooLongForSite reads a
+   * missing limit as a fit). A unit created from this class inherits it exactly
+   * the way it inherits the layout and the amps, and owns it from then on.
+   */
+  rvMaxRigLengthFt?: number | null
   dwellingOwnership?: string | null
   storageSize?: string | null
   rentAmount: number | string | null
@@ -2867,6 +3213,35 @@ export function isSiteLayoutMismatch(required: string | null | undefined, actual
 // service; a reservation can require an amperage; staff are WARNED (not blocked)
 // on a mismatched move/edit (same posture as site layout — Nic 2026-06-27).
 // 'none' = not an RV site / unspecified. 'both' on the UNIT satisfies either.
+/**
+ * 10/21 (Nic) — THE TWO LISTS A PROPERTY KEEPS, AND WHO MAY WRITE WHICH.
+ *
+ *   'job'     the owner's task list. "It's stuff assigned by the landlord
+ *             himself" — he writes the lines, anybody working the park ticks
+ *             one off. Never meter reads (checkout takes those) and never
+ *             repairs (those are maintenance requests): "None of that stuff
+ *             should be here. It's an owner that says, hey, I want you to take
+ *             some pictures of this apartment, get it listed as available."
+ *
+ *   'supply'  things to buy. "Anybody can contribute to a list of things to
+ *             purchase. The owner can consult that list when either ordering
+ *             online or running to the store. But that way he doesn't have text
+ *             messages from like 5 or 6 different people." So the write rule is
+ *             INVERTED: anybody working the park adds a line, and only the
+ *             owner ticks it bought, because he is the one at the till.
+ *
+ * One table, one screen pattern, two lists (migration 20261023120000). A line
+ * always belongs to a PROPERTY — that is where the thing is needed and where it
+ * is delivered — while the owner's shopping view groups by ENTITY, because an
+ * order and its bookkeeping are the company's.
+ */
+export const PROPERTY_LIST_KINDS = ['job', 'supply'] as const
+export type PropertyListKind = typeof PROPERTY_LIST_KINDS[number]
+export const PROPERTY_LIST_KIND_LABEL: Record<PropertyListKind, string> = {
+  job:    'Task list',
+  supply: 'Supply list',
+}
+
 export const RV_AMP_SERVICES = ['none', '30', '50', 'both'] as const
 export type RvAmpService = typeof RV_AMP_SERVICES[number]
 export const RV_AMP_SERVICE_LABEL: Record<RvAmpService, string> = {
@@ -2884,6 +3259,40 @@ export function isAmpServiceMismatch(required: string | null | undefined, actual
   if (!actual || actual === 'none') return true
   return required !== actual
 }
+
+/**
+ * 10/24 (Nic) — WILL THE RIG FIT ON THE SITE?
+ *
+ *   "somebody's got a 37 foot camper. They can't go in the small sites."
+ *
+ * The third thing a reservation can require, beside layout and amps, and the
+ * one that was missing while the schedule was already free to move bookings
+ * around: nothing described how long a site was, so a 37-foot fifth wheel could
+ * be re-sited onto a short one and the guest would learn about it on arrival
+ * morning.
+ *
+ * SILENT WHEN EITHER NUMBER IS UNKNOWN, and that is the important half.
+ * Mountain View has no lengths on any site today; a rule that treated "not
+ * stated" as "will not fit" would empty the board overnight. So a park that
+ * never fills these in behaves exactly as it does now, and the rule only bites
+ * once somebody has actually measured both.
+ *
+ * Longer than the site is a mismatch; equal fits — a 30-foot site takes a
+ * 30-foot rig, which is how a park describes its own sites.
+ */
+export function isRigTooLongForSite(
+  rigLengthFt: number | null | undefined,
+  siteMaxLengthFt: number | null | undefined,
+): boolean {
+  const rig = Number(rigLengthFt)
+  const site = Number(siteMaxLengthFt)
+  if (!Number.isFinite(rig) || rig <= 0) return false
+  if (!Number.isFinite(site) || site <= 0) return false
+  return rig > site
+}
+
+/** The longest rig a park will sensibly describe, and what the CHECK allows. */
+export const MAX_RIG_LENGTH_FT = 120
 
 export enum PropertyType {
   RESIDENTIAL  = 'residential',
@@ -3277,18 +3686,79 @@ export const LEASE_DOCUMENT_TYPE_LABEL: Record<LeaseDocumentType, string> = {
   work_trade_addendum: 'Work-Trade Addendum',
 }
 
-// Generic signer roles for standalone documents. The e-sign engine matches a
-// template field's signer_role to a document signer's role, so ANY consistent
-// role string works — these are the common presets (+ labels for the UI). Lease
-// documents keep using landlord / witness / tenant roles.
+// ============================================================================
+// SIGNER ROLES — ONE VOCABULARY, SO A ROLE YOU CAN PLACE IS A ROLE YOU CAN FILL
+// ----------------------------------------------------------------------------
+// The e-sign engine matches a template field's signer_role to a document
+// signer's role. The same string on both sides, or the field belongs to nobody
+// and is dropped from the document without a word.
+//
+// 10/20 — Blu, at Mattoon, wanted a work-trade agreement his tenant signs. He
+// built the form with a landlord box and a tenant box, added the document, and
+// could not get it signed. Nic: "On the signing page, it only wants to let him
+// pick either buyer or seller or... person one or person two. It wouldn't let
+// the data box be targeted to landlord and tenant. So he had no way to get that
+// document to sign from... you can't just have that be person one and person
+// two when it needs to be, you know, if it's a tenant, it needs to be able to
+// be signed by the tenant."
+//
+// The field editor could PLACE a landlord box. The signer picker could not
+// ASSIGN anybody to it. Three lists of roles existed — what the editor offered,
+// what the picker offered, what the builder accepted — and only the picker was
+// short. So his two fields matched no signer, were pruned, and the document
+// went out looking finished and unsignable.
+//
+// Nic, asked what the picker should offer: "any data field that can be picked
+// in the regular template flow for leases up to co tenant 3 etc. there should
+// be uniformity."
+//
+// Hence one list, below, in two honest halves. The field editor places from it,
+// the signer picker assigns from it, and the document builder accepts exactly
+// it. Uniformity by construction, not by three lists happening to agree —
+// apps/api/src/routes/standaloneSignerRoles.test.ts fails if they drift again.
+// ============================================================================
+
+/** The landlord and the residents — who a lease form binds its boxes to. */
+export const LEASE_SIGNER_ROLES = ['landlord', 'primary', 'co_tenant_1', 'co_tenant_2', 'co_tenant_3'] as const
+
+/**
+ * Parties to a contract with no lease behind it: a financed home sale, a
+ * resident-to-resident bill of sale the landlord only facilitates. 'witness'
+ * has always lived in this half and applies to anything that needs one.
+ */
 export const GENERIC_SIGNER_ROLES = ['seller', 'purchaser', 'party_1', 'party_2', 'witness'] as const
 export type GenericSignerRole = typeof GENERIC_SIGNER_ROLES[number]
-export const GENERIC_SIGNER_ROLE_LABEL: Record<GenericSignerRole, string> = {
-  seller:    'Seller',
-  purchaser: 'Purchaser',
-  party_1:   'Party 1',
-  party_2:   'Party 2',
-  witness:   'Witness',
+
+/** Every role a box can be placed for and a signer can be assigned to. */
+export const DOCUMENT_SIGNER_ROLES = [...LEASE_SIGNER_ROLES, ...GENERIC_SIGNER_ROLES] as const
+export type DocumentSignerRole = typeof DOCUMENT_SIGNER_ROLES[number]
+
+// 'Primary Tenant' / 'Co-Tenant' are the words the rest of GAM already uses for
+// these people (LEASE_TENANT_ROLE_LABEL), so the picker says what a lease says.
+export const DOCUMENT_SIGNER_ROLE_LABEL: Record<DocumentSignerRole, string> = {
+  landlord:    'Landlord',
+  primary:     'Primary Tenant',
+  co_tenant_1: 'Co-Tenant 1',
+  co_tenant_2: 'Co-Tenant 2',
+  co_tenant_3: 'Co-Tenant 3',
+  seller:      'Seller',
+  purchaser:   'Purchaser',
+  party_1:     'Party 1',
+  party_2:     'Party 2',
+  witness:     'Witness',
+}
+/** Kept for the standalone contract defaults, which are a seller and a buyer. */
+export const GENERIC_SIGNER_ROLE_LABEL: Record<GenericSignerRole, string> =
+  DOCUMENT_SIGNER_ROLE_LABEL
+
+/**
+ * Is this one of the roles GAM offers? Custom role strings still pass
+ * isValidSignerRole below — a contract may name a contractor and a client — but
+ * a template field can only be BOUND to one of these, so a picker must not
+ * offer anything this rejects.
+ */
+export function isAssignableSignerRole(role: string): role is DocumentSignerRole {
+  return (DOCUMENT_SIGNER_ROLES as readonly string[]).includes(role)
 }
 // A signer role is valid if it's a known lease role, a generic role, or a sane
 // custom label (letters/digits/underscore/space, ≤40 chars) — the generic engine
@@ -4072,6 +4542,21 @@ export const EARLY_CHECKOUT_CHOICE_LABEL: Record<EarlyCheckoutChoice, string> = 
   refund_unused: 'Refund the unused nights',
   refund_other: 'Refund a different amount',
 }
+/**
+ * 10/12 (Nic, G6): a stay shortened (an Edit or drag of its dates, or an early
+ * check-out) past unpaid rent that a payment was tried on — a declined card, a
+ * returned bank pull. The landlord chooses at that moment:
+ *   'void' — take those charges off (any money paid on them comes back to the
+ *            guest as credit);
+ *   'keep' — they stay owed.
+ * Single source for stay_shortened_charge_choices_choice_check.
+ */
+export const STAY_SHORTENED_CHARGE_CHOICES = ['void', 'keep'] as const
+export type StayShortenedChargeChoice = typeof STAY_SHORTENED_CHARGE_CHOICES[number]
+export const STAY_SHORTENED_CHARGE_CHOICE_LABEL: Record<StayShortenedChargeChoice, string> = {
+  void: 'Take those charges off',
+  keep: 'Keep them owed',
+}
 /** A money question waiting on a stay (stay_checkout_decisions.status). 'undone': the check-out was put back. */
 export const STAY_CHECKOUT_DECISION_STATUSES = ['pending', 'decided', 'undone'] as const
 export type StayCheckoutDecisionStatus = typeof STAY_CHECKOUT_DECISION_STATUSES[number]
@@ -4178,6 +4663,111 @@ export const BOOKING_STATUS_LABEL: Record<BookingStatus, string> = {
   // American spelling on screen; the stored value stays 'cancelled'.
   cancelled: 'Canceled',
   no_show: 'No-show',
+}
+
+/**
+ * 10/17 (Nic) — WHERE A STAY CAME FROM: one list, and the Source filter offers
+ * all of it.
+ *
+ * The first question anybody asks about a reservation is how it got on the
+ * board, and the schedule and the reservations list both have a Source filter
+ * for exactly that. Those filters offered four travel sites and "Direct" — so
+ * a stay rung at the counter, booked on the park's own booking site, or held by
+ * an emailed link could be SEEN but never filtered for, and a desk looking for
+ * "everything that came off the register today" could only pick All.
+ *
+ * The first four are the doors inside GAM; the rest are where else a landlord
+ * takes bookings. A value not in this list still shows (the schedule falls back
+ * to humanize) — the column is not constrained, so an import can carry
+ * anything.
+ */
+export const BOOKING_SOURCES = [
+  'direct', 'public', 'register', 'pay_link',
+  'airbnb', 'vrbo', 'booking_com', 'other',
+] as const
+export type BookingSource = typeof BOOKING_SOURCES[number]
+export const BOOKING_SOURCE_LABEL: Record<BookingSource, string> = {
+  direct: 'Direct',
+  public: 'Booking site',
+  register: 'Register',
+  pay_link: 'Pay link',
+  airbnb: 'Airbnb',
+  vrbo: 'VRBO',
+  booking_com: 'Booking.com',
+  other: 'Other',
+}
+
+/**
+ * 10/17 (Nic) — IS THIS RESERVATION LOCKED IN, OR CAN IT BE BOOTED?
+ *
+ * "reservations are only locked in with deposits. still reserved without
+ * deposits but can be booted when space is limited by other paying people."
+ *
+ * The schedule already had the two states and showed neither of them in words
+ * a desk clerk could act on: a badge reading "Tentative" does not tell anybody
+ * that this guest loses the site if the park fills up, and "Confirmed" does not
+ * say that this one cannot be touched. These are those two sentences.
+ *
+ * Deliberately NOT a third status. Nic's rule is the one the software already
+ * enforces — a reservation with money on it is never displaced
+ * (services/holdDisplacement tests deposit_paid_at, not the status), and one
+ * without it yields to anybody who pays — so what was missing was only the
+ * saying of it.
+ *
+ * Null for a stay where the question has stopped mattering: checked in,
+ * checked out, canceled, a no-show.
+ */
+export function stayHoldWords(status: BookingStatus, depositPaid: boolean): string | null {
+  if (status !== 'tentative' && status !== 'confirmed') return null
+  if (depositPaid) return 'Locked in — a deposit is paid on it, so nobody can take this site.'
+  return 'Reserved, not paid for — if the park fills up, a paying guest can take this site.'
+}
+
+/**
+ * 10/18 (Nic) — CAN THIS RESERVATION STILL BE ASKED FOR ITS DEPOSIT?
+ *
+ *   "yeah, let's add a button so that we can collect deposits from people that
+ *    haven't done it for their stays."
+ *
+ * The sentence above (stayHoldWords) tells the desk a reservation is not locked
+ * in. This says whether there is anything they can DO about it: a reservation
+ * still holding its site, with nobody's money on it and an email address to
+ * send to, can be asked for its deposit. Anything else is refused in words
+ * before a link is made, and nothing is sent.
+ *
+ * It is the same question on both sides — the schedule decides whether to offer
+ * the button with it, and the server refuses with it — so the screen can never
+ * offer something the server will turn down.
+ *
+ * What it deliberately does NOT answer is whether anything is OWED. A park that
+ * takes no deposit on a stay like this has nothing to ask for, and only the
+ * server can price that (services/propertyBooking quoteStayDeposit).
+ */
+export type StayDepositAsk = 'ask' | 'already_paid' | 'no_email' | 'no_longer_holding'
+
+export function stayDepositAsk(stay: {
+  status: BookingStatus
+  // A Date is what the database hands the server; a string is what the wire
+  // hands the browser. Both are read for presence only.
+  depositPaidAt?: string | Date | null
+  balancePaidAt?: string | Date | null
+  posTransactionId?: string | null
+  guestEmail?: string | null
+}): StayDepositAsk {
+  // Checked in, checked out, canceled, a no-show: the deposit question is over.
+  if (stay.status !== 'tentative' && stay.status !== 'confirmed') return 'no_longer_holding'
+  // Money on it already — a deposit, the whole stay, or a register sale.
+  if (stay.depositPaidAt || stay.balancePaidAt || stay.posTransactionId) return 'already_paid'
+  if (!stay.guestEmail || !stay.guestEmail.trim()) return 'no_email'
+  return 'ask'
+}
+
+/** Why the guest cannot be asked, in the words the desk is given. Nothing is sent in any of these. */
+export const STAY_DEPOSIT_ASK_REFUSAL: Record<Exclude<StayDepositAsk, 'ask'>, string> = {
+  already_paid: 'This reservation is already paid for, so there is nothing to ask the guest for. Nothing was sent.',
+  no_email: 'There is no email address on this reservation, so there is nowhere to send a link. '
+    + "Add the guest's email on the reservation, or take the deposit at the register. Nothing was sent.",
+  no_longer_holding: 'This reservation is not holding its site any more, so there is no deposit to ask for. Nothing was sent.',
 }
 
 // 10/6 (Nic): a stay is priced by ONE rule everywhere — the cheapest whole
@@ -4444,6 +5034,26 @@ export const UTILITY_UNIT_LABEL: Record<UtilityType, string> = {
   propane:  'gal',
 }
 
+/**
+ * 10/12 (Nic), M1: what a household that uses none of this utility uses none
+ * of. The choice beside "Repaired" on a meter marked broken reads
+ * "Works, tenant uses no power" on an electric meter (Nic's words) and says
+ * the same thing in its own terms on the others.
+ */
+export const UTILITY_USAGE_NOUN: Record<UtilityType, string> = {
+  water:    'water',
+  sewer:    'water',
+  electric: 'power',
+  gas:      'gas',
+  trash:    'trash service',
+  propane:  'propane',
+}
+
+/** The "Works, tenant uses no power" choice, worded for the meter's utility. */
+export function meterWorksNoUseLabel(utilityType: string): string {
+  return `Works, tenant uses no ${UTILITY_USAGE_NOUN[utilityType as UtilityType] ?? 'power'}`
+}
+
 export type UtilityRowTag =
   | 'utility_water_responsibility'
   | 'utility_gas_responsibility'
@@ -4700,10 +5310,10 @@ export interface Landlord {
   user?: User
   businessName?: string
   ein?: string                   // Tax ID
-  // S67: bankAccountReady is server-derived from active user_bank_accounts.
-  // Replaces the pre-16a stripeAccountId / stripeBankVerified fields which
-  // were Stripe-Connect-specific and incorrect under the merchant-of-record
-  // model.
+  // 10/12: bankAccountReady is server-derived from the landlord company's
+  // Stripe Connect payouts (landlords.connect_payouts_enabled) and nothing
+  // else. The S67 derivation from the legacy user_bank_accounts catalog is
+  // gone — that catalog never set up a payout.
   bankAccountReady?: boolean
   onboardingComplete: boolean
   units?: Unit[]
@@ -5106,9 +5716,24 @@ export const CARD_FEE_PAYER_LABEL: Record<CardFeePayer, string> = {
  * A card charge for `amount` (the price): what GAM's fee is, what the customer
  * is charged, and what GAM holds for the landlord afterwards. The fee is the
  * same either way — only who pays it moves.
+ *
+ * 10/21 (Nic): `feeExempt` is the part of `amount` that must NOT take a card
+ * fee on top, because its processing is already inside the price it is sold
+ * at. Today that is exactly one thing — a background check.
+ *
+ *   "a background check is a fixed thing, and so it should be one price...
+ *    That way it's not a landlord paying for it for some people and getting a
+ *    little bit of a break and making other people pay for it themselves."
+ *
+ * A screening is $46.03 to whoever buys it: the applicant on their own card,
+ * the guest on a pay link, the office taking cash, the landlord eating it out
+ * of a payout. Adding a fee on top of a price that already contains one would
+ * have made a third price out of the same check, which is the thing he was
+ * killing.
  */
-export function cardFeeSplit(amount: number, payer: CardFeePayer): { fee: number; charged: number; held: number } {
-  const fee = processingFeeFor({ amount, paymentMethod: 'card' })
+export function cardFeeSplit(amount: number, payer: CardFeePayer, feeExempt = 0): { fee: number; charged: number; held: number } {
+  const base = round2(Math.max(0, amount - Math.max(0, feeExempt)))
+  const fee = base > 0 ? processingFeeFor({ amount: base, paymentMethod: 'card' }) : 0
   const charged = payer === 'customer' ? round2(amount + fee) : round2(amount)
   return { fee, charged, held: round2(charged - fee) }
 }
@@ -5283,6 +5908,11 @@ export const RESERVE_CONFIG = {
 //   low risk      → max for the band
 //   medium risk   → max − 1 (floor 2)
 //   high+         → 2 only
+/**
+ * @deprecated 10/26 — FlexDeposit sells 2 or 4 to everyone, so a band's
+ * "maxInstallments" no longer decides anything. Kept because getFlexDepositTier
+ * is still exported for pre-S246 callers; nothing new should read it.
+ */
 export const FLEX_DEPOSIT_TIERS = [
   { maxDeposit: 500,     maxInstallments: 2 },
   { maxDeposit: 1000,    maxInstallments: 3 },
@@ -5482,14 +6112,60 @@ export function getReservePhase(occupiedUnits: number): { phase: 1|2|3; rate: nu
  */
 export type FlexDepositRiskLevel = 'low' | 'medium' | 'high' | 'very_high'
 
+/**
+ * How many installments a FlexDeposit plan may be split into.
+ *
+ * 10/26 (Nic): "Lots of recent late payments, we only offer them a split into
+ * 2 versus a split into 6. It's not that they're getting denied, it's just that
+ * they get less options."
+ *
+ * TWO INPUTS, AND BOTH ARE GAM'S OWN:
+ *  - `riskLevel` — GAM's own application-risk model (services/riskScore.ts:
+ *    identity quality, employment, income against rent, application
+ *    behavior). NOT a credit report and NOT a credit score.
+ *  - `recentLatePayments` — how many times this person has paid GAM late
+ *    inside the lookback window, from GAM's own payment record.
+ *
+ * WHY THE INPUT MATTERS MORE THAN THE RULE. A credit report is a *consumer
+ * report*: using one to give somebody fewer options is an adverse action under
+ * FCRA, owing them a notice naming the bureau and the score, and it is direct
+ * evidence of a risk-based decision made on a consumer report — which is what
+ * a credit decision looks like. GAM's own experience with its own customer is
+ * none of those things; every business prices on it. So NEVER feed a bureau
+ * score or a credit-report field into this function. Keeping FlexDeposit's
+ * "service-tier qualification, not a credit decision" posture depends on it.
+ *
+ * Nobody is denied here — the floor is always 2, so the worst outcome is
+ * fewer, larger installments rather than no plan.
+ */
 export function getFlexDepositMaxInstallments(
-  depositAmount: number,
+  _depositAmount: number,
   riskLevel: FlexDepositRiskLevel | null | undefined,
 ): number | null {
+  // 10/26 (Nic): EVERYBODY GETS BOTH CHOICES. 2 or 4, same price for the same
+  // deposit, whoever they are.
+  //
+  // This used to narrow the options by GAM's risk level (and, briefly, by their
+  // payment record with GAM). Both are gone on purpose: giving one applicant
+  // fewer options than another IS a decision made about that applicant, and
+  // under FCRA an adverse action needs only to rest "in part" on such
+  // information. With the variation removed there is nothing to be adverse
+  // about — the price is a function of the deposit and the split, and neither
+  // is set by GAM about the person.
+  //
+  //   "That way there's no adverse anything. People don't have a choice.
+  //    There's no 'in part' by limiting their options. It's only based on their
+  //    rent, which is not set by us."
+  //
+  // riskLevel is still required: a null means the screening has not produced a
+  // result yet, and the eligibility gate reports that as risk_level_missing.
+  // It no longer changes the answer. Deposit size does not either — it sets the
+  // PRICE of each choice, never which choices exist.
   if (!riskLevel) return null
-  const band = FLEX_DEPOSIT_TIERS.find(t => depositAmount <= t.maxDeposit) ?? FLEX_DEPOSIT_TIERS[FLEX_DEPOSIT_TIERS.length - 1]
-  const downgrade = riskLevel === 'low' ? 0 : riskLevel === 'medium' ? 1 : 99
-  return Math.max(2, band.maxInstallments - downgrade)
+  // The larger of the two choices FlexDeposit sells. Named from flexFees so
+  // there is one definition of what is sellable; index.ts re-exports that
+  // module below, which is why it is imported rather than re-stated here.
+  return FLEX_DEPOSIT_PAYMENT_CHOICES[FLEX_DEPOSIT_PAYMENT_CHOICES.length - 1]
 }
 
 /** Backwards-compatible shim — returns the band's max-installment
@@ -5516,7 +6192,14 @@ export * from './standaloneScroll'
 // === S617: one definition of how fast an agent reads and types ===
 export * from './chatCadence'
 export * from './paymentAllocation'
-export * from './creditAllocation'
+// 10/18 review fix — the one credit allocation rule lives in the API
+// (services/creditUse buildCreditPlan), with the credit ledger behind it.
+// './creditAllocation' used to export a SECOND rule from here, announcing
+// itself as "one rule, used by every place that shows credit against a
+// balance", whose first line was "a credit tied to a lease only ever reduces
+// that lease" — exactly what Nic reversed on 10/18. Nothing called it; it was
+// deleted rather than kept in step, because a second rule nobody runs is the
+// one a future session copies.
 export * from './moveInCharges'
 import { parseDueDay } from './moveInCharges'
 export * from './camelize'
@@ -5577,7 +6260,7 @@ export type PaymentType = typeof PAYMENT_TYPES[number]
 // Its own descriptor rather than 'RENT': this is what the tenant sees on their
 // bank statement, and a debt they recognize as an old balance should not appear
 // as a rent charge they might read as a duplicate.
-export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'PROPANE', 'RETURNFEE', 'HOMEPMT', 'FCPAYDOWN', 'DECLINEFEE', 'BALANCE'] as const
+export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'FLEXDEP', 'PROPANE', 'RETURNFEE', 'HOMEPMT', 'FCPAYDOWN', 'DECLINEFEE', 'BALANCE'] as const
 export type PaymentEntryDescription = typeof PAYMENT_ENTRY_DESCRIPTIONS[number]
 
 // S562: manual (off-platform) rent payment recording. A landlord/staff records
@@ -5762,6 +6445,24 @@ export function lateFeeCreditedTenantText(o: {
 //     date decides after all.
 
 /** 10/6 (Nic): the per-property setting (properties.tenants_deposit_at_bank, default off) and its one line. */
+/**
+ * 10/23 (Nic) — DOES THIS PROPERTY TAKE A CHECK AT THE COUNTER?
+ *
+ *   "That also needs to be turned on or off if a property chooses to accept
+ *    checks. A lot of places don't accept them."
+ *
+ * Reads as a question a landlord answers, like the departure rules, and
+ * defaults to Yes — every property already takes a check on an invoice, so a
+ * default of No would quietly stop something that works.
+ */
+export const ACCEPTS_CHECKS_QUESTION = 'Do you take checks at the front counter?'
+export const ACCEPTS_CHECKS_HINT = {
+  yes: 'The register shows a Check button, and asks for the check number so the payment can be '
+    + 'found again if the bank sends it back. A check is free — no fee, and no change to give.',
+  no: 'The register shows no Check button, and a check cannot be rung up here. Cash and card still work, '
+    + 'and a resident can still pay their invoice by check.',
+} as const
+
 export const TENANTS_DEPOSIT_AT_BANK_LABEL = 'Tenants may deposit rent directly at the bank'
 export const TENANTS_DEPOSIT_AT_BANK_HINT =
   'Tenants deposit rent at your bank themselves. GAM matches each deposit to their bill using your bank feed.'
@@ -5885,6 +6586,35 @@ export const CARD_DECLINE_FEE = 1.00
  */
 export const MIGRATION_WINDOW_DAYS = 28
 
+/**
+ * 10/19 (Nic): "Fix invite flag overridden in first 28 days."
+ *
+ * The existing-resident box on an invite answers a MONEY question, and until
+ * today it only said "skip background check" — so nobody reading it knew that
+ * ticking it zeroes the security deposit, the pet and utility deposits, the
+ * move-in fee and the prorated part-month. It has to say what it costs, in the
+ * same words on every door that offers it, because a signed lease cannot be
+ * corrected afterwards (the proration box on the signing page is locked).
+ *
+ * The two halves are separate rules and the copy keeps them separate:
+ *   - skipping the background check needs THIS PROPERTY'S onboarding window
+ *     (S579, and it can never be reopened);
+ *   - "their tenancy started before today" needs that window OR the landlord's
+ *     own 28 days (S631). In the band between the two, a sitting resident is
+ *     still papered as sitting AND still screens.
+ */
+export const EXISTING_RESIDENT_ATTESTATION_TITLE =
+  'They already live here — their tenancy started before today'
+export const EXISTING_RESIDENT_MONEY_NOTE =
+  'Their first bill is one whole month\u2019s rent and nothing else: no prorated part-month, no security '
+  + 'deposit, no pet or utility deposit, no move-in fee. Leave it unticked for anybody genuinely moving in '
+  + '\u2014 once the lease is signed this cannot be changed.'
+export const EXISTING_RESIDENT_SKIPS_SCREENING_NOTE =
+  'They also sign without a background check, because this property is still inside its onboarding window.'
+export const EXISTING_RESIDENT_STILL_SCREENS_NOTE =
+  'This property\u2019s onboarding window has closed, so they still complete a background check before portal '
+  + 'access. Ticking this only says their tenancy started before today.'
+
 export const PRIOR_ARRANGEMENT_METHOD = 'prior_arrangement' as const
 export const PRIOR_ARRANGEMENT_TRANSITION_DAYS = 21
 
@@ -5898,6 +6628,10 @@ export const PAYMENT_ENTRY_DESCRIPTION_LABELS: Partial<Record<PaymentEntryDescri
   DECLINEFEE: 'Declined-payment fee',
   ONTIMEPAY: 'On-time pay',
   FLEXPAY:   'FlexPay',
+  // 10/26: GAM's FlexDeposit service fee, charged in full with installment 1.
+  // Its own name because the resident reads it on their bill and it lands in
+  // GAM's book — never 'OTHERFEE', and never folded into deposit principal.
+  FLEXDEP:   'FlexDeposit fee',
   HOMEPMT:   'Home payment',
 }
 
@@ -6007,6 +6741,11 @@ export const DISBURSEMENT_STATUS_LABEL: Record<DisbursementStatus, string> = {
 // old rows still carry it, so it keeps a name.
 export const LANDLORD_GAM_CHARGE_KINDS = [
   'subscription', 'manual_payment_fee', 'bank_debit_cost', 'device_installment', 'screening_fee',
+  // 10/12 (Nic, G1): what a failed or returned bank pull of GAM's fees actually
+  // cost GAM — "gam eats no fees of failed pulls ever" — billed at cost.
+  // 10/12 (Nic, G5): the part of a processing fee the landlord covers that is
+  // more than the money GAM held from that payment.
+  'bank_debit_failed_cost', 'uncovered_processing_fee',
 ] as const
 export type LandlordGamChargeKind = typeof LANDLORD_GAM_CHARGE_KINDS[number]
 export const LANDLORD_GAM_CHARGE_KIND_LABEL: Record<LandlordGamChargeKind, string> = {
@@ -6015,6 +6754,8 @@ export const LANDLORD_GAM_CHARGE_KIND_LABEL: Record<LandlordGamChargeKind, strin
   bank_debit_cost:    'Bank transfer cost',
   device_installment: 'Card reader installment',
   screening_fee:      'Background check',
+  bank_debit_failed_cost:   'Bank transfer that did not go through (what it cost)',
+  uncovered_processing_fee: 'Processing fee you cover (more than the payment)',
 }
 
 // trigger_type is nullable in DB; null = legacy row pre-S64.
@@ -6029,8 +6770,20 @@ export type DisbursementTriggerType = typeof DISBURSEMENT_TRIGGER_TYPES[number]
 export const SECURITY_DEPOSIT_HELD_BY_VALUES = ['gam_escrow', 'landlord'] as const
 export type SecurityDepositHeldBy = typeof SECURITY_DEPOSIT_HELD_BY_VALUES[number]
 
-export const SECURITY_DEPOSIT_STATUSES = ['pending', 'funded', 'partial', 'disbursed', 'claimed'] as const
+// 10/12 (Nic, G8): 'voided' — a deposit record that was only ever a pending
+// line with nothing collected, on a lease voided before signing or never moved
+// into, is kept as a voided record (it used to be deleted). Every reader of a
+// lease's or a tenant's deposit leaves it out.
+export const SECURITY_DEPOSIT_STATUSES = ['pending', 'funded', 'partial', 'disbursed', 'claimed', 'voided'] as const
 export type SecurityDepositStatus = typeof SECURITY_DEPOSIT_STATUSES[number]
+
+// 10/12 (Nic, ledger P1): payments.deposit_collected_by — who COLLECTED a
+// deposit payment, stored once when it settles (decisions #46.3: by card or
+// bank onto GAM's balance → 'gam'; in person or into the landlord's own bank →
+// 'landlord'). Matches the payments_deposit_collected_by_check CHECK and the
+// values leaseFeesSync.depositCollectedBySql returns.
+export const DEPOSIT_COLLECTED_BY_VALUES = ['gam', 'landlord'] as const
+export type DepositCollectedBy = typeof DEPOSIT_COLLECTED_BY_VALUES[number]
 
 // ── PM (third-party property-management) companies — S108 ────────────────
 // Distinct from the OWNER's in-house property managers (those live in
@@ -6136,11 +6889,22 @@ export function formatInvoiceNumber(year: number, sequence: number): string {
 
 export * from './lateFees';
 export * from './autopaySchedule';
+// 10/26: FlexPay and FlexDeposit bracket pricing. The grids themselves live in
+// flexpay_fee_schedule / flexdeposit_fee_schedule; this is the matching logic.
+import { FLEX_DEPOSIT_PAYMENT_CHOICES } from './flexFees';
+export * from './flexFees';
+
+// 10/26: a printed page is always the light theme, whatever the screen is set
+// to. Nic printed an eviction balance summary in dark mode and got a solid
+// black sheet. Browser-only — never imported by the API.
+export * from './printTheme';
 // S624: property timezone from state + ZIP. Fifteen states split, so state alone
 // is wrong for all of them — and an unresolvable ZIP is FLAGGED, not guessed.
 export * from './propertyTimezone';
 // S640: reading an emergency contact out of a free-text lease field.
 export * from './emergencyContact';
+// 10/25 (Nic): one GAM customer per person, and the three-point match rule.
+export * from './customerMatch';
 
 // ============================================================================
 // Pending tenant intent parser types (S29c-2-A backend, S29c-2-B UI)
@@ -6585,8 +7349,9 @@ export const BANK_ACCOUNT_STATUS_VALUES = ['active', 'archived'] as const
 export type BankAccountStatus = typeof BANK_ACCOUNT_STATUS_VALUES[number]
 
 /**
- * POST /api/bank-accounts payload. routing_number + account_number raw on
- * the wire (TLS only); server encrypts at rest and only ever returns last4.
+ * The old POST /api/bank-accounts payload. 10/12: that endpoint now refuses
+ * new entries (payouts are set up with Stripe on the Bank page's Bank setup
+ * tab); the shape is kept only as a record of what existing rows hold.
  */
 export interface BankAccountInput {
   nickname: string
@@ -6753,6 +7518,13 @@ export const CREDIT_EVENT_TYPES = [
   'dispute_resolved_corrected',
   'dispute_resolved_no_change',
 
+  // Ledger integrity (system-recorded, 10/13). Nic: restart a forked chain
+  // "from today, with a recorded note explaining the break" — the restart is
+  // the new chain's first event and seals the old one (apps/api
+  // services/creditLedger restartChain). Not a mark: never scored, never in a
+  // credit history (getSubjectChain leaves it out); verifyChain reports it.
+  'chain_restarted',
+
   // External life events — utility (v1.5+ Plaid/aggregator)
   'utility_payment_on_time',
   'utility_payment_late_grace',
@@ -6893,11 +7665,34 @@ export const CREDIT_SUPERSEDE_REASONS = [
   'correction_after_dispute',
   'data_entry_error_corrected',
   'attestation_invalidated',
+  // 10/12 (Nic): "the payment history should be a health percentage. one mark
+  // per invoice." A bill's mark replaced by the one its new outcome earns
+  // (outstanding → paid late, a payment reversed, a bank match moving the day),
+  // and a per-line mark written before 10/12 replaced by its bill's mark
+  // (apps/api services/creditBillMarks). credit_events.superseded_reason is
+  // TEXT with no CHECK: no migration.
+  'bill_status_changed',
+  'replaced_by_bill_mark',
+  // 10/13 (Nic, the marks whose payment row is gone — deleted demo tenants,
+  // "Nic Test"): "withdrawn: no bill" — the mark points at itself, stops
+  // counting anywhere, and the record stays (scripts/oct12_rerate_late_marks).
+  'withdrawn_no_bill',
+  // 10/14 (review of Nic's #8): the marks of a lease erased as never having
+  // come to be ("signed a lease", its bills' marks) — withdrawn the same way,
+  // record kept (apps/api lib/eraseUnfinishedDocument.eraseLeaseRows).
+  'withdrawn_no_lease',
 ] as const
 export type CreditSupersedeReason = typeof CREDIT_SUPERSEDE_REASONS[number]
 
 export const CREDIT_NETWORK_TIERS = ['tier_2_full'] as const
 export type CreditNetworkTier = typeof CREDIT_NETWORK_TIERS[number]
+
+// 10/13 evening (Nic): "Broken credit chain: fold into the 8:05 MORNING admin
+// email (not its own 3 am email)." What a night's credit chain check found
+// (credit_chain_check_runs.outcome; mirrors credit_chain_check_runs_outcome_check):
+// 'running' until it finishes; 'failed' is a check that could not finish.
+export const CREDIT_CHAIN_CHECK_OUTCOMES = ['running', 'whole', 'broken', 'failed'] as const
+export type CreditChainCheckOutcome = typeof CREDIT_CHAIN_CHECK_OUTCOMES[number]
 
 export const EXTERNAL_ACCOUNT_CATEGORIES = [
   'utility',
@@ -7178,6 +7973,69 @@ export const DISBURSEMENT_TRIGGER_LABEL: Record<string, string> = {
 export const WORK_TRADE_LOG_STATUS_LABEL: Record<string, string> = {
   pending: 'Logged', approved: 'Approved', rejected: 'Denied',
 }
+
+// work_trade_settlements.status — a month's work-trade period is open until
+// its month closes, then settled (the hours covered it) or billed (the
+// shortfall was billed). 10/12 (Nic, G8): 'voided' — a period on a bill that
+// will never be owed (a lease voided before signing, a new lease that never
+// starts, a stay shortened past the bill), kept as a record, never deleted.
+// The CHECK (migration 20261013235130) lists the same values.
+export const WORK_TRADE_SETTLEMENT_STATUSES = ['open', 'settled', 'billed', 'voided'] as const
+export type WorkTradeSettlementStatus = typeof WORK_TRADE_SETTLEMENT_STATUSES[number]
+
+// 10/12 (Nic): "He may be doing more work than what the work trade covers. And
+// instead of giving him credit ahead for his rent, it may be compensation on top
+// of the rent." The LANDLORD PICKS PER AGREEMENT what approved hours beyond what
+// a month needs (after any carried shortfall) do:
+//   bank — banked toward future months (what every agreement did before this)
+//   pay  — paid at an hourly rate the landlord sets, through payroll or a
+//          contractor payment. Paid extra hours are wages; the TRADE hours never
+//          carry a rate for the tenant (S643).
+// The migration's CHECKs list the same values.
+export const WORK_TRADE_EXTRA_HOURS_MODES = ['bank', 'pay'] as const
+export type WorkTradeExtraHoursMode = typeof WORK_TRADE_EXTRA_HOURS_MODES[number]
+export const WORK_TRADE_EXTRA_HOURS_MODE_LABEL: Record<WorkTradeExtraHoursMode, string> = {
+  bank: 'Bank them toward future months',
+  pay: 'Pay them at an hourly rate',
+}
+export const WORK_TRADE_EXTRA_PAY_METHODS = ['payroll_w2', 'contractor_1099'] as const
+export type WorkTradeExtraPayMethod = typeof WORK_TRADE_EXTRA_PAY_METHODS[number]
+export const WORK_TRADE_EXTRA_PAY_METHOD_LABEL: Record<WorkTradeExtraPayMethod, string> = {
+  payroll_w2: 'Payroll (W-2)',
+  contractor_1099: 'Contractor payment (1099)',
+}
+// Neutral copy only — no legal advice (national platform rule).
+export const WORK_TRADE_EXTRA_HOURS_NOTICE =
+  'Paying a tenant for work may make them your employee or contractor. Check your local laws.'
+// A payable record of paid extra hours. 'sent_to_books' = queued for GAM Books
+// payroll or contractor payment; 'paid' = paid (by hand, or once Books pays it).
+export const WORK_TRADE_EXTRA_PAYABLE_STATUSES = ['unpaid', 'sent_to_books', 'paid'] as const
+export type WorkTradeExtraPayableStatus = typeof WORK_TRADE_EXTRA_PAYABLE_STATUSES[number]
+export const WORK_TRADE_EXTRA_PAYABLE_STATUS_LABEL: Record<WorkTradeExtraPayableStatus, string> = {
+  unpaid: 'Not paid yet', sent_to_books: 'Sent to GAM Books', paid: 'Paid',
+}
+// How extra hours were paid by hand (Mark paid).
+export const WORK_TRADE_EXTRA_PAID_HOW = ['check', 'cash'] as const
+export type WorkTradeExtraPaidHow = typeof WORK_TRADE_EXTRA_PAID_HOW[number]
+export const WORK_TRADE_EXTRA_PAID_HOW_LABEL: Record<WorkTradeExtraPaidHow, string> = {
+  check: 'Check', cash: 'Cash',
+}
+// 10/12 (Nic, ledger P6/P7): how a record of extra hours ended up paid — by
+// hand (above), or in GAM Books ('gam_books': a payroll run paid it, or the
+// contractor-payment expense it became was paid there). Mirrors
+// work_trade_extra_hours_paid_how_check. Mark paid offers only the by-hand two.
+export const WORK_TRADE_EXTRA_PAID_HOW_RECORDED = [...WORK_TRADE_EXTRA_PAID_HOW, 'gam_books'] as const
+export type WorkTradeExtraPaidHowRecorded = typeof WORK_TRADE_EXTRA_PAID_HOW_RECORDED[number]
+export const WORK_TRADE_EXTRA_PAID_HOW_RECORDED_LABEL: Record<WorkTradeExtraPaidHowRecorded, string> = {
+  ...WORK_TRADE_EXTRA_PAID_HOW_LABEL, gam_books: 'Paid in GAM Books',
+}
+
+// 10/12 (Nic): when a landlord takes a charge type OFF a work trade while open
+// charges of that type are parked under it, it is the landlord's choice at that
+// moment: keep those open charges covered, or put them back on the tenant's
+// balance. Charges already paid or settled at a month close are never touched.
+export const WORK_TRADE_COVERAGE_REMOVAL_CHOICES = ['keep_covered', 'put_back'] as const
+export type WorkTradeCoverageRemovalChoice = typeof WORK_TRADE_COVERAGE_REMOVAL_CHOICES[number]
 
 // What rate a SUBMETERED unit on a RUBS master's line is billed at (S607).
 //   property_rate — the rate the landlord published (default). A predictable
@@ -7863,3 +8721,313 @@ export function installmentSplit(total: number, n: number): number[] {
   out[n - 1] += cents - base * n
   return out.map(c => c / 100)
 }
+
+// ── 10/12 (Nic): what a reader cost GAM, and what of its price is earnings ──
+// "331.73 after tax and shipping. 299 base. those orders are going to need to
+// be tracked because shipping will vary." Each order records GAM's actual cost
+// (base price, tax, shipping — or tax and shipping as one amount when the
+// receipt does not split them), entered on GAM's desk, every entry kept; 10/13
+// (Nic): "allow dated cost corrections" — a later entry applies from its own
+// date, and a piece of the plan is split under the figure in force the day it
+// is billed (apps/api services/readerOrders bookReaderBook).
+// Markup = what the landlord is charged − GAM's total cost.
+//
+// COST FIRST (Nic 10/12): the payments repay GAM's cost first; the markup lands
+// in the last piece(s). Mountain View: 4 × $87.50 against $331.73 → pieces 1-3
+// are all cost ($262.50), piece 4 is $69.23 cost + $18.27 markup. Only the
+// markup is GAM's earnings (platform_revenue_ledger 'device_markup', booked when
+// the piece carrying it is billed, like a platform fee).
+//
+// 10/13 (Nic): FULL PURCHASE — "Book the $331.73 as an expense the day we buy
+// it, and each $87.50 payment as paying it back (lowers 'earned all time' until
+// repaid)." GAM's own book holds the purchase as an expense and each piece's
+// cost part as paying it back (readerBookRows, below); the markup is still the
+// only earnings beyond the cost.
+
+/** Mirrors pos_reader_order_costs_source_check. */
+export const READER_ORDER_COST_SOURCES = ['desk', 'backfill'] as const
+export type ReaderOrderCostSource = typeof READER_ORDER_COST_SOURCES[number]
+export const READER_ORDER_COST_SOURCE_LABEL: Record<ReaderOrderCostSource, string> = {
+  desk:     'Entered on the desk',
+  backfill: 'Recorded from Nic’s figures (10/12)',
+}
+
+export interface ReaderCostParts {
+  basePrice: number
+  tax?: number | null
+  shipping?: number | null
+  /** Tax and shipping as one amount, when the receipt does not split them. Never beside tax or shipping. */
+  taxAndShipping?: number | null
+}
+
+const rc = (n: number | null | undefined) => Math.round(Number(n ?? 0) * 100)
+
+/** GAM's total cost of a reader, to the cent. */
+export function readerCostTotal(c: ReaderCostParts): number {
+  return (rc(c.basePrice) + rc(c.tax) + rc(c.shipping) + rc(c.taxAndShipping)) / 100
+}
+
+/** One monthly piece of a reader's price, split cost first. */
+export interface ReaderPieceSplit { n: number; amount: number; cost: number; markup: number }
+
+/**
+ * The pieces of a reader's price, each split into GAM's cost and markup, cost
+ * first: the first pieces repay the cost; whatever of a piece is left once the
+ * cost is covered is markup. Unknown cost (null): every dollar counts as cost
+ * — GAM books no earnings it cannot show. A cost above the price: every piece
+ * is cost and nothing is markup (the shortfall is GAM's loss on that reader).
+ */
+export function readerPieceSplit(price: number, installments: number, totalCost: number | null): ReaderPieceSplit[] {
+  const pieces = installmentSplit(price, installments).map(rc)
+  let costLeft = totalCost == null ? Infinity : Math.max(0, rc(totalCost))
+  return pieces.map((p, i) => {
+    const cost = Math.min(p, costLeft)
+    costLeft -= cost
+    return { n: i + 1, amount: p / 100, cost: cost / 100, markup: (p - cost) / 100 }
+  })
+}
+
+/** A piece GAM has billed (a landlord_gam_charges row of the order). */
+export interface ReaderPieceBilled { n: number; amount: number; collected: number; voided?: boolean }
+
+export interface ReaderOrderMoney {
+  charged: number
+  totalCost: number | null
+  /** charged − totalCost; negative when the reader cost GAM more than it charges. null: cost not entered. */
+  markup: number | null
+  split: ReaderPieceSplit[]
+  /** Billed so far (pieces raised and not voided). */
+  billed: number
+  /** Collected so far, on every piece. */
+  collected: number
+  /** The markup in the pieces billed so far — what GAM's earnings ledger books. */
+  markupBilled: number
+  /** Of what was collected, the markup (cost first, across the whole order). */
+  markupCollected: number
+  /** Of what was collected, GAM's cost coming back. */
+  costRecovered: number
+  /** markupBilled − markupCollected. */
+  markupNotCollected: number
+  /**
+   * 10/13 (Nic): "record each reader as a GAM expense (loss if cost >
+   * charge)" — totalCost − charged when that is above zero, else 0. null: cost
+   * not entered. In GAM's own book it is the part of the purchase (an expense)
+   * that the pieces never pay back (readerBookRows).
+   */
+  loss: number | null
+}
+
+/**
+ * One reader order's money: the split of every piece, and — over the pieces
+ * billed so far — the markup billed, collected and still owed. Cost first
+ * holds across the whole order: of everything collected, the first dollars up
+ * to GAM's cost are cost, the rest markup (never more than the markup billed).
+ */
+export function readerOrderMoney(o: {
+  price: number; installments: number; totalCost: number | null; pieces: ReaderPieceBilled[]
+}): ReaderOrderMoney {
+  const split = readerPieceSplit(o.price, o.installments, o.totalCost)
+  let billed = 0, collected = 0, markupBilled = 0
+  for (const p of o.pieces) {
+    collected += rc(p.collected)
+    if (p.voided) continue
+    billed += rc(p.amount)
+    markupBilled += rc(split[p.n - 1]?.markup ?? 0)
+  }
+  const markupCollected = o.totalCost == null ? 0
+    : Math.min(markupBilled, Math.max(0, collected - rc(o.totalCost)))
+  return {
+    charged: rc(o.price) / 100,
+    totalCost: o.totalCost == null ? null : rc(o.totalCost) / 100,
+    markup: o.totalCost == null ? null : (rc(o.price) - rc(o.totalCost)) / 100,
+    split,
+    billed: billed / 100,
+    collected: collected / 100,
+    markupBilled: markupBilled / 100,
+    markupCollected: markupCollected / 100,
+    costRecovered: (collected - markupCollected) / 100,
+    markupNotCollected: (markupBilled - markupCollected) / 100,
+    loss: o.totalCost == null ? null : Math.max(0, rc(o.totalCost) - rc(o.price)) / 100,
+  }
+}
+
+// ── 10/13 (Nic): a card reader in GAM's OWN book — the full purchase ──────
+// "Book the $331.73 as an expense the day we buy it, and each $87.50 payment
+// as paying it back (lowers 'earned all time' until repaid)." For every reader
+// GAM bought, GAM's book (platform_revenue_ledger) holds:
+//   - PURCHASE: GAM's cost as an expense (below zero) the day GAM bought it.
+//     A dated cost correction books the difference on its own date — a refund
+//     gives some back, extra shipping takes more — and every row before it
+//     stays as it was ("old figures kept").
+//   - COST REPAID: each piece of the plan, as it is billed, pays the cost back
+//     first (10/12, cost first) — split under the cost in force the day it is
+//     billed.
+//   - MARKUP: what a piece carries beyond the cost, once the cost is repaid —
+//     GAM's earnings ('device_markup', 10/12).
+// Mountain View: −$331.73 on 9/28, +$87.50 a month on pieces 1-3, and piece 4
+// +$69.23 repaid + $18.27 markup. A reader that cost more than it is charged
+// stays below zero by its loss once its last piece is billed.
+//
+// 10/13 evening (Nic): "Redo the split" — a cost correction after pieces are
+// booked REDOES the split, as a dated correction. Every piece already billed
+// is split again under the corrected cost, cost first: what moves between its
+// cost repaid and its markup is booked as the difference, ON THE CORRECTION'S
+// DATE (the rows booked before stay as they were; a piece's own rows stay
+// dated the day it was billed). So once every correction is in, the slices
+// say what Nic's rule says — the markup is only what is beyond the cost.
+// Mountain View with $5.00 more shipping from 10/1: piece 4 −$5.00 markup and
+// +$5.00 cost repaid on 10/1 ($74.23 + $13.27 in all), beside the −$5.00
+// purchase correction.
+
+/**
+ * The reference_type of a reader's purchase and cost-repaid rows, which are
+ * typed 'adjustment' in platform_revenue_ledger (the markup has its own type,
+ * 'device_markup', referenced 'reader_order_installment'). A purchase row
+ * references its cost entry (pos_reader_order_costs), a cost-repaid row its
+ * piece (landlord_gam_charges). Read by the money pies and the bridge.
+ *
+ * 10/13 evening (Nic: "Redo the split"): a piece split again under a later
+ * cost entry references the re-split (pos_reader_order_resplits: the piece and
+ * the entry) — its cost-repaid difference keeps the cost-repaid reference (so
+ * the pies and the bridge count it in "Cost repaid"), its markup difference is
+ * 'device_markup' referenced `resplit`. Either may be below zero.
+ */
+export const READER_BOOK_REFERENCE = { purchase: 'reader_purchase', costRepaid: 'reader_cost_repaid', resplit: 'reader_resplit' } as const
+
+export const READER_BOOK_ROW_KINDS = ['purchase', 'cost_repaid', 'markup'] as const
+export type ReaderBookRowKind = typeof READER_BOOK_ROW_KINDS[number]
+export const READER_BOOK_ROW_KIND_LABEL: Record<ReaderBookRowKind, string> = {
+  purchase:    'Bought — GAM’s expense',
+  cost_repaid: 'Cost repaid',
+  markup:      'Markup — GAM’s earnings',
+}
+
+/** One cost entry of an order, in the order they were typed (seq). */
+export interface ReaderCostEntryForBook { id?: string; total: number; effectiveOn: string }
+/** One billed piece of an order: its number, amount and the day it was billed (GAM's calendar, 'YYYY-MM-DD'). */
+export interface ReaderPieceForBook { id?: string; n: number; amount: number; billedOn: string; voided?: boolean }
+
+export interface ReaderBookRow {
+  kind: ReaderBookRowKind
+  /** The cost entry (a purchase) or the piece (cost repaid, markup) the row is for. */
+  ref?: string
+  /** The piece's number (cost repaid, markup). */
+  n?: number
+  /** Signed: a purchase is below zero; a correction that gives money back is above it. */
+  amount: number
+  /** The day it is booked: the entry's effectiveOn, or the day the piece was billed. */
+  on: string
+  /** The cost it was worked out under: the entry's total, or the cost in force the day the piece was billed. */
+  cost: number
+  /** A correction: the figure it replaces. */
+  previousCost?: number
+  /**
+   * 10/13 evening (Nic: "Redo the split"): a piece split again under a later
+   * cost entry. The row is the difference from the split before it (signed),
+   * dated the entry's day; `resplitUnder` is that entry's id (when ids are given).
+   */
+  resplit?: true
+  resplitUnder?: string
+}
+
+/**
+ * The rows GAM's book should hold for one reader order. Nothing until its
+ * cost is entered (until then no dollar of it can be split); no purchase for an
+ * order GAM never bought (`bought`: ordered from Stripe's shop, or further, or
+ * cancelled after that). Voided pieces are left out. A piece carries the split
+ * under the latest entry dated on or before the day it was billed (an order's
+ * first entry covers every day before it, so a cost typed late still splits
+ * the pieces billed before it).
+ *
+ * 10/13 evening (Nic: "Redo the split"): each later entry — a correction dated
+ * after the piece was billed — splits the piece again, and the difference from
+ * the split before it is a row of its own on that entry's day (`resplitUnder`):
+ * cost repaid one way, markup the other, the piece's total unchanged. Summed,
+ * every piece is split under the order's latest cost.
+ */
+export function readerBookRows(o: {
+  price: number; installments: number; bought: boolean
+  entries: ReaderCostEntryForBook[]; pieces: ReaderPieceForBook[]
+}): ReaderBookRow[] {
+  if (!o.entries.length) return []
+  const rows: ReaderBookRow[] = []
+  if (o.bought) {
+    let prevC: number | null = null
+    for (const e of o.entries) {
+      const c = rc(e.total)
+      const diff = c - (prevC ?? 0)
+      if (diff !== 0) {
+        rows.push({
+          kind: 'purchase', ref: e.id, amount: -diff / 100, on: e.effectiveOn, cost: c / 100,
+          ...(prevC == null ? {} : { previousCost: prevC / 100 }),
+        })
+      }
+      prevC = c
+    }
+  }
+  for (const p of [...o.pieces].filter(p => !p.voided).sort((a, b) => a.n - b.n)) {
+    const at = readerEntryInForce(o.entries, p.billedOn)
+    const inForce = o.entries[at]
+    const s = readerPieceSplit(o.price, o.installments, inForce.total)[p.n - 1]
+    if (!s) continue
+    if (s.cost > 0) rows.push({ kind: 'cost_repaid', ref: p.id, n: p.n, amount: s.cost, on: p.billedOn, cost: rc(inForce.total) / 100 })
+    if (s.markup > 0) rows.push({ kind: 'markup', ref: p.id, n: p.n, amount: s.markup, on: p.billedOn, cost: rc(inForce.total) / 100 })
+    // Every entry after it is dated after the day the piece was billed: the
+    // split redone under each, the difference on that entry's day.
+    let prev = s, prevCost = rc(inForce.total)
+    for (const e of o.entries.slice(at + 1)) {
+      const next = readerPieceSplit(o.price, o.installments, e.total)[p.n - 1]
+      const dCost = rc(next.cost) - rc(prev.cost)
+      const dMarkup = rc(next.markup) - rc(prev.markup)
+      const redo = { ref: p.id, n: p.n, on: e.effectiveOn, cost: rc(e.total) / 100, previousCost: prevCost / 100, resplit: true as const, resplitUnder: e.id }
+      if (dCost !== 0) rows.push({ kind: 'cost_repaid', amount: dCost / 100, ...redo })
+      if (dMarkup !== 0) rows.push({ kind: 'markup', amount: dMarkup / 100, ...redo })
+      prev = next; prevCost = rc(e.total)
+    }
+  }
+  return rows
+}
+
+/**
+ * Which of an order's cost entries (in the order typed) a piece billed on
+ * `billedOn` is split under when it is billed: the latest dated on or before
+ * that day, else the first (an order's first entry covers every day before
+ * it). Entries are never dated before the one they correct, so every entry
+ * after it is dated after the piece was billed.
+ */
+export function readerEntryInForce(entries: ReadonlyArray<Pick<ReaderCostEntryForBook, 'effectiveOn'>>, billedOn: string): number {
+  for (let i = entries.length - 1; i >= 0; i--) if (entries[i].effectiveOn <= billedOn) return i
+  return 0
+}
+
+/** What the rows come to, to the cent: purchase (below zero), cost repaid, markup, and the net. */
+export function readerBookTotals(rows: ReadonlyArray<Pick<ReaderBookRow, 'kind' | 'amount'>>): {
+  purchase: number; costRepaid: number; markup: number; net: number
+} {
+  const t = { purchase: 0, cost_repaid: 0, markup: 0 }
+  for (const r of rows) t[r.kind] += rc(r.amount)
+  return {
+    purchase: t.purchase / 100, costRepaid: t.cost_repaid / 100, markup: t.markup / 100,
+    net: (t.purchase + t.cost_repaid + t.markup) / 100,
+  }
+}
+
+// 10/13 (Nic, full purchase): the admin income pies — a slice below zero (a reader GAM bought) is named, not drawn.
+export * from './incomePie'
+
+// 10/12 (Nic): held items, transfer purposes and GAM-charge voids (ledger P0).
+export * from './landlordGamMoney'
+
+// 10/12 (Nic): Charged / Received / Owed columns and the monthly property report.
+export * from './monthlyReport'
+
+// 10/12 (Nic): who stays on the Rent Roll after moving out (the landlord's choice, per company).
+export * from './rentRoll'
+
+// 10/13 (Nic): the admin Metrics map's levels (cities, districts, ZIP codes) — one list for the API and the page.
+export * from './metricsMap'
+
+// 10/20 (Nic): "this looks like the same person" — the signals, the confidence and the
+// sentences for both, shared by the matcher that scores a pair and the screen that asks.
+export * from './duplicatePeople'
+

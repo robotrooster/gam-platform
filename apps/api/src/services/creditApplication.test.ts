@@ -4,10 +4,14 @@
  * and the portal charge until they call the rule themselves (Steps 7 and 8),
  * deleted in Step 18.
  *
- * Nic (10/2): credit applies by itself only when it covers the WHOLE bill.
- * The S638 rule ("posting a credit changes no charge") still holds for a credit
- * smaller than the bill; what a credit route does after issuing one is the
- * route's own test (routes/tenantCredits.test.ts, Step 7).
+ * Nic (10/2): a credit that covers the WHOLE bill settles it by itself.
+ * Nic (10/15): one that covers less goes on the balance anyway — "money gets
+ * applied to the most outstanding balance first. Somebody can't go put $1,000
+ * credit and not pay a $2,000 existing bill" — oldest bill first, part of a
+ * line where it runs out, the rest left owed. The S638 rule that survives is
+ * that nothing is settled LINE BY LINE out of order and no row is cut in two;
+ * what a credit route does after issuing one is the route's own test
+ * (routes/tenantCredits.test.ts, Step 7).
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import { db } from '../db'
@@ -61,16 +65,35 @@ const credit = (landlordId: string, tenantId: string, leaseId: string | null, am
    VALUES ($1,$2,$3,$4,$4,'goodwill')`, [landlordId, tenantId, leaseId, amount])
 
 describe('the wrapper delegates to the whole-bill rule', () => {
-  it('a credit smaller than the whole bill changes no charge and stays whole (Kim Harland)', async () => {
+  it('a credit smaller than the whole bill goes on the balance oldest first, the rest left owed (10/15)', async () => {
     const f = await seedLeaseWithCharges([25, 5, 5])
     await credit(f.landlordId, f.tenantId, f.leaseId, 30)
-    expect(await apply(f.leaseId)).toEqual({ applied: 0, rowsTouched: 0 })
-    // The charges stand: nothing settled, nothing split, nothing invented.
-    expect(await openBalance(f.leaseId)).toBeCloseTo(35, 2)
-    const settled = await db.query(`SELECT 1 FROM payments WHERE lease_id = $1 AND status <> 'pending'`, [f.leaseId])
-    expect(settled.rowCount).toBe(0)
-    expect(Number((await db.query(`SELECT amount_remaining FROM tenant_credits`)).rows[0].amount_remaining)).toBe(30)
-    expect((await db.query(`SELECT 1 FROM credit_uses`)).rowCount).toBe(0)
+    // $30 against $35: the Sep 2 $25 and the Sep 3 $5 are paid, $5 still owed.
+    expect(await apply(f.leaseId)).toEqual({ applied: 30, rowsTouched: 2 })
+    expect(await openBalance(f.leaseId)).toBeCloseTo(5, 2)
+    // Oldest first, and the row it reached last is the NEWEST — never picked
+    // out of order, never cut in two.
+    const open = await db.query<{ amount: string; due_date: string }>(
+      `SELECT amount::text, due_date::text FROM payments WHERE lease_id = $1 AND status = 'pending'`, [f.leaseId])
+    expect(open.rows).toEqual([{ amount: '5.00', due_date: '2026-09-04' }])
+    expect(Number((await db.query(`SELECT amount_remaining FROM tenant_credits`)).rows[0].amount_remaining)).toBe(0)
+    const uses = await db.query<any>(`SELECT source, status, SUM(amount)::float AS a FROM credit_uses GROUP BY 1, 2`)
+    expect(uses.rows).toEqual([{ source: 'whole_bill', status: 'applied', a: 30 }])
+  })
+
+  // 10/15 (Nic): a credit that cannot cover even the oldest line still pays
+  // part of it — "money gets applied to the most outstanding balance first" —
+  // and that line stays open for the rest (the row is never cut in two).
+  it('a credit smaller than the oldest line pays part of it and the line stays open', async () => {
+    const f = await seedLeaseWithCharges([25])
+    await credit(f.landlordId, f.tenantId, f.leaseId, 10)
+    expect(await apply(f.leaseId)).toEqual({ applied: 10, rowsTouched: 0 })
+    const r = (await db.query<{ status: string; on_it: string }>(
+      `SELECT p.status, (SELECT COALESCE(SUM(u.amount),0) FROM credit_uses u
+                          WHERE u.payment_id = p.id AND u.status = 'applied')::text AS on_it
+         FROM payments p WHERE p.lease_id = $1`, [f.leaseId])).rows[0]
+    expect(r).toEqual({ status: 'pending', on_it: '10.00' })
+    expect(Number((await db.query(`SELECT amount_remaining FROM tenant_credits`)).rows[0].amount_remaining)).toBe(0)
   })
 
   it('a credit covering the whole bill settles every row, through the credit ledger', async () => {

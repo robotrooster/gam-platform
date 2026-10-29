@@ -250,7 +250,12 @@ describe('POST /api/entry-requests — create', () => {
     expect(res.body.data.typical_hours_warning).toBeNull()
   })
 
-  it('S475: pre-8am start (5am Phoenix) → outside_typical_hours=true + hedged warning', async () => {
+  // 10/20 (Nic): "no state law warnings anywhere in the system ... just hide
+  // all that stuff." The HOUR is a fact and stays; the sentence telling them
+  // what entry laws commonly require and to go read their local one is a
+  // state-law caution and waits for the same switch the banner below it waits
+  // for (system_features.state_law_warnings_enabled).
+  it('S475: pre-8am start (5am Phoenix) → outside_typical_hours=true, and no law caution while the switch is off', async () => {
     const f = await seedERFixture()
     // 12:00 UTC = 05:00 Phoenix (UTC-7, no DST).
     const res = await createRequest(f, f.landlordToken, {
@@ -260,7 +265,26 @@ describe('POST /api/entry-requests — create', () => {
     expect(res.status).toBe(200)
     expect(res.body.data.outside_typical_hours).toBe(true)
     expect(res.body.data.typical_hours_warning).toMatch(/typical daytime/i)
-    expect(res.body.data.typical_hours_warning).toMatch(/check your local law/i)
+    expect(res.body.data.typical_hours_warning).not.toMatch(/local law|entry laws|reasonable times/i)
+  })
+
+  it('S475: switch ON — the same request carries the entry-law caution back', async () => {
+    const f = await seedERFixture()
+    await db.query(
+      `INSERT INTO system_features (key, enabled, description)
+       VALUES ('state_law_warnings_enabled', TRUE, 'test')
+       ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
+    try {
+      const res = await createRequest(f, f.landlordToken, {
+        windowStartIso: '2026-07-01T12:00:00Z',
+        windowEndIso:   '2026-07-01T13:00:00Z',
+      })
+      expect(res.status).toBe(200)
+      expect(res.body.data.typical_hours_warning).toMatch(/typical daytime/i)
+      expect(res.body.data.typical_hours_warning).toMatch(/check your local law/i)
+    } finally {
+      await db.query(`DELETE FROM system_features WHERE key = 'state_law_warnings_enabled'`)
+    }
   })
 
   it('S475: post-8pm start (9pm Phoenix) → outside_typical_hours=true', async () => {
@@ -323,22 +347,23 @@ describe('POST /api/entry-requests — create', () => {
        ON CONFLICT DO NOTHING`, [actId])
   }
 
-  it('S476: AZ residential 30h notice (below 48h statute) → state_law_warnings nonempty', async () => {
+  it('hidden 10/20: AZ 30h notice (under the seeded 48h figure) → nothing shown', async () => {
+    // Nic, 10/20: "There should be no state law warnings anywhere in the
+    // system." The statute is seeded and the notice is short, and the landlord
+    // still sees no notice about it. The field stays on the response (always
+    // empty) so the one switch in services/stateLaw restores the banner
+    // without a code change — proven both ways in
+    // tenantsLeaseStateLaw.test.ts and services/stateLaw.test.ts.
     const f = await seedERFixture()
     await seedAzEntryNoticeStatute()
-    // 30h notice = below AZ § 33-1343's 48h minimum.
     const futureStart = new Date(Date.now() + 30 * 3_600_000).toISOString()
     const futureEnd   = new Date(Date.now() + 31 * 3_600_000).toISOString()
     const res = await createRequest(f, f.landlordToken,
       { windowStartIso: futureStart, windowEndIso: futureEnd })
     expect(res.status).toBe(200)
     expect(Array.isArray(res.body.data.state_law_warnings)).toBe(true)
-    expect(res.body.data.state_law_warnings.length).toBe(1)
-    const flag = res.body.data.state_law_warnings[0]
-    expect(flag.topic).toBe('entry_notice_hours')
-    expect(flag.message).toMatch(/below the 48/)
-    expect(flag.message).toMatch(/AZ/)
-    expect(flag.disclaimer).toMatch(/may be out of date/i)
+    expect(res.body.data.state_law_warnings).toEqual([])
+    expect(JSON.stringify(res.body)).not.toMatch(/not legal advice|A\.R\.S\./i)
   })
 
   it('S476: AZ residential 60h notice (above 48h statute) → state_law_warnings empty', async () => {
@@ -600,7 +625,7 @@ describe('loadRequest scope guard (via GET /:id)', () => {
        ON CONFLICT DO NOTHING`, [actId])
   }
 
-  it('S478: tenant GETs own request → sees outside_typical_hours + state_law_warnings', async () => {
+  it('S478: tenant GETs own request → sees outside_typical_hours, and no state-law notice (hidden 10/20)', async () => {
     const f = await seedERFixture()
     await seedAzEntryNoticeStatute()
     // 30h notice + 5 AM Phoenix = both flags fire.
@@ -619,9 +644,13 @@ describe('loadRequest scope guard (via GET /:id)', () => {
       .set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.outside_typical_hours).toBe(true)
+    // The HOUR stays — a 5am entry is a fact worth both parties seeing. What
+    // is gone is every law sentence: the state-law comparison beside it AND
+    // the "entry laws commonly require reasonable times" tail the notice used
+    // to carry, which was never local-law-neutral however it was described.
     expect(res.body.data.typical_hours_warning).toMatch(/typical daytime/i)
-    expect(res.body.data.state_law_warnings.length).toBe(1)
-    expect(res.body.data.state_law_warnings[0].topic).toBe('entry_notice_hours')
+    expect(res.body.data.typical_hours_warning).not.toMatch(/local law|entry laws|reasonable times/i)
+    expect(res.body.data.state_law_warnings).toEqual([])
   })
 
   it('S478: GET on a within-range request → outside_typical_hours=false + empty state_law_warnings', async () => {

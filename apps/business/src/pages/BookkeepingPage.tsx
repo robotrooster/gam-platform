@@ -14,6 +14,9 @@ interface Account {
   id: string; code: string; name: string
   type: 'asset' | 'liability' | 'equity' | 'income' | 'expense'
   balance: string
+  // 10/11: the balance in its normal sign (money owed, equity and income
+  // earned read positive). `balance` is stored debits minus credits.
+  normalBalance?: number
 }
 interface Txn {
   id: string; date: string; description: string
@@ -208,7 +211,8 @@ function ExpensesTab() {
   const cancelEdit = () => { setEditingId(null); setForm(blank) }
 
   const remove = async (r: Txn) => {
-    if (!(await appConfirm(`Delete "${r.description}"? This can't be undone.`, { danger: true, confirmLabel: 'Delete' }))) return
+    // 10/11: removing hides the row from the books and keeps it (it is not erased).
+    if (!(await appConfirm(`Remove "${r.description}" from your books?`, { danger: true, confirmLabel: 'Remove' }))) return
     setErr(null)
     try { await apiDelete(`/books/transactions/${r.id}`); if (editingId === r.id) cancelEdit(); await load() }
     catch (e: any) { setErr(e?.response?.data?.error || 'Delete failed') }
@@ -371,7 +375,7 @@ function AccountsTab() {
                   <td style={{ ...tdStyle, fontFamily: 'var(--font-mono)' }}>{a.code}</td>
                   <td style={tdStyle}>{a.name}</td>
                   <td style={{ ...tdStyle, color: 'var(--text-2)', textTransform: 'capitalize' }}>{humanize(a.type)}</td>
-                  <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--font-mono)' }}>{fmtMoney(+a.balance)}</td>
+                  <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--font-mono)' }}>{fmtMoney(+(a.normalBalance ?? a.balance))}</td>
                 </tr>
               ))}
             </tbody>

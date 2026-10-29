@@ -158,14 +158,28 @@ async function addHousehold(park: Awaited<ReturnType<typeof seedPark>>, opts: {
 
 const api = () => request(buildApp())
 
-/** Draft through the real route, send, and have the landlord sign at `startIso` / `rent`. */
-async function newLeaseSignedByLandlord(park: Awaited<ReturnType<typeof seedPark>>, h: Household, startIso: string, rent = '1050.00') {
+/**
+ * Draft through the real route, send, and have the landlord sign at `startIso` /
+ * `rent`.
+ *
+ * `mayRefuseAtSend` is for the one test about a stretch that is already billed.
+ * The start is typed at SIGNING, but SENDING checks the successor's DEFAULT
+ * start — so whether the refusal lands at send or at sign depends on where the
+ * billed invoice falls relative to that default, which moves with the calendar.
+ * (10/22: it moved. plusDays(40) was November 30 and became December 1, which
+ * is a rent due day, so the refusal that used to land at sign landed at send
+ * and the suite failed on a date rather than on a change — it failed on the
+ * previous night's green code too.) What the product guarantees is that it is
+ * refused and the signature does not land, not which of the two doors says so.
+ */
+async function newLeaseSignedByLandlord(park: Awaited<ReturnType<typeof seedPark>>, h: Household, startIso: string, rent = '1050.00', mayRefuseAtSend = false) {
   const drafted = await api().post('/api/esign/documents/renewal')
     .set('Authorization', `Bearer ${h.landlordToken}`).send({ leaseId: h.leaseId, templateId: park.templateId })
   expect(drafted.status).toBe(201)
   const docId = drafted.body.data.id
   const sent = await api().post(`/api/esign/documents/${docId}/send`).set('Authorization', `Bearer ${h.landlordToken}`).send({})
-  expect(sent.status).toBe(200)
+  if (mayRefuseAtSend && sent.status === 409) return { docId, sent, signed: sent }
+  expect(sent.status, JSON.stringify(sent.body)).toBe(200)
   const fields = (await db.query<{ id: string; lease_column: string }>(
     `SELECT id, lease_column FROM lease_document_fields WHERE document_id=$1 AND signer_role='landlord'`, [docId])).rows
   const fid = (col: string) => fields.find(f => f.lease_column === col)!.id
@@ -174,7 +188,7 @@ async function newLeaseSignedByLandlord(park: Awaited<ReturnType<typeof seedPark
       { fieldId: fid('start_date'), value: isoToDocumentDate(startIso) },
       { fieldId: fid('rent_amount'), value: rent },
     ] })
-  return { docId, signed }
+  return { docId, sent, signed }
 }
 
 /** The landlord signs an already-drafted new lease, typing `startIso` / `rent`. */
@@ -283,7 +297,10 @@ describe('a month-to-month household can be sent a new lease', () => {
     await db.query(
       `INSERT INTO invoices (landlord_id, lease_id, unit_id, invoice_number, due_date, subtotal_rent, total_amount, status)
        VALUES ($1,$2,$3,'INV-BILLED',$4,1000,1000,'pending')`, [h.landlordId, h.leaseId, h.unitId, start])
-    const { signed, docId } = await newLeaseSignedByLandlord(park, h, start)
+    // Refused — at send or at sign, whichever reaches the billed stretch first
+    // (see newLeaseSignedByLandlord). Both say the same thing and neither lets
+    // the signature land, which is the rule that matters.
+    const { signed, docId } = await newLeaseSignedByLandlord(park, h, start, '1050.00', true)
     expect(signed.status).toBe(409)
     expect(signed.body.error).toMatch(/already billed .* or later, so that stretch is not billed twice/)
     // The landlord's signature did not land; they can fix the box and sign.
@@ -1199,7 +1216,8 @@ describe('the never-signed draft and the reminders', () => {
       [d.rows[0].id, isoToDocumentDate(opts.start)])
     return { docId: d.rows[0].id, leaseId }
   }
-  const docStatus = async (id: string) => (await db.query<any>(`SELECT status FROM lease_documents WHERE id=$1`, [id])).rows[0].status
+  // 10/14 (Nic, #4): an automatic end deletes what no money touched — null = gone.
+  const docStatus = async (id: string) => (await db.query<any>(`SELECT status FROM lease_documents WHERE id=$1`, [id])).rows[0]?.status ?? null
 
   it('a draft the landlord never signed lapses once its start date has passed — only the landlord hears, nothing changes', async () => {
     const park = await seedPark()
@@ -1207,14 +1225,50 @@ describe('the never-signed draft and the reminders', () => {
     const lapsed = await seedDoc(h, { issued: false, start: plusDays(-1) })
     const waiting = await seedDoc(await addHousehold(park), { issued: false, start: plusDays(10) })
     await processNewLeaseSignings({ hour: 12 })
-    expect(await docStatus(lapsed.docId)).toBe('voided')
+    // 10/14 (Nic, #4/#5): deleted (nothing billed from it), and the notice says it expired.
+    expect(await docStatus(lapsed.docId)).toBe(null)
     expect(await docStatus(waiting.docId)).toBe('sent')
     // The landlord side only (the signer and the account owner); the household
     // was never sent the draft.
     const to = mocks.draftLapsed.mock.calls.map(c => c[0])
     expect(to).toContain('ll@test.dev')
     expect(to).not.toContain(h.tenantEmail)
+    expect(mocks.draftLapsed.mock.calls.every((c: any[]) => c[3]?.deleted === true)).toBe(true)
     expect(await leaseRow(h.leaseId)).toMatchObject({ status: 'active', end_date: null })
+  })
+
+  // 10/14 afternoon (Nic): an automatic delete never cancels an invite — only
+  // the landlord's own Delete does. The invite lets go of the lapsed draft and
+  // stays open, to be drafted again.
+  it('a lapsed draft deleted on its own leaves the invite waiting on it open', async () => {
+    const park = await seedPark()
+    const h = await addHousehold(park)
+    const lapsed = await seedDoc(h, { issued: false, start: plusDays(-1) })
+    const intent = (await db.query<{ id: string }>(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, unit_id, property_id, parser_status, draft_document_id)
+       VALUES ($1,$2,$3,$4,'not_uploaded',$5) RETURNING id`,
+      [h.landlordId, h.tenantId, h.unitId, h.propertyId, lapsed.docId])).rows[0].id
+    await processNewLeaseSignings({ hour: 12 })
+    expect(await docStatus(lapsed.docId)).toBe(null)
+    expect((await db.query<any>(
+      `SELECT cancelled_at, resolved_at, draft_document_id FROM pending_tenant_intents WHERE id = $1`, [intent])).rows[0])
+      .toEqual({ cancelled_at: null, resolved_at: null, draft_document_id: null })
+  })
+
+  // 10/14 (Nic, #4): only what no money touched is deleted. A lapsed draft the
+  // erase's test keeps (a rent change from it already reached the bill) is
+  // canceled exactly as before, and the landlord hears the old words.
+  it('a lapsed draft the erase keeps is voided as before, and the notice keeps the canceled wording', async () => {
+    const park = await seedPark()
+    const h = await addHousehold(park)
+    const lapsed = await seedDoc(h, { issued: false, start: plusDays(-1) })
+    await db.query(
+      `INSERT INTO scheduled_lease_changes (lease_id, change_type, effective_date, new_rent_amount, status, source_document_id)
+       VALUES ($1,'rent', CURRENT_DATE, 600, 'applied', $2)`, [h.leaseId, lapsed.docId])
+    await processNewLeaseSignings({ hour: 12 })
+    expect(await docStatus(lapsed.docId)).toBe('voided')
+    expect(mocks.draftLapsed.mock.calls.length).toBeGreaterThan(0)
+    expect(mocks.draftLapsed.mock.calls.every((c: any[]) => c[3]?.deleted === false)).toBe(true)
   })
 
   it('a new lease the landlord signed is never canceled for want of the tenant\'s signature', async () => {

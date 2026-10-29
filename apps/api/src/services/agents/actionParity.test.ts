@@ -63,7 +63,14 @@ describe('action parity — what a person can do, the agent should be able to do
     expect(reachable).toBeGreaterThan(250)
     // 10/6: 451 after the per-property bank-deposit setting and the bank
     // feed's deposit matching each added a mutating route.
-    expect(reachable).toBeLessThan(475)
+    // 10/12 (Nic, GAM Books ledger): the loan register and fixed assets added
+    // nine (routes/booksLoansAssets.ts, each named in actionGap DELIBERATE)
+    // and the Contractors list took two away (contractors are vendors now),
+    // beside the ledger's other phases.
+    // 10/20: 501 after the utility pay link, the reservation importer and the
+    // duplicate-person screens — six mutating routes, every one of them named
+    // in actionGap DELIBERATE because a person pressing them is the feature.
+    expect(reachable).toBeLessThan(530)
   })
 
   it('nothing from another portal has crept into a landlord or tenant agent', async () => {
@@ -143,7 +150,23 @@ describe('action parity — what a person can do, the agent should be able to do
     //
     // The ratchet is doing its job by making this visible: it must only ever move
     // down for a stated reason, never because something quietly stopped working.
-    expect(writes.size).toBeGreaterThanOrEqual(229)
+    //
+    // 10/12 (Nic): 229 → 227. add_contractor and update_contractor are gone
+    // with the Contractors routes — "one list of everyone the company pays";
+    // a contractor is a vendor of type contractor, which add_vendor and
+    // update_vendor (both still here, now with the type and the 1099 box)
+    // cover. A duplicate path removed, not a capability lost.
+    //
+    // 10/20 (Nic): 227 → 225. create_daily_task and complete_daily_task are
+    // gone with the old landlord-wide "Tasks" tab — one task list, not two.
+    // Blu's per-property list replaced it, its open lines were folded onto the
+    // parks they belong to, and both endpoints behind these actions are
+    // deleted. The same duplicate-path shape as the contractors above: the
+    // surface they wrote to no longer exists, so keeping the actions would mean
+    // the assistant offering to put a job on a board nobody looks at. The
+    // park's list is named in actionGap DELIBERATE with Nic's reason — "it's
+    // stuff assigned by the landlord himself."
+    expect(writes.size).toBeGreaterThanOrEqual(225)
   })
 })
 

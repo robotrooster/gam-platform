@@ -23,7 +23,7 @@
  * on the breakdown and an admin notice when the payout is filed.
  */
 import type { PoolClient } from 'pg'
-import type { PaymentType } from '@gam/shared'
+import type { PaymentType, PlatformTransferPurpose } from '@gam/shared'
 import { query, getClient } from '../db'
 import { createAdminNotification } from './adminNotifications'
 import { logger } from '../lib/logger'
@@ -58,6 +58,19 @@ const HELD_SOURCE_LABEL: Record<string, string> = {
   dispute: 'Disputed payment',
   platform_fee: 'Platform fee',
   prepaid_draw: 'Prepaid credit',
+  deposit_settlement: 'Deposit settled at move-out',
+}
+
+/**
+ * 10/12 (Nic, G3): a transfer that is not the weekly batch has its own line on
+ * the breakdown, named for what it is — never "Part of a transfer GAM could
+ * not itemize". A move-out's share of a deposit GAM held is sent to the
+ * landlord on its own (services/depositReturn, purpose 'deposit_settlement'),
+ * and so is a store charge account statement's merchant share.
+ */
+const DIRECT_TRANSFER_LABEL: Record<Exclude<PlatformTransferPurpose, 'payout'>, string> = {
+  deposit_settlement: 'Deposit returned at move-out',
+  flexcharge_merchant: 'Charge account payment',
 }
 
 /**
@@ -67,8 +80,15 @@ const HELD_SOURCE_LABEL: Record<string, string> = {
  */
 const FULL_SWEEP_TRIGGERS = ['auto_friday', 'catch_up'] as const
 
-/** SQL: the Connect account a disbursement row paid out from — its company's, else its user's. */
+/**
+ * SQL: the Connect account a disbursement row paid out from — the account the
+ * row itself names (stripe_account_id, 10/5), else its company's, else its
+ * user's. 10/12 (ledger P0): a payout from an account two companies share
+ * names no company now (connectPayoutSync SOLE_COMPANY_ON_ACCOUNT_SQL), so the
+ * company cannot be the way to its account.
+ */
 const PAYOUT_ACCOUNT_SQL = (d: string) => `COALESCE(
+  ${d}.stripe_account_id,
   (SELECT l.stripe_connect_account_id FROM landlords l WHERE l.id = ${d}.landlord_id),
   (SELECT u.stripe_connect_account_id FROM users u WHERE u.id = ${d}.user_id))`
 
@@ -339,6 +359,15 @@ export interface PayoutHeldLine {
   amount: number
 }
 
+/** 10/12 (G3): a transfer sent on its own (not the weekly batch) that this payout carried. */
+export interface PayoutDirectLine {
+  intentId: string
+  purpose: Exclude<PlatformTransferPurpose, 'payout'>
+  /** "Deposit returned at move-out · Sunset Palms · RV 07" */
+  label: string
+  amount: number
+}
+
 export interface PayoutAdjustment {
   kind: 'unitemized' | 'reversals' | 'gam_charges' | 'residual'
   label: string
@@ -354,7 +383,9 @@ export interface PayoutComposition {
   transfers: Array<{ intentId: string; amount: number; grossOwed: number; transferredAt: string | null }>
   payments: PayoutPaymentLine[]
   heldItems: PayoutHeldLine[]
-  /** Everything that is not a payment or held item; payments + held + adjustments = amount. */
+  /** 10/12 (G3): transfers sent on their own — a move-out's deposit share, a charge account's merchant share. */
+  directTransfers: PayoutDirectLine[]
+  /** Everything that is not a payment, held item or direct transfer; payments + held + direct + adjustments = amount. */
   adjustments: PayoutAdjustment[]
   gamChargesNetted: number
   reversalsNetted: number
@@ -375,11 +406,17 @@ export async function payoutCompositions(disbursementIds: string[]): Promise<Map
   const disbs = await query<{ id: string; amount: string }>(
     `SELECT id, amount::text AS amount FROM disbursements WHERE id = ANY($1::uuid[])`, [ids])
   const intents = await query<any>(
-    `SELECT id, disbursement_id, amount::text AS amount, gross_owed::text AS gross_owed,
-            netted_amount::text AS netted_amount, transferred_at
-       FROM platform_transfer_intents
-      WHERE disbursement_id = ANY($1::uuid[])
-      ORDER BY transferred_at, created_at`, [ids])
+    `SELECT i.id, i.disbursement_id, i.amount::text AS amount, i.gross_owed::text AS gross_owed,
+            i.netted_amount::text AS netted_amount, i.transferred_at, i.purpose,
+            -- 10/12 (G3): where a move-out's deposit share came from.
+            pr.name AS property_name, u.unit_number
+       FROM platform_transfer_intents i
+       LEFT JOIN deposit_returns dr ON dr.id = i.deposit_return_id
+       LEFT JOIN leases l ON l.id = dr.lease_id
+       LEFT JOIN units u ON u.id = l.unit_id
+       LEFT JOIN properties pr ON pr.id = u.property_id
+      WHERE i.disbursement_id = ANY($1::uuid[])
+      ORDER BY i.transferred_at, i.created_at`, [ids])
   const payments = await query<any>(
     `SELECT i.disbursement_id, i.id AS intent_id, p.id AS payment_id, p.type,
             ubl.amount::text AS amount, p.amount::text AS paid,
@@ -427,14 +464,26 @@ export async function payoutCompositions(disbursementIds: string[]): Promise<Map
         amount: dollars(cents(h.amount)),
       }))
 
+    // 10/12 (G3): a transfer sent on its own carries exactly its amount (no
+    // owner shares, no held lines, nothing netted) — its own line.
+    const myDirect: PayoutDirectLine[] = myIntents
+      .filter((i: any) => i.purpose && i.purpose !== 'payout' && i.purpose in DIRECT_TRANSFER_LABEL)
+      .map((i: any) => ({
+        intentId: i.id,
+        purpose: i.purpose as PayoutDirectLine['purpose'],
+        label: [DIRECT_TRANSFER_LABEL[i.purpose as PayoutDirectLine['purpose']], i.property_name, i.unit_number].filter(Boolean).join(' · '),
+        amount: dollars(cents(i.gross_owed)),
+      }))
+
     const amountC = cents(d.amount)
     const paymentsC = myPayments.reduce((s, p) => s + cents(p.amount), 0)
     const heldC = myHeld.reduce((s, h) => s + cents(h.amount), 0)
+    const directC = myDirect.reduce((s, x) => s + cents(x.amount), 0)
     const grossC = myIntents.reduce((s: number, i: any) => s + cents(i.gross_owed), 0)
     const reversalsC = myIntents.reduce((s: number, i: any) => s + cents(i.netted_amount), 0)
     const transfersC = myIntents.reduce((s: number, i: any) => s + cents(i.amount), 0)
     const gamC = grossC - reversalsC - transfersC
-    const unitemizedC = grossC - paymentsC - heldC
+    const unitemizedC = grossC - paymentsC - heldC - directC
     const residualC = amountC - transfersC
 
     const adjustments: PayoutAdjustment[] = []
@@ -456,6 +505,7 @@ export async function payoutCompositions(disbursementIds: string[]): Promise<Map
       const parts: string[] = []
       if (n) parts.push(`${n} payment${n === 1 ? '' : 's'}: ${myPayments.map(p => `${p.label} ${money(p.amount)}`).join(', ')}`)
       if (myHeld.length) parts.push(`${myHeld.length} other item${myHeld.length === 1 ? '' : 's'}: ${myHeld.map(h => `${h.label} ${money(h.amount)}`).join(', ')}`)
+      if (myDirect.length) parts.push(myDirect.map(x => `${x.label} ${money(x.amount)}`).join(', '))
       let s = `${money(dollars(amountC))} from GAM — ${parts.join('; ') || 'no payments'}`
       if (reversalsC) s += `, less ${money(dollars(reversalsC))} of returned payments`
       if (gamC) s += `, less ${money(dollars(gamC))} of GAM charges`
@@ -473,6 +523,7 @@ export async function payoutCompositions(disbursementIds: string[]): Promise<Map
       })),
       payments: myPayments,
       heldItems: myHeld,
+      directTransfers: myDirect,
       adjustments,
       gamChargesNetted: dollars(gamC),
       reversalsNetted: dollars(reversalsC),

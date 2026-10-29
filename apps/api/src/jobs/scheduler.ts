@@ -12,6 +12,7 @@ import { tenantLeaseLink } from '../services/tenantLeaseLink'
 import { replyToProperty } from '../services/replyRouting'
 import { portalLink } from '../lib/portalUrls'
 import { query, queryOne, getClient } from '../db'
+import { graceDaysSql, pastGraceSql, propertyDaySql, lateCountsFromSql, writtenAtSql } from '../services/openBalances'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
 import { generateInvoices, registerInvoiceEngine, unbilledDueDates, CATCHUP_DAYS } from './invoiceGeneration'
 import { registerLateFeeEngine } from './lateFees'
@@ -281,18 +282,74 @@ export async function handOffOpenItemsToRenewal(
   }
 }
 
-export async function processLeaseEnds() {
+/**
+ * 10/24 (Nic) — ONE LEASE, BECAUSE SOMEBODY IS AT THE COUNTER LEAVING.
+ *
+ * The nightly sweep and the front desk's check-out are the SAME close-out:
+ * expire the lease, take the household off it, free the space, emit the credit
+ * event, and cut the deposit-return draft the landlord finalizes. Giving the
+ * desk its own copy of that would be a second way to do the same thing badly,
+ * so it calls this with the one lease it is closing.
+ *
+ * `theyActuallyLeft` is the difference between the two callers, and it is not a
+ * detail: a tenant-owned dwelling's end date LAPSES when it passes unattended
+ * (see the space-rental gate below — a date nobody chose must never put somebody
+ * off their space). But a clerk pressing Check out is a person saying they are
+ * going, which is the one case Nic said should free the space. So the sweep
+ * passes nothing and the counter passes true.
+ */
+export async function processLeaseEnds(onlyLeaseId?: string | null, theyActuallyLeft = false) {
   try {
     const ended = await query<any>(`
       SELECT l.*, un.id as unit_id_ref, un.unit_number,
+             -- 10/24 (Nic): who owns the DWELLING decides whether this end date
+             -- may free the space. See the block below.
+             un.dwelling_ownership, un.unit_type,
              (l.end_date < CURRENT_DATE) AS past_end
       FROM leases l
       JOIN units un ON un.id = l.unit_id
       WHERE l.status = 'active'
         AND l.end_date IS NOT NULL
         AND l.end_date <= CURRENT_DATE
-    `)
+        AND ($1::uuid IS NULL OR l.id = $1)
+    `, [onlyLeaseId ?? null])
     for (const lease of ended) {
+      // ── 10/24 (Nic, DIRECTIVE) — A RENTED SPACE IS NOT A RENTED HOME ────────
+      //
+      //   "You're making it a contradiction on what I said, but the good news is
+      //    that we are having different structure for different unit types. RV
+      //    sites are not the same thing as a new lease in an apartment or
+      //    whatever. When the tenant owns the unit and they're just renting the
+      //    space, like in an RV, that doesn't matter. It can be month to month.
+      //    It can auto renew."
+      //
+      // S562 retired auto-renew so that nobody is TRAPPED by forgetting a lease
+      // end — a real protection when the landlord owns the home somebody lives
+      // in. It does not apply when the resident owns their own dwelling and is
+      // renting the ground under it: they can leave whenever they like, with
+      // their home, and the thing that actually hurts them is being put out of a
+      // space because a date nobody chose went by.
+      //
+      // And on the park's side the same date is a liability: "February is one of
+      // our busiest times, and if he's a person that decides he's going to stay
+      // longer, like, we can't have that reservation messing up on us." A space
+      // rental therefore does NOT expire on its end date — the end date simply
+      // lapses and the lease carries on month to month, holding the space until
+      // somebody actually leaves. Nothing is vacated, nobody is billed out, no
+      // deposit-return draft is cut.
+      //
+      // Both halves of Nic's rule, in one gate: a lease holds a space
+      // indefinitely, and paying ahead is the only other way to lock one out.
+      if (lease.dwelling_ownership === 'tenant' && !theyActuallyLeft) {
+        await query(
+          `UPDATE leases
+              SET end_date = NULL, lease_type = 'month_to_month', updated_at = NOW()
+            WHERE id = $1 AND status = 'active'`, [lease.id])
+        logger.info(
+          `[LeaseEnd] ${lease.unit_number}: tenant-owned dwelling on a rented space — ` +
+          `end date ${lease.end_date} lapsed to month-to-month, space held, nothing vacated`)
+        continue
+      }
       {
         // Auto-renew RETIRED (Nic, S562): a lease NEVER auto-extends or reverts to
         // month-to-month. Every lease expires at its end_date unless a signed
@@ -451,6 +508,38 @@ export async function processLeaseEnds() {
         try {
           const { createOrFetchDraft } = await import('../services/depositReturn')
           const draft = await createOrFetchDraft(lease.id)
+          // ── 10/24: TELL THE LANDLORD, not only GAM ────────────────────────
+          //
+          // Their finalize is the only thing that pays a refund or raises the
+          // gap invoice, so a draft nobody tells them about is a deposit that
+          // sits past whatever deadline the state sets. The admin notice below
+          // stays — GAM wants to know a draft exists too; this ADDS the person
+          // who has to act on it. One per deposit return, not per lease-end.
+          try {
+            const owner = await queryOne<{ user_id: string }>(
+              `SELECT user_id FROM landlords WHERE id = $1`, [lease.landlord_id])
+            if (owner) {
+              const { createNotification } = await import('../services/notifications')
+              const kept = Number(draft.cleaning_fee_amount) > 0
+                ? `$${draft.cleaning_fee_amount} in fees already taken off`
+                : 'no fees to take off'
+              await createNotification({
+                userId: owner.user_id,
+                landlordId: lease.landlord_id,
+                type: 'deposit_return_waiting',
+                title: `Deposit return waiting on you — ${lease.unit_number}`,
+                body: `${lease.unit_number}'s tenancy ended. Its deposit return is drafted `
+                    + `($${draft.total_deposit} deposit, ${kept}). Add any damage lines and `
+                    + `finalize it to send the refund or raise the difference as an invoice.`,
+                data: { leaseId: lease.id, depositReturnId: draft.id,
+                        totalDeposit: Number(draft.total_deposit) },
+                actionUrl: `/leases/${lease.id}/deposit-return`,
+              })
+            }
+          } catch (e) {
+            logger.error({ err: e, leaseId: lease.id }, '[LeaseEnd] landlord deposit-return notice failed')
+          }
+
           const { createAdminNotification } = await import('../services/adminNotifications')
           await createAdminNotification({
             severity: 'info',
@@ -649,6 +738,207 @@ async function processInvitationExpiry() {
 // tests can place the cutover in the past and exercise the real query.
 const esign48hCutover = () => process.env.ESIGN_48H_CUTOVER || '2026-09-02T21:00:00Z'
 
+/** One row per address (case-insensitive), first one wins — one email per person per thing. */
+function uniqueRecipients<T extends { email?: string | null }>(rows: T[]): T[] {
+  const seen = new Set<string>()
+  return rows.filter(r => {
+    const k = String(r.email ?? '').trim().toLowerCase()
+    if (!k || seen.has(k)) return false
+    seen.add(k)
+    return true
+  })
+}
+
+/**
+ * 10/14 (Nic, #4): "Automatic voids (48h timeout, lapsed new lease): delete
+ * them too, instead of voiding." GAM ending a document on its own, in one
+ * transaction: ERASED when it never completed and no money touched it
+ * (lib/eraseUnfinishedDocument — the one test the void button uses: with its
+ * packet's unfinished forms, and the lease it issued when nothing paid,
+ * credited or settled on it). 10/14 afternoon (Nic): "invite and signing by
+ * tenant is one flow after landlord has already signed" — GAM ending it on
+ * its own never cancels an invite (onItsOwn): the invite waiting on it stays
+ * open and lets go of it, so the household is drafted again; only the
+ * landlord's own Delete closes one (#1). Anything that
+ * test keeps is voided by `voidKept`, each job's own void, exactly as before.
+ * 'gone': it completed, was voided, or was deleted since the job read it —
+ * nothing done, nobody told. Files only the erased documents used are removed
+ * after COMMIT. Sends nothing; the caller tells people.
+ */
+async function endDocumentOnItsOwn(
+  d: { id: string; lease_id?: string | null; document_type?: string | null },
+  voidKept: (vq: (sql: string, params?: any[]) => Promise<any>, live: any) => Promise<void>,
+): Promise<'deleted' | 'voided' | 'gone'> {
+  const { eraseUnfinishedDocument, removeOrphanedDocumentFiles } = await import('../lib/eraseUnfinishedDocument')
+  const vc = await getClient()
+  let files: string[] = []
+  let ended: 'deleted' | 'voided' | 'gone'
+  try {
+    await vc.query('BEGIN')
+    const vq = vc.query.bind(vc) as any
+    const first = (await vc.query(`SELECT id, lease_id, document_type, status FROM lease_documents WHERE id = $1`, [d.id])).rows[0]
+    if (!first || ['completed', 'voided'].includes(first.status)) {
+      await vc.query('ROLLBACK')
+      return 'gone'
+    }
+    const out = await eraseUnfinishedDocument(vq, first, { onItsOwn: true })
+    if (out.erased) {
+      files = out.files
+      ended = 'deleted'
+    } else {
+      // Kept: read again under the lock the erase took — a signature that
+      // completed it a moment ago leaves it alone.
+      const live = (await vc.query(
+        `SELECT * FROM lease_documents WHERE id = $1 AND status NOT IN ('completed','voided') FOR UPDATE`, [d.id])).rows[0]
+      if (!live) {
+        await vc.query('ROLLBACK')
+        return 'gone'
+      }
+      await voidKept(vq, live)
+      ended = 'voided'
+    }
+    await vc.query('COMMIT')
+  } catch (e) {
+    await vc.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    vc.release()
+  }
+  if (files.length) {
+    await removeOrphanedDocumentFiles(async (sql, params) => ({ rows: await query<any>(sql, params) }), files).catch(() => {})
+  }
+  return ended
+}
+
+/** 10/14 (Nic, #7): how long a draft waits out for signature, with nobody signing, before GAM deletes it. */
+export const UNSIGNED_DRAFT_EXPIRY_DAYS = 30
+
+/**
+ * 10/14 (Nic, #7): "Drafts out for signature nobody has signed: GAM deletes
+ * them on its own after 30 days (no money touched)." Nightly, beside the
+ * e-sign timeouts.
+ *
+ *   OUT FOR SIGNATURE: lease_documents.status 'sent' or 'in_progress' — sent
+ *     to its signers (a 'pending' draft was never sent; 'completed',
+ *     'voided' and 'execution_failed' are done).
+ *   NOBODY HAS SIGNED: no signer row — landlord, resident or witness — has a
+ *     signed_at; for a packet (S652, one thing), on no document of the
+ *     packet.
+ *   THE 30-DAY CLOCK: from when it went out — lease_documents.sent_at, else
+ *     its first signing invite (MIN(lease_document_signers.invite_sent_at));
+ *     a document never sent to anyone has no clock. The S637 window restart
+ *     needs the landlord's signature, so it never applies here.
+ *   A PACKET is judged by its lease (it takes the packet's unfinished forms
+ *     with it); a form whose packet lease is still waiting is never taken on
+ *     its own.
+ *   NOT a new lease for a household already living there (renews_lease_id):
+ *     it has its own clock — canceled at its start date when the landlord
+ *     never signed (processNewLeaseSignings, S655).
+ *   NOT AN ONBOARDING DRAFT. 10/14 afternoon (Nic): "30-day auto-delete:
+ *     leave ONBOARDING drafts (waiting on the landlord's own signature) out."
+ *     S647: an invite drafts the lease for the landlord to sign first, and
+ *     he signs at his own pace; nobody else has been told. Waiting on him:
+ *     the landlord's is the first signature it asks for (the lowest signing
+ *     position) — on it, or on any open document of its packet. Every lease
+ *     and addendum asks for his first (the send route's landlord-first
+ *     rule), so what is left is a document that opens with somebody else's
+ *     signature (a purchase agreement or contract the buyer signs first).
+ *   NO MONEY: the erase's own test (lib/eraseUnfinishedDocument). A draft it
+ *     keeps is LEFT exactly as it is — Nic's answer deletes; it never voids.
+ *   THE INVITE STAYS. 10/14 afternoon (Nic): an automatic delete never
+ *     cancels an invite (endDocumentOnItsOwn — onItsOwn); it lets go of the
+ *     document and the household is drafted again.
+ *
+ * THE EMAIL: the waiting signers — every signer who was sent a signing link
+ * (invite_sent_at) — get "This document expired and is no longer available
+ * to sign." ONCE per person per packet (one email per thing), read before the
+ * erase takes their signer rows. A signer whose turn had not come was never
+ * sent a link and hears nothing. Returns what it deleted.
+ */
+export async function processUnsignedDraftExpiry(opts: { days?: number } = {}): Promise<{ deleted: string[]; kept: string[] }> {
+  const days = opts.days ?? UNSIGNED_DRAFT_EXPIRY_DAYS
+  const deleted: string[] = []
+  const kept: string[] = []
+  const due = await query<any>(`
+    SELECT d.id, d.title, d.document_type, d.landlord_id, d.lease_id, d.package_group_id,
+           COALESCE(u.display_label, u.unit_number) AS unit_number, u.property_id, p.name AS property_name
+      FROM lease_documents d
+      LEFT JOIN units u ON u.id = d.unit_id
+      LEFT JOIN properties p ON p.id = u.property_id
+     WHERE d.status IN ('sent', 'in_progress')
+       AND d.renews_lease_id IS NULL
+       AND COALESCE(d.sent_at,
+                    (SELECT MIN(s.invite_sent_at) FROM lease_document_signers s WHERE s.document_id = d.id))
+             < NOW() - make_interval(days => $1::int)
+       AND NOT EXISTS (
+             SELECT 1 FROM lease_documents o
+               JOIN lease_document_signers s ON s.document_id = o.id
+              WHERE (o.id = d.id OR (d.package_group_id IS NOT NULL AND o.package_group_id = d.package_group_id))
+                AND s.signed_at IS NOT NULL)
+       -- 10/14 afternoon (Nic): not an onboarding draft waiting on the
+       -- landlord's own signature — his is the first one asked for, on it or
+       -- on any open document of its packet (nobody has signed, above).
+       AND NOT EXISTS (
+             SELECT 1 FROM lease_documents o
+               JOIN lease_document_signers ls ON ls.document_id = o.id AND ls.role = 'landlord'
+              WHERE (o.id = d.id OR (d.package_group_id IS NOT NULL AND o.package_group_id = d.package_group_id))
+                AND o.status IN ('pending', 'sent', 'in_progress')
+                AND NOT EXISTS (SELECT 1 FROM lease_document_signers e
+                                 WHERE e.document_id = o.id AND e.order_index < ls.order_index))
+       AND (d.package_group_id IS NULL OR d.document_type = 'original_lease'
+            OR NOT EXISTS (SELECT 1 FROM lease_documents pl
+                            WHERE pl.package_group_id = d.package_group_id AND pl.id <> d.id
+                              AND pl.document_type = 'original_lease'
+                              AND pl.status IN ('pending', 'sent', 'in_progress')))
+     ORDER BY (d.document_type = 'original_lease') DESC, d.created_at, d.id`, [days])
+  for (const d of due as any[]) {
+    try {
+      // Taken with its packet lease earlier in this run.
+      if (!(await queryOne(`SELECT 1 FROM lease_documents WHERE id = $1`, [d.id]))) continue
+      // The waiting signers, before the erase takes their rows: whoever was
+      // sent a link (S654: the address on their own account; the landlord's
+      // row keeps its own) — across the packet, once each.
+      const waiting = uniqueRecipients(await query<any>(`
+        SELECT CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS email,
+               s.name, s.role
+          FROM lease_documents o
+          JOIN lease_document_signers s ON s.document_id = o.id
+          LEFT JOIN users su ON su.id = s.user_id
+         WHERE (o.id = $1 OR ($2::uuid IS NOT NULL AND o.package_group_id = $2::uuid))
+           AND o.status IN ('sent', 'in_progress')
+           AND s.invite_sent_at IS NOT NULL AND s.signed_at IS NULL
+         ORDER BY s.order_index, s.id`, [d.id, d.package_group_id]))
+      const ended = await endDocumentOnItsOwn(d, async () => {
+        // Kept by the erase's test (money touched it, or its packet): left
+        // exactly as it is — Nic's answer is a delete, never a void.
+        throw new KeptOnItsOwn()
+      }).catch((e) => { if (e instanceof KeptOnItsOwn) return 'kept' as const; throw e })
+      if (ended === 'kept') { kept.push(d.id); continue }
+      if (ended !== 'deleted') continue
+      deleted.push(d.id)
+      logger.info({ document_id: d.id, title: d.title, days }, '[ESIGN-EXPIRY] unsigned draft deleted after its signing window')
+      const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
+      for (const rcp of waiting) {
+        try {
+          await emailDocumentAutoVoided(rcp.email, rcp.name, d.title, unitLabel, {
+            landlordId: d.landlord_id, documentId: d.id, deleted: true, toLandlord: rcp.role === 'landlord',
+            replyTo: rcp.role === 'landlord' ? undefined : replyToProperty(d.property_id),
+          })
+        } catch (e) {
+          logger.error({ err: e, recipient_email: rcp.email }, '[ESIGN-EXPIRY] expired email failed')
+        }
+      }
+    } catch (e) {
+      logger.error({ err: e, document_id: d.id }, '[ESIGN-EXPIRY] could not delete an unsigned draft')
+    }
+  }
+  if (deleted.length) logger.info(`[ESIGN-EXPIRY] ${deleted.length} unsigned draft(s) deleted after ${days} days`)
+  return { deleted, kept }
+}
+
+/** Thrown inside endDocumentOnItsOwn to roll back a draft the erase keeps (processUnsignedDraftExpiry never voids). */
+class KeptOnItsOwn extends Error {}
+
 // S652 (Nic, Blu): "he just wants one per packet." Blu's eight re-drafted
 // packets produced fifty-four reminder emails in one tick — one for every
 // document, each saying the same sentence. A packet is signed as one thing:
@@ -706,6 +996,15 @@ async function remindByPacket(rows: any[], tag: string): Promise<number> {
   }
   return sent
 }
+
+/**
+ * 10/25 — how many times the 48-hour timeout path may re-send a signing request
+ * before it gives up. Five, matching the ceiling S639 put on the 2-hour nudge
+ * for the same failure mode: "somebody who has ignored five daily reminders is
+ * not going to sign because of a sixth; they need a phone call, and the document
+ * auto-voids anyway."
+ */
+export const SIGNING_REQUEST_MAX_RESENDS = 5
 
 export async function processEsignTimeouts() {
   try {
@@ -800,7 +1099,7 @@ export async function processEsignTimeouts() {
     // cutover, so pre-existing documents get a full fresh 48 hours from
     // the moment the rule started existing. Harmless once past.
     const expired = await query<any>(`
-      SELECT d.id, d.title, d.document_type, d.landlord_id,
+      SELECT d.id, d.title, d.document_type, d.landlord_id, d.lease_id,
              u.unit_number, u.property_id, p.name as property_name
       FROM lease_documents d
       LEFT JOIN units u ON u.id = d.unit_id
@@ -878,6 +1177,22 @@ export async function processEsignTimeouts() {
             FROM lease_document_signers s
             LEFT JOIN users su ON su.id = s.user_id
            WHERE s.document_id = $1 AND s.status <> 'signed'
+             -- ── 10/25: FIVE ASKS, THEN STOP ───────────────────────────────
+             --
+             -- Re-sending here stamps invite_sent_at = NOW(), which makes the
+             -- document 48 hours stale again two days later — so this path
+             -- re-asked forever. Jolyn Whitfield got 108 signing requests in
+             -- October across nine documents, every two days since the 2nd;
+             -- Kyra Smith the same. Those two were 28% of every email GAM sent
+             -- this month, and September came to 3,215 — over Resend's free tier.
+             --
+             -- The same ceiling S639 put on the 2-hour nudge one block above,
+             -- for the same failure mode and by the same reasoning: somebody
+             -- who has ignored five asks is not going to sign because of a
+             -- sixth, they need a phone call, and the document auto-voids
+             -- anyway. Its counter is its own because a re-sent REQUEST and a
+             -- reminder are different acts on different clocks.
+             AND COALESCE(s.invite_resend_count, 0) < ${SIGNING_REQUEST_MAX_RESENDS}
            ORDER BY s.order_index
            LIMIT 1`, [d.id])
         const landlordSigned = await query<any>(`
@@ -907,7 +1222,9 @@ export async function processEsignTimeouts() {
                   replyTo: replyToProperty(d.property_id) })
               await query(
                 `UPDATE lease_document_signers
-                    SET status='sent', invite_sent=TRUE, invite_sent_at=NOW() WHERE id=$1`, [s.id])
+                    SET status='sent', invite_sent=TRUE, invite_sent_at=NOW(),
+                        invite_resend_count = COALESCE(invite_resend_count, 0) + 1
+                  WHERE id=$1`, [s.id])
             } catch (e) {
               logger.error({ err: e, signer_id: s.id }, '[ESIGN-TIMEOUTS] resend failed')
             }
@@ -920,27 +1237,43 @@ export async function processEsignTimeouts() {
           continue
         }
 
-        await cascadeLeaseTenantsOnVoid(query, d)
-        await query(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
-          ['auto-voided: signers did not respond within 48 hours', d.id])
-
         const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
         // S654: each signer at the address on their own account (the landlord's
-        // row keeps its own), never a signer row's possibly stale one.
-        const recipients = await query<any>(`
+        // row keeps its own), never a signer row's possibly stale one. Read
+        // BEFORE the document ends: an erased document takes its signer rows
+        // with it. 10/14: once per address (the landlord's signer row and the
+        // account owner are usually the same person — one email per thing).
+        const recipients = uniqueRecipients(await query<any>(`
           SELECT CASE WHEN s.role = 'landlord' THEN s.email ELSE COALESCE(su.email, s.email) END AS email, s.name, s.role
             FROM lease_document_signers s LEFT JOIN users su ON su.id = s.user_id
            WHERE s.document_id=$1
           UNION ALL
           SELECT lu.email, (lu.first_name || ' ' || lu.last_name) as name, 'landlord' AS role
           FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id=$2
-        `, [d.id, d.landlord_id])
-        for (const rcp of recipients as any[]) {
+        `, [d.id, d.landlord_id]))
+
+        // 10/14 (Nic, #4): "Automatic voids (48h timeout, lapsed new lease):
+        // delete them too, instead of voiding." ERASED when it never completed
+        // and no money touched it (lib/eraseUnfinishedDocument — with its
+        // packet's unfinished forms; 10/14 afternoon, the invite waiting on it
+        // stays open to be drafted again); anything that test keeps is voided
+        // exactly as before.
+        const ended = await endDocumentOnItsOwn(d, async (vq, live) => {
+          await cascadeLeaseTenantsOnVoid(vq, live)
+          await vq(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
+            ['auto-voided: signers did not respond within 48 hours', live.id])
+        })
+        if (ended === 'gone') continue
+
+        for (const rcp of recipients) {
           try {
             // 10/5: a resident's reply ("contact the landlord") reaches the property
             // (services/replyRouting); the landlord side's copies stay GAM's.
+            // 10/14 (Nic, #5): deleted → "This document expired and is no
+            // longer available to sign."
             await emailDocumentAutoVoided(rcp.email, rcp.name, d.title, unitLabel, { landlordId: d.landlord_id, documentId: d.id,
-              replyTo: rcp.role === 'landlord' ? undefined : replyToProperty(d.property_id) })
+              replyTo: rcp.role === 'landlord' ? undefined : replyToProperty(d.property_id),
+              deleted: ended === 'deleted', toLandlord: rcp.role === 'landlord' })
           } catch(e) {
             logger.error({ err: e, recipient_email: rcp.email }, '[ESIGN-TIMEOUTS] auto-void email failed')
           }
@@ -1022,31 +1355,15 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
   let lapsed = 0
   // One lapse email per landlord-side person, listing every draft of theirs that
   // lapsed in this run.
-  const lapseMail = new Map<string, { email: string; name: string; landlordId: string; items: NewLeaseDigestItem[]; documentId: string }>()
+  const lapseMail = new Map<string, { email: string; name: string; landlordId: string; items: NewLeaseDigestItem[]; documentId: string; deleted: boolean }>()
   for (const d of drafts as any[]) {
     try {
       const today = todayIn(d.tz)
       const startIso = docBoxDate(d.start_raw)
       const due = startIso ? today > startIso : today >= addDaysTo(d.fallback_last, -1)
       if (!due) continue
-      const vc = await getClient()
-      try {
-        await vc.query('BEGIN')
-        await cascadeLeaseTenantsOnVoid(vc.query.bind(vc) as any, d)
-        const { unwindIssuedLease } = await import('../lib/unwindIssuedLease')
-        await unwindIssuedLease(vc.query.bind(vc), d)
-        await vc.query(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
-          ['auto-voided: the landlord never signed this new lease before its start date', d.id])
-        await vc.query('COMMIT')
-      } catch (e) {
-        await vc.query('ROLLBACK').catch(() => {})
-        throw e
-      } finally {
-        vc.release()
-      }
-      lapsed++
-      const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
       // The household was never sent this draft — only the landlord side hears.
+      // Read before it ends: an erased draft takes its signer rows with it.
       const recipients = await query<any>(`
         SELECT s.email, s.name FROM lease_document_signers s
          WHERE s.document_id = $1 AND s.role = 'landlord'
@@ -1054,11 +1371,25 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
         SELECT lu.email, (lu.first_name || ' ' || lu.last_name) AS name
           FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id = $2
       `, [d.id, d.landlord_id])
+      // 10/14 (Nic, #4): "a lapsed new lease ... delete them too, instead of
+      // voiding" — erased when no money touched it; voided as before otherwise.
+      const ended = await endDocumentOnItsOwn(d, async (vq, live) => {
+        await cascadeLeaseTenantsOnVoid(vq, live)
+        const { unwindIssuedLease } = await import('../lib/unwindIssuedLease')
+        await unwindIssuedLease(vq, live)
+        await vq(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
+          ['auto-voided: the landlord never signed this new lease before its start date', live.id])
+      })
+      if (ended === 'gone') continue
+      lapsed++
+      const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
       for (const rcp of recipients as any[]) {
-        const key = String(rcp.email || '').toLowerCase()
-        if (!key) continue
+        // One email per person per kind (deleted reads "expired", 10/14 #5).
+        const key = `${String(rcp.email || '').toLowerCase()}|${ended}`
+        if (!rcp.email) continue
         if (!lapseMail.has(key)) {
-          lapseMail.set(key, { email: rcp.email, name: rcp.name, landlordId: d.landlord_id, items: [], documentId: d.id })
+          lapseMail.set(key, { email: rcp.email, name: rcp.name, landlordId: d.landlord_id, items: [], documentId: d.id,
+                               deleted: ended === 'deleted' })
         }
         const m = lapseMail.get(key)!
         if (!m.items.some(i => i.unitLabel === unitLabel && i.startDate === startIso)) {
@@ -1071,7 +1402,7 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
   }
   for (const m of lapseMail.values()) {
     try {
-      await emailNewLeaseDraftLapsed(m.email, m.name, m.items, { landlordId: m.landlordId, documentId: m.documentId })
+      await emailNewLeaseDraftLapsed(m.email, m.name, m.items, { landlordId: m.landlordId, documentId: m.documentId, deleted: m.deleted })
     } catch (e) {
       logger.error({ err: e, recipient_email: m.email }, '[ESIGN-TIMEOUTS] new-lease lapse email failed')
     }
@@ -1133,7 +1464,11 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
     const {
       newLeasesAfterEarlyEnd, clearNeverOwedOnHeldNewLease, sayMoney, sayKeptCharges,
     } = await import('../services/renewalSuccessor')
-    const { voidDocument } = await import('../lib/voidDocument')
+    // 10/14 (Nic, #4): this automatic cancel ends the new lease the one way
+    // (endDocument) — erased with the lease it issued when no money touched
+    // it, voided exactly as before otherwise.
+    const { endDocument } = await import('../lib/voidDocument')
+    const { removeOrphanedDocumentFiles } = await import('../lib/eraseUnfinishedDocument')
     // S655: the deposit move that counts the new lease's own deposit payments
     // once, and the household lock every writer of a household's money takes
     // — resolved the void's own way (lockLeaseHousehold), so the cancel, the
@@ -1190,9 +1525,10 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
         const live = (await vc.query(
           `SELECT * FROM lease_documents WHERE id = $1 AND status NOT IN ('completed','voided') FOR UPDATE`, [d.id])).rows[0]
         if (!live) { await vc.query('ROLLBACK'); continue }
-        await voidDocument(vc.query.bind(vc), live,
+        const out = await endDocument(vc.query.bind(vc), live,
           `canceled: the lease it follows ended early (${d.ended_on}) and nobody in the household had signed it`)
         await vc.query('COMMIT')
+        if (out.deleted) await removeOrphanedDocumentFiles(vc.query.bind(vc), out.files).catch(() => {})
       } catch (e) {
         await vc.query('ROLLBACK').catch(() => {})
         logger.error({ err: e, document_id: d.id, lease_id: d.new_lease_id },
@@ -1803,8 +2139,41 @@ async function checkServiceDue() {
 // reveals confirmed same-day arrivals once 6:30am local has passed. The stamp
 // (site_reveal_sent_at) is THE movement fence — once sent, the booking can't be
 // re-sited. Tentative (unpaid) holds are never revealed.
+//
+// ── 10/20 (Nic) — AND NEVER TO A GUEST GAM HAS NOT SPOKEN TO ────────────────
+//
+//   "The import does not send the emails because one, you're going to be
+//    sending emails to people that don't need them... They may have already
+//    gotten a confirmation on a space number. Our system with compression and
+//    expansion is going to kind of screw that up if they think they're locked
+//    to a specific site already. So I don't want the import to do anything."
+//
+// The import obeys that to the letter — it sends nothing (services/
+// reservationImport). This job was quietly undoing it. A reservation brought in
+// from the old system is written status 'confirmed', with the guest's email and
+// no reveal stamp, which is THIS QUERY'S SHAPE EXACTLY — so bringing the season
+// file in at 2pm emailed a site number to every guest arriving that day, inside
+// fifteen minutes, with nobody pressing anything. "The import sends nothing" is
+// worth nothing if a cron sends it an hour later.
+//
+// And on an imported row with no space named in the file there is nothing
+// holding it still, so the number sent is whatever the nightly packer settled
+// on — not the space Nic promised by text. "Head straight there when you
+// arrive" pointing at somebody else's rig is the arrival he described.
+//
+// So ONE RULE, and it is about who GAM has spoken to rather than about imports:
+// GAM reveals a site only to a guest it has told about this reservation itself.
+// Either the reservation was taken here (migrated_at IS NULL — every row on the
+// board before today), or a person deliberately sent the confirmation
+// (confirmation_sent_at, routes/bookings). A migrated guest hears from GAM when
+// somebody decides they should, and their site follows on arrival morning like
+// anybody else's; until then GAM is silent, which is exactly what the schedule
+// screen tells Nic it is.
 const SITE_REVEAL_LOCAL_TIME = '06:30'
-export async function revealTodaysSites() {
+// The clock is an argument so a test can stand at a known minute of a known
+// day rather than depending on what time the suite happens to run, the same
+// way the arrival-day balance run takes one (services/stayBalance).
+export async function revealTodaysSites(now: Date = new Date()) {
   try {
     const due = await query<any>(`
       SELECT b.id, b.guest_name, b.guest_email, b.landlord_id,
@@ -1814,11 +2183,13 @@ export async function revealTodaysSites() {
         JOIN units u ON u.id = b.unit_id
         JOIN properties p ON p.id = u.property_id
        WHERE b.status = 'confirmed'
-         AND b.check_in = (now() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date
+         AND b.check_in = ($2::timestamptz AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date
          AND b.site_reveal_sent_at IS NULL
          AND b.guest_email IS NOT NULL
-         AND (now() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::time
-             >= $1::time`, [SITE_REVEAL_LOCAL_TIME])
+         -- Taken here, or told by a person. See the note above this function.
+         AND (b.migrated_at IS NULL OR b.confirmation_sent_at IS NOT NULL)
+         AND ($2::timestamptz AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::time
+             >= $1::time`, [SITE_REVEAL_LOCAL_TIME, now])
     for (const b of due) {
       try {
         const { emailBookingSiteAssignment } = await import('../services/email')
@@ -2248,6 +2619,12 @@ async function processBackgroundCheckExpiry() {
 export function schedulerInit() {
   logger.info('⏰ Scheduler initialized')
 
+  // 10/12 (Nic): GAM Books ledger — the outbox drain every minute and the
+  // nightly tie-out at 04:40 (services/ledgerJobs). Dark until the projector
+  // phases register their source types; until then both find nothing to do.
+  import('../services/ledgerJobs').then(m => m.registerLedgerJobs())
+    .catch(e => logger.error({ err: e }, '[ledger] could not register its jobs'))
+
   // S654: daily crons run on Phoenix time, so each fires at the same local hour
   // on any host (the API is moving to a UTC host, S641). Two exceptions, pinned
   // to UTC on purpose: payout sync (4:10 UTC) and auto-payouts (1:00 UTC), because
@@ -2299,7 +2676,11 @@ export function schedulerInit() {
   cron.schedule('0 8 * * *', checkLeaseExpiryNotices, { timezone: 'America/Phoenix' })
 
   // S652 (Nic): a card-reader request must never sit unseen. Every morning,
-  // one email while anything is waiting on GAM; silent otherwise.
+  // one email while anything is waiting on GAM; silent otherwise. 10/13 (Nic):
+  // it also flags every reader GAM bought whose cost is not entered yet.
+  // 10/13 evening (Nic): "Broken credit chain: fold into the 8:05 MORNING admin
+  // email (not its own 3 am email)" — this is that email: it also names any
+  // credit chain last night's check found broken, or says the check did not run.
   cron.schedule('5 8 * * *', async () => {
     try {
       const { chaseReaderOrders } = await import('../services/readerOrders')
@@ -2331,9 +2712,9 @@ export function schedulerInit() {
       logger.error({ err: e }, '[tenant-date-reads] fatal')
     }
     // S548 (Nic): every morning — not just month-end — prompt for meter
-    // reads on submetered sites whose guests pull out TODAY. The at-checkout
-    // read closes the departing guest's bill same-day and baselines the
-    // meter for the next arrival.
+    // reads on submetered spots whose closing read is still missing, whether
+    // the guest pulled out today or left early (10/18, RV 10 and RV 11). The
+    // read closes their bill and baselines the meter for the next arrival.
     try {
       const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
       const r = await promptMoveOutMeterReads()
@@ -2594,11 +2975,26 @@ export function schedulerInit() {
   cron.schedule('20 4 * * *', async () => {
     try {
       const { billDueHomeSaleInstallments, reconcileAllHomeSaleContracts } = await import('../services/homeSale')
-      // S654: the month on GAM's home calendar (Phoenix), not the host's clock.
-      const asOf = monthStartOf(todayIn(null))
+      // S654: the day on GAM's home calendar (Phoenix), not the host's clock.
+      // 10/25: the DAY, not the month's first. An installment bills when its
+      // own date arrives — Lisa Scheeler's falls on the 10th, and a month-start
+      // comparison billed it a month late every month.
+      const asOf = todayIn(null)
       const billed = await billDueHomeSaleInstallments(asOf)
+      // 10/25 (Nic): a contract GAM tracks but does not bill gets a REMINDER
+      // instead of an invoice — "we are going to send reminders about that
+      // contract payment being due... it stays off the books." Once per
+      // installment. Its own try, so a reminder that fails never costs anybody
+      // their billing.
+      let reminded = 0
+      try {
+        const { remindTrackedHomePayments } = await import('../services/homeSale')
+        reminded = await remindTrackedHomePayments(asOf)
+      } catch (e) {
+        logger.error({ err: e }, '[home-sale-billing] tracked payment reminders failed')
+      }
       await reconcileAllHomeSaleContracts()
-      if (billed) logger.info({ billed, asOf }, '[home-sale-billing]')
+      if (billed || reminded) logger.info({ billed, reminded, asOf }, '[home-sale-billing]')
     } catch (e) { logger.error({ err: e }, '[home-sale-billing] fatal') }
     // S654: 04:20 Phoenix, so the run and its Phoenix month agree on any host.
   }, { timezone: 'America/Phoenix' })
@@ -2620,6 +3016,35 @@ export function schedulerInit() {
       if (accrued) logger.info({ accrued, asOf }, '[lot-rent-accrual]')
     } catch (e) { logger.error({ err: e }, '[lot-rent-accrual] fatal') }
     // S654: 04:25 Phoenix, so the run and its Phoenix month agree on any host.
+  }, { timezone: 'America/Phoenix' })
+
+  // 10/19 (Nic): PAYMENT ARRANGEMENTS ON A CARRIED SPACE-RENT BALANCE.
+  //
+  //   "there's nothing that automatically bills for it right now. The regular
+  //    monthly bill comes out every month and the carry forward balance is kept
+  //    track of, but it's at the tenant's discretion to actually make any sort
+  //    of payment against that. So, to help landlords not forget about it and
+  //    stuff, we need to do, you know, payment arrangements on carry forward
+  //    balances. So what, even if it's $50 or $100 or whatever."
+  //
+  // Asks for the arrangement's amount on its day of the property's month and
+  // judges the previous ask by the money that actually landed. It writes no
+  // charge (the whole balance is already one charge row, so a second would bill
+  // the same debt twice) and no late fee, ever — Nic dropped late fees on a
+  // carried balance outright. Idempotent by (carryforward_id, due_date), so the
+  // daily cadence is safe whatever the property's timezone.
+  cron.schedule('35 4 * * *', async () => {
+    const client = await getClient()
+    try {
+      const { runCarryforwardArrangements } = await import('../services/spaceRentCarryforward')
+      await client.query('BEGIN')
+      const r = await runCarryforwardArrangements(client)
+      await client.query('COMMIT')
+      if (r.asked || r.met || r.missed) logger.info(r, '[carryforward-arrangements]')
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      logger.error({ err: e }, '[carryforward-arrangements] fatal')
+    } finally { client.release() }
   }, { timezone: 'America/Phoenix' })
 
   cron.schedule('45 1 * * *', async () => {
@@ -2959,6 +3384,20 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // 10/13 (Nic): "emailing tenants on their birthday and saying, Hey, happy
+  // birthday from GAM ... Thank you for using GAM." Current tenants and
+  // landlords whose birthday is today, once a person a year
+  // (jobs/birthdayEmails.ts). A morning hour, so it lands on the day itself.
+  cron.schedule('15 9 * * *', async () => {
+    try {
+      const { runBirthdayEmails } = await import('./birthdayEmails')
+      const r = await runBirthdayEmails()
+      if (r.birthdays) logger.info(r, '[birthday-emails] run')
+    } catch (e) {
+      logger.error({ err: e }, '[birthday-emails] run failed')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S652 (Nic): "immediately reach out to people when there's a problem."
   // A landlord GAM cannot collect from is a silent problem — the fee accrues,
   // the sweep finds no bank, and nothing reaches the one person who can fix it.
@@ -3039,6 +3478,29 @@ export function schedulerInit() {
       logger.info({ raised: await raiseDueInstallments() }, '[reader-installments]')
     } catch (e) {
       logger.error({ err: e }, '[platform-fee-accrual] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // ── 10/21 (Nic): WHO WAS IN THE SPOT LAST NIGHT, WRITTEN DOWN ──────────
+  //
+  //   "say I had 10 or 12 people go in the month, and then the landlord goes to
+  //    delete all of those out of the schedule before the close of the month…
+  //    the landlord could be cheating us out of the subscription fee by
+  //    deleting the history. We need a way to have that no matter what changes
+  //    they try to do."
+  //
+  // Hourly, at twenty past, because a park's midnight is its own: the parks run
+  // in four time zones today and will run in more, so an hourly pass writes
+  // last night down within the hour of each park's own midnight — in particular
+  // before the accrual reads the month at 1:30 am Phoenix on the 1st. It writes
+  // nothing on almost every run, because the night it would write is already
+  // written (services/occupancyNights).
+  cron.schedule('20 * * * *', async () => {
+    try {
+      const { stampOccupancyNightsHourly } = await import('../services/occupancyNights')
+      await stampOccupancyNightsHourly()
+    } catch (e) {
+      logger.error({ err: e }, '[occupancy-nights] fatal')
     }
   }, { timezone: 'America/Phoenix' })
 
@@ -3342,10 +3804,11 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
-  // Credit ledger nightly recompute. 3am Phoenix — sits between
-  // lease-ends (2am) and background-check expiry (3am same minute on
-  // a different table set, no contention). Recomputes scores for
-  // every subject with active events and refreshes the stats panel.
+  // Credit ledger nightly. 3am Phoenix — sits between lease-ends (2am) and
+  // background-check expiry (3am same minute on a different table set, no
+  // contention). Writes tonight's bill marks, runs the credit chain check
+  // (10/13 Nic; evening: written down for the 8:05 morning admin email, no
+  // 3 am email), then recomputes scores and refreshes the stats panel.
   cron.schedule('0 3 * * *', async () => {
     try {
       const { processCreditNightly } = await import('./creditNightly')
@@ -3648,7 +4111,9 @@ export function schedulerInit() {
       }
     } catch (e) { logger.error({ err: e }, '[SCHEDULER] schedule compression') }
   }, { timezone: 'America/Phoenix' })
-  cron.schedule('*/15 * * * *', revealTodaysSites)
+  // Wrapped rather than passed by name: node-cron hands a task its own trigger
+  // date, and this job reads the clock itself.
+  cron.schedule('*/15 * * * *', () => revealTodaysSites())
 
   // W-44 (S531): hourly private-event sweep — announce paid events,
   // auto-release unpaid ones at start time.
@@ -3744,26 +4209,50 @@ export function schedulerInit() {
   // to Phoenix; unpinned it ran at the host's 7am (midnight Phoenix on UTC).
   cron.schedule('0 7 * * *', async () => {
     try {
-      // Rent due 5+ days ago that hasn't settled. S654: these rows only mark
-      // units delinquent now; the morning email reads the Outstanding list.
+      // Rent past its grace period that hasn't settled. S654: these rows only
+      // mark units delinquent now; the morning email reads the Outstanding list.
+      //
+      // 10/12 (Nic): "Grace = lease, else property, else 5 — the only chain."
+      // This used a fixed 5 days on the server's clock, so a lease with a
+      // 10-day grace was marked delinquent here and cleared again by the
+      // database trigger (sync_unit_delinquency), which honors the lease and
+      // the property. Now it reads the same chain on the property's calendar,
+      // and the first late day is the late fees' (the 6th for the 1st with 5
+      // days: services/openBalances.pastGraceSql).
+      //
+      // 10/12 (Nic, LF2): a bill written after its due date is late counted
+      // "from the DAY IT WAS WRITTEN (grace starts then)" — "delinquency
+      // trigger too". So lateness starts on the later of the due date and the
+      // day GAM wrote the bill (lateCountsFromSql / writtenAtSql: a reopened
+      // row or the rest of a part-paid row counts from its bill, a released
+      // work-trade hold from its release), the same start as Outstanding, the
+      // Rent Roll and the digest. The trigger asks the identical question
+      // (20261013120000_delinquency_first_late_day.sql), so the two never flip
+      // a space back and forth. The rows are unpaid, so "the day it was paid"
+      // is today. A $0 rent line is never owed (10/12): the trigger leaves it
+      // out, so this does too.
+      const today = propertyDaySql('NOW()', 'pr')
+      const lateStart = lateCountsFromSql('p.due_date', propertyDaySql(writtenAtSql('p'), 'pr'), today)
+      const pastGrace = `p.amount > 0 AND ${pastGraceSql(today, lateStart, graceDaysSql('l', 'pr'))}`
       const overdue = await query<any>(`
         SELECT p.*, u.unit_number, u.id AS unit_id,
           t.id AS tenant_id, t.ssi_ssdi,
           tu.email AS tenant_email, tu.first_name AS tenant_first,
           tu.last_name AS tenant_last,
           ul.email AS landlord_email,
-          COALESCE(l.business_name, ul.first_name || ' ' || ul.last_name) AS landlord_name,
+          COALESCE(ll.business_name, ul.first_name || ' ' || ul.last_name) AS landlord_name,
           pr.name AS property_name
         FROM payments p
         JOIN units u ON u.id = p.unit_id
         JOIN properties pr ON pr.id = u.property_id
         JOIN tenants t ON t.id = p.tenant_id
         JOIN users tu ON tu.id = t.user_id
-        JOIN landlords l ON l.id = p.landlord_id
-        JOIN users ul ON ul.id = l.user_id
+        JOIN landlords ll ON ll.id = p.landlord_id
+        JOIN users ul ON ul.id = ll.user_id
+        LEFT JOIN leases l ON l.id = p.lease_id
         WHERE p.type = 'rent'
           AND p.status IN ('pending','failed')
-          AND p.due_date <= NOW() - INTERVAL '5 days'
+          AND ${pastGrace}
           AND u.payment_block = FALSE
           -- ── S638 (Nic): WORK TRADE IS NOT LATE ────────────────────────────
           --
@@ -3821,11 +4310,14 @@ export function schedulerInit() {
          WHERE u.status = 'delinquent'
            AND NOT EXISTS (
              SELECT 1 FROM payments p
+               JOIN units pu ON pu.id = p.unit_id
+               JOIN properties pr ON pr.id = pu.property_id
+               LEFT JOIN leases l ON l.id = p.lease_id
               WHERE p.unit_id = u.id
                 AND p.type = 'rent'
                 AND p.status IN ('pending','failed')
                 AND p.work_trade_suspended_at IS NULL
-                AND p.due_date <= NOW() - INTERVAL '5 days')
+                AND ${pastGrace})
         RETURNING u.id`)
       if (cleared.length > 0) {
         logger.info(`[Scheduler] ${cleared.length} unit(s) no longer delinquent`)
@@ -3887,6 +4379,12 @@ export function schedulerInit() {
   // S29 item 4: e-sign reminders (2h) + auto-void (24h). Every 15 min.
   cron.schedule('*/15 * * * *', processEsignTimeouts)
 
+  // 10/14 (Nic, #7): drafts out for signature that nobody has signed in 30
+  // days are deleted (no money touched them); the waiting signers hear once.
+  cron.schedule('20 2 * * *', async () => {
+    try { await processUnsignedDraftExpiry() } catch (e) { logger.error({ err: e }, '[ESIGN-EXPIRY] fatal') }
+  }, { timezone: 'America/Phoenix' })
+
   // Run every hour — flip scheduled-activation units to active once due
   cron.schedule('5 * * * *', async () => {
     try {
@@ -3918,6 +4416,7 @@ export function schedulerInit() {
   registerServiceAgreementInvoiceEngine()
   registerLateFeeEngine()
   registerAutopayEngine()
+  void import('./monthlyPropertyReportEmail').then(m => m.registerMonthlyPropertyReportEmail()).catch((e: unknown) => logger.error({ err: e }, '[Scheduler] monthly property report email')) // 10/12 (Nic): the monthly property report, emailed the 2nd
   registerRefreshCron()
   // initial population — async, will populate per-tz crons on next tick
   refreshTimezoneCrons().then(({ added }) => {

@@ -1,12 +1,26 @@
 import { Resend } from 'resend'
 import { LandlordAssignableRole, LANDLORD_ASSIGNABLE_ROLE_LABEL, FLEXPAY_TERMS } from '@gam/shared'
+import {
+  emailGateFor, emailCategoryLabel, isCriticalNotificationType,
+  EMAIL_DECLINED_BY_PREFERENCE,
+} from '@gam/shared'
+import { TEAM_INVITATION_TTL_HOURS } from '@gam/shared'
+import { longCalendarDate } from '@gam/shared'
 import { query } from '../db'
 import { logger } from '../lib/logger'
-import { portalLink } from '../lib/portalUrls'
+// 10/21 (Nic): these six emails each defaulted their button to a localhost
+// address, and every caller passed `undefined`, so every one of them shipped a
+// dead link. Nine had already gone out — five "your application is approved"
+// emails to real applicants among them. portalUrls exists because this happened
+// once before ("Lisa's email link is trying to go to localhost"); these were
+// missed. A default is evaluated at call time, so these read the real host.
+import { portalLink, portalUrl as portalUrlFor } from '../lib/portalUrls'
 import { replyAddressesFor, type ReplyTo } from './replyRouting'
 import { buildDemoBookingIcs } from './demoCalendar'
 // S651: read before every send — see the comment at the send decision below.
 import { suppressionFor } from './emailSuppressions'
+// 10/20: an email another email in this same action is already carrying.
+import { withheldBecause } from './emailWithheld'
 
 // S630: no key, no sender. The Resend constructor throws on a missing key, at
 // IMPORT time, which took the whole API down rather than degrading — and the
@@ -115,6 +129,67 @@ export interface EmailAttachment {
   content:  Buffer | string | Uint8Array
 }
 
+/**
+ * ── 10/20 (Nic): THE SECOND GATE. THIS IS THE ROOT OF THE COMPLAINT. ───────
+ *
+ * Blu Haws sat down and answered every box on his settings page — 90 rows,
+ * every optional email off, read out of `gam`. The 7am overdue digest, the
+ * monthly bill, every payment receipt, the signing request, up to four signing
+ * reminders and the monthly property report all kept arriving, because not one
+ * of them goes through `createNotification`. They come straight here, and this
+ * function's only suppression check was the mail provider's bounce list.
+ *
+ * So every category is declared once, in packages/shared/src/emailCategories.ts,
+ * as either a notification the recipient may decline (with the type whose row on
+ * their settings page does it) or a transactional email with the reason it always
+ * goes. This reads that declaration.
+ *
+ * Returns the sentence to write on the log row when the email must NOT go, or
+ * null when it may.
+ *
+ * Three deliberate choices:
+ *   · The critical five are never declined here, the same as createNotification.
+ *   · The recipient is matched by ADDRESS (users.email is unique, lower-cased
+ *     index), because these senders take an address, not a user. A guest or a
+ *     prospect has no row, so nothing is declined and the mail goes — which is
+ *     right: they were never asked and have no page to answer on.
+ *   · A failed lookup FAILS OPEN. Losing mail because a query timed out would
+ *     be a worse bug than the one being fixed.
+ */
+async function declinedByPreference(to: string, category: string | null | undefined): Promise<string | null> {
+  const gate = emailGateFor(category)
+  if (gate.kind === 'undeclared') {
+    // Drift, the same shape as the twenty-two types with no switch. The test in
+    // services/notificationCatalog.test.ts fails naming the category; at run
+    // time the mail still goes rather than vanishing on a missing declaration.
+    logger.error({ category: category ?? null },
+      '[EMAIL UNDECLARED CATEGORY] nobody has said whether the recipient may decline this one. '
+      + 'Declare it in packages/shared/src/emailCategories.ts — `gate` with a notification type '
+      + 'whose row on the settings page switches it off, or `always` with the reason it cannot be. '
+      + 'Sending it this time.')
+    return null
+  }
+  if (gate.kind !== 'preference') return null
+  if (isCriticalNotificationType(gate.type)) return null
+  try {
+    const rows = await query<{ one: number }>(
+      `SELECT 1 AS one
+         FROM notification_preferences np
+         JOIN users u ON u.id = np.user_id
+        WHERE lower(u.email) = lower($1)
+          AND np.type = $2
+          AND np.email_enabled = FALSE
+        LIMIT 1`,
+      [to, gate.type])
+    if (!rows.length) return null
+    return `${EMAIL_DECLINED_BY_PREFERENCE} (“${emailCategoryLabel(category)}”).`
+  } catch (e) {
+    logger.error({ err: e, to, category: category ?? null },
+      '[EMAIL PREF LOOKUP FAILED] could not read the recipient’s notification settings — sending rather than losing it')
+    return null
+  }
+}
+
 async function send(
   to: string,
   subject: string,
@@ -123,6 +198,21 @@ async function send(
   from: SenderKind = 'noreply',
   attachments: EmailAttachment[] | undefined = undefined,
 ): Promise<string | null> {
+  // 10/20 (review) — SOMETHING ELSE IN THIS SAME ACTION IS SAYING THIS.
+  //
+  // A confirmation has to make the deposit card page before it can offer it,
+  // and the link maker emails the guest the moment it makes one — so the guest
+  // got a bare "Reservation deposit: $28.39" and then, moments later, the
+  // actual confirmation. Nic's rule is one email per thing, so the carrying
+  // email withholds the one it is carrying (services/emailWithheld.ts has the
+  // whole why, and why this is not a mute switch). First thing checked: a
+  // withheld send does no work, writes no log row and never reaches Resend.
+  const withheld = withheldBecause(ctx.category)
+  if (withheld) {
+    logger.info({ to, subject, category: ctx.category ?? null, because: withheld },
+      '[EMAIL WITHHELD] another email in this same action carries this one')
+    return null
+  }
   // S536/S553 (Nic): only PRODUCTION (or an explicit EMAIL_SEND_LIVE=1
   // override) actually hits Resend. This now covers NODE_ENV=test too —
   // the prior `nodeEnv !== 'test'` carve-out let any test with an UNMOCKED
@@ -172,7 +262,18 @@ async function send(
   // row says who would have heard back.
   const routedReplyTo = ctx.replyTo ? await replyAddressesFor(ctx.replyTo) : null
   if (routedReplyTo) ctx = { ...ctx, metadata: { ...(ctx.metadata ?? {}), reply_to: routedReplyTo } }
-  const suppressed = willSend ? await suppressionFor(to) : null
+  // 10/20: the recipient's own answer, read before the provider's bounce list —
+  // an email somebody switched off is not sent to a dead address either, and the
+  // reason on the row has to be theirs, not the provider's. See
+  // declinedByPreference above for why this exists at all.
+  const declined = await declinedByPreference(to, ctx.category)
+  if (declined) {
+    status = 'suppressed'
+    errorMessage = declined
+    logger.info({ to, subject, category: ctx.category ?? null },
+      '[EMAIL DECLINED] the recipient switched this one off in their notification settings')
+  }
+  const suppressed = (willSend && !declined) ? await suppressionFor(to) : null
   if (suppressed) {
     status = 'undeliverable'
     errorMessage = `Address is on the mail provider suppression list (${suppressed.origin}`
@@ -180,7 +281,7 @@ async function send(
       + ' — nothing sent. Correct the address; resending to this one cannot work.'
     logger.warn({ to, subject, origin: suppressed.origin },
       '[EMAIL UNDELIVERABLE] provider suppresses this address — not sent')
-  } else if (willSend) {
+  } else if (willSend && !declined) {
     try {
       // S322: optional attachments via Resend's documented attachments[]
       // field. Unset for the existing callers — only the new
@@ -216,7 +317,7 @@ async function send(
       errorMessage = e instanceof Error ? e.message : String(e)
       logger.error({ err: e }, '[EMAIL FAILED]')
     }
-  } else {
+  } else if (!declined) {
     // S641: the log must not claim we sent something we did not. This row is
     // the answer to "did the tenant get their notice?", and a record that
     // cannot tell "delivered" from "never left the machine" is worse than no
@@ -307,7 +408,7 @@ function h(text: string) {
 
 // ── BACKGROUND CHECK EMAILS ───────────────────────────────────
 
-export async function emailNewBackgroundCheck(landlordEmail: string, landlordName: string, tenantName: string, propertyName: string, unitNumber: string, riskLevel: string, portalUrl = 'http://localhost:3001/background', ctx?: { landlordId?: string; backgroundCheckId?: string }) {
+export async function emailNewBackgroundCheck(landlordEmail: string, landlordName: string, tenantName: string, propertyName: string, unitNumber: string, riskLevel: string, portalUrl = portalLink('landlord', 'background'), ctx?: { landlordId?: string; backgroundCheckId?: string }) {
   const riskColor = riskLevel === 'low' ? '#22c55e' : riskLevel === 'medium' ? '#f59e0b' : '#ef4444'
   await send(landlordEmail, `New background check submitted — ${tenantName}`,
     base(h('New Application Received') +
@@ -362,9 +463,218 @@ export async function emailBookingSiteChanged(
         + `from site <strong style="color:#eef1f8">${fromSite}</strong> to site `
         + `<strong style="color:#eef1f8">${toSite}</strong>.`) +
       p('Your dates have not changed and nothing else about your reservation is different.') +
-      p('If that site does not suit you, just reply to this email or give us a ring and we will sort it out.')
+      // 10/20: "give us a ring" was a British idiom sitting in live guest mail
+      // (memory: feedback-american-spelling). Same sentence, American.
+      p('If that site does not work for you, just reply to this email or call us and we will fix it.')
     ),
     { category: 'booking_site_changed', landlordId: ctx?.landlordId ?? null, replyTo: ctx?.replyTo }
+  )
+}
+
+// ── THE RESERVATION CONFIRMATION ──────────────────────────────────────────
+
+/**
+ * 10/20 (Nic) — THE HONEST TRADE, IN WORDS A PERSON WROTE.
+ *
+ *   "paying the deposit guarantees the spot, not paying the deposit risks the
+ *    site being given away by other people that have paid ahead, and there are
+ *    no refunds on deposits. So I don't know the best way to word that, but the
+ *    tenant or the customer basically has to gamble."
+ *
+ * He asked for this wording himself, so here it is, in one place, as four short
+ * lines rather than a paragraph of disclaimers. The rules it has to carry, and
+ * nothing beyond them:
+ *
+ *   - paying is the guest's choice, not a requirement;
+ *   - paid, the site is held for them;
+ *   - unpaid, a guest who HAS paid can be given it — which is literally true:
+ *     an unpaid hold is exactly what GAM moves aside for money
+ *     (services/holdDisplacement), so this is not a sales line;
+ *   - a deposit is not refundable.
+ *
+ * What it deliberately does NOT do is threaten. "Pay now or lose your spot" is
+ * a different email from the one Nic described, and the refund sentence only
+ * reads as fair sitting next to "only if you are sure" — the guest is making a
+ * judgment call with their eyes open, which is the whole point of offering it
+ * rather than requiring it.
+ */
+
+/**
+ * 10/20 (review) — THE ONE LINE ON THAT PAGE THE GUEST DOES NOT GET TO CHOOSE.
+ *
+ * A stay of more than three weeks needs a background check before check-in
+ * (R8), and when nothing is on file its fee rides on this same card page as a
+ * line the payer cannot take off. So the sentences below — "paying the deposit
+ * is your choice" — would be read across the whole total unless the email says
+ * which part of it is not a choice. It says it in the words the pay link's own
+ * email already uses, because it is the same fee and the same check.
+ */
+export const confirmationScreeningWords = (amount: string): string =>
+  'Your stay comes to more than three weeks, so a background check is required before check-in. '
+  + `Its ${amount} is included above. Once it is paid we email you the link to fill it out, `
+  + 'and you are not charged for it again.'
+
+export const DEPOSIT_CHOICE_WORDS: readonly string[] = [
+  'Paying the deposit is your choice.',
+  'Pay it and the site is held for you — we will not give it to anyone else.',
+  'Leave it unpaid and we still keep your dates on the schedule, but if the park fills up, '
+    + 'a guest who has paid can be given the site.',
+  'A deposit is not refundable, so pay it only if you are sure of your plans.',
+]
+
+/**
+ * 10/20 (Nic) — A GUEST'S CONFIRMATION: THEIR DATES, THEIR PRICE, AND THE
+ * DEPOSIT OFFERED RATHER THAN DEMANDED.
+ *
+ *   "the confirmation actually says that they have a reservation on these
+ *    dates. I'd like it to tell them a grand total if it's a short-term stay
+ *    ... If they're seasonal and going to be here more than the 30 days, I just
+ *    want it to tell them the first month's rate. I also want it to tell them a
+ *    deposit of 10% or whatever that property's deposit rate is. Have it
+ *    display that as available to pay now. But I also want it to not be
+ *    required"
+ *
+ * NEVER SENT BY ANYTHING BUT A PERSON. There is no hook on booking creation and
+ * no sweep for unsent confirmations — see services/bookingConfirmation for why
+ * that matters more than usual right now.
+ *
+ * THE SUBJECT DOES NOT SAY "CONFIRMED". With the deposit unpaid the site is
+ * genuinely not guaranteed, and an email headed "confirmed" would contradict
+ * its own middle paragraph.
+ *
+ * THE CARD FEE IS ON THE PAGE BEFORE THEY PAY, never discovered afterwards —
+ * as a figure, not as a rate: GAM does not read a processor's rate card out to
+ * a customer.
+ */
+export async function emailBookingConfirmation(args: {
+  to: string
+  guestName: string | null
+  propertyName: string
+  /** 'YYYY-MM-DD' */
+  checkIn: string
+  checkOut: string
+  nights: number
+  /** 30 nights or more: `amount` is the FIRST MONTH and the email says so. */
+  firstMonthOnly: boolean
+  amount: number
+  /** The first month's last day, for a 30+ stay. */
+  firstMonthThrough: string | null
+  /** The lodging tax inside `amount`, or null to not break it out. */
+  tax: number | null
+  /** R13's held-through sentence, for a 30+ stay with no lease. */
+  heldThrough: string | null
+  /** The property's own deposit rate, for the sentence that names it. */
+  depositPct: number
+  /** What the card page charges, line by line. Null when this park asks no deposit on a stay like this. */
+  deposit: {
+    deposit: number; screening: number; cardFee: number; total: number; url: string | null
+  } | null
+  /**
+   * Money is already in. Most of Nic's board is in this state right now —
+   * guests who paid him in the old system — and asking one of them for it
+   * again, under a sentence about the site being given away, is the worst
+   * version of this email. Set, it REPLACES the offer.
+   *
+   * 10/20 (defect): WHICH money, because the two read differently to the
+   * person holding the receipt. A deposit is in and the rest is owed on
+   * arrival; the whole stay is in and nothing is. This email used to know only
+   * "something is paid", call it a deposit, quote the property's percentage for
+   * it, and tell a guest who had paid in full that the balance was due at the
+   * gate. `amount` is null where the reservation cannot say what came in — then
+   * no figure is quoted, because a figure nobody paid is worse than none.
+   */
+  paid?: { kind: 'deposit' | 'stay'; amount: number | null } | null
+  ctx?: { landlordId?: string; bookingId?: string; replyTo?: ReplyTo }
+}) {
+  const money = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  const strong = (s: string) => `<strong style="color:#eef1f8">${s}</strong>`
+  const night = (n: number) => `${n} night${n === 1 ? '' : 's'}`
+  const inDay = longCalendarDate(args.checkIn)
+  const outDay = longCalendarDate(args.checkOut)
+  // A clerk types the guest's name and a landlord types the property's, so
+  // both are somebody's free text arriving in an HTML document.
+  const park = escapeHtml(args.propertyName)
+  const who = escapeHtml(args.guestName || 'there')
+
+  // What they owe: the whole stay, or the first month said plainly as the first
+  // month. A guest down for the season must not read one month's rate as the
+  // price of six.
+  //
+  // AND WHAT IS LEFT OF IT. 10/20 (defect): this paragraph used to end "The
+  // balance is due when you arrive." on every short stay, whatever had been
+  // paid — so a guest who had handed over the whole $286.75 on the card page
+  // read that he owed it again on the day. What is still owed is one answer
+  // (`paid`, from services/bookingConfirmation confirmationPaid), read here and
+  // again below, so the price paragraph and the paid paragraph say the same
+  // thing as each other. Paid in full, neither this sentence nor the promise to
+  // bill each month belongs in the email at all: nothing more is coming.
+  const paidWhole = args.paid?.kind === 'stay'
+  const whatIsLeft = paidWhole ? ''
+    : args.paid?.kind === 'deposit' ? ' The rest is due when you arrive.'
+    : ' The balance is due when you arrive.'
+  const priceLines = args.firstMonthOnly
+    ? p(`${strong(`Your first month is ${money(args.amount)}`)}`
+        + (args.firstMonthThrough ? ` — ${inDay} through ${longCalendarDate(args.firstMonthThrough)}.` : '.')
+        + ' That is the first month only, not the whole stay.'
+        + (paidWhole ? '' : ' We bill each month as it comes.'))
+      + (args.heldThrough ? p(escapeHtml(args.heldThrough)) : '')
+    : p(`${strong(`Your stay comes to ${money(args.amount)}`)}`
+        + (args.tax != null && args.tax > 0 ? `, including ${money(args.tax)} of lodging tax.` : '.')
+        + whatIsLeft)
+
+  // The deposit, offered. Its lines are the card page's own, so the email and
+  // the page can never quote two different numbers.
+  const d = args.deposit
+  const pct = Number.isFinite(args.depositPct) && args.depositPct > 0
+    ? `${String(args.depositPct).replace(/\.00?$/, '')}%` : null
+  // ALREADY PAID BEATS THE OFFER, and says which of the two things happened.
+  // The "deposit" sentence on a guest who paid for everything is the sentence
+  // that told Dale his $28.68 was in when he had paid $286.75.
+  const paidBlock = !args.paid ? ''
+    : args.paid.kind === 'stay'
+    ? p(`${strong('Your stay is paid in full')}`
+        + (args.paid.amount != null ? ` — we have your ${money(args.paid.amount)}.` : '.')
+        + ' There is nothing to pay when you arrive, and your site is held for you'
+        + ' — we will not give it to anyone else.')
+    : p(`${strong(args.paid.amount != null ? `Your deposit of ${money(args.paid.amount)} is paid` : 'Your deposit is paid')}`
+        + ' — your site is held for you and we will not give it to anyone else.')
+  const depositBlock = args.paid
+    ? paidBlock
+    : !d ? '' :
+    p(`${strong(`A deposit of ${money(d.deposit)}`)}`
+      + (pct && !args.firstMonthOnly ? ` — ${pct} of your stay —` : '')
+      + ' holds your site.')
+    + p([
+        `${strong('Deposit:')} ${money(d.deposit)}`,
+        d.screening > 0 ? `${strong('Background check:')} ${money(d.screening)}` : '',
+        d.cardFee > 0 ? `${strong('Card processing fee:')} ${money(d.cardFee)}` : '',
+        `${strong('Total to pay by card:')} ${money(d.total)}`,
+      ].filter(Boolean).join('<br>'))
+    + (d.screening > 0 ? p(escapeHtml(confirmationScreeningWords(money(d.screening)))) : '')
+    + DEPOSIT_CHOICE_WORDS.map(w => p(escapeHtml(w))).join('')
+    + (d.url
+        ? btnWithLink('Pay the deposit', d.url)
+        : p('Call the office and we can take the deposit by card.'))
+
+  await send(args.to,
+    `Your reservation at ${args.propertyName} — ${inDay} to ${outDay}`,
+    base(
+      h(`Your reservation at ${park}`) +
+      p(`Hi ${who},`) +
+      p(`You have a reservation at ${strong(park)} from ${strong(inDay)} to ${strong(outDay)}`
+        + ` — ${night(args.nights)}.`) +
+      priceLines +
+      depositBlock +
+      p('If anything above looks wrong, reply to this email or call us and we will fix it.')
+    ),
+    {
+      category: 'booking_confirmation',
+      landlordId: args.ctx?.landlordId ?? null,
+      relatedEntityType: 'unit_booking',
+      relatedEntityId: args.ctx?.bookingId ?? null,
+      replyTo: args.ctx?.replyTo,
+    },
+    'support',
   )
 }
 
@@ -372,7 +682,7 @@ export async function emailBookingSiteChanged(
 // 10/5 (Nic): a stay of more than three weeks needs a background check before
 // check-in, and its fee is taken with the stay's payment — `prepaid` says so,
 // so the guest is never asked to pay for it again.
-export async function emailBackgroundCheckScreeningRequest(guestEmail: string, guestName: string | null, propertyName: string, portalUrl = 'http://localhost:3002/background', ctx?: { landlordId?: string; replyTo?: ReplyTo; prepaid?: boolean }) {
+export async function emailBackgroundCheckScreeningRequest(guestEmail: string, guestName: string | null, propertyName: string, portalUrl = portalLink('tenant', 'background'), ctx?: { landlordId?: string; replyTo?: ReplyTo; prepaid?: boolean }) {
   await send(guestEmail, `${propertyName} — background check for your stay`,
     base(h('One more step before check-in') +
       p(`Hi ${guestName || 'there'},`) +
@@ -387,7 +697,7 @@ export async function emailBackgroundCheckScreeningRequest(guestEmail: string, g
   )
 }
 
-export async function emailBackgroundDecision(tenantEmail: string, tenantName: string, decision: 'approved' | 'denied', propertyName: string, unitNumber: string, notes?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; backgroundCheckId?: string; replyTo?: ReplyTo }) {
+export async function emailBackgroundDecision(tenantEmail: string, tenantName: string, decision: 'approved' | 'denied', propertyName: string, unitNumber: string, notes?: string, portalUrl = portalUrlFor('tenant'), ctx?: { landlordId?: string; backgroundCheckId?: string; replyTo?: ReplyTo }) {
   const approved = decision === 'approved'
   await send(tenantEmail,
     approved ? 'Your application has been approved! 🎉' : 'Update on your rental application',
@@ -414,7 +724,7 @@ export async function emailBackgroundDecision(tenantEmail: string, tenantName: s
 
 // ── POOL EMAILS ───────────────────────────────────────────────
 
-export async function emailPoolMatchInterest(tenantEmail: string, tenantName: string, landlordName: string, propertyName: string, unitNumber: string, message: string|null, monthlyRent: number | null = null, portalUrl = 'http://localhost:3002/notifications', ctx?: { landlordId?: string; matchRequestId?: string; replyTo?: ReplyTo }) {
+export async function emailPoolMatchInterest(tenantEmail: string, tenantName: string, landlordName: string, propertyName: string, unitNumber: string, message: string|null, monthlyRent: number | null = null, portalUrl = portalLink('tenant', 'notifications'), ctx?: { landlordId?: string; matchRequestId?: string; replyTo?: ReplyTo }) {
   await send(tenantEmail, `A landlord is interested in you — ${propertyName}`,
     base(
       h('You Have a Match!') +
@@ -434,7 +744,7 @@ export async function emailPoolMatchInterest(tenantEmail: string, tenantName: st
   )
 }
 
-export async function emailPoolTenantInterested(landlordEmail: string, landlordName: string, portalUrl = 'http://localhost:3001/pool', ctx?: { landlordId?: string; matchRequestId?: string }) {
+export async function emailPoolTenantInterested(landlordEmail: string, landlordName: string, portalUrl = portalLink('landlord', 'pool'), ctx?: { landlordId?: string; matchRequestId?: string }) {
   await send(landlordEmail, 'A tenant confirmed interest — unlock their full report',
     base(
       h('Tenant Is Interested!') +
@@ -505,7 +815,7 @@ export async function emailSigningRequest(to: string, signerName: string, docume
   )
 }
 
-export async function emailSigningCompleted(to: string, signerName: string, documentTitle: string, unitLabel: string, pdfUrl?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; documentId?: string; replyTo?: ReplyTo }, pdfBytes?: Buffer) {
+export async function emailSigningCompleted(to: string, signerName: string, documentTitle: string, unitLabel: string, pdfUrl?: string, portalUrl = portalUrlFor('tenant'), ctx?: { landlordId?: string; documentId?: string; replyTo?: ReplyTo }, pdfBytes?: Buffer) {
   // S637: no leading emoji in a transactional subject — it is a spam signal
   // and this one goes out at the moment a lease becomes legally binding.
   await send(to, `Document fully signed: ${documentTitle}`,
@@ -582,17 +892,31 @@ export async function emailSigningReminder(to: string, signerName: string, docum
   )
 }
 
-export async function emailDocumentAutoVoided(to: string, recipientName: string, documentTitle: string, unitLabel: string, ctx?: { landlordId?: string; documentId?: string; replyTo?: ReplyTo }) {
-  await send(to, `Document auto-voided: ${documentTitle}`,
+/**
+ * A document GAM ended on its own. 10/14 (Nic, #5): when it was DELETED — no
+ * money touched it (#4: the 48-hour timeout; #7: 30 days out for signature
+ * with nobody signing) — it reads "This document expired and is no longer
+ * available to sign." (`deleted`), same layout. One that stays on record as
+ * voided keeps today's words. `toLandlord` (review 10/14): the landlord is
+ * the one who sends a new document, so their copy never tells them to
+ * contact the landlord.
+ */
+export async function emailDocumentAutoVoided(to: string, recipientName: string, documentTitle: string, unitLabel: string, ctx?: { landlordId?: string; documentId?: string; replyTo?: ReplyTo; deleted?: boolean; toLandlord?: boolean }) {
+  const deleted = ctx?.deleted === true
+  await send(to, deleted ? `Document expired: ${documentTitle}` : `Document auto-voided: ${documentTitle}`,
     base(
-      h('Document Has Been Auto-Voided') +
-      p(`Hi ${recipientName},`) +
-      p('The following document was automatically voided because it was not signed by all parties within 48 hours of being sent:') +
+      h(deleted ? 'Document Expired' : 'Document Has Been Auto-Voided') +
+      p(`Hi ${escapeHtml(recipientName)},`) +
+      p(deleted
+        ? 'This document expired and is no longer available to sign.'
+        : 'The following document was automatically voided because it was not signed by all parties within 48 hours of being sent:') +
       `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
-        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${documentTitle}</div>
-        <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${escapeHtml(documentTitle)}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${escapeHtml(unitLabel)}</div>
       </div>` +
-      p('No action is required. If you still need to complete this signing, please contact the landlord to send a new document.')
+      p(ctx?.toLandlord
+        ? 'No action is required. If you still need it signed, send a new document from GoldSign.'
+        : 'No action is required. If you still need to complete this signing, please contact the landlord to send a new document.')
     ),
     {
       category: 'esign_document_auto_voided',
@@ -778,18 +1102,33 @@ export async function emailNewLeasesAwaitingLandlord(to: string, recipientName: 
  */
 export async function emailNewLeaseDraftLapsed(to: string, recipientName: string, items: NewLeaseDigestItem[], ctx: {
   landlordId?: string; documentId?: string
+  /** 10/14 (Nic, #4/#5): the drafts were DELETED (no money touched them) —
+   *  "This document expired and is no longer available to sign." */
+  deleted?: boolean
 } = {}) {
   if (items.length === 0) return
   const one = items.length === 1
   const only = items[0]
-  await send(to, one ? `New lease canceled (never signed): ${only.unitLabel}` : `${newLeaseCount(items.length)} canceled (never signed)`,
+  const deleted = ctx.deleted === true
+  await send(to, deleted
+      ? (one ? `New lease expired (never signed): ${only.unitLabel}` : `${newLeaseCount(items.length)} expired (never signed)`)
+      : (one ? `New lease canceled (never signed): ${only.unitLabel}` : `${newLeaseCount(items.length)} canceled (never signed)`),
     base(
-      h(one ? 'A New Lease Draft Was Canceled' : `${items.length} New Lease Drafts Were Canceled`) +
+      h(deleted
+        ? (one ? 'A New Lease Draft Expired' : `${items.length} New Lease Drafts Expired`)
+        : (one ? 'A New Lease Draft Was Canceled' : `${items.length} New Lease Drafts Were Canceled`)) +
       p(`Hi ${escapeHtml(recipientName)},`) +
-      (one
-        ? p(`The new lease for <strong style="color:#eef1f8">${escapeHtml(only.unitLabel)}</strong> was never signed on your side` +
-            `${only.startDate ? ` before its start date (${escapeHtml(newLeaseDate(only.startDate))})` : ''}, so it was canceled.`)
-        : p('These new leases were never signed on your side before their start dates, so they were canceled:') + newLeaseList(items)) +
+      (deleted
+        ? (one
+          ? p(`The new lease for <strong style="color:#eef1f8">${escapeHtml(only.unitLabel)}</strong> was never signed on your side` +
+              `${only.startDate ? ` before its start date (${escapeHtml(newLeaseDate(only.startDate))})` : ''}. ` +
+              'This document expired and is no longer available to sign.')
+          : p('These new leases were never signed on your side before their start dates. ' +
+              'These documents expired and are no longer available to sign:') + newLeaseList(items))
+        : (one
+          ? p(`The new lease for <strong style="color:#eef1f8">${escapeHtml(only.unitLabel)}</strong> was never signed on your side` +
+              `${only.startDate ? ` before its start date (${escapeHtml(newLeaseDate(only.startDate))})` : ''}, so it was canceled.`)
+          : p('These new leases were never signed on your side before their start dates, so they were canceled:') + newLeaseList(items))) +
       p(one
         ? 'Nothing changed for the household: their current lease carries on exactly as it is, and they were never sent this draft.'
         : 'Nothing changed for those households: each current lease carries on exactly as it is, and none of them was sent a draft.') +
@@ -800,6 +1139,51 @@ export async function emailNewLeaseDraftLapsed(to: string, recipientName: string
       landlordId: ctx.landlordId ?? null,
       relatedEntityType: ctx.documentId ? 'document' : null,
       relatedEntityId: ctx.documentId ?? null,
+    },
+  )
+}
+
+/**
+ * 10/24 (Nic) — TO THE RESIDENT BEING REPLACED, BECAUSE THE APP IS NOT WHERE
+ * THEY WILL SEE IT.
+ *
+ *   "Yes, they do need an email. Because the people that don't get on the app
+ *    are the people that are going to need the email showing their bill."
+ *
+ * A replacement signing for their space is what ends their lease
+ * (services/spotSuccession), and it can happen on a day they never log in. The
+ * in-app notice alone would reach exactly the residents least likely to read
+ * it. So the date their lease now ends goes to them by email, with what is
+ * still owed stated plainly — ending a lease forgives nothing, and somebody who
+ * finds that out a month later has been badly served.
+ *
+ * No link and no button: there is nothing for them to do here and nothing to
+ * accept. It tells them what happened and who to talk to.
+ */
+export async function emailLeaseHandedOver(to: string, o: {
+  name: string; spaceLabel: string; endsOn: string; owed: number; propertyName: string | null
+}, ctx: { landlordId?: string; leaseId?: string } = {}) {
+  const money = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  await send(to, `Your lease for ${o.spaceLabel} now ends ${o.endsOn}`,
+    base(
+      h('Your Lease Is Ending') +
+      p(`Hi ${escapeHtml(o.name)},`) +
+      p(`Your landlord has signed a new lease for <strong style="color:#eef1f8">${escapeHtml(o.spaceLabel)}</strong>` +
+        `${o.propertyName ? ` at ${escapeHtml(o.propertyName)}` : ''} starting the day after ` +
+        `<strong style="color:#eef1f8">${escapeHtml(o.endsOn)}</strong>, so your lease now ends on that date.`) +
+      (o.owed > 0
+        ? p(`<strong style="color:#eef1f8">What is still unpaid on your account — ${escapeHtml(money(o.owed))} — is still owed.</strong> ` +
+            'Ending the lease does not cancel it, and the amount is recorded in your name as it stands today. ' +
+            'It does not grow after this.')
+        : p('Nothing is outstanding on your account.')) +
+      p('If this is not what you were expecting, talk to your landlord before that date — this email is a record ' +
+        'of the change, not a notice to leave by.')
+    ),
+    {
+      category: 'lease_handed_over',
+      landlordId: ctx.landlordId ?? null,
+      relatedEntityType: ctx.leaseId ? 'lease' : null,
+      relatedEntityId: ctx.leaseId ?? null,
     },
   )
 }
@@ -886,7 +1270,11 @@ export async function emailInvitation(to: string, inviterName: string, role: Lan
     base(
       h(isResend ? 'Your new invitation link' : "You've been invited") +
       intro +
-      p('Click below to accept and set up your account. This invitation expires in 7 days.') +
+      // 10/13 (Nic): "team invites expire after 24 HOURS (fix the email that
+      // says 7 days)". The link has always died at 24 hours (routes/scopes.ts);
+      // this sentence said 7 days, so a person who waited a day or two found a
+      // dead link the email had promised would still work.
+      p(`Click below to accept and set up your account. This invitation expires in <strong style="color:#eef1f8">${TEAM_INVITATION_TTL_HOURS} hours</strong>.`) +
       btnWithLink(isResend ? 'Set Up My Account' : 'Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
@@ -1049,7 +1437,10 @@ export async function emailPmInvitation(
       h(`You've been invited to ${companyName}`) +
       p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join <strong style="color:#eef1f8">${companyName}</strong> as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
       p(`${companyName} uses GAM (Gold Asset Management) to manage rental properties on behalf of property owners. As ${roleLabel.toLowerCase()}, you'll have access to the company's portfolio inside the GAM platform.`) +
-      p('Click below to accept and set up your account. This invitation expires in 7 days.') +
+      // 10/13: the same wrong "7 days" as the team invitation (Nic: "fix the
+      // email that says 7 days"). This link dies at 24 hours too (routes/pm.ts
+      // INVITATION_TTL_HOURS).
+      p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
       btnWithLink('Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
@@ -1095,7 +1486,10 @@ export async function emailBusinessInvitation(
       h(`You've been invited to ${businessName}`) +
       p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join <strong style="color:#eef1f8">${businessName}</strong> as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
       p(`${businessName} uses GAM (Gold Asset Management) to run their operations. As ${roleLabel.toLowerCase()}, you'll have access to your assigned screens in the business portal.`) +
-      p('Click below to accept and set up your account. This invitation expires in 7 days.') +
+      // 10/13: the same wrong "7 days" as the team invitation (Nic: "fix the
+      // email that says 7 days"). This link dies at 24 hours too
+      // (routes/businessUsers.ts INVITATION_TTL_HOURS).
+      p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
       btnWithLink('Accept Invitation', acceptUrl) +
       `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     ),
@@ -1278,8 +1672,7 @@ export async function sendSubleaseInvite({
   startDate: string; endDate: string | null
   ctx?: { masterLeaseId?: string; sublessorTenantId?: string; replyTo?: ReplyTo }
 }) {
-  const appUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
-  const acceptUrl = `${appUrl}/sublease-invite/${token}`
+  const acceptUrl = portalLink('tenant', `sublease-invite/${token}`)
   const range = endDate
     ? `${new Date(startDate).toLocaleDateString()} – ${new Date(endDate).toLocaleDateString()}`
     : `Starting ${new Date(startDate).toLocaleDateString()} (open-ended)`
@@ -1332,8 +1725,7 @@ export async function sendPosCustomerOnboarding({
   token:         string
   ctx?: { landlordId?: string; posCustomerId?: string; replyTo?: ReplyTo }
 }) {
-  const appUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
-  const acceptUrl = `${appUrl}/pos-customer-onboard/${token}`
+  const acceptUrl = portalLink('tenant', `pos-customer-onboard/${token}`)
   await send(customerEmail, `${merchantName} invited you to open a FlexCharge tab`,
     base(
       h('Open a FlexCharge tab') +
@@ -1390,7 +1782,8 @@ export async function sendLatePaymentDigest({ landlordEmail, landlordName, items
     base(
       h('Overdue balances this morning') +
       p(`Hi ${escapeHtml(landlordName)},`) +
-      p(`${who} a balance five or more days past due. See who in your portal.`) +
+      // 10/12 (Nic): late means past the grace period (the lease's, else the property's, else 5 days).
+      p(`${who} a balance past its grace period. See who in your portal.`) +
       btnWithLink('Open Outstanding Balances', portalLink('landlord', 'balances'))
     ),
     {
@@ -1681,17 +2074,33 @@ export async function emailLoginCode(
 ): Promise<string | null> {
   // ── S637: THE CODE DOES NOT GO IN THE SUBJECT ───────────────────────────
   //
-  // Every subject line is written to email_send_log, which is PERMANENT by
-  // design — triggers refuse UPDATE and DELETE so an outreach record cannot be
-  // rewritten. That made 183 live sign-in codes readable in plaintext by any
-  // admin, and put them in every nightly backup. A second factor anybody with
-  // database access can read is not a second factor.
+  // 10/15 (Nic) — THE CODE IS IN THE SUBJECT, AND THE SUBJECT IS LOGGED.
   //
-  // The code lives in the body only. The body is not logged (body_text is null
-  // for this category), so it never lands anywhere durable.
+  // S637 took it out of the subject because every subject is written to
+  // email_send_log, which is permanent (its triggers refuse UPDATE and
+  // DELETE). That was written up as "183 live codes readable in plaintext".
+  // Checked on 10/15: 215 of 559 code emails carry a code in the subject, the
+  // last on 2026-09-04, and NONE is inside its ten minutes. Nic: "if the codes
+  // expire after 10 minutes then they're not really live, are they ... I don't
+  // understand why you wouldn't want it to be in the server as a history log."
+  //
+  // He is right, and the risk was overstated. A logged code is usable only
+  // within its ten minutes, only unused, only before a resend retires it, and
+  // only by somebody who also has the password — this is the SECOND factor.
+  // Whoever can read this table has live database access, which already reads
+  // every resident's record, moves an address or mints a session. In a backup
+  // they are dead numbers. So the whole subject is logged, as history.
+  // 10/15 (Nic): Scott Vigne asked for twelve codes over two days and could
+  // not sign in. Every one was delivered — and every one had the SAME subject,
+  // so Gmail collapsed them into one conversation and the code he read was
+  // never the newest. A resend retires the one before it, so a stale code
+  // fails, he asks again, and the pile grows. The code is in the subject now:
+  // each email is its own thread and he can read it off the notification.
+  // It is REDACTED from email_send_log below, so the permanent record (and
+  // every backup) still never holds a live code.
   return send(
     to,
-    'Your GAM sign-in code',
+    `Your GAM sign-in code: ${code}`,
     base(
       h('Your sign-in code') +
       p('Use this code to finish signing in to GAM:') +
@@ -1699,6 +2108,8 @@ export async function emailLoginCode(
         <div style="font-family:monospace;font-size:2rem;font-weight:800;letter-spacing:.35em;color:#eef1f8">${code}</div>
       </div>` +
       p(`This code expires in <strong style="color:#eef1f8">${ttlMinutes} minutes</strong> and can be used once.`) +
+      // 10/15 (Nic): say it, so somebody reading an older email knows why it failed.
+      p('If you asked for more than one code, only the newest one works.') +
       p(`If you didn't try to sign in, you can ignore this email — your account is safe.`)
     ),
     {
@@ -1919,6 +2330,24 @@ export async function emailPayLink(args: {
   note?: string | null
   /** A link with no expiry (a deposit or a background check) — the email does not say 14 days. */
   neverExpires?: boolean
+  /**
+   * 10/24 (Nic) — THE SECOND BUTTON.
+   *
+   *   "I don't want them to have a type in amount that they pay. There's two
+   *    buttons. They toggle the deposit amount or the full amount, and that's
+   *    it. There's no 'I can only put $200 down right now, but I wanted to pay
+   *    the whole thing', blah blah blah. It's two buttons. It's the deposit or
+   *    the full amount. No type box."
+   *
+   * A guest who wants to settle the whole stay up front had no way to: the
+   * deposit link charges the deposit and nothing else, and no route anywhere
+   * lets a payer name their own figure. So the email carries a second link for
+   * the whole stay. Two links rather than two amounts on one, because a pay link
+   * IS an invoice for a fixed sum — the page goes straight to the card screen
+   * with no step in between, and settleLinkBooking already stamps a stay paid in
+   * full on its own when what was paid covers the total.
+   */
+  alsoPayInFull?: { url: string; amount: number } | null
   ctx?: { landlordId?: string; payLinkId?: string; replyTo?: ReplyTo }
 }) {
   const money = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
@@ -1931,7 +2360,13 @@ export async function emailPayLink(args: {
         (args.cardFee > 0 ? `<strong style="color:#eef1f8">Card processing fee:</strong> ${money(args.cardFee)}<br>` : '') +
         `<strong style="color:#eef1f8">Total:</strong> ${money(args.amount + args.cardFee)}`) +
       (args.note ? p(escapeHtml(args.note)) : '') +
-      btn('Pay by card', args.url) +
+      btn(args.alsoPayInFull ? `Pay the deposit · ${money(args.amount)}` : 'Pay by card', args.url) +
+      // The whole stay, for a guest who would rather be done with it. Second,
+      // so the deposit stays the obvious thing to press.
+      (args.alsoPayInFull
+        ? p(`Or settle the whole stay now and owe nothing on arrival.`)
+          + btn(`Pay in full · ${money(args.alsoPayInFull.amount)}`, args.alsoPayInFull.url)
+        : '') +
       p(args.neverExpires ? 'To pay another way, contact the office.' : 'The link works for 14 days. To pay another way, contact the office.')
     ),
     {
@@ -2559,6 +2994,50 @@ ${paras.map((t) => `  <p style="margin:0 0 16px">${t}</p>`).join('\n')}
   )
 }
 
+// ── 10/13: HAPPY BIRTHDAY FROM GAM ───────────────────────────────────
+//
+// Nic: "emailing tenants on their birthday and saying, Hey, happy birthday
+// from GAM ... just like a happy birthday message. Thank you for using GAM,
+// that sort of thing." Tenants and landlords alike, once a person a year — who
+// and when live in jobs/birthdayEmails.ts. GAM's normal sender (noreply, with
+// replies routed to support like every other send). The last line says where
+// to switch it off: the same per-type email switch every other GAM email has
+// (notification type 'birthday').
+
+/**
+ * Does mail actually leave this machine? send()'s own rule: production (or an
+ * explicit EMAIL_SEND_LIVE=1), with a mail-service key configured. A job that
+ * writes a once-a-year "greeted" row asks this first, so a machine that sends
+ * nothing (a dev API pointed at the shared database, the keyless demo
+ * instance) never touches that row — not even to give it back.
+ */
+export function mailLeavesThisMachine(): boolean {
+  return EMAIL_ENABLED
+    && ((process.env.NODE_ENV || 'development') === 'production' || process.env.EMAIL_SEND_LIVE === '1')
+}
+
+export async function emailBirthdayGreeting(args: {
+  to: string
+  firstName: string | null
+  ctx?: { userId?: string | null; audience?: 'tenant' | 'landlord' }
+}): Promise<string | null> {
+  const name = (args.firstName || '').trim()
+  return send(args.to, 'Happy birthday from GAM',
+    base(
+      h(name ? `Happy birthday, ${escapeHtml(name)}!` : 'Happy birthday!') +
+      p('Happy birthday from all of us at GAM. We hope you have a great day.') +
+      p('Thank you for using GAM.') +
+      `<p style="margin:18px 0 0;color:#4a5568;font-size:.72rem;line-height:1.5">Rather not get a birthday email? Turn it off under Notifications in your GAM settings.</p>`
+    ),
+    {
+      category: 'birthday',
+      relatedEntityType: 'user',
+      relatedEntityId: args.ctx?.userId ?? null,
+      metadata: args.ctx?.audience ? { audience: args.ctx.audience } : undefined,
+    },
+  )
+}
+
 // ── S636: A PLAIN NOTE FROM SUPPORT ──────────────────────────────────
 //
 // Nic: "How do I send an email from the GAM support? How do I type one up
@@ -2948,8 +3427,15 @@ export async function emailInvoiceReady(
     workTradeCredit?: number
     /**
      * 10/6 (Nic): credit already applied against this bill (money paid ahead
-     * goes on by itself) — one "Credit applied" line under the charges, then
-     * "Still owed". Never a tag on a line.
+     * goes on by itself). Never a tag on a line — the line keeps its own
+     * amount.
+     *
+     * 10/26 (Nic): it is rendered in the PAID category, not as a deduction.
+     * The summary reads "Total invoiced", then "Paid — paid-ahead credit",
+     * then "Total owed": "maybe you just have it in the paid category, like
+     * '$10.40 paid ahead credit'... And then the owed is $10.40 less than what
+     * the bill is." The old "Credit applied" / "Still owed" labels no longer
+     * exist, so do not grep for them.
      */
     creditApplied?: number
     /** S655: the credit Pay Now will offer for this bill — said beside it, never netted. */
@@ -2969,11 +3455,6 @@ export async function emailInvoiceReady(
     `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:${l.covered ? '#7a8aaa' : '#b8c4d8'};margin-bottom:5px">
        <span>${escapeHtml(l.label)}${l.covered ? ` <span style="font-size:.72rem;color:#5fbf7f">&mdash; covered (${escapeHtml(l.coveredHow || 'already paid')})</span>` : ''}${l.detail ? `<span style="display:block;font-size:.74rem;color:#7a8aaa">${escapeHtml(l.detail)}</span>` : ''}</span><span style="${l.covered ? 'text-decoration:line-through' : ''}">${money(l.amount)}</span>
      </div>`).join('')
-
-  const deduction = (label: string, amount: number) =>
-    `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#5fbf7f;margin-bottom:5px">
-       <span>${label}</span><span>-${money(amount)}</span>
-     </div>`
 
   // A zero balance is still worth sending: it is the tenant's proof that the
   // month was covered, and the commonest cause is work trade.
@@ -2998,13 +3479,53 @@ export async function emailInvoiceReady(
          <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${escapeHtml(args.unitLabel)}</div>
          <div style="font-size:.72rem;color:#7a8aaa;margin-bottom:10px">Invoice ${escapeHtml(args.invoiceNumber)} &middot; due ${escapeHtml(args.dueDateLabel)}</div>
          ${rows}` +
-      (args.workTradeCredit && args.workTradeCredit > 0 ? deduction('Work trade', args.workTradeCredit) : '') +
-      (args.creditApplied && args.creditApplied > 0 ? deduction('Credit applied', args.creditApplied) : '') +
-      `   <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+      // ── 10/26 (Nic): INVOICED, PAID, OWED — AND CREDIT SITS IN *PAID* ──────
+      //
+      //   "It'll show total invoiced, total paid, total owed... maybe you just
+      //    have it in the paid category, like '$10.40 paid ahead credit' or
+      //    whatever. And then the owed is $10.40 less than what the bill is."
+      //
+      // It used to read as a DEDUCTION under the charges and then "Still
+      // owed", which makes credit look like a discount on the bill. It is not:
+      // it is money of theirs that has already gone against it. So the three
+      // figures are named, and the credit is one of the things making up what
+      // has been paid.
+      //
+      // `args.total` is already net of credit and work trade, so the invoiced
+      // figure is the total plus whatever has been applied — which keeps the
+      // three lines arithmetically consistent with each other whatever the
+      // caller passes.
+      (() => {
+        const applied = (args.creditApplied ?? 0) + (args.workTradeCredit ?? 0)
+        const owed = Math.max(0, args.total)
+        const invoiced = Math.round((owed + applied) * 100) / 100
+        if (applied <= 0) {
+          // Nothing paid against it yet: one line, as before.
+          return `   <div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
                      border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
-           <span>${settled ? 'Balance' : (args.creditApplied && args.creditApplied > 0 ? 'Still owed' : 'Total due')}</span><span>${money(Math.max(0, args.total))}</span>
+           <span>${settled ? 'Balance' : 'Total due'}</span><span>${money(owed)}</span>
          </div>
-       </div>` +
+       </div>`
+        }
+        const row = (label: string, amount: string, strong = false) =>
+          `<div style="display:flex;justify-content:space-between;font-size:.86rem;margin-bottom:5px;${
+            strong ? 'font-weight:800;color:#eef1f8;' : 'color:#b8c4d8;'}">
+             <span>${label}</span><span>${amount}</span>
+           </div>`
+        return `   <div style="border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
+           ${row('Total invoiced', money(invoiced))}
+           ${(args.creditApplied ?? 0) > 0
+             ? `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#5fbf7f;margin-bottom:5px">
+                  <span>Paid &mdash; paid-ahead credit</span><span>${money(args.creditApplied ?? 0)}</span>
+                </div>` : ''}
+           ${(args.workTradeCredit ?? 0) > 0
+             ? `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#5fbf7f;margin-bottom:5px">
+                  <span>Paid &mdash; work trade</span><span>${money(args.workTradeCredit ?? 0)}</span>
+                </div>` : ''}
+           ${row(settled ? 'Balance' : 'Total owed', money(owed), true)}
+         </div>
+       </div>`
+      })() +
       // S655 (Nic, 10/2): credit is used when they pay — they choose "Use all"
       // or "Save it for later" — so it is said here, not taken off the bill.
       (!settled && credit > 0
@@ -3037,6 +3558,40 @@ export async function emailInvoiceReady(
 // had no card on file, and when it was re-placed five days later the only email
 // he had ever received from GAM was a sign-in code. He could not have finished
 // if he wanted to.
+/**
+ * 10/21 (Nic) — START A BACKGROUND CHECK, WITH NOTHING BOOKED.
+ *
+ *   "for people that just legitimately want to move in, they need to be able to
+ *    just do the background check first and see if they're going to be
+ *    approved."
+ *
+ * Handed out at the desk, or texted to somebody who rang. They pay GAM for it
+ * themselves on their own phone, so nobody at the park is holding their money
+ * and no landlord is fronting it for a person who may never move in.
+ */
+export async function emailStartScreening(
+  to: string,
+  args: { name?: string | null; propertyName?: string | null; url: string; price: number },
+  ctx?: { landlordId?: string; replyTo?: ReplyTo },
+): Promise<string | null> {
+  const where = args.propertyName ? `<strong style="color:#eef1f8">${args.propertyName}</strong>` : 'the property'
+  return await send(to, `Start your background check${args.propertyName ? ` — ${args.propertyName}` : ''}`,
+    base(
+      h('Start your background check') +
+      p(`Hi ${args.name || 'there'},`) +
+      p(`Here is the link to run your background check for ${where}. You do not have to book anything first — `
+        + `run the check, and you will know where you stand before you commit to a thing.`) +
+      p(`It costs <strong style="color:#eef1f8">$${args.price.toFixed(2)}</strong>, which you pay on this page. `
+        + `Our screening partner Checkr asks for your Social Security number and your consent on their own secure form — we never see or store it.`) +
+      btn('Start my background check', args.url) +
+      `<div style="margin-top:14px;font-size:.78rem;color:#7a8aaa">
+         If the button does not work, paste this into your browser:<br/>
+         <span style="color:#b8c4d8;word-break:break-all">${args.url}</span>
+       </div>`
+    ),
+    { category: 'screening_start_link', landlordId: ctx?.landlordId ?? null, replyTo: ctx?.replyTo })
+}
+
 export async function emailScreeningApplyLink(
   to: string,
   args: {
@@ -3070,5 +3625,71 @@ export async function emailScreeningApplyLink(
       relatedEntityId: ctx?.backgroundCheckId ?? null,
     },
     'support',
+  )
+}
+
+// ── 10/12 (Nic): THE MONTHLY PROPERTY REPORT ──────────────────
+//
+//   "EMAILED at month close WITH A PDF attachment so they can put it to their
+//    books" — to the people the owner picks (jobs/monthlyPropertyReportEmail).
+//
+// The email is a short cover: each property's Charged / Received / Owed and
+// how many households are past grace. The report itself — names included —
+// is the attached PDF (services/monthlyReportPdf). A link to the report page
+// is added only for someone who signs in to the landlord portal.
+export interface MonthlyReportEmailRow { name: string; charged: number; received: number; owed: number; lateHouseholds: number }
+
+export async function emailMonthlyPropertyReport(args: {
+  to: string
+  recipientName: string | null
+  companyName: string
+  monthLabel: string
+  rows: MonthlyReportEmailRow[]
+  pdf: Buffer
+  filename: string
+  reportUrl: string | null
+  landlordId: string
+  sendId: string
+  /** 10/12 review: an outside address answers to the account owner (replyRouting); unset = GAM support. */
+  replyTo?: ReplyTo
+}): Promise<string | null> {
+  const dollars = (n: number) => `${n < 0 ? '−' : ''}$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  const cell = 'padding:6px 8px;border-bottom:1px solid #1e2530;font-size:.8rem;color:#b8c4d8'
+  const num = `${cell};text-align:right;white-space:nowrap`
+  const head = 'padding:6px 8px;font-size:.66rem;color:#7a8699;text-transform:uppercase;letter-spacing:.05em'
+  const table = args.rows.length ? `
+    <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%;border-collapse:collapse;margin:8px 0 16px">
+      <tr><td style="${head}">Property</td><td style="${head};text-align:right">Received</td><td style="${head};text-align:right">Charged</td><td style="${head};text-align:right">Owed</td><td style="${head};text-align:right">Past grace</td></tr>
+      ${args.rows.map(r => `<tr>
+        <td style="${cell};color:#eef1f8">${escapeHtml(r.name)}</td>
+        <td style="${num}">${dollars(r.received)}</td>
+        <td style="${num}">${dollars(r.charged)}</td>
+        <td style="${num}">${dollars(r.owed)}</td>
+        <td style="${num}">${r.lateHouseholds} household${r.lateHouseholds === 1 ? '' : 's'}</td>
+      </tr>`).join('')}
+    </table>` : ''
+  const greeting = args.recipientName ? `Hi ${escapeHtml(args.recipientName.split(' ')[0])},` : 'Hello,'
+  const html = base(
+    h(`${escapeHtml(args.companyName)} — ${escapeHtml(args.monthLabel)}`) +
+    p(greeting) +
+    p(`The monthly property report for ${escapeHtml(args.monthLabel)} is attached as a PDF: tenants and leases, payments, money (received, charged and owed), expenses and operations for each property.`) +
+    table +
+    p('Received is the money that arrived in the month, Charged is what was billed for it, and Owed is what is still unpaid of those bills today.') +
+    (args.reportUrl ? btnWithLink('Open the report', args.reportUrl) : '') +
+    `<div style="margin-top:20px;font-size:.72rem;color:#4a5568">You get this report because the account owner added you to its list. They can change who receives it on the Reports page.</div>`
+  )
+  return send(
+    args.to,
+    `Monthly property report — ${args.companyName} — ${args.monthLabel}`,
+    html,
+    {
+      category: 'monthly_property_report',
+      landlordId: args.landlordId,
+      relatedEntityType: 'monthly_report_send',
+      relatedEntityId: args.sendId,
+      replyTo: args.replyTo,
+    },
+    'noreply',
+    [{ filename: args.filename, content: args.pdf }],
   )
 }

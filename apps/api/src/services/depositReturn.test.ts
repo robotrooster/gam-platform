@@ -107,6 +107,7 @@ import {
   seedSecurityDeposit, seedDepositReturnDraft,
   seedRentPayment, seedUtilityMeter, seedUtilityBill,
   seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import { todayIn } from '../lib/timezone'
 
@@ -953,6 +954,17 @@ describe('S655: move-out pools paid-ahead money through the credit ledger', () =
     expect(params).toMatchObject({ amount: 60000, destination: 'acct_landlord_test' })
     expect(opts).toEqual({ idempotencyKey: `deposit_disb_${draftId}` })
     expect((await db.query(`SELECT COUNT(*)::int AS n FROM held_payout_items`)).rows[0].n).toBe(0)
+    // 10/12 (Nic, ledger P0): the transfer has a record, so the payout that
+    // carries it to the bank lists it and the books can post it.
+    const { rows: intents } = await db.query<any>(
+      `SELECT purpose, deposit_return_id, landlord_id, amount::text AS amount, status, stripe_transfer_id,
+              stripe_idempotency_key, destination_connect_account_id
+         FROM platform_transfer_intents`)
+    expect(intents).toEqual([{
+      purpose: 'deposit_settlement', deposit_return_id: draftId, landlord_id: stack.landlordId, amount: '600.00',
+      status: 'transferred', stripe_transfer_id: 'tr_test', stripe_idempotency_key: `deposit_disb_${draftId}`,
+      destination_connect_account_id: 'acct_landlord_test',
+    }])
   })
 
   it('the deposit never pays a work-trade line or GAM’s FlexPay collection', async () => {
@@ -1511,6 +1523,30 @@ describe('Step 9 review: the move-out pool is split by who holds each deposit', 
     expect(await heldItems()).toEqual([])
   })
 
+  it('10/12 review: a landlord transfer that could not even be recorded is told to GAM as never sent', async () => {
+    const stack = await buildLeaseStack({ depositTotal: 500, heldBy: 'gam_escrow', cleaningFeeAmount: 300 })
+    await db.query(`UPDATE landlords SET stripe_connect_account_id='acct_landlord_test' WHERE id=$1`, [stack.landlordId])
+    // Writing the transfer's record fails (as an INSERT error would): nothing
+    // is recorded and Stripe is never asked.
+    await db.query(`CREATE OR REPLACE FUNCTION test_refuse_transfer_record() RETURNS trigger AS $$
+                    BEGIN RAISE EXCEPTION 'record refused (test)'; END $$ LANGUAGE plpgsql`)
+    await db.query(`CREATE TRIGGER test_refuse_transfer_record BEFORE INSERT ON platform_transfer_intents
+                    FOR EACH ROW EXECUTE FUNCTION test_refuse_transfer_record()`)
+    try {
+      const draft = await createOrFetchDraft(stack.leaseId)
+      await finalizeDepositReturn(draft.id, stack.ownerUserId)
+      expect(stripeMocks.transfersCreate).not.toHaveBeenCalled()
+      // The notice paymentReversal reads to know the landlord was never paid this share.
+      const notes = (await db.query(
+        `SELECT context FROM admin_notifications WHERE category = 'deposit_disbursement_transfer_failed'`)).rows
+      expect(notes).toHaveLength(1)
+      expect(notes[0].context).toMatchObject({ deposit_return_id: draft.id, lease_id: stack.leaseId, amount: 300 })   // 500 held − 200 refunded
+    } finally {
+      await db.query(`DROP TRIGGER IF EXISTS test_refuse_transfer_record ON platform_transfer_intents`)
+      await db.query(`DROP FUNCTION IF EXISTS test_refuse_transfer_record()`)
+    }
+  })
+
   it('landlord-held deposit, one deposit paid through GAM and one at the desk: GAM releases what it holds, and only that', async () => {
     const stack = await buildLeaseStack({ depositTotal: 500, heldBy: 'landlord' })
     const pet = await boxDeposit(stack, { feeType: 'pet_deposit', amount: 200, via: 'gam', description: 'Dog deposit' })
@@ -1988,10 +2024,6 @@ describe('Step 9 review (fix pass 1): a security deposit paid by bank deposit co
 
 describe('Step 9 review (fix pass 2): the payment webhook settles a move-out balance charge', () => {
   beforeEach(() => { vi.clearAllMocks(); stripeMocks.made.length = 0 })
-  const addedRates: string[] = []
-  afterEach(async () => {
-    if (addedRates.length > 0) await db.query(`DELETE FROM platform_processing_rates WHERE id = ANY($1::uuid[])`, [addedRates.splice(0)])
-  })
 
   async function postSucceeded(intentId: string, metadata: Record<string, string>) {
     const express = (await import('express')).default
@@ -2016,20 +2048,19 @@ describe('Step 9 review (fix pass 2): the payment webhook settles a move-out bal
     const client = await getClient()
     try {
       await seedAllocationRule(client, { propertyId: stack.propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
-      // Rates only if none is active: cleanupAllSchema keeps this table, and an
-      // earlier file in the same run may already have seeded an active rate
-      // (one active rate per method). Rows this test adds are removed at its
-      // end (afterEach), so a later file seeds its own. The test asserts no
-      // rate-specific figure.
-      for (const [method, flat, pct, costFlat, costPct] of [['card', 0.55, 3.5, 0.26, 2.9], ['ach', 6, 0, 0, 0.5]] as const) {
-        const added = await client.query<{ id: string }>(
-          `INSERT INTO platform_processing_rates
-             (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-           SELECT $1, $2, $3, $4, $5
-            WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = $1 AND effective_until IS NULL)
-           RETURNING id`,
-          [method, flat, pct, costFlat, costPct])
-        addedRates.push(...added.rows.map((r) => r.id))
+      // 10/17: the live rates, STATED. This used to insert only if none was open
+      // (one is open per method, and cleanupAllSchema leaves the rate card
+      // alone) and then delete its own rows again afterwards, so a later file
+      // would seed its own — every file states its own now, so there is nothing
+      // to take back.
+      for (const [paymentMethod, flat, pct, costFlat, costPct] of
+           [['card', 0.55, 3.5, 0.26, 2.9], ['ach', 6, 0, 0, 0.5]] as const) {
+        await setEffectiveProcessingRate(client, {
+          paymentMethod,
+          customerFacingFlat: flat, customerFacingPercent: pct,
+          stripeCostFlat: costFlat, stripeCostPercent: costPct,
+          notes: 'depositReturn.test.ts rate',
+        })
       }
     } finally { client.release() }
     const draft = await createOrFetchDraft(stack.leaseId)

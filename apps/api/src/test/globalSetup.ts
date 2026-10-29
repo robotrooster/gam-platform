@@ -14,17 +14,26 @@
  * (DB_HOST/DB_PORT/DB_USER/DB_PASSWORD), with dotenv loading the
  * apps/api/.env file if those vars aren't already set in the
  * environment.
+ *
+ * 10/17: the suite runs on several workers at once and no test touches this
+ * database itself any more — it is the TEMPLATE each worker's own database is
+ * cloned from (makeWorkerDatabases below, src/test/testWorkers.ts).
  */
 
 import dotenv from 'dotenv'
 import fs from 'fs'
+import { seedFlexPriceCards } from './flexPriceCards'
 import path from 'path'
 import os from 'os'
 import { Client } from 'pg'
+import {
+  WORKER_DB_CONNECTION_LIMIT, isWorkerDbOf, templateDbName, testWorkerCount,
+  workerCwd, workerDbName, workersRoot,
+} from './testWorkers'
 
 dotenv.config({ path: path.join(__dirname, '..', '..', '.env') })
 
-const TEST_DB_NAME = process.env.TEST_DB_NAME || 'gam_test'
+const TEST_DB_NAME = templateDbName()
 
 if (!TEST_DB_NAME.endsWith('_test')) {
   throw new Error(
@@ -91,7 +100,109 @@ function claimLock(): void {
   fs.writeFileSync(LOCK_PATH, String(process.pid))
 }
 
-export async function setup(): Promise<void> {
+/**
+ * 10/13 — TESTING MIGRATIONS THAT ARE NOT ON PRODUCTION YET.
+ *
+ * schema.sql is production's schema, re-dumped only when migrations reach
+ * production, so a new migration file is invisible to the suite until then.
+ * Set TEST_APPLY_MIGRATIONS_AFTER to the newest migration production has
+ * (e.g. 20261014240200): every .sql migration whose name sorts after it is
+ * applied, in name order, on top of schema.sql, each in its own transaction
+ * as the runner does. Unset (deploy.sh, a plain run), nothing changes.
+ * Replaced the per-feature test shims (test/pendingMeterSchema.ts and
+ * friends) retired on 10/13.
+ */
+async function applyMigrationsNotYetInSchema(target: Client): Promise<void> {
+  const after = process.env.TEST_APPLY_MIGRATIONS_AFTER
+  if (!after) return
+  if (!/^\d{14}$/.test(after)) throw new Error(`TEST_APPLY_MIGRATIONS_AFTER must be a 14-digit migration timestamp, got '${after}'`)
+  const dir = path.join(__dirname, '..', 'db', 'migrations')
+  const pending = fs.readdirSync(dir).filter(f => f.endsWith('.sql') && f.slice(0, 14) > after).sort()
+  // pg_dump's schema.sql empties search_path for the session; migrations name
+  // tables unqualified, as the runner's fresh connection allows.
+  if (pending.length) await target.query('RESET search_path')
+  for (const f of pending) {
+    try {
+      await target.query('BEGIN')
+      await target.query(fs.readFileSync(path.join(dir, f), 'utf8'))
+      await target.query('COMMIT')
+    } catch (e: any) {
+      await target.query('ROLLBACK').catch(() => {})
+      throw new Error(`test migration ${f} failed: ${e?.message ?? e}`)
+    }
+  }
+}
+
+
+/**
+ * The grids the suite runs on live in src/test/flexPriceCards — one definition,
+ * because services/flexFees.test.ts borrows these tables and has to put them
+ * back. See that file for the defect that moved them out of here.
+ */
+
+/**
+ * 10/17 — HOW MANY WORKER DATABASES THIS RUN NEEDS.
+ *
+ * GAM_TEST_WORKERS is the knob (vitest.config.ts turns it into the fork count),
+ * but a run can also be pointed at more workers from the command line
+ * (--poolOptions.forks.maxForks). Take whichever is larger, so a worker can
+ * never start on a database that was never made. Spare copies cost a fraction
+ * of a second each and nothing uses them.
+ */
+function workerSlots(config: any): number {
+  const fromEnv = testWorkerCount()
+  const pool = config?.pool === 'threads' ? config?.poolOptions?.threads : config?.poolOptions?.forks
+  const fromConfig = Number(pool?.maxForks ?? pool?.maxThreads) || 0
+  return Math.max(fromEnv, fromConfig)
+}
+
+/**
+ * 10/17 — ONE DATABASE AND ONE FOLDER PER WORKER (see src/test/testWorkers.ts).
+ *
+ * Each worker database is a copy of the template just built (CREATE DATABASE
+ * ... TEMPLATE copies it in well under a second), so every worker starts from
+ * exactly the schema the one-process run used. Worker databases left by an
+ * earlier run on this template — a crashed one, or one that used more workers —
+ * are dropped first; the PID lock above means no live run is using them.
+ *
+ * Each is capped at WORKER_DB_CONNECTION_LIMIT connections. The test databases
+ * share a Postgres server with production (max_connections 100), so the cap is
+ * what guarantees a parallel run cannot take the connections the live API
+ * needs: a worker that tried to exceed it would fail its own test, never the
+ * live site.
+ */
+async function makeWorkerDatabases(workers: number): Promise<void> {
+  const stem = TEST_DB_NAME.slice(0, -'_test'.length)
+  const admin = new Client({ ...PG_CONFIG, database: 'postgres' })
+  await admin.connect()
+  try {
+    const { rows } = await admin.query<{ datname: string }>(
+      `SELECT datname FROM pg_database WHERE starts_with(datname, $1)`, [stem])
+    for (const { datname } of rows.filter(r => isWorkerDbOf(TEST_DB_NAME, r.datname))) {
+      await admin.query(`DROP DATABASE IF EXISTS "${datname}" WITH (FORCE)`)
+    }
+  } finally {
+    await admin.end()
+  }
+  // One connection per copy so they are made side by side. Nothing is connected
+  // to the template now, which CREATE DATABASE ... TEMPLATE requires.
+  await Promise.all(Array.from({ length: workers }, async (_, i) => {
+    const name = workerDbName(TEST_DB_NAME, i + 1)
+    const c = new Client({ ...PG_CONFIG, database: 'postgres' })
+    await c.connect()
+    try {
+      await c.query(`CREATE DATABASE "${name}" TEMPLATE "${TEST_DB_NAME}"`)
+      await c.query(`ALTER DATABASE "${name}" CONNECTION LIMIT ${WORKER_DB_CONNECTION_LIMIT}`)
+    } finally {
+      await c.end()
+    }
+  }))
+  // A fresh, empty working folder per worker; last run's uploads go with it.
+  fs.rmSync(workersRoot(TEST_DB_NAME), { recursive: true, force: true })
+  for (let i = 1; i <= workers; i++) fs.mkdirSync(workerCwd(TEST_DB_NAME, i), { recursive: true })
+}
+
+export async function setup(ctx?: { config?: any }): Promise<void> {
   claimLock()
   if (!fs.existsSync(SCHEMA_PATH)) {
     throw new Error(`schema.sql not found at ${SCHEMA_PATH} — run npm run db:dump-schema`)
@@ -123,20 +234,27 @@ export async function setup(): Promise<void> {
   await target.connect()
   try {
     await target.query(schemaSql)
+    await applyMigrationsNotYetInSchema(target)
+    await seedFlexPriceCards(sql => target.query(sql))
   } finally {
     await target.end()
   }
+
+  await makeWorkerDatabases(workerSlots(ctx?.config))
 
   process.env.DB_NAME = TEST_DB_NAME
 
   // Best-effort propagation to workers — vitest reads process.env when forking.
   // Worker processes also receive env via the parent's process.env at fork time,
-  // so setting it here before workers spawn is sufficient.
+  // so setting it here before workers spawn is sufficient. Each worker then
+  // points itself at its OWN copy (src/test/setupEnv.ts).
 }
 
 export async function teardown(): Promise<void> {
   // Intentionally leave the test DB in place for post-run inspection.
-  // The next run drops + recreates it. No cleanup needed.
+  // The next run drops + recreates it. No cleanup needed. The worker copies
+  // stay for the same reason — makeWorkerDatabases drops this template's stale
+  // ones on the way in, so they never pile up past one run's worth.
   //
   // The lock DOES go, so a finished run never blocks the next one. Only this
   // process's own lock — a crashed run leaves a stale file, and the liveness

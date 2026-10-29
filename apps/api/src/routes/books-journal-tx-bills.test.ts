@@ -79,6 +79,12 @@ interface PortfolioFixture {
   accountBAssetId:  string
   vendorAId:       string
   vendorBId:       string
+  // 10/12 (Nic, ledger P6, L5): GAM Books' own Bills and Transactions serve a
+  // business's books only — a landlord company's moved onto Expenses — so
+  // their route tests run as two business owners.
+  bizAId: string; bizBId: string; bizAToken: string; bizBToken: string
+  bizAccountAAssetId: string; bizAccountAIncomeId: string; bizAccountBAssetId: string
+  bizVendorAId: string; bizVendorBId: string
 }
 
 async function seedPortfolio(): Promise<PortfolioFixture> {
@@ -102,6 +108,24 @@ async function seedPortfolio(): Promise<PortfolioFixture> {
       `INSERT INTO books_vendors (landlord_id, name) VALUES ($1, 'A Vendor') RETURNING id`, [aId])
     const bVendor = await client.query<{ id: string }>(
       `INSERT INTO books_vendors (landlord_id, name) VALUES ($1, 'B Vendor') RETURNING id`, [bId])
+    const biz = async (tag: string) => {
+      const email = `biz-${tag}-${randomUUID()}@test.dev`
+      const u = (await client.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+         VALUES ($1, 'x', 'business_owner', 'Biz', $2, TRUE) RETURNING id`, [email, tag])).rows[0].id
+      const id = (await client.query<{ id: string }>(
+        `INSERT INTO businesses (owner_user_id, name, business_type, email) VALUES ($1, $2, 'trash_hauling', $3) RETURNING id`,
+        [u, `Biz ${tag}`, email])).rows[0].id
+      const acct = async (code: string, name: string, type: string) => (await client.query<{ id: string }>(
+        `INSERT INTO books_accounts (business_id, code, name, type) VALUES ($1, $2, $3, $4) RETURNING id`, [id, code, name, type])).rows[0].id
+      const asset = await acct('1010', `${tag} Bank`, 'asset')
+      const income = await acct('4010', `${tag} Sales`, 'income')
+      const vendor = (await client.query<{ id: string }>(
+        `INSERT INTO books_vendors (business_id, name) VALUES ($1, $2) RETURNING id`, [id, `${tag} Vendor`])).rows[0].id
+      return { u, id, asset, income, vendor, email }
+    }
+    const zA = await biz('A')
+    const zB = await biz('B')
     await client.query('COMMIT')
     const sign = (p: object) => jwt.sign(p, process.env.JWT_SECRET!, { expiresIn: '1h' })
     return {
@@ -114,6 +138,11 @@ async function seedPortfolio(): Promise<PortfolioFixture> {
       adminToken:     sign({ userId: admin.rows[0].id, role: 'admin', email: 'a@t.dev', profileId: null, permissions: {} }),
       landlordAToken: sign({ userId: aUid, role: 'landlord', email: 'la@t.dev', profileId: null, landlordIds: [aId], permissions: {} }),
       landlordBToken: sign({ userId: bUid, role: 'landlord', email: 'lb@t.dev', profileId: null, landlordIds: [bId], permissions: {} }),
+      bizAId: zA.id, bizBId: zB.id,
+      bizAToken: sign({ userId: zA.u, role: 'business_owner', email: zA.email, profileId: zA.id, businessId: zA.id, permissions: {} }),
+      bizBToken: sign({ userId: zB.u, role: 'business_owner', email: zB.email, profileId: zB.id, businessId: zB.id, permissions: {} }),
+      bizAccountAAssetId: zA.asset, bizAccountAIncomeId: zA.income, bizAccountBAssetId: zB.asset,
+      bizVendorAId: zA.vendor, bizVendorBId: zB.vendor,
     }
   } catch (e) { await client.query('ROLLBACK'); throw e }
   finally { client.release() }
@@ -367,7 +396,7 @@ describe('POST /transactions — S386 scope fix', () => {
     const f = await seedPortfolio()
     const res = await request(buildApp())
       .post('/api/books/transactions')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({ date: '2026-05-01' })
     expect(res.status).toBe(400)
   })
@@ -376,10 +405,10 @@ describe('POST /transactions — S386 scope fix', () => {
     const f = await seedPortfolio()
     const res = await request(buildApp())
       .post('/api/books/transactions')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({
         date: '2026-05-01', description: 'cross-tenant', amount: 100, type: 'income',
-        accountId: f.accountBAssetId,
+        accountId: f.bizAccountBAssetId,
       })
     expect(res.status).toBe(403)
     expect(res.body.error).toMatch(/not in your chart/i)
@@ -391,13 +420,13 @@ describe('POST /transactions — S386 scope fix', () => {
     const f = await seedPortfolio()
     const res = await request(buildApp())
       .post('/api/books/transactions')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({
         date: '2026-05-01', description: 'Rent deposit', amount: 1500, type: 'income',
-        accountId: f.accountAAssetId,
+        accountId: f.bizAccountAAssetId,
       })
     expect(res.status).toBe(201)
-    expect(res.body.data.account_id).toBe(f.accountAAssetId)
+    expect(res.body.data.account_id).toBe(f.bizAccountAAssetId)
     expect(Number(res.body.data.amount)).toBe(1500)
   })
 })
@@ -406,24 +435,24 @@ describe('PATCH /transactions/:id/reconcile', () => {
   it('cross-landlord blocked → 404', async () => {
     const f = await seedPortfolio()
     const tx = await db.query<{ id: string }>(
-      `INSERT INTO books_transactions (landlord_id, date, description, amount, type) VALUES
+      `INSERT INTO books_transactions (business_id, date, description, amount, type) VALUES
         ($1, '2026-05-01', 'B tx', 100, 'income') RETURNING id`,
-      [f.landlordBId])
+      [f.bizBId])
     const res = await request(buildApp())
       .patch(`/api/books/transactions/${tx.rows[0].id}/reconcile`)
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
     expect(res.status).toBe(404)
   })
 
   it('happy: flips reconciled to TRUE + stamps reconciled_at', async () => {
     const f = await seedPortfolio()
     const tx = await db.query<{ id: string }>(
-      `INSERT INTO books_transactions (landlord_id, date, description, amount, type) VALUES
+      `INSERT INTO books_transactions (business_id, date, description, amount, type) VALUES
         ($1, '2026-05-01', 'A tx', 100, 'income') RETURNING id`,
-      [f.landlordAId])
+      [f.bizAId])
     const res = await request(buildApp())
       .patch(`/api/books/transactions/${tx.rows[0].id}/reconcile`)
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.reconciled).toBe(true)
     expect(res.body.data.reconciled_at).not.toBeNull()
@@ -438,16 +467,16 @@ describe('GET /bills', () => {
   it('landlord-scoped + vendor_name joined', async () => {
     const f = await seedPortfolio()
     await db.query(
-      `INSERT INTO books_bills (landlord_id, vendor_id, date, description, amount) VALUES
+      `INSERT INTO books_bills (business_id, vendor_id, date, description, amount) VALUES
         ($1, $2, '2026-05-01', 'A bill', 500)`,
-      [f.landlordAId, f.vendorAId])
+      [f.bizAId, f.bizVendorAId])
     await db.query(
-      `INSERT INTO books_bills (landlord_id, vendor_id, date, description, amount) VALUES
+      `INSERT INTO books_bills (business_id, vendor_id, date, description, amount) VALUES
         ($1, $2, '2026-05-01', 'B bill', 300)`,
-      [f.landlordBId, f.vendorBId])
+      [f.bizBId, f.bizVendorBId])
     const res = await request(buildApp())
       .get('/api/books/bills')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data).toHaveLength(1)
     expect(res.body.data[0].description).toBe('A bill')
@@ -460,7 +489,7 @@ describe('POST /bills — S386 scope fix', () => {
     const f = await seedPortfolio()
     const res = await request(buildApp())
       .post('/api/books/bills')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({ date: '2026-05-01' })
     expect(res.status).toBe(400)
   })
@@ -468,18 +497,18 @@ describe('POST /bills — S386 scope fix', () => {
   it('S386 fix: vendorId from another landlord → 403; A vendor ap_balance untouched', async () => {
     const f = await seedPortfolio()
     const bBalanceBefore = await db.query<{ ap_balance: string }>(
-      `SELECT ap_balance FROM books_vendors WHERE id=$1`, [f.vendorBId])
+      `SELECT ap_balance FROM books_vendors WHERE id=$1`, [f.bizVendorBId])
     const res = await request(buildApp())
       .post('/api/books/bills')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({
         date: '2026-05-01', description: 'cross-tenant bill', amount: 500,
-        vendorId: f.vendorBId,  // landlord B vendor
+        vendorId: f.bizVendorBId,  // landlord B vendor
       })
     expect(res.status).toBe(403)
     expect(res.body.error).toMatch(/not in your books/i)
     const bBalanceAfter = await db.query<{ ap_balance: string }>(
-      `SELECT ap_balance FROM books_vendors WHERE id=$1`, [f.vendorBId])
+      `SELECT ap_balance FROM books_vendors WHERE id=$1`, [f.bizVendorBId])
     expect(bBalanceAfter.rows[0].ap_balance).toBe(bBalanceBefore.rows[0].ap_balance)
   })
 
@@ -487,14 +516,14 @@ describe('POST /bills — S386 scope fix', () => {
     const f = await seedPortfolio()
     const res = await request(buildApp())
       .post('/api/books/bills')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({
         date: '2026-05-01', description: 'Plumbing', amount: 500,
-        vendorId: f.vendorAId,
+        vendorId: f.bizVendorAId,
       })
     expect(res.status).toBe(201)
     const vendor = await db.query<{ ap_balance: string }>(
-      `SELECT ap_balance FROM books_vendors WHERE id=$1`, [f.vendorAId])
+      `SELECT ap_balance FROM books_vendors WHERE id=$1`, [f.bizVendorAId])
     expect(Number(vendor.rows[0].ap_balance)).toBe(500)
   })
 })
@@ -504,7 +533,7 @@ describe('POST /bills/:id/pay', () => {
     const f = await seedPortfolio()
     const res = await request(buildApp())
       .post(`/api/books/bills/${randomUUID()}/pay`)
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({ amount: 100 })
     expect(res.status).toBe(404)
   })
@@ -512,12 +541,12 @@ describe('POST /bills/:id/pay', () => {
   it('already-paid → 400', async () => {
     const f = await seedPortfolio()
     const bill = await db.query<{ id: string }>(
-      `INSERT INTO books_bills (landlord_id, vendor_id, date, description, amount, amount_paid, status)
+      `INSERT INTO books_bills (business_id, vendor_id, date, description, amount, amount_paid, status)
        VALUES ($1, $2, '2026-05-01', 'Done', 100, 100, 'paid') RETURNING id`,
-      [f.landlordAId, f.vendorAId])
+      [f.bizAId, f.bizVendorAId])
     const res = await request(buildApp())
       .post(`/api/books/bills/${bill.rows[0].id}/pay`)
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({ amount: 10 })
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/already paid/i)
@@ -527,19 +556,19 @@ describe('POST /bills/:id/pay', () => {
     const f = await seedPortfolio()
     // Seed bill via the route so vendor.ap_balance starts at 500.
     await request(buildApp()).post('/api/books/bills')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({ date: '2026-05-01', description: 'Bill', amount: 500, vendorId: f.vendorAId })
+      .set('Authorization', `Bearer ${f.bizAToken}`)
+      .send({ date: '2026-05-01', description: 'Bill', amount: 500, vendorId: f.bizVendorAId })
     const bill = await db.query<{ id: string }>(
-      `SELECT id FROM books_bills WHERE landlord_id=$1 LIMIT 1`, [f.landlordAId])
+      `SELECT id FROM books_bills WHERE business_id=$1 LIMIT 1`, [f.bizAId])
     const res = await request(buildApp())
       .post(`/api/books/bills/${bill.rows[0].id}/pay`)
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({ amount: 200 })
     expect(res.status).toBe(200)
     expect(res.body.data.status).toBe('partial')
     expect(Number(res.body.data.amount_paid)).toBe(200)
     const vendor = await db.query<{ ap_balance: string; ytd_paid: string }>(
-      `SELECT ap_balance, ytd_paid FROM books_vendors WHERE id=$1`, [f.vendorAId])
+      `SELECT ap_balance, ytd_paid FROM books_vendors WHERE id=$1`, [f.bizVendorAId])
     expect(Number(vendor.rows[0].ap_balance)).toBe(300)  // 500 - 200
     expect(Number(vendor.rows[0].ytd_paid)).toBe(200)
   })
@@ -547,13 +576,13 @@ describe('POST /bills/:id/pay', () => {
   it('full pay (no explicit amount): pays remaining; status=paid; paid_at stamped', async () => {
     const f = await seedPortfolio()
     await request(buildApp()).post('/api/books/bills')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({ date: '2026-05-01', description: 'Bill', amount: 500, vendorId: f.vendorAId })
+      .set('Authorization', `Bearer ${f.bizAToken}`)
+      .send({ date: '2026-05-01', description: 'Bill', amount: 500, vendorId: f.bizVendorAId })
     const bill = await db.query<{ id: string }>(
-      `SELECT id FROM books_bills WHERE landlord_id=$1 LIMIT 1`, [f.landlordAId])
+      `SELECT id FROM books_bills WHERE business_id=$1 LIMIT 1`, [f.bizAId])
     const res = await request(buildApp())
       .post(`/api/books/bills/${bill.rows[0].id}/pay`)
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({})  // no amount → defaults to remaining
     expect(res.status).toBe(200)
     expect(res.body.data.status).toBe('paid')
@@ -566,39 +595,39 @@ describe('POST /bills/:id/pay', () => {
   it('S413 fix: overpayment without acceptOverpayment → 409 + requiresOverpaymentConfirm flag', async () => {
     const f = await seedPortfolio()
     await request(buildApp()).post('/api/books/bills')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({ date: '2026-05-01', description: 'Bill', amount: 100, vendorId: f.vendorAId })
+      .set('Authorization', `Bearer ${f.bizAToken}`)
+      .send({ date: '2026-05-01', description: 'Bill', amount: 100, vendorId: f.bizVendorAId })
     const bill = await db.query<{ id: string }>(
-      `SELECT id FROM books_bills WHERE landlord_id=$1 LIMIT 1`, [f.landlordAId])
+      `SELECT id FROM books_bills WHERE business_id=$1 LIMIT 1`, [f.bizAId])
     const res = await request(buildApp())
       .post(`/api/books/bills/${bill.rows[0].id}/pay`)
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({ amount: 150 })  // $50 over
     expect(res.status).toBe(409)
     expect(res.body.requiresOverpaymentConfirm).toBe(true)
     expect(Number(res.body.billRemaining)).toBe(100)
     expect(Number(res.body.overpaymentAmount)).toBe(50)
-    expect(res.body.vendorId).toBe(f.vendorAId)
+    expect(res.body.vendorId).toBe(f.bizVendorAId)
     // Verify NO state change on the 409.
     const after = await db.query<{ amount_paid: string; status: string }>(
       `SELECT amount_paid, status FROM books_bills WHERE id=$1`, [bill.rows[0].id])
     expect(Number(after.rows[0].amount_paid)).toBe(0)
     expect(after.rows[0].status).not.toBe('paid')
     const vendor = await db.query<{ credit_balance: string }>(
-      `SELECT credit_balance FROM books_vendors WHERE id=$1`, [f.vendorAId])
+      `SELECT credit_balance FROM books_vendors WHERE id=$1`, [f.bizVendorAId])
     expect(Number(vendor.rows[0].credit_balance)).toBe(0)
   })
 
   it('S413 fix: overpayment with acceptOverpayment=true → bill caps at amount + excess to vendor credit_balance', async () => {
     const f = await seedPortfolio()
     await request(buildApp()).post('/api/books/bills')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({ date: '2026-05-01', description: 'Bill', amount: 100, vendorId: f.vendorAId })
+      .set('Authorization', `Bearer ${f.bizAToken}`)
+      .send({ date: '2026-05-01', description: 'Bill', amount: 100, vendorId: f.bizVendorAId })
     const bill = await db.query<{ id: string }>(
-      `SELECT id FROM books_bills WHERE landlord_id=$1 LIMIT 1`, [f.landlordAId])
+      `SELECT id FROM books_bills WHERE business_id=$1 LIMIT 1`, [f.bizAId])
     const res = await request(buildApp())
       .post(`/api/books/bills/${bill.rows[0].id}/pay`)
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({ amount: 150, acceptOverpayment: true })
     expect(res.status).toBe(200)
     expect(res.body.data.status).toBe('paid')
@@ -608,7 +637,7 @@ describe('POST /bills/:id/pay', () => {
     // excess flows to credit_balance.
     const vendor = await db.query<{ ap_balance: string; ytd_paid: string; credit_balance: string }>(
       `SELECT ap_balance, ytd_paid, credit_balance FROM books_vendors WHERE id=$1`,
-      [f.vendorAId])
+      [f.bizVendorAId])
     expect(Number(vendor.rows[0].ytd_paid)).toBe(100)
     expect(Number(vendor.rows[0].credit_balance)).toBe(50)
   })
@@ -616,31 +645,31 @@ describe('POST /bills/:id/pay', () => {
   it('S413: exact amount (no overpayment) → status=paid, credit_balance untouched', async () => {
     const f = await seedPortfolio()
     await request(buildApp()).post('/api/books/bills')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({ date: '2026-05-01', description: 'Bill', amount: 100, vendorId: f.vendorAId })
+      .set('Authorization', `Bearer ${f.bizAToken}`)
+      .send({ date: '2026-05-01', description: 'Bill', amount: 100, vendorId: f.bizVendorAId })
     const bill = await db.query<{ id: string }>(
-      `SELECT id FROM books_bills WHERE landlord_id=$1 LIMIT 1`, [f.landlordAId])
+      `SELECT id FROM books_bills WHERE business_id=$1 LIMIT 1`, [f.bizAId])
     const res = await request(buildApp())
       .post(`/api/books/bills/${bill.rows[0].id}/pay`)
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({ amount: 100 })  // exact, no overpayment
     expect(res.status).toBe(200)
     expect(Number(res.body.overpaymentCreditRecorded)).toBe(0)
     const vendor = await db.query<{ credit_balance: string }>(
-      `SELECT credit_balance FROM books_vendors WHERE id=$1`, [f.vendorAId])
+      `SELECT credit_balance FROM books_vendors WHERE id=$1`, [f.bizVendorAId])
     expect(Number(vendor.rows[0].credit_balance)).toBe(0)
   })
 
   it('S413: tiny rounding (<= $0.01) does NOT trigger 409 (floating-point tolerance)', async () => {
     const f = await seedPortfolio()
     await request(buildApp()).post('/api/books/bills')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({ date: '2026-05-01', description: 'Bill', amount: 100, vendorId: f.vendorAId })
+      .set('Authorization', `Bearer ${f.bizAToken}`)
+      .send({ date: '2026-05-01', description: 'Bill', amount: 100, vendorId: f.bizVendorAId })
     const bill = await db.query<{ id: string }>(
-      `SELECT id FROM books_bills WHERE landlord_id=$1 LIMIT 1`, [f.landlordAId])
+      `SELECT id FROM books_bills WHERE business_id=$1 LIMIT 1`, [f.bizAId])
     const res = await request(buildApp())
       .post(`/api/books/bills/${bill.rows[0].id}/pay`)
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({ amount: 100.005 })  // 0.5 cent over — within tolerance
     expect(res.status).toBe(200)
   })
@@ -648,25 +677,54 @@ describe('POST /bills/:id/pay', () => {
   it('S413: subsequent payment after partial does not double-count credit', async () => {
     const f = await seedPortfolio()
     await request(buildApp()).post('/api/books/bills')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({ date: '2026-05-01', description: 'Bill', amount: 100, vendorId: f.vendorAId })
+      .set('Authorization', `Bearer ${f.bizAToken}`)
+      .send({ date: '2026-05-01', description: 'Bill', amount: 100, vendorId: f.bizVendorAId })
     const bill = await db.query<{ id: string }>(
-      `SELECT id FROM books_bills WHERE landlord_id=$1 LIMIT 1`, [f.landlordAId])
+      `SELECT id FROM books_bills WHERE business_id=$1 LIMIT 1`, [f.bizAId])
     // First: partial $60
     await request(buildApp())
       .post(`/api/books/bills/${bill.rows[0].id}/pay`)
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({ amount: 60 })
     // Second: $80 (would be $40 over the remaining $40)
     const res = await request(buildApp())
       .post(`/api/books/bills/${bill.rows[0].id}/pay`)
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .set('Authorization', `Bearer ${f.bizAToken}`)
       .send({ amount: 80, acceptOverpayment: true })
     expect(res.status).toBe(200)
     expect(Number(res.body.overpaymentCreditRecorded)).toBe(40)
     const vendor = await db.query<{ ytd_paid: string; credit_balance: string }>(
-      `SELECT ytd_paid, credit_balance FROM books_vendors WHERE id=$1`, [f.vendorAId])
+      `SELECT ytd_paid, credit_balance FROM books_vendors WHERE id=$1`, [f.bizVendorAId])
     expect(Number(vendor.rows[0].ytd_paid)).toBe(100)  // $60 + $40, NOT $140
     expect(Number(vendor.rows[0].credit_balance)).toBe(40)
+  })
+})
+
+// 10/12 (Nic, ledger P6, L5): "money out is ONE record" — a landlord company's
+// Bills and Transactions moved onto Expenses; writing them here is refused
+// with where they are now, and reading what was there still works.
+describe('a landlord company\'s Bills and Transactions are on Expenses now', () => {
+  it('writes are refused (409, in words); the old rows still read', async () => {
+    const f = await seedPortfolio()
+    const tx = await db.query<{ id: string }>(
+      `INSERT INTO books_transactions (landlord_id, date, description, amount, type) VALUES ($1, '2026-05-01', 'old', 10, 'income') RETURNING id`,
+      [f.landlordAId])
+    const bill = await db.query<{ id: string }>(
+      `INSERT INTO books_bills (landlord_id, vendor_id, date, description, amount) VALUES ($1, $2, '2026-05-01', 'old bill', 50) RETURNING id`,
+      [f.landlordAId, f.vendorAId])
+    const as = (r: request.Test) => r.set('Authorization', `Bearer ${f.landlordAToken}`)
+    for (const r of [
+      as(request(buildApp()).post('/api/books/transactions')).send({ date: '2026-05-01', description: 'x', amount: 5, type: 'income' }),
+      as(request(buildApp()).patch(`/api/books/transactions/${tx.rows[0].id}`)).send({ description: 'y' }),
+      as(request(buildApp()).delete(`/api/books/transactions/${tx.rows[0].id}`)),
+      as(request(buildApp()).post('/api/books/bills')).send({ date: '2026-05-01', description: 'x', amount: 5 }),
+      as(request(buildApp()).post(`/api/books/bills/${bill.rows[0].id}/pay`)).send({}),
+    ]) {
+      const res = await r
+      expect(res.status).toBe(409)
+      expect(res.body.error).toMatch(/on Expenses now/)
+    }
+    expect((await as(request(buildApp()).get('/api/books/transactions'))).body.data).toHaveLength(1)
+    expect((await as(request(buildApp()).get('/api/books/bills'))).body.data).toHaveLength(1)
   })
 })

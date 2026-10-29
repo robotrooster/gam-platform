@@ -16,7 +16,7 @@ import { DateTime } from 'luxon'
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import {
-  priceStay, BOOKING_MONTHLY_DEPOSIT_DEFAULT, processingFeeFor, cardFeeSplit,
+  priceStay, BOOKING_MONTHLY_DEPOSIT_DEFAULT, processingFeeFor, cardFeeSplit, stayNightsBetween,
   STAY_LEASE_CHOICE_NIGHTS, STAY_SCREENING_NIGHTS, stayHeldWords, stayPlanWords, leaseDueDay, dueDayLabel, type CardFeePayer,
 } from '@gam/shared'
 import { stayNeeds } from './stayTerms'
@@ -160,6 +160,49 @@ export const LEASE_OR_STAY_WORDS =
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100
 
 /**
+ * The deposit on a stay, from the property's own two settings.
+ *
+ * A flat amount for a stay of 30+ nights (S547: the percentage is for short
+ * stays only), held to one month's rent regardless of what the flat setting
+ * says. Everything shorter is a percentage of the taxed total.
+ * 10/6: decided by the stay's LENGTH, not by the rate it is charged at — a
+ * 25-night stay charged at the monthly rate (the lower price) is still a short
+ * stay and owes the percentage.
+ *
+ * S652: pulled out of quoteStay so a reservation taken at the COUNTER quotes
+ * the same deposit the booking site would have. A guest who phones and a guest
+ * who books online are buying the same nights on the same site and must not be
+ * told two different numbers. (memory: gam-register-price-is-its-own-thing)
+ *
+ * 10/20 (review) — A SITE WITH NO MONTHLY RATE IS STILL A SEASONAL SITE.
+ * The flat rule used to be gated on the site HAVING a monthly rate, so a 92-
+ * night reservation on a site priced by the night (or not priced at all, taken
+ * at a typed total) fell through to the short-stay percentage and was asked
+ * 10% of a season. The monthly rate was never the trigger; it is only the CAP,
+ * which is what migration 20260718184500 means by "stays 30+ nights owe AT
+ * MOST one month". With no monthly rate there is no month to cap against, so
+ * the figure the stay was sold at caps it instead, and a stay with no price at
+ * all is asked for nothing — the office settles that one by hand.
+ *
+ * It lives here rather than in propertyBooking because the booking site's own
+ * quote (typeAvailability, below) used to carry a SECOND copy of this
+ * arithmetic, and the copies drifted on exactly the case above. One function,
+ * so the website and the counter cannot quote a guest two different deposits.
+ */
+export function depositForStay(
+  prop: { booking_deposit_pct: string | number; booking_monthly_deposit: string | number | null },
+  stay: { total: number; nights: number; monthlyRate: number | null },
+): number {
+  if (stay.nights >= STAY_LEASE_CHOICE_NIGHTS) {
+    const flat = prop.booking_monthly_deposit != null
+      ? Number(prop.booking_monthly_deposit) : BOOKING_MONTHLY_DEPOSIT_DEFAULT
+    const caps = [stay.monthlyRate, stay.total].filter((n): n is number => n != null && n > 0)
+    return caps.length ? round2(Math.min(flat, ...caps)) : 0
+  }
+  return round2(stay.total * (Number(prop.booking_deposit_pct) / 100))
+}
+
+/**
  * What the guest pays now, line by line: the stay's part (a deposit, or a
  * no-lease stay's first month), the background check (R8 — a fixed line that
  * cannot be removed; 0 when none is due) and GAM's card fee on the whole of it
@@ -168,7 +211,9 @@ const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100
 export interface DueNow { stay: number; screening: number; cardFee: number; total: number }
 export function dueNowFor(stay: number, screening: number, payer: CardFeePayer): DueNow {
   const base = round2(stay + screening)
-  const split = cardFeeSplit(base, payer)
+  // 10/21 (Nic): the check is one price with its processing already in it, so
+  // the card fee is figured on the stay's part only.
+  const split = cardFeeSplit(base, payer, screening)
   return { stay: round2(stay), screening: round2(screening), cardFee: round2(split.charged - base), total: split.charged }
 }
 
@@ -197,6 +242,71 @@ export function firstStayMonth(
   void taxRatePct
   const amount = priceStay(rates, 0, checkIn, nights).total
   return { checkOut: out, nights, amount }
+}
+
+/**
+ * 10/20 (defect) — WHAT A RESERVATION OWES RIGHT NOW, ANSWERED ONCE.
+ *
+ * Two doors ask this question about the same row and they must never come to
+ * different money: the confirmation a person presses send on
+ * (services/bookingConfirmation) and the ticket arrival morning raises
+ * (services/stayBalance). Both used to decide it for themselves, and they
+ * disagreed on exactly the reservations Nic is bringing over from the old
+ * system.
+ *
+ *   "If they're seasonal and going to be here more than the 30 days, I just
+ *    want it to tell them the first month's rate."
+ *
+ * That sentence is about a stay the RATE CARD priced. A month can only be cut
+ * out of a price the card actually set, and Nic's board is full of figures it
+ * never set: a total a clerk typed on a site with no rate on it, a season
+ * imported straight across at a price of its own. A 92-night season sold for
+ * $1,767 on a site carrying nothing but a $49 nightly rate has a card-priced
+ * "first month" of $1,519 — 86% of the whole season, a figure no door ever
+ * showed anybody, and it left $248 that nothing at all would ever bill.
+ *
+ * So the question is answered in one place, in four plain answers, and each
+ * caller decides what to DO with them (the confirmation quotes; the arrival run
+ * bills). `checkOut` is the check-out the stay was SOLD for — registerStay
+ * soldCheckOutSql — never a check-out an early departure moved, because a guest
+ * who leaves early does not retroactively become a short stay.
+ */
+export type SoldStayMonth =
+  /** 30+ nights the card priced: this is the first month, already held to the price the stay was sold at. */
+  | { kind: 'month'; checkOut: string; nights: number; amount: number }
+  /** Under 30 nights: there is no "first month" — the stay is its own figure. */
+  | { kind: 'short_stay' }
+  /** 30+ nights the card did NOT price: the only figure this stay has is the one it was sold at. */
+  | { kind: 'whole_stay' }
+  /** 30+ nights and nothing can price a month of it — no rate on the site or the property. */
+  | { kind: 'unpriceable' }
+
+export function soldStayFirstMonth(args: {
+  checkIn: string
+  /** The check-out the stay was SOLD for. */
+  checkOut: string
+  /** unit_bookings.total_amount — the price it was sold at; null or 0 when it has none. */
+  soldTotal: number | string | null
+  rates: { nightly: number | null; weekly: number | null; monthly: number | null }
+}): SoldStayMonth {
+  if (stayNightsBetween(args.checkIn, args.checkOut) < STAY_LEASE_CHOICE_NIGHTS) return { kind: 'short_stay' }
+  const sold = round2(Number(args.soldTotal) || 0)
+  const month = firstStayMonth(args.checkIn, args.checkOut, args.rates, 0)
+  const amount = round2(month.amount)
+  // Asked FIRST, because a site with no rate card at all cannot be told apart
+  // from one whose card disagrees by comparing prices — both come to nothing.
+  if (!(amount > 0)) return { kind: 'unpriceable' }
+  // WHOSE PRICE IS THIS? Only the card's own price may be cut into months; a
+  // reservation with no price of its own is the card's to price. (A 30+ night
+  // stay carries no lodging tax, so the card's figure is the whole comparison
+  // — there is no tax split to line up.)
+  const nights = stayNightsBetween(args.checkIn, args.checkOut)
+  if (sold > 0 && round2(priceStay(args.rates, 0, args.checkIn, nights).total) !== sold) {
+    return { kind: 'whole_stay' }
+  }
+  // Never more than the stay costs altogether: a season sold flat, below the
+  // card's month, owes that flat price and not the card's.
+  return { ...month, kind: 'month', amount: sold > 0 ? Math.min(amount, sold) : amount }
 }
 
 /**
@@ -298,14 +408,12 @@ export async function typeAvailability(
   const depositPct = Number(prop.booking_deposit_pct)
   // Deposit rule (S547, Nic): % of total for short stays only; a stay of 30+
   // nights owes a flat deposit (per-property, default utility-bill-sized),
-  // hard-capped at one month's rent. (10/6: by the stay's length, as
-  // propertyBooking depositForStay — never by the rate it is charged at.)
+  // held to one month. (10/6: by the stay's length, as depositForStay — never
+  // by the rate it is charged at.) 10/20 (review): this was a second copy of
+  // that arithmetic and it had drifted, so it calls the one function now.
   const monthlyRateNum = rates.monthly != null && Number(rates.monthly) > 0 ? Number(rates.monthly) : null
-  const flatDeposit = nights >= STAY_LEASE_CHOICE_NIGHTS && monthlyRateNum != null
-  const monthlyFlat = prop.booking_monthly_deposit != null ? Number(prop.booking_monthly_deposit) : BOOKING_MONTHLY_DEPOSIT_DEFAULT
   const depositAmount = total == null ? null
-    : flatDeposit ? Math.round(Math.min(monthlyFlat, monthlyRateNum!) * 100) / 100
-    : Math.round(total * (depositPct / 100) * 100) / 100
+    : depositForStay(prop, { total, nights, monthlyRate: monthlyRateNum })
 
   // 10/5 (R1/R8, R2/R5): the background check and the lease-or-stay choice.
   const screeningFee = opts.screeningFee !== undefined

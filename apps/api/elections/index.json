@@ -1,0 +1,55 @@
+{
+ "about": "Built by apps/admin/scripts/build-election-results.mjs from official election returns (public data). Do not edit by hand; re-run the script.",
+ "margin": "Votes on the right minus votes on the left, over every vote cast, in percentage points. Positive is the right.",
+ "shape": "An area, a contest (an office and a year, with its two sides named), and that area's margin in it. Any office at any level drops into the same shape.",
+ "levels": {
+  "county": {
+   "areas": 3121,
+   "file": "county.json.gz",
+   "contests": [
+    {
+     "id": "president-2024",
+     "office": "president",
+     "year": 2024,
+     "label": "2024 presidential margin",
+     "areas": 3112,
+     "states_left_out": [
+      "District of Columbia: this state reported it by \"Ward 2\" and \"Ward 3\" and the like, not by county",
+      "Alaska: this state reported it by \"State House District 1\" and \"State House District 2\" and the like, not by county"
+     ],
+     "rows_dropped": []
+    },
+    {
+     "id": "president-2020",
+     "office": "president",
+     "year": 2020,
+     "label": "2020 presidential margin",
+     "areas": 3112,
+     "states_left_out": [
+      "Alaska: this state reported it by \"District 1\" and \"District 2\" and the like, not by county"
+     ],
+     "rows_dropped": []
+    },
+    {
+     "id": "president-2016",
+     "office": "president",
+     "year": 2016,
+     "label": "2016 presidential margin",
+     "areas": 3111,
+     "states_left_out": [
+      "AK: this state reported one figure for the whole state rather than by county"
+     ],
+     "rows_dropped": [
+      "SD Oglala County (46113) is not a county on this map"
+     ]
+    }
+   ],
+   "newest": {
+    "contest": "president-2024",
+    "lowest": -75.2,
+    "median": 42.1,
+    "highest": 92.5
+   }
+  }
+ }
+}

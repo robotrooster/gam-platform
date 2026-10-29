@@ -168,8 +168,15 @@ describe('account credit on the Payments page', () => {
     await render()
     await until(() => text().includes('Account credit'), 'the credit card')
     expect(text()).toContain('$60.10')
-    // 10/6 (Nic): money paid ahead goes on the balance by itself, whole or in part.
-    expect(text()).toContain('Money you paid ahead goes on your bill by itself, oldest bill first. Other credit you can use when you pay; it is applied by itself only when it covers a whole bill.')
+    // 10/6 (Nic): money paid ahead goes on the balance by itself, whole or in
+    // part. 10/15: so does a credit from the landlord — the "only when it
+    // covers a whole bill" line was wrong from that day and said so here until
+    // 10/18. 10/18 (Nic): the page tells the payer which money stays with the
+    // space they paid it for and which crosses every space.
+    expect(text()).toContain('Money you paid ahead goes on your bill by itself, oldest bill first, and stays with the space you paid it for.')
+    expect(text()).toContain('Credit from your landlord goes on your balance by itself too, oldest bill first — across every space you rent from them.')
+    expect(text()).toContain('Interest on your deposit stays with that space, and comes back to you with that deposit.')
+    expect(text()).not.toMatch(/only when it covers a whole bill/)
     expect(text()).toContain('Statutory interest on your deposit$12.50')
     expect(text()).toContain('Paid ahead$37.60')
     expect(text()).toContain('Credit from your landlord$10.00')

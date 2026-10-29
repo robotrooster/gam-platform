@@ -46,17 +46,22 @@ import { heldOwnerShareForUser } from './landlordPassthrough'
 import { executeRentAllocation, ALLOCATABLE_PAYMENT_TYPES } from './allocation'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 
 beforeEach(async () => {
   await cleanupAllSchema()
   process.env.STRIPE_SECRET_KEY = 'sk_test_mocked'
   process.env.STRIPE_WEBHOOK_SECRET = 'whsec_mocked'
-  await db.query(
-    `INSERT INTO platform_processing_rates
-       (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-     VALUES ('ach', 0, 1.0, 0, 0.5)
-     ON CONFLICT DO NOTHING`)
+  // 10/17: the rate this file's figures are worked out on, STATED rather than
+  // seeded-if-missing: one row is open per method and cleanupAllSchema leaves the
+  // rate card alone, so an insert-if-missing took whatever an earlier file left.
+  await setEffectiveProcessingRate(db, {
+    paymentMethod: 'ach',
+    customerFacingFlat: 0, customerFacingPercent: 1.0,
+    stripeCostFlat: 0, stripeCostPercent: 0.5,
+    notes: 'allocation.carriedBalance.test.ts ACH rate',
+  })
 })
 
 interface Park { ownerUserId: string; landlordId: string; tenantId: string; unitId: string; leaseId: string }

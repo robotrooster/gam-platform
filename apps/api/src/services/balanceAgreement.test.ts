@@ -47,6 +47,7 @@ import { db, getClient } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedAllocationRule,
   seedUtilityMeter, seedUtilityBill,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import { paymentsRouter } from '../routes/payments'
 import { balancesRouter } from '../routes/balances'
@@ -127,6 +128,10 @@ async function household(): Promise<House> {
     await createPaidAhead(c, { leaseId: base.leaseId, tenantId: base.tenantId, amount: 10, fundedBy: 'landlord', receivedAt: '2026-08-20T17:00:00Z' })
     await createIssuedCredit(c, { landlordId: base.landlordId, tenantId: base.tenantId, amount: 15, category: 'goodwill',
       reason: 'Sorry about the water outage', createdBy: base.landlordUserId })
+    // 10/12: the bill was written on its due date (the run above is dated
+    // 9/1), so its lateness counts from the due date — a line GAM writes
+    // after its due date counts from the day it was written.
+    await c.query(`UPDATE payments SET created_at = '2026-09-01T15:00:00Z' WHERE invoice_id = $1`, [inv.id])
   })
   return {
     ...base, invoiceId: inv.id, rentId,
@@ -201,11 +206,15 @@ function expectAllAgree(all: Record<string, { balance: number; credit: number | 
 beforeEach(async () => {
   await cleanupAllSchema()
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_balance_agreement'
-  await db.query(
-    `INSERT INTO platform_processing_rates
-       (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-     SELECT 'card', 0.55, 3.5, 0.26, 0.7
-      WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'card' AND effective_until IS NULL)`)
+  // 10/17: the rate this file's figures are worked out on, STATED rather than
+  // seeded-if-missing: one row is open per method and cleanupAllSchema leaves the
+  // rate card alone, so an insert-if-missing took whatever an earlier file left.
+  await setEffectiveProcessingRate(db, {
+    paymentMethod: 'card',
+    customerFacingFlat: 0.55, customerFacingPercent: 3.5,
+    stripeCostFlat: 0.26, stripeCostPercent: 0.7,
+    notes: 'balanceAgreement.test.ts card rate',
+  })
 })
 
 describe('one household, one balance, one credit figure on every surface', () => {
@@ -234,6 +243,11 @@ describe('one household, one balance, one credit figure on every surface', () =>
     await row({ type: 'fee', amount: 25, revenue_owner: 'gam', entry_description: 'FLEXPAY', invoice_id: null, due_date: '2026-09-06' })
     // August rent, paid, then the bank sent it back: the 'returned' original and its reopened row.
     const aug = (await row({ type: 'rent', amount: 300, status: 'returned', entry_description: 'RENT', due_date: '2026-08-01', invoice_id: null, return_code: 'R01' })).rows[0].id
+    // 10/12 (Nic, LF2): lateness counts from the day GAM wrote the bill when
+    // that is after its due date. August's rent was written in August; the
+    // reopened row carries that bill over (services/lateness writtenAtSql), so
+    // it is as late as the bill — and in the 7 am digest.
+    await db.query(`UPDATE payments SET created_at = '2026-08-01T15:00:00Z' WHERE id = $1`, [aug])
     const rv = (await db.query<{ id: string }>(
       `INSERT INTO payment_reversals (payment_id, landlord_id, tenant_id, lease_id, reversal_type, reversed_amount, stripe_event_id, raw_event)
        VALUES ($1,$2,$3,$4,'ach_return',300,'evt_agree_aug','{}') RETURNING id`, [aug, h.landlordId, h.tenantId, h.leaseId])).rows[0].id
@@ -253,10 +267,13 @@ describe('one household, one balance, one credit figure on every surface', () =>
     const h = await household()
     // A tenant-paid GAM fee on September's bill: the desk lists it as "Pay
     // online", the portal as GAM's own line — both inside the full balance.
+    // 10/12 (Nic, LF2): written with September's bill (on its due date), so it
+    // is as late as the bill and in the 7 am digest; a line written after its
+    // due date is late only from the day it was written + grace.
     await db.query(
       `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, invoice_id, type, amount, status, due_date,
-                             entry_description, revenue_owner)
-       VALUES ($1,$2,$3,$4,$5,'fee',12,'pending','2026-09-01','OTHERFEE','gam')`,
+                             entry_description, revenue_owner, created_at)
+       VALUES ($1,$2,$3,$4,$5,'fee',12,'pending','2026-09-01','OTHERFEE','gam','2026-09-01T15:00:00Z')`,
       [h.unitId, h.leaseId, h.tenantId, h.landlordId, h.invoiceId])
     await db.query(`UPDATE invoices SET total_amount = total_amount + 12 WHERE id = $1`, [h.invoiceId])
     // Credit pays only the landlord's lines, so it is still $25.

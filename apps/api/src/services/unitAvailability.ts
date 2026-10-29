@@ -112,8 +112,9 @@ export const STAY_CONFLICT_MESSAGE: Record<Exclude<StayConflict, null>, string> 
 }
 
 // Every unit of the landlord that is free for the window. RV compatibility
-// (site layout / amp service) is filtered by the CALLER using the shared
-// isSiteLayoutMismatch / isAmpServiceMismatch helpers — one semantic source
+// (site layout / amp service / how long a rig the pad takes) is filtered by the
+// CALLER using the shared isSiteLayoutMismatch / isAmpServiceMismatch /
+// isRigTooLongForSite helpers — one semantic source
 // in packages/shared, no SQL re-implementation. Subtype pricing is joined so
 // consumers (reach-out rent prefill) read the unit's preset rent without a
 // second query: unit override first, subtype fallback.
@@ -133,7 +134,8 @@ export async function findAvailableUnits(opts: {
   if (opts.scopedPropertyIds) filter += ` AND u.property_id = ANY($${params.push(opts.scopedPropertyIds)})`
   return query<any>(`
     SELECT u.id, u.unit_number, u.unit_type, u.status, u.property_id,
-           u.is_bookable, u.rv_site_layout, u.rv_amp_service, u.lease_types_allowed,
+           u.is_bookable, u.rv_site_layout, u.rv_amp_service, u.rv_max_rig_length_ft,
+           u.lease_types_allowed,
            u.rent_amount, u.nightly_rate, u.weekly_rate, u.monthly_rate,
            s.name AS subtype_name,
            s.rent_amount AS subtype_rent_amount,

@@ -125,6 +125,22 @@ describe('postTenantPayment — the household', () => {
     expect(rem).toEqual({ gross_amount: null, a: 1150 })
   })
 
+  // Review fix (10/17): the receipt is filed where the money was TAKEN — the
+  // space whose bill it paid — and no longer follows money kept to another
+  // space. Every money figure is read off the bills and the credit, never off
+  // the receipt, so this only decides which space's history shows the receipt.
+  it('the receipt is filed on the space whose bill the money paid, not where the extra was kept', async () => {
+    const h = await household()
+    const b = await secondLease(h, '2026-06-01')            // the newer lease
+    await row(h, h.unitId, h.leaseId, 'rent', 450, '2026-09-01')
+    const r = await post(h, 600)                            // pays the bill, $150 kept
+    expect(r.paidAhead).toBe(150)
+    expect((await db.query<any>(
+      `SELECT lease_id FROM tenant_remittances WHERE id = $1`, [r.remittanceId])).rows[0].lease_id).toBe(h.leaseId)
+    // The money kept still sits where the posted payment says: the newest space.
+    expect((await db.query<any>(`SELECT lease_id FROM lease_prepaid_credits`)).rows[0].lease_id).toBe(b.leaseId)
+  })
+
   it('never spends credit', async () => {
     const h = await household()
     const rent = await row(h, h.unitId, h.leaseId, 'rent', 450, '2026-09-01')

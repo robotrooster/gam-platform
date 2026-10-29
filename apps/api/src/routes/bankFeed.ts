@@ -5,7 +5,12 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { MERCHANT_RULE_SCOPES, EXPENSE_CATEGORIES, OTHER_INCOME_CATEGORIES, BANK_TXN_STATUSES } from '@gam/shared'
+import { BANK_FILING_SCOPES, BANK_TXN_STATUSES, BANK_OUT_MATCH_KINDS, BANK_IN_MATCH_KINDS, EXPENSE_MATCH_MAX } from '@gam/shared'
+import { companyWideRefusal, bookkeeperMayWrite, READ_ONLY_REFUSAL } from '../lib/bookkeeperScope'
+import {
+  moneyOutMatchesFor, matchLineToExpenses, matchLineToRecord, assertBookkeeperMayFileLine, assertBookkeeperMayFileTransfer,
+  assertBookkeeperMayMarkNotRent,
+} from '../services/bankMoneyOut'
 import { queryOne } from '../db'
 import { landlordScopeIds, resolveLandlordTarget } from '../lib/landlordScope'
 import { logger } from '../lib/logger'
@@ -13,10 +18,44 @@ import { NOT_RENT_MARK } from '../services/bankDepositCandidates'
 import {
   createLinkSession, finalizeConnection, syncConnection, listConnections,
   listTransactions, categorizeTransaction, ignoreTransaction, disconnectConnection,
+  splitTransaction, undoSplit, SPLIT_MAX_PARTS, undoFiling,
 } from '../services/bankFeed'
 
 export const bankFeedRouter = Router()
 bankFeedRouter.use(requireAuth)
+
+/**
+ * 10/12 (Nic, L19; design §11): bank lines are the owner's, and a
+ * bookkeeper's with the bank — the company-wide box (10/12, ledger decision 2:
+ * one level, so every such bookkeeper files). Money going out is open to them; money coming in only as the
+ * owner chose for them (assertBookkeeperMayFileLine on each filing route).
+ * Never a tenant's payment: confirming a deposit and a recorded deposit stay
+ * the owner's (requireLandlord, and off the bookkeeper allowlist). 10/13 (Nic):
+ * "Not rent" is the owner's and the bookkeeper's ("owner + bookkeeper (not
+ * front-desk staff)") — requireBankFiler, on the bookkeeper allowlist; never a
+ * bookkeeper the owner keeps away from money coming in (assertBookkeeperMayMarkNotRent).
+ */
+function bankGate(write: boolean) {
+  return (req: any, res: any, next: any) => {
+    const role = req.user?.role
+    if (role === 'landlord' || role === 'admin' || role === 'super_admin') return next()
+    if (role === 'bookkeeper') {
+      if (!req.user.bookkeeperScope?.companyWide) {
+        return res.status(403).json({ success: false, error: companyWideRefusal('The bank account') })
+      }
+      // 10/12 (Nic) review, SECURITY: THIS company's scope row, read live
+      // (lib/bookkeeperScope), never the sign-in pass's value. 10/12 (Nic):
+      // one level — refused only without a scope row on the company.
+      if (write && !bookkeeperMayWrite(req.user.bookkeeperScope)) {
+        return res.status(403).json({ success: false, error: READ_ONLY_REFUSAL })
+      }
+      return next()
+    }
+    return res.status(403).json({ success: false, error: 'Insufficient permissions' })
+  }
+}
+const requireBankViewer = bankGate(false)
+const requireBankFiler = bankGate(true)
 
 // A landlord acts as themselves; landlord-scoped staff act on their landlord.
 /**
@@ -88,7 +127,13 @@ bankFeedRouter.put('/books-start-date', requireLandlord, async (req: any, res, n
     }).parse(req.body)
     const { setBooksStartDate } = await import('../services/bankFeed')
     res.json({ success: true, data: await setBooksStartDate(scope(req), b.date) })
-  } catch (e) { next(e) }
+  } catch (e: any) {
+    // 10/13: a books start that would fall between a fixed asset and the loan
+    // that paid for it is refused by the database (20261015190100) in words —
+    // a 409 with those words, as Books Settings shows it, never a 500.
+    if (e?.code === '23514' || e?.code === 'P0001') return next(new AppError(409, String(e.message || 'That books start is not allowed.')))
+    next(e)
+  }
 })
 
 bankFeedRouter.post('/finalize', requireLandlord, async (req: any, res, next) => {
@@ -99,9 +144,44 @@ bankFeedRouter.post('/finalize', requireLandlord, async (req: any, res, next) =>
 })
 
 // GET /api/bank-feed/connections
-bankFeedRouter.get('/connections', requireLandlord, async (req: any, res, next) => {
+bankFeedRouter.get('/connections', requireBankViewer, async (req: any, res, next) => {
   try {
-    res.json({ success: true, data: await listConnections(scope(req)) })
+    const landlordId = scope(req)
+    // 10/20 (Nic, ONE BANK LINK): before answering "is a bank linked", find out
+    // whether the landlord already linked one in step one. From this morning on,
+    // the bank they sign into while verifying their business can be read for
+    // transactions, so there is nothing for step two to collect — and this is
+    // what makes the page say so instead of asking again.
+    //
+    // SAY WHAT THIS IS, because it is not a read. On the one request per
+    // landlord that finds a bank to adopt, this GET writes: a bank_connections
+    // row, two Financial Connections subscribes at Stripe, the
+    // connect_bank_checked_at stamp, and a first transaction import. Every
+    // other request short-circuits before Stripe is touched — once a row
+    // exists, and inside ten minutes of an ask that found nothing.
+    //
+    // 10/20 (review): and it is serialized, which it had to be. OnboardingPage
+    // polls this endpoint every four seconds while the landlord sits on step 4,
+    // and the adopting request can take longer than four seconds, so the second
+    // poll used to start the whole adoption again — four subscribes at Stripe
+    // and two transaction imports contending on one connection, with whatever
+    // they collided over swallowed below. ensureOnboardingBankLink now claims
+    // the ask atomically and holds an advisory lock for the adoption, so a
+    // second caller is told `in_flight` and does nothing.
+    //
+    // Nobody who may only READ can reach this: bookkeeper_scopes.access_level is
+    // NOT NULL DEFAULT 'read_write' and bookkeeperMayWrite is true for both
+    // levels, so there is no actor that passes requireBankViewer and would fail
+    // requireBankFiler. If a read-only level is ever added, this call moves.
+    try {
+      const { ensureOnboardingBankLink } = await import('../services/connectBankLink')
+      await ensureOnboardingBankLink(landlordId)
+    } catch (e) {
+      // The list is the answer the page needs; a failed look-up must never be
+      // the reason a landlord cannot see the bank they already have.
+      logger.warn({ err: e, landlordId }, '[bank-feed] onboarding bank look-up failed')
+    }
+    res.json({ success: true, data: await listConnections(landlordId) })
   } catch (e) { next(e) }
 })
 
@@ -132,40 +212,241 @@ bankFeedRouter.post('/connections/:id/disconnect', requireLandlord, async (req: 
 })
 
 // GET /api/bank-feed/transactions?status=needs_review&connectionId=&limit=
-bankFeedRouter.get('/transactions', requireLandlord, async (req: any, res, next) => {
+bankFeedRouter.get('/transactions', requireBankViewer, async (req: any, res, next) => {
   try {
     const q = z.object({
       // S655: the shared list, not a re-declared copy of it.
       status: z.enum(BANK_TXN_STATUSES).optional(),
       connectionId: z.string().uuid().optional(),
       limit: z.coerce.number().int().positive().max(500).optional(),
+      // 10/12: one line (the Expenses page links to the bank line an expense came from).
+      lineId: z.string().uuid().optional(),
     }).parse(req.query)
-    res.json({ success: true, data: await listTransactions(scope(req), q) })
+    const rows = await listTransactions(scope(req), q)
+    // 10/12 (Nic, L19): a bookkeeper reads the same lines with any email or
+    // phone number on a memo taken out (routes/financials memoWithoutContact).
+    if (req.user?.role === 'bookkeeper') {
+      const { memoWithoutContact } = await import('./financials')
+      for (const r of rows as any[]) {
+        if (typeof r.description === 'string') r.description = memoWithoutContact(r.description)
+        if (typeof r.normalized_merchant === 'string') r.normalized_merchant = memoWithoutContact(r.normalized_merchant)
+      }
+    }
+    res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
 
 // POST /api/bank-feed/transactions/:id/categorize
-bankFeedRouter.post('/transactions/:id/categorize', requireLandlord, async (req: any, res, next) => {
+bankFeedRouter.post('/transactions/:id/categorize', requireBankFiler, async (req: any, res, next) => {
   try {
     const body = z.object({
       // S605: accepts BOTH sides — the service picks by the transaction's sign
       // (expense categories for money out, income for money in) and rejects a
       // mismatch, so widening here can't file a deposit as 'repairs'.
-      category: z.enum([...EXPENSE_CATEGORIES, ...OTHER_INCOME_CATEGORIES] as unknown as [string, ...string[]]),
-      scopeKind: z.enum(MERCHANT_RULE_SCOPES as unknown as [string, ...string[]]),
+      // 10/12 (Nic, L5): a company's own category (categoryId), or GAM's
+      // starting key (category); the service checks it is the company's and
+      // of the line's direction.
+      category: z.string().max(60).default('other'),
+      categoryId: z.string().uuid().nullable().optional(),
+      // 10/13 (Nic): money going out may also be split across the properties by units.
+      scopeKind: z.enum(BANK_FILING_SCOPES as unknown as [string, ...string[]]),
       unitId: z.string().uuid().nullable().optional(),
       propertyId: z.string().uuid().nullable().optional(),
       vendor: z.string().max(200).nullable().optional(),
       description: z.string().max(500).nullable().optional(),
+      // 10/12 review (Nic L5, match first): "none of these" — money going out
+      // that fits a record to the cent is refused (409 MATCH_FIRST) without it.
+      notAMatch: z.boolean().optional(),
     }).parse(req.body)
-    res.json({ success: true, data: await categorizeTransaction(await scopeFromRow(req, 'bank_transactions', req.params.id), req.params.id, body as any) })
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayFileLine(req.user, landlordId, req.params.id)
+    res.json({ success: true, data: await categorizeTransaction(landlordId, req.params.id, body as any) })
   } catch (e) { next(e) }
 })
 
-// POST /api/bank-feed/transactions/:id/ignore
-bankFeedRouter.post('/transactions/:id/ignore', requireLandlord, async (req: any, res, next) => {
+// POST /api/bank-feed/transactions/:id/split — 10/12 (Nic): "categories are
+// separate. if a deposit is multiple sources it should be split for record
+// keeping." Files one bank line as parts, each with its own category and its
+// own unit or property, adding up to the bank's amount to the cent. On a line
+// already filed from the Bank page (as one category, or in parts) it replaces
+// that filing; the old rows are voided, never deleted. Body { parts: [{
+// category, amount, scopeKind, unitId | propertyId, description? }] }. The
+// owner's, like filing (services/bankFeed splitTransaction).
+bankFeedRouter.post('/transactions/:id/split', requireBankFiler, async (req: any, res, next) => {
   try {
-    res.json({ success: true, data: await ignoreTransaction(await scopeFromRow(req, 'bank_transactions', req.params.id), req.params.id) })
+    const body = z.object({
+      parts: z.array(z.object({
+        // Both sides, as on categorize: the service picks the list by the
+        // line's sign and refuses a part from the other one.
+        // 10/12 (Nic, L5): or one of the company's own categories (categoryId).
+        category: z.string().max(60).default('other'),
+        categoryId: z.string().uuid().nullable().optional(),
+        amount: z.number().positive().max(100_000_000),
+        scopeKind: z.enum(BANK_FILING_SCOPES as unknown as [string, ...string[]]),
+        unitId: z.string().uuid().nullable().optional(),
+        propertyId: z.string().uuid().nullable().optional(),
+        description: z.string().max(500).nullable().optional(),
+      })).max(SPLIT_MAX_PARTS),
+      // 10/12 review (Nic L5, match first): as on categorize.
+      notAMatch: z.boolean().optional(),
+    }).parse(req.body)
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayFileLine(req.user, landlordId, req.params.id)
+    res.json({ success: true, data: await splitTransaction(landlordId, req.params.id, body.parts as any, { by: req.user.userId ?? null, notAMatch: body.notAMatch }) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/split/undo — 10/12 (Nic): the split's
+// parts are voided (kept on file) and the line goes back to review.
+bankFeedRouter.post('/transactions/:id/split/undo', requireBankFiler, async (req: any, res, next) => {
+  try {
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayFileLine(req.user, landlordId, req.params.id)
+    res.json({ success: true, data: await undoSplit(landlordId, req.params.id, { undoneBy: req.user.userId ?? null }) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/undo-filing — 10/12 (Nic): "every
+// bank filing (hand-filed too) can be undone (kept on record)." Takes back how
+// a line is filed, whichever way: one category the owner picked, a filing the
+// feed made by itself, a split, or the owner's Ignore. What it booked is voided
+// (never deleted, stamped with the line) and the line goes back to review,
+// never again filed by itself (services/bankFeed undoFiling). The owner's.
+bankFeedRouter.post('/transactions/:id/undo-filing', requireBankFiler, async (req: any, res, next) => {
+  try {
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayFileLine(req.user, landlordId, req.params.id)
+    // 10/12 review (L19): undoing a transfer releases the line it arrived as too.
+    await assertBookkeeperMayFileTransfer(req.user, landlordId, req.params.id)
+    res.json({ success: true, data: await undoFiling(landlordId, req.params.id, { undoneBy: req.user.userId ?? null }) })
+  } catch (e) { next(e) }
+})
+
+// (10/14, Nic answer 16: POST /transactions/:id/stop-auto-filing is gone —
+// nothing files itself from a payer's name any more, so there is nothing to stop.)
+
+// POST /api/bank-feed/transactions/:id/ignore
+bankFeedRouter.post('/transactions/:id/ignore', requireBankFiler, async (req: any, res, next) => {
+  try {
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayFileLine(req.user, landlordId, req.params.id)
+    res.json({ success: true, data: await ignoreTransaction(landlordId, req.params.id) })
+  } catch (e) { next(e) }
+})
+
+// ── 10/12 (Nic, L5): money going out matches what is already on record ─────
+//
+// "money out = ONE record": a line going out is matched FIRST to what already
+// has its record — one or several open expenses (a bill, a check written),
+// GAM's fee debit, a register refund or a refund check, or a transfer to
+// another of the company's linked accounts — and filed as a new expense only
+// when nothing fits (categorize / split above). Undone like any filing
+// (POST /transactions/:id/undo-filing). services/bankMoneyOut.
+
+// GET /api/bank-feed/transactions/:id/matches — what this money-out line could be, in that order.
+bankFeedRouter.get('/transactions/:id/matches', requireBankViewer, async (req: any, res, next) => {
+  try {
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    const found = await moneyOutMatchesFor(landlordId, req.params.id)
+    // 10/12 review (L19): a bookkeeper is offered only the transfers they may
+    // file (the line arriving is money coming in, the owner's choice for them).
+    if (req.user?.role === 'bookkeeper') {
+      const allowed: typeof found.records = []
+      for (const r of found.records) {
+        if (r.kind !== 'transfer') { allowed.push(r); continue }
+        try { await assertBookkeeperMayFileLine(req.user, landlordId, r.id); allowed.push(r) } catch { /* not theirs to file */ }
+      }
+      found.records = allowed
+    }
+    // 10/14 (Nic, answer 15): a line going out may be a check the bank
+    // returned — the checks of its amount in deposits on that account, for the
+    // owner to pick the one that bounced (POST /transactions/:id/returned-check).
+    // Never a bookkeeper's: taking a tenant's payment back is a tenant action.
+    const isOwner = req.user?.role === 'landlord' || req.user?.role === 'admin' || req.user?.role === 'super_admin'
+    const { checkChoices, mentionsAReturn } = await import('../services/returnedCheck')
+    const returnedChecks = isOwner ? await checkChoices(landlordId, req.params.id) : []
+    const memo = returnedChecks.length
+      ? (await queryOne<{ description: string | null }>(`SELECT description FROM bank_transactions WHERE id = $1`, [req.params.id]))?.description
+      : null
+    res.json({ success: true, data: { ...found, returnedChecks, returnedLine: returnedChecks.length > 0 && mentionsAReturn(memo) } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/returned-check — { remittanceId }:
+// 10/14 (Nic, answer 15) the owner says this line going out is that check (or
+// money order) on a matched deposit slip — or, 10/14 afternoon, that tenant's
+// own bank deposit GAM matched — returned by the bank, when GAM could not be
+// sure which it was. The same take-back GAM does by itself
+// (services/returnedCheck): just that payment, its bills owed again with late
+// fees, the returned-check fee billed, everyone told once. Refused in words
+// when the take-back is not clean. Undone with POST /deposits/:id/undo.
+bankFeedRouter.post('/transactions/:id/returned-check', requireLandlord, async (req: any, res, next) => {
+  try {
+    const { remittanceId } = z.object({ remittanceId: z.string().uuid() }).parse(req.body ?? {})
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    const { takeBackChosenCheck } = await import('../services/returnedCheck')
+    res.json({ success: true, data: await takeBackChosenCheck({
+      landlordId, lineId: req.params.id, remittanceId, by: req.user.userId,
+    }) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/match-payout — { disbursementId }:
+// 10/14 (Nic, answer 16) the owner says this deposit IS GAM's payout — offered
+// beside a deposit of a payout's amount whose memo does not name GAM, so GAM
+// would be guessing (services/bankFeed matchPayoutByHand). Undone with
+// POST /deposits/:id/undo.
+bankFeedRouter.post('/transactions/:id/match-payout', requireLandlord, async (req: any, res, next) => {
+  try {
+    const { disbursementId } = z.object({ disbursementId: z.string().uuid() }).parse(req.body ?? {})
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    const { matchPayoutByHand } = await import('../services/bankFeed')
+    res.json({ success: true, data: await matchPayoutByHand(landlordId, req.params.id, disbursementId, req.user.userId) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/match-expenses — { expenseIds?, paymentIds? }:
+// the open expenses this line paid (each paid from it), and/or checks already
+// recorded as written that it cleared. They add up to the line, except one
+// expense the line paid only part of.
+bankFeedRouter.post('/transactions/:id/match-expenses', requireBankFiler, async (req: any, res, next) => {
+  try {
+    const body = z.object({
+      expenseIds: z.array(z.string().uuid()).max(EXPENSE_MATCH_MAX).optional(),
+      paymentIds: z.array(z.string().uuid()).max(EXPENSE_MATCH_MAX).optional(),
+    }).parse(req.body ?? {})
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    res.json({ success: true, data: await matchLineToExpenses({
+      landlordId, lineId: req.params.id, expenseIds: body.expenseIds, paymentIds: body.paymentIds, by: req.user.userId ?? null,
+    }) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/bank-feed/transactions/:id/match-record — { kind, recordId }: GAM's
+// fee debit, a register refund by check, a refund check, or a transfer (the
+// line it arrived as). The same amount to the cent.
+// 10/12 (Nic): or a loan (recordId = the loan) — money out as its payment
+// ({ split } in cents: principal + interest + escrow = the line, else GAM's
+// suggestion), money in as its money arriving. A bookkeeper matches money in
+// only as the owner chose for them (Nic L19).
+const splitCents = z.number().int().min(0)
+bankFeedRouter.post('/transactions/:id/match-record', requireBankFiler, async (req: any, res, next) => {
+  try {
+    const body = z.object({
+      kind: z.enum([...BANK_OUT_MATCH_KINDS.filter(k => k !== 'expenses'), ...BANK_IN_MATCH_KINDS] as string[] as [string, ...string[]]),
+      recordId: z.string().uuid(),
+      split: z.object({ principalCents: splitCents, interestCents: splitCents, escrowCents: splitCents }).nullish(),
+    }).parse(req.body ?? {})
+    const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayFileLine(req.user, landlordId, req.params.id)
+    // 10/12 review (L19): a transfer files the money arriving on the other
+    // account too — under the owner's choice for this bookkeeper.
+    if (body.kind === 'transfer') await assertBookkeeperMayFileTransfer(req.user, landlordId, req.params.id, body.recordId)
+    await matchLineToRecord({
+      landlordId, lineId: req.params.id, kind: body.kind as any, recordId: body.recordId, by: req.user.userId ?? null,
+      split: body.split ?? null,
+    })
+    res.json({ success: true })
   } catch (e) { next(e) }
 })
 
@@ -278,9 +559,18 @@ bankFeedRouter.post('/deposits/:id/recorded-deposit', requireLandlord, async (re
 //     between their own accounts and income are different things, and which
 //     one it is, is theirs to say there (file it, or ignore it).
 // Pressing it twice is harmless (the first mark stands).
-bankFeedRouter.post('/deposits/:id/not-rent', requireLandlord, async (req: any, res, next) => {
+//
+// WHO — 10/13 (Nic): "Bank deposit 'Not rent': owner + bookkeeper (not
+// front-desk staff)." The owner, and a bookkeeper with the bank (the
+// company-wide box, requireBankFiler — the same door as filing a bank line).
+// Never staff who take payments: the front desk makes the deposit slip, it
+// does not say what a bank line was. The mark keeps who pressed it ('by').
+// Nic L19: a bookkeeper the owner keeps away from money coming in ('never')
+// does not make this call either (assertBookkeeperMayMarkNotRent).
+bankFeedRouter.post('/deposits/:id/not-rent', requireBankFiler, async (req: any, res, next) => {
   try {
     const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayMarkNotRent(req.user, landlordId)
     const row = await queryOne<{ id: string; amount: string; posted_date: string }>(
       `UPDATE bank_transactions
           SET auto_settle_undo = CASE
@@ -302,10 +592,12 @@ bankFeedRouter.post('/deposits/:id/not-rent', requireLandlord, async (req: any, 
 
 // POST /api/bank-feed/deposits/:id/not-rent/undo — the one-button back-out:
 // the deposit comes back on the rent-matching list exactly as it was (the
-// mark is removed; anything else the column held stays).
-bankFeedRouter.post('/deposits/:id/not-rent/undo', requireLandlord, async (req: any, res, next) => {
+// mark is removed; anything else the column held stays). 10/13 (Nic): the
+// owner's and a bookkeeper's with the bank, like the mark itself.
+bankFeedRouter.post('/deposits/:id/not-rent/undo', requireBankFiler, async (req: any, res, next) => {
   try {
     const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    await assertBookkeeperMayMarkNotRent(req.user, landlordId)
     const row = await queryOne<{ id: string }>(
       `UPDATE bank_transactions
           SET auto_settle_undo = NULLIF(auto_settle_undo - '${NOT_RENT_MARK}', '{}'::jsonb),
@@ -527,10 +819,35 @@ bankFeedRouter.post('/deposit-slips/:id/match', requireLandlord, async (req: any
 
 // POST /api/bank-feed/deposits/:id/undo — take a deposit's match back exactly
 // (a tenant deposit a person confirmed or the feed applied by itself, or a
-// deposit slip). Refused when anything changed since.
+// deposit slip). Refused when anything changed since. 10/14 afternoon: a
+// returned line that took back a tenant's own deposit has its own Undo
+// (services/returnedCheck undoReturnedDeposit), and the deposit it came back
+// from is put back from there, never from its own line. 10/14 follow-up: a
+// Stripe ACH payout GAM matched by its trace code has its own Undo too
+// (services/bankFeed undoTracedPayout — Nic 10/12: "every bank filing
+// (hand-filed too) can be undone").
 bankFeedRouter.post('/deposits/:id/undo', requireLandlord, async (req: any, res, next) => {
   try {
     const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
+    const { RETURNED_DEPOSIT_KIND, CAME_BACK_MARK, undoReturnedDeposit } = await import('../services/returnedCheck')
+    const { TRACED_PAYOUT_KIND, undoTracedPayout } = await import('../services/bankFeed')
+    const line = await queryOne<{ kind: string | null; came_back: string | null; payout: boolean }>(
+      `SELECT auto_settle_undo->>'kind' AS kind, auto_settle_undo->'${CAME_BACK_MARK}'->>'postedDate' AS came_back,
+              matched_disbursement_id IS NOT NULL AS payout
+         FROM bank_transactions WHERE id = $1 AND landlord_id = $2 AND status = 'matched'`, [req.params.id, landlordId])
+    if (line?.payout && line.kind === TRACED_PAYOUT_KIND) {
+      res.json({ success: true, data: await undoTracedPayout({ landlordId, lineId: req.params.id, undoneBy: req.user.userId }) })
+      return
+    }
+    if (line?.kind === RETURNED_DEPOSIT_KIND) {
+      res.json({ success: true, data: await undoReturnedDeposit({
+        lineId: req.params.id, landlordId, undoneBy: req.user.userId,
+      }) })
+      return
+    }
+    if (line?.came_back) {
+      throw new AppError(409, `This deposit came back from your bank on ${line.came_back}, and GAM took it back off the bills it paid. Undo that on the returned line (Undo this match there) to put this deposit's match back.`)
+    }
     const { undoDepositMatch } = await import('../services/bankDepositConfirm')
     res.json({ success: true, data: await undoDepositMatch({
       bankTransactionId: req.params.id, landlordId, undoneBy: req.user.userId,
@@ -539,14 +856,12 @@ bankFeedRouter.post('/deposits/:id/undo', requireLandlord, async (req: any, res,
 })
 
 // POST /api/bank-feed/transactions/:id/undo-auto-file — a deposit that filed
-// itself as income goes back to review; optionally stop that payer filing itself.
+// itself as income (before 10/14, when nothing files itself from a payer's
+// name any more — Nic, answer 16) goes back to review.
 bankFeedRouter.post('/transactions/:id/undo-auto-file', requireLandlord, async (req: any, res, next) => {
   try {
-    const body = z.object({ stopAutoFiling: z.boolean().default(false) }).parse(req.body ?? {})
     const landlordId = await scopeFromRow(req, 'bank_transactions', req.params.id)
     const { undoAutoFile } = await import('../services/bankFeed')
-    res.json({ success: true, data: await undoAutoFile(landlordId, req.params.id, {
-      stopAutoFiling: body.stopAutoFiling, undoneBy: req.user.userId,
-    }) })
+    res.json({ success: true, data: await undoAutoFile(landlordId, req.params.id, { undoneBy: req.user.userId }) })
   } catch (e) { next(e) }
 })

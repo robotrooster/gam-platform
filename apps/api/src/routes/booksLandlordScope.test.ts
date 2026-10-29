@@ -209,26 +209,27 @@ describe('Books bookkeeper access with the S633 pass', () => {
        VALUES ($1, 'x', 'bookkeeper', 'Bk', 'Keeper', TRUE) RETURNING id`, [`bk-${randomUUID()}@t.dev`])).rows[0].id
   }
 
-  it('a landlord can give a bookkeeper its own company\'s books (refused for every landlord before)', async () => {
+  // 10/11 (Nic): the old direct assign is retired — a bookkeeper is given a
+  // company's books only through the Team page invite, with their property
+  // boxes ticked. Nothing is left at the old address.
+  it('the retired assign route is gone: nobody can attach a bookkeeper without boxes', async () => {
     const { a } = await seedTwo()
     const bk = await bookkeeper()
     const res = await request(buildApp()).post('/api/books/bookkeeper/assign')
       .set('Authorization', `Bearer ${landlordPass(a.userId, [a.landlordId])}`)
       .send({ bookkeeperUserId: bk, landlordId: a.landlordId, accessLevel: 'read_only' })
-    expect(res.status).toBe(200)
-    const rows = await db.query(`SELECT 1 FROM bookkeeper_scopes WHERE user_id = $1 AND landlord_id = $2`, [bk, a.landlordId])
-    expect(rows.rowCount).toBe(1)
+    expect(res.status).toBe(404)
+    const rows = await db.query(`SELECT 1 FROM bookkeeper_scopes WHERE user_id = $1`, [bk])
+    expect(rows.rowCount).toBe(0)
   })
 
-  it('a landlord can never give or take away another landlord\'s books', async () => {
+  it('a landlord can never take away another landlord\'s books', async () => {
     const { a, b } = await seedTwo()
     const bk = await bookkeeper()
     const pass = landlordPass(a.userId, [a.landlordId])
-    const assign = await request(buildApp()).post('/api/books/bookkeeper/assign')
-      .set('Authorization', `Bearer ${pass}`)
-      .send({ bookkeeperUserId: bk, landlordId: b.landlordId })
-    expect(assign.status).toBe(403)
-    await db.query(`INSERT INTO bookkeeper_scopes (user_id, landlord_id) VALUES ($1, $2)`, [bk, b.landlordId])
+    await db.query(
+      `INSERT INTO bookkeeper_scopes (user_id, landlord_id, property_ids)
+       VALUES ($1, $2, ARRAY(SELECT id FROM properties WHERE landlord_id = $2))`, [bk, b.landlordId])
     const revoke = await request(buildApp()).delete('/api/books/bookkeeper/revoke')
       .set('Authorization', `Bearer ${pass}`)
       .send({ bookkeeperUserId: bk, landlordId: b.landlordId })

@@ -303,16 +303,12 @@ describe('GET /api/payments', () => {
 
 describe('POST /api/payments/initiate-rent-collection', () => {
   async function setupEligibleUnit(f: Fixture) {
-    // Activate the unit, verify the tenant's ACH, give landlord A an
-    // active bank account row so the eligibility query matches.
+    // Activate the unit, verify the tenant's ACH, and make landlord A payable:
+    // 10/12 (Nic) that means live Stripe Connect payouts, not a row in the
+    // legacy bank catalog (the removed Add Bank Account form).
     await db.query(`UPDATE units SET status='active' WHERE id=$1`, [f.aUnitId])
     await db.query(`UPDATE tenants SET ach_verified=TRUE WHERE id=$1`, [f.tenant1Id])
-    const c = await db.connect()
-    try {
-      await c.query('BEGIN')
-      await seedUserBankAccount(c, { userId: f.aUid })
-      await c.query('COMMIT')
-    } finally { c.release() }
+    await db.query(`UPDATE landlords SET connect_payouts_enabled=TRUE WHERE id=$1`, [f.aLid])
   }
 
   it('non-admin → 403', async () => {
@@ -399,6 +395,19 @@ describe('POST /api/payments/initiate-rent-collection', () => {
     const res = await request(buildApp()).post('/api/payments/initiate-rent-collection')
       .set('Authorization', `Bearer ${f.tokenAdmin}`)
       .send({ targetMonth: '2026-07' })
+    expect(res.body.data.initiated).toBe(0)
+  })
+
+  it('10/12: a landlord with only a legacy bank row (no Connect payouts) is not collected for', async () => {
+    const f = await seed()
+    await setupEligibleUnit(f)
+    await db.query(`UPDATE landlords SET connect_payouts_enabled=FALSE WHERE id=$1`, [f.aLid])
+    const c = await db.connect()
+    try { await seedUserBankAccount(c, { userId: f.aUid }) } finally { c.release() }
+    const res = await request(buildApp()).post('/api/payments/initiate-rent-collection')
+      .set('Authorization', `Bearer ${f.tokenAdmin}`)
+      .send({ targetMonth: '2026-07' })
+    expect(res.status).toBe(200)
     expect(res.body.data.initiated).toBe(0)
   })
 })
@@ -1432,7 +1441,8 @@ describe('POST /api/payments/:id/record-manual', () => {
     expect(rows[0].event_type).toBe('payment_received_late_severe')
     expect(rows[0].attestation_source).toBe('landlord_self_reported_with_evidence')
     expect(rows[0].attestation_evidence).toMatchObject({ manual_method: 'check', reference: 'CHK-77' })
-    expect(rows[0].event_data.payment_id).toBe(pid)
+    // 10/12 (Nic): "one mark per invoice" — the bill's mark, its lines listed.
+    expect(rows[0].event_data.payment_ids).toContain(pid)
   })
 
   it('a check is recorded settled (no disbursement) and the response carries no fee fields', async () => {
@@ -2815,7 +2825,10 @@ describe('credit another bank payment holds, and Pay all (10/4)', () => {
     expect(renewal.creditWaitingNote).toBe(WAITING_50)
     expect(renewal.creditWaitingHeldBy).toEqual([oldLeaseId])
     const old = res.body.data.leases.find((l: any) => l.leaseId === oldLeaseId)
-    expect(old.usableCredit).toBe(0)
+    // 10/18 (Nic): paying September — the oldest bill — replaces its own retry,
+    // so the whole $80 is free for it. A credit the landlord gave is the
+    // household's whichever space it was issued on.
+    expect(old.usableCredit).toBe(80)
     expect(old.creditWaiting).toBe(0)
     expect(old.creditWaitingNote).toBeNull()
   })
@@ -2828,20 +2841,23 @@ describe('credit another bank payment holds, and Pay all (10/4)', () => {
     expect(q.body.data).toMatchObject({ usableCredit: 30, base: 450, creditWaiting: 50, creditWaitingNote: WAITING_50 })
   })
 
-  it('Pay all figures: the old lease first (its retry is replaced), then the renewal with the $80 the replaced retry frees', async () => {
+  // 10/18 (Nic): the run pays the OLDEST bill first and the credit goes there —
+  // September, on the space they are leaving — never to October while
+  // September is open. The run still offers every dollar exactly once.
+  it('Pay all figures: the old lease first, and the whole $80 goes on its September bill', async () => {
     const f = await seed()
     const { oldLeaseId } = await movedCreditHeldByOldRetry(f)
     const res = await context(f)
     const renewal = res.body.data.leases.find((l: any) => l.leaseId === f.lease1Id)
     const old = res.body.data.leases.find((l: any) => l.leaseId === oldLeaseId)
-    expect(old.payAll).toMatchObject({ order: [oldLeaseId, f.lease1Id], usableCredit: 0, payIfUsed: 460 })
-    expect(renewal.payAll).toMatchObject({ order: [oldLeaseId, f.lease1Id], usableCredit: 80, expectedCredit: 80, payIfUsed: 400, creditWaiting: 0, creditWaitingNote: null })
+    expect(old.payAll).toMatchObject({ order: [oldLeaseId, f.lease1Id], usableCredit: 80, expectedCredit: 80, payIfUsed: 380 })
+    expect(renewal.payAll).toMatchObject({ order: [oldLeaseId, f.lease1Id], usableCredit: 0, expectedCredit: 0, payIfUsed: 480, creditWaiting: 0, creditWaitingNote: null })
     // The run's own first charge replaces the retry that held the $50, so the run has nothing waiting.
     expect(old.payAll).toMatchObject({ runCreditWaiting: 0, runCreditWaitingNote: null })
     expect(renewal.payAll).toMatchObject({ runCreditWaiting: 0, runCreditWaitingNote: null })
     // The quote asked with the same order is the same figure.
     const q = await quote(f, { method: 'ach', leaseId: f.lease1Id, useCredit: true, afterLeaseIds: [oldLeaseId] })
-    expect(q.body.data).toMatchObject({ usableCredit: 80, base: 400, creditWaiting: 0, creditWaitingNote: null })
+    expect(q.body.data).toMatchObject({ usableCredit: 0, base: 480, creditWaiting: 0, creditWaitingNote: null })
   })
 
   it('Pay all with Use all charges the old lease and then the renewal in one go — no "Your credit changed"', async () => {
@@ -2854,20 +2870,22 @@ describe('credit another bank payment holds, and Pay all (10/4)', () => {
       .mockImplementationOnce(async () => ({ id: 'pi_payall_old', status: 'processing' }))
       .mockImplementationOnce(async () => ({ id: 'pi_payall_renewal', status: 'processing' }))
     const pay = (body: any) => request(buildApp()).post('/api/payments/pay-balance').set('Authorization', `Bearer ${f.tokenTenant1}`).send(body)
-    // What the pay screen sends (lib/payCredit planCharges with the payAll figures).
+    // What the pay screen sends (lib/payCredit planCharges with the payAll
+    // figures): 10/18, the credit is on the first bill of the run — September,
+    // the oldest — so that is the charge that carries it.
     const first = await pay({ leaseId: oldLeaseId, amount: old.payAll.payIfUsed, paymentMethodId: 'pm_x', paymentMethodType: 'ach',
-      useCredit: false, expectedCredit: 0 })
+      useCredit: true, expectedCredit: old.payAll.expectedCredit })
     expect(first.status, JSON.stringify(first.body)).toBe(200)
+    expect(first.body.data.creditUsed).toBe(80)
     const second = await pay({ leaseId: f.lease1Id, amount: renewal.payAll.payIfUsed, paymentMethodId: 'pm_x', paymentMethodType: 'ach',
-      useCredit: true, expectedCredit: renewal.payAll.expectedCredit })
+      useCredit: false, expectedCredit: 0 })
     expect(second.status, JSON.stringify(second.body)).toBe(200)
-    expect(second.body.data.creditUsed).toBe(80)
     const st = (await db.query<{ id: string; status: string }>(`SELECT id, status FROM payments WHERE id = ANY($1::uuid[])`, [[sept, oct]])).rows
     expect(new Map(st.map(r => [r.id, r.status]))).toEqual(new Map([[sept, 'processing'], [oct, 'processing']]))
     const held = (await db.query<{ payment_id: string; amount: string }>(
       `SELECT payment_id, amount::text AS amount FROM credit_uses WHERE tenant_credit_id = $1 AND status = 'held'`, [special])).rows
-    expect(held).toEqual([{ payment_id: oct, amount: '80.00' }])
-    expect((stripeConnect.createRentPlatformCharge as any).mock.calls.map((c: any[]) => c[0].amount)).toEqual([465, 405])
+    expect(held).toEqual([{ payment_id: sept, amount: '80.00' }])
+    expect((stripeConnect.createRentPlatformCharge as any).mock.calls.map((c: any[]) => c[0].amount)).toEqual([385, 485])
   })
 
   // Fix pass 2: a paused lease's bank retry holds the whole $50 general
@@ -2942,15 +2960,18 @@ describe('credit another bank payment holds, and Pay all (10/4)', () => {
   it('one bill: the rest of the credit on file is said in plain words, on the pay screen and in the quote', async () => {
     const f = await seed()
     const { oldLeaseId } = await movedCreditHeldByOldRetry(f)
-    // $20 tied to the old lease: its only bill is the retrying one.
+    // $20 the landlord gave on the old space, whose only bill is the retrying
+    // one. 10/18 (Nic): it is no longer fenced there, so it pays this bill
+    // instead of sitting unsaid. $50 is still waiting on September's retry.
+    // Money paid ahead on that space WOULD stay there (10/17): the sentence
+    // for that is tested in services/rentCharge.test.ts.
     await db.query(
       `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category)
        VALUES ($1,$2,$3,20,20,'goodwill')`, [f.aLid, f.tenant1Id, oldLeaseId])
-    const REST_20 = '$20.00 of your credit is kept for a bill on another lease.'
     const renewal = (await context(f)).body.data.leases.find((l: any) => l.leaseId === f.lease1Id)
-    expect(renewal).toMatchObject({ creditOnFile: 100, usableCredit: 30, creditWaiting: 50, creditKeptElsewhere: 20, creditKeptForLater: 0, creditAlsoHeld: 0, creditRestNote: REST_20 })
+    expect(renewal).toMatchObject({ creditOnFile: 100, usableCredit: 50, creditWaiting: 50, creditKeptElsewhere: 0, creditKeptForLater: 0, creditAlsoHeld: 0, creditRestNote: null })
     const q = await quote(f, { method: 'ach', leaseId: f.lease1Id, useCredit: true })
-    expect(q.body.data).toMatchObject({ creditOnFile: 100, usableCredit: 30, creditWaiting: 50, creditRestNote: REST_20 })
+    expect(q.body.data).toMatchObject({ creditOnFile: 100, usableCredit: 50, creditWaiting: 50, creditRestNote: null })
   })
 
   it('a bill with nothing left over says no rest sentence', async () => {
@@ -3913,7 +3934,11 @@ describe('Pay all: every dollar of the credit on file is explained', () => {
     }
   })
 
-  it('credit tied to a lease outside the run is said to be kept for that lease, and the parts add up to the credit on file', async () => {
+  // 10/18 (Nic): a credit the landlord GAVE on a space with no bills of its own
+  // still pays the run's bills — it is the household's. Money the tenant PAID
+  // AHEAD on that space does not move (10/17), and that is what "kept for a
+  // bill on another lease" names now.
+  it('credit given on a space outside the run pays the run; money paid ahead there is kept for it, and the parts add up', async () => {
     const f = await seed()
     const two = await secondLease(f)
     const three = await secondLease(f)
@@ -3925,9 +3950,21 @@ describe('Pay all: every dollar of the credit on file is explained', () => {
     const p = res.body.data.leases.find((l: any) => l.leaseId === f.lease1Id).payAll
     const usable = res.body.data.leases.reduce((s: number, l: any) => s + (l.payAll?.usableCredit ?? 0), 0)
     expect(p.runCreditOnFile).toBe(1270)
-    expect(usable).toBe(1000)
-    expect(p.runCreditKeptElsewhere).toBe(270)
+    expect(usable).toBe(1270)
+    expect(p.runCreditKeptElsewhere).toBe(0)
     expect(Math.round((usable + p.runCreditKeptElsewhere + p.runCreditKeptForLater + p.runCreditAlsoHeld) * 100) / 100).toBe(1270)
-    expect(p.runCreditRestNote).toBe('$270.00 of your credit is kept for a bill on another lease.')
+    expect(p.runCreditRestNote).toBeNull()
+
+    // The same $270 as money they paid ahead on that space: it stays there.
+    await db.query(`UPDATE tenant_credits SET status = 'void', voided_at = now() WHERE lease_id = $1`, [three.leaseId])
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by, received_at)
+       VALUES ($1,$2,270,270,'landlord', now())`, [three.leaseId, f.tenant1Id])
+    const after = await context(f)
+    const q = after.body.data.leases.find((l: any) => l.leaseId === f.lease1Id).payAll
+    expect(q.runCreditOnFile).toBe(1270)
+    expect(after.body.data.leases.reduce((s: number, l: any) => s + (l.payAll?.usableCredit ?? 0), 0)).toBe(1000)
+    expect(q.runCreditKeptElsewhere).toBe(270)
+    expect(q.runCreditRestNote).toBe('$270.00 of your credit is kept for a bill on another lease.')
   })
 })

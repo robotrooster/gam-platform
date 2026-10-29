@@ -1,11 +1,13 @@
 /**
- * S655 money plan Step 7 — the three paths that delete unpaid charge rows
+ * S655 money plan Step 7 — the three paths that take unpaid charge rows off
  * (a voided lease's unwind, a shortened stay, a reservation's fee when the
- * reservation is canceled or released) never lose a credit record.
+ * reservation is canceled or released) never lose a credit record. 10/12
+ * (Nic): they VOID the row as a record now (services/chargeVoids) — they
+ * used to delete it.
  *
  * The rules (the database enforces the first two, M4):
  *   - a credit use is never deleted; a use given back (released) keeps its
- *     record with no target when its unpaid row is removed;
+ *     record, and its target now that the unpaid row is voided, not removed;
  *   - a row carrying a live use (held or applied) cannot be deleted;
  *   - a row a payment was TRIED on — a bank or card payment that bounced or is
  *     being retried, a receipt applied to it, credit a payment set aside on it —
@@ -46,10 +48,22 @@ vi.mock('../lib/stripe', async (orig) => ({
 const voidCalls = vi.hoisted(() => ({ n: 0 }))
 vi.mock('./voidDocument', async (orig) => {
   const real = await orig<typeof import('./voidDocument')>()
-  return { ...real, voidDocument: async (...a: Parameters<typeof real.voidDocument>) => { voidCalls.n++; return real.voidDocument(...a) } }
+  return {
+    ...real,
+    voidDocument: async (...a: Parameters<typeof real.voidDocument>) => { voidCalls.n++; return real.voidDocument(...a) },
+    // 10/14 (Nic, #4): the cancel ends the document the one way (endDocument —
+    // erased when no money touched it); a void inside it is counted the same.
+    endDocument: async (...a: Parameters<typeof real.endDocument>) => {
+      const out = await real.endDocument(...a)
+      if (!out.deleted) voidCalls.n++
+      return out
+    },
+  }
 })
 
-import { unwindIssuedLease, returnDepositCountedOnce } from './unwindIssuedLease'
+import { unwindIssuedLease, returnDepositCountedOnce, LEASE_VOIDED_CHARGE_REASON } from './unwindIssuedLease'
+import { RESERVATION_FEE_VOID_REASON } from '../services/commonAreas'
+import { STAY_SHORTENED_RENT_VOID_REASON } from '../services/bookingLeaseBilling'
 import { processTenantEvents, processNewLeaseSignings } from '../jobs/scheduler'
 import { handlePaymentReversal } from '../services/paymentReversal'
 import { reconcileSettledDepositPayment } from '../services/leaseFeesSync'
@@ -115,6 +129,9 @@ async function hold(f: Fx, paymentId: string, amount: number, rem: string, lease
 }
 
 const exists = async (id: string) => (await db.query(`SELECT 1 FROM payments WHERE id = $1`, [id])).rows.length === 1
+/** 10/12 (Nic): a charge taken off is voided as a record, never deleted — its status and why. */
+const voidOf = async (id: string) => (await db.query<{ status: string; void_reason: string | null }>(
+  `SELECT status, void_reason FROM payments WHERE id = $1`, [id])).rows[0]
 const usesOf = async (creditId: string) => (await db.query<{ status: string; payment_id: string | null }>(
   `SELECT status, payment_id FROM credit_uses WHERE tenant_credit_id = $1`, [creditId])).rows
 const remaining = async (creditId: string) =>
@@ -134,8 +151,10 @@ async function unpaidEvent(f: Fx, feeId: string): Promise<string> {
 
 beforeEach(async () => { await cleanupAllSchema(); stripeCancel.mockClear(); voidCalls.n = 0 })
 
-describe('deleting unpaid charges keeps every credit record', () => {
-  it('unwind, stay shortening and common-area release delete unpaid charges that carry only released credit', async () => {
+describe('taking unpaid charges off keeps every credit record', () => {
+  // 10/12 (Nic): each path VOIDS the unpaid charge as a record (it used to
+  // delete it). A use given back (released) keeps its record AND its target.
+  it('unwind, stay shortening and common-area release void unpaid charges that carry only released credit', async () => {
     // ── A reservation released at its start with the deposit unpaid ──
     const a = await fixture()
     const fee = await row(a, { amount: 50, type: 'fee', entry: 'OTHERFEE' })
@@ -145,8 +164,8 @@ describe('deleting unpaid charges keeps every credit record', () => {
     await tx(c => releaseHeldForRemittance(c, aRem, 'payment_failed'))
     const reservation = await unpaidEvent(a, fee)
     await processTenantEvents()
-    expect(await exists(fee)).toBe(false)
-    expect(await usesOf(aCredit)).toEqual([{ status: 'released', payment_id: null }])
+    expect(await voidOf(fee)).toEqual({ status: 'voided', void_reason: RESERVATION_FEE_VOID_REASON })
+    expect(await usesOf(aCredit)).toEqual([{ status: 'released', payment_id: fee }])
     expect(await remaining(aCredit)).toBe(50)
     const res = (await db.query<{ status: string; fee_voided: boolean }>(
       `SELECT status, fee_voided FROM common_area_reservations WHERE id = $1`, [reservation])).rows[0]
@@ -161,8 +180,8 @@ describe('deleting unpaid charges keeps every credit record', () => {
     const out = await tx(c => unwindIssuedLease(c.query.bind(c) as any,
       { id: '00000000-0000-0000-0000-000000000001', lease_id: b.leaseId, issued_at: new Date(), unit_id: b.unitId }))
     expect(out.unwound).toBe(true)
-    expect(await exists(rent)).toBe(false)
-    expect(await usesOf(bCredit)).toEqual([{ status: 'released', payment_id: null }])
+    expect(await voidOf(rent)).toEqual({ status: 'voided', void_reason: LEASE_VOIDED_CHARGE_REASON })
+    expect(await usesOf(bCredit)).toEqual([{ status: 'released', payment_id: rent }])
     expect(await remaining(bCredit)).toBe(60)
 
     // ── A stay shortened on the schedule ──
@@ -182,9 +201,17 @@ describe('deleting unpaid charges keeps every credit record', () => {
     await tx(c => releaseHeldForRemittance(c, sRem, 'superseded'))
     await db.query(`UPDATE unit_bookings SET check_out = '2026-11-15', nights = 97 WHERE id = $1`, [booking])
     await syncLeaseWithBookingDates(booking)
-    expect(await exists(december)).toBe(false)
-    expect(await usesOf(sCredit)).toEqual([{ status: 'released', payment_id: null }])
-    expect(await remaining(sCredit)).toBe(100)
+    expect(await voidOf(december)).toEqual({ status: 'voided', void_reason: STAY_SHORTENED_RENT_VOID_REASON })
+    // The record of the released hold survives the void. 10/15 (Nic): the
+    // freed $100 then goes on the oldest month of the stay that is still open
+    // — "money gets applied to the most outstanding balance first" — so it is
+    // never left sitting beside unpaid rent.
+    const sUses = await usesOf(sCredit)
+    expect(sUses).toContainEqual({ status: 'released', payment_id: december })
+    const spent = sUses.filter((u: any) => u.status === 'applied')
+    expect(spent).toHaveLength(1)
+    expect(spent[0].payment_id).not.toBe(december)
+    expect(await remaining(sCredit)).toBe(0)
   })
 
   it('the database refuses to delete a charge a payment has set credit aside on', async () => {
@@ -807,8 +834,8 @@ describe('a void never strands a charge the landlord recorded', () => {
     const out = await tx(c => unwindIssuedLease(c.query.bind(c) as any,
       { id: docId, lease_id: renewalId, issued_at: new Date(), unit_id: f.unitId }))
     expect(out.unwound).toBe(true)
-    expect(await exists(x.fee)).toBe(false)
-    expect(await exists(x.propaneRow)).toBe(false)
+    expect(await voidOf(x.fee)).toEqual({ status: 'voided', void_reason: LEASE_VOIDED_CHARGE_REASON })
+    expect(await voidOf(x.propaneRow)).toEqual({ status: 'voided', void_reason: LEASE_VOIDED_CHARGE_REASON })
     expect((await db.query(`SELECT status, payment_id, lease_id FROM tenant_one_off_charges WHERE id = $1`, [x.oneOff])).rows[0])
       .toEqual({ status: 'pending', payment_id: null, lease_id: f.leaseId })
     expect((await db.query(`SELECT payment_id FROM propane_fill_installments WHERE id = $1`, [x.installment])).rows[0])

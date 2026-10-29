@@ -16,7 +16,7 @@
  * to /inquiry and land as landlord notifications + property_inquiries.
  */
 // S540: self-hosted fonts — no render-blocking external stylesheet
-import { readBeatMs, typeBeatMs, readGapMs, noticeDelayMs, PAUSE_BEFORE_TYPING_MS, STAY_TERMS_LABEL, type StayTerms } from '@gam/shared'
+import { readBeatMs, typeBeatMs, readGapMs, noticeDelayMs, PAUSE_BEFORE_TYPING_MS, STAY_TERMS_LABEL, type StayTerms, installPrintLightTheme } from '@gam/shared'
 import '@fontsource/syne/600.css'
 import '@fontsource/syne/700.css'
 import '@fontsource/syne/800.css'
@@ -353,7 +353,13 @@ interface TypeAvail {
   longStay: LongStay | null
   altStay: { checkOut: string; nights: number } | null
 }
-/** "Due now: $60.00 deposit + $42.94 background check + $4.19 card fee" */
+/**
+ * "Due now: $60.00 deposit + $46.03 background check + $2.65 card fee"
+ *
+ * 10/21 (Nic): the check is one price wherever it is sold, its processing
+ * already inside it, so the card fee shown here is the one on the stay alone
+ * (propertyBookingQuote dueNowFor).
+ */
 function dueNowWords(d: DueNow, stayWord: string): string {
   return [
     `Due now: ${money(d.stay)} ${stayWord}`,
@@ -1240,5 +1246,10 @@ function PropertyChat({ slug, propertyName }: { slug: string; propertyName: stri
     </div>
   )
 }
+
+// 10/26 (Nic): a printed page is always the light theme, whatever the screen
+// is set to — he printed an eviction balance summary in dark mode and got a
+// solid black sheet. Installed once here; restores the viewer's theme after.
+installPrintLightTheme()
 
 ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>)

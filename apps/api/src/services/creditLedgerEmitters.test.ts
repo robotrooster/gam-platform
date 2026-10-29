@@ -18,8 +18,10 @@
  *
  * Coverage:
  *   - classifyPaymentTier (pure tier-classifier)
- *   - emitPaymentSettledEvent — 5 tier branches + visibility split
- *   - emitPaymentFailedEvent  — single event shape
+ *   - emitPaymentSettledEvent — 10/12 (Nic): "one mark per invoice" — the
+ *     settle brings its BILL's one mark to the payment-health rule
+ *     (services/creditBillMarks; the rule's own tests: creditBillMarks.test.ts)
+ *   - emitPaymentFailedEvent  — 10/12: no mark of its own; the bill's mark
  *   - emitLeaseSignedTenant  / emitLeaseSignedLandlord — per-tenant
  *     fanout, single landlord event, shared dimension tags
  *   - emitInspectionFinalizedEvents — move-in (3 sub-events) /
@@ -59,10 +61,8 @@ import {
   emitRecurringRepairEvent,
   emitHabitabilityUnresolvedEvent,
   emitMultiLandlordHistoryCleanEvent,
-  correctLateMarksForBillsWrittenLate,
 } from './creditLedgerEmitters'
-import { appendEvent, verifyChain } from './creditLedger'
-import type { CreditEventType } from '@gam/shared'
+import { verifyChain } from './creditLedger'
 
 // The score recompute a late-mark correction runs needs the published formula,
 // which the schema-only test database does not carry; record the call instead.
@@ -85,10 +85,9 @@ beforeEach(async () => {
 
 // S652 (Nic): "don't count the onboarding month for anything negative, only
 // positive." The onboarding month is the month of the first rent charge on an
-// existing-tenancy lease.
+// existing-tenancy lease. 10/12: judged per bill (one mark per invoice).
 describe('onboarding month is never negative', () => {
   async function seedOnboarded() {
-    const { seedLandlord, seedProperty, seedUnit, seedTenant, seedLease } = await import('../test/dbHelpers')
     const c = await db.connect()
     try {
       const { userId, landlordId } = await seedLandlord(c)
@@ -96,39 +95,44 @@ describe('onboarding month is never negative', () => {
       const unitId = await seedUnit(c, { propertyId, landlordId })
       const tenantId = await seedTenant(c)
       const leaseId = await seedLease(c, { unitId, landlordId, startDate: '2024-03-01' })
+      await seedLeaseTenant(c, { leaseId, tenantId })
       await c.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [leaseId])
-      // Written a week before each due date, as the bill run does.
-      const pay = async (due: string) => (await c.query<{ id: string }>(
-        `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description, due_date, created_at)
-         VALUES ($1,$2,$3,$4,'rent',900,'settled','RENT',$5,$5::date - 7) RETURNING id`, [unitId, tenantId, landlordId, leaseId, due])).rows[0].id
-      return { tenantId, first: await pay('2026-09-01'), second: await pay('2026-10-01') }
+      // One bill a month, written a week before its due date (as the bill run does), paid at `paidAt`.
+      const pay = async (due: string, paidAt: string) => {
+        const inv = (await c.query<{ id: string }>(
+          `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,900,'settled',$6::date - 7) RETURNING id`,
+          [landlordId, tenantId, leaseId, unitId, `INV-${randomUUID().slice(0, 8)}`, due])).rows[0].id
+        return (await c.query<{ id: string }>(
+          `INSERT INTO payments (invoice_id, unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description,
+                                 due_date, created_at, settled_at, manual_method)
+           VALUES ($1,$2,$3,$4,$5,'rent',900,'settled','RENT',$6,$6::date - 7,$7::timestamptz,'cash') RETURNING id`,
+          [inv, unitId, tenantId, landlordId, leaseId, due, paidAt])).rows[0].id
+      }
+      return { tenantId, pay }
     } finally { c.release() }
   }
   const eventsFor = async (tenantId: string) => (await db.query<any>(
     `SELECT ce.event_type FROM credit_events ce JOIN credit_subjects cs ON cs.id = ce.subject_id
-      WHERE cs.subject_type='tenant' AND cs.subject_ref_id=$1 ORDER BY ce.recorded_at`, [tenantId])).rows.map(r => r.event_type)
+      WHERE cs.subject_type='tenant' AND cs.subject_ref_id=$1 AND ce.superseded_by IS NULL ORDER BY ce.recorded_at`, [tenantId])).rows.map(r => r.event_type)
+  const settled = (tenantId: string, paymentId: string) => withTx(c => emitPaymentSettledEvent(c, {
+    tenantId, paymentId, paymentType: 'rent', amount: '900', dueDate: '2026-09-01', settledAt: new Date(), graceDays: 5, stripePaymentIntentId: null,
+  }))
 
   it('a late payment in the onboarding month writes nothing; on time writes a good mark', async () => {
-    const s = await seedOnboarded()
-    await withTx(c => emitPaymentSettledEvent(c, {
-      tenantId: s.tenantId, paymentId: s.first, paymentType: 'rent', amount: '900',
-      dueDate: new Date('2026-09-01T00:00:00Z'), settledAt: new Date('2026-09-28T00:00:00Z'), graceDays: 5, stripePaymentIntentId: null,
-    }))
-    expect(await eventsFor(s.tenantId)).toEqual([])
-    await withTx(c => emitPaymentSettledEvent(c, {
-      tenantId: s.tenantId, paymentId: s.first, paymentType: 'rent', amount: '900',
-      dueDate: new Date('2026-09-01T00:00:00Z'), settledAt: new Date('2026-09-01T12:00:00Z'), graceDays: 5, stripePaymentIntentId: null,
-    }))
-    expect(await eventsFor(s.tenantId)).toEqual(['payment_received_on_time'])
+    const late = await seedOnboarded()
+    await settled(late.tenantId, await late.pay('2026-09-01', '2026-09-28T19:00:00Z'))
+    expect(await eventsFor(late.tenantId)).toEqual([])
+    const onTime = await seedOnboarded()
+    await settled(onTime.tenantId, await onTime.pay('2026-09-01', '2026-09-01T19:00:00Z'))
+    expect(await eventsFor(onTime.tenantId)).toEqual(['payment_received_on_time'])
   })
 
   it('the month after onboarding is scored normally', async () => {
     const s = await seedOnboarded()
-    await withTx(c => emitPaymentSettledEvent(c, {
-      tenantId: s.tenantId, paymentId: s.second, paymentType: 'rent', amount: '900',
-      dueDate: new Date('2026-10-01T00:00:00Z'), settledAt: new Date('2026-10-28T00:00:00Z'), graceDays: 5, stripePaymentIntentId: null,
-    }))
-    expect(await eventsFor(s.tenantId)).toEqual(['payment_received_late_severe'])
+    await settled(s.tenantId, await s.pay('2026-09-01', '2026-09-01T19:00:00Z'))
+    await settled(s.tenantId, await s.pay('2026-10-01', '2026-10-28T19:00:00Z'))
+    expect(await eventsFor(s.tenantId)).toEqual(['payment_received_on_time', 'payment_received_late_severe'])
   })
 })
 
@@ -242,12 +246,29 @@ describe('classifyPaymentTier — the property calendar decides the day (S654)',
     })).toBe('payment_received_on_time')
   })
 
-  it('paid the evening of the last grace day → still within grace', () => {
+  // 10/12 (Nic): "rent due the 1st, 5-day grace → the 6th is late, the day
+  // late fees start." The 5th is the last grace day.
+  it('paid the evening of the last grace day (the 5th) → still within grace', () => {
+    expect(classifyPaymentTier({
+      dueDate: '2026-10-01',
+      settledAt: new Date('2026-10-06T05:00:00Z'),   // 10 pm Oct 5 Phoenix
+      graceDays: 5,
+    })).toBe('payment_received_late_grace')
+  })
+
+  it('paid on the 6th → 1 day past grace (late fees start that night)', () => {
     expect(classifyPaymentTier({
       dueDate: '2026-10-01',
       settledAt: new Date('2026-10-07T05:00:00Z'),   // 10 pm Oct 6 Phoenix
       graceDays: 5,
-    })).toBe('payment_received_late_grace')
+    })).toBe('payment_received_late_minor')
+  })
+
+  it('a grace of 0 never makes the due day itself late', () => {
+    expect(classifyPaymentTier({ dueDate: '2026-10-01', settledAt: new Date('2026-10-01T20:00:00Z'), graceDays: 0 }))
+      .toBe('payment_received_on_time')
+    expect(classifyPaymentTier({ dueDate: '2026-10-01', settledAt: new Date('2026-10-02T20:00:00Z'), graceDays: 0 }))
+      .toBe('payment_received_late_minor')
   })
 
   it('uses the property zone, not Phoenix, when one is given', () => {
@@ -286,20 +307,12 @@ describe('classifyPaymentTier — the property calendar decides the day (S654)',
     } finally { warn.mockRestore() }
   })
 
-  it('emitPaymentSettledEvent with an unrecognized zone still records the event', async () => {
-    const tenantId = randomUUID()
-    await withTx(c => emitPaymentSettledEvent(c, {
-      tenantId, paymentId: randomUUID(), paymentType: 'rent', amount: '1000',
-      dueDate: '2026-10-01', settledAt: new Date('2026-10-02T01:30:00Z'),
-      graceDays: 5, stripePaymentIntentId: null, propertyTz: 'Arizona',
-    }))
-    const e = await readSoleEvent('tenant', tenantId)
-    expect(e.event_type).toBe('payment_received_on_time')
-  })
+  // (A property's zone is always a real one — trg_properties_timezone_real,
+  // S654 — so the bill rule, which reads it in SQL, cannot be undone by one.)
 
-  // S654: the desk (cash/check) settle classified with a Date due date and no
-  // zone, so it always read Phoenix's calendar. It now passes the due day as
-  // text and the property's zone, as the Stripe webhook does.
+  // S654: the desk (cash/check) settle used to classify with no zone, so it
+  // always read Phoenix's calendar. 10/12: the bill rule reads each line's
+  // day on its property's calendar.
   it('a desk cash settle reads the property\'s calendar, not Phoenix\'s', async () => {
     const c = await db.connect()
     let tenantId = ''
@@ -313,24 +326,30 @@ describe('classifyPaymentTier — the property calendar decides the day (S654)',
       const leaseId = await seedLease(c, { unitId, landlordId })
       await seedLeaseTenant(c, { leaseId, tenantId })
       await c.query(`UPDATE leases SET late_fee_grace_days = 5 WHERE id = $1`, [leaseId])
+      const inv = (await c.query<{ id: string }>(
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status, created_at)
+         VALUES ($1,$2,$3,$4,$5,'2026-10-01',1000,'pending','2026-09-25T17:00:00Z') RETURNING id`,
+        [landlordId, tenantId, leaseId, unitId, `INV-${randomUUID().slice(0, 8)}`])).rows[0].id
       const paymentId = await seedRentPayment(c, { unitId, tenantId, landlordId, amount: 1000, status: 'pending' })
-      await c.query(`UPDATE payments SET lease_id = $2, due_date = DATE '2026-10-01', created_at = '2026-09-25T17:00:00Z' WHERE id = $1`, [paymentId, leaseId])
+      await c.query(`UPDATE payments SET lease_id = $2, invoice_id = $3, due_date = DATE '2026-10-01', created_at = '2026-09-25T17:00:00Z' WHERE id = $1`,
+        [paymentId, leaseId, inv])
       await settleManualRentPayment(c, {
         payment: {
           id: paymentId, landlord_id: landlordId, tenant_id: tenantId, unit_id: unitId,
           lease_id: leaseId, due_date: '2026-10-01',
         },
         method: 'cash',
-        // 1:30 am Oct 2 in New York (10:30 pm Oct 1 in Phoenix).
-        settledAt: new Date('2026-10-02T05:30:00Z'),
+        // 1:30 am Oct 6 in New York — the first late day there (10:30 pm Oct 5, the last grace day, in Phoenix).
+        settledAt: new Date('2026-10-06T05:30:00Z'),
       })
       await c.query('COMMIT')
     } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e }
     finally { c.release() }
 
     const e = await readSoleEvent('tenant', tenantId)
-    expect(e.event_type).toBe('payment_received_late_grace')
-    expect(e.event_data.due_date).toBe('2026-10-01')
+    expect(e.event_type).toBe('payment_received_late_minor')
+    expect(e.event_data).toMatchObject({ due_date: '2026-10-01', paid_in_full_on: '2026-10-06', days_past_grace: 1, mark_basis: 'invoice' })
+    // S652: cash the desk recorded is landlord-attested.
     expect(e.attestation_source).toBe('landlord_self_reported_with_evidence')
   })
 
@@ -340,40 +359,21 @@ describe('classifyPaymentTier — the property calendar decides the day (S654)',
       // 7 pm Phoenix on the given day is 02:00Z the next day.
       settledAt: new Date(Date.parse(`${paidPhoenixEvening}T19:00:00-07:00`)),
     })
-    expect(tier('2026-10-09')).toBe('payment_received_late_minor')   // 3 days past Oct 6
-    expect(tier('2026-10-10')).toBe('payment_received_late_major')   // 4 days
-    expect(tier('2026-10-21')).toBe('payment_received_late_major')   // 15 days
-    expect(tier('2026-10-22')).toBe('payment_received_late_severe')  // 16 days
+    // 10/12: the last grace day is Oct 5 (the 6th is the first late day).
+    expect(tier('2026-10-08')).toBe('payment_received_late_minor')   // 3 days past Oct 5
+    expect(tier('2026-10-09')).toBe('payment_received_late_major')   // 4 days
+    expect(tier('2026-10-20')).toBe('payment_received_late_major')   // 15 days
+    expect(tier('2026-10-21')).toBe('payment_received_late_severe')  // 16 days
   })
 
-  it('emitPaymentSettledEvent records the evening payment on time, with the due day as a date', async () => {
-    const tenantId = randomUUID()
-    await withTx(c => emitPaymentSettledEvent(c, {
-      tenantId, paymentId: randomUUID(), paymentType: 'rent', amount: '1000',
-      dueDate: '2026-10-01', settledAt: new Date('2026-10-02T01:30:00Z'),
-      graceDays: 5, stripePaymentIntentId: null, propertyTz: 'America/Phoenix',
-    }))
-    const e = await readSoleEvent('tenant', tenantId)
-    expect(e.event_type).toBe('payment_received_on_time')
-    expect(e.network_visibility).toBe('visible_to_current_landlord')
-    expect(e.event_data.due_date).toBe('2026-10-01')
-  })
-
-  it('emitPaymentFailedEvent records the due day as a date', async () => {
-    const tenantId = randomUUID()
-    await withTx(c => emitPaymentFailedEvent(c, {
-      tenantId, paymentId: randomUUID(), paymentType: 'rent', amount: '1000',
-      dueDate: '2026-10-01', failedAt: new Date('2026-10-02T01:30:00Z'),
-      stripePaymentIntentId: null, failureCode: 'R01', failureMessage: null,
-    }))
-    const e = await readSoleEvent('tenant', tenantId)
-    expect(e.event_data.due_date).toBe('2026-10-01')
-  })
 })
 
 // A bill cannot be late before GAM writes it. A longer stay's rent
 // (bookingLeaseBilling billLongerStay) is written the day the stay grows but
-// carries its month's own due date; the mark counts from the later of the two.
+// carries its month's own due date; the bill's mark counts from the later of
+// the two (the one lateness rule, services/lateness: lateCountsFrom). 10/12
+// (Nic): "one mark per invoice" — each case is a bill, judged by the
+// payment-health rule from its own records when its line settles.
 describe('a bill written after its due date is rated from the day it was written', () => {
   async function seedStay() {
     const c = await db.connect()
@@ -390,16 +390,26 @@ describe('a bill written after its due date is rated from the day it was written
     } finally { c.release() }
   }
   type Stay = Awaited<ReturnType<typeof seedStay>>
-  /** A rent row as GAM wrote it: `writtenAt` is its created_at. */
+  /** The bill (invoice) a row is on: one per due date. */
+  const invoiceFor = async (s: Stay, due: string, writtenAt: string): Promise<string> => {
+    const found = (await db.query<{ id: string }>(`SELECT id FROM invoices WHERE lease_id = $1 AND due_date = $2`, [s.leaseId, due])).rows[0]
+    if (found) return found.id
+    return (await db.query<{ id: string }>(
+      `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,0,'pending',$7::timestamptz) RETURNING id`,
+      [s.landlordId, s.tenantId, s.leaseId, s.unitId, `INV-${randomUUID().slice(0, 8)}`, due, writtenAt])).rows[0].id
+  }
+  /** A rent row as GAM wrote it, on its bill: `writtenAt` is its created_at. */
   const bill = async (s: Stay, b: {
     due: string; writtenAt: string; amount: number; notes: string
-    isRemainder?: boolean; status?: string; reversalId?: string | null
+    isRemainder?: boolean; status?: string; reversalId?: string | null; settledAt?: string; type?: string; entry?: string
   }) => (await db.query<{ id: string }>(
-    `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date,
-                           entry_description, notes, is_remainder, revenue_owner, created_at, reversal_id)
-     VALUES ($1,$2,$3,$4,'rent',$5,$6,$7::date,'RENT',$8,$9,'landlord',$10::timestamptz,$11) RETURNING id`,
-    [s.unitId, s.leaseId, s.tenantId, s.landlordId, b.amount, b.status ?? 'pending', b.due, b.notes,
-     b.isRemainder ?? false, b.writtenAt, b.reversalId ?? null])).rows[0].id
+    `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date,
+                           entry_description, notes, is_remainder, revenue_owner, created_at, reversal_id, settled_at, manual_method)
+     VALUES ($1,$2,$3,$4,$5,$15,$6,$7,$8::date,$16,$9,$10,'landlord',$11::timestamptz,$12,$13::timestamptz,$14) RETURNING id`,
+    [await invoiceFor(s, b.due, b.writtenAt), s.unitId, s.leaseId, s.tenantId, s.landlordId, b.amount, b.status ?? 'pending', b.due, b.notes,
+     b.isRemainder ?? false, b.writtenAt, b.reversalId ?? null, b.settledAt ?? null, b.settledAt ? 'cash' : null,
+     b.type ?? 'rent', b.entry ?? 'RENT'])).rows[0].id
   /** Cash at the desk for that one row, at `at`. */
   const payAtDesk = (s: Stay, paymentId: string, due: string, at: string) => withTx(c => settleManualRentPayment(c, {
     payment: { id: paymentId, landlord_id: s.landlordId, tenant_id: s.tenantId, unit_id: s.unitId, lease_id: s.leaseId, due_date: due },
@@ -413,8 +423,13 @@ describe('a bill written after its due date is rated from the day it was written
       await afterRowsSettled(c, [paymentId], { attestationSource: 'stripe_attested', receipt: null })
     })
   }
+  /** A row already settled, its bill judged as a settle judges it. */
+  const settledNow = (s: Stay, paymentId: string) => withTx(c => emitPaymentSettledEvent(c, {
+    tenantId: s.tenantId, paymentId, paymentType: 'rent', amount: '0', dueDate: '2026-01-01',
+    settledAt: new Date(), graceDays: null, stripePaymentIntentId: null,
+  }))
   const markOf = async (s: Stay) => {
-    const all = await readAllEvents('tenant', s.tenantId)
+    const all = (await readAllEvents('tenant', s.tenantId)).filter(e => !e.superseded_by)
     expect(all).toHaveLength(1)
     return all[0]
   }
@@ -430,8 +445,7 @@ describe('a bill written after its due date is rated from the day it was written
     const e = await markOf(s)
     expect(e.event_type).toBe('payment_received_on_time')
     expect(e.network_visibility).toBe('visible_to_current_landlord')
-    expect(e.event_data.due_date).toBe('2026-10-01')
-    expect(e.event_data.billed_on).toBe('2026-10-10')
+    expect(e.event_data).toMatchObject({ due_date: '2026-10-01', first_late_day: '2026-10-15', paid_in_full_on: '2026-10-10' })
   })
 
   it('a longer-stay bill paid the day it is billed is on time on the credit record (a whole month written after the catch-up window)', async () => {
@@ -444,19 +458,18 @@ describe('a bill written after its due date is rated from the day it was written
     await payOnline(id, '2026-12-10T22:00:00Z')
     const e = await markOf(s)
     expect(e.event_type).toBe('payment_received_on_time')
-    expect(e.attestation_source).toBe('stripe_attested')
-    expect(e.event_data.due_date).toBe('2026-11-01')
-    expect(e.event_data.billed_on).toBe('2026-12-10')
+    expect(e.attestation_source).toBe('system_derived')
+    expect(e.event_data).toMatchObject({ due_date: '2026-11-01', first_late_day: '2026-12-15' })
   })
 
-  it('a longer-stay bill gets its grace days from the day it was written', async () => {
+  it('a longer-stay bill gets its grace days from the day it was written (within them is on time)', async () => {
     const s = await seedStay()
     const id = await bill(s, {
       due: '2026-10-01', writtenAt: '2026-10-10T17:00:00Z', amount: 520.97, isRemainder: true,
       notes: 'Stay now ends November 1, 2026: the rest of October 2026',
     })
     await payAtDesk(s, id, '2026-10-01', '2026-10-14T22:00:00Z')   // 4 days after it was written
-    expect((await markOf(s)).event_type).toBe('payment_received_late_grace')
+    expect((await markOf(s)).event_type).toBe('payment_received_on_time')
   })
 
   it('a longer-stay bill paid well after it was written is still late', async () => {
@@ -465,66 +478,60 @@ describe('a bill written after its due date is rated from the day it was written
       due: '2026-10-01', writtenAt: '2026-10-10T17:00:00Z', amount: 520.97, isRemainder: true,
       notes: 'Stay now ends November 1, 2026: the rest of October 2026',
     })
-    // Grace ends Oct 15 (5 days from Oct 10); Oct 25 is 10 days past it.
+    // The first late day is Oct 15 (5 days from Oct 10); Oct 25 is 11 days past grace.
     await payAtDesk(s, id, '2026-10-01', '2026-10-25T22:00:00Z')
     const e = await markOf(s)
     expect(e.event_type).toBe('payment_received_late_major')
+    expect(e.event_data.days_past_grace).toBe(11)
     expect(e.network_visibility).toBe('visible_to_gam_network')
   })
 
   it('a bill written before its due date and paid late is still late, counted from the due date', async () => {
     const s = await seedStay()
     const id = await bill(s, { due: '2026-10-01', writtenAt: '2026-09-25T17:00:00Z', amount: 950, notes: 'October rent' })
-    // Grace ends Oct 6; Oct 10 is 4 days past it.
+    // The first late day is Oct 6; Oct 10 is 5 days past grace.
     await payAtDesk(s, id, '2026-10-01', '2026-10-10T22:00:00Z')
     const e = await markOf(s)
     expect(e.event_type).toBe('payment_received_late_major')
-    expect(e.event_data.billed_on).toBeUndefined()
+    expect(e.event_data).toMatchObject({ first_late_day: '2026-10-06', days_past_grace: 5 })
   })
 
   it('a payment recorded on a bill written after the money arrived is rated from its due date', async () => {
     const s = await seedStay()
-    // History written up later: March's rent, paid March 21, is recorded on a
+    // History written up later: March's rent, paid March 20, is recorded on a
     // row GAM wrote on Oct 3. The row records an older bill; the money came in
-    // 20 days after the due date, so the payment is late.
-    const id = await bill(s, { due: '2026-03-01', writtenAt: '2026-10-03T17:00:00Z', amount: 950, notes: 'March rent' })
-    await withTx(c => emitPaymentSettledEvent(c, {
-      tenantId: s.tenantId, paymentId: id, paymentType: 'rent', amount: '950',
-      dueDate: '2026-03-01', settledAt: new Date('2026-03-21T19:00:00Z'), graceDays: 5,
-      stripePaymentIntentId: null, propertyTz: 'America/Phoenix',
-    }))
+    // 15 days past grace, so the payment is late.
+    const id = await bill(s, {
+      due: '2026-03-01', writtenAt: '2026-10-03T17:00:00Z', amount: 950, notes: 'March rent',
+      status: 'settled', settledAt: '2026-03-20T19:00:00Z',
+    })
+    await settledNow(s, id)
     const e = await markOf(s)
-    // Grace ends March 6; March 21 is 15 days past it.
     expect(e.event_type).toBe('payment_received_late_major')
     expect(e.network_visibility).toBe('visible_to_gam_network')
-    expect(e.event_data.due_date).toBe('2026-03-01')
-    expect(e.event_data.billed_on).toBeUndefined()
+    expect(e.event_data).toMatchObject({ due_date: '2026-03-01', first_late_day: '2026-03-06', days_past_grace: 15 })
   })
 
   it('a bill written on the day its money came in still counts from the day it was written', async () => {
     const s = await seedStay()
-    // Written at 10 am, paid at 3 pm the same day: the day it was written is
-    // not after the day it was paid.
+    // Written at 10 am, paid at 3 pm the same day.
     const id = await bill(s, {
       due: '2026-10-01', writtenAt: '2026-10-10T17:00:00Z', amount: 520.97, isRemainder: true,
       notes: 'Stay now ends November 1, 2026: the rest of October 2026',
+      status: 'settled', settledAt: '2026-10-10T22:00:00Z',
     })
-    await withTx(c => emitPaymentSettledEvent(c, {
-      tenantId: s.tenantId, paymentId: id, paymentType: 'rent', amount: '520.97',
-      dueDate: '2026-10-01', settledAt: new Date('2026-10-10T22:00:00Z'), graceDays: 5,
-      stripePaymentIntentId: null, propertyTz: 'America/Phoenix',
-    }))
+    await settledNow(s, id)
     const e = await markOf(s)
     expect(e.event_type).toBe('payment_received_on_time')
-    expect(e.event_data.billed_on).toBe('2026-10-10')
+    expect(e.event_data.first_late_day).toBe('2026-10-15')
   })
 
   it('the rest of a part-paid old bill counts from that bill, not from the day it was split off', async () => {
     const s = await seedStay()
-    // October's bill (written Sep 25) was paid down at the desk on Nov 5; the
-    // rest went on its own row that day and was paid the same day.
+    // October's bill (written Sep 25) was paid down at the desk on Oct 28; the
+    // rest went on its own row on Nov 5 and was paid the same day.
     await bill(s, {
-      due: '2026-10-01', writtenAt: '2026-09-25T17:00:00Z', amount: 500, status: 'settled',
+      due: '2026-10-01', writtenAt: '2026-09-25T17:00:00Z', amount: 500, status: 'settled', settledAt: '2026-10-28T17:00:00Z',
       notes: 'October rent — partly paid toward the old balance; $450.00 remains on a separate row',
     })
     const rest = await bill(s, {
@@ -534,23 +541,21 @@ describe('a bill written after its due date is rated from the day it was written
     await payAtDesk(s, rest, '2026-10-01', '2026-11-05T22:00:00Z')
     const e = await markOf(s)
     expect(e.event_type).toBe('payment_received_late_severe')
-    expect(e.event_data.billed_on).toBeUndefined()
+    expect(e.event_data).toMatchObject({ first_late_day: '2026-10-06', paid_in_full_on: '2026-11-05' })
   })
 
-  it('only rent and utility rows carry a payment mark: a late fee or a home payment writes nothing', async () => {
+  it('a late fee is never a bill\'s mark; a home payment is part of its bill', async () => {
     const s = await seedStay()
-    for (const [type, entry] of [['late_fee', 'LATEFEE'], ['home_payment', 'HOMEPMT']] as const) {
-      const id = (await db.query<{ id: string }>(
-        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
-         VALUES ($1,$2,$3,$4,$5,50,'settled','2026-10-01',$6) RETURNING id`,
-        [s.unitId, s.leaseId, s.tenantId, s.landlordId, type, entry])).rows[0].id
-      await withTx(c => emitPaymentSettledEvent(c, {
-        tenantId: s.tenantId, paymentId: id, paymentType: 'rent', amount: '50',
-        dueDate: '2026-10-01', settledAt: new Date('2026-10-20T22:00:00Z'), graceDays: 5,
-        stripePaymentIntentId: 'pi_beside_rent', propertyTz: 'America/Phoenix',
-      }))
-    }
+    // A bill with only a late fee on it: nothing to judge.
+    const fee = await bill(s, { due: '2026-09-01', writtenAt: '2026-08-25T17:00:00Z', amount: 50, notes: 'Late fee',
+      type: 'late_fee', entry: 'LATEFEE', status: 'settled', settledAt: '2026-09-20T22:00:00Z' })
+    await settledNow(s, fee)
     expect(await readAllEvents('tenant', s.tenantId)).toHaveLength(0)
+    // A home payment paid on the 20th: its bill is paid late.
+    const home = await bill(s, { due: '2026-10-01', writtenAt: '2026-09-25T17:00:00Z', amount: 50, notes: 'Home payment',
+      type: 'home_payment', entry: 'HOMEPMT', status: 'settled', settledAt: '2026-10-20T22:00:00Z' })
+    await settledNow(s, home)
+    expect((await markOf(s)).event_type).toBe('payment_received_late_major')
   })
 
   it('a row reopened after a reversal counts from the bill it reopens', async () => {
@@ -565,303 +570,157 @@ describe('a bill written after its due date is rated from the day it was written
       [original, s.landlordId, s.tenantId, s.leaseId, `evt_${randomUUID()}`])).rows[0].id
     const reopened = await bill(s, {
       due: '2026-10-01', writtenAt: '2026-11-05T17:00:00Z', amount: 950,
-      notes: 'Reopened after payment reversal', reversalId: rev,
+      notes: 'Reopened after payment reversal', reversalId: rev, status: 'settled', settledAt: '2026-11-05T22:00:00Z',
     })
-    await withTx(c => emitPaymentSettledEvent(c, {
-      tenantId: s.tenantId, paymentId: reopened, paymentType: 'rent', amount: '950',
-      dueDate: '2026-10-01', settledAt: new Date('2026-11-05T22:00:00Z'), graceDays: 5,
-      stripePaymentIntentId: null, propertyTz: 'America/Phoenix',
-    }))
-    expect((await markOf(s)).event_type).toBe('payment_received_late_severe')
-  })
-
-  // ── Marks written before the rule: corrected once, at deploy ──────────────
-
-  /** A late mark as the emitter wrote it before it read the day the bill was written. */
-  const oldMark = (s: Stay, paymentId: string, m: { tier: CreditEventType; due: string; paidAt: string }) =>
-    appendEvent({
-      subjectType: 'tenant', subjectRefId: s.tenantId, eventType: m.tier,
-      eventData: {
-        payment_id: paymentId, payment_type: 'rent', amount: '520.97',
-        due_date: m.due, paid_at: new Date(m.paidAt).toISOString(), grace_days: 5,
-      },
-      occurredAt: new Date(m.paidAt),
-      attestationSource: 'stripe_attested',
-      attestationEvidence: { stripe_payment_intent_id: 'pi_before_the_rule' },
-      dimensionTags: ['payment_reliability'],
-      networkVisibility: 'visible_to_gam_network',
-    })
-  /** The rest of October, written Oct 10 (10 am Phoenix), due Oct 1. */
-  const restOfOctober = (s: Stay) => bill(s, {
-    due: '2026-10-01', writtenAt: '2026-10-10T17:00:00Z', amount: 520.97, isRemainder: true, status: 'settled',
-    notes: 'Stay now ends November 1, 2026: the rest of October 2026',
-  })
-
-  it('a late mark written before the rule, on a bill paid the day it was written, is replaced by an on-time mark that names the day it was billed', async () => {
-    const s = await seedStay()
-    const id = await restOfOctober(s)
-    const old = await oldMark(s, id, { tier: 'payment_received_late_major', due: '2026-10-01', paidAt: '2026-10-10T22:00:00Z' })
-
-    const fixed = await correctLateMarksForBillsWrittenLate({ dryRun: false })
-
-    expect(fixed).toEqual([{
-      eventId: old.eventId, correctedEventId: expect.any(String), tenantId: s.tenantId, paymentId: id,
-      dueDate: '2026-10-01', billedOn: '2026-10-10',
-      was: 'payment_received_late_major', now: 'payment_received_on_time',
-    }])
-    const [before, after] = await readAllEvents('tenant', s.tenantId)
-    // The late mark stays in the chain, superseded, so scores skip it.
-    expect(before.id).toBe(old.eventId)
-    expect(before.superseded_by).toBe(after.id)
-    expect(before.superseded_reason).toBe('data_entry_error_corrected')
-    // The good mark the current landlord sees, for the same payment and time.
-    expect(after.event_type).toBe('payment_received_on_time')
-    expect(after.network_visibility).toBe('visible_to_current_landlord')
-    expect(after.superseded_by).toBeNull()
-    expect(after.event_data).toMatchObject({
-      payment_id: id, due_date: '2026-10-01', billed_on: '2026-10-10',
-      paid_at: '2026-10-10T22:00:00.000Z', grace_days: 5, corrects_event_id: old.eventId,
-    })
-    expect(new Date(after.occurred_at).toISOString()).toBe('2026-10-10T22:00:00.000Z')
-    expect(after.attestation_source).toBe('stripe_attested')
-    expect(after.attestation_evidence).toEqual({ stripe_payment_intent_id: 'pi_before_the_rule' })
-    // Appended, never rewritten: the hash chain still checks out.
-    expect((await verifyChain(old.subjectId)).ok).toBe(true)
-    // The tenant's score is worked out again without the late mark.
-    expect(recomputeMock.mock.calls).toEqual([[old.subjectId]])
-  })
-
-  it('a dry run of the late-mark correction lists what it would change and changes nothing', async () => {
-    const s = await seedStay()
-    const id = await restOfOctober(s)
-    const old = await oldMark(s, id, { tier: 'payment_received_late_major', due: '2026-10-01', paidAt: '2026-10-14T22:00:00Z' })
-
-    const listed = await correctLateMarksForBillsWrittenLate({ dryRun: true })
-
-    // Paid four days after it was written: within grace, counted from that day.
-    expect(listed).toEqual([expect.objectContaining({
-      eventId: old.eventId, correctedEventId: null, now: 'payment_received_late_grace',
-    })])
-    const all = await readAllEvents('tenant', s.tenantId)
-    expect(all).toHaveLength(1)
-    expect(all[0].superseded_by).toBeNull()
-    expect(recomputeMock).not.toHaveBeenCalled()
-  })
-
-  it('a late mark still late when counted from the day the bill was written is left as it is', async () => {
-    const s = await seedStay()
-    const id = await restOfOctober(s)
-    // Grace ends Oct 15 (5 days from Oct 10); Oct 25 is 10 days past it: late_major either way.
-    await oldMark(s, id, { tier: 'payment_received_late_major', due: '2026-10-01', paidAt: '2026-10-25T22:00:00Z' })
-    expect(await correctLateMarksForBillsWrittenLate({ dryRun: false })).toEqual([])
-    const all = await readAllEvents('tenant', s.tenantId)
-    expect(all).toHaveLength(1)
-    expect(all[0].superseded_by).toBeNull()
-  })
-
-  it('a late mark on a row written after its money came in is left as it is', async () => {
-    const s = await seedStay()
-    // March's rent, paid March 21, written up on a row GAM wrote on Oct 3.
-    const id = await bill(s, { due: '2026-03-01', writtenAt: '2026-10-03T17:00:00Z', amount: 950, status: 'settled', notes: 'March rent' })
-    await oldMark(s, id, { tier: 'payment_received_late_major', due: '2026-03-01', paidAt: '2026-03-21T19:00:00Z' })
-    expect(await correctLateMarksForBillsWrittenLate({ dryRun: false })).toEqual([])
-    const all = await readAllEvents('tenant', s.tenantId)
-    expect(all).toHaveLength(1)
-    expect(all[0].superseded_by).toBeNull()
-  })
-
-  it('a late mark on a bill written before its due date is left as it is', async () => {
-    const s = await seedStay()
-    const id = await bill(s, { due: '2026-10-01', writtenAt: '2026-09-25T17:00:00Z', amount: 950, status: 'settled', notes: 'October rent' })
-    await oldMark(s, id, { tier: 'payment_received_late_major', due: '2026-10-01', paidAt: '2026-10-10T22:00:00Z' })
-    expect(await correctLateMarksForBillsWrittenLate({ dryRun: false })).toEqual([])
-    expect((await readAllEvents('tenant', s.tenantId))[0].superseded_by).toBeNull()
-  })
-
-  it('a late mark that is less late counted from the day the bill was written is replaced by the lesser late mark', async () => {
-    const s = await seedStay()
-    const id = await restOfOctober(s)
-    // Paid Oct 17: 11 days past grace from the due date, 2 days past grace from Oct 10.
-    const old = await oldMark(s, id, { tier: 'payment_received_late_major', due: '2026-10-01', paidAt: '2026-10-17T22:00:00Z' })
-    expect(await correctLateMarksForBillsWrittenLate({ dryRun: false })).toEqual([
-      expect.objectContaining({ eventId: old.eventId, was: 'payment_received_late_major', now: 'payment_received_late_minor' }),
-    ])
-    const [, after] = await readAllEvents('tenant', s.tenantId)
-    expect(after.event_type).toBe('payment_received_late_minor')
-    expect(after.network_visibility).toBe('visible_to_gam_network')
-  })
-
-  it('a late mark in the onboarding month that is still late counted from the day the bill was written is never replaced by another late mark', async () => {
-    const s = await seedStay()
-    // The household moved onto GAM mid-tenancy: this is its first rent month.
-    await db.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [s.leaseId])
-    const id = await restOfOctober(s)
-    await oldMark(s, id, { tier: 'payment_received_late_major', due: '2026-10-01', paidAt: '2026-10-17T22:00:00Z' })
-    expect(await correctLateMarksForBillsWrittenLate({ dryRun: false })).toEqual([])
-    const all = await readAllEvents('tenant', s.tenantId)
-    expect(all).toHaveLength(1)
-    expect(all[0].superseded_by).toBeNull()
-  })
-
-  it('a late mark in the onboarding month on a bill paid the day it was written becomes an on-time mark', async () => {
-    const s = await seedStay()
-    await db.query(`UPDATE leases SET is_existing_tenancy = TRUE WHERE id = $1`, [s.leaseId])
-    const id = await restOfOctober(s)
-    await oldMark(s, id, { tier: 'payment_received_late_major', due: '2026-10-01', paidAt: '2026-10-10T22:00:00Z' })
-    expect(await correctLateMarksForBillsWrittenLate({ dryRun: false })).toEqual([
-      expect.objectContaining({ now: 'payment_received_on_time' }),
-    ])
-  })
-
-  it('the late-mark correction runs once: a second run finds nothing', async () => {
-    const s = await seedStay()
-    const id = await restOfOctober(s)
-    await oldMark(s, id, { tier: 'payment_received_late_minor', due: '2026-10-01', paidAt: '2026-10-10T22:00:00Z' })
-    expect(await correctLateMarksForBillsWrittenLate({ dryRun: false })).toHaveLength(1)
-    expect(await correctLateMarksForBillsWrittenLate({ dryRun: false })).toEqual([])
-    expect(await readAllEvents('tenant', s.tenantId)).toHaveLength(2)
-  })
-
-  it('a mark written under the rule (it records billed_on) is never corrected again', async () => {
-    const s = await seedStay()
-    const id = await bill(s, {
-      due: '2026-10-01', writtenAt: '2026-10-10T17:00:00Z', amount: 520.97, isRemainder: true,
-      notes: 'Stay now ends November 1, 2026: the rest of October 2026',
-    })
-    await payAtDesk(s, id, '2026-10-01', '2026-10-25T22:00:00Z')
-    expect((await markOf(s)).event_data.billed_on).toBe('2026-10-10')
-    expect(await correctLateMarksForBillsWrittenLate({ dryRun: false })).toEqual([])
+    await settledNow(s, reopened)
+    const e = await markOf(s)
+    expect(e.event_type).toBe('payment_received_late_severe')
+    // The 'returned' original is left out; the reopened row carries the bill.
+    expect(e.event_data.payment_ids).toEqual([reopened])
   })
 })
 
 // ─── emitPaymentSettledEvent ───────────────────────────────────
+//
+// 10/12 (Nic): "one mark per invoice." The settle of any line brings its
+// bill's ONE mark to the payment-health rule; the arguments besides the row
+// are no longer read (creditBillMarks.test.ts holds the rule's own cases).
 
 describe('emitPaymentSettledEvent', () => {
-  const tenantId = randomUUID()
-  const paymentId = randomUUID()
-  const due = new Date('2026-06-01T00:00:00Z')
+  async function onBill(o: { lines: Array<{ type: 'rent' | 'utility'; amount: number; settledAt: string | null }>; grace?: number | null }) {
+    const c = await db.connect()
+    try {
+      const { userId, landlordId } = await seedLandlord(c)
+      const tenantId = await seedTenant(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      await c.query(`UPDATE properties SET timezone = 'America/Phoenix', late_fee_grace_days = 5 WHERE id = $1`, [propertyId])
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const leaseId = await seedLease(c, { unitId, landlordId, startDate: '2026-05-01' })
+      await seedLeaseTenant(c, { leaseId, tenantId })
+      await c.query(`UPDATE leases SET late_fee_grace_days = $2 WHERE id = $1`, [leaseId, o.grace ?? null])
+      const inv = (await c.query<{ id: string }>(
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status, created_at)
+         VALUES ($1,$2,$3,$4,$5,'2026-06-01',0,'pending','2026-05-25T17:00:00Z') RETURNING id`,
+        [landlordId, tenantId, leaseId, unitId, `INV-${randomUUID().slice(0, 8)}`])).rows[0].id
+      const ids: string[] = []
+      for (const l of o.lines) {
+        ids.push((await c.query<{ id: string }>(
+          `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date,
+                                 entry_description, created_at, settled_at, manual_method)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'2026-06-01',$9,'2026-05-25T17:00:00Z',$10::timestamptz,$11) RETURNING id`,
+          [inv, unitId, leaseId, tenantId, landlordId, l.type, l.amount, l.settledAt ? 'settled' : 'pending',
+           l.type === 'rent' ? 'RENT' : 'UTILITY', l.settledAt, l.settledAt ? 'cash' : null])).rows[0].id)
+      }
+      return { tenantId, invoiceId: inv, ids }
+    } finally { c.release() }
+  }
+  const emit = (tenantId: string, paymentId: string) => withTx(c => emitPaymentSettledEvent(c, {
+    tenantId, paymentId, paymentType: 'rent', amount: '1000.00', dueDate: '2026-06-01',
+    settledAt: new Date('2030-01-01T00:00:00Z'), graceDays: 5, stripePaymentIntentId: 'pi_not_read',
+  }))
 
-  it('on_time → visible_to_current_landlord (positive)', async () => {
-    await withTx(c => emitPaymentSettledEvent(c, {
-      tenantId, paymentId, paymentType: 'rent',
-      amount: '1000.00',
-      dueDate: due,
-      settledAt: new Date('2026-06-01T18:00:00Z'),
-      graceDays: 5,
-      stripePaymentIntentId: 'pi_test_on_time',
-    }))
-    const e = await readSoleEvent('tenant', tenantId)
+  it('on time → visible_to_current_landlord (positive), derived from the bill\'s records', async () => {
+    const b = await onBill({ lines: [{ type: 'rent', amount: 1000, settledAt: '2026-06-01T18:00:00Z' }] })
+    await emit(b.tenantId, b.ids[0])
+    const e = await readSoleEvent('tenant', b.tenantId)
     expect(e.event_type).toBe('payment_received_on_time')
     expect(e.network_visibility).toBe('visible_to_current_landlord')
     expect(e.dimension_tags).toEqual(['payment_reliability'])
-    expect(e.attestation_source).toBe('stripe_attested')
-    expect(e.attestation_evidence).toEqual({ stripe_payment_intent_id: 'pi_test_on_time' })
-    expect(e.event_data.payment_id).toBe(paymentId)
-    expect(e.event_data.amount).toBe('1000.00')
-    expect(e.event_data.grace_days).toBe(5)
+    // S652: cash the desk recorded — landlord-attested, the method its evidence.
+    expect(e.attestation_source).toBe('landlord_self_reported_with_evidence')
+    expect(e.attestation_evidence).toEqual({ bill_key: b.invoiceId, invoice_id: b.invoiceId, payment_ids: b.ids, manual_method: 'cash' })
+    expect(e.event_data).toMatchObject({ mark_basis: 'invoice', invoice_id: b.invoiceId, charged: '1000.00', grace_days: 5 })
   })
 
-  it('late_grace → still visible_to_current_landlord (within grace = positive)', async () => {
-    await withTx(c => emitPaymentSettledEvent(c, {
-      tenantId, paymentId, paymentType: 'rent',
-      amount: 950,
-      dueDate: due,
-      settledAt: new Date('2026-06-04T12:00:00Z'),
-      graceDays: 5,
-      stripePaymentIntentId: 'pi_late_grace',
-    }))
-    const e = await readSoleEvent('tenant', tenantId)
-    expect(e.event_type).toBe('payment_received_late_grace')
+  it('within the grace period is on time (one rule: no "within grace" tier on a bill)', async () => {
+    const b = await onBill({ lines: [{ type: 'rent', amount: 950, settledAt: '2026-06-04T19:00:00Z' }] })
+    await emit(b.tenantId, b.ids[0])
+    const e = await readSoleEvent('tenant', b.tenantId)
+    expect(e.event_type).toBe('payment_received_on_time')
     expect(e.network_visibility).toBe('visible_to_current_landlord')
-    expect(e.event_data.amount).toBe('950')         // number → String(950)
   })
 
-  it('late_minor → visible_to_gam_network (adverse)', async () => {
-    await withTx(c => emitPaymentSettledEvent(c, {
-      tenantId, paymentId, paymentType: 'rent',
-      amount: '1000',
-      dueDate: due,
-      settledAt: new Date('2026-06-08T00:00:00Z'),
-      graceDays: 5,
-      stripePaymentIntentId: 'pi_late_minor',
-    }))
-    const e = await readSoleEvent('tenant', tenantId)
+  it('paid on the first late day → late, minor, visible_to_gam_network (adverse)', async () => {
+    const b = await onBill({ lines: [{ type: 'rent', amount: 1000, settledAt: '2026-06-06T19:00:00Z' }] })
+    await emit(b.tenantId, b.ids[0])
+    const e = await readSoleEvent('tenant', b.tenantId)
     expect(e.event_type).toBe('payment_received_late_minor')
     expect(e.network_visibility).toBe('visible_to_gam_network')
   })
 
-  it('null stripePaymentIntentId → attestation_evidence is empty object', async () => {
-    await withTx(c => emitPaymentSettledEvent(c, {
-      tenantId, paymentId, paymentType: 'utility',
-      amount: '85.50',
-      dueDate: due,
-      settledAt: new Date('2026-06-01T08:00:00Z'),
-      graceDays: 5,
-      stripePaymentIntentId: null,
-    }))
-    const e = await readSoleEvent('tenant', tenantId)
-    expect(e.attestation_evidence).toEqual({})
-    expect(e.event_data.payment_type).toBe('utility')
+  it('rent and utility settled together: one mark for the bill, written once', async () => {
+    const b = await onBill({ lines: [
+      { type: 'rent', amount: 1000, settledAt: '2026-06-02T18:00:00Z' },
+      { type: 'utility', amount: 85.5, settledAt: '2026-06-02T18:00:00Z' },
+    ] })
+    await withTx(async c => {
+      for (const id of b.ids) {
+        await emitPaymentSettledEvent(c, {
+          tenantId: b.tenantId, paymentId: id, paymentType: 'utility', amount: '85.50', dueDate: '2026-06-01',
+          settledAt: new Date(), graceDays: null, stripePaymentIntentId: null,
+        })
+      }
+    })
+    const e = await readSoleEvent('tenant', b.tenantId)
+    expect(e.event_data.charged).toBe('1085.50')
+    expect((await verifyChain(e.subject_id)).ok).toBe(true)
   })
 
-  it('graceDays NULL → defaults to 5 in event_data', async () => {
-    await withTx(c => emitPaymentSettledEvent(c, {
-      tenantId, paymentId, paymentType: 'rent',
-      amount: '1000',
-      dueDate: due,
-      settledAt: new Date('2026-06-04T12:00:00Z'),
-      graceDays: null,
-      stripePaymentIntentId: 'pi_default_grace',
-    }))
-    const e = await readSoleEvent('tenant', tenantId)
-    expect(e.event_type).toBe('payment_received_late_grace') // grace=5 used
+  it('no grace on the lease → the property\'s (5 days here)', async () => {
+    const b = await onBill({ lines: [{ type: 'rent', amount: 1000, settledAt: '2026-06-05T19:00:00Z' }], grace: null })
+    await emit(b.tenantId, b.ids[0])
+    const e = await readSoleEvent('tenant', b.tenantId)
+    expect(e.event_type).toBe('payment_received_on_time')
     expect(e.event_data.grace_days).toBe(5)
   })
 })
 
 // ─── emitPaymentFailedEvent ────────────────────────────────────
+//
+// 10/12 (Nic): "one mark per invoice" — a failed payment is no longer its own
+// mark (payment_failed_nsf). Its bill is judged again: the money that was
+// clearing on it is not, so a bill past grace with nothing paid is "unpaid".
 
 describe('emitPaymentFailedEvent', () => {
-  it('records payment_failed_nsf with full evidence + visibility', async () => {
-    const tenantId = randomUUID()
-    const paymentId = randomUUID()
-    const due = new Date('2026-06-01T00:00:00Z')
-    const failedAt = new Date('2026-06-03T15:30:00Z')
-
-    await withTx(c => emitPaymentFailedEvent(c, {
-      tenantId, paymentId, paymentType: 'rent',
-      amount: '1200.50',
-      dueDate: due,
-      failedAt,
-      stripePaymentIntentId: 'pi_failed_1',
-      failureCode: 'R01',
-      failureMessage: 'Insufficient funds',
+  it('writes no failed-payment mark; the bill, unpaid past grace, carries its one mark', async () => {
+    const c = await db.connect()
+    let tenantId = ''
+    let paymentId = ''
+    try {
+      const { userId, landlordId } = await seedLandlord(c)
+      tenantId = await seedTenant(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const leaseId = await seedLease(c, { unitId, landlordId, startDate: '2026-05-01' })
+      await seedLeaseTenant(c, { leaseId, tenantId })
+      const inv = (await c.query<{ id: string }>(
+        `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status, created_at)
+         VALUES ($1,$2,$3,$4,$5,'2026-06-01',1200.5,'pending','2026-05-25T17:00:00Z') RETURNING id`,
+        [landlordId, tenantId, leaseId, unitId, `INV-${randomUUID().slice(0, 8)}`])).rows[0].id
+      paymentId = (await c.query<{ id: string }>(
+        `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, created_at)
+         VALUES ($1,$2,$3,$4,$5,'rent',1200.5,'failed','2026-06-01','RENT','2026-05-25T17:00:00Z') RETURNING id`,
+        [inv, unitId, leaseId, tenantId, landlordId])).rows[0].id
+    } finally { c.release() }
+    await withTx(cl => emitPaymentFailedEvent(cl, {
+      tenantId, paymentId, paymentType: 'rent', amount: '1200.50', dueDate: '2026-06-01',
+      failedAt: new Date('2026-06-03T15:30:00Z'), stripePaymentIntentId: 'pi_failed_1',
+      failureCode: 'R01', failureMessage: 'Insufficient funds',
     }))
     const e = await readSoleEvent('tenant', tenantId)
-    expect(e.event_type).toBe('payment_failed_nsf')
+    expect(e.event_type).toBe('payment_skipped')
+    expect(e.event_data).toMatchObject({ stamp: 'outstanding', owed: '1200.50' })
     expect(e.network_visibility).toBe('visible_to_gam_network')
-    expect(e.dimension_tags).toEqual(['payment_reliability'])
-    expect(e.attestation_source).toBe('stripe_attested')
-    expect(e.attestation_evidence).toEqual({ stripe_payment_intent_id: 'pi_failed_1' })
-    expect(e.event_data.failure_code).toBe('R01')
-    expect(e.event_data.failure_message).toBe('Insufficient funds')
-    expect(new Date(e.event_data.failed_at).getTime()).toBe(failedAt.getTime())
   })
 
-  it('null stripe id → empty evidence object (still records event)', async () => {
+  it('a row on no bill: nothing is written', async () => {
     const tenantId = randomUUID()
     await withTx(c => emitPaymentFailedEvent(c, {
-      tenantId, paymentId: randomUUID(), paymentType: 'rent',
-      amount: 800,
-      dueDate: new Date('2026-06-01T00:00:00Z'),
-      failedAt: new Date('2026-06-04T00:00:00Z'),
-      stripePaymentIntentId: null,
-      failureCode: null,
-      failureMessage: null,
+      tenantId, paymentId: randomUUID(), paymentType: 'rent', amount: 800,
+      dueDate: new Date('2026-06-01T00:00:00Z'), failedAt: new Date('2026-06-04T00:00:00Z'),
+      stripePaymentIntentId: null, failureCode: null, failureMessage: null,
     }))
-    const e = await readSoleEvent('tenant', tenantId)
-    expect(e.attestation_evidence).toEqual({})
-    expect(e.event_data.amount).toBe('800')
+    expect(await readAllEvents('tenant', tenantId)).toHaveLength(0)
   })
 })
 

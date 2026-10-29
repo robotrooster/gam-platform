@@ -1,0 +1,155 @@
+/* 10/13 (Nic) — the Rent Roll (history, one property at a time) and the
+   status pill it shares with the tenant report: one colored pill that says the
+   month in words ("Paid", "Paid late +5", "Partial", "Owes +3", "Due"), never a
+   letter code. The page's layout classes (.rr-split, .rr-table, the print
+   rules) are styles/rent-roll.css; everything new is here. Colors are theme
+   tokens; the two the palette lacks are defined for both themes. */
+
+:root {
+  --rrs-yellow: #eab308;
+  --rrs-yellow-bg: rgba(234, 179, 8, .12);
+  --rrs-orange: #f97316;
+  --rrs-orange-bg: rgba(249, 115, 22, .12);
+}
+:root[data-theme="light"] {
+  --rrs-yellow: #a16207;
+  --rrs-yellow-bg: rgba(234, 179, 8, .18);
+  --rrs-orange: #c2410c;
+  --rrs-orange-bg: rgba(249, 115, 22, .14);
+}
+
+/* ── The pill: green paid, orange paid late, yellow partial, red owes, gray due / no bill / vacant ── */
+.rrs {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 2px 8px; border-radius: 999px; border: 1px solid transparent;
+  font-family: var(--font-body); font-size: .68rem; font-weight: 700; line-height: 1.5;
+  white-space: nowrap; cursor: default;
+}
+.rrs.green  { background: var(--green-bg); color: var(--green); border-color: rgba(34,197,94,.3); }
+.rrs.orange { background: var(--rrs-orange-bg); color: var(--rrs-orange); border-color: rgba(249,115,22,.35); }
+.rrs.yellow { background: var(--rrs-yellow-bg); color: var(--rrs-yellow); border-color: rgba(234,179,8,.35); }
+.rrs.red    { background: var(--red-bg); color: var(--red); border-color: rgba(239,68,68,.35); }
+.rrs.gray   { background: var(--bg-4); color: var(--text-2); border-color: var(--border-1); }
+/* No bill that month: a quiet dash, not a pill. */
+.rrs.empty  { background: transparent; color: var(--text-3); border-color: transparent; font-weight: 400; }
+/* The household's first month on GAM (good news only): the gold underline,
+   labeled (10/13, Nic: "KEEP it, and give it a label") — a button, so a tap
+   says it too (StatusStamp's OnboardingStamp). */
+.rrs.onboarding { box-shadow: inset 0 -2px 0 var(--gold); cursor: help; }
+button.rrs { margin: 0; -webkit-appearance: none; appearance: none; }
+button.rrs:focus-visible { outline: 2px solid var(--gold); outline-offset: 1px; }
+.rrs-onb { position: relative; display: inline-flex; }
+.rrs-tip {
+  position: absolute; left: 50%; bottom: calc(100% + 6px); transform: translateX(-50%); z-index: 30;
+  width: max-content; max-width: 220px; padding: 6px 9px; border-radius: 8px;
+  background: var(--bg-2); border: 1px solid var(--gold); color: var(--text-0);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .25);
+  font-family: var(--font-body); font-size: .68rem; font-weight: 400; line-height: 1.35; text-align: center; white-space: normal;
+}
+.rrs-tip strong { display: block; font-weight: 700; color: var(--gold); }
+.rrs-tip-sub { display: block; margin-top: 2px; color: var(--text-2); }
+/* Nothing counted yet (10/13, Nic: "Keep it out, but say so"): health in words, never a bare dash. */
+.rr-health-words { display: inline-block; max-width: 10em; font-size: .68rem; font-weight: 600; line-height: 1.3; white-space: normal; color: var(--text-3); }
+
+/* A month's count in words, in its status color ("3 paid late"). */
+.rrs-count { display: block; font-size: .64rem; font-weight: 600; white-space: nowrap; line-height: 1.35; }
+.rrs-count.green  { color: var(--green); }
+.rrs-count.orange { color: var(--rrs-orange); }
+.rrs-count.yellow { color: var(--rrs-yellow); }
+.rrs-count.red    { color: var(--red); }
+.rrs-count.gray   { color: var(--text-3); }
+
+/* ── The property pick (asked first; one property opens straight to it) ── */
+.rrh-picker { padding: 6px 0; overflow: hidden; }
+.rrh-picker-title { padding: 10px 16px 6px; font-size: .7rem; font-weight: 700; color: var(--text-3); text-transform: uppercase; letter-spacing: .07em; }
+.rrh-prop {
+  width: 100%; display: flex; align-items: center; gap: 10px; text-align: left;
+  padding: 12px 16px; background: none; border: none; border-top: 1px solid var(--border-0);
+  color: var(--text-0); font-family: var(--font-body); font-size: .9rem; font-weight: 600; cursor: pointer;
+}
+.rrh-prop:hover { background: var(--bg-3); }
+.rrh-prop:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
+.rrh-prop-meta { margin-left: auto; font-size: .74rem; font-weight: 400; color: var(--text-3); text-align: right; }
+
+/* ── Inside a property: its name, then the view ── */
+.rrh-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.rrh-head-name { font-size: 1.05rem; font-weight: 700; color: var(--text-0); margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.rrh-head-actions { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+.rrh-view { display: flex; align-items: center; gap: 6px 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.rrh-custom { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: .76rem; color: var(--text-2); }
+.rrh-custom .form-select { width: auto; min-width: 0; flex: 0 1 auto; padding-top: 4px; padding-bottom: 4px; font-size: .78rem; }
+.rrh-summary { display: flex; align-items: baseline; gap: 4px 14px; flex-wrap: wrap; margin-bottom: 12px; font-size: .8rem; color: var(--text-2); }
+.rrh-summary strong { font-family: var(--font-mono); color: var(--text-0); }
+.rrh-summary .rrh-range { font-weight: 700; color: var(--text-0); }
+.rrh-summary .owed { color: var(--gold); }
+/* 10/13 (Nic): "Range totals INCLUDE moved-out folder households" — what of them is theirs. */
+.rrh-summary .rrh-incl { flex-basis: 100%; font-size: .72rem; color: var(--text-3); }
+
+/* The table: Space · Tenant beside the columns that scroll (styles/rent-roll.css .rr-split). */
+.rrh-card { padding: 0; overflow: hidden; margin-bottom: 14px; }
+.rrh-card .rr-fixed { width: 300px; }
+.rrh-card .rr-scroll .rr-table { min-width: 0; }
+.rrh-card .rrh-spacecol { width: 84px; }
+.rrh-card td.rrh-spacecol { font-family: var(--font-mono); font-size: .76rem; color: var(--text-1); }
+.rrh-card td.rrh-spacecol .rr-sub { font-family: var(--font-body); }
+.rrh-card .rr-name-link { max-width: 190px; display: block; }
+.rrh-card .rrh-stampcol { text-align: center; padding: 0 4px; width: 104px; min-width: 104px; }
+.rrh-card .rrh-stampcol .rrs { min-width: 64px; }
+.rrh-card .rrh-month-head { display: flex; flex-direction: column; align-items: center; line-height: 1.2; }
+.rrh-card .rrh-month-year { font-size: .56rem; font-weight: 600; letter-spacing: 0; color: var(--text-3); }
+.rrh-card tfoot .rrh-stampcol { text-align: center; }
+.rrh-moved { display: inline-block; margin-top: 2px; padding: 0 6px; border-radius: 999px; font-size: .6rem; font-weight: 700;
+  background: var(--bg-4); color: var(--text-2); white-space: nowrap; font-family: var(--font-body); }
+
+/* Phones: one card per household (styles/rent-roll.css .rr-cards). */
+.rrh-card .rr-card-stamps .rrs { min-width: 60px; }
+
+/* ── "Moved out, still owes" (collapsed until opened) ── */
+.rrh-folder { padding: 0; overflow: hidden; margin-bottom: 14px; }
+.rrh-folder-head {
+  width: 100%; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; text-align: left;
+  padding: 12px 16px; background: var(--bg-2); border: none;
+  color: var(--text-0); font-family: var(--font-body); font-size: .88rem; font-weight: 700; cursor: pointer;
+}
+.rrh-folder-head:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
+.rrh-folder-meta { font-weight: 400; font-size: .76rem; color: var(--text-3); }
+.rrh-folder-body { border-top: 1px solid var(--border-0); overflow-x: auto; }
+.rrh-mo-table { width: 100%; border-collapse: collapse; font-size: .78rem; }
+.rrh-mo-table th, .rrh-mo-table td { padding: 8px 12px; border-bottom: 1px solid var(--border-0); text-align: left; color: var(--text-1); white-space: nowrap; }
+.rrh-mo-table th { font-size: .62rem; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 700; }
+.rrh-mo-table .num { text-align: right; font-family: var(--font-mono); }
+.rrh-mo-table td.wrap { white-space: normal; }
+
+/* ── 10/13 (Nic): the range's stays, below the households — "an aggregate by
+   line items … below with expandable notes" (one line each, its notes per site
+   opened under it; nothing scrolls sideways on a phone) ── */
+.rrh-stays { padding: 0; overflow: hidden; margin-bottom: 14px; }
+.rrh-stays-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px 16px;
+  background: var(--bg-2); color: var(--text-0); font-size: .88rem; font-weight: 700;
+}
+.rrh-stays-list { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--border-0); }
+.rrh-stay { border-bottom: 1px solid var(--border-0); }
+.rrh-stay:last-child { border-bottom: none; }
+.rrh-stay-head {
+  width: 100%; display: flex; align-items: baseline; gap: 8px; text-align: left; padding: 10px 16px;
+  background: none; border: none; color: var(--text-0); font-family: var(--font-body); font-size: .82rem; cursor: pointer;
+}
+.rrh-stay-head:hover { background: var(--bg-3); }
+.rrh-stay-head:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
+.rrh-stay-label { flex: 1; min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
+.rrh-stay-paid { font-family: var(--font-mono); color: var(--text-1); white-space: nowrap; }
+.rrh-stay-notes {
+  list-style: none; margin: 0; padding: 0 16px 10px 38px; display: flex; flex-wrap: wrap; gap: 4px 14px;
+  font-size: .76rem; color: var(--text-2);
+}
+.rrh-stay-notes li { overflow-wrap: anywhere; }
+
+/* ── The tenant report's month history (10/13: "the kind of information I want to see on the customer history") ── */
+.tr-months { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.tr-month { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.tr-month-name { font-size: .6rem; font-weight: 600; color: var(--text-3); white-space: nowrap; }
+
+@media (max-width: 640px) {
+  .rrh-head-actions { margin-left: 0; width: 100%; }
+}

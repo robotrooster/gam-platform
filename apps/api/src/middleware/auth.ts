@@ -6,8 +6,12 @@ import { AppError } from './errorHandler'
 import { isPosLimitedRequestAllowed } from '../lib/posLock'
 import {
   isBookkeeperRequestAllowed, bookkeeperResponseIsScrubbed, scrubPersonFields,
-  BOOKKEEPER_REFUSAL, BOOKKEEPER_GRANTED_PERMS,
+  BOOKKEEPER_REFUSAL, bookkeeperHasPerm,
 } from '../lib/bookkeeperAccess'
+import {
+  bookkeeperScopesOf, requestScopeOf, NO_BOOKKEEPER_SCOPE, bookkeeperMayWrite,
+  type BookkeeperScopeRow, type BookkeeperRequestScope, type PropertyCutoff,
+} from '../lib/bookkeeperScope'
 
 export interface AuthPayload {
   userId:      string
@@ -43,11 +47,11 @@ export interface AuthPayload {
   // requireAuth constrains such sessions to the register surface (see
   // isPosLimitedRequestAllowed). Absent/false on every normal session.
   posLimited?: boolean
-  // 10/11 (Nic): a bookkeeper's properties within their company, read fresh
-  // from bookkeeper_scopes by requireAuth on every request. null = every
-  // property the company owns; [] = no scope row (sees nothing). Absent on
-  // every other role. See lib/bookkeeperAccess.ts.
-  bookkeeperPropertyIds?: string[] | null
+  // 10/11 (Nic): a bookkeeper's properties within their company, worked out
+  // fresh by requireAuth on every request (lib/bookkeeperScope). 10/12: with
+  // the company-wide box, the lease-dates box and the former properties (read
+  // up to the day they left, never after). Absent on every other role.
+  bookkeeperScope?: BookkeeperRequestScope
   // S655: 'fixed' — ends SESSION_TTL_SECONDS after sign-in, never extended;
   // 'rolling' — renewed while in use. Absent on a pass minted before S655 (read
   // through policyOfPass in lib/sessionToken.ts). Type only: requireAuth does
@@ -106,8 +110,11 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       }
     }
     req.user = payload
-    // 10/11 (Nic): a bookkeeper sees money in, money out, receipts and
-    // maintenance costs — nothing else. Deny by default, the cashier's rule
+    // 10/11 (Nic): a bookkeeper sees money in and who paid it (tenant names
+    // included), money out, receipts, maintenance costs and (10/12, with the
+    // company-wide box) the bank account, payouts and payroll — never
+    // contact details, leases, documents, screening or messages. Deny by
+    // default, the cashier's rule
     // (lib/bookkeeperAccess.ts), then pin the request to their company and
     // properties as the scope table says NOW (a revoke or a narrowed scope
     // takes effect on the next request, not at the next sign-in).
@@ -128,7 +135,15 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       req.user = {
         ...payload,
         landlordId: row?.landlord_id ?? null,
-        bookkeeperPropertyIds: row ? (row.property_ids ?? null) : [],
+        bookkeeperScope: row ? requestScopeOf(row) : NO_BOOKKEEPER_SCOPE,
+        // 10/12 (Nic) review, SECURITY: the read-only / read-write box is the
+        // one on THIS company's scope row, read now. The pass carries the
+        // access level of their oldest assignment from sign-in, so read-write
+        // on one company opened another's bank and expenses to writes, and a
+        // downgrade waited for the next sign-in. Every gate that reads
+        // permissions.access_level (requireBooksWrite, the bank feed, the
+        // Expenses writes) now reads the live value.
+        ...(row ? { permissions: { ...(payload.permissions || {}), access_level: row.access_level } } : {}),
       }
       if (bookkeeperResponseIsScrubbed(req.originalUrl)) {
         const send = res.json.bind(res)
@@ -191,11 +206,11 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
 async function bookkeeperScopeFor(
   payload: AuthPayload,
   header: string | string[] | undefined,
-): Promise<{ landlord_id: string; property_ids: string[] | null } | null | 'not_theirs'> {
+): Promise<BookkeeperScopeRow | null | 'not_theirs'> {
   const named = Array.isArray(header) ? header[0] : header
-  const rows = await query<{ landlord_id: string; property_ids: string[] | null }>(
-    `SELECT landlord_id, property_ids FROM bookkeeper_scopes
-      WHERE user_id = $1 ORDER BY created_at, id`, [payload.userId])
+  // 10/11: their ticked properties, worked out against what the company owns
+  // right now (lib/bookkeeperScope), never read raw off the row.
+  const rows = await bookkeeperScopesOf(payload.userId)
   if (named) return rows.find(r => r.landlord_id === named) ?? 'not_theirs'
   return rows.find(r => r.landlord_id === payload.landlordId) ?? rows[0] ?? null
 }
@@ -354,11 +369,57 @@ const WORKER_SCOPE_TABLE: Record<string, string> = {
 export async function assertPropertyInScope(
   user: AuthPayload | undefined,
   propertyId: string | null | undefined,
+  /**
+   * 10/22 — A PERMISSION IS GRANTED BY A COMPANY, NOT HELD BY A PERSON.
+   *
+   * Name the permission this action needs and it is checked against the set
+   * THIS PROPERTY'S COMPANY granted, read from that company's own scope row.
+   *
+   * It matters as soon as one person works for two owners, which is the whole
+   * point of folding the management portal in (PM_FOLD_PLAN.md). A worker's
+   * token carries one flat permission set, so "issue refunds" granted at park A
+   * would otherwise pass the check at park B, which granted nothing of the
+   * kind — property access would refuse the data while the permission sailed
+   * through. Read fresh here rather than baked into the pass, so an owner
+   * taking a permission away takes effect on the next request and not the next
+   * login.
+   *
+   * requirePerm still admits the route on what the pass carries. This is the
+   * narrower question asked where the property is already known.
+   */
+  opts: { perm?: string | string[] } = {},
 ): Promise<void> {
   if (!user) throw new AppError(401, 'Unauthenticated')
-  if (OWNER_ROLES.includes(user.role)) return
+  // 10/23 — AN OWNER OF THEIR OWN COMPANY IS A MANAGER OF SOMEBODY ELSE'S.
+  //
+  // Folding the management portal in means Blu signs in to ONE account that
+  // owns Country Acres and manages Oak Park for its owner. His users.role is
+  // 'landlord' either way, and 'landlord' used to bypass every property check
+  // outright — so a grant of one park would have shown him the whole of
+  // somebody else's company. The bypass is right for a company they OWN and
+  // wrong for one they manage, so it now asks which this property's company is.
+  //
+  // Not a member at all falls through to the bypass, exactly as before: the
+  // company-level gates (canAccessLandlordResource, resolveLandlordTarget) are
+  // what refuse a stranger, and this function has never been the thing that
+  // did it.
+  if (OWNER_ROLES.includes(user.role)) {
+    if (user.role !== 'landlord' || !propertyId) return
+    const how = await query<{ role: string }>(
+      `SELECT m.role
+         FROM properties p
+         JOIN landlord_members m ON m.landlord_id = p.landlord_id AND m.user_id = $1
+        WHERE p.id = $2::uuid`,
+      [user.userId, propertyId])
+    if (!how.length || how.some(r => r.role === 'owner')) return
+    // Managed, not owned: the owner's grant decides, read below out of the
+    // property-manager scope for this company.
+    return await assertManagedPropertyInScope(user, propertyId, opts)
+  }
   if (user.role === 'bookkeeper') {
-    const ids = await bookkeeperPropertyIdsOf(user)
+    // 10/12: an action is on a property the company owns today and they keep.
+    // A former property is read only (lib/bookkeeperScope).
+    const ids = (await bookkeeperRequestScopeOf(user)).currentIds
     if (ids === null) return
     if (!propertyId) throw new AppError(400, 'A property must be selected for this action')
     if (!ids.includes(propertyId)) throw new AppError(403, 'You are not assigned to this property')
@@ -366,15 +427,72 @@ export async function assertPropertyInScope(
   }
   const table = WORKER_SCOPE_TABLE[user.role]
   if (!table) throw new AppError(403, 'Not authorized for property-scoped actions')
-  const rows = await query<{ property_ids: string[]; all_properties: boolean }>(
-    `SELECT property_ids, all_properties FROM ${table} WHERE user_id = $1 LIMIT 1`,
-    [user.userId],
-  )
-  const row = rows[0]
-  if (!row) throw new AppError(403, 'No property scope assigned')
-  if (row.all_properties) return
   if (!propertyId) throw new AppError(400, 'A property must be selected for this action')
-  if (!row.property_ids.includes(propertyId)) throw new AppError(403, 'You are not assigned to this property')
+  // 10/22 — THE PROPERTY NAMES THE COMPANY, AND THE COMPANY NAMES THE SCOPE.
+  //
+  // This read was `WHERE user_id = $1 LIMIT 1`, which could only ever be right
+  // while a person worked for exactly one company. The scope tables are keyed
+  // (user_id, landlord_id) and always were, so a manager working for two owners
+  // had two rows and got whichever one came back first: one owner's properties
+  // answered and the other silently did not — or, if the first row happened to
+  // say all_properties, it answered for a company that had granted nothing.
+  //
+  // It is the same rule the rest of the platform follows since S654 ("the
+  // property or the row names the company; none is the default"): find the
+  // scope row belonging to the company that owns THIS property. No row for that
+  // company means no access to it, whatever they hold elsewhere.
+  const rows = await query<{ property_ids: string[]; all_properties: boolean; permissions: Record<string, unknown> | null }>(
+    `SELECT s.property_ids, s.all_properties, s.permissions
+       FROM ${table} s
+       JOIN properties p ON p.landlord_id = s.landlord_id
+      WHERE s.user_id = $1 AND p.id = $2::uuid`,
+    [user.userId, propertyId],
+  )
+  if (!rows.length) {
+    // Told apart so the words are true: somebody with no scope at all is a
+    // setup problem, somebody scoped elsewhere is a permission answer.
+    const any = await query<{ one: number }>(
+      `SELECT 1 AS one FROM ${table} WHERE user_id = $1 LIMIT 1`, [user.userId])
+    throw new AppError(403, any.length
+      ? 'You are not assigned to this property'
+      : 'No property scope assigned')
+  }
+  // Several rows can only mean several companies own the same property, which
+  // cannot happen — but if it ever did, any grant that reaches it is enough.
+  const reaching = rows.filter(r => r.all_properties || r.property_ids.includes(propertyId))
+  if (!reaching.length) throw new AppError(403, 'You are not assigned to this property')
+
+  const needs = opts.perm == null ? [] : (Array.isArray(opts.perm) ? opts.perm : [opts.perm])
+  if (!needs.length) return
+  // Granted by THIS property's company, or not granted here at all.
+  const granted = reaching.some(r => needs.some(k => (r.permissions ?? {})[k] === true))
+  if (!granted) throw new AppError(403, 'Insufficient permissions for this property')
+}
+
+/**
+ * The same question for somebody whose access to this company came from MANAGING
+ * it rather than owning it: their grant lives in property_manager_scopes for
+ * that company, whatever their own account's role says. Kept beside the worker
+ * path rather than folded into it, because the two arrive by different doors and
+ * a reader should see that.
+ */
+async function assertManagedPropertyInScope(
+  user: AuthPayload, propertyId: string, opts: { perm?: string | string[] } = {},
+): Promise<void> {
+  const rows = await query<{ property_ids: string[]; all_properties: boolean; permissions: Record<string, unknown> | null }>(
+    `SELECT s.property_ids, s.all_properties, s.permissions
+       FROM property_manager_scopes s
+       JOIN properties p ON p.landlord_id = s.landlord_id
+      WHERE s.user_id = $1 AND p.id = $2::uuid`,
+    [user.userId, propertyId])
+  const reaching = rows.filter(r => r.all_properties || r.property_ids.includes(propertyId))
+  if (!reaching.length) {
+    throw new AppError(403, 'You manage this company, but not this property')
+  }
+  const needs = opts.perm == null ? [] : (Array.isArray(opts.perm) ? opts.perm : [opts.perm])
+  if (!needs.length) return
+  if (reaching.some(r => needs.some(k => (r.permissions ?? {})[k] === true))) return
+  throw new AppError(403, 'The owner of this property has not given you that')
 }
 
 // Read-side companion to assertPropertyInScope: which properties may this
@@ -394,28 +512,72 @@ export async function getScopedPropertyIds(
   if (user.role === 'bookkeeper') return bookkeeperPropertyIdsOf(user)
   const table = WORKER_SCOPE_TABLE[user.role]
   if (!table) return null
+  // 10/22 — EVERY COMPANY THEY WORK FOR, NOT THE FIRST ONE.
+  //
+  // `LIMIT 1` here was the read-side half of the same fault: a manager working
+  // for two owners listed one owner's properties and the other's were invisible
+  // to every list in the portal.
+  //
+  // `null` KEEPS ITS MEANING, which is not "no filter" but "NOT NARROWED" —
+  // this person holds whole companies, so every page that distinguishes a
+  // company-wide document from a per-property one (the Books P&L, the cash
+  // flow, the owner statements) still hands them the company's own. Returning a
+  // list instead refused a manager with every property of the only company they
+  // work for, which the Books audience-isolation suite caught at once.
+  //
+  // Narrowed anywhere, and the answer is the explicit union: a person who
+  // manages every property for one owner and fixes two sites for another is
+  // narrowed, and must never see past either grant. An all_properties row
+  // expands to ITS OWN company's properties — never to every property on the
+  // platform, which is what a bare `null` would have meant for them.
   const rows = await query<{ property_ids: string[] | null; all_properties: boolean }>(
-    `SELECT property_ids, all_properties FROM ${table} WHERE user_id = $1 LIMIT 1`,
+    `SELECT property_ids, all_properties FROM ${table} WHERE user_id = $1`,
     [user.userId],
   )
-  const row = rows[0]
-  if (!row) return []
-  if (row.all_properties) return null
-  return row.property_ids || []
+  if (!rows.length) return []
+  if (rows.every(r => r.all_properties)) return null
+  const spread = await query<{ pid: string }>(
+    `SELECT DISTINCT pid FROM (
+       SELECT unnest(s.property_ids) AS pid FROM ${table} s WHERE s.user_id = $1
+       UNION
+       SELECT p.id FROM ${table} s
+         JOIN properties p ON p.landlord_id = s.landlord_id
+        WHERE s.user_id = $1 AND s.all_properties
+     ) q WHERE pid IS NOT NULL`,
+    [user.userId],
+  )
+  return spread.map(r => r.pid)
 }
 
 /**
  * 10/11: a bookkeeper's properties. requireAuth puts them on the request; a
- * caller holding a bare pass (a job, a test) reads the scope row instead.
- * null = the whole company; [] = no assignment.
+ * caller holding a bare pass (a job, a test) works them out from the scope row
+ * the same way (lib/bookkeeperScope). null = the whole company (10/12: the
+ * company-wide box and every property the company owns today ticked; BK3: a
+ * sold property never theirs is hidden by the cutoffs — lib/bookkeeperScope
+ * requestScopeOf); else the kept properties and
+ * the former ones; [] = no property's money (a company-wide-only bookkeeper,
+ * or no assignment at all).
  */
 export async function bookkeeperPropertyIdsOf(user: AuthPayload): Promise<string[] | null> {
-  if (user.bookkeeperPropertyIds !== undefined) return user.bookkeeperPropertyIds
-  const row = await queryOne<{ property_ids: string[] | null }>(
-    `SELECT property_ids FROM bookkeeper_scopes
-      WHERE user_id = $1 AND ($2::uuid IS NULL OR landlord_id = $2::uuid)
-      ORDER BY created_at, id LIMIT 1`, [user.userId, user.landlordId ?? null])
-  return row ? (row.property_ids ?? null) : []
+  return (await bookkeeperRequestScopeOf(user)).propertyIds
+}
+
+/** 10/12: everything one bookkeeper request reads (lib/bookkeeperScope BookkeeperRequestScope). */
+export async function bookkeeperRequestScopeOf(user: AuthPayload): Promise<BookkeeperRequestScope> {
+  if (user.bookkeeperScope !== undefined) return user.bookkeeperScope
+  const [row] = await bookkeeperScopesOf(user.userId, user.landlordId ?? null)
+  return row ? requestScopeOf(row) : NO_BOOKKEEPER_SCOPE
+}
+
+/**
+ * 10/12 (Nic): the clean cut at a sale. The former properties' last days a
+ * reader leaves later rows of out — a bookkeeper's; [] for everyone else
+ * (owners and staff read what the landlord_id on each row says, as before).
+ */
+export async function propertyCutoffsOf(user: AuthPayload | undefined): Promise<PropertyCutoff[]> {
+  if (!user || user.role !== 'bookkeeper') return []
+  return (await bookkeeperRequestScopeOf(user)).cutoffs
 }
 
 // requirePerm — gate a worker route by sub-permission key. Owner roles
@@ -438,7 +600,8 @@ export async function bookkeeperPropertyIdsOf(user: AuthPayload): Promise<string
 export function userHasPerm(user: Request['user'], ...keys: string[]): boolean {
   if (!user) return false
   if (OWNER_ROLES.includes(user.role)) return true
-  if (user.role === 'bookkeeper') return keys.some(k => BOOKKEEPER_GRANTED_PERMS.has(k))
+  // 10/12 (Nic): and the keys an owner's box gives them (the monthly report).
+  if (user.role === 'bookkeeper') return keys.some(k => bookkeeperHasPerm(user.bookkeeperScope, k))
   const perms = user.permissions || {}
   return keys.some(k => perms[k] === true)
 }
@@ -448,8 +611,9 @@ export function requirePerm(...keys: string[]) {
     if (!req.user) return res.status(401).json({ success: false, error: 'Unauthenticated' })
     if (OWNER_ROLES.includes(req.user.role)) return next()
     // 10/11: a bookkeeper holds a fixed set (lib/bookkeeperAccess); requireAuth
-    // has already kept them to the routes those keys may open.
-    if (req.user.role === 'bookkeeper' && keys.some(k => BOOKKEEPER_GRANTED_PERMS.has(k))) return next()
+    // has already kept them to the routes those keys may open. 10/12 (Nic):
+    // plus the keys their owner's boxes give them (the monthly report).
+    if (req.user.role === 'bookkeeper' && keys.some(k => bookkeeperHasPerm(req.user!.bookkeeperScope, k))) return next()
     const perms = req.user.permissions || {}
     for (const k of keys) if (perms[k] === true) return next()
     return res.status(403).json({ success: false, error: 'Insufficient permissions' })
@@ -458,7 +622,9 @@ export function requirePerm(...keys: string[]) {
 
 // Bookkeeper-specific gates. Bookkeepers don't have sub-permissions —
 // they have access_level (read_only | read_write) packed into the
-// permissions claim by getScopeForUser. Owner roles always pass.
+// permissions claim by getScopeForUser. 10/12 (Nic): one level — a
+// bookkeeper with a scope row on the company reads and writes its books
+// (requireBooksWrite). Owner roles always pass.
 // Property managers with books.view / books.edit also pass — books
 // access overlaps both roles.
 export function requireBooksRead(req: Request, res: Response, next: NextFunction) {
@@ -481,7 +647,12 @@ export function requireBooksWrite(req: Request, res: Response, next: NextFunctio
   if (OWNER_ROLES.includes(req.user.role)) return next()
   if (req.user.role === 'business_owner' && req.user.businessId) return next()
   const perms = req.user.permissions || {}
-  if (req.user.role === 'bookkeeper' && perms.access_level === 'read_write') return next()
+  // 10/12 (Nic, ledger decision 2): "Full bookkeeping … One level, no
+  // per-bookkeeper switch." Every bookkeeper this company keeps (its live
+  // scope row, put on the request by requireAuth) writes its books; the old
+  // read-only box decides nothing. Which books (the ledger, the company-wide
+  // pages) is still the owner's boxes, checked by routes/books' own gate.
+  if (req.user.role === 'bookkeeper' && bookkeeperMayWrite(req.user.bookkeeperScope)) return next()
   if (req.user.role === 'property_manager' && perms['books.edit'] === true) return next()
   return res.status(403).json({ success: false, error: 'Insufficient permissions' })
 }

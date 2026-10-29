@@ -337,6 +337,202 @@ describe('POST /api/pos/transactions — happy paths', () => {
     expect(log.rows[0].reference_id).toBe(res.body.data.id)
   })
 
+  // 10/23 (Nic): "we need to add a button to record check payments. That also
+  // needs to be turned on or off if a property chooses to accept checks. A lot
+  // of places don't accept them. For some reason, you can record an invoice
+  // with a check number and record the payment, but you can't do it on the
+  // point of sale system."
+  describe('a check at the counter', () => {
+    // The check gates refuse BEFORE the cart is priced, so a refusal test must
+    // not queue a tax answer — an unconsumed mockResolvedValueOnce is picked up
+    // by whichever test runs next and prices its cart wrong.
+    const ring = async (f: any, itemId: string, body: Record<string, unknown>, priced = true) => {
+      if (priced) calculateCartTaxMock.mockResolvedValueOnce({
+        subtotal: 49.25, taxAmount: 0, lines: [{ itemId, lineSubtotal: 49.25, lineTax: 0 }],
+      })
+      return request(buildApp())
+        .post('/api/pos/transactions')
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+        .send({
+          propertyId: f.propertyId,
+          items: [{ id: itemId, name: 'Propane', qty: 1, price: 49.25, tax_rate: 0, category: 'Test Cat' }],
+          ...body,
+        })
+    }
+
+    it('records the tender and the check number, and takes no fee for it', async () => {
+      const f = await seedPosFixture()
+      const itemId = await seedPosItem(f, { sellPrice: 49.25, stockQty: 50 })
+      const res = await ring(f, itemId, { paymentMethod: 'check', paymentReference: ' 167 ' })
+      expect(res.status, JSON.stringify(res.body)).toBe(201)
+      expect(res.body.data.payment_method).toBe('check')
+      // Trimmed, because a number typed with a space is the same check.
+      expect(res.body.data.payment_reference).toBe('167')
+      // A CHECK IS FREE, like cash (S654, Nic: "There's no fee. Paying cash or
+      // check is free"). No surcharge, no platform fee, and no money held.
+      expect(Number(res.body.data.surcharge)).toBe(0)
+      expect(Number(res.body.data.platform_fee)).toBe(0)
+      expect(Number(res.body.data.total)).toBe(49.25)
+      const held = await db.query(
+        `SELECT 1 FROM held_payout_items WHERE source_type = 'pos_sale' AND source_id = $1`, [res.body.data.id])
+      expect(held.rows).toHaveLength(0)
+    })
+
+    it('refuses a check with no number, because an anonymous check cannot be found again', async () => {
+      const f = await seedPosFixture()
+      const itemId = await seedPosItem(f, { sellPrice: 49.25, stockQty: 50 })
+      const res = await ring(f, itemId, { paymentMethod: 'check', paymentReference: '   ' }, false)
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/check number/i)
+      // Nothing was written, and no stock moved.
+      const item = await db.query<{ stock_qty: string }>(`SELECT stock_qty FROM pos_items WHERE id = $1`, [itemId])
+      expect(Number(item.rows[0].stock_qty)).toBe(50)
+    })
+
+    it('refuses a check number on a tender that has none', async () => {
+      const f = await seedPosFixture()
+      const itemId = await seedPosItem(f, { sellPrice: 49.25, stockQty: 50 })
+      const res = await ring(f, itemId, { paymentMethod: 'cash', paymentReference: '167' }, false)
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/only a check/i)
+    })
+
+    it('refuses a check where the park says it does not take them, button or no button', async () => {
+      const f = await seedPosFixture()
+      await db.query(`UPDATE properties SET accepts_checks = FALSE WHERE id = $1`, [f.propertyId])
+      const itemId = await seedPosItem(f, { sellPrice: 49.25, stockQty: 50 })
+      const res = await ring(f, itemId, { paymentMethod: 'check', paymentReference: '167' }, false)
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/does not take checks/i)
+      // And the register is told so before it ever shows the button.
+      const settings = await request(buildApp())
+        .get(`/api/pos/settings?propertyId=${f.propertyId}`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(settings.body.data.acceptsChecks).toBe(false)
+    })
+
+    it('tells the register a park takes checks, which is every park by default', async () => {
+      const f = await seedPosFixture()
+      const settings = await request(buildApp())
+        .get(`/api/pos/settings?propertyId=${f.propertyId}`)
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+      expect(settings.body.data.acceptsChecks).toBe(true)
+    })
+  })
+
+  // 10/24 (Nic): "one propane sale got marked as cash when the person dropped
+  // off a check... I want you to re-record Donald Hamp as paid with check. I
+  // don't want to void the sale and redo it. I don't like voiding sales. It's
+  // just like it makes it look like it was there when it wasn't."
+  describe('correcting the tender on a sale already rung', () => {
+    const sell = async (f: any, method: string, ref?: string) => {
+      const itemId = await seedPosItem(f, { sellPrice: 49.25, stockQty: 50 })
+      calculateCartTaxMock.mockResolvedValueOnce({
+        subtotal: 49.25, taxAmount: 0, lines: [{ itemId, lineSubtotal: 49.25, lineTax: 0 }],
+      })
+      const res = await request(buildApp())
+        .post('/api/pos/transactions')
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+        .send({ propertyId: f.propertyId,
+                items: [{ id: itemId, name: 'Propane', qty: 1, price: 49.25, tax_rate: 0, category: 'Test Cat' }],
+                paymentMethod: method, ...(ref ? { paymentReference: ref } : {}) })
+      expect(res.status, JSON.stringify(res.body)).toBe(201)
+      return res.body.data
+    }
+    const correct = (f: any, id: string, body: Record<string, unknown>) =>
+      request(buildApp()).patch(`/api/pos/transactions/${id}/tender`)
+        .set('Authorization', `Bearer ${f.landlordToken}`).send(body)
+
+    it('re-records a cash sale as a check WITHOUT a void, and keeps what it said before', async () => {
+      const f = await seedPosFixture()
+      const sale = await sell(f, 'cash')
+      const res = await correct(f, sale.id, { paymentMethod: 'check', paymentReference: '167' })
+      expect(res.status, JSON.stringify(res.body)).toBe(200)
+      expect(res.body.data).toMatchObject({ was: 'cash', paymentMethod: 'check', paymentReference: '167' })
+
+      const row = (await db.query<any>(
+        `SELECT payment_method, payment_reference, voided_at, total::text AS total, status
+           FROM pos_transactions WHERE id = $1`, [sale.id])).rows[0]
+      expect(row).toMatchObject({ payment_method: 'check', payment_reference: '167', voided_at: null })
+      // THE SALE IS STILL THE SALE: same money, same status, not voided, and no
+      // second sale written to carry the correction.
+      expect(Number(row.total)).toBe(49.25)
+      const all = await db.query(
+        `SELECT 1 FROM pos_transactions WHERE landlord_id = $1`, [f.landlordId])
+      expect(all.rows).toHaveLength(1)
+
+      // AND NOTHING IS LOST — the change journal holds what the row said before,
+      // which is why a void is not needed to keep the history.
+      const journal = await db.query<any>(
+        `SELECT op, old_row, new_row FROM audit_row_changes
+          WHERE table_name = 'pos_transactions' AND row_id = $1 ORDER BY changed_at DESC LIMIT 1`, [sale.id])
+      expect(journal.rows).toHaveLength(1)
+      expect(journal.rows[0].op).toBe('UPDATE')
+      expect(journal.rows[0].old_row.payment_method).toBe('cash')
+      expect(journal.rows[0].old_row.payment_reference).toBeNull()
+      expect(journal.rows[0].new_row.payment_method).toBe('check')
+    })
+
+    it('goes back the other way, and clears the number with it', async () => {
+      const f = await seedPosFixture()
+      const sale = await sell(f, 'check', '167')
+      const res = await correct(f, sale.id, { paymentMethod: 'cash' })
+      expect(res.status, JSON.stringify(res.body)).toBe(200)
+      const row = (await db.query<any>(
+        `SELECT payment_method, payment_reference FROM pos_transactions WHERE id = $1`, [sale.id])).rows[0]
+      expect(row).toMatchObject({ payment_method: 'cash', payment_reference: null })
+    })
+
+    it('will not re-label a card sale, because the card charge is a real authorization', async () => {
+      const f = await seedPosFixture()
+      const sale = await sell(f, 'cash')
+      await db.query(`UPDATE pos_transactions SET payment_method = 'card', stripe_payment_intent_id = 'pi_x' WHERE id = $1`, [sale.id])
+      const res = await correct(f, sale.id, { paymentMethod: 'check', paymentReference: '167' })
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/paid by card/i)
+    })
+
+    it('will not re-label a store-account sale, which carries its own balance', async () => {
+      const f = await seedPosFixture()
+      const sale = await sell(f, 'cash')
+      await db.query(`UPDATE pos_transactions SET payment_method = 'charge' WHERE id = $1`, [sale.id])
+      const res = await correct(f, sale.id, { paymentMethod: 'cash' })
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/store account/i)
+    })
+
+    it('refuses a check with no number here too, and leaves the sale alone', async () => {
+      const f = await seedPosFixture()
+      const sale = await sell(f, 'cash')
+      const res = await correct(f, sale.id, { paymentMethod: 'check' })
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/check number/i)
+      const row = (await db.query<any>(`SELECT payment_method FROM pos_transactions WHERE id = $1`, [sale.id])).rows[0]
+      expect(row.payment_method).toBe('cash')
+    })
+
+    it('will not correct a voided or refunded sale', async () => {
+      const f = await seedPosFixture()
+      const voided = await sell(f, 'cash')
+      await db.query(`UPDATE pos_transactions SET voided_at = NOW() WHERE id = $1`, [voided.id])
+      expect((await correct(f, voided.id, { paymentMethod: 'check', paymentReference: '1' })).status).toBe(400)
+      const refunded = await sell(f, 'cash')
+      await db.query(`UPDATE pos_transactions SET refunded_at = NOW() WHERE id = $1`, [refunded.id])
+      const r = await correct(f, refunded.id, { paymentMethod: 'check', paymentReference: '1' })
+      expect(r.status).toBe(400)
+      expect(r.body.error).toMatch(/refunded/i)
+    })
+
+    it('is another landlord\'s sale to nobody else', async () => {
+      const f = await seedPosFixture()
+      const other = await seedPosFixture()
+      const sale = await sell(f, 'cash')
+      const res = await request(buildApp()).patch(`/api/pos/transactions/${sale.id}/tender`)
+        .set('Authorization', `Bearer ${other.landlordToken}`).send({ paymentMethod: 'cash' })
+      expect(res.status).toBe(404)
+    })
+  })
+
   // S652 (Nic): "charge a transaction on propane at Mountain View… it's not
   // completing the sale." Propane sells by the gallon; 4.6 gallons hit
   // integer stock columns, the database refused "-4.6", and the sale rolled
@@ -539,7 +735,12 @@ describe('POST /api/pos/transactions — happy paths', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Ice', qty: 1, price: 10 }], paymentMethod: 'card', stripePaymentIntentId: 'pi_wallet', stripeReaderId })
     expect(res.status).toBe(201)
-    expect(res.body.data.customer).toMatchObject({ firstName: 'Card', lastName: 'Customer', isNew: true, cardKeepable: false, prompting: true, asks: { askSave: false, askName: true, askEmail: true } })
+    // 10/24 (Nic): "we just had one sale earlier today that says Visa card
+    // holder. Did it not pull their name off the card?" It did — the card had
+    // no name on it. A nameless card is named by the CARD now, so two of them
+    // are tellable apart and the last four is searchable. The reader is still
+    // asked for a name, because "Visa ••4242" is a card, not a person.
+    expect(res.body.data.customer).toMatchObject({ firstName: 'Visa', lastName: '\u2022\u20224242', isNew: true, cardKeepable: false, prompting: true, asks: { askSave: false, askName: true, askEmail: true } })
     expect(startSaveCardPromptMock).toHaveBeenCalledWith(stripeReaderId, { askSave: false, askName: true, askEmail: true })
     // They type their name and an email: the record is theirs now, the receipt goes out, nothing is "kept".
     readSaveCardAnswerMock.mockResolvedValueOnce({ answered: true, yes: null, name: 'Nic Rhoades', email: 'nic@example.com' })
@@ -1337,6 +1538,21 @@ async function seedCompletedTransaction(
 }
 
 describe('POST /api/pos/transactions/:id/refund', () => {
+  // 10/12 (Nic, ledger P1): the refund row keeps the tax it gave back.
+  it('a refund of half a taxed sale stores the tax it gave back', async () => {
+    const f = await seedPosFixture()
+    const txId = (await db.query<{ id: string }>(
+      `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, tax_amount, total, status)
+       VALUES ($1, $2, 'cash', 100, 8, 108, 'completed') RETURNING id`, [f.landlordId, f.landlordUserId])).rows[0].id
+    const res = await request(buildApp())
+      .post(`/api/pos/transactions/${txId}/refund`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ amount: 54, refundMethod: 'cash' })
+    expect(res.status).toBe(200)
+    const ref = await db.query<{ tax_refunded: string }>(`SELECT tax_refunded FROM pos_refunds WHERE transaction_id = $1`, [txId])
+    expect(Number(ref.rows[0].tax_refunded)).toBe(4)
+  })
+
   it('cash sale refund (no method passed): defaults to cash, status → refunded', async () => {
     const f = await seedPosFixture()
     const txId = await seedCompletedTransaction(f, { paymentMethod: 'cash', total: 25 })
@@ -1623,10 +1839,12 @@ describe('POST /api/pos/transactions/:id/void', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ reason: 'rung up wrong' })
     expect(res.status).toBe(200)
-    const tx = await db.query<{ status: string; void_reason: string }>(
-      `SELECT status, void_reason FROM pos_transactions WHERE id = $1`, [txId])
+    const tx = await db.query<{ status: string; void_reason: string; voided: boolean }>(
+      `SELECT status, void_reason, voided_at IS NOT NULL AS voided FROM pos_transactions WHERE id = $1`, [txId])
     expect(tx.rows[0].status).toBe('voided')
     expect(tx.rows[0].void_reason).toBe('rung up wrong')
+    // 10/12 (Nic, ledger P1): the moment, not only the reason.
+    expect(tx.rows[0].voided).toBe(true)
   })
 
   it('cannot void an already-refunded transaction → 400', async () => {
@@ -2894,6 +3112,162 @@ describe('S649 a two-company account uses the register by property', () => {
   })
 })
 
+// ── 10/20 (review) — THE CUSTOMER BOOK IS A READ, SO IT SPANS THE ACCOUNT ────
+//
+// The Customers tab stopped sending `?propertyId=` so the book would stop
+// looking like a property's (Nic: "I shouldn't have to toggle"). But that
+// parameter was also the only thing telling the API which company the register
+// was standing in, and Nic's live account owns two — Mountain View RV Park
+// Ranch LLC and Oak Park Motel and RV LLC. With nothing named, the list went
+// through the WRITE resolver and came back 400, "choose which one"; the page has
+// no handler for that, so it drew "No customers yet" over thirteen real
+// records. A read spans every company the account owns, each row saying which
+// company keeps it, and likely-duplicate matching stays inside one book.
+describe('10/20 the customer book spans every company the account owns', () => {
+  it('lists both books labeled, keeps duplicates per company, and folds only inside one', async () => {
+    const f = await seedPosFixture()
+    const c = await db.connect()
+    let second = ''
+    try {
+      await c.query(`UPDATE landlords SET business_name = 'Mountain View RV Park Ranch LLC' WHERE id = $1`, [f.landlordId])
+      second = (await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, business_name) VALUES ($1, 'Oak Park Motel and RV LLC') RETURNING id`,
+        [f.landlordUserId])).rows[0].id
+    } finally { c.release() }
+    const mk = async (landlordId: string, first: string, email: string | null, phone: string | null) =>
+      (await db.query<{ id: string }>(
+        `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, phone) VALUES ($1,$2,'Doe',$3,$4) RETURNING id`,
+        [landlordId, first, email, phone])).rows[0].id
+    const mvJane = await mk(f.landlordId, 'Jane', 'jane@example.com', '(602) 555-0100')
+    const mvBob  = await mk(f.landlordId, 'Bob',  null,               '602-555-0100')   // same phone, same company
+    const opJane = await mk(second,       'J',    'jane@example.com', null)             // same email, OTHER company
+    const token = jwt.sign(
+      { userId: f.landlordUserId, role: 'landlord', email: 'll@test.dev', profileId: null,
+        landlordIds: [f.landlordId, second], permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const auth = { Authorization: `Bearer ${token}` }
+
+    // The tab exactly as it ships: no property, no company named.
+    const list = await request(buildApp()).get('/api/pos/customers').set(auth)
+    expect(list.status, JSON.stringify(list.body)).toBe(200)
+    const by = Object.fromEntries(list.body.data.map((r: any) => [r.id, r]))
+    expect(Object.keys(by).sort()).toEqual([mvJane, mvBob, opJane].sort())
+    expect(by[mvJane]).toMatchObject({ landlord_id: f.landlordId, company: 'Mountain View RV Park Ranch LLC' })
+    expect(by[opJane]).toMatchObject({ landlord_id: second, company: 'Oak Park Motel and RV LLC' })
+    // Two records in one book with one phone are the same person; the other
+    // company's row with the same email is a different book and never offered.
+    expect(by[mvJane].duplicate_ids).toEqual([mvBob])
+    expect(by[mvBob].duplicate_ids).toEqual([mvJane])
+    expect(by[opJane].duplicate_ids).toEqual([])
+
+    // Naming a property still narrows the list to that property's company.
+    const one = await request(buildApp()).get(`/api/pos/customers?propertyId=${f.propertyId}`).set(auth)
+    expect(one.status, JSON.stringify(one.body)).toBe(200)
+    expect(one.body.data.map((r: any) => r.id).sort()).toEqual([mvJane, mvBob].sort())
+
+    // THE HISTORY THAT ROW OPENS (POSPage txQuery). A customer of the OTHER
+    // company is read by naming that company, so her purchases come back —
+    // read through the register's own property she had none, which drew an
+    // empty History tab under a row that had just counted them.
+    const hers = (await db.query<{ id: string }>(
+      `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, tax_amount, total, status, pos_customer_id)
+       VALUES ($1, $2, 'cash', 9, 0, 9, 'completed', $3) RETURNING id`, [second, f.landlordUserId, opJane])).rows[0].id
+    const hist = await request(buildApp()).get(`/api/pos/transactions?posCustomerId=${opJane}&landlordId=${second}`).set(auth)
+    expect(hist.status, JSON.stringify(hist.body)).toBe(200)
+    expect(hist.body.data.map((t: any) => t.id)).toEqual([hers])
+    // 10/20 (second review): THE SAME HISTORY WHICHEVER OF THE ACCOUNT'S
+    // COMPANIES IS NAMED, because it is HER history and not a location's. The
+    // row counts a person's purchases across the account's book — Nic's propane
+    // man is on one park's book and buys at the other's counter — so a row
+    // reading "1 purchase · $9" over an empty History tab was the list and the
+    // history contradicting each other on one screen. With nobody named it is
+    // still the register's own History at one counter (asserted above).
+    const either = await request(buildApp()).get(`/api/pos/transactions?posCustomerId=${opJane}&landlordId=${f.landlordId}`).set(auth)
+    expect(either.status, JSON.stringify(either.body)).toBe(200)
+    expect(either.body.data.map((t: any) => t.id)).toEqual([hers])
+
+    // Folding across the two companies is refused in words that say why.
+    const across = await request(buildApp()).post(`/api/pos/customers/${mvBob}/merge`).set(auth).send({ into: opJane })
+    expect(across.status, JSON.stringify(across.body)).toBe(409)
+    expect(String(across.body?.error)).toMatch(/different companies of yours/i)
+    expect((await db.query<any>(`SELECT archived_at FROM pos_customers WHERE id = $1`, [mvBob])).rows[0].archived_at).toBeNull()
+    // Inside one company it still folds.
+    const inside = await request(buildApp()).post(`/api/pos/customers/${mvBob}/merge`).set(auth).send({ into: mvJane })
+    expect(inside.status, JSON.stringify(inside.body)).toBe(200)
+  })
+
+  // 10/20 (second review) — AND THE DESK IS WHO READS THIS TAB.
+  //
+  // Nic, decisions #11: a customer anywhere on the account is shown with their
+  // name and their site "to anyone with register access on that account,
+  // cashier included — they are his customers and the desk has to find them."
+  //
+  // The list above passed on an OWNER token and was still broken for the person
+  // who actually works the tab. It read landlordScopeIds(), which answers a
+  // team role with the ONE company its token carries — that is the whole of a
+  // team scope — so the on-site manager on Mountain View got Mountain View's
+  // book while the /people picker beside it, which asks the data, offered the
+  // account's. Two answers to one question on one screen, which is how the
+  // empty list started. The widening stops at the account: another landlord's
+  // book is not hers to read and naming his company is still a 403.
+  it('the desk, scoped to one company, reads the whole account book — and no further', async () => {
+    const f = await seedPosFixture()
+    const c = await db.connect()
+    let second = ''
+    let outsider = { userId: '', landlordId: '' }
+    try {
+      await c.query(`UPDATE landlords SET business_name = 'Mountain View RV Park Ranch LLC' WHERE id = $1`, [f.landlordId])
+      second = (await c.query<{ id: string }>(
+        `INSERT INTO landlords (user_id, business_name) VALUES ($1, 'Oak Park Motel and RV LLC') RETURNING id`,
+        [f.landlordUserId])).rows[0].id
+      outsider = await seedLandlord(c)
+      await c.query(`UPDATE landlords SET business_name = 'Somebody Else LLC' WHERE id = $1`, [outsider.landlordId])
+    } finally { c.release() }
+    const mk = async (landlordId: string, first: string) =>
+      (await db.query<{ id: string }>(
+        `INSERT INTO pos_customers (landlord_id, first_name, last_name) VALUES ($1,$2,'Doe') RETURNING id`,
+        [landlordId, first])).rows[0].id
+    const mvJane = await mk(f.landlordId, 'Jane')
+    const opBob = await mk(second, 'Bob')              // the account's OTHER company
+    const theirs = await mk(outsider.landlordId, 'Nobody')  // another landlord entirely
+    // The propane sale: Oak Park's man, rung at the Mountain View counter she works.
+    const propane = (await db.query<{ id: string }>(
+      `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, tax_amount, total, status, pos_customer_id, property_id)
+       VALUES ($1, $2, 'cash', 24, 0, 24, 'completed', $3, $4) RETURNING id`,
+      [f.landlordId, f.landlordUserId, opBob, f.propertyId])).rows[0].id
+    const desk = { Authorization: `Bearer ${await cashierFor(f, [f.propertyId])}` }
+
+    // The tab exactly as it ships: no property, no company named.
+    const list = await request(buildApp()).get('/api/pos/customers').set(desk)
+    expect(list.status, JSON.stringify(list.body)).toBe(200)
+    const rows = Object.fromEntries(list.body.data.map((r: any) => [r.id, r]))
+    expect(Object.keys(rows).sort()).toEqual([mvJane, opBob].sort())
+    expect(rows[opBob]).toMatchObject({ landlord_id: second, company: 'Oak Park Motel and RV LLC' })
+    expect(rows[mvJane].company).toBe('Mountain View RV Park Ranch LLC')
+    expect(Object.keys(rows)).not.toContain(theirs)
+    // The row counts the propane she rang, and opens it: the history names the
+    // company that keeps his record, which is not the one in her token.
+    expect(rows[opBob].purchases).toBe(1)
+    const hist = await request(buildApp()).get(`/api/pos/transactions?posCustomerId=${opBob}&landlordId=${second}`).set(desk)
+    expect(hist.status, JSON.stringify(hist.body)).toBe(200)
+    expect(hist.body.data.map((t: any) => t.id)).toEqual([propane])
+
+    // And Save writes where that lookup read: a typed phone number on the
+    // account's other book is the counter's ordinary work, and it answered
+    // "merged or closed" — which had not happened — because the UPDATE beside
+    // the lookup demanded an exact company.
+    const saved = await request(buildApp()).patch(`/api/pos/customers/${opBob}`).set(desk).send({ phone: '(602) 555-0199' })
+    expect(saved.status, JSON.stringify(saved.body)).toBe(200)
+    expect(saved.body.data.phone).toBe('(602) 555-0199')
+
+    // Another landlord's company is not hers to name, on either read.
+    const askedTheirs = await request(buildApp()).get(`/api/pos/customers?landlordId=${outsider.landlordId}`).set(desk)
+    expect(askedTheirs.status, JSON.stringify(askedTheirs.body)).toBe(403)
+    const theirHistory = await request(buildApp()).get(`/api/pos/transactions?landlordId=${outsider.landlordId}`).set(desk)
+    expect(theirHistory.status, JSON.stringify(theirHistory.body)).toBe(403)
+  })
+})
+
 // S654 (Nic): "it goes away. It needs to be there the whole time … link it to be
 // always on the screen until the payment is processed. Also, it doesn't show a
 // customer name … I need to be able to choose a customer from the drop-down menu
@@ -3265,6 +3639,7 @@ describe('10/2 (review) a wrong pick is put back with Undo', () => {
     expect(named.body.data.message).toMatch(/^Saved Pat Typed/)
     expect((await undo(f, s, named.body.data.undo)).status).toBe(200)
     expect((await db.query<any>(`SELECT first_name, last_name, email FROM pos_customers WHERE id = $1`, [standIn])).rows[0])
+      // No card identity on this stand-in at all, so it stays Card Customer.
       .toEqual({ first_name: 'Card', last_name: 'Customer', email: null })
     // A cash sale linked to a brand-new customer: undone, that record goes again.
     const cash = await saleRow(f, { paymentMethod: 'cash' })
@@ -3313,7 +3688,7 @@ describe('10/2 linking a sale to a person fills in every sale on the same card',
     const standIn = s1.body.data.pos_customer_id
     expect(s2.body.data.pos_customer_id).toBe(standIn)
     expect((await db.query<any>(`SELECT first_name, last_name, created_from FROM pos_customers WHERE id = $1`, [standIn])).rows[0])
-      .toEqual({ first_name: 'Card', last_name: 'Customer', created_from: 'card_reader' })
+      .toEqual({ first_name: 'Visa', last_name: '\u2022\u20229767', created_from: 'card_reader' })
 
     // He clicks his own name on the later sale.
     const res = await link(f, s2.body.data.id, { tenantId: nic })
@@ -3519,7 +3894,10 @@ describe('10/2 linking a sale to a person fills in every sale on the same card',
     const res = await link(f, sale, { match: { pick: byName.pick } })
     expect(res.status, JSON.stringify(res.body)).toBe(200)
     const row = (await db.query<any>(`SELECT landlord_id, first_name, last_name, email, phone FROM pos_customers WHERE id = $1`, [res.body.data.pos_customer_id])).rows[0]
-    expect(row).toEqual({ landlord_id: f.landlordId, first_name: 'Zed', last_name: 'Elsewhere', email: null, phone: null })
+    // 10/24 (Nic): their phone comes with them — it was already on the clerk's
+    // screen, so withholding it from the record only meant somebody retyped it.
+    // The email still only crosses when the clerk typed it in full.
+    expect(row).toEqual({ landlord_id: f.landlordId, first_name: 'Zed', last_name: 'Elsewhere', email: null, phone: '602-555-0199' })
     // Typed in full, the email they typed comes too — on a fresh company.
     const g = await seedPosFixture()
     const sale2 = await saleRow(g)
@@ -3527,7 +3905,7 @@ describe('10/2 linking a sale to a person fills in every sale on the same card',
     const res2 = await link(g, sale2, { match: { pick: byEmail.pick } })
     expect(res2.status, JSON.stringify(res2.body)).toBe(200)
     expect((await db.query<any>(`SELECT email, phone FROM pos_customers WHERE id = $1`, [res2.body.data.pos_customer_id])).rows[0])
-      .toEqual({ email: 'zed@elsewhere.com', phone: null })
+      .toEqual({ email: 'zed@elsewhere.com', phone: '602-555-0199' })
     // A pick that is not one the search handed out is nobody.
     expect((await link(f, sale, { match: { pick: 'not-a-real-pick-not-a-real-pick-not-a-real-pick' } })).status).toBe(404)
   })
@@ -3585,6 +3963,7 @@ describe('10/2 a cashier works only the properties they are assigned to', () => 
     expect(emailPosReceiptMock).not.toHaveBeenCalled()
     expect(saveCardForCustomerMock).not.toHaveBeenCalled()
     expect((await db.query<any>(`SELECT first_name, last_name, email FROM pos_customers WHERE id = $1`, [standIn])).rows[0])
+      // No card identity on this stand-in either.
       .toEqual({ first_name: 'Card', last_name: 'Customer', email: null })
     // Their own park's sale is answered.
     readSaveCardAnswerMock.mockResolvedValue({ answered: false })
@@ -3614,20 +3993,23 @@ describe('10/2 a cashier works only the properties they are assigned to', () => 
 })
 
 describe('10/2 typing a name at the register finds the person', () => {
-  it('finds this property\'s residents by part of a last name, with their site; a former resident says so; under two letters finds nothing', async () => {
+  it('finds the account\'s residents by part of a last name, with their site; a former resident says so; another park says which; under two letters finds nothing', async () => {
     const f = await seedPosFixture()
     const nic = await residentOf(f, 'Nicholas', 'Rhoades', { site: 'MH 02' })
     await residentOf(f, 'Ray', 'Rhodes', { site: '14', status: 'terminated' })
     const parkB = await secondProperty(f)
-    // Another property's resident is not listed as this register's own — no
-    // site, no "resident" — only as anyone else on GAM is: a name and a hint.
-    await residentOf(f, 'Rhonda', 'Elsewhere', { propertyId: parkB })
+    await db.query(`UPDATE properties SET name = 'Oak Park Motel and RV' WHERE id = $1`, [parkB])
+    // 10/20 (Nic): another park of his own is not "elsewhere". She is this
+    // account's resident, named with the park and the site the desk confirms
+    // her by — the masked hint is for another ACCOUNT's people. The park is
+    // printed only because it is not the one this register is standing in.
+    await residentOf(f, 'Rhonda', 'Elsewhere', { propertyId: parkB, site: '7' })
     const res = await searchAt(f, 'rho')
     expect(res.status, JSON.stringify(res.body)).toBe(200)
     expect(res.body.data.map((p: any) => [p.name, p.hint, p.kind])).toEqual([
       ['Nicholas Rhoades', 'resident · Site MH 02', 'resident'],
       ['Ray Rhodes', 'former resident · Site 14', 'resident'],
-      ['Rhonda Elsewhere', 't•••@test.dev', 'elsewhere'],
+      ['Rhonda Elsewhere', 'resident · Oak Park Motel and RV · Site 7', 'resident'],
     ])
     expect(res.body.data[0]).toMatchObject({ key: `t:${nic}`, kind: 'resident', tenantId: nic })
     expect((await searchAt(f, 'r')).body.data).toEqual([])
@@ -3676,18 +4058,21 @@ describe('10/2 typing a name at the register finds the person', () => {
     await customerRow(other, 'Card', 'Customer', { fromCard: true })           // a nameless card is nobody
     await customerRow(other, 'Bob', 'Printed', { fromCard: true })             // an unconfirmed card record is nobody
     const bobs = (await searchAt(f, 'bob')).body.data
-    // 10/2 (review): never digits of a stranger's phone the clerk did not type
-    // — a masked email, else just "phone on file".
+    // 10/24 (Nic, DIRECTIVE — replaces the 10/2 phone masking): "Name and phone
+    // number should be visible between different properties... They are all
+    // customers of GAM." So the phone shows, formatted, ready to read back to
+    // the guest. The EMAIL is still masked — that is the line now.
     expect(bobs.map((p: any) => [p.name, p.hint, p.kind])).toEqual([
-      ['Bob Marsh', 'phone on file', 'elsewhere'],
+      ['Bob Marsh', '(480) 555-0111', 'elsewhere'],
       ['Bob Tanner', 'b•••@gmail.com', 'elsewhere'],
     ])
-    // A whole email, a whole phone, part of a last name. A phone typed whole
-    // comes back with its own last four (nothing the clerk did not type).
-    expect((await searchAt(f, 'zed@elsewhere.com')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zed Elsewhere', 'z•••@elsewhere.com']])
-    expect((await searchAt(f, '602-555-0199')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zed Elsewhere', 'phone ••0199']])
-    expect((await searchAt(f, 'zed')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zed Elsewhere', 'z•••@elsewhere.com']])
-    expect((await searchAt(f, '480-555-0111')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Bob Marsh', 'phone ••0111']])
+    // A whole email, a whole phone, part of a last name — all find them, and
+    // all come back with the same hint, because the hint no longer depends on
+    // what the clerk happened to type.
+    expect((await searchAt(f, 'zed@elsewhere.com')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zed Elsewhere', '(602) 555-0199 · z•••@elsewhere.com']])
+    expect((await searchAt(f, '602-555-0199')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zed Elsewhere', '(602) 555-0199 · z•••@elsewhere.com']])
+    expect((await searchAt(f, 'zed')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zed Elsewhere', '(602) 555-0199 · z•••@elsewhere.com']])
+    expect((await searchAt(f, '480-555-0111')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Bob Marsh', '(480) 555-0111']])
     expect((await searchAt(f, 'awa')).body.data.map((p: any) => [p.name, p.hint])).toEqual([['Zoe Away', 'z•••@away.com']])
     // Never a piece of an email or phone.
     expect((await searchAt(f, 'zed@else')).body.data).toEqual([])
@@ -3697,12 +4082,15 @@ describe('10/2 typing a name at the register finds the person', () => {
     // No company, no site, no "resident", no ids, no real email or phone.
     const all = await Promise.all(['bob', 'zed', 'zoe', 'zed@elsewhere.com'].map((q) => searchAt(f, q)))
     const raw = JSON.stringify(all.map((r) => r.body))
+    // 10/24: the phone is deliberately NOT on this list any more — it is the one
+    // thing Nic opened up. Everything else it ever held is still held back: the
+    // other company, its property, every id, "resident", a site, and the email.
     for (const leak of [other.landlordId, other.propertyId, zedId, zoe, bob1, 'Test Property', 'resident', 'zed@elsewhere.com', 'zoe@away.com',
-                        'btanner', '602-555-0199', '6025550199', '480-555-0111', 'Site']) {
+                        'btanner', 'Site']) {
       expect(raw).not.toContain(leak)
     }
     for (const hit of all.flatMap((r) => r.body.data)) {
-      expect(hit).toMatchObject({ kind: 'elsewhere', tenantId: null, customerId: null, email: null, phone: null })
+      expect(hit).toMatchObject({ kind: 'elsewhere', tenantId: null, customerId: null, email: null })
       expect(typeof hit.pick).toBe('string')
     }
   })
@@ -3718,6 +4106,8 @@ describe('10/2 typing a name at the register finds the person', () => {
     const zoeHit = (await searchAt(f, 'zoe')).body.data[0]
     const picked = await post(pickBody(zoeHit.pick))
     expect(picked.status, JSON.stringify(picked.body)).toBe(201)
+    // Zoe has no phone on file at the other company, so there is nothing to
+    // bring across — the record is her name alone, as before.
     expect(picked.body.data).toMatchObject({ first_name: 'Zoe', last_name: 'Away', email: null, phone: null, kind: 'customer', tenant_id: null })
     const zoeRow = (await db.query<any>(`SELECT landlord_id, tenant_id, email, phone, elsewhere_ref FROM pos_customers WHERE id = $1`, [picked.body.data.id])).rows[0]
     expect(zoeRow).toMatchObject({ landlord_id: f.landlordId, tenant_id: null, email: null, phone: null })   // no tenancy link
@@ -3731,7 +4121,7 @@ describe('10/2 typing a name at the register finds the person', () => {
     // Typed in full: that email (and only that) comes with them.
     const zedHit = (await searchAt(f, 'zed@elsewhere.com')).body.data[0]
     const zed = await post(pickBody(zedHit.pick))
-    expect(zed.body.data).toMatchObject({ first_name: 'Zed', last_name: 'Elsewhere', email: 'zed@elsewhere.com', phone: null })
+    expect(zed.body.data).toMatchObject({ first_name: 'Zed', last_name: 'Elsewhere', email: 'zed@elsewhere.com', phone: '602-555-0199' })
     // The other company's records are untouched.
     expect((await db.query<any>(`SELECT landlord_id, email FROM pos_customers WHERE id = $1`, [zedId])).rows[0])
       .toEqual({ landlord_id: other.landlordId, email: 'zed@elsewhere.com' })
@@ -3794,7 +4184,7 @@ describe('10/2 typing a name at the register finds the person', () => {
     expect((await db.query<any>(`SELECT archived_at FROM pos_customers WHERE id = $1`, [theirs])).rows[0].archived_at).toBeNull()
   })
 
-  it('someone this company already has is linked, not copied: same email on a register customer here, or a resident of this company\'s other park', async () => {
+  it('someone this account already has is linked, not copied: same email on a register customer here, or a resident of its other park', async () => {
     const f = await seedPosFixture()
     const other = await seedPosFixture()
     // The same person on two companies' registers, by email.
@@ -3802,15 +4192,24 @@ describe('10/2 typing a name at the register finds the person', () => {
     const mine = await customerRow(f, 'Patricia', 'Rivers', { email: 'pat@rivers.com' })
     // Already this company's own by email, so nobody from elsewhere is listed for it.
     expect((await searchAt(f, 'rivers')).body.data.map((p: any) => [p.kind, p.customerId])).toEqual([['customer', mine]])
-    // A resident of this company's other park shows as a name only — and picked, is their resident record.
+    // 10/20 (Nic): a resident of the account's other park is its own customer,
+    // named with her park and site and reached by her tenant id — so there is
+    // no sealed pick at this counter to make a copy out of.
     const parkB = await secondProperty(f)
-    const rhonda = await residentOf(f, 'Rhonda', 'Parkb', { propertyId: parkB, email: 'rhonda@parkb.com' })
+    await db.query(`UPDATE properties SET name = 'Oak Park Motel and RV' WHERE id = $1`, [parkB])
+    const rhonda = await residentOf(f, 'Rhonda', 'Parkb', { propertyId: parkB, email: 'rhonda@parkb.com', site: '7' })
     const hit = (await searchAt(f, 'parkb')).body.data[0]
-    expect(hit).toMatchObject({ kind: 'elsewhere', name: 'Rhonda Parkb', email: null, tenantId: null })
-    const picked = await request(buildApp()).post('/api/pos/customers').set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ propertyId: f.propertyId, match: { pick: hit.pick } })
-    expect(picked.status, JSON.stringify(picked.body)).toBe(200)
-    expect(picked.body.data).toMatchObject({ tenant_id: rhonda, kind: 'resident', existing: true })
+    expect(hit).toMatchObject({ kind: 'resident', name: 'Rhonda Parkb', tenantId: rhonda,
+      email: 'rhonda@parkb.com', hint: 'resident · Oak Park Motel and RV · Site 7' })
+    expect(hit.pick).toBeUndefined()
+    // And adding her by hand here lands on HER — one record for the account,
+    // whichever of its counters wrote it.
+    const added = await request(buildApp()).post('/api/pos/customers').set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId: f.propertyId, firstName: 'Rhonda', lastName: 'Parkb', email: 'rhonda@parkb.com' })
+    expect(added.status, JSON.stringify(added.body)).toBe(200)
+    expect(added.body.data).toMatchObject({ tenant_id: rhonda, kind: 'resident', existing: true })
+    expect((await db.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pos_customers WHERE tenant_id = $1 AND archived_at IS NULL`, [rhonda])).rows[0].n).toBe(1)
   })
 
   it('returns only what the picker needs — never balances, lease dates or payment history', async () => {
@@ -3867,11 +4266,12 @@ describe('10/2 typing a name at the register finds the person', () => {
     expect(await found('gmai')).toEqual([['customer', 'Ann Local']])
     expect(await found('0123')).toEqual([['customer', 'Ann Local']])
     expect(await found('ann@')).toEqual([['customer', 'Ann Local']])
-    // So do the people who lease with this company at its other parks (listed
-    // by name and a masked hint, as for anyone not at this property).
+    // So do the people who lease with this ACCOUNT at its other parks — 10/20
+    // (Nic): they are its own customers, listed by name with their park and
+    // site, so the looser rule is theirs as much as this property's.
     const parkB = await secondProperty(f)
     await residentOf(f, 'Rita', 'Parkb', { propertyId: parkB, phone: '928-555-0177' })
-    expect(await found('928-555-01')).toEqual([['elsewhere', 'Rita Parkb']])
+    expect(await found('928-555-01')).toEqual([['resident', 'Rita Parkb']])
   })
 
   // The review's own probe: the masked hint hands over the email's domain and
@@ -3879,17 +4279,25 @@ describe('10/2 typing a name at the register finds the person', () => {
   // 10/2 (review, again): and the last four themselves were the shortcut — with
   // the area code known, ~1,000 whole-number guesses rebuilt the number. A
   // name search shows no phone digits at all.
-  it('a stranger\'s email or phone cannot be grown out of the masked hint, one character at a time', async () => {
+  it('a stranger\'s email cannot be grown out of the masked hint, one character at a time', async () => {
     const f = await seedPosFixture()
     const other = await seedPosFixture()
     await customerRow(other, 'Bob', 'Smith', { email: 'zqprivate77@gmail.com', phone: '602-555-0199' })
     await customerRow(other, 'Bob', 'Nomail', { phone: '602-555-0177' })
     const hit = async (q: string) => (await searchAt(f, q)).body.data.filter((p: any) => p.kind === 'elsewhere').length
-    expect((await searchAt(f, 'bob smith')).body.data[0]).toMatchObject({ name: 'Bob Smith', hint: 'z•••@gmail.com' })
-    expect((await searchAt(f, 'bob nomail')).body.data[0]).toMatchObject({ name: 'Bob Nomail', hint: 'phone on file' })
+    // 10/24 (Nic): the PHONE is shared on purpose now — "they are all customers
+    // of GAM" — so there is nothing left to grow it out of. The EMAIL is still
+    // masked, and this is what stops the masked part being guessed a character
+    // at a time: a PIECE of an address finds nobody, so no guess is ever
+    // confirmed. (The same filter also means a phone must be typed whole, which
+    // is why handing back the whole number tells a fisher nothing.)
+    expect((await searchAt(f, 'bob smith')).body.data[0]).toMatchObject({ name: 'Bob Smith', hint: '(602) 555-0199 · z•••@gmail.com' })
+    expect((await searchAt(f, 'bob nomail')).body.data[0]).toMatchObject({ name: 'Bob Nomail', hint: '(602) 555-0177' })
     const named = (await searchAt(f, 'bob')).body.data
     expect(named).toHaveLength(2)
-    for (const p of named) expect(`${p.hint} ${p.name} ${p.email} ${p.phone}`).not.toMatch(/\d/)
+    // Their real address never comes back, by any route.
+    for (const p of named) expect(`${p.hint} ${p.email}`).not.toContain('zqprivate77')
+    for (const p of named) expect(p.email).toBeNull()
     for (const guess of ['bob @gmail.com', 'bob 7@gmail.com', 'bob 77@gmail.com', 'bob 8@gmail.com', 'bob e77@gmail.com',
                          'bob 990199', 'bob 550199', 'bob 5550199', 'bob 25550199', 'bob 025550199']) {
       expect(await hit(guess), guess).toBe(0)
@@ -3963,7 +4371,7 @@ describe('10/2 typing a name at the register finds the person', () => {
     const res = await link(f, sale, { match: { pick: hit.pick } })
     expect(res.status, JSON.stringify(res.body)).toBe(200)
     expect((await db.query<any>(`SELECT first_name, phone FROM pos_customers WHERE id = $1`, [res.body.data.pos_customer_id])).rows[0])
-      .toEqual({ first_name: 'Zed', phone: null })
+      .toEqual({ first_name: 'Zed', phone: '602-555-0199' })
     // The old way of naming someone from elsewhere (their email or phone) is not accepted.
     expect((await link(f, sale, { match: { phone: '6025550199' } })).status).toBe(400)
   })

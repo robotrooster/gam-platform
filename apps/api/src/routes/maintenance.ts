@@ -345,6 +345,20 @@ maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, r
        landlordNotes||null, req.params.id, manHours||null, priority, category,
        assignTouched, workTradeAccess])
 
+    // 10/12 (Nic, L6): "a repair closed with a cost → landlord's choice (auto
+    // unpaid bill vs 'Record as bill' button)". With the automatic choice the
+    // completed repair's cost becomes an unpaid bill on Expenses (kept in step
+    // while unpaid). Best-effort: the repair is saved either way.
+    // 10/12 review: on every save of a completed repair with a cost, not only
+    // one that set the status or the cost — syncRepairBill makes nothing twice
+    // and changes nothing already right, so a repair a work trader closed with
+    // a cost on it (or one completed before the company chose 'automatic')
+    // gets its bill the next time it is saved.
+    if (updated?.status === 'completed' && updated?.actual_cost != null) {
+      const { syncRepairBill } = await import('../services/repairBills')
+      await syncRepairBill(updated.id, req.user!.userId)
+    }
+
     // Auto-add status change comment
     if (effectiveStatus && effectiveStatus !== request.status) {
       const statusLabels: Record<string, string> = {

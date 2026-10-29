@@ -139,7 +139,10 @@ describe('the bill run and the whole-bill rule', () => {
   })
 
   it('older open rows on the lease are part of the whole bill', async () => {
-    // $470 covers May's rent but not rent + April's $30 water: nothing is spent.
+    // $470 covers May's rent but not rent + April's $30 water, so the bill
+    // does not settle itself. 10/15 (Nic): the credit still goes on the
+    // balance oldest first — April's $30 water is paid and $440 goes on May's
+    // rent, which stays open for the $20 money still owes.
     const a = await house()
     const aWater = await olderRow(a, { amount: 30 })
     const short = await issued(a, 470)
@@ -151,8 +154,10 @@ describe('the bill run and the whole-bill rule', () => {
     await generateInvoices(NOW)
 
     expect((await mayRent(a)).status).toBe('pending')
-    expect(await statusOf(aWater)).toBe('pending')
-    expect(await issuedLeft(short)).toBe(470)
+    expect(await statusOf(aWater)).toBe('settled')
+    expect(await issuedLeft(short)).toBe(0)
+    expect(await usesOn(aWater)).toEqual([{ source: 'whole_bill', status: 'applied', amount: '30.00' }])
+    expect(await usesOn((await mayRent(a)).id)).toEqual([{ source: 'whole_bill', status: 'applied', amount: '440.00' }])
 
     expect((await mayRent(b)).status).toBe('settled')
     expect(await statusOf(bWater)).toBe('settled')

@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react'
 import { Search } from 'lucide-react'
 
 // S576: shared list-page controls — one search box + one property dropdown,
-// reused across Units, Tenants, Leases, E-Sign, and Payments so big landlords
+// reused across Units, Tenants, Leases and E-Sign (10/12: the Rent Roll uses
+// the search box; its property folders are the filter) so big landlords
 // (500+ tenants, many properties) can find rows fast. Each page owns its own
 // `.filter-bar` wrapper and any extra chips; these are the two common pieces.
 

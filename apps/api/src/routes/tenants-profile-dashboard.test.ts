@@ -176,15 +176,36 @@ describe('GET /api/tenants/me', () => {
 // to pay. A unit of their own from THIS lease (the landlord's signature issued
 // it) is no reason to skip signing.
 describe('GET /api/tenants/me — pending_lease_locks (the signing lock-in)', () => {
-  async function waitingOn(f: TFixture, landlordId: string, unitId: string, leaseId: string | null) {
+  const signingToken = () => randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '')
+
+  /**
+   * A document sitting on this tenant's signature. It is a LEASE unless the
+   * case says otherwise, which is what every one of these was until 10/20 —
+   * the day a resident's own page could raise a work-trade form, and that form
+   * started answering the portal's "is your lease waiting?" question.
+   *
+   * landlordSignedFirst is how a real document goes out: the landlord signs
+   * his box, the document moves to 'in_progress', and the resident is the next
+   * unsigned signer.
+   */
+  async function waitingOn(
+    f: TFixture, landlordId: string, unitId: string, leaseId: string | null,
+    opts: { documentType?: string; title?: string; landlordSignedFirst?: boolean } = {},
+  ) {
     const doc = (await db.query<{ id: string }>(
       `INSERT INTO lease_documents (landlord_id, unit_id, lease_id, title, document_type, status)
-       VALUES ($1,$2,$3,'Lease','original_lease','in_progress') RETURNING id`,
-      [landlordId, unitId, leaseId])).rows[0].id
+       VALUES ($1,$2,$3,$4,$5,'in_progress') RETURNING id`,
+      [landlordId, unitId, leaseId, opts.title ?? 'Lease', opts.documentType ?? 'original_lease'])).rows[0].id
+    if (opts.landlordSignedFirst) {
+      await db.query(
+        `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status, signed_at)
+         VALUES ($1,$2,'landlord','Blu B','blu@test.dev',1,$3,'signed',NOW())`,
+        [doc, f.landlordUserId, signingToken()])
+    }
     await db.query(
       `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
        VALUES ($1,$2,'primary','T T','t@test.dev',2,$3,'sent')`,
-      [doc, f.tenantUserId, randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '')])
+      [doc, f.tenantUserId, signingToken()])
     return doc
   }
   const me = (f: TFixture) => request(buildApp()).get('/api/tenants/me').set('Authorization', `Bearer ${f.tenantToken}`)
@@ -226,19 +247,80 @@ describe('GET /api/tenants/me — pending_lease_locks (the signing lock-in)', ()
     const f = await seedTFixture()
     expect((await me(f)).body.data.pending_lease_locks).toBeNull()
   })
+
+  // ── 10/20 — THE MAINTENANCE AGREEMENT THAT TOOK CURTIS'S PORTAL ─────────
+  //
+  // Blu opens Curtis's file at Mattoon and sends the Mattoon Maintenance
+  // Agreement — a work-trade form with a landlord box and a tenant box, raised
+  // from the resident's own page. He signs his box first, which is how every
+  // GAM document goes out. Curtis has lived there two years and has rent due.
+  //
+  // Until the portal's question named the document TYPE, that maintenance
+  // agreement came back as Curtis's PENDING LEASE, said it locked his portal,
+  // and the tenant app sent every route he has to a signing page with no nav
+  // and no sign-out, titled "Sign your lease". He could not reach Payments
+  // until he signed a maintenance agreement. A lease holds the portal; paper
+  // waits on the Documents screen while they go on paying rent.
+  it('a work-trade form sent from the resident page is not their lease and does not lock the portal', async () => {
+    const f = await seedTFixture()
+    await waitingOn(f, f.landlordId, f.unitId, null, {
+      documentType: 'general_contract',
+      title: 'Mattoon Maintenance Agreement — Curtis Bell (Lot 1)',
+      landlordSignedFirst: true,
+    })
+    const d = (await me(f)).body.data
+    expect(d.pending_lease_document_id).toBeNull()
+    expect(d.pending_lease_locks).toBeNull()
+    // All four signals read the same document, so they go quiet together —
+    // otherwise the nav and the Home notice describe a lease the lock-in says
+    // is not there.
+    expect(d.pending_lease_waiting_on_is_me).toBeNull()
+    expect(d.pending_lease_waiting_on_name).toBeNull()
+    expect(d.pending_lease_signers).toBeNull()
+    // And he still has his home in front of him, which is the whole point.
+    expect(d.unit_id).toBe(f.unitId)
+  })
+
+  it('an add-a-roommate addendum is not their lease either', async () => {
+    const f = await seedTFixture()
+    await waitingOn(f, f.landlordId, f.unitId, f.leaseId!, {
+      documentType: 'addendum_add', title: 'Add a roommate', landlordSignedFirst: true })
+    const d = (await me(f)).body.data
+    expect(d.pending_lease_document_id).toBeNull()
+    expect(d.pending_lease_locks).toBeNull()
+  })
+
+  it('a contract raised after the lease never outranks the lease that is actually waiting', async () => {
+    const f = await seedTFixture()
+    const lease = await waitingOn(f, f.landlordId, f.unitId, f.leaseId!)
+    await waitingOn(f, f.landlordId, f.unitId, null, {
+      documentType: 'general_contract', title: 'Mattoon Maintenance Agreement', landlordSignedFirst: true })
+    const d = (await me(f)).body.data
+    expect(d.pending_lease_document_id).toBe(lease)
+    expect(d.pending_lease_locks).toBe(true)
+    // The newest open document is the contract; the roster still has to be the
+    // LEASE's roster, or the signing notice names the wrong paper.
+    expect((d.pending_lease_signers ?? []).map((s: any) => s.role)).toEqual(['primary'])
+    expect(d.pending_lease_waiting_on_is_me).toBe(true)
+  })
 })
 
 describe('GET /api/tenants/me/payment-health', () => {
-  it('computes on-time rate from the tenant\'s own payments', async () => {
+  // 10/12 (Nic): "Payment health = ONE definition everywhere, per HOUSEHOLD
+  // per BILL MONTH" — the tenant sees the figure the landlord sees: months
+  // paid on time over the last 12, judged after the grace period (the
+  // property's 5 days when the lease names none).
+  it('counts months, not payments: one paid on time, one paid past grace → 50%', async () => {
     const f = await seedTFixture()
     const client = await db.connect()
     try {
-      // 3 settled, 1 failed → 3/4 = 75%. One payment per unit to avoid the
-      // (unit_id, due_date) active-rent unique index (all share CURRENT_DATE).
-      const statuses: Array<'settled' | 'failed'> = ['settled', 'settled', 'settled', 'failed']
-      for (const status of statuses) {
-        const unitId = await seedUnit(client, { propertyId: f.propertyId, landlordId: f.landlordId })
-        await seedRentPayment(client, { unitId, tenantId: f.tenantId, landlordId: f.landlordId, amount: 1000, status })
+      // Two months ago, paid on day 3 (on time); last month, paid on day 12 (past grace).
+      for (const [monthsAgo, paidOnDay] of [[2, 3], [1, 12]]) {
+        await client.query(
+          `WITH d AS (SELECT (date_trunc('month', CURRENT_DATE) - ($5 || ' months')::interval)::date AS due)
+           INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, created_at, settled_at, manual_method)
+           SELECT $1,$2,$3,$4,'rent',1000,'settled','RENT',d.due,d.due,(d.due + ($6 - 1) * interval '1 day' + interval '19 hours'),'cash' FROM d`,
+          [f.unitId, f.leaseId, f.tenantId, f.landlordId, monthsAgo, paidOnDay])
       }
     } finally { client.release() }
 
@@ -246,20 +328,21 @@ describe('GET /api/tenants/me/payment-health', () => {
       .get('/api/tenants/me/payment-health')
       .set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(200)
-    expect(res.body.data.totalPayments).toBe(4)
-    expect(res.body.data.settledCount).toBe(3)
-    expect(res.body.data.failedCount).toBe(1)
-    expect(res.body.data.onTimeRate).toBe(75)
+    expect(res.body.data.totalPayments).toBe(2)
+    expect(res.body.data.settledCount).toBe(2)
+    expect(res.body.data.onTime).toMatchObject({ pct: 50, resolved: 2, onTimeCount: 1 })
+    // The per-row rate (paid rows ÷ rows) is gone: one figure, everywhere.
+    expect(res.body.data.onTimeRate).toBeUndefined()
   })
 
-  it('no payments → 0% rate, zero counts', async () => {
+  it('no bills → nothing to judge yet, zero counts', async () => {
     const f = await seedTFixture()
     const res = await request(buildApp())
       .get('/api/tenants/me/payment-health')
       .set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.totalPayments).toBe(0)
-    expect(res.body.data.onTimeRate).toBe(0)
+    expect(res.body.data.onTime).toMatchObject({ pct: null, resolved: 0 })
   })
 })
 

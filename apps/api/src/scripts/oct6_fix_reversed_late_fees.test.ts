@@ -14,7 +14,8 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import type { PoolClient } from 'pg'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant, seedLeaseTenant } from '../test/dbHelpers'
-import { emitPaymentSettledEvent, correctMarkForLateFeeOnBill } from '../services/creditLedgerEmitters'
+import { emitPaymentSettledEvent } from '../services/creditLedgerEmitters'
+import { appendEvent } from '../services/creditLedger'
 import { undoDepositMatch } from '../services/bankDepositConfirm'
 import { creditLateFee, BANK_SHOWS_LATE_FEE_NOTE } from '../services/lateFeeCredit'
 import { fixReversedLateFees, correctBankMatchedCreditedFees } from './oct6_fix_reversed_late_fees'
@@ -73,6 +74,8 @@ async function zeroedTheOldWay(o: { onboarding: boolean }) {
     // … and settled the rent on the deposit's day, marking it from that day (on time).
     const settledAt = new Date(`${dueDay}T19:00:00Z`)
     await db.query(`UPDATE payments SET status = 'settled', settled_at = $2, manual_method = 'bank_deposit' WHERE id = $1`, [rentId, settledAt])
+    // Recorded yesterday (the change journal says when GAM recorded it).
+    await db.query(`UPDATE audit_row_changes SET changed_at = NOW() - interval '1 day' WHERE row_id = $1`, [rentId])
     if (!o.onboarding) {
       await tx(cl => emitPaymentSettledEvent(cl, {
         tenantId, paymentId: rentId, paymentType: 'rent', amount: '600', dueDate: dueDay, settledAt, graceDays: 3,
@@ -111,9 +114,11 @@ async function bankMatchOf(z: Awaited<ReturnType<typeof zeroedTheOldWay>>, o: { 
 
 const fee = async (id: string) => (await db.query<any>(
   `SELECT amount::float AS amount, status, issued_credit_amount::float AS credited, notes FROM payments WHERE id = $1`, [id])).rows[0] ?? null
+// 10/12 (Nic): "one mark per invoice" — the live mark of the BILL a row is on.
 const liveMarks = async (id: string) => (await db.query<any>(
-  `SELECT id, event_type, event_data FROM credit_events
-    WHERE event_type LIKE 'payment_received_%' AND event_data->>'payment_id' = $1 AND superseded_by IS NULL`, [id])).rows
+  `SELECT e.id, e.event_type, e.event_data
+     FROM credit_events e JOIN payments bp ON bp.invoice_id::text = e.event_data->>'invoice_id'
+    WHERE bp.id = $1 AND e.event_data->>'mark_basis' = 'invoice' AND e.superseded_by IS NULL`, [id])).rows
 
 describe('oct6_fix_reversed_late_fees', () => {
   it('a dry run changes nothing; --apply restores the fee, credits it, and marks the rent LATE from the day it was recorded; a second run finds nothing', async () => {
@@ -146,10 +151,10 @@ describe('oct6_fix_reversed_late_fees', () => {
     expect(now[0].event_type).toMatch(/^payment_received_late_(minor|major|severe)$/)
     expect(now[0].event_data).toMatchObject({ late_fee_on_bill: true, corrects_event_id: onTime[0].id })
     const yesterday = (await db.query<{ d: string }>(`SELECT ((NOW() - interval '1 day') AT TIME ZONE $1)::date::text AS d`, [TZ])).rows[0].d
-    expect((await db.query<{ d: string }>(`SELECT (($1::timestamptz) AT TIME ZONE $2)::date::text AS d`, [now[0].event_data.paid_at, TZ])).rows[0].d)
-      .toBe(yesterday)
+    expect(now[0].event_data.paid_in_full_on).toBe(yesterday)
+    expect(now[0].event_data.logged_after_late_fee).toBe(true)
     expect((await db.query<any>(`SELECT superseded_reason FROM credit_events WHERE id = $1`, [onTime[0].id])).rows[0].superseded_reason)
-      .toBe('data_entry_error_corrected')
+      .toBe('bill_status_changed')
 
     const again = await tx(c => fixReversedLateFees(c), true)
     expect(again).toEqual({ fixed: [], skipped: [], subjects: [] })
@@ -204,8 +209,8 @@ describe('oct6_fix_reversed_late_fees', () => {
   it('part B: a fee a bank match CREDITED (this script before the table, or a match while 0763a6b was live) is zeroed, the undo record rewritten, the mark corrected to ON TIME from the bank\'s day — once; Undo then puts it all back as before the match', async () => {
     const z = await zeroedTheOldWay({ onboarding: false })
     const { txn } = await bankMatchOf(z, { zeroed: true })
-    // As the earlier run of this script left it: charged again, credited, the undo record listing it as credited, the rent LATE.
-    const recordedAt = new Date(Date.now() - 86_400_000)
+    // As the earlier run of this script left it: charged again, credited, the undo record listing it as credited, the rent LATE
+    // (a per-line mark written then, as the code before 10/12 wrote marks).
     await tx(async c => {
       await c.query(`UPDATE payments SET amount = 25, status = 'pending', settled_at = NULL, notes = NULL WHERE id = $1`, [z.feeId])
       const cr = await creditLateFee(c, z.feeId, { paidOn: z.dueDay, tenantId: z.tenantId, createdBy: null })
@@ -214,9 +219,18 @@ describe('oct6_fix_reversed_late_fees', () => {
                 '{lateFeesCredited}', jsonb_build_array($2::jsonb)) WHERE id = $1`,
         [txn, JSON.stringify({ paymentId: z.feeId, amount: cr!.amount, priorStatus: 'pending', priorNotes: null,
           priorIssued: 0, creditId: cr!.creditId, useId: cr!.useId })])
-      await correctMarkForLateFeeOnBill(c, { paymentId: z.rentId, recordedAt })
+      await c.query(`UPDATE credit_events SET superseded_by = id, superseded_reason = 'attestation_invalidated'
+                      WHERE event_data->>'invoice_id' = $1 AND superseded_by IS NULL`, [z.invoiceId])
+      await appendEvent({
+        subjectType: 'tenant', subjectRefId: z.tenantId, eventType: 'payment_received_late_minor',
+        eventData: { payment_id: z.rentId, payment_type: 'rent', amount: '600', due_date: z.dueDay,
+          paid_at: new Date(Date.now() - 86_400_000).toISOString(), grace_days: 3, late_fee_on_bill: true },
+        occurredAt: new Date(Date.now() - 86_400_000), attestationSource: 'landlord_self_reported_with_evidence',
+        attestationEvidence: {}, dimensionTags: ['payment_reliability'], networkVisibility: 'visible_to_gam_network',
+      }, c)
     }, true)
-    const [lateMark] = await liveMarks(z.rentId)
+    const lateMark = (await db.query<any>(
+      `SELECT id, event_type FROM credit_events WHERE event_data->>'payment_id' = $1 AND superseded_by IS NULL`, [z.rentId])).rows[0]
     expect(lateMark.event_type).toMatch(/^payment_received_late_/)
     const creditId = (await db.query<any>(`SELECT tenant_credit_id FROM credit_uses WHERE payment_id = $1`, [z.feeId])).rows[0].tenant_credit_id
 
@@ -235,22 +249,29 @@ describe('oct6_fix_reversed_late_fees', () => {
     const undo = (await db.query<any>(`SELECT auto_settle_undo FROM bank_transactions WHERE id = $1`, [txn])).rows[0].auto_settle_undo
     expect(undo.lateFeesCredited).toEqual([])
     expect(undo.lateFeesZeroed).toEqual([{ paymentId: z.feeId, priorAmount: 25, priorStatus: 'pending', priorNotes: null }])
+    // The per-line late mark is replaced (never edited) by the bill's one mark, on time from the bank's day.
     const [now] = await liveMarks(z.rentId)
     expect(now.event_type).toBe('payment_received_on_time')
-    expect(now.event_data).toMatchObject({ bank_validated: true, corrects_event_id: lateMark.id })
-    expect((await db.query<any>(`SELECT superseded_by FROM credit_events WHERE id = $1`, [lateMark.id])).rows[0].superseded_by).toBe(now.id)
+    expect(now.event_data).toMatchObject({ bank_validated: true, replaces_event_ids: [lateMark.id] })
+    expect((await db.query<any>(`SELECT superseded_by, superseded_reason FROM credit_events WHERE id = $1`, [lateMark.id])).rows[0])
+      .toEqual({ superseded_by: now.id, superseded_reason: 'replaced_by_bill_mark' })
     // Part A does not undo it, and a second run finds nothing.
     expect((await tx(c => fixReversedLateFees(c), true)).fixed).toEqual([])
     expect(await tx(c => correctBankMatchedCreditedFees(c), true)).toEqual({ zeroed: [], skipped: [], subjects: [] })
 
-    // Undo of the match: the fee owed again as it was before the match, the rent open, its mark withdrawn.
+    // Undo of the match: the fee owed again as it was before the match, the rent open — the bill
+    // judged again (10/12): unpaid ten days after its due date, past grace.
     const u = await undoDepositMatch({ bankTransactionId: txn, landlordId: z.landlordId, undoneBy: z.ownerUserId })
     expect(u.lateFeesRestored).toBe(1)
     expect(await fee(z.feeId)).toMatchObject({ amount: 25, status: 'pending', credited: 0 })
-    expect(await liveMarks(z.rentId)).toEqual([])
+    expect((await liveMarks(z.rentId)).map(m => m.event_type)).toEqual(['payment_skipped'])
   })
 
-  it('a utility on the same bill paid on time BEFORE the fee was charged keeps its on-time mark (review fix)', async () => {
+  // 10/12 (Nic): "one mark per invoice" — the bill has ONE mark. The rent,
+  // recorded after the late fee was charged, counts from the day it was
+  // recorded (10/6), so the bill is paid late; the utility, paid and recorded
+  // before the fee, does not move the bill's day.
+  it('a utility on the same bill paid on time BEFORE the fee was charged: the bill\'s one mark counts from the rent (review fix)', async () => {
     const z = await zeroedTheOldWay({ onboarding: false })
     // A $40 utility on the bill, paid on its due day — eight days ago in GAM,
     // three days before the late fee posted — and marked on time then.
@@ -267,13 +288,16 @@ describe('oct6_fix_reversed_late_fees', () => {
     }), true)
     const utilBefore = await liveMarks(utilId)
     expect(utilBefore.map(m => m.event_type)).toEqual(['payment_received_on_time'])
+    expect((await liveMarks(z.rentId)).map(m => m.id)).toEqual([utilBefore[0].id])   // one bill, one mark
 
     const r = await tx(c => fixReversedLateFees(c), true)
     expect(r.fixed).toHaveLength(1)
-    // Only the rent (paid while the fee was on the bill) is corrected.
+    // Only the rent (recorded while the fee was on the bill) is looked at.
     expect(r.fixed[0].marks.map(m => m.paymentId)).toEqual([z.rentId])
-    expect((await liveMarks(z.rentId))[0].event_type).toMatch(/^payment_received_late_/)
-    expect((await liveMarks(utilId)).map(m => m.id)).toEqual([utilBefore[0].id])
+    const [now] = await liveMarks(z.rentId)
+    expect(now.event_type).toMatch(/^payment_received_late_/)
+    const yesterday = (await db.query<{ d: string }>(`SELECT ((NOW() - interval '1 day') AT TIME ZONE $1)::date::text AS d`, [TZ])).rows[0].d
+    expect(now.event_data).toMatchObject({ paid_in_full_on: yesterday, logged_after_late_fee: true, corrects_event_id: utilBefore[0].id })
   })
 
   it('a fee zeroed before 10/5 is left alone', async () => {

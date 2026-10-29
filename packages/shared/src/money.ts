@@ -63,9 +63,11 @@ export const CREDIT_USE_LIVE_STATUSES = ['held', 'applied'] as const satisfies r
  * released ∈ payment_failed | payment_canceled | superseded (a held use);
  * late_fee_credit_withdrawn (10/6: a late-fee credit taken back off its late
  * fee — an undone bank match, or the fee deleted in the onboarding month);
+ * credit_undone (10/18: a credit the landlord gave, taken back whole because
+ * it was typed by mistake — what it paid comes back off every bill it paid);
  * reversed = funding_reversed.
  */
-export const CREDIT_USE_RELEASE_REASONS = ['payment_failed', 'payment_canceled', 'superseded', 'funding_reversed', 'late_fee_credit_withdrawn'] as const
+export const CREDIT_USE_RELEASE_REASONS = ['payment_failed', 'payment_canceled', 'superseded', 'funding_reversed', 'late_fee_credit_withdrawn', 'credit_undone'] as const
 export type CreditUseReleaseReason = typeof CREDIT_USE_RELEASE_REASONS[number]
 export const CREDIT_USE_RELEASE_REASON_LABEL: Record<CreditUseReleaseReason, string> = {
   payment_failed:   'The payment failed',
@@ -73,6 +75,7 @@ export const CREDIT_USE_RELEASE_REASON_LABEL: Record<CreditUseReleaseReason, str
   superseded:       'Replaced by a newer payment',
   funding_reversed: 'The money behind the credit was returned or disputed',
   late_fee_credit_withdrawn: 'The late-fee credit was taken back',
+  credit_undone: 'The credit was undone',
 }
 /** The reasons a HELD use may be released for (everything but funding_reversed). */
 export const CREDIT_USE_HELD_RELEASE_REASONS = ['payment_failed', 'payment_canceled', 'superseded'] as const satisfies readonly CreditUseReleaseReason[]
@@ -220,6 +223,10 @@ export const INCOME_UTILITY_CATEGORIES = ['electric', 'water', 'sewer', 'gas', '
 export const PLATFORM_REVENUE_TYPES = [
   'banking_spread', 'manual_withdrawal_fee', 'placement_fee_share',
   'platform_fee_subscription', 'screening_margin', 'adjustment', 'flexpay_subscription',
+  // 10/12 (Nic): a card reader's markup — what GAM charged the landlord less
+  // GAM's actual cost of the reader. Only the markup is earnings; the cost
+  // part of the payments is GAM's money coming back (readerOrderMoney).
+  'device_markup',
 ] as const
 export type PlatformRevenueTypeValue = typeof PLATFORM_REVENUE_TYPES[number]
 
@@ -253,13 +260,15 @@ export const DEPOSIT_SLIP_SOURCE_LABEL: Record<DepositSlipSource, string> = {
  * What a matched money-in bank row was matched TO. index.ts's
  * BANK_TXN_MATCH_KINDS is this same list (one definition).
  */
-export const BANK_MATCH_KINDS = ['gam_payout', 'tenant_deposit', 'deposit_slip', 'auto_filed'] as const
+export const BANK_MATCH_KINDS = ['gam_payout', 'tenant_deposit', 'deposit_slip', 'auto_filed', 'returned_check'] as const
 export type BankMatchKind = typeof BANK_MATCH_KINDS[number]
 export const BANK_MATCH_KIND_LABEL: Record<BankMatchKind, string> = {
   gam_payout:     'GAM payout',
   tenant_deposit: 'Tenant’s bank deposit',
   deposit_slip:   'Bank deposit slip',
   auto_filed:     'Filed by itself',
+  // 10/14 (Nic, answer 15): a check the bank returned out of a deposit, taken back by itself.
+  returned_check: 'Returned check',
 }
 
 /**

@@ -6,7 +6,7 @@ import { query, queryOne, getClient } from '../db'
 import type { PoolClient } from 'pg'
 import { LEASE_TYPES, AUTO_RENEW_MODES, LEASE_STATUSES, MOVE_OUT_INSPECTION_REQUIRED_UNIT_TYPES,
          RENT_COMPONENT_KINDS } from '@gam/shared'
-import { requireAuth, requirePerm, userHasPerm } from '../middleware/auth'
+import { requireAuth, requirePerm, userHasPerm, assertPropertyInScope } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
@@ -16,6 +16,7 @@ import { todayIn, monthStartOf } from '../lib/timezone'
 import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 import { allocateInvoiceNumber } from '../services/invoiceNumbers'
 import { replyToProperty } from '../services/replyRouting'
+import { repriceDeparture, adjustUnpaidDepartureBill } from '../services/departureReprice'
 
 export const leasesRouter = Router()
 leasesRouter.use(requireAuth)
@@ -115,6 +116,70 @@ async function appendLeaseAddendums(leaseId: string, mainBytes: Uint8Array): Pro
  * (same package group), each with who has signed and who has not, and the file
  * to open — the executed copy once complete, the drafted copy until then.
  */
+// ── 10/22 (Nic): the money when somebody leaves part way through a month ───
+//
+//   "if they used more than half the month, we're not going to prorate them. We
+//    would just either wash the electric or other utilities. And if they are
+//    leaving before half the paid for time, then we could prorate a refund back
+//    to their payment method on file."
+//
+// WHAT COMES BACK IS A QUOTE AND NOTHING ELSE. No money moves, no bill changes,
+// nothing is written — the desk reads the figure, and the day it is worked out
+// for is the day THEY name:
+//
+//   "those guys actually ended up leaving about 2 days ago... in case somebody
+//    leaves on a Sunday when the office is closed and we don't check them out
+//    till Monday. Or they're going to be checking out on Sunday and we settle
+//    them up on Saturday."
+//
+// Left out: `leftOn` defaults to the leaving day already on the lease.
+leasesRouter.get('/:id/departure-money', async (req: any, res, next) => {
+  try {
+    const lease = await queryOne<{ id: string; landlord_id: string }>(
+      'SELECT id, landlord_id FROM leases WHERE id = $1', [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canAccessLandlordResource(req.user!, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    const leftOn = typeof req.query.leftOn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.leftOn)
+      ? req.query.leftOn : null
+    res.json({ success: true, data: await repriceDeparture(
+      { leaseId: lease.id, landlordId: lease.landlord_id, leftOn }) })
+  } catch (e) { next(e) }
+})
+
+// THE ADJUSTMENT — for the one case where no money has to move: they never paid
+// the month they left in, so the bill is re-priced to the days they used and
+// the late fees that came of waiting on it are voided.
+//
+//   "We want to adjust the bill so that there's no late fees but also get them
+//    prorated."
+//
+// It refuses, in plain words, anything else: a month that was actually paid
+// (that is a refund or a wash), a departure past the halfway point, or a month
+// carrying more than one unpaid rent charge.
+//
+// Takes the same permission the rest of a departure's money takes at the desk.
+leasesRouter.post('/:id/departure-money/adjust', requirePerm('pos.refund', 'take_payment'), async (req: any, res, next) => {
+  try {
+    const lease = await queryOne<{ id: string; landlord_id: string; property_id: string | null }>(
+      `SELECT l.id, l.landlord_id, u.property_id
+         FROM leases l LEFT JOIN units u ON u.id = l.unit_id WHERE l.id = $1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canAccessLandlordResource(req.user!, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    // 10/22: the permission has to be the one THIS property's company granted,
+    // not one carried in from another company somebody also works for.
+    await assertPropertyInScope(req.user, lease.property_id, { perm: ['pos.refund', 'take_payment'] })
+    const body = z.object({
+      leftOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullish(),
+    }).parse(req.body ?? {})
+    const out = await adjustUnpaidDepartureBill({
+      leaseId: lease.id, landlordId: lease.landlord_id,
+      leftOn: body.leftOn ?? null, byUserId: req.user!.userId,
+    })
+    if (!out.applied) throw new AppError(409, out.why)
+    res.json({ success: true, data: out })
+  } catch (e) { next(e) }
+})
+
 leasesRouter.get('/:id/documents', async (req, res, next) => {
   try {
     const lease = await queryOne<{ id: string; landlord_id: string }>(
@@ -299,7 +364,12 @@ leasesRouter.get('/', async (req, res, next) => {
               AND lf.fee_type = 'security_deposit'
               AND lf.due_timing = 'move_in'
             LIMIT 1) AS security_deposit,
-          u.unit_number, unit_number_on(l.unit_id, l.start_date) AS unit_number_then, u.unit_type, p.id AS property_id, p.name AS property_name,
+          u.unit_number, unit_number_on(l.unit_id, l.start_date) AS unit_number_then, u.unit_type,
+          -- 10/19: who owns the home on the space. The page offers the
+          -- space-rent close-out from this plus unit_type, and says plainly why
+          -- it does not apply where it does not, rather than hiding it.
+          u.dwelling_ownership,
+          p.id AS property_id, p.name AS property_name,
           -- S655: a household's new lease whose lease before it ENDED EARLY,
           -- with nobody in the household signed: it never starts and is being
           -- canceled. The Leases page says so, instead of "it takes over on its
@@ -2578,9 +2648,14 @@ leasesRouter.post('/:id/discard', requirePerm('leases.terminate'), async (req, r
     if (voided.refused) {
       return res.status(409).json({ success: false, error: voided.refused.words, code: voided.refused.code })
     }
-    logger.info({ leaseId: req.params.id, by: req.user!.userId, source: lease.lease_source, voidedDocuments: voided.documentIds.length },
+    logger.info({ leaseId: req.params.id, by: req.user!.userId, source: lease.lease_source, voidedDocuments: voided.documentIds.length,
+                  deletedDocuments: voided.deletedDocumentIds.length, leaseDeleted: voided.leaseDeleted },
       '[lease] unsigned draft discarded')
-    res.json({ success: true, data: { id: req.params.id, status: 'terminated' } })
+    // 10/14 (Nic, #6): 'deleted' — the paperwork and the lease row are gone;
+    // 'terminated' — money touched it, so it stays on record (kept_words says why).
+    res.json({ success: true, data: {
+      id: req.params.id, status: voided.leaseDeleted ? 'deleted' : 'terminated', kept_words: voided.keptWords,
+    } })
   } catch (e) { next(e) }
 })
 
@@ -2595,17 +2670,40 @@ export const DISCARD_VOID_REASON = 'The lease ended: the unsigned draft was disc
  * Fix pass 3: discard an unsigned draft — ONE transaction. The lease and its
  * own paperwork are locked, the "nobody signed" test runs again under the
  * locks (a signature since the page read it is refused in plain words, nothing
- * changed), its documents still out for signature are voided (they can't be
- * signed afterwards; a home-sale document is not the lease's and is left
- * alone), their scheduled money changes canceled (as every void does), and the
- * lease ends. Soft: every row stays.
+ * changed), its documents still out for signature end (they can't be signed
+ * afterwards). A home-sale document of its own is not the lease's and is left
+ * alone; one in the lease's packet goes with the lease (the packet is one
+ * thing, S652).
+ *
+ * 10/14 (Nic, #6): "Leases → Discard on an unsigned draft: delete the
+ * paperwork and the never-signed lease record." Each document is ERASED by
+ * the void button's own test (lib/eraseUnfinishedDocument — its packet's
+ * unfinished forms with it, and #1 an invite waiting on it canceled, so the
+ * hourly re-draft never makes a new one); one that test keeps is voided as
+ * before, its scheduled money changes canceled. Then the lease row itself is
+ * erased with every row of it (eraseLeaseRows) when no money touched it and
+ * nothing else lives on it (leaseMoneyTouchedSql, leaseInUseSql — a kept
+ * document on it is such a thing); otherwise it ends as before — soft, every
+ * row stays, and `keptWords` says why. Review 10/14: a document on it voided
+ * EARLIER that no money touched is erased first too (10/13: "If it never
+ * completed, it doesn't exist") — left, it would keep the lease row as
+ * "another document on it".
  */
 async function discardUnsignedDraft(leaseId: string): Promise<{
-  documentIds: string[]; refused: { code: 'tenant_signed' | 'landlord_signed' | 'not_a_draft'; words: string } | null
+  documentIds: string[]; deletedDocumentIds: string[]; leaseDeleted: boolean; keptWords: string | null
+  refused: { code: 'tenant_signed' | 'landlord_signed' | 'not_a_draft'; words: string } | null
 }> {
+  const {
+    eraseUnfinishedDocument, eraseLeaseRows, leaseMoneyTouchedSql, leaseInUseSql, removeOrphanedDocumentFiles,
+  } = await import('../lib/eraseUnfinishedDocument')
+  const { lockLeaseHousehold } = await import('../lib/unwindIssuedLease')
   const c = await getClient()
+  let files: string[] = []
   try {
     await c.query('BEGIN')
+    const cq = c.query.bind(c) as any
+    // The void's lock order (S655): the household, then the lease, then its paperwork.
+    await lockLeaseHousehold(cq, leaseId)
     const l = (await c.query<{ status: string }>(`SELECT status FROM leases WHERE id = $1 FOR UPDATE`, [leaseId])).rows[0]
     await c.query(`SELECT id FROM lease_documents WHERE lease_id = $1 ORDER BY id FOR UPDATE`, [leaseId])
     const now = (await c.query<{ tenant: boolean; anyone: boolean }>(
@@ -2618,27 +2716,70 @@ async function discardUnsignedDraft(leaseId: string): Promise<{
       : null
     if (refused) {
       await c.query('ROLLBACK')
-      return { documentIds: [], refused }
+      return { documentIds: [], deletedDocumentIds: [], leaseDeleted: false, keptWords: null, refused }
     }
-    const documentIds = (await c.query<{ id: string }>(
-      `UPDATE lease_documents
-          SET status = 'voided', voided_at = NOW(), updated_at = NOW(), void_reason = $2
+    const open = (await c.query<{ id: string; lease_id: string; document_type: string; status: string }>(
+      `SELECT id, lease_id, document_type, status FROM lease_documents
         WHERE lease_id = $1
-          AND status IN ('pending', 'sent', 'in_progress')
+          AND status IN ('pending', 'sent', 'in_progress', 'voided')
           AND document_type IN ('original_lease', 'addendum_add', 'addendum_remove', 'addendum_terms',
                                 'work_trade_addendum', 'sublease_agreement')
-        RETURNING id`, [leaseId, DISCARD_VOID_REASON])).rows.map((r) => r.id)
-    if (documentIds.length > 0) {
+        ORDER BY (document_type = 'original_lease') DESC, id`, [leaseId])).rows
+    const documentIds: string[] = []
+    const deletedDocumentIds: string[] = []
+    for (const d of open) {
+      if (deletedDocumentIds.includes(d.id)) continue   // taken with its packet lease
+      const out = await eraseUnfinishedDocument(cq, d)
+      if (out.erased) {
+        deletedDocumentIds.push(...out.documents.map(x => x.id))
+        files.push(...out.files)
+        continue
+      }
+      if (d.status === 'voided') continue   // kept, and already voided
+      await c.query(
+        `UPDATE lease_documents
+            SET status = 'voided', voided_at = NOW(), updated_at = NOW(), void_reason = $2
+          WHERE id = $1 AND status IN ('pending', 'sent', 'in_progress')`, [d.id, DISCARD_VOID_REASON])
       await c.query(
         `UPDATE scheduled_lease_changes SET status = 'cancelled', updated_at = NOW()
-          WHERE source_document_id = ANY($1::uuid[]) AND status IN ('draft', 'scheduled')`, [documentIds])
+          WHERE source_document_id = $1 AND status IN ('draft', 'scheduled')`, [d.id])
+      documentIds.push(d.id)
     }
-    await c.query(
-      `UPDATE leases
-          SET status = 'terminated', needs_review = FALSE, updated_at = NOW()
-        WHERE id = $1`, [leaseId])
+    // The never-signed lease row: erased when no money touched it and nothing
+    // else lives on it. The in-use test asks about every document still on it
+    // (nothing is being erased beside it now — hence no document of its own).
+    const why = (await c.query<{ money: boolean; in_use: boolean }>(
+      `SELECT ${leaseMoneyTouchedSql('$1')} AS money, ${leaseInUseSql('$1', 'nd')} AS in_use
+         FROM (SELECT '00000000-0000-0000-0000-000000000000'::uuid AS id, NULL::uuid AS package_group_id) nd`,
+      [leaseId])).rows[0]
+    let leaseDeleted = false
+    let keptWords: string | null = why?.money
+      ? 'Money touched this lease (something on it was billed, paid, credited or settled), so it stays on record as ended.'
+      : why?.in_use
+        ? 'Other records were made on this lease (a document, a notice, an inspection or a request), so it stays on record as ended.'
+        : null
+    if (!keptWords) {
+      await c.query('SAVEPOINT erase_discarded_lease')
+      try {
+        await eraseLeaseRows(cq, leaseId)
+        await c.query('RELEASE SAVEPOINT erase_discarded_lease')
+        leaseDeleted = true
+      } catch (e: any) {
+        await c.query('ROLLBACK TO SAVEPOINT erase_discarded_lease')
+        if (e?.code !== '23503') throw e
+        keptWords = 'Another record still points at this lease, so it stays on record as ended.'
+      }
+    }
+    if (!leaseDeleted) {
+      await c.query(
+        `UPDATE leases
+            SET status = 'terminated', needs_review = FALSE, updated_at = NOW()
+          WHERE id = $1`, [leaseId])
+    }
     await c.query('COMMIT')
-    return { documentIds, refused: null }
+    // Files only the erased paperwork used — after COMMIT, best-effort.
+    if (files.length) await removeOrphanedDocumentFiles(cq, files).catch(() => {})
+    return { documentIds, deletedDocumentIds, leaseDeleted, keptWords, refused: null }
   } catch (e) {
     await c.query('ROLLBACK').catch(() => {})
     throw e
@@ -2805,6 +2946,188 @@ leasesRouter.get('/:id/carried-balance', async (req, res, next) => {
     if (!canAccessLandlordResource(req.user, row.landlord_id)) throw new AppError(403, 'Forbidden')
     res.json({ success: true, data: row })
   } catch (e) { next(e) }
+})
+
+/**
+ * 10/19: the LEASE a space-rent route works on, with the caller's right to it —
+ * their company owns it AND, for a team member locked to some properties, this
+ * lease's property is one of theirs.
+ *
+ * Checked on the LEASE and before the balance is looked at, which is the order
+ * that matters: resolving the balance first answered "this lease carries no
+ * space-rent balance" to a staffer at another park, which is a door that is
+ * only shut while it happens to be empty. Same shape as depositReturnLease
+ * above, for the same reason.
+ */
+async function spaceRentLease(req: any, mode: 'read' | 'write'): Promise<{
+  id: string; landlord_id: string; property_id: string
+}> {
+  const lease = await queryOne<{ id: string; landlord_id: string; property_id: string }>(
+    `SELECT l.id, l.landlord_id, u.property_id
+       FROM leases l JOIN units u ON u.id = l.unit_id WHERE l.id = $1`, [req.params.id])
+  if (!lease) throw new AppError(404, 'Lease not found')
+  const allowed = mode === 'read'
+    ? canAccessLandlordResource(req.user, lease.landlord_id)
+    : canManageLandlordResource(req.user, lease.landlord_id)
+  if (!allowed) throw new AppError(403, 'Forbidden')
+  await assertPropertyInScope(req.user, lease.property_id)
+  return lease
+}
+
+// ── 10/19 (Nic): UNPAID SPACE RENT FOLLOWS THE SPACE ─────────────────────────
+//
+// "The rent is owed by the trailer because it was the same trailer there. It
+// doesn't matter how many people cycle in and out." Only on a TENANT-OWNED
+// home: a park-owned rental going vacant has no next owner to inherit it.
+// See services/spaceRentCarryforward for the whole decision set.
+
+// What the close-out would do, in dollars, changing nothing. The screen the
+// landlord decides from: space rent that leaves with the space, utilities that
+// stay the departing resident's, late fees that disappear.
+leasesRouter.get('/:id/space-carryforward/preview', async (req, res, next) => {
+  try {
+    // A debt on a space is money, and a staff member locked to one park has no
+    // business reading one at another. The company-level check alone passes for
+    // every team role of the company, so without the property scope an on-site
+    // manager at one park could read — and, below, close out and write off — a
+    // space at another.
+    await spaceRentLease(req, 'read')
+    const { previewSpaceRentCarryforward } = await import('../services/spaceRentCarryforward')
+    const pv = await previewSpaceRentCarryforward(req.params.id)
+    res.json({ success: true, data: pv })
+  } catch (e) { next(e) }
+})
+
+// Do it. Ends the lease, so it needs the permission that ends a lease.
+leasesRouter.post('/:id/space-carryforward/close-out', requirePerm('leases.terminate'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const body = z.object({
+      endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      notes:   z.string().max(500).optional(),
+      // 10/19: the figure the LANDLORD SAW. The screen shows what the space
+      // will carry and he presses on that number; if a payment landed in
+      // between, closing out on the new one silently is the thing the desk rule
+      // forbids (S655: "a figure that moved under the desk's answer is asked
+      // again IN PLACE, never sent silently"). Optional, so a caller that has
+      // no screen behind it (a job, a test) is unaffected.
+      expectedCarried: z.number().nonnegative().optional(),
+    }).parse(req.body ?? {})
+    await spaceRentLease(req, 'write')
+    const { previewSpaceRentCarryforward, closeOutWithCarryforward, carriedFigureMoved, carriedFigureDiffers } =
+      await import('../services/spaceRentCarryforward')
+    const pv = await previewSpaceRentCarryforward(req.params.id)
+    // Answered here when it is already wrong, so the usual case costs no
+    // transaction — but this read is OUTSIDE the household lock, so it is not
+    // the check that holds. The one that holds is inside
+    // closeOutWithCarryforward, against the locked read, because a desk payment
+    // landing in between holds that same lock and therefore completes first:
+    // this guard would compare 880 against a stale 880, pass, and the claim
+    // would then be created for 440 — closed out silently on a figure the
+    // landlord never saw, which is what the guard exists to prevent.
+    if (body.expectedCarried != null && carriedFigureDiffers(body.expectedCarried, pv.carriesTotal)) {
+      throw new AppError(409, carriedFigureMoved(body.expectedCarried, pv.carriesTotal))
+    }
+
+    await client.query('BEGIN')
+    const result = await closeOutWithCarryforward(client, {
+      leaseId: req.params.id,
+      byUserId: req.user.userId,
+      endDate: body.endDate ?? null,
+      notes: body.notes ?? null,
+      expectedCarried: body.expectedCarried ?? null,
+    })
+    await client.query('COMMIT')
+    res.status(201).json({ success: true, data: result })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally { client.release() }
+})
+
+// What this lease carries: the balance it took on with the space (or, for the
+// lease that left it behind, the one it created). The landlord must be able to
+// see that the new resident took it on.
+leasesRouter.get('/:id/space-carryforward', async (req, res, next) => {
+  try {
+    await spaceRentLease(req, 'read')
+    const { carryforwardForLease } = await import('../services/spaceRentCarryforward')
+    const cf = await carryforwardForLease(req.params.id)
+    if (!cf) return res.json({ success: true, data: null })
+    // The BALANCE's own property too: a claim written before a property changed
+    // hands still belongs to the property it was written on.
+    if (!canAccessLandlordResource(req.user, cf.landlordId)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, cf.propertyId)
+    res.json({ success: true, data: cf })
+  } catch (e) { next(e) }
+})
+
+// Take it off. The undo of a close-out, and what the refusal on the preview
+// means by "Settle or take off the existing one first" — a close-out run on
+// the wrong resident was otherwise permanent, because one open balance per
+// space refuses every later close-out there. Nothing is erased: the charge
+// rows are voided with their reason, what was really paid stays recorded, and
+// the claim keeps saying whose debt it was. It writes money off, so it takes
+// the same permission as the close-out that created it.
+leasesRouter.post('/:id/space-carryforward/take-off', requirePerm('leases.terminate'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const body = z.object({ reason: z.string().max(500).optional() }).parse(req.body ?? {})
+    await spaceRentLease(req, 'write')
+    const { carryforwardForLease, takeOffCarryforward } = await import('../services/spaceRentCarryforward')
+    const cf = await carryforwardForLease(req.params.id)
+    if (!cf) throw new AppError(404, 'This lease carries no space-rent balance.')
+    if (!canManageLandlordResource(req.user, cf.landlordId)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, cf.propertyId)
+
+    await client.query('BEGIN')
+    const result = await takeOffCarryforward(client, {
+      carryforwardId: cf.id,
+      byUserId: req.user.userId,
+      reason: body.reason ?? null,
+    })
+    await client.query('COMMIT')
+    res.json({ success: true, data: result })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally { client.release() }
+})
+
+// The payment arrangement. Nic: "to help landlords not forget about it and
+// stuff, we need to do, you know, payment arrangements on carry forward
+// balances. So what, even if it's $50 or $100 or whatever." Send nulls to stop
+// asking. Nothing is fined when a cycle is missed.
+leasesRouter.put('/:id/space-carryforward/arrangement', requirePerm('leases.bill_fee'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const body = z.object({
+      amount:     z.number().positive().max(1_000_000).nullable(),
+      dayOfMonth: z.number().int().min(1).max(28).nullable(),
+      startOn:    z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    }).parse(req.body)
+    await spaceRentLease(req, 'write')
+    const { carryforwardForLease, setArrangement } = await import('../services/spaceRentCarryforward')
+    const cf = await carryforwardForLease(req.params.id)
+    if (!cf) throw new AppError(404, 'This lease carries no space-rent balance.')
+    if (!canManageLandlordResource(req.user, cf.landlordId)) throw new AppError(403, 'Forbidden')
+    await assertPropertyInScope(req.user, cf.propertyId)
+
+    await client.query('BEGIN')
+    await setArrangement(client, {
+      carryforwardId: cf.id,
+      amount: body.amount,
+      dayOfMonth: body.dayOfMonth,
+      byUserId: req.user.userId,
+      startOn: body.startOn ?? null,
+    })
+    await client.query('COMMIT')
+    const after = await carryforwardForLease(req.params.id)
+    res.json({ success: true, data: after })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally { client.release() }
 })
 
 

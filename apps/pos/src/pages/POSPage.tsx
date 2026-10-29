@@ -11,6 +11,10 @@ import {
 } from '../lib/terminal'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiPut, apiDel } from '../lib/api'
+import { ScreeningsWaitingPanel } from '../../../../packages/shared-ui/ScreeningsWaitingPanel'
+
+/** The panel is shared with the landlord's own screening page — one list, both screens. */
+const screeningsApi = { get: apiGet, post: apiPost }
 import { humanize, processingFeeFor, rvSiteFactsLabel, SUPPORTED_CARD_READER, READER_ORDER_STATUS_LABEL, STAY_TERMS, STAY_TERMS_LABEL, RETURNING_GUEST_LABEL, type StayTerms } from '@gam/shared'
 import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
 import { appConfirm, appPrompt } from '../components/dialogs'
@@ -66,7 +70,15 @@ function cartFromTicket(t: any): CartItem[] {
     tax: Number(i.tax) || 0, cat: i.cat || '', icon: '📦', chargeEligible: true, stayUnit: null,
     reservation: !!i.reservation,
     // 10/5 (Nic, R8): a link's background check stays on it — it cannot be taken off.
-    fixed: !!i.screening,
+    // 10/20 (Nic): nor is a utility bill's line the counter's to change. Settling
+    // the link closes that bill out at the BILL'S figure, so a retyped or
+    // deleted line would take one amount and mark another collected — the
+    // server refuses it (assertUtilityBillLinesKept) and the register does not
+    // offer it. To stop asking for it, close the link under Pay Links.
+    fixed: !!i.screening || !!i.utilityBillId,
+    // 10/20 (review): and a cart with a bill on it takes no discount — the
+    // discount box is hidden for the same reason the line cannot be retyped.
+    utilityBill: !!i.utilityBillId,
     ...(i.reservation && Number(i.nights) > 0 ? { nights: Number(i.nights) } : {}),
   }))
 }
@@ -198,7 +210,12 @@ function CustomerEditor({ c, all, onHistory, onChanged }: { c: any; all: any[]; 
     () => apiPost(`/pos/customers/${c.id}/merge`, { into: mergeInto }),
     { onSuccess: () => { refresh(); setConfirmMerge(false); toastOnce('Merged'); onChanged() }, onError: (e: any) => { setConfirmMerge(false); toastOnce(errorMessage(e, 'Could not merge — check the connection and press Merge again.'), { error: true }) } })
   const dupeIds: string[] = c.duplicateIds || []
-  const others = all.filter(o => o.id !== c.id)
+  // 10/20 (review): the list spans every company the account owns, so what can
+  // be folded into is narrowed to this record's OWN company. Two companies keep
+  // two sets of records, each carrying that LLC's sales, cards and charge
+  // account, and the server refuses to fold one into the other — offering it
+  // would only be a click that fails.
+  const others = all.filter(o => o.id !== c.id && (o.landlordId ?? null) === (c.landlordId ?? null))
   const ordered = [...others.filter(o => dupeIds.includes(o.id)), ...others.filter(o => !dupeIds.includes(o.id))]
   const target = others.find(o => o.id === mergeInto)
   const label = (o: any) => `${o.firstName} ${o.lastName}`.trim() + (o.email ? ` — ${o.email}` : o.phone ? ` — ${o.phone}` : '')
@@ -237,7 +254,46 @@ function CustomerEditor({ c, all, onHistory, onChanged }: { c: any; all: any[]; 
   )
 }
 
-const TENDER_LABEL: Record<string,string> = { cash:'Cash', card:'Card · online', card_reader:'Card · in person', pay_link:'Pay link · online', pay_link_in_person_cash:'Pay link · in person (cash)', pay_link_in_person_card:'Pay link · in person (card)', card_on_file:'Card on file', charge:'Charge account' }
+/**
+ * 10/24 (Nic) — A LINE ON THE HISTORY IS A NAME AND A COUNT, NOT A PARAGRAPH.
+ *
+ *   "where it says RV site weekly, 7 nights at site, RV 12, October 17th to
+ *    24th, one quantity of one. Just change that, shorten it to RV site weekly
+ *    X1. It doesn't need to have all that other junk in the middle. Maybe if you
+ *    click on the row to expand it, it can show you the dates."
+ *
+ * So the collapsed row keeps what the thing IS and drops everything the expanded
+ * row already shows. Cut at the first comma or the first bracket, whichever
+ * comes first — a stay line is built as "<what>, <nights> at <site>, <dates>",
+ * so the head of it is the product. Anything with no comma is already short and
+ * is left exactly alone.
+ */
+const shortItemName = (name: string): string => {
+  const full = String(name ?? '').trim()
+  const cut = full.search(/[,(—–]/)
+  if (cut < 4) return full
+  return full.slice(0, cut).trim()
+}
+
+/**
+ * Find-on-page over the sales already on screen. Matches the person, what was
+ * sold, the tender, the check number and the card's last four — everything a
+ * desk would have in hand when somebody rings about a sale.
+ */
+const saleMatches = (t: any, needle: string): boolean => {
+  const q = needle.trim().toLowerCase()
+  if (!q) return true
+  const hay = [
+    t.tenantName, t.customerName, t.paymentReference, t.cardLast4,
+    t.tender, t.paymentMethod, TENDER_LABEL[t.tender || t.paymentMethod],
+    fmtPlain(t.total), new Date(t.createdAt).toLocaleDateString(),
+    ...(t.items || []).map((i: any) => i.name),
+  ]
+  return hay.some(v => v != null && String(v).toLowerCase().includes(q))
+}
+const fmtPlain = (n: unknown) => String(Number(n ?? 0).toFixed(2))
+
+const TENDER_LABEL: Record<string,string> = { cash:'Cash', check:'Check', card:'Card · online', card_reader:'Card · in person', pay_link:'Pay link · online', pay_link_in_person_cash:'Pay link · in person (cash)', pay_link_in_person_card:'Pay link · in person (card)', card_on_file:'Card on file', charge:'Charge account' }
 // S512 LAUNCH: the "charge" (FlexCharge) tender is hidden at launch with the
 // rest of the Flex Suite. The button is filtered out of the register picker so
 // a clerk can only ring cash/card; all charge code stays for post-launch.
@@ -274,6 +330,15 @@ const LAUNCH_HIDE_CHARGE = true
 interface CartItem { id:string; name:string; price:number; qty:number; tax:number; cat:string; icon:string; chargeEligible:boolean; stayUnit?:'night'|'week'|'month'|null; reservation?:boolean; nights?:number
   stayUnitId?:string; stayCheckIn?:string; stayTotal?:number; stayTax?:number
   stayEmail?:string|null; stayTerms?:StayTerms|null; stayExtend?:string|null; screeningFee?:number|null; fixed?:boolean
+  /** 10/20 (review): a line raised from a utility bill — collected in full, so the sale takes no discount. */
+  utilityBill?:boolean
+  /**
+   * 10/20 (Nic): the bill a CLOSING READ taken at this register raised. The line
+   * carries its bill number, so the match is CARRIED to the till and never
+   * guessed from a dollar figure and a name — the same shape an emailed bill's
+   * line has. A pay link's bill line needs none of this: the link names its own.
+   */
+  utilityBillId?:string
   /** 10/6 (Nic): "Returning guest — they've stayed with us before" — no background check (owner / a manager only). */
   stayReturning?:boolean|null }
 
@@ -290,12 +355,35 @@ const unpriceStay = <T extends CartItem>(i: T): T => {
 }
 
 /**
+ * 10/20 (review) — THE REGISTER'S OWN LINE KEYS NEVER GO OVER THE WIRE.
+ *
+ * Two kinds of cart line have no register item behind them and carry a key this
+ * screen invented for its own list: a ticket's own typed line ('open-…') and a
+ * bill a closing read raised here ('bill-…'). Over the wire both are id null.
+ *
+ * It lives in one place because the three doors that each wrote their own
+ * version of it each got it wrong, and with a closing read on the ticket that
+ * shut all three exits at once: Clear could not hold the cart, a reopened
+ * ticket could not be put back, and a pay link could not be sent. The bill then
+ * sat off BOTH collection routes — off the Pay Links list because a collection
+ * was already out for it, and on nobody's invoice — until the twelve-hour sweep
+ * let it go. One line, one definition, every door.
+ */
+const wireId = (id: string) => id.startsWith('open-') || id.startsWith('bill-') ? null : id
+
+/**
  * A cart line as the server's pricing calls take it (the quote, the card
  * reader's charge and breakdown). A reservation's line names its ticket, so the
  * server prices it as the reservation — the same way the sale does.
  */
 function wireLine(i: CartItem, ticketId: string | null, linkId: string | null = null) {
-  return { id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax,
+  return { id: wireId(i.id),
+           name: i.name, qty: i.qty, price: i.price, tax: i.tax,
+           // 10/20 (Nic): a bill raised at this register by its own number. The
+           // server re-reads the bill and charges ITS figure; a line that was
+           // retyped, shrunk or untaxed is refused rather than collected at the
+           // wrong number.
+           ...(i.utilityBillId ? { utilityBillId: i.utilityBillId } : {}),
            ...(i.reservation && ticketId ? { openTicketId: ticketId } : {}),
            // 10/3: a pay link's reservation names its link (and its nights), so
            // the server prices it as the reservation — the quote, the reader, the sale.
@@ -310,6 +398,49 @@ function wireLine(i: CartItem, ticketId: string | null, linkId: string | null = 
              ...(i.stayReturning ? { stayReturning: true } : {}) } : {}) }
 }
 
+/** The bills a closing read raised at this register that the cart is still carrying. */
+const raisedBillIds = (c: CartItem[]) => c.filter(i => !!i.utilityBillId).map(i => i.utilityBillId!)
+
+/**
+ * The cart as a TICKET's lines — held for delivery, or a reopened ticket put
+ * back. A bill a closing read raised here is left OUT of both: a ticket holds
+ * register items, and a bill is not one of those (it has no item behind it, and
+ * the ticket door refuses a line that names none — assertTicketLines).
+ *
+ * That is not the bill being dropped. D2 is what happens to it instead: it is
+ * let go and owed the ordinary way, on their invoice or as an emailed link, and
+ * releaseRaisedBills is what does the letting go. The reading stands either way.
+ */
+const ticketLines = (c: CartItem[]) =>
+  c.filter(i => !i.utilityBillId).map(i => ({ id: wireId(i.id), name: i.name, qty: i.qty, price: i.price, tax: i.tax }))
+
+/**
+ * The cart as a PAY LINK's lines. A bill is left out here for a second reason
+ * on top of that one: a link's line cannot NAME a bill, so a bill sent from
+ * this cart would be a second place to pay it and the bill itself would never
+ * close out — the exact thing D1 exists to prevent. A final bill has its own
+ * door under Pay Links, where the line names its bill, so the button says so
+ * rather than sending a figure with nothing attached to it.
+ */
+const payLinkLines = (c: CartItem[]) =>
+  c.filter(i => !i.utilityBillId).map(i => ({ id: wireId(i.id), name: i.name, qty: i.qty, price: i.price, tax: i.tax, cat: i.cat,
+    // 10/3 (review): the stay's figure as shown — the link never goes out at another.
+    ...(stayPriced(i) ? { stayTotal: i.stayTotal } : {}) }))
+
+
+/**
+ * 10/20 (review) — ONE EMPTY LIST, NOT A NEW ONE EVERY TIME THE PAGE DRAWS.
+ *
+ * `= []` in a destructure mints a fresh array on every render, and the open-tab
+ * effect below DEPENDS on the open-sessions read: a fresh array each draw meant
+ * the effect ran each draw, set the open-tab state, redrew, and ran again —
+ * forever. It never showed up at one park, because the read lands in a moment
+ * and the loop stops when it does. At TWO parks under one account the register
+ * opens with no park picked, which leaves that read switched off and its value
+ * undefined for as long as the clerk takes to choose: the loop has no end and
+ * the browser sits there with a core pegged.
+ */
+const NO_OPEN_SESSIONS: any[] = []
 
 // POS money/quantity fields are never negative. Spread {...nonNeg} into every
 // numeric input to block a value < 0 three ways: typing '-'/'+'/'e', spinner-
@@ -325,7 +456,7 @@ const nonNeg = { min: 0, onKeyDown: blockNeg, onPaste: blockNegPaste }
 export function POSPage() {
   const qc = useQueryClient()
   const [payLinkOpen, setPayLinkOpen] = useState(false)
-  const [tab, setTab] = useUrlTab('tab', 'register', ['register','history','customers','paylinks','items','categories','taxes','discounts','vendors','orders','inventory','readers'] as const)
+  const [tab, setTab] = useUrlTab('tab', 'register', ['register','checkout','checks','history','customers','paylinks','items','categories','taxes','discounts','vendors','orders','inventory','readers'] as const)
 
   const [cart, setCart] = useState<CartItem[]>([])
   // S651: the site + dates + guest for a stay in the cart. Held here rather
@@ -333,6 +464,9 @@ export function POSPage() {
   // checkout can refuse to run without them.
   const [stay, setStay] = useState<any | null>(null)
   const [stayModal, setStayModal] = useState(false)
+  // 10/21 (Nic): a background check rung on its own — who it is for and what
+  // the SERVER said it costs. Never priced here.
+  const [counterCheck, setCounterCheck] = useState<{ name: string; email: string; price: number } | null>(null)
   // The stay line in the cart, if there is one. Only ONE kind of stay can be
   // sold at a time — two different lengths on one sale have no single set of
   // dates, and the server refuses it too.
@@ -341,6 +475,11 @@ export function POSPage() {
   // 10/3 (decisions #9): ready to charge once its site and arrival are picked
   // for the nights in the cart (changing the nights asks for the site again).
   const stayReady = !!stay && !!stayLine && (stayLine.reservation || stayPriced(stayLine))
+  // 10/20 (review): what of this cart a ticket can hold, and whether a closing
+  // read is on it. Clear, Hold for delivery and the pay link all need both —
+  // and each of them used to work it out again, differently.
+  const heldLines = ticketLines(cart)
+  const billInCart = raisedBillIds(cart).length > 0
   // S536: browser-neutral — no native alert(); transient in-app notice.
   const [stockNotice, setStockNotice] = useState<string | null>(null)
   const showStockNotice = (msg: string) => {
@@ -359,7 +498,11 @@ export function POSPage() {
   type OpenTab = { id:string; total:number; openedAt:string; itemCount:number; customerName:string|null; preview:string|null }
   const [openTabs, setOpenTabs] = useState<OpenTab[]>([])
   const [tabsExpanded, setTabsExpanded] = useState(false)
-  const [method, setMethod] = useState<'cash'|'card'|'card_on_file'|'charge'>('cash')
+  const [method, setMethod] = useState<'cash'|'check'|'card'|'card_on_file'|'charge'>('cash')
+  // 10/23 (Nic): the check number, which is what makes the payment findable
+  // later — the same thing an invoice's check payment already stores. Cleared
+  // with the tender, so a number typed for one check never rides the next sale.
+  const [checkNumber, setCheckNumber] = useState('')
   // S254/S538: FlexCharge account holder can come from either backing
   // list (resident account or POS customer account). The register shows
   // ONE neutral "customer" picker; the ids stay mutually exclusive.
@@ -383,6 +526,10 @@ export function POSPage() {
   // S652 (Nic): an emailed pay link being settled here, in person. The link
   // is the bill; the server charges its lines and marks it paid.
   const [payLinkId, setPayLinkId] = useState<string | null>(null)
+  // 10/20 (Nic): the closing read taken at the counter. Open only once somebody
+  // is picked: GAM finds their site from their own reservation or lease, so
+  // there is nothing to ask until there is a person.
+  const [closingRead, setClosingRead] = useState(false)
   const [dismissedSessions, setDismissedSessions] = useState<Set<string>>(new Set())
   const [cashGiven, setCashGiven] = useState('')
   const [filterCat, setFilterCat] = useState('all')
@@ -393,7 +540,9 @@ export function POSPage() {
   const [saveCard, setSaveCard] = useState<'asking' | 'saved' | 'declined' | 'timeout' | null>(null)
   const [receiptEmail, setReceiptEmail] = useState('')
   const [receiptSent, setReceiptSent] = useState<string | null>(null)
-  const [historyCustomer, setHistoryCustomer] = useState<{ id: string; name: string } | null>(null)
+  // `landlordId` is the company whose book the row came from — set when the
+  // Customers tab opened this, because that list spans the whole account.
+  const [historyCustomer, setHistoryCustomer] = useState<{ id: string; name: string; landlordId?: string | null } | null>(null)
   // S654: resending a sale's receipt from History; the Customers tab.
   const [txEdit, setTxEdit] = useState<{ id: string; mode: 'receipt'; value: string } | null>(null)
   const [custSearch, setCustSearch] = useState('')
@@ -403,7 +552,17 @@ export function POSPage() {
   const [openTx,setOpenTx]=useState<string|null>(null)   // S653: history row expanded to its lines
   const [refundModal, setRefundModal] = useState<{show:boolean; tx:any}>({show:false,tx:null})
   // 10/3 (review): Void asks first, in the app — never a browser pop-up.
+  // 10/24 (Nic): "if I type Hamp, anything attached to Donald Hamp should show
+  // on the list, and everything else should just be hidden." A find-on-page over
+  // the history already loaded — no round trip, no new query.
+  const [historyFind, setHistoryFind] = useState('')
   const [voidAsk, setVoidAsk] = useState<any | null>(null)
+  // 10/24 (Nic): "one propane sale got marked as cash when the person dropped
+  // off a check... I don't want to void the sale and redo it. I don't like
+  // voiding sales." The sale happened and was for the right money — only the
+  // line saying HOW it was paid is wrong, so the tender is corrected in place.
+  const [tenderAsk, setTenderAsk] = useState<any | null>(null)
+  const [tenderCheckNo, setTenderCheckNo] = useState('')
   const [refundAmt, setRefundAmt] = useState('')
   const [refundReason, setRefundReason] = useState('')
   // S339: refund_method enforcement. Cashier picks cash or check for
@@ -453,7 +612,9 @@ export function POSPage() {
   const [newItem, setNewItem] = useState({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct:'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' as string })
   // S650 (Nic): one list of named taxes, each applied to everything, to whole
   // categories, or to single items. The name is what the receipt prints.
-  const blankTax = { id:'' as string, name:'', ratePct:'', all:true, categoryIds:[] as string[], itemIds:[] as string[] }
+  // 10/17 (Nic, one home for a tax rate): onStays — is this tax charged on a
+  // stay here? That one tick is what prices every stay at the property.
+  const blankTax = { id:'' as string, name:'', ratePct:'', all:true, onStays:false, categoryIds:[] as string[], itemIds:[] as string[] }
   const [taxDraft, setTaxDraft] = useState(blankTax)
   // S217: tax-rate list filter on the taxes tab.
   const [newDiscount, setNewDiscount] = useState({ name:'', type:'percent', value:'', code:'' })
@@ -512,6 +673,21 @@ export function POSPage() {
   }, [ticketsOpen, registerProperty])   // eslint-disable-line react-hooks/exhaustive-deps
 
   /**
+   * D2, at every exit that is not the sale: the bills a closing read raised at
+   * this register are let go. The power was genuinely used, so NOTHING is
+   * written off — the counter's ask is let go, the bill goes back to the
+   * ordinary route (their invoice, or an emailed link from Pay Links), and the
+   * READING stands. Returns whether there was anything to let go.
+   */
+  const releaseRaisedBills = (): boolean => {
+    const raised = raisedBillIds(cart)
+    if (!raised.length || !registerProperty) return false
+    void apiPost('/pos/final-utility/release', { propertyId: registerProperty, billIds: raised })
+      .catch(() => toastOnce('The closing read came off the ticket; its bill is owed as usual.'))
+    return true
+  }
+
+  /**
    * Back to an empty register, with nothing left behind: the live cart session
    * is closed (so it never comes back as an "open cart"), the reader's waiting
    * charge is let go, and the person, discount, stay, ticket and pay link are
@@ -524,8 +700,20 @@ export function POSPage() {
       qc.invalidateQueries(['pos-sessions-open', registerProperty])
     }
     setClientSessionId(null); abandonPendingIntent()
-    setCart([]); setPerson(null); setAppliedDiscount(null); setStay(null); setCashGiven('')
-    setOpenTicketId(null); setTicketSnapshot(null); setPayLinkId(null)
+    // 10/20 (Nic): a closing read that was raised and not paid lets go of its
+    // bill — the power was used, so nothing is written off: it is owed the
+    // ordinary way, on their invoice or as an emailed link. The read stands.
+    releaseRaisedBills()
+    setCart([]); setPerson(null); setAppliedDiscount(null); setStay(null); setCashGiven(''); setCheckNumber(''); setCounterCheck(null)
+    setOpenTicketId(null); setTicketSnapshot(null); setPayLinkId(null); setClosingRead(false)
+  }
+
+  /** A bill raised here, taken off the ticket: it goes back to the ordinary route. */
+  const takeClosingReadOff = (billId: string) => {
+    setCart(c => c.filter(i => i.utilityBillId !== billId))
+    void apiPost('/pos/final-utility/release', { propertyId: registerProperty, billIds: [billId] })
+      .then(() => toastOnce('Taken off the ticket — the bill is owed as usual, on their invoice or as an emailed link.'))
+      .catch((e: any) => toastOnce(errorMessage(e, 'It came off the ticket, but GAM could not be told — check the connection.'), { error: true }))
   }
 
   const writeTicketMut = useMutation(
@@ -533,13 +721,18 @@ export function POSPage() {
       propertyId: registerProperty,
       tenantId: tenantId || null,
       posCustomerId: posCustomerId || null,
-      items: cart.map(i => ({ id: i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax })),
+      // 10/20 (review): what a ticket can hold, by its ids as the server knows
+      // them. A closing read's bill is not on it — see ticketLines.
+      items: heldLines.filter(l => !!l.id),
     }),
     {
       onSuccess: () => {
+        // Read before the cart is emptied: what was held, and what came off it.
+        const letGo = billInCart
         qc.invalidateQueries('pos-tickets')
         resetRegister('held_for_delivery')
-        toastOnce('Held for delivery — it is on the open tickets list.')
+        toastOnce('Held for delivery — it is on the open tickets list.'
+          + (letGo ? ' The closing read came off it: that bill is owed as usual, on their invoice or as an emailed link.' : ''))
       },
       onError: (e: any) => toastOnce(errorMessage(e, 'Could not hold it for delivery — check the connection and press Hold for delivery again.'), { error: true }),
     },
@@ -556,7 +749,7 @@ export function POSPage() {
   const ticketChanges = (): any | null => {
     if (!openTicketId) return null
     const snap = ticketSnapshot
-    const lines = cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax }))
+    const lines = heldLines
     const personChanged = !!person && (
       (tenantId || null) !== (snap?.tenantId ?? null) || (posCustomerId || null) !== (snap?.posCustomerId ?? null))
     const unchanged = !lines.length || (!!snap && snap.id === openTicketId && snap.lines === linesKey(lines) && !personChanged)
@@ -632,6 +825,12 @@ export function POSPage() {
     } else if (payLinkId) {
       // A pay link opened here stays on this property's list, as it was.
       resetRegister('property_switched')
+    } else if (releaseRaisedBills()) {
+      // 10/20 (review): a closing read belongs to the park it was taken at. The
+      // release names the property, so a bill carried across to another park
+      // would have been let go at the wrong one — which is to say not at all.
+      setCart(c => c.filter(i => !i.utilityBillId))
+      toastOnce('The closing read came off the cart — a bill belongs to the park it was taken at. It is owed as usual, on their invoice or as an emailed link.')
     }
     setRegisterProperty(next); setPerson(null)
   }
@@ -642,8 +841,14 @@ export function POSPage() {
     if (payLinkId) { resetRegister('pay_link_put_back'); toastOnce('Pay link put back on the open list.'); return }
     // S652 (Nic): "just clearing the cart should clear it, and if they have a
     // name associated with it save it as a ticket."
-    if (tenantId || posCustomerId) { writeTicketMut.mutate(); return }
+    // 10/20 (review): a bill a closing read raised here is not something a
+    // ticket can hold, so what is held is the REST of the cart — and a cart
+    // with nothing else in it is not written up at all. Either way the bill is
+    // let go and owed as usual (D2); before this, Clear sent the bill's own
+    // line to the ticket door, was refused, and let go of nothing.
+    if ((tenantId || posCustomerId) && heldLines.length) { writeTicketMut.mutate(); return }
     resetRegister('cleared_by_cashier')
+    if (billInCart) toastOnce('Cleared. The closing read stands, and its bill is owed as usual — on their invoice, or as an emailed link.')
   }
 
   // 10/2 (Nic, front desk foolproof): a ticket or pay link is opened from the
@@ -678,7 +883,7 @@ export function POSPage() {
         setOpenTicketId(fresh.id)
         setTicketSnapshot({ id: fresh.id, tenantId: fresh.tenantId ?? null, posCustomerId: fresh.posCustomerId ?? null,
           name: personOfTicket(fresh)?.name ?? null,
-          lines: linesKey(lines.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, qty: i.qty, price: i.price }))) })
+          lines: linesKey(lines.map(i => ({ id: wireId(i.id), qty: i.qty, price: i.price }))) })
       }
       setTicketsOpen(false)
       // 10/3: a ticket whose reservation is over opens with what is left on it, and says why.
@@ -699,7 +904,21 @@ export function POSPage() {
   )
   const { data: taxRates = [] } = useQuery<any[]>(['pos-tax-rates', registerProperty], () => apiGet(`/pos/tax-rates${propQ}`), { enabled: tab==='taxes'||tab==='register' })
   const { data: discounts = [] } = useQuery<any[]>(['pos-discounts', registerProperty], () => apiGet(`/pos/discounts${propQ}`), { enabled: tab==='discounts'||tab==='register' })
-  const { data: txns = [], isLoading: txLoading } = useQuery<any[]>(['pos-transactions', registerProperty, historyCustomer?.id ?? null], () => apiGet(`/pos/transactions${propQ}${historyCustomer ? `${propQ ? '&' : '?'}posCustomerId=${historyCustomer.id}` : ''}`), { enabled: tab==='history' })
+  // 10/20 (review) — A CUSTOMER'S HISTORY IS THEIRS, NOT A LOCATION'S.
+  //
+  // The book spans the account now, so a row opened from the Customers tab can
+  // belong to the account's OTHER company. Read through the register's property
+  // it came back EMPTY under a row that said "3 purchases · $42" — the list and
+  // the history contradicting each other on one screen. So a customer's history
+  // names that customer's company, which the row carries, and drops the
+  // property filter; a cashier is still held to their own properties by the
+  // server. "Show everyone" is unchanged: that list IS the register's location.
+  const txQuery = !historyCustomer ? propQ
+    : historyCustomer.landlordId ? `?posCustomerId=${historyCustomer.id}&landlordId=${historyCustomer.landlordId}`
+    : `${propQ}${propQ ? '&' : '?'}posCustomerId=${historyCustomer.id}`
+  const { data: txns = [], isLoading: txLoading } = useQuery<any[]>(
+    ['pos-transactions', registerProperty, historyCustomer?.id ?? null, historyCustomer?.landlordId ?? null],
+    () => apiGet(`/pos/transactions${txQuery}`), { enabled: tab==='history' })
   const { data: vendors = [] } = useQuery<any[]>(['pos-vendors', registerProperty], () => apiGet(`/pos/vendors?propertyId=${registerProperty}`), { enabled: !!registerProperty && (tab==='vendors'||tab==='orders') })
   const { data: purchaseOrders = [] } = useQuery<any[]>(['pos-purchase-orders', registerProperty], () => apiGet(`/pos/purchase-orders${propQ}`), { enabled: tab==='orders' })
   const { data: inventoryLog = [] } = useQuery<any[]>(['pos-inventory-log', registerProperty], () => apiGet(`/pos/inventory-log${propQ}`), { enabled: tab==='inventory' })
@@ -793,7 +1012,7 @@ export function POSPage() {
   // S263: open-tab query (cross-terminal pickup + crash recovery). When
   // the register tab loads with a property selected and no live session,
   // surface a banner if there's an open tab on this property.
-  const { data: openSessions = [] } = useQuery<any[]>(
+  const { data: openSessions = NO_OPEN_SESSIONS } = useQuery<any[]>(
     ['pos-sessions-open', registerProperty],
     () => apiGet(`/pos/sessions?status=open&propertyId=${registerProperty}`),
     { enabled: tab==='register' && !!registerProperty },
@@ -991,15 +1210,28 @@ export function POSPage() {
   // 10/5 (Nic, R8): the background check's fee the server quoted for the stay
   // in the cart — its own line, which the server adds and the register cannot
   // take off. Shown here so the cart says what Charge takes.
-  const screeningDue = stayLine && stayPriced(stayLine) ? Number(stayLine.screeningFee) || 0 : 0
+  // 10/21 (Nic): a background check rung on its own, for somebody with no stay
+  // — "for people that just legitimately want to move in, they need to be able
+  // to just do the background check first and see if they're going to be
+  // approved." Its price is the server's (cart-quote answers with it); nothing
+  // here works it out.
+  const counterCheckDue = counterCheck ? Number(counterCheck.price) || 0 : 0
+  const screeningDue = (stayLine && stayPriced(stayLine) ? Number(stayLine.screeningFee) || 0 : 0) + counterCheckDue
   const subtotal = cart.reduce((s,i) => s+lineAmount(i), 0) + screeningDue
   // 10/3 (review, decisions #9): a stay is charged at the schedule's price —
   // a sale with a stay (or a reservation) in it takes no discount, and the
   // server refuses one. The box says so instead of offering it.
   const noDiscountForStay = cart.some(i => !!i.stayUnit || !!i.reservation)
-  useEffect(() => { if (noDiscountForStay && appliedDiscount) setAppliedDiscount(null) }, [noDiscountForStay, appliedDiscount])
+  // 10/20 (review): a utility bill is collected in full or it is not collected.
+  // A discount never touches a line, so $75.25 off an $81.27 final electric
+  // left $6.02 in the drawer and closed the bill out as paid — the server
+  // refuses it now (assertUtilityBillNotDiscounted) and the box says so
+  // instead of offering it. A bill that is wrong is corrected on the bill.
+  const noDiscountForBill = cart.some(i => !!i.utilityBill)
+  const noDiscountHere = noDiscountForStay || noDiscountForBill
+  useEffect(() => { if (noDiscountHere && appliedDiscount) setAppliedDiscount(null) }, [noDiscountHere, appliedDiscount])
   const fixedDiscount = appliedDiscount?.linkLines ? linkDiscountShare(appliedDiscount.value, appliedDiscount.linkLines, cart) : appliedDiscount?.value
-  const discountAmt = appliedDiscount && !noDiscountForStay ? (appliedDiscount.type==='percent' ? subtotal*(appliedDiscount.value/100) : Math.min(fixedDiscount, subtotal)) : 0
+  const discountAmt = appliedDiscount && !noDiscountHere ? (appliedDiscount.type==='percent' ? subtotal*(appliedDiscount.value/100) : Math.min(fixedDiscount, subtotal)) : 0
   const discountedSubtotal = subtotal - discountAmt
   const taxAmount = cart.reduce((s,i) => s+lineTax(i), 0)
   // S650: the cart's tax by name ("Lodging tax"), from each item's taxes.
@@ -1023,8 +1255,14 @@ export function POSPage() {
   // whether the customer pays it on top or the landlord absorbs it. The server
   // decides the real figure (cart-quote / transactions); this shows it first.
   const absorbsCardFee = (allProperties as any[]).find(p => p.id === registerProperty)?.registerCardFeePayer === 'landlord'
+  // 10/21 (Nic): one price for a background check. Its line already carries its
+  // own processing, so the card fee here is figured on the rest of the ticket —
+  // the same base the server uses (serverCartTotals), or the screen would quote
+  // a fee the Charge never takes. A cart with a check in it takes no discount,
+  // so the whole fee is still in discountedSubtotal.
+  const cardFeeBase = Math.max(0, discountedSubtotal + taxAmount - screeningDue)
   const surcharge = method==='charge' ? discountedSubtotal*0.01
-    : (method==='card'||method==='card_on_file') && !absorbsCardFee ? processingFeeFor({ amount: discountedSubtotal + taxAmount, paymentMethod: 'card' })
+    : (method==='card'||method==='card_on_file') && !absorbsCardFee ? processingFeeFor({ amount: cardFeeBase, paymentMethod: 'card' })
     : 0
   const total = discountedSubtotal + taxAmount + surcharge
   // 10/3 (decisions #16): "Cash given" left blank is exact cash — received is
@@ -1152,7 +1390,10 @@ export function POSPage() {
   // null and skip validation.
   const checkoutMut = useMutation(
     (stripePaymentIntentId?: string) => apiPost('/pos/transactions', {
-      items: cart.map(i => ({ ...wireLine(i, openTicketId, payLinkId), cat:i.cat })),
+      // 10/20: a bill being collected carries NO category — it is not a catalog
+      // sale and has no merchandising grouping to give (the same shape an
+      // emailed bill's line has, so one report reads both).
+      items: cart.map(i => ({ ...wireLine(i, openTicketId, payLinkId), ...(i.utilityBillId ? {} : { cat: i.cat }) })),
       // S654: a card the reader took is a card sale, whatever the tender buttons say now.
       paymentMethod: stripePaymentIntentId ? 'card' : method,
       // S254: charge mode posts customer + property scoping for FlexCharge
@@ -1169,6 +1410,9 @@ export function POSPage() {
       propertyId: registerProperty || null,
       subtotal:discountedSubtotal, taxAmount, surcharge, total, changeGiven:changeDue,
       discountAmount:discountAmt, discountReason:appliedDiscount?.name||null,
+      // 10/23 (Nic): the check number, on a check sale only. The API refuses
+      // one on any other tender, so it is sent only where it belongs.
+      paymentReference: !stripePaymentIntentId && method==='check' ? checkNumber.trim() : null,
       stripePaymentIntentId: stripePaymentIntentId || null,
       // S652: the ticket this sale settles, claimed inside the sale's own
       // transaction so two drivers cannot both charge the same tank.
@@ -1178,6 +1422,9 @@ export function POSPage() {
       // dates from the item and its quantity; this is the part only the
       // cashier knows. (A stay taken back out leaves nothing behind.)
       stay: stayInCart ? (stay || null) : null,
+      // 10/21 (Nic): a check sold on its own. The server prices it and writes
+      // the line — this is only the person it is for.
+      screening: counterCheck ? { name: counterCheck.name, email: counterCheck.email } : null,
     }),
     { onSuccess: async (res:any) => {
       // 10/3 (Nic, decisions #16): the change stays on screen until the cashier
@@ -1208,7 +1455,7 @@ export function POSPage() {
         })
       }
       setClientSessionId(null)
-      abandonPendingIntent(); setCart([]); setCashGiven(''); setPerson(null); setAppliedDiscount(null); setStay(null)
+      abandonPendingIntent(); setCart([]); setCashGiven(''); setCheckNumber(''); setPerson(null); setAppliedDiscount(null); setStay(null); setCounterCheck(null)
       setOpenTicketId(null); setTicketSnapshot(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets')
       qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-items')
       // 10/3 (review): a stay sold here took its site — the next picker reads what is free again.
@@ -1299,6 +1546,7 @@ export function POSPage() {
     name: d.name.trim(), rate: Number(d.ratePct) / 100,
     appliesTo: d.all ? ['all'] : [],
     categoryIds: d.all ? [] : d.categoryIds, itemIds: d.all ? [] : d.itemIds,
+    onStays: d.onStays,
   })
   const saveTaxMut = useMutation(() => taxDraft.id
     ? apiPatch(`/pos/tax-rates/${taxDraft.id}`, taxBody(taxDraft))
@@ -1350,6 +1598,19 @@ export function POSPage() {
   const voidMut = useMutation((id:string) => apiPost(`/pos/transactions/${id}/void`, { reason:'Voided by cashier' }), {
     onSuccess: () => { setVoidAsk(null); toastOnce('Sale voided — what it took is back on the shelf'); afterVoid() },
     onError: (e: any) => { setVoidAsk(null); afterVoid(); toastOnce(errorMessage(e, 'The sale was not voided — check the connection, then press Void again.'), { error: true }) } })
+
+  const tenderMut = useMutation(
+    (b: { id: string; paymentMethod: 'cash'|'check'; paymentReference?: string }) =>
+      apiPatch(`/pos/transactions/${b.id}/tender`,
+        { paymentMethod: b.paymentMethod, paymentReference: b.paymentReference ?? null }),
+    { onSuccess: (r: any) => {
+        const m = r?.data?.paymentMethod === 'check'
+          ? `check #${r?.data?.paymentReference}` : 'cash'
+        setTenderAsk(null); setTenderCheckNo('')
+        toastOnce(`Re-recorded as paid by ${m}. The sale itself is untouched.`)
+        afterVoid()
+      },
+      onError: (e: any) => toastOnce(errorMessage(e, 'That tender was not corrected — check the connection, then try again.'), { error: true }) })
 
   // S243: SDK Bluetooth-reader discovery + connect (handheld path).
   // Smart readers (S700, WisePOS E) appear in the modal too but via
@@ -1526,6 +1787,18 @@ export function POSPage() {
   const canVoid = canSeeTab('pos.void')
   const TABS = [
     { key:'register',  label:'Register',   perm:'pos.tab.register' },
+    // 10/21 (Nic): "maybe there's another one that says checkout" — beside the
+    // register, because checking somebody out is a sequence of its own and
+    // crowding it into the register would make the register mean two things.
+    // Anyone who can ring a sale can check somebody out; its money lands on
+    // the register ticket either way.
+    { key:'checkout',  label:'Checkout',   perm:'pos.tab.register' },
+    // 10/21 (Nic): "nothing shows the desk it's waiting. Yeah, we need a way to
+    // resend it." The desk took the money for these checks, and the desk is who
+    // the guest rings when the link never came — so the list of who has paid and
+    // not done it belongs here, with the address editable, because a mistyped
+    // one is why the link never came AND why they cannot sign in to fix it.
+    { key:'checks',    label:'Checks',     perm:'pos.tab.register' },
     { key:'history',   label:'History',    perm:'pos.tab.history' },
     // S654 (Nic): "an overall customers tab… see my whole customer history."
     { key:'customers', label:'Customers',  perm:'pos.tab.history' },
@@ -1605,8 +1878,27 @@ export function POSPage() {
     () => apiPost(`/pos/transactions/${receipt?.id}/email-receipt`, { email: receiptEmail.trim() }),
     { onSuccess: (r: any) => { setReceiptSent(r.data.sentTo) },
       onError: (e: any) => toastOnce(errorMessage(e, 'The receipt could not be sent — check the email and press Send again.'), { error: true }) })
-  const { data: customersBase = [], isLoading: custLoading } = useQuery<any[]>(['pos-customer-base', registerProperty],
-    () => apiGet(`/pos/customers?propertyId=${registerProperty}`), { enabled: tab==='customers' && !!registerProperty })
+  // 10/20 (Nic), shown a customer list he had to pick a property to see: "When
+  // I click the customer list, I want to be able to see that combined as all
+  // properties, because that could be people from my other property could be
+  // customers at this property for propane. I shouldn't have to toggle."
+  //
+  // The book hangs off the COMPANY — a register record has no property of its
+  // own — so there was never a property filter here to drop. The toggle was:
+  // the tab refused to load or draw until a property was picked, and the query
+  // string told anyone reading it that a customer belongs to a location. Both
+  // are gone. The picker at the top still decides where a SALE rings; it has
+  // nothing to say about who the account's customers are.
+  //
+  // 10/20 (review): dropping `?propertyId=` is only safe because the SERVER was
+  // fixed in the same pass. That parameter was how the register told the API
+  // which of Nic's two companies it was standing in, and an account that owns
+  // two got a 400 back without it ("choose which one") — which this page has no
+  // handler for, so it drew the empty state and said he had no customers. The
+  // list now spans every company the account owns and says, on each row, which
+  // company keeps it (routes/pos.ts).
+  const { data: customersBase = [], isLoading: custLoading } = useQuery<any[]>(['pos-customer-base'],
+    () => apiGet('/pos/customers'), { enabled: tab==='customers' })
   const txReceiptMut = useMutation(
     (v: { id: string; email: string }) => apiPost(`/pos/transactions/${v.id}/email-receipt`, { email: v.email.trim() }),
     { onSuccess: (r: any) => { setTxEdit(null); toastOnce(`Receipt sent to ${r.data.sentTo}`); qc.invalidateQueries('pos-customer-base') },
@@ -1757,10 +2049,44 @@ export function POSPage() {
         </div>
       )}
 
-      {!registerProperty && (
+      {/* 10/20 (Nic): Customers is the one tab that is not per-property — it is
+          the company's whole book of people, every property at once — so this
+          notice must not stand in front of it. The sentence lists what IS per
+          location, and customers were never on that list. */}
+      {!registerProperty && tab !== 'customers' && (
         <div style={{padding:'48px 24px',textAlign:'center',color:'var(--text-3)',border:'1px dashed var(--border-1)',borderRadius:12}}>
           Select a property above — POS is per-property: its register, sales history, items, and tax rates all live at one location.
         </div>
+      )}
+
+      {/* 10/21 (Nic) — CHECKING SOMEBODY OUT. Its own tab, its output on the
+          register's ticket: "I want the determination of checking out to
+          automatically know all of the things to bill for, not just targeted
+          electric." */}
+      {tab==='checks' && (
+        <div style={{maxWidth:760}}>
+          <StartACheck propertyId={registerProperty}
+            onToSale={(c)=>{ setCounterCheck(c); setTab('register') }} />
+          <ScreeningsWaitingPanel propertyId={registerProperty} api={screeningsApi} />
+        </div>
+      )}
+      {tab==='checkout' && !!registerProperty && (
+        <CheckoutTab propertyId={registerProperty}
+          onToTicket={(lines, notes, picked)=>{
+            if (lines.length) setCart(c => [...c.filter(i => !lines.some(l => l.utilityBillId === i.utilityBillId)), ...lines])
+            // Why there is nothing to collect, said out loud — one line per
+            // meter that did not go on the ticket.
+            for (const n of notes) toastOnce(n)
+            if (!lines.length && !notes.length) toastOnce('The read was recorded. There is nothing to collect for it.')
+            if (!lines.length) return
+            // The person carries over only when picking them made a record to
+            // carry (somebody from another company comes back sealed, with no
+            // record, and a chip with no record behind it would block a charge
+            // account at the till).
+            if (picked && (picked.tenantId || picked.customerId) && !person) setPerson(picked)
+            setTab('register')
+            toastOnce('On the ticket — take the money at the register.')
+          }} />
       )}
 
       {tab==='register' && (
@@ -1783,6 +2109,17 @@ export function POSPage() {
                     </div>
                     {!many && <div style={{fontSize:'.75rem',color:'var(--text-2)',marginTop:2}}>{line(openTabs[0])}</div>}
                     {many && !tabsExpanded && <div style={{fontSize:'.75rem',color:'var(--text-3)',marginTop:2}}>Open the list to pick one to resume.</div>}
+                    {/* 10/24 (Nic): "I thought the window that popped up at the
+                        top of the screen, which was resume or discard, was to
+                        resume like the currently open ticket." It is not — this
+                        is an unfinished CART, and Discard here throws away a
+                        half-rung sale, never somebody's unpaid ticket. Said
+                        outright, because the two words are the same and the
+                        wrong guess loses work or looks like it loses money. */}
+                    <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:4,lineHeight:1.45}}>
+                      This is a sale that was started and never finished. Discarding it clears the cart only —
+                      open tickets and pay links stay on the open list, and nothing owed is written off.
+                    </div>
                   </div>
                   {!many && <button onClick={()=>resumeSession(openTabs[0].id)} className="btn btn-primary btn-sm">Resume</button>}
                   {!many && <button onClick={()=>discardOpenTab(openTabs[0].id)} className="btn btn-ghost btn-sm">Discard</button>}
@@ -1841,7 +2178,7 @@ export function POSPage() {
                   pay link stays out, and the live cart session is closed so it
                   never comes back as "resume or discard" (resetRegister). */}
               {(cart.length>0||!!openTicketId||!!payLinkId)&&<button disabled={readerHoldsCharge || putTicketBackMut.isLoading || writeTicketMut.isLoading} onClick={clearRegister}
-                title={openTicketId ? 'Put this ticket back on the open list' : payLinkId ? 'Put this pay link back on the open list' : (tenantId||posCustomerId) ? 'Hold it for delivery under their name' : 'Empty the cart'}
+                title={openTicketId ? 'Put this ticket back on the open list' : payLinkId ? 'Put this pay link back on the open list' : (tenantId||posCustomerId) && heldLines.length ? 'Hold it for delivery under their name' : 'Empty the cart'}
                 style={{background:'none',border:'none',color:'var(--text-3)',cursor:'pointer',fontSize:'.75rem'}}>
                 {putTicketBackMut.isLoading ? 'Putting it back…' : 'Clear'}
               </button>}
@@ -1858,6 +2195,15 @@ export function POSPage() {
                   {i.reservation ? (
                     <div style={{fontSize:'.68rem',color:'var(--text-3)',textAlign:'right',maxWidth:110,lineHeight:1.3}}>
                       {i.nights ? `${i.nights} night${i.nights===1?'':'s'} · ` : ''}reservation price · change it on the schedule
+                    </div>
+                  ) : i.utilityBillId ? (
+                    <div style={{fontSize:'.68rem',color:'var(--text-3)',textAlign:'right',maxWidth:118,lineHeight:1.3}}>
+                      their bill · collected in full
+                      <button type="button" onClick={()=>takeClosingReadOff(i.utilityBillId!)}
+                              style={{display:'block',marginLeft:'auto',background:'none',border:'none',padding:0,
+                                      color:'var(--text-3)',cursor:'pointer',fontSize:'.68rem',textDecoration:'underline'}}>
+                        take it off
+                      </button>
                     </div>
                   ) : i.fixed ? (
                     <div style={{fontSize:'.68rem',color:'var(--text-3)',textAlign:'right',maxWidth:110,lineHeight:1.3}}>
@@ -1876,16 +2222,25 @@ export function POSPage() {
                     check on file carries the check's fee — the server adds it
                     to the sale, and nobody can take it off. */}
                 {screeningDue>0 && (<div style={{display:'flex',alignItems:'center',gap:6,padding:'7px 0',borderBottom:'1px solid var(--border-1)'}}>
-                  <div style={{flex:1,minWidth:0,fontSize:'.8rem',fontWeight:500}}>{stay?.screeningLineName || 'Background check'}</div>
-                  <div style={{fontSize:'.68rem',color:'var(--text-3)',textAlign:'right',maxWidth:110,lineHeight:1.3}}>required · cannot be taken off</div>
+                  <div style={{flex:1,minWidth:0,fontSize:'.8rem',fontWeight:500}}>
+                    {counterCheck ? `Background check — ${counterCheck.name}` : (stay?.screeningLineName || 'Background check')}
+                  </div>
+                  {counterCheck
+                    ? <button type="button" onClick={()=>setCounterCheck(null)}
+                        style={{border:'none',background:'none',color:'var(--text-3)',fontSize:'.68rem',cursor:'pointer',textDecoration:'underline'}}>
+                        take off
+                      </button>
+                    : <div style={{fontSize:'.68rem',color:'var(--text-3)',textAlign:'right',maxWidth:110,lineHeight:1.3}}>required · cannot be taken off</div>}
                   <div style={{fontSize:'.82rem',fontWeight:600,minWidth:44,textAlign:'right'}}>{fmt(screeningDue)}</div>
                 </div>)}
               </div>
             )}
             {/* S650: the discount box is for staff allowed to discount; the server refuses it otherwise. */}
             {!(isOwner || (user?.permissions as any)?.['pos.discount'] === true || (user?.permissions as any)?.['pos.manage_inventory'] === true) ? null
-              : noDiscountForStay ? (<div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:10,lineHeight:1.45}}>
-                  No discount on a sale with a stay — the stay is charged at the schedule's price. To discount other items, ring them on a sale of their own.
+              : noDiscountHere ? (<div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:10,lineHeight:1.45}}>
+                  {noDiscountForStay
+                    ? 'No discount on a sale with a stay — the stay is charged at the schedule\'s price. To discount other items, ring them on a sale of their own.'
+                    : 'No discount on a sale with a utility bill — the bill is collected at its own figure, and settling it closes it out in full. To discount other items, ring them on a sale of their own.'}
                 </div>)
               : appliedDiscount?(<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'var(--gold-bg)',borderRadius:6,padding:'6px 10px',marginBottom:10,fontSize:'.8rem'}}>
               <span style={{color:'var(--gold)',fontWeight:600}}>discount: {appliedDiscount.name}</span>
@@ -1923,7 +2278,13 @@ export function POSPage() {
                     point of sale customer, we can just auto charge them on
                     delivery and we don't even have to take the reader with us."
                     Same card, same fee — nobody is holding the plastic. */}
-                {(['cash','card','card_on_file','charge'] as const).filter(m=>!(LAUNCH_HIDE_CHARGE && m==='charge')).map(m=>(<button key={m} disabled={readerHoldsCharge} onClick={()=>setMethod(m)} style={{opacity:readerHoldsCharge&&method!==m?0.45:1,padding:'7px 0',border:"1px solid "+(method===m?'var(--gold)':'var(--border-1)'),background:method===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',cursor:'pointer',fontSize:'.75rem',fontWeight:method===m?700:400,color:method===m?'var(--gold)':'var(--text-2)'}}>{m==='card_on_file'?'On file':m==='charge'?'Charge':m==='cash'?'Cash':'Card'}</button>))}
+                {/* 10/23 (Nic): "we need to add a button to record check
+                    payments. That also needs to be turned on or off if a
+                    property chooses to accept checks. A lot of places don't
+                    accept them." A park that says no never sees the button;
+                    the sale route refuses a check there either way, because a
+                    hidden button is a courtesy and not a rule. */}
+                {(['cash','check','card','card_on_file','charge'] as const).filter(m=>!(LAUNCH_HIDE_CHARGE && m==='charge') && !(m==='check' && !posSettings?.acceptsChecks)).map(m=>(<button key={m} disabled={readerHoldsCharge} onClick={()=>setMethod(m)} style={{opacity:readerHoldsCharge&&method!==m?0.45:1,padding:'7px 0',border:"1px solid "+(method===m?'var(--gold)':'var(--border-1)'),background:method===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',cursor:'pointer',fontSize:'.75rem',fontWeight:method===m?700:400,color:method===m?'var(--gold)':'var(--text-2)'}}>{m==='card_on_file'?'On file':m==='charge'?'Charge':m==='cash'?'Cash':m==='check'?'Check':'Card'}</button>))}
               </div>
             </div>
             {method==='cash'&&(<div style={{marginBottom:10}}>
@@ -1933,6 +2294,21 @@ export function POSPage() {
                 : cashShortBy>0
                   ? <div style={{fontSize:'.82rem',color:'var(--red)',fontWeight:600,marginTop:4}}>Cash given is short by {fmt(cashShortBy)} — take the rest, then press Charge.</div>
                   : <div style={{fontSize:'.82rem',color:'var(--green)',fontWeight:600,marginTop:4}}>{changeDue>0 ? `Change: ${fmt(changeDue)}` : 'No change due'}</div>}
+            </div>)}
+            {/* 10/23 — THE CHECK NUMBER IS PART OF THE RECORD, NOT A NOTE.
+                It is how the park finds this payment again when the bank sends
+                the check back, or when the customer asks which one paid for
+                what. A check is FREE like cash (S654, Nic: "There's no fee.
+                Paying cash or check is free") — no fee line, no surcharge, and
+                no change to give. */}
+            {method==='check'&&(<div style={{marginBottom:10}}>
+              <input className="form-input" inputMode="numeric" placeholder="Check number" maxLength={40}
+                value={checkNumber} onChange={e=>setCheckNumber(e.target.value)} style={{width:'100%'}} />
+              <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:4}}>
+                {checkNumber.trim()
+                  ? 'No fee on a check, and no change to give.'
+                  : 'Type the number off the check — it is how this payment is found again later.'}
+              </div>
             </div>)}
             {/* S654 (Nic): "it should show their name on the pay screen as
                 well." 10/2 (Nic): "type their name, not a scroll down list...
@@ -1946,6 +2322,33 @@ export function POSPage() {
                 disabled={!registerProperty || readerHoldsCharge}
                 placeholder={(method==='charge'||method==='card_on_file') ? 'Type who this is for' : 'Type a name, email or phone'} />
             </div>
+            {/* 10/20 (Nic) — THE FINAL UTILITY BILL, RAISED RIGHT HERE.
+                "desk picks the customer and gam should know the site from the
+                reservation. no reason for the front counter to pick a space
+                too." Nothing is emailed and nothing goes on an invoice: the
+                ticket is the bill, and paying it closes it out. */}
+            {!payLinkId && (<div style={{marginBottom:10,display:'grid',gap:4}}>
+              <button type="button" className="btn btn-ghost btn-sm" style={{width:'100%'}}
+                      disabled={!registerProperty || !(tenantId||posCustomerId) || readerHoldsCharge}
+                      onClick={()=>setClosingRead(true)}>
+                Closing read · final utility
+              </button>
+              {!(tenantId||posCustomerId) && (
+                <div style={{fontSize:'.68rem',color:'var(--text-3)',lineHeight:1.45}}>
+                  Pick who this is for first — GAM finds their site from their own reservation or lease.
+                </div>)}
+            </div>)}
+            {closingRead && registerProperty && (
+              <ClosingReadModal propertyId={registerProperty} tenantId={tenantId || null} posCustomerId={posCustomerId || null}
+                onCancel={()=>setClosingRead(false)}
+                onDone={(lines, notes)=>{
+                  setClosingRead(false)
+                  if (lines.length) setCart(c => [...c.filter(i => !lines.some(l => l.utilityBillId === i.utilityBillId)), ...lines])
+                  // Why there is nothing to collect, said out loud — one line per
+                  // meter that did not go on the ticket.
+                  for (const n of notes) toastOnce(n)
+                  if (!lines.length && !notes.length) toastOnce('The read was recorded. There is nothing to collect for it.')
+                }} />)}
             {(method==='charge'||method==='card_on_file')&&(<div style={{marginBottom:10,display:'grid',gap:6}}>
               {method==='charge'&&chargeBlocked&&<div style={{fontSize:'.72rem',color:'var(--red)'}}>Cart has non-charge-eligible items</div>}
               {method==='card_on_file'&&(
@@ -2031,6 +2434,8 @@ export function POSPage() {
               || (method==='card' && !registerProperty)
               // 10/3: cash given that does not cover the total is not a sale yet.
               || (method==='cash' && cashShortBy > 0)
+              // 10/23: a check with no number is not written down yet.
+              || (method==='check' && !checkNumber.trim())
               // S652: no customer, no card — and a customer with no card saved
               // has to go on the reader, which saves it for next time.
               || (method==='card_on_file' && (!registerProperty || (!tenantId && !posCustomerId) || !cardOnFile.data))
@@ -2046,9 +2451,15 @@ export function POSPage() {
                 they can pay by email." The same cart, paid later by card. */}
             {/* 10/2: a ticket or pay link opened here is already out — a link
                 for it too would be a second bill for the same thing. */}
+            {/* 10/20 (review): a closing read is not emailed from here — see
+                payLinkLines. Its own door is under Pay Links, where the line
+                names its bill, and it opens the moment the read comes off the
+                ticket ("take it off" on its line). A door that cannot do the
+                thing is not offered. */}
             <button className="btn btn-primary" style={{width:'100%',marginTop:8}}
-              disabled={cart.length===0 || !registerProperty || readerHoldsCharge || !!openTicketId || !!payLinkId}
-              title={openTicketId || payLinkId ? 'This is already out on the open list — charge it here, or press Clear to put it back.' : undefined}
+              disabled={cart.length===0 || !registerProperty || readerHoldsCharge || !!openTicketId || !!payLinkId || billInCart}
+              title={openTicketId || payLinkId ? 'This is already out on the open list — charge it here, or press Clear to put it back.'
+                     : billInCart ? 'A closing read is not emailed from here — take it off its line, then send that bill from Pay Links.' : undefined}
               onClick={()=>{
                 // 10/3 (decisions #9): a stay goes out on a link with its site and
                 // dates — held for them, at the same price Charge would take.
@@ -2057,6 +2468,10 @@ export function POSPage() {
               }}>
               Email a pay link
             </button>
+            {cart.length>0 && !openTicketId && !payLinkId && billInCart &&
+              <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:4}}>
+                A closing read is not emailed from here — charge it now, or take it off its line and send that bill from Pay Links.
+              </div>}
             {/* S652 (Nic): the propane is pumped here, where the meter is and
                 where it has to be zeroed before the next tank — and paid for at
                 the customer's door. Nic, on why this is not a pay link: "That's
@@ -2067,8 +2482,9 @@ export function POSPage() {
                 the site. The button says so instead of failing on the server. */}
             <button className="btn btn-primary" style={{width:'100%',marginTop:8}}
               disabled={cart.length===0 || !registerProperty || (!tenantId && !posCustomerId) || !!openTicketId || !!payLinkId
-                        || stayInCart || writeTicketMut.isLoading || readerHoldsCharge}
-              title={stayInCart ? 'A stay is charged now or sent on a pay link — it is not held for delivery.' : undefined}
+                        || stayInCart || writeTicketMut.isLoading || readerHoldsCharge || !heldLines.length}
+              title={stayInCart ? 'A stay is charged now or sent on a pay link — it is not held for delivery.'
+                     : !heldLines.length ? 'A closing read is not held for delivery — charge it now, or press Clear and the bill is owed as usual.' : undefined}
               onClick={()=>writeTicketMut.mutate()}>
               {writeTicketMut.isLoading ? 'Writing it up…' : 'Hold for delivery'}
             </button>
@@ -2080,12 +2496,14 @@ export function POSPage() {
               <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:4}}>
                 Pick who it is for to hold it for delivery.
               </div>}
+            {cart.length>0 && !openTicketId && !payLinkId && !stayInCart && !!(tenantId||posCustomerId) && !heldLines.length &&
+              <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:4}}>
+                A closing read is not held for delivery — charge it now, or press Clear and the bill is owed as usual.
+              </div>}
             {payLinkOpen && (
               <SendPayLinkModal
                 propertyId={registerProperty}
-                cart={cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, name: i.name, qty: i.qty, price: i.price, tax: i.tax, cat: i.cat,
-                                       // 10/3 (review): the stay's figure as shown — the link never goes out at another.
-                                       ...(stayPriced(i) ? { stayTotal: i.stayTotal } : {}) }))}
+                cart={payLinkLines(cart)}
                 stay={stayInCart && stayReady && stay ? { unitId: stay.unitId, checkIn: stay.checkIn, guestName: stay.guestName, guestPhone: stay.guestPhone || null,
                                                           guestEmail: stay.guestEmail || null, stayTerms: stay.stayTerms || null,
                                                           extendBookingId: stay.extendBookingId || null, screeningFee: stay.screeningFee || null,
@@ -2113,17 +2531,35 @@ export function POSPage() {
           </div>
         )}
         
+        <div style={{marginBottom:10,position:'relative'}}>
+          <input className="form-input" style={{width:'100%'}}
+            placeholder="Find a sale — name, item, check number, card last four…"
+            value={historyFind} onChange={e=>setHistoryFind(e.target.value)} />
+          {historyFind && (
+            <button className="btn btn-ghost btn-sm" onClick={()=>setHistoryFind('')}
+              style={{position:'absolute',right:6,top:'50%',transform:'translateY(-50%)'}}>Clear</button>
+          )}
+        </div>
         <div className="card" style={{padding:0}}>
           {txLoading?<div style={{padding:32,textAlign:'center',color:'var(--text-3)'}}>Loading...</div>:(
             <table className="data-table">
-              <thead><tr><th>Date</th><th>Items</th><th>Subtotal</th><th>Total</th><th>Method</th><th>Status</th><th>Actions</th></tr></thead>
+              {/* 10/24 (Nic): "add a column for customers in between the items
+                  and the subtotal." */}
+              <thead><tr><th>Date</th><th>Items</th><th>Customer</th><th>Subtotal</th><th>Total</th><th>Method</th><th>Status</th><th>Actions</th></tr></thead>
               <tbody>
-                {(txns as any[]).length?(txns as any[]).map((t:any)=>(<Fragment key={t.id}><tr style={{cursor:'pointer'}} onClick={()=>setOpenTx(o=>o===t.id?null:t.id)} title="Click to see what was sold">
+                {(() => { const shown = (txns as any[]).filter((t:any)=>saleMatches(t, historyFind)); return shown.length?shown.map((t:any)=>(<Fragment key={t.id}><tr style={{cursor:'pointer'}} onClick={()=>setOpenTx(o=>o===t.id?null:t.id)} title="Click to see what was sold">
                   <td className="mono">{new Date(t.createdAt).toLocaleDateString()}</td>
                   <td style={{color:'var(--text-3)',fontSize:'.82rem'}}>
-                    {/* S653 (Nic): "it isn't clickable" — the lines open under the row. */}
-                    {(t.items||[]).length===1 ? `${t.items[0].name} ×${Number(t.items[0].qty)}` : `${t.itemCount} items`}
+                    {/* S653 (Nic): "it isn't clickable" — the lines open under the row.
+                        10/24 (Nic): the short name here; the dates and the site
+                        are in the lines that open underneath. */}
+                    {(t.items||[]).length===1 ? `${shortItemName(t.items[0].name)} ×${Number(t.items[0].qty)}` : `${t.itemCount} items`}
                     <span style={{marginLeft:6,color:'var(--text-3)'}}>{openTx===t.id?'▾':'▸'}</span>
+                  </td>
+                  <td style={{fontSize:'.82rem'}}>
+                    {t.tenantName || t.customerName
+                      ? <span style={{color:'var(--text-1)'}}>{t.tenantName || t.customerName}</span>
+                      : <span style={{color:'var(--text-3)'}}>—</span>}
                   </td>
                   <td className="mono">{fmt(t.subtotal)}</td>
                   <td className="mono" style={{fontWeight:600}}>{fmt(t.total)}</td>
@@ -2139,12 +2575,16 @@ export function POSPage() {
                       schedule). It asks first, in the app. */}
                   <td>{t.status==='completed'&&(canRefund||(canVoid&&!t.voidBlocked))&&(<div style={{display:'flex',gap:6}}>
                     {canRefund&&<button className="btn btn-ghost btn-sm" onClick={e=>{e.stopPropagation(); setRefundModal({show:true,tx:t})}}>Refund</button>}
+                    {/* 10/24: cash and check only — a card sale's tender is a
+                        real authorization on GAM's account, and a store account
+                        carries its own balance. The API refuses either too. */}
+                    {canVoid&&(t.paymentMethod==='cash'||t.paymentMethod==='check')&&<button className="btn btn-ghost btn-sm" onClick={e=>{e.stopPropagation(); setTenderCheckNo(t.paymentReference||''); setTenderAsk(t)}}>Wrong tender</button>}
                     {canVoid&&!t.voidBlocked&&<button className="btn btn-ghost btn-sm" style={{color:'var(--red)'}} onClick={e=>{e.stopPropagation(); setVoidAsk(t)}}>Void</button>}
                   </div>)}
                   {t.status==='refunded'&&<span style={{fontSize:'.75rem',color:'var(--text-3)'}}>-{fmt(t.refundAmount)}</span>}
                   </td>
                 </tr>
-                {openTx===t.id&&(<tr><td colSpan={7} style={{background:'var(--bg-2)',padding:'8px 16px 12px'}}>
+                {openTx===t.id&&(<tr><td colSpan={8} style={{background:'var(--bg-2)',padding:'8px 16px 12px'}}>
                   <div style={{display:'grid',gap:4,fontSize:'.8rem'}}>
                     {(t.items||[]).map((it:any,i:number)=>(<div key={i} style={{display:'flex',justifyContent:'space-between',gap:12}}>
                       <span>{it.name} <span style={{color:'var(--text-3)'}}>×{Number(it.qty)} @ {fmt(it.price)}</span></span>
@@ -2177,7 +2617,7 @@ export function POSPage() {
                     </div>
                   </div>
                 </td></tr>)}
-                </Fragment>)):<tr><td colSpan={7} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No transactions yet.</td></tr>}
+                </Fragment>)):<tr><td colSpan={8} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>{historyFind ? `Nothing here matches "${historyFind}".` : 'No transactions yet.'}</td></tr>})()}
               </tbody>
             </table>
           )}
@@ -2365,13 +2805,16 @@ export function POSPage() {
                   const cats = categoriesForProperty(registerProperty).filter(c=>(t.categoryIds||[]).includes(c.id)).map(c=>c.name)
                   const legacy = Array.isArray(t.appliesTo) ? t.appliesTo.filter((x:string)=>String(x).toLowerCase()!=='all') : []
                   const its = (items as any[]).filter((i:any)=>i.propertyId===registerProperty).filter((i:any)=>(t.itemIds||[]).includes(i.id)).map((i:any)=>i.name)
-                  const reach = taxAppliesToAll(t) ? 'Everything' : [...cats, ...legacy].map(n=>`${n} (category)`).concat(its).join(', ') || 'Nothing yet'
+                  // 10/17 (Nic): a tax charged on stays says so first — that is the rate
+                  // every stay at this property is priced with, wherever it is booked.
+                  const onGoods = taxAppliesToAll(t) ? 'Everything sold here' : [...cats, ...legacy].map(n=>`${n} (category)`).concat(its).join(', ')
+                  const reach = [t.onStays===true ? 'Stays here' : '', onGoods].filter(Boolean).join(' + ') || 'Nothing yet'
                   return (<tr key={t.id}>
                     <td style={{fontWeight:500}}>{t.name}</td>
                     <td className="mono">{pct(t.rate)}</td>
                     <td style={{fontSize:'.82rem'}}>{reach}</td>
                     <td style={{textAlign:'right',whiteSpace:'nowrap'}}>
-                      <button className="btn btn-ghost btn-sm" onClick={()=>setTaxDraft({ id:t.id, name:t.name, ratePct:String(+(Number(t.rate)*100).toFixed(4)), all:taxAppliesToAll(t), categoryIds:t.categoryIds||[], itemIds:t.itemIds||[] })}>Edit</button>
+                      <button className="btn btn-ghost btn-sm" onClick={()=>setTaxDraft({ id:t.id, name:t.name, ratePct:String(+(Number(t.rate)*100).toFixed(4)), all:taxAppliesToAll(t), onStays:t.onStays===true, categoryIds:t.categoryIds||[], itemIds:t.itemIds||[] })}>Edit</button>
                       <button className="btn btn-ghost btn-sm" onClick={()=>deleteTaxMut.mutate(t.id)}>Remove</button>
                     </td>
                   </tr>)
@@ -2389,6 +2832,22 @@ export function POSPage() {
               <label style={{display:'flex',gap:6,alignItems:'center'}}><input type="radio" checked={taxDraft.all} onChange={()=>setTaxDraft(d=>({...d,all:true}))} /> Everything sold here</label>
               <label style={{display:'flex',gap:6,alignItems:'center'}}><input type="radio" checked={!taxDraft.all} onChange={()=>setTaxDraft(d=>({...d,all:false}))} /> Only what I choose</label>
             </div>
+            {/* 10/17 (Nic): the ONE place a stay's tax rate is set. Ticked, this is
+                the rate every stay at this property is priced with — the booking
+                site, a pay link and the counter all follow it, so a rate can
+                never be changed in one screen and leave a stay at the old one. */}
+            <label style={{display:'flex',gap:8,alignItems:'flex-start',fontSize:'.85rem',marginTop:12}}>
+              {/* Ticking it moves the reach above to "Only what I choose" — a lodging
+                  tax is on stays, not on everything in the shop, unless the
+                  landlord says so by choosing again. */}
+              <input type="checkbox" checked={taxDraft.onStays} onChange={e=>setTaxDraft(d=>({...d,onStays:e.target.checked,all:e.target.checked?false:d.all}))} style={{marginTop:3}} />
+              <span>Charged on a stay here (a lodging tax)
+                <span style={{display:'block',color:'var(--text-3)',fontSize:'.75rem'}}>
+                  Every stay at this property is priced with it, wherever it is booked — the tax is inside the price the guest is quoted, so it is never added again at the till.
+                  {!taxDraft.all && !taxDraft.categoryIds.length && !taxDraft.itemIds.length ? ' Nothing else is taxed by it.' : ''}
+                </span>
+              </span>
+            </label>
             {!taxDraft.all && (
               <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginTop:12}}>
                 <div>
@@ -2401,7 +2860,9 @@ export function POSPage() {
                 </div>
                 <div>
                   <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:6}}>Single items</div>
-                  {(items as any[]).filter((i:any)=>i.propertyId===registerProperty).map((i:any)=>(
+                  {/* 10/17 (Nic): sites and stays are not on this list — a stay's tax
+                      is the tick above, inside the price every door quotes. */}
+                  {(items as any[]).filter((i:any)=>i.propertyId===registerProperty).filter((i:any)=>!i.stayUnit).map((i:any)=>(
                     <label key={i.id} style={{display:'flex',gap:8,alignItems:'center',fontSize:'.82rem',marginBottom:4}}>
                       <input type="checkbox" checked={taxDraft.itemIds.includes(i.id)} onChange={e=>setTaxDraft(d=>({...d,itemIds:e.target.checked?[...d.itemIds,i.id]:d.itemIds.filter(x=>x!==i.id)}))} />
                       {i.name} <span style={{color:'var(--text-3)',fontSize:'.72rem'}}>{i.category}</span>
@@ -2445,9 +2906,15 @@ export function POSPage() {
         </div>
       )}
 
-      {tab==='customers' && !!registerProperty && (() => {
+      {tab==='customers' && (() => {
         const q = custSearch.trim().toLowerCase()
         const rows = (customersBase as any[]).filter((c:any) => !q || [c.firstName, c.lastName, c.email, c.phone, ...(c.cards||[]).map((k:any)=>k.last4)].filter(Boolean).join(' ').toLowerCase().includes(q))
+        // 10/20 (review): one list, several companies — an account with two
+        // LLCs sees both books here, so each row says which company keeps it.
+        // An account with one company has nothing to distinguish and gets no
+        // tag at all. Counted off the whole book, not the search, so typing a
+        // name cannot make the tags appear and disappear.
+        const manyBooks = new Set((customersBase as any[]).map((c:any) => c.landlordId).filter(Boolean)).size > 1
         return (
         <div className="card" style={{padding:0}}>
           <div className="card-header" style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:12,flexWrap:'wrap'}}>
@@ -2465,6 +2932,7 @@ export function POSPage() {
                     {(c.duplicateIds||[]).length>0 && <span style={{marginLeft:8,fontSize:'.68rem',color:'var(--amber, #d0a02a)',fontWeight:600}}>possible duplicate</span>}
                     {c.isResident && <span style={{marginLeft:8,fontSize:'.68rem',color:'var(--gold)',fontWeight:600}}>resident</span>}
                     {c.createdFrom==='card_reader' && !c.isResident && <span style={{marginLeft:8,fontSize:'.68rem',color:'var(--text-3)'}}>from a card</span>}
+                    {manyBooks && !!c.company && <span style={{marginLeft:8,fontSize:'.68rem',color:'var(--text-3)'}}>{c.company}</span>}
                   </td>
                   <td style={{fontSize:'.82rem'}}>{c.email||'—'}</td>
                   <td style={{fontSize:'.82rem'}}>{c.phone||'—'}</td>
@@ -2475,7 +2943,15 @@ export function POSPage() {
                 </tr>
                 {openCust===c.id && (<tr><td colSpan={7} style={{background:'var(--bg-2)',padding:'10px 16px 14px'}}>
                   <CustomerEditor c={c} all={customersBase as any[]}
-                    onHistory={()=>{ setHistoryCustomer({ id:c.id, name:`${c.firstName} ${c.lastName}`.trim() }); setTab('history') }}
+                    // 10/20: this list spans the account, so the history it
+                    // opens says WHOSE company the row is — their purchases
+                    // wherever they were rung, not this location's (txQuery
+                    // above). The register's History tab itself still opens at a
+                    // property, because the buttons on each sale belong to one.
+                    onHistory={()=>{
+                      if (!registerProperty) { toastOnce('Pick a property at the top first — the register opens its History there.'); return }
+                      setHistoryCustomer({ id:c.id, name:`${c.firstName} ${c.lastName}`.trim(), landlordId: c.landlordId ?? null }); setTab('history')
+                    }}
                     onChanged={()=>{ setOpenCust(null) }} />
                 </td></tr>)}
               </Fragment>))}</tbody>
@@ -2870,6 +3346,36 @@ export function POSPage() {
 
 
 
+      {tenderAsk&&(<div className="modal-overlay" onClick={()=>{ if (!tenderMut.isLoading) { setTenderAsk(null); setTenderCheckNo('') } }}><div className="modal" style={{maxWidth:420}} onClick={e=>e.stopPropagation()}>
+        <h3 style={{margin:'0 0 8px'}}>How was this paid?</h3>
+        <div style={{fontSize:'.82rem',color:'var(--text-2)',lineHeight:1.5,marginBottom:14}}>
+          The {fmt(tenderAsk.total)} sale from {new Date(tenderAsk.createdAt).toLocaleDateString()} is recorded as
+          {' '}{tenderAsk.paymentMethod==='check'?`a check${tenderAsk.paymentReference?` (#${tenderAsk.paymentReference})`:''}`:'cash'}.
+          {' '}The sale itself is not changed — same items, same money, same day. Only how it was paid.
+        </div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:12}}>
+          {(['cash','check'] as const).map(m=>(
+            <button key={m} className={`btn btn-sm ${tenderAsk.paymentMethod===m?'btn-primary':'btn-ghost'}`}
+              disabled={tenderMut.isLoading}
+              onClick={()=>setTenderAsk({...tenderAsk,paymentMethod:m})}>{m==='cash'?'Cash':'Check'}</button>))}
+        </div>
+        {tenderAsk.paymentMethod==='check'&&(<div style={{marginBottom:12}}>
+          <input className="form-input" inputMode="numeric" placeholder="Check number" maxLength={40}
+            value={tenderCheckNo} onChange={e=>setTenderCheckNo(e.target.value)} style={{width:'100%'}} />
+          <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:4}}>
+            It is how this payment is found again if the bank sends the check back.
+          </div>
+        </div>)}
+        <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+          <button className="btn btn-ghost" disabled={tenderMut.isLoading} onClick={()=>{ setTenderAsk(null); setTenderCheckNo('') }}>Leave it</button>
+          <button className="btn btn-primary"
+            disabled={tenderMut.isLoading||(tenderAsk.paymentMethod==='check'&&!tenderCheckNo.trim())}
+            onClick={()=>tenderMut.mutate({ id:tenderAsk.id, paymentMethod:tenderAsk.paymentMethod,
+                                            paymentReference: tenderAsk.paymentMethod==='check'?tenderCheckNo.trim():undefined })}>
+            {tenderMut.isLoading?'Saving…':'Re-record it'}
+          </button>
+        </div>
+      </div></div>)}
       {voidAsk&&(<div className="modal-overlay" onClick={()=>{ if (!voidMut.isLoading) setVoidAsk(null) }}><div className="modal" style={{maxWidth:400}} onClick={e=>e.stopPropagation()}>
         <div className="modal-header"><span className="modal-title">Void this sale?</span></div>
         <div style={{padding:'0 24px 24px',display:'grid',gap:12}}>
@@ -2942,6 +3448,18 @@ export function POSPage() {
                   </div>
                   {t.note && <div style={{fontSize:'.7rem',color:'var(--text-3)',marginTop:2}}>{t.note}</div>}
                 </div>
+                {/* 10/24 (Nic) — A TICKET IS NOT DISCARDABLE, AND THERE IS NO
+                    BUTTON HERE THAT PRETENDS IT IS.
+                      "Anything that's a ticket is a outstanding balance that
+                       needs to be paid. If I send somebody a point of sale
+                       ticket and they never pay it, that's a left owing money
+                       situation. Those are not able to be discarded. Cart items
+                       that never complete a sale can be discarded, but pay
+                       links and other invoice tickets, those stay."
+                    A Discard was added here earlier today and taken straight
+                    back out: a ticket nobody pays is money owed, which is what
+                    the left-owing book is for — not something a counter throws
+                    away. Settle is the only thing that closes one. */}
                 {(openTicketId===t.id||payLinkId===t.id)
                   ? <span style={{fontSize:'.72rem',color:'var(--gold)',fontWeight:700,whiteSpace:'nowrap'}}>In the cart</span>
                   : <button className="btn btn-primary btn-sm"
@@ -3005,6 +3523,606 @@ export function POSPage() {
  * front counter person that's clicking lease or no lease." A monthly stay can
  * instead add a month to a stay that is here now (R6).
  */
+/**
+ * What the desk is told the customer was matched on. Never the raw value — and
+ * never a name: a name match is the one thing a money decision in GAM may not
+ * be made on, which is why there is no third label here.
+ *
+ * The values are COUNTER_MATCHES (api services/registerFinalUtility); this is
+ * the only surface that renders them, so the words live here rather than in
+ * packages/shared. A second surface moves both.
+ */
+const CLOSING_MATCH_LABEL: Record<string, string> = {
+  email: 'Matched on their email address',
+  phone: 'Matched on their phone number',
+}
+
+/**
+ * WHAT ONE CLOSING IS, FOR THE DESK TO CONFIRM — a stay or a lease, never a
+ * space. Two rigs means two of these and the desk confirms which.
+ *
+ * 10/21 (Nic), with the stay's own money on it: "I want the determination of
+ * checking out to automatically know all of the things to bill for, not just
+ * targeted electric." A stay that still owes says so and says where it is
+ * taken, because a closing read does not collect it and somebody settling up
+ * is the last moment anyone can.
+ */
+function ClosingPickList({ closings, pickedId, onPick, busy }: {
+  closings: any[]
+  pickedId: string | null
+  onPick: (c: any) => void
+  busy?: boolean
+}) {
+  return (
+    <div style={{display:'grid',gap:6,marginBottom:14}}>
+      {closings.map((c: any) => {
+        const owes = typeof c.owed === 'number' && c.owed > 0.005
+        return (
+          <button key={c.id} type="button" disabled={busy} onClick={()=>onPick(c)}
+                  style={{textAlign:'left',padding:'8px 10px',borderRadius:6,cursor:'pointer',
+                          background: c.id===pickedId ? 'var(--gold-bg)' : 'var(--bg-3)',
+                          border:`1px solid ${c.id===pickedId ? 'var(--gold)' : 'var(--border-1)'}`,
+                          color: c.id===pickedId ? 'var(--gold)' : 'var(--text-1)', fontSize:'.82rem', fontWeight:600}}>
+            {c.who ? `${c.who} · ${c.what}` : c.what}
+            <div style={{fontSize:'.68rem',color:'var(--text-3)',fontWeight:500,marginTop:2}}>
+              {c.meters.length
+                ? `${c.meters.length} meter${c.meters.length===1?'':'s'} on this space`
+                : 'No submeter on this space — nothing to read'}
+              {owes ? ` · still owes ${fmt(c.owed)} on the stay` : ''}
+            </div>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+/**
+ * 10/20 (Nic) — THE CLOSING READ ITSELF: a box for every submeter the site has,
+ * usually one and sometimes two, and they go on the one ticket as one set of
+ * lines.
+ *
+ * ── WHY TWO BUTTONS ─────────────────────────────────────────────────────────
+ *
+ * Typing the number writes nothing. "Check the read" shows the usage and the
+ * dollar amount, which is the one thing the desk is shown here (staff entry is
+ * otherwise blind — no previous read, ever, in either direction) because they
+ * have to read the total out to somebody who is about to pay it. "Put it on the
+ * ticket" is what writes the reading and the bill. A typo is retyped; there is
+ * nothing to void, because nothing has been written.
+ *
+ * Nothing is emailed and nothing goes on their invoice: the ticket is the bill.
+ * When there is nothing to collect — a nightly guest whose power is in the rate
+ * they already paid, a guest who left early at a park that kept their money, a
+ * figure the landlord has to look at first — the screen says so in a sentence
+ * and the ticket stays as it was.
+ *
+ * One form, used by the register's window and by the Checkout tab (10/21), so
+ * the two can never ask for a reading differently.
+ */
+function ClosingReadForm({ propertyId, closing, onDone }: {
+  propertyId: string
+  closing: any
+  onDone: (lines: CartItem[], notes: string[]) => void
+}) {
+  const [values, setValues] = useState<Record<string, string>>({})
+  const [checked, setChecked] = useState<any[] | null>(null)
+  // A different closing is a different set of meters: nothing typed carries over.
+  useEffect(() => { setValues({}); setChecked(null) }, [closing?.kind, closing?.id])
+
+  // Only the meters a figure was typed for. A site with two meters where only
+  // the electric was read sends the electric.
+  const typed = (closing?.meters ?? [])
+    .filter((m: any) => String(values[m.meterId] ?? '').trim() !== '')
+    .map((m: any) => ({ meterId: m.meterId, value: Number(values[m.meterId]) }))
+  const typedOk = typed.length > 0 && typed.every((r: any) => Number.isInteger(r.value) && r.value >= 0)
+
+  const body = () => ({ propertyId, closing: { kind: closing.kind, id: closing.id }, reads: typed })
+
+  const checkMut = useMutation(() => apiPost<any>('/pos/final-utility/quote', body()), {
+    onSuccess: (r: any) => setChecked(r?.data?.reads ?? []),
+    onError: (e: any) => toastOnce(errorMessage(e, 'That read could not be checked — check the connection and press Check the read again.'), { error: true }),
+  })
+  const confirmMut = useMutation(() => apiPost<any>('/pos/final-utility/confirm', body()), {
+    onSuccess: (r: any) => {
+      const lines: CartItem[] = (r?.data?.lines ?? []).map((l: any) => ({
+        id: `bill-${l.utilityBillId}`, utilityBillId: l.utilityBillId,
+        name: l.name, price: Number(l.price) || 0, qty: 1, tax: Number(l.tax) || 0,
+        cat: '', icon: '⚡', chargeEligible: false, stayUnit: null,
+        // Collected in full at the bill's own figure, so the line is not the
+        // counter's to retype and the sale takes no discount.
+        fixed: true, utilityBill: true,
+      }))
+      setValues({}); setChecked(null)
+      onDone(lines, r?.data?.notes ?? [])
+    },
+    onError: (e: any) => toastOnce(errorMessage(e, 'That read could not be recorded — check the connection and press Put it on the ticket again.'), { error: true }),
+  })
+
+  // A figure retyped is a figure not yet checked.
+  const setValue = (meterId: string, v: string) => { setChecked(null); setValues(s => ({ ...s, [meterId]: v })) }
+  const busy = checkMut.isLoading || confirmMut.isLoading
+
+  if (!closing?.meters?.length) {
+    return (
+      <div style={{fontSize:'.82rem',color:'var(--text-2)',lineHeight:1.55,marginBottom:12}}>
+        That space has no submeter of its own, so there is no closing read to take and no final utility bill to raise.
+      </div>
+    )
+  }
+  return (<>
+    {/* D4 (Nic): every submeter the site has gets a box — they go on the
+        one ticket as one set of lines. */}
+    <div style={{display:'grid',gap:10,marginBottom:12}}>
+      {closing.meters.map((m: any) => {
+        const line = (checked ?? []).find((q: any) => q.meterId === m.meterId)
+        return (
+          <div key={m.meterId} style={{display:'grid',gap:4}}>
+            <div style={{fontSize:'.74rem',color:'var(--text-3)'}}>
+              {m.label}{m.digits ? ` · ${m.digits} digits` : ''}
+              {m.noBaseline ? ' · never read before' : ''}
+            </div>
+            <input className="form-input" type="number" inputMode="numeric" value={values[m.meterId] ?? ''}
+                   placeholder={`Read off the face of ${m.label}`} disabled={busy}
+                   onChange={e=>setValue(m.meterId, e.target.value)} {...nonNeg} />
+            {line && (
+              <div style={{fontSize:'.78rem',lineHeight:1.5,fontWeight:600,
+                           color: line.block ? 'var(--amber)' : 'var(--gold)'}}>
+                {line.note}
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+
+    {/* The desk reads the total out to the person paying it. */}
+    {checked && checked.some((q: any) => !q.block) && (
+      <div style={{display:'flex',justifyContent:'space-between',fontWeight:700,fontSize:'.95rem',
+                   borderTop:'1px solid var(--border-1)',paddingTop:8,marginBottom:12}}>
+        <span>Going on the ticket</span>
+        <span style={{color:'var(--gold)'}}>
+          {fmt(checked.filter((q: any) => !q.block).reduce((s: number, q: any) => s + (Number(q.amount) || 0), 0))}
+        </span>
+      </div>
+    )}
+
+    {!checked || !typedOk ? (
+      <button type="button" className="btn btn-primary" style={{width:'100%'}} disabled={!typedOk || busy}
+              onClick={()=>checkMut.mutate()}>
+        {checkMut.isLoading ? 'Checking…' : 'Check the read'}
+      </button>
+    ) : (
+      <button type="button" className="btn btn-primary" style={{width:'100%'}} disabled={busy}
+              onClick={()=>confirmMut.mutate()}>
+        {confirmMut.isLoading ? 'Recording…' : 'Put it on the ticket'}
+      </button>
+    )}
+    <div style={{fontSize:'.68rem',color:'var(--text-3)',marginTop:8,lineHeight:1.5}}>
+      Nothing is recorded until you press Put it on the ticket, and nothing is emailed — the ticket is the bill.
+    </div>
+  </>)
+}
+
+/** What a stay still owes, and where it is taken — never by a closing read (10/21). */
+function StayStillOwes({ closing }: { closing: any }) {
+  if (!(typeof closing?.owed === 'number' && closing.owed > 0.005)) return null
+  return (
+    <div style={{fontSize:'.8rem',lineHeight:1.55,color:'var(--amber)',fontWeight:600,
+                 background:'var(--bg-3)',border:'1px solid var(--border-1)',borderRadius:6,padding:'8px 10px',marginBottom:12}}>
+      This stay still owes {fmt(closing.owed)}.
+      <div style={{fontWeight:500,color:'var(--text-2)',marginTop:2}}>
+        A closing read does not collect it — open their ticket or their pay link from the open list and charge that,
+        on this ticket or its own.
+      </div>
+    </div>
+  )
+}
+
+/**
+ * 10/20 (Nic) — THE CLOSING READ, TAKEN AT THE COUNTER.
+ *
+ *   "desk picks the customer and gam should know the site from the reservation.
+ *    no reason for the front counter to pick a space too"
+ *
+ * The desk has already picked the customer on the ticket. GAM finds what of
+ * theirs can be closed out — their own stays and their own leases at this park,
+ * matched on their email address and then their phone number, never on a name —
+ * and the desk confirms WHICH one. It is never a list of spaces.
+ *
+ * The Checkout tab (10/21) is the same thing with its own front door; this
+ * window stays for the clerk who is already mid-sale.
+ */
+function ClosingReadModal({ propertyId, tenantId, posCustomerId, onCancel, onDone }: {
+  propertyId: string; tenantId: string | null; posCustomerId: string | null
+  onCancel: () => void
+  onDone: (lines: CartItem[], notes: string[]) => void
+}) {
+  const [pickedId, setPickedId] = useState<string | null>(null)
+
+  const who = useQuery<any>(
+    ['pos-final-utility', propertyId, tenantId, posCustomerId],
+    () => apiGet(`/pos/final-utility/customer?propertyId=${propertyId}`
+      + (tenantId ? `&tenantId=${tenantId}` : '') + (posCustomerId ? `&posCustomerId=${posCustomerId}` : '')),
+    { enabled: !!propertyId && !!(tenantId || posCustomerId), retry: false, staleTime: 0, refetchOnMount: 'always' },
+  )
+  const closings: any[] = who.data?.closings ?? []
+  const picked = closings.find((c: any) => c.id === pickedId) ?? null
+
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.6)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:2000,padding:16}}>
+      <div className="card" style={{width:'100%',maxWidth:520,maxHeight:'88vh',overflowY:'auto'}}>
+        <div className="card-header"><span className="card-title">Closing read</span></div>
+
+        {who.isLoading ? (
+          <div style={{fontSize:'.85rem',color:'var(--text-3)',padding:'18px 0'}}>Looking them up…</div>
+        ) : who.isError ? (
+          <div style={{fontSize:'.85rem',color:'var(--red)',lineHeight:1.5,padding:'8px 0'}}>
+            {errorMessage(who.error, 'They could not be looked up — check the connection and open it again.')}
+          </div>
+        ) : !closings.length ? (
+          <div style={{fontSize:'.85rem',color:'var(--text-2)',lineHeight:1.55,padding:'8px 0'}}>{who.data?.note}</div>
+        ) : (<>
+          {who.data?.matchedBy && (
+            <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:8}}>
+              {CLOSING_MATCH_LABEL[who.data.matchedBy] ?? 'Matched on their own record'}
+            </div>
+          )}
+          <div style={{fontSize:'.78rem',color:'var(--text-2)',marginBottom:8,lineHeight:1.5}}>
+            {closings.length === 1
+              ? 'Confirm this is what they are closing out.'
+              : 'Which one are they closing out?'}
+          </div>
+          <ClosingPickList closings={closings} pickedId={pickedId} onPick={(c)=>setPickedId(c.id)} />
+          {picked && (<>
+            <StayStillOwes closing={picked} />
+            <ClosingReadForm propertyId={propertyId} closing={picked} onDone={onDone} />
+          </>)}
+        </>)}
+
+        <div style={{display:'flex',gap:8,marginTop:12}}>
+          <button type="button" className="btn btn-ghost" style={{flex:1}} onClick={onCancel}>Close</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * 10/21 (Nic) — THE CHECKOUT TAB.
+ *
+ *   "on the point of sale, how we have the tabs at the top for register,
+ *    history, customers, maybe there's another one that says checkout… when
+ *    somebody's checking out, the point of sale should communicate with the
+ *    unit and any submeters applicable to that unit… I want the determination
+ *    of checking out to automatically know all of the things to bill for, not
+ *    just targeted electric."
+ *
+ * Checking somebody out is a SEQUENCE, not a thing in a cart — who is leaving,
+ * what of theirs is ending, every meter on it read, the money on the ticket —
+ * so it gets its own tab beside Register and History rather than another button
+ * on the register, where it would be one option among forty and the register
+ * would stop meaning one thing. Its output still lands on the REGISTER TICKET,
+ * so taking the money is the ordinary thing the desk does every day.
+ *
+ * The tab opens on who is due out (the schedule's own answer — last day come
+ * and gone, still checked in), because the desk has usually typed nothing: the
+ * person is standing there for that one reason. Anybody not on that list is
+ * found by name, the same typed flow as everywhere else. Either way GAM finds
+ * the site from the reservation; the counter never picks a space.
+ *
+ * WHAT IT KNOWS TO BILL FOR: every submeter the site has, not the electric
+ * alone (the unit answers with its own meters), and what the stay itself still
+ * owes — said out loud, with where it is taken, because a closing read does not
+ * collect it and this is the last moment anybody can.
+ */
+function CheckoutTab({ propertyId, onToTicket }: {
+  propertyId: string
+  /** The lines the reads raised, the sentences for what was not billed, and who it was for. */
+  onToTicket: (lines: CartItem[], notes: string[], person: PickedPerson | null) => void
+}) {
+  const [person, setPerson] = useState<PickedPerson | null>(null)
+  const [picked, setPicked] = useState<any | null>(null)
+  // 10/24 (Nic): the read is taken, so the check-out step is live. Cleared when
+  // a different person is picked — a read belongs to the stay it was taken on.
+  const [readDone, setReadDone] = useState(false)
+  const tenantId = person?.kind === 'resident' ? (person.tenantId ?? '') : ''
+  const posCustomerId = person?.kind === 'customer' ? (person.customerId ?? '') : ''
+
+  const due = useQuery<any>(
+    ['pos-checkout-due-out', propertyId],
+    () => apiGet(`/pos/checkout/due-out?propertyId=${propertyId}`),
+    { enabled: !!propertyId, retry: false, staleTime: 0, refetchOnMount: 'always' },
+  )
+  const dueOut: any[] = due.data?.closings ?? []
+
+  const who = useQuery<any>(
+    ['pos-final-utility', propertyId, tenantId, posCustomerId],
+    () => apiGet(`/pos/final-utility/customer?propertyId=${propertyId}`
+      + (tenantId ? `&tenantId=${tenantId}` : '') + (posCustomerId ? `&posCustomerId=${posCustomerId}` : '')),
+    { enabled: !!propertyId && !!(tenantId || posCustomerId), retry: false, staleTime: 0, refetchOnMount: 'always' },
+  )
+  const theirs: any[] = who.data?.closings ?? []
+
+  return (
+    <div style={{display:'grid',gap:14,maxWidth:620}}>
+      <div className="card">
+        <div className="card-header"><span className="card-title">Who is leaving</span></div>
+        <div style={{fontSize:'.78rem',color:'var(--text-2)',lineHeight:1.55,marginBottom:10}}>
+          Pick them and GAM finds their site from their own reservation, reads every meter on it, and puts the power
+          on the ticket with whatever else they are buying.
+        </div>
+
+        {/* The schedule's own answer: last day come and gone, still here. */}
+        <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:6}}>Due out</div>
+        {due.isLoading ? (
+          <div style={{fontSize:'.8rem',color:'var(--text-3)',marginBottom:12}}>Reading the schedule…</div>
+        ) : due.isError ? (
+          <div style={{fontSize:'.8rem',color:'var(--red)',lineHeight:1.5,marginBottom:12}}>
+            {errorMessage(due.error, 'The schedule could not be read — check the connection and open the tab again.')}
+          </div>
+        ) : !dueOut.length ? (
+          <div style={{fontSize:'.8rem',color:'var(--text-2)',lineHeight:1.5,marginBottom:12}}>
+            Nobody is past their last day right now. Type a name below for anybody leaving early.
+          </div>
+        ) : (
+          <ClosingPickList closings={dueOut} pickedId={picked?.id ?? null}
+                           onPick={(c)=>{ setPicked(c); setPerson(null); setReadDone(false) }} />
+        )}
+
+        <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:6}}>Somebody else here</div>
+        {/* 10/24 (Nic): hereOnly — "it should only pull up people that are
+            actually specific to a lease or stay at that property." The register's
+            platform-wide search is right for a sale and wrong for a check-out. */}
+        <POSCustomerPicker propertyId={propertyId} value={person} hereOnly
+                           placeholder="Type a name or phone"
+                           onChange={(p)=>{ setPerson(p); setPicked(null); setReadDone(false) }} />
+      </div>
+
+      {/* What of theirs is ending — their own stays and leases here, never spaces. */}
+      {!!(tenantId || posCustomerId) && (
+        <div className="card">
+          <div className="card-header"><span className="card-title">What they are closing out</span></div>
+          {who.isLoading ? (
+            <div style={{fontSize:'.8rem',color:'var(--text-3)'}}>Looking them up…</div>
+          ) : who.isError ? (
+            <div style={{fontSize:'.8rem',color:'var(--red)',lineHeight:1.5}}>
+              {errorMessage(who.error, 'They could not be looked up — check the connection and pick them again.')}
+            </div>
+          ) : !theirs.length ? (
+            <div style={{fontSize:'.8rem',color:'var(--text-2)',lineHeight:1.55}}>{who.data?.note}</div>
+          ) : (<>
+            {who.data?.matchedBy && (
+              <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:8}}>
+                {CLOSING_MATCH_LABEL[who.data.matchedBy] ?? 'Matched on their own record'}
+              </div>
+            )}
+            <div style={{fontSize:'.78rem',color:'var(--text-2)',marginBottom:8,lineHeight:1.5}}>
+              {theirs.length === 1 ? 'Confirm this is what they are closing out.' : 'Which one are they closing out?'}
+            </div>
+            <ClosingPickList closings={theirs} pickedId={picked?.id ?? null} onPick={(c)=>{ setPicked(c); setReadDone(false) }} />
+          </>)}
+        </div>
+      )}
+
+      {picked && (
+        <div className="card">
+          <div className="card-header">
+            <span className="card-title">Closing read · {picked.spaceLabel || 'their site'}</span>
+          </div>
+          <div style={{fontSize:'.78rem',color:'var(--text-2)',lineHeight:1.5,marginBottom:10}}>
+            {picked.who ? `${picked.who} · ${picked.what}` : picked.what}
+          </div>
+          <StayStillOwes closing={picked} />
+          {/* 10/24 (Nic): "The checkout tab is the action of checking the person
+              out." The read no longer clears the card — it hands over to the
+              step that actually closes the stay, so the desk finishes here
+              instead of being left with nowhere to go. */}
+          <ClosingReadForm propertyId={propertyId} closing={picked}
+                           onDone={(lines, notes)=>{ setReadDone(true); onToTicket(lines, notes, person) }} />
+          {picked.kind === 'stay' ? (
+            <FinishCheckOut closing={picked} readDone={readDone}
+                            onDone={()=>{ setPicked(null); setReadDone(false); void due.refetch() }} />
+          ) : (
+            /* 10/24 (Nic): "if somebody were to move out of an unsubmetered
+               unit, there's no way to check them out through that checkout flow
+               on the point of sale system." A lease used to get the meter form
+               and then nothing — while the master schedule deliberately sent
+               lease check-outs here. */
+            <FinishLeaseMoveOut propertyId={propertyId} closing={picked}
+                                onDone={()=>{ setPicked(null); setReadDone(false); setPerson(null); void due.refetch() }} />
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * 10/24 (Nic) — THE CHECKOUT TAB IS THE ACT OF CHECKING SOMEBODY OUT.
+ *
+ *   "Val Sutherland, I could not check out. Even though the meter read
+ *    reconciliates to nothing billed, zero kilowatts to add to the bill, the
+ *    only button at the bottom of the screen says to add to ticket. I clicked
+ *    it, just seeing if it would go through, but it refused to generate a
+ *    ticket even for $0 or anything like that. There's no way to resolve it
+ *    from that screen."
+ *
+ * He is right, and the tab was only ever half of a check-out. It read the
+ * meter and put the power on a ticket — and a stay with nothing to bill
+ * produces no ticket, so the desk was left with a recorded read, a guest
+ * standing there, and no button that finishes anything. The stay stayed
+ * `checked_in`.
+ *
+ * So the read hands over to this, which drives the check-out that already
+ * exists (routes/stayCheckOut) rather than inventing a second one. Three
+ * shapes, and the desk is never the one deciding which:
+ *
+ *   NOTHING TO SETTLE — they stayed the nights they booked and paid for them.
+ *     Val exactly: 7 nights booked, 7 stayed, $286.08 paid, $0 owed, nothing
+ *     refundable, `question: 'none'`. One button, and it is done.
+ *   A MONEY QUESTION — they left early, or they still owe. The choices come
+ *     back from the server already written as one line each ("They will owe
+ *     $280.00"), so the desk reads consequences rather than working them out.
+ *   NOT THEIRS TO ANSWER — no "Check guests out" permission, or the stay is
+ *     waiting on something. It says which, instead of a dead screen.
+ *
+ * The read is NOT a precondition. A guest can be checked out before anybody
+ * walks to the meter — the two are separate facts and forcing an order on them
+ * is how a desk gets stuck.
+ */
+/**
+ * 10/24 (Nic) — FINISHING A LEASE MOVE-OUT AT THE COUNTER.
+ *
+ * What the desk may do, in his words:
+ *
+ *   "I think this should be split based on my personal front desk not having
+ *    lease permission. They can do the process to check them out, any invoices
+ *    for remaining balance generated and billed against deposit. Front desk does
+ *    not choose to issue refund without permission, it goes to landlord to
+ *    initiate."
+ *
+ * So this ends the tenancy, frees the space and leaves the deposit return as a
+ * DRAFT — unpaid rent, utilities and move-out fees already swept against the
+ * deposit by the server. It never issues money: the landlord's finalize is what
+ * writes a refund or a gap invoice, and the copy here says so out loud so a
+ * clerk is never left wondering whether they just paid somebody.
+ */
+function FinishLeaseMoveOut({ propertyId, closing, onDone }: {
+  propertyId: string; closing: any; onDone: () => void
+}) {
+  const [confirming, setConfirming] = useState(false)
+  const go = useMutation(
+    () => apiPost(`/pos/checkout/lease/${closing.id}/finish`, { propertyId }),
+    {
+      onSuccess: (r: any) => {
+        const d = r?.data ?? r
+        toastOnce(`${d?.who || 'They'} are moved out of ${d?.unitNumber || 'their space'}.`
+          + (d?.depositReturnId ? ' The deposit return is waiting for the owner.' : ''))
+        onDone()
+      },
+      onError: (e: any) => toastOnce(
+        errorMessage(e, 'The move-out did not go through — check the connection and press it again.'),
+        { error: true }),
+    })
+
+  return (
+    <div style={{marginTop:12}}>
+      <div style={{fontSize:'.78rem',color:'var(--text-2)',lineHeight:1.55,marginBottom:10}}>
+        Ending this lease frees {closing.spaceLabel || 'the space'} and settles what is owed
+        against their deposit. Anything left to pay back to them is the owner's to send —
+        you are not issuing a refund here.
+      </div>
+      {!confirming ? (
+        <button className="btn btn-primary" onClick={()=>setConfirming(true)}>
+          Finish the move-out
+        </button>
+      ) : (
+        <div style={{display:'flex',flexWrap:'wrap',gap:8,alignItems:'center'}}>
+          <span style={{fontSize:'.78rem',color:'var(--text-1)'}}>
+            {closing.who ? `${closing.who} has moved out?` : 'They have moved out?'}
+          </span>
+          <button className="btn btn-primary btn-sm" disabled={go.isLoading}
+                  onClick={()=>go.mutate()}>
+            {go.isLoading ? 'Finishing…' : 'Yes, they are gone'}
+          </button>
+          <button className="btn btn-ghost btn-sm" disabled={go.isLoading}
+                  onClick={()=>setConfirming(false)}>Not yet</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function FinishCheckOut({ closing, readDone, onDone }: {
+  closing: any; readDone: boolean; onDone: () => void
+}) {
+  const today = new Date().toISOString().slice(0, 10)
+  const q = useQuery<any>(
+    ['stay-check-out', closing.id, closing.unitId],
+    () => apiGet(`/units/${closing.unitId}/bookings/${closing.id}/check-out?leftOn=${today}`),
+    { enabled: !!closing?.unitId && !!closing?.id, retry: false, staleTime: 0, refetchOnMount: 'always' },
+  )
+  const [chosen, setChosen] = useState<string | null>(null)
+  const quote: any = q.data?.data ?? q.data ?? null
+  const go = useMutation(
+    (choice: string | null) => apiPost(`/units/${closing.unitId}/bookings/${closing.id}/check-out`, {
+      leftOn: today, choice: choice ?? undefined,
+      quoteToken: quote?.quoteToken,
+      idempotencyKey: `checkout-${closing.id}-${today}`,
+    }),
+    { onSuccess: () => { toastOnce(`${quote?.guest || 'They'} are checked out.`); onDone() },
+      onError: (e: any) => toastOnce(errorMessage(e, 'The check-out did not go through — check the connection and press it again.'), { error: true }) })
+
+  if (q.isLoading) return <div style={{marginTop:12,fontSize:'.8rem',color:'var(--text-3)'}}>Reading their stay…</div>
+  if (q.isError) {
+    return <div style={{marginTop:12,fontSize:'.8rem',color:'var(--red)',lineHeight:1.5}}>
+      {errorMessage(q.error, 'Their stay could not be read — check the connection and pick them again.')}
+    </div>
+  }
+  if (!quote) return null
+  if (quote.checkedOut) {
+    return <div style={{marginTop:12,padding:'10px 12px',borderRadius:8,background:'rgba(34,197,94,.08)',
+                        border:'1px solid rgba(34,197,94,.3)',fontSize:'.82rem',color:'var(--green)'}}>
+      {quote.guest} is already checked out{quote.leftOn ? ` — left ${quote.leftOn}` : ''}.
+    </div>
+  }
+  if (!quote.canCheckOut || quote.waitsForCheckOut) {
+    return <div style={{marginTop:12,padding:'10px 12px',borderRadius:8,background:'rgba(245,158,11,.08)',
+                        border:'1px solid rgba(245,158,11,.3)',fontSize:'.82rem',color:'var(--amber)',lineHeight:1.5}}>
+      {quote.waitsForCheckOut
+        || 'Checking a guest out needs the "Check guests out" permission. Ask the account owner to turn it on for you on the Team page.'}
+    </div>
+  }
+  const choices: any[] = quote.choices ?? []
+  const simple = quote.question === 'none' && choices.length === 0
+  return (
+    <div style={{marginTop:14,paddingTop:12,borderTop:'1px solid var(--border-0)'}}>
+      <div style={{fontSize:'.74rem',color:'var(--text-3)',marginBottom:6}}>Finish the check-out</div>
+      {!readDone && (
+        <div style={{fontSize:'.76rem',color:'var(--text-3)',marginBottom:8,lineHeight:1.5}}>
+          The meter read above is not required to check somebody out — take it if you have it.
+        </div>
+      )}
+      {simple ? (
+        <>
+          <div style={{fontSize:'.82rem',color:'var(--text-2)',lineHeight:1.55,marginBottom:10}}>
+            {quote.guest} stayed the {quote.booked?.nights} night{quote.booked?.nights === 1 ? '' : 's'} they booked and
+            paid for them. Nothing is owed and nothing goes back.
+          </div>
+          <button className="btn btn-primary" style={{width:'100%'}} disabled={go.isLoading}
+            onClick={()=>go.mutate(null)}>
+            {go.isLoading ? 'Checking them out…' : `Check ${quote.guest} out`}
+          </button>
+        </>
+      ) : (
+        <>
+          <div style={{fontSize:'.82rem',color:'var(--text-2)',lineHeight:1.55,marginBottom:10}}>
+            {quote.guest} booked {quote.booked?.nights} night{quote.booked?.nights === 1 ? '' : 's'} and stayed{' '}
+            {quote.stayed?.nights}. Pick what happens to the money — each line says what it leaves.
+          </div>
+          <div style={{display:'grid',gap:8}}>
+            {choices.map((c:any)=>(
+              <button key={c.choice}
+                className={`btn ${chosen===c.choice?'btn-primary':'btn-ghost'}`}
+                style={{width:'100%',textAlign:'left',padding:'10px 12px'}}
+                disabled={go.isLoading}
+                onClick={()=>setChosen(c.choice)}>
+                <div style={{fontWeight:700,fontSize:'.84rem'}}>{c.label}</div>
+                <div style={{fontSize:'.76rem',color:'var(--text-3)',marginTop:2}}>{c.result}</div>
+              </button>
+            ))}
+          </div>
+          <button className="btn btn-primary" style={{width:'100%',marginTop:10}}
+            disabled={!chosen || go.isLoading} onClick={()=>go.mutate(chosen)}>
+            {go.isLoading ? 'Checking them out…' : chosen ? `Check ${quote.guest} out` : 'Pick one above'}
+          </button>
+        </>
+      )}
+    </div>
+  )
+}
+
 function StayDetailsModal({ line, propertyId, initial, onCancel, onDone, onLeaseDrafted }: {
   line: any; propertyId: string; initial: any
   onCancel: () => void; onDone: (d: any) => void
@@ -3345,6 +4463,101 @@ function GetReaderCard({ propertyId, property }: { propertyId: string; property:
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * 10/21 (Nic) — START A BACKGROUND CHECK FOR SOMEBODY WITH NO STAY.
+ *
+ *   "Somebody pays for a background check in person. The only way to get there
+ *    is to book 22 nights or more. What happens? They have to pay not only for
+ *    the check, but the whole 22 nights just to do the check. And then what
+ *    happens if the landlord denies them?... for people that just legitimately
+ *    want to move in, they need to be able to just do the background check
+ *    first and see if they're going to be approved."
+ *
+ * Two ways out of the same box, because he asked for both:
+ *
+ *   SEND THEM THE LINK — the park's own application link, the same one the QR
+ *   on the desk already encodes. They pay GAM on their own phone, so nobody at
+ *   the counter is holding their money and no landlord fronts anything for a
+ *   person who may never move in. Best for almost everyone.
+ *
+ *   TAKE IT AT THE COUNTER — puts the check on the register ticket for anyone
+ *   who cannot or will not use a phone. Paid in cash, GAM takes its fee out of
+ *   the landlord's next payout, so the landlord is briefly fronting it.
+ *
+ * The price is the server's either way. The email is not optional on either
+ * path: the link goes to it, and it is the address they sign in with.
+ */
+function StartACheck({ propertyId, onToSale }: {
+  propertyId: string | null
+  onToSale: (c: { name: string; email: string; price: number }) => void
+}) {
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+  const ready = !!propertyId && !!name.trim() && emailOk && !busy
+
+  const run = async (what: 'send' | 'counter') => {
+    if (!ready) return
+    setBusy(true); setErr(null); setNote(null)
+    try {
+      if (what === 'send') {
+        const r: any = await apiPost(`/properties/${propertyId}/apply-link/send`,
+          { email: email.trim(), name: name.trim() })
+        setNote(`Sent to ${r?.data?.sentTo ?? email.trim()}. They pay for it on the page.`)
+        setName(''); setEmail('')
+      } else {
+        // The server prices it; the register never does.
+        const q: any = await apiPost('/pos/cart-quote',
+          { propertyId, items: [], paymentMethod: 'cash', screening: { name: name.trim(), email: email.trim() } })
+        const priced = q?.data?.screening
+        if (!priced) throw new Error('The register could not price that check just now — try again in a moment.')
+        onToSale({ name: priced.name, email: priced.email, price: Number(q.data.total) })
+      }
+    } catch (e: any) {
+      setErr(e?.message || 'That did not go through — try again in a moment.')
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div style={{border:'1px solid var(--border)',borderRadius:10,padding:14,marginBottom:16}}>
+      <h3 style={{margin:'0 0 4px',fontSize:'.9rem'}}>Start a background check</h3>
+      <p style={{margin:'0 0 12px',fontSize:'.76rem',color:'var(--text-3)'}}>
+        For somebody who wants to know where they stand before they book anything. They do not
+        have to take a site first.
+      </p>
+      <div style={{display:'flex',gap:8,flexWrap:'wrap',marginBottom:10}}>
+        <input value={name} onChange={e=>{setName(e.target.value);setNote(null);setErr(null)}} placeholder="Their name"
+          style={{flex:'1 1 180px',minWidth:0,padding:'7px 10px',borderRadius:8,border:'1px solid var(--border)',
+                  background:'var(--bg-2)',color:'var(--text-1)',fontSize:'.82rem'}} />
+        <input value={email} onChange={e=>{setEmail(e.target.value);setNote(null);setErr(null)}} placeholder="Their email"
+          style={{flex:'1 1 220px',minWidth:0,padding:'7px 10px',borderRadius:8,border:'1px solid var(--border)',
+                  background:'var(--bg-2)',color:'var(--text-1)',fontSize:'.82rem'}} />
+      </div>
+      <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
+        <button type="button" disabled={!ready} onClick={()=>run('send')}
+          style={{padding:'7px 14px',borderRadius:8,border:'none',background:ready?'var(--gold)':'var(--bg-3)',
+                  color:ready?'#1a1a1a':'var(--text-3)',fontWeight:700,fontSize:'.8rem',cursor:ready?'pointer':'default'}}>
+          Send them the link
+        </button>
+        <button type="button" disabled={!ready} onClick={()=>run('counter')}
+          style={{padding:'7px 14px',borderRadius:8,border:'1px solid var(--border)',background:'transparent',
+                  color:'var(--text-1)',fontWeight:600,fontSize:'.8rem',cursor:ready?'pointer':'default'}}>
+          Take it at the counter
+        </button>
+        <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>
+          They pay on their own phone, or on this ticket.
+        </span>
+      </div>
+      {!propertyId && <div style={{marginTop:8,fontSize:'.74rem',color:'var(--amber)'}}>Pick which property this register is at first.</div>}
+      {note && <div style={{marginTop:8,fontSize:'.76rem',color:'var(--green)'}}>{note}</div>}
+      {err && <div style={{marginTop:8,fontSize:'.76rem',color:'var(--red)'}}>{err}</div>}
     </div>
   )
 }

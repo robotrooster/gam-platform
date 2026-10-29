@@ -131,6 +131,9 @@ export function UnitDetailPage() {
       occupancyMode: unit.occupancyMode || 'whole_unit',
       rvSiteLayout: unit.rvSiteLayout || 'none',
       rvAmpService: unit.rvAmpService || 'none',
+      // 10/24: null is "nobody has measured this pad", which is NOT the same as
+      // zero — so it stays null rather than becoming '' and then 0 on save.
+      rvMaxRigLengthFt: unit.rvMaxRigLengthFt ?? null,
       storageSize: unit.storageSize || '',
       lotRentAmount: unit.lotRentAmount != null ? String(unit.lotRentAmount) : '',
     })
@@ -162,6 +165,7 @@ export function UnitDetailPage() {
       occupancyMode: f.occupancyMode,
       rvSiteLayout: f.rvSiteLayout,
       rvAmpService: f.rvAmpService,
+      rvMaxRigLengthFt: f.rvMaxRigLengthFt ?? null,
       storageSize: f.storageSize || null,
       lotRentAmount: num(f.lotRentAmount),
     })
@@ -462,6 +466,23 @@ export function UnitDetailPage() {
                           <option value="none">—</option><option value="30">30 amp</option><option value="50">50 amp</option><option value="both">30/50 amp</option>
                         </select>
                       )}
+                    </div>
+                    {/* 10/24 (Nic): "I'm trying to make a reservation right now
+                        where somebody's got a 37 foot camper. They can't go in the
+                        small sites, right?" The longest rig this pad takes. Left
+                        blank it means nobody has measured it, and every rig fits —
+                        so no park's availability changes until it is filled in.
+                        A reservation carrying a longer rig than this is never
+                        OFFERED this site, and the nightly compression will not
+                        move one here either. */}
+                    <div className="data-row"><span className="data-key">Longest rig</span>
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <input {...inpS} type="number" min={1} max={120} placeholder="any length"
+                          style={{ ...inpS.style, maxWidth: 110 }}
+                          value={editForm.rvMaxRigLengthFt ?? ''}
+                          onChange={e => set('rvMaxRigLengthFt', e.target.value === '' ? null : Number(e.target.value))} />
+                        <span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>feet</span>
+                      </span>
                     </div>
                   </>}
                   {editForm.unitType === 'storage' && (
@@ -1765,6 +1786,147 @@ function OpeningReadModal({ meter, onClose, onSaved }: { meter: any; onClose: ()
 // tenant, financed over N years — a separate amortized "home payment" that bills
 // alongside space rent, auto-stops at term, and flips the unit to tenant-owned on
 // payoff. Shows the contract + progress if one exists; otherwise offers setup.
+/**
+ * 10/25 (Nic): HOW THIS CONTRACT IS PAID.
+ *
+ *   "A trailer bill could possibly have late fees. It's an installment contract
+ *    that may carry its own late terms. I don't have any specific to these
+ *    contracts, but we need to have the capability for landlords. We provide
+ *    the tools to do the job, whatever their job is."
+ *
+ *   "We need the ability to have the contract flagged as, you know, prevent
+ *    credit card payments on that bill. That's an exposure where we would have
+ *    to backtrack bookkeeping and stuff."
+ *
+ * Late fees are OFF on every contract until a landlord turns them on — a fee
+ * nobody signed for is never charged — so this is the only place one can start.
+ */
+/**
+ * 10/25 (Nic): one line of the ledger on a contract GAM tracks but does not
+ * bill. "When that payment comes in, we will mark that it was paid, but it
+ * stays off the books." Nothing GAM can see confirms it, so the mark is the
+ * record and a person makes it — which is also why no assistant may
+ * (services/agents/actionGap).
+ */
+function TrackedPaidCell({ unitId, contractId, row }: { unitId: string; contractId: string; row: any }) {
+  const qc = useQueryClient()
+  const paid = !!row.settledOffPlatformAt
+  const mark = useMutation(
+    (next: boolean) => apiPatch(`/home-sales/${contractId}/installments/mark`,
+      { installmentNumber: row.installmentNumber, paid: next }),
+    { onSuccess: () => { qc.invalidateQueries(['home-sale', unitId]); toast(paid ? 'Marked unpaid.' : 'Marked paid.') },
+      onError: (e: any) => toast.error(e?.response?.data?.message || 'Could not save that.') })
+  // Nothing is due yet, so there is nothing to record.
+  const dueYet = String(row.billingMonth).slice(0, 10) <= new Date().toISOString().slice(0, 10)
+  if (paid) {
+    return (
+      <button className="btn btn-ghost btn-sm" style={{ padding: '2px 6px', fontSize: '.68rem' }}
+        disabled={mark.isLoading} title="Recorded as received. Press to undo."
+        onClick={() => mark.mutate(false)}>Paid ✓</button>
+    )
+  }
+  if (!dueYet) return <span style={{ color: 'var(--text-3)' }}>—</span>
+  return (
+    <button className="btn btn-p btn-sm" style={{ padding: '2px 6px', fontSize: '.68rem' }}
+      disabled={mark.isLoading} onClick={() => mark.mutate(true)}>Mark paid</button>
+  )
+}
+
+function SaleTermsControls({ unitId, contract }: { unitId: string; contract: any }) {
+  const qc = useQueryClient()
+  const [err, setErr] = useState<string | null>(null)
+  const [grace, setGrace] = useState(String(contract.lateFeeGraceDays ?? ''))
+  const [amount, setAmount] = useState(String(contract.lateFeeInitialAmount ?? ''))
+  const [kind, setKind] = useState<'flat' | 'percent'>(contract.lateFeeInitialType === 'percent' ? 'percent' : 'flat')
+
+  const save = useMutation(
+    (patch: Record<string, unknown>) => apiPatch(`/home-sales/${contract.id}/terms`, patch),
+    { onSuccess: () => { qc.invalidateQueries(['home-sale', unitId]); setErr(null); toast('Saved.') },
+      onError: (e: any) => setErr(e?.response?.data?.message || e?.message || 'Could not save.') })
+
+  const tracked = contract.trackedNotBilled === true
+  // A contract GAM does not bill has no bill to fine and no card to refuse.
+  const feesOn = !tracked && contract.lateFeeEnabled === true
+  return (
+    <div style={{ borderTop: '1px solid var(--border-0)', marginTop: 14, paddingTop: 12 }}>
+      <div style={{ fontSize: '.65rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', marginBottom: 8 }}>
+        How this contract is paid
+      </div>
+
+      {/* 10/25 (Nic), on Dominic Gonzalez's contract: "it is not going to go
+          billed through the property. It's not going to get invoiced through
+          the property. It's just going to be a ledger that keeps track and when
+          that payment comes in, we will mark that it was paid, but it stays off
+          the books." */}
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.8rem', marginBottom: 8 }}>
+        <input type="checkbox" checked={tracked} disabled={save.isLoading}
+          onChange={e => save.mutate({ trackedNotBilled: e.target.checked })} />
+        <span>
+          Track this one — don't bill it through the property
+          <span style={{ color: 'var(--text-3)' }}> — for an installment whose money belongs to
+            another account. GAM invoices nothing and takes nothing: it keeps the schedule, reminds
+            the buyer when a payment is due, and you mark each one as it arrives. None of it reaches
+            your books.</span>
+        </span>
+      </label>
+
+      {!tracked && (
+        <>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.8rem', marginBottom: 8 }}>
+            <input type="checkbox" checked={contract.cardPaymentsBlocked === true} disabled={save.isLoading}
+              onChange={e => save.mutate({ cardPaymentsBlocked: e.target.checked })} />
+            <span>
+              No card payments on this bill
+              <span style={{ color: 'var(--text-3)' }}> — for an installment whose money belongs to another
+                account, where a chargeback would have to be unwound twice. Bank transfer, cash and check
+                still work, at the counter too.</span>
+            </span>
+          </label>
+
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.8rem' }}>
+            <input type="checkbox" checked={feesOn} disabled={save.isLoading}
+              onChange={e => save.mutate({ lateFeeEnabled: e.target.checked })} />
+            <span>
+              Charge a late fee on this contract
+              <span style={{ color: 'var(--text-3)' }}> — off unless the signed contract says so.</span>
+            </span>
+          </label>
+        </>
+      )}
+
+      {feesOn && (
+        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, marginTop: 10, flexWrap: 'wrap' }}>
+          <label style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+            Grace days<br />
+            <input className="inp" style={{ width: 90 }} value={grace} inputMode="numeric"
+              onChange={e => setGrace(e.target.value.replace(/[^0-9]/g, ''))} />
+          </label>
+          <label style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+            Fee<br />
+            <input className="inp" style={{ width: 110 }} value={amount} inputMode="decimal"
+              onChange={e => setAmount(e.target.value.replace(/[^0-9.]/g, ''))} />
+          </label>
+          <label style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+            Kind<br />
+            <select className="inp" style={{ width: 150 }} value={kind}
+              onChange={e => setKind(e.target.value as 'flat' | 'percent')}>
+              <option value="flat">Flat amount</option>
+              <option value="percent">Percent of the payment</option>
+            </select>
+          </label>
+          <button className="btn btn-p btn-sm" disabled={save.isLoading}
+            onClick={() => save.mutate({
+              lateFeeGraceDays: grace === '' ? null : Number(grace),
+              lateFeeInitialAmount: amount === '' ? null : Number(amount),
+              lateFeeInitialType: amount === '' ? null : kind,
+            })}>Save late fee</button>
+        </div>
+      )}
+      {err && <div style={{ color: 'var(--red)', fontSize: '.75rem', marginTop: 8 }}>{err}</div>}
+    </div>
+  )
+}
+
 function FinancedSaleSection({ unitId }: { unitId: string }) {
   const qc = useQueryClient()
   const { data } = useQuery(['home-sale', unitId], () => apiGet<any>(`/home-sales/unit/${unitId}`))
@@ -1814,7 +1976,9 @@ function FinancedSaleSection({ unitId }: { unitId: string }) {
             {contract.planType === 'flat'
               ? `Flat plan · ${contract.installmentsTotal} payments of ${fmt(contract.monthlyPayment)} · total ${fmt(contract.salePrice)}.`
               : `Sale price ${fmt(contract.salePrice)} · down ${fmt(contract.downPayment)} · ${contract.termMonths}-month term.`}
-            {' '}Billed as a separate “Home payment” each month alongside space rent; stops automatically at payoff, then the unit becomes tenant-owned.
+            {' '}Billed as a “Home payment” each month — on its own bill, or on the space-rent
+            bill when this property is set to bundle them. Stops automatically at payoff, then the
+            unit becomes tenant-owned.
           </div>
           {schedule.length > 0 && (
             <div style={{ maxHeight: 180, overflowY: 'auto', border: '1px solid var(--border-0)', borderRadius: 8 }}>
@@ -1828,13 +1992,22 @@ function FinancedSaleSection({ unitId }: { unitId: string }) {
                       <td style={{ padding: '5px 10px' }}>{s.installmentNumber}</td>
                       <td>{String(s.billingMonth).slice(0, 7)}</td>
                       <td>{fmt(s.amount)}</td><td>{fmt(s.principalPortion)}</td><td>{fmt(s.interestPortion)}</td><td>{fmt(s.remainingBalance)}</td>
-                      <td>{s.paymentStatus ? humanize(s.paymentStatus) : (s.paymentId ? 'billed' : '—')}</td>
+                      <td>
+                        {/* 10/25 (Nic): on a contract GAM tracks but does not
+                            bill, this ledger IS the record — "when that payment
+                            comes in, we will mark that it was paid, but it stays
+                            off the books." */}
+                        {contract.trackedNotBilled === true
+                          ? <TrackedPaidCell unitId={unitId} contractId={contract.id} row={s} />
+                          : (s.paymentStatus ? humanize(s.paymentStatus) : (s.paymentId ? 'billed' : '—'))}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
           )}
+          <SaleTermsControls unitId={unitId} contract={contract} />
           <button className="btn btn-ghost btn-sm" style={{ marginTop: 12 }} disabled={cancel.isLoading}
             onClick={() => cancel.mutate()}>Cancel financing</button>
         </>

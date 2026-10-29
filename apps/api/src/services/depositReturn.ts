@@ -377,7 +377,7 @@ async function liveDepositPool(runner: Runner, leaseId: string, lock: boolean): 
   securityReturnedUnpaid: number
 }> {
   const sd = (await runner.query<{ collected_amount: string }>(
-    `SELECT collected_amount::text AS collected_amount FROM security_deposits WHERE lease_id = $1 LIMIT 1`,
+    `SELECT collected_amount::text AS collected_amount FROM security_deposits WHERE lease_id = $1 AND status <> 'voided' LIMIT 1`,
     [leaseId])).rows[0]
   const payments = await settledDepositPayments(runner, leaseId, lock)
   let security: number
@@ -436,7 +436,7 @@ async function unpaidDepositInterest(runner: Runner, leaseId: string, lock: bool
 }> {
   const sd = (await runner.query<{ id: string; interest_accrued: string | null }>(
     `SELECT id, interest_accrued::text AS interest_accrued
-       FROM security_deposits WHERE lease_id = $1 LIMIT 1
+       FROM security_deposits WHERE lease_id = $1 AND status <> 'voided' LIMIT 1
        ${lock ? 'FOR UPDATE' : ''}`,
     [leaseId])).rows[0]
   if (!sd) return { depositId: null, amount: 0, unpaidAccrualIds: [] }
@@ -1070,7 +1070,7 @@ export async function calculateDepositReturn(
     held_by: string | null; flex_deposit_enabled: boolean | null
   }>(
     `SELECT id, total_amount, collected_amount, interest_accrued, held_by, flex_deposit_enabled
-       FROM security_deposits WHERE lease_id = $1 LIMIT 1`,
+       FROM security_deposits WHERE lease_id = $1 AND status <> 'voided' LIMIT 1`,
     [leaseId],
   )
 
@@ -1587,7 +1587,7 @@ export async function finalizeDepositReturn(
       id: string; held_by: string | null; collected_amount: string; flex_deposit_enabled: boolean | null
     }>(
       `SELECT id, held_by, collected_amount::text AS collected_amount, flex_deposit_enabled
-         FROM security_deposits WHERE lease_id = $1 LIMIT 1
+         FROM security_deposits WHERE lease_id = $1 AND status <> 'voided' LIMIT 1
           FOR UPDATE`,
       [row.lease_id],
     )).rows[0] ?? null
@@ -2041,11 +2041,13 @@ export async function finalizeDepositReturn(
     )).rows[0]?.unit_number ?? 'the space'
     const release = async (sourceType: 'prepaid_draw' | 'deposit_settlement', sourceId: string, amount: number, description: string): Promise<boolean> => {
       if (amount === 0) return false
+      // 10/12 (Nic, ledger P1): the line names its property — the move-out's space.
       await client.query(
-        `INSERT INTO held_payout_items (landlord_id, source_type, source_id, amount, description)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO held_payout_items (landlord_id, source_type, source_id, amount, description, property_id)
+         VALUES ($1, $2, $3, $4, $5,
+                 (SELECT u.property_id FROM leases l JOIN units u ON u.id = l.unit_id WHERE l.id = $6))
          ON CONFLICT (source_type, source_id) DO NOTHING`,
-        [row.landlord_id, sourceType, sourceId, amount.toFixed(2), description],
+        [row.landlord_id, sourceType, sourceId, amount.toFixed(2), description, row.lease_id],
       )
       return true
     }
@@ -2286,11 +2288,11 @@ export async function finalizeDepositReturn(
         `SELECT annual_rate_pct::text, state_code,
                 (SELECT COUNT(*)::text FROM security_deposit_interest_accruals
                   WHERE security_deposit_id = (
-                    SELECT id FROM security_deposits WHERE lease_id = $1 LIMIT 1
+                    SELECT id FROM security_deposits WHERE lease_id = $1 AND status <> 'voided' LIMIT 1
                   )) AS accrual_count
            FROM security_deposit_interest_accruals
           WHERE security_deposit_id = (
-            SELECT id FROM security_deposits WHERE lease_id = $1 LIMIT 1
+            SELECT id FROM security_deposits WHERE lease_id = $1 AND status <> 'voided' LIMIT 1
           )
           ORDER BY accrual_month DESC
           LIMIT 1`,
@@ -2564,31 +2566,58 @@ async function fireLandlordDisbursementTransfer(row: DepositReturnRow, settlemen
     return
   }
 
+  // 10/12 (Nic, ledger P0, design M0b): recorded BEFORE Stripe is asked, as
+  // a platform_transfer_intents row (purpose 'deposit_settlement'), then
+  // confirmed — so the payout that carries it to the landlord's bank lists it
+  // instead of showing it as "not traced", and the books can post it. A
+  // refusal marks the record failed and raises the same admin notice as
+  // before ('deposit_disbursement_transfer_failed', which paymentReversal
+  // reads to know this share never reached the landlord).
   try {
-    const stripe = getStripe()
-    await stripe.transfers.create(
-      {
-        amount:      Math.round(disbursement * 100),
-        currency:    'usd',
-        destination: dep.connect_account,
-        description: `Deposit disbursement — lease ${row.lease_id}`,
-        metadata: {
-          gam_purpose:           'deposit_return_landlord_disbursement',
-          gam_deposit_return_id: row.id,
-          gam_lease_id:          row.lease_id,
-        },
+    const { fireRecordedDirectTransfer } = await import('./landlordPassthrough')
+    await fireRecordedDirectTransfer({
+      purpose:                     'deposit_settlement',
+      landlordId:                  row.landlord_id,
+      destinationConnectAccountId: dep.connect_account,
+      amount:                      disbursement,
+      depositReturnId:             row.id,
+      idempotencyKey:              `deposit_disb_${row.id}`,
+      description:                 `Deposit disbursement — lease ${row.lease_id}`,
+      metadata: {
+        gam_purpose:           'deposit_return_landlord_disbursement',
+        gam_deposit_return_id: row.id,
+        gam_lease_id:          row.lease_id,
       },
-      { idempotencyKey: `deposit_disb_${row.id}` },
-    )
-  } catch (e: any) {
-    const { createAdminNotification } = await import('./adminNotifications')
-    await createAdminNotification({
-      severity: 'warn',
-      category: 'deposit_disbursement_transfer_failed',
-      title:    `Deposit disbursement Transfer failed — return ${row.id}`,
-      body:     `Stripe Transfer for $${disbursement.toFixed(2)} to landlord Connect ${dep.connect_account} failed: ${e?.message ?? e}.`,
-      context:  { deposit_return_id: row.id, lease_id: row.lease_id, amount: disbursement, connect_account: dep.connect_account },
     })
+  } catch (e: any) {
+    logger.error({ err: e, depositReturnId: row.id, amount: disbursement },
+      '[deposit-return] the landlord\'s deposit share was not transferred')
+    // 10/12 (Nic, ledger P0 review): a refusal from Stripe marks the record
+    // failed and raises the notice there (landlordPassthrough). A throw before
+    // any record was written (the INSERT failed, the company was not found)
+    // left nothing recorded, nothing sent and nobody told — and
+    // paymentReversal.depositAskFigures reads that notice to know this share
+    // never reached the landlord. Said here whenever no record of it exists.
+    // (A record still pending means Stripe's answer was unknown: RECOVER asks
+    // again under the same key, and says so itself if Stripe refuses.)
+    try {
+      const recorded = await queryOne<{ id: string }>(
+        `SELECT id FROM platform_transfer_intents
+          WHERE purpose = 'deposit_settlement' AND deposit_return_id = $1 LIMIT 1`, [row.id])
+      if (!recorded) {
+        const { createAdminNotification } = await import('./adminNotifications')
+        await createAdminNotification({
+          severity: 'warn',
+          category: 'deposit_disbursement_transfer_failed',
+          title:    `Deposit disbursement Transfer failed — return ${row.id}`,
+          body:     `The $${disbursement.toFixed(2)} transfer to landlord Connect ${dep.connect_account} was never sent: ${e?.message ?? String(e)}.`,
+          context:  { deposit_return_id: row.id, lease_id: row.lease_id, amount: disbursement,
+                      connect_account: dep.connect_account },
+        })
+      }
+    } catch (err) {
+      logger.error({ err, depositReturnId: row.id }, '[deposit-return] could not raise the not-sent notice')
+    }
   }
 }
 

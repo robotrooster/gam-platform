@@ -73,6 +73,24 @@ const uploadProof = (app: any, t: string, name: string) =>
     .set('Authorization', `Bearer ${t}`)
     .attach('file', makeProofDoc(name), { filename: 'award.pdf', contentType: 'application/pdf' })
 
+// 10/26: the FlexPay cycle fee comes from the price card
+// (gam_test.flexpay_fee_schedule, seeded by seedFlexPriceCards), not from the
+// deprecated flat $25. Two inputs decide it, so both are pinned here:
+//
+//   basis  — enrollFlexPay prices off flexPayAmountToFront(), which is the sum
+//            of the resident's OPEN bill lines. This fixture seeds a lease and
+//            no invoices, so there is nothing open and the figure falls back to
+//            the active lease's rent: FIXTURE_RENT. That is the number that
+//            goes into the terms they sign, so the test pins the rent itself.
+//   column — the enroll below picks pull day 6. Anything before the 8th is
+//            earlier than any 2nd Wednesday, so it prices at the cheapest
+//            column: benefit Wednesday 2.
+//
+// $440 lands in the under-$1,000 bracket → 2nd-Wednesday price = $23.
+const FIXTURE_RENT = 440
+const FIXTURE_PULL_DAY = 6
+const FIXTURE_CYCLE_FEE = 23
+
 async function fixture() {
   const client = await db.connect()
   try {
@@ -85,7 +103,7 @@ async function fixture() {
       `SELECT t.user_id, u.first_name, u.last_name FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id=$1`, [tenantId])
     // ACH verified (enrollment gate) but income NOT verified — approval flips it.
     await client.query(`UPDATE tenants SET ach_verified=TRUE, ssi_ssdi=FALSE WHERE id=$1`, [tenantId])
-    const leaseId = await seedLease(client, { unitId, landlordId: ll.landlordId, rentAmount: 440 })
+    const leaseId = await seedLease(client, { unitId, landlordId: ll.landlordId, rentAmount: FIXTURE_RENT })
     await seedLeaseTenant(client, { leaseId, tenantId })
     // Admin user for the review endpoints.
     const adm = await client.query<{ id: string }>(
@@ -193,13 +211,14 @@ describe('S541 FlexPay demand-test gate', () => {
     // (The pending and declined tries above sent the 3rd and were told about
     // their request first, never the day.)
     const enroll3 = await request(app).post('/api/tenants/flexpay/enroll')
-      .set('Authorization', `Bearer ${t}`).send({ pullDay: 6, acceptedTerms: true })
+      .set('Authorization', `Bearer ${t}`).send({ pullDay: FIXTURE_PULL_DAY, acceptedTerms: true })
     expect(enroll3.status).toBe(200)
-    expect(enroll3.body.data.fee).toBe(25)  // S562: flat $25/mo (pull day is scheduling only)
+    // Priced off the table, not the retired flat $25 — see FIXTURE_CYCLE_FEE.
+    expect(enroll3.body.data.fee).toBe(FIXTURE_CYCLE_FEE)
 
     const enrolled = await db.query<any>(`SELECT flexpay_enrolled, flexpay_pull_day FROM tenants WHERE id=$1`, [f.tenantId])
     expect(enrolled.rows[0].flexpay_enrolled).toBe(true)
-    expect(enrolled.rows[0].flexpay_pull_day).toBe(6)
+    expect(enrolled.rows[0].flexpay_pull_day).toBe(FIXTURE_PULL_DAY)
   })
 
   it('S542b: FCFS queue positions + state hold blocks approval until cleared + proof upload round-trip', async () => {
@@ -454,6 +473,31 @@ describe('S541 FlexPay demand-test gate', () => {
     expect(row.benefit_schedule).toBe('ssdi_wed_4')
     expect(row.desired_pull_day).toBe(28)     // latest a 4th Wednesday can land
     expect(row.est_float_days).toBe(23)       // 28 − default grace 5
+  })
+
+  // 10/12 (Nic): "Grace = lease, else property, else 5 — the only chain." The
+  // float is measured from the late-fee engine's grace end: a lease with no
+  // grace of its own at a 2-day park fronts on the 2nd, not the 5th.
+  it('the float counts from the property\'s grace when the lease names none; a lease grace still wins', async () => {
+    const f = await fixture()
+    const app = buildApp()
+    const t = tok(f.tenantUserId, 'tenant', f.tenantId)
+    const a = tok(f.adminUserId, 'super_admin', f.adminUserId)
+    const leaseOf = `SELECT l.id, u.property_id FROM lease_tenants lt
+                       JOIN leases l ON l.id = lt.lease_id JOIN units u ON u.id = l.unit_id
+                      WHERE lt.tenant_id = $1`
+    const { rows: [ctx] } = await db.query<{ id: string; property_id: string }>(leaseOf, [f.tenantId])
+    await db.query(`UPDATE leases SET late_fee_grace_days = NULL WHERE id = $1`, [ctx.id])
+    await db.query(`UPDATE properties SET late_fee_grace_days = 2 WHERE id = $1`, [ctx.property_id])
+
+    await request(app).post('/api/tenants/flexpay/inquiry')
+      .set('Authorization', `Bearer ${t}`).send({ incomeSource: 'ssi', benefitDay: 10 })
+    const list = async () => (await request(app).get('/api/admin/flexpay/inquiries')
+      .set('Authorization', `Bearer ${a}`)).body.data[0]
+    expect((await list()).est_float_days).toBe(8)   // day 10 − the park's grace 2
+
+    await db.query(`UPDATE leases SET late_fee_grace_days = 4 WHERE id = $1`, [ctx.id])
+    expect((await list()).est_float_days).toBe(6)   // day 10 − the lease's own 4
   })
 
   it('S545c: birthdate mismatch silently holds — out of queue, tenant sees nothing, release restores the spot', async () => {

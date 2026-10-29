@@ -19,7 +19,7 @@
  * Readers: services/earlyCheckOut (what was paid, and where it goes back).
  */
 import type { PoolClient } from 'pg'
-import { STAY_PAYMENT_METHODS, type StayPaymentMethod } from '@gam/shared'
+import { STAY_PAYMENT_METHODS, priceStayBetween, type StayPaymentMethod } from '@gam/shared'
 import { logger } from '../lib/logger'
 
 type Q = Pick<PoolClient, 'query'>
@@ -100,10 +100,66 @@ export async function recordSiteDeposit(q: Q, o: {
   if (!(deposit > 0) || !o.paymentIntentId) return
   const onTop = round2(Math.max(0, o.charged - deposit))
   const covered = onTop > 0 ? 0 : round2(Math.max(0, o.gamFee))
+  // 10/12 (Nic, ledger P1): the lodging tax inside the deposit, stored with it.
+  const lodgingTax = await siteDepositLodgingTax(q, o.bookingId, deposit)
   await q.query(
     `INSERT INTO stay_payments
-       (booking_id, landlord_id, kind, stripe_payment_intent_id, method, toward_stay, card_fee, landlord_card_fee)
-     VALUES ($1, $2, 'site_deposit', $3, 'card', $4, $5, $6)
+       (booking_id, landlord_id, kind, stripe_payment_intent_id, method, toward_stay, card_fee, landlord_card_fee,
+        lodging_tax_amount)
+     VALUES ($1, $2, 'site_deposit', $3, 'card', $4, $5, $6, $7)
      ON CONFLICT DO NOTHING`,
-    [o.bookingId, o.landlordId, o.paymentIntentId, deposit.toFixed(2), onTop.toFixed(2), covered.toFixed(2)])
+    [o.bookingId, o.landlordId, o.paymentIntentId, deposit.toFixed(2), onTop.toFixed(2), covered.toFixed(2),
+     lodgingTax.toFixed(2)])
+}
+
+/**
+ * 10/12 (Nic, ledger P1) — the lodging tax inside a booking-site deposit, as
+ * priced the day it is paid. The booking site quotes a stay with the
+ * property's short-stay tax already in it (shared priceStay — the one price
+ * every door charges) and the deposit is a share of that taxed total, so its
+ * tax is the deposit less its pre-tax share: deposit − ROUND(deposit ÷ (1 +
+ * rate), 2) — the split the reports make, but from the rate THE STAY WAS
+ * PRICED AT (10/17, unit_bookings.stay_tax_rate) and stored, never re-derived
+ * later from whatever the rate has become
+ * (stay_payments.lodging_tax_amount). Priced over the nights SOLD
+ * (registerStay soldCheckOutSql): an untaxed stay (30+ nights, or exactly
+ * whole calendar months) has none. Also the backfill's rule for deposits
+ * recorded before 10/12.
+ *
+ * 10/12 (ledger P1 review): nor does the first month of a 30+ night stay
+ * booked on the booking site (registerStay untaxedMonthStaySql — the stay
+ * asked for is 30+ nights, so propertyBookingQuote.firstStayMonth charged it
+ * no tax, even when the month booked is a 28-night February). Repricing its
+ * sold dates alone found a nightly or weekly price with tax in it. The
+ * reports' rule (incomeBasis.stayTaxPctSql) leaves it out the same way.
+ */
+export async function siteDepositLodgingTax(q: Q, bookingId: string, deposit: number): Promise<number> {
+  if (!(deposit > 0)) return 0
+  const { soldCheckOutSql, untaxedMonthStaySql } = await import('./registerStay')
+  const b = (await q.query<{
+    check_in: string; check_out: string; short_term_tax_rate: string | null
+    nightly: string | null; weekly: string | null; monthly: string | null; month_stay: boolean
+  }>(
+    `SELECT to_char(b.check_in, 'YYYY-MM-DD') AS check_in, to_char(${soldCheckOutSql('b')}, 'YYYY-MM-DD') AS check_out,
+            ${untaxedMonthStaySql('b')} AS month_stay,
+            -- 10/17 (Nic, "never reprice history"): the rate THIS stay was
+            -- priced at (stamped on the booking), not the property's rate at
+            -- the moment the webhook lands. The booking row exists before the
+            -- deposit does, and a rate change in between is now instant and
+            -- company-wide, so reading today's figure stored a tax the card
+            -- was never charged. The property's rate stands in only for a stay
+            -- priced before stamping began.
+            COALESCE(b.stay_tax_rate * 100, p.short_term_tax_rate)::text AS short_term_tax_rate,
+            COALESCE(u.nightly_rate, p.nightly_rate)::text AS nightly,
+            COALESCE(u.weekly_rate, p.weekly_rate)::text AS weekly,
+            COALESCE(u.monthly_rate, p.monthly_rate)::text AS monthly
+       FROM unit_bookings b
+       JOIN units u ON u.id = b.unit_id
+       JOIN properties p ON p.id = u.property_id
+      WHERE b.id = $1`, [bookingId])).rows[0]
+  if (!b || b.month_stay) return 0
+  const price = priceStayBetween({ nightly: b.nightly, weekly: b.weekly, monthly: b.monthly },
+    b.short_term_tax_rate, b.check_in, b.check_out)
+  if (!(price.taxRate > 0)) return 0
+  return round2(deposit - round2(deposit / (1 + price.taxRate)))
 }

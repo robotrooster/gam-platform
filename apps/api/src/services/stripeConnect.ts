@@ -431,9 +431,10 @@ export async function firePmTransfersForReference(
     user_id: string
     amount: string
     bank_account_id: string | null
+    property_id: string | null
     notes: string | null
   }>(
-    `SELECT id, user_id, amount, bank_account_id, notes
+    `SELECT id, user_id, amount, bank_account_id, property_id, notes
        FROM user_balance_ledger
       WHERE type = 'allocation_pm_company_fee'
         AND reference_type = $1
@@ -460,11 +461,26 @@ export async function firePmTransfersForReference(
   let failed = 0
   for (const row of rows) {
     try {
-      // Resolve the destination Connect account for this user. The PM
-      // company's payout user owns a bank account (snapshotted at allocation
-      // time); their stripe_connect_account_id is what we transfer to.
+      // Resolve the destination Connect account for this row.
+      // 10/12 (Nic): the PM COMPANY's Connect account first — that is the one
+      // its owner verifies in the PM portal (pm_companies.stripe_connect_
+      // account_id) and the one PM acceptance checks. Only when the recipient
+      // is an active owner of the company managing the row's property, so a
+      // cut never lands in a company the recipient does not own. The old
+      // user-level account stays as the fallback for a legacy catalog-bank
+      // recipient (services/pmPayoutRecipient.ts).
       const destRow = await queryOne<{ stripe_connect_account_id: string | null }>(
-        `SELECT stripe_connect_account_id FROM users WHERE id=$1`, [row.user_id]
+        `SELECT COALESCE(
+           (SELECT c.stripe_connect_account_id
+              FROM properties p
+              JOIN pm_companies c ON c.id = p.pm_company_id
+             WHERE p.id = $2
+               AND c.stripe_connect_account_id IS NOT NULL
+               AND EXISTS (SELECT 1 FROM pm_staff s
+                            WHERE s.pm_company_id = c.id AND s.user_id = $1
+                              AND s.role = 'owner' AND s.status = 'active')),
+           (SELECT u.stripe_connect_account_id FROM users u WHERE u.id = $1)
+         ) AS stripe_connect_account_id`, [row.user_id, row.property_id]
       )
       if (!destRow?.stripe_connect_account_id) {
         logger.warn(`[pm_transfer] user ${row.user_id} has no Connect account; ledger ${row.id} skipped`)
@@ -910,6 +926,36 @@ export async function recordAccountUpdated(account: Stripe.Account): Promise<voi
     if (landlordUserId) {
       const { tryReconcileForLandlordUserId } = await import('./landlordPassthrough')
       await tryReconcileForLandlordUserId(landlordUserId)
+    }
+  }
+
+  // 10/20 (Nic, ONE BANK LINK): "We need a way to link the bank account once and
+  // have it be everything." The moment Stripe says a company's details are in,
+  // ask that company's account which bank links it holds — because the bank the
+  // landlord just signed into IS the feed now, and the Bank page should already
+  // show step two as done the first time they look at it rather than offering
+  // them a second sign-in to the same bank.
+  //
+  // Best-effort and last: this is a webhook, and a landlord's bank feed is never
+  // worth failing the capability sync that gates their rent over.
+  //
+  // 10/20 (review): the owner lookup used to be `SELECT id FROM landlords WHERE
+  // stripe_connect_account_id = $1`, which cannot see an account anchored on the
+  // USER — the legacy shape S554 still allows, and the one the comment at the
+  // top of this block calls a no-op today. Zero rows came back and nothing was
+  // adopted, so that landlord was left in front of a step that was already
+  // done. `landlordsForConnectAccount` is the SAME resolution the adoption
+  // itself uses (COALESCE entity, user), so the webhook and the page can never
+  // disagree about whose account this is.
+  if (details) {
+    try {
+      const { ensureOnboardingBankLink, landlordsForConnectAccount } = await import('./connectBankLink')
+      for (const landlordId of await landlordsForConnectAccount(account.id)) {
+        await ensureOnboardingBankLink(landlordId, { force: true })
+      }
+    } catch (e) {
+      logger.warn({ err: e, stripe_account_id: account.id },
+        '[one-bank-link] could not adopt the onboarding bank on account.updated')
     }
   }
 }

@@ -14,6 +14,8 @@ import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYE
 // Narrow KPI tiles use the compact format ($18,400 / $248.6K / $1.24M) so a
 // six-/seven-figure property (or portfolio sum) never overflows or resizes a card.
 import { fmtCompact as fmt } from '../lib/format'
+import { useEntities } from '../components/EntityPicker'
+import { companiesMissingPayouts, companyName, type PayoutCompany } from '../lib/payoutReadiness'
 
 // S574: the public per-property website — path-slug in dev, {slug}.gam.biz in
 // prod (mirrors the API's STOREFRONT_URL_TEMPLATE + SchedulePage). Every
@@ -213,7 +215,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     // anywhere that could conflict with the lease. The backend columns and
     // lease-side late-fee engine stay intact.
     // 16a: allocation rule — required at property creation.
-    // S172: three independent fee_payer toggles + payout bank account are
+    // S172: the fee_payer toggles are
     // editable in both create and edit modes; manager-fee math
     // (rentPercent etc.) and placement / maintenance fields stay
     // create-only because they affect retroactive ledger interpretation.
@@ -246,8 +248,9 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
       placementFeeType: (property?.allocationRule?.placementFeeType || '') as '' | 'flat' | 'percent_of_first_month',
       placementFeeValue: property?.allocationRule?.placementFeeValue != null ? String(property.allocationRule.placementFeeValue) : '',
       maintenanceMarkupPercent: property?.allocationRule?.maintenanceMarkupPercent != null ? String(property.allocationRule.maintenanceMarkupPercent) : '',
-      // S66: bank account routing target (UUID or null)
-      ownerBankAccountId: (property?.allocationRule?.ownerBankAccountId ?? null) as string | null,
+      // 10/12 (Nic): no ownerBankAccountId here any more — see the Payout Bank
+      // Account section below. A value already saved on a property is left
+      // as it is (never sent, so never changed).
     },
   })
   const [errors, setErrors] = useState<Record<string, string>>({})
@@ -259,14 +262,6 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
   const MAPBOX_TOKEN = (import.meta as any).env?.VITE_MAPBOX_TOKEN || ''
   const addrTimer = useRef<any>(null)
   // Step 2: unit groups — one per selected type
-
-  // S66: active bank accounts for the current user, used by the routing
-  // dropdown below. Only active accounts shown — archived rows still exist
-  // in the catalog but can't be assigned as a fresh routing target.
-  const { data: bankAccounts = [] } = useQuery<any[]>(
-    'bank-accounts', () => apiGet('/bank-accounts')
-  )
-  const activeBankAccounts = bankAccounts.filter(b => b.status === 'active')
 
   // S631 (Nic): "I'm pretty sure I already added the Oak Park bank account with
   // Stripe, with the know-your-customer information. So why is it still asking
@@ -281,6 +276,10 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
   // TAGS a ledger row; it moves no money and blocks none. So a landlord with
   // Connect fully enabled was told "rent will accumulate, not pay out" about
   // money that was already paying out on schedule.
+  //
+  // 10/12 (Nic): the selector itself is now gone too ("Remove the old form"),
+  // along with the Add Bank Account form that filled it. This section only
+  // shows the company's Stripe payout bank.
   //
   // Keyed to THIS property's entity. The status endpoint answers per entity —
   // a bare call returns the signed-in user's own account, which on a portfolio
@@ -304,16 +303,14 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
         // Property core fields PATCH
         const propRes = await apiPatch<any>(`/properties/${property.id}`, data)
         // S66 + S172: allocation-rule PATCH carries the editable fee_payer
-        // toggles + payout bank account. Build a delta of just what
-        // changed since unchanged values would no-op anyway.
+        // toggles. Build a delta of just what changed since unchanged values
+        // would no-op anyway. (10/12: the payout-bank pick is gone — it never
+        // moved a payout.)
         const arNew = data.allocationRule ?? {}
         // S312: read the saved allocationRule via camelCase keys
         // after the response-interceptor transform.
         const arOld = property?.allocationRule ?? {}
         const allocPatch: Record<string, unknown> = {}
-        if (arNew.ownerBankAccountId !== (arOld.ownerBankAccountId ?? null)) {
-          allocPatch.ownerBankAccountId = arNew.ownerBankAccountId
-        }
         // 10/5: one card-and-bank choice — achFeePayer carries it; the server
         // sets card and the counter/booking-site columns to match.
         const oldAch       = arOld.achFeePayer       || arOld.bankingFeePayer || 'tenant'
@@ -438,7 +435,6 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
         placementFeeType: ar.placementFeeType === '' ? null : ar.placementFeeType,
         placementFeeValue: num(ar.placementFeeValue),
         maintenanceMarkupPercent: num(ar.maintenanceMarkupPercent),
-        ownerBankAccountId: ar.ownerBankAccountId,
       },
     }
     propMut.mutate(payload)
@@ -766,8 +762,8 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
           </>)}
 
           {/* 16a allocation rule.
-              S172: ACH / card / platform fee_payer toggles + payout bank
-              account are editable in both create and edit modes. Manager
+              S172: ACH / card / platform fee_payer toggles are editable in
+              both create and edit modes. Manager
               fee (rentPercent) and other allocation math fields stay
               create-only because they affect retroactive ledger
               interpretation. */}
@@ -828,24 +824,11 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                     Change it
                   </Link>
                 </div>
-                {activeBankAccounts.length > 0 && (
-                  <div style={{ marginTop: 10 }}>
-                    <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 4 }}>
-                      Or send this property&apos;s rent somewhere else
-                    </div>
-                    <select
-                      value={form.allocationRule.ownerBankAccountId ?? ''}
-                      onChange={e => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, ownerBankAccountId: e.target.value || null } }))}
-                      style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box', color: 'var(--text-0)' }}>
-                      <option value="">Use the verified account above</option>
-                      {activeBankAccounts.map(b => (
-                        <option key={b.id} value={b.id}>
-                          {b.nickname} • {b.accountType} •••• {b.accountNumberLast4}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                )}
+                {/* 10/12 (Nic): "Or send this property's rent somewhere else"
+                    listed rows from the legacy bank catalog. Picking one only
+                    tagged a ledger row — rent still paid out to the Stripe
+                    account above — so the choice promised a routing that never
+                    happened. Removed with the Add Bank Account form it fed. */}
               </>
             ) : (
               <>
@@ -1131,35 +1114,39 @@ export function PropertiesPage() {
 // S161: surfaces a soft warning when the landlord hasn't completed
 // Stripe Connect onboarding. Doesn't block property creation — Nic's
 // rule that staffing/operations data should land before the rent rail
-// is up. Routes to /banking on click. Self-hides when onboarding is
-// done (cached `payoutsEnabled` = true).
+// is up. Routes to /banking on click. Self-hides when payouts are live.
 function ConnectReadinessBanner() {
   const navigate = useNavigate()
   const { user } = useAuth()
   // S321: snake_case reads were silently undefined post-S312 (response
   // interceptor camelizes), so this banner never auto-hid after the
-  // landlord finished Stripe Connect onboarding. Reading camelCase
-  // now picks up the bridged values correctly.
+  // landlord finished Stripe Connect onboarding.
   //
-  // S605 (Nic): it STILL didn't hide. It asked for the USER-level Connect
-  // account, but S554 re-anchored owner accounts to the LANDLORD entity — so
-  // for an owner this looked up an account that is legitimately NULL and nagged
-  // "Bank account setup incomplete" at a landlord whose Stripe verification was
-  // complete, charges and payouts enabled. Resolve the same entity BankingPage
-  // does.
+  // S605 (Nic): it STILL didn't hide — it asked about the USER-level Connect
+  // account, which S554 moved to the landlord company.
+  //
+  // 10/12 (Nic): and then it asked Stripe about user.profileId, which /auth/me
+  // fills with the account's OLDEST company. Blu co-owns Oak Park (paid) and
+  // owns TruBlu Management LLC, which holds Country Acres and has no Stripe
+  // account — Oak Park answered, so the banner hid. It now reads every company
+  // the account belongs to and shows for each one that has a property and
+  // can't be paid, by name, linking to that company on the Disbursement
+  // Account page. Same rule as the owner to-do list (lib/payoutReadiness.ts).
+  //
+  // Owners only. A manager reached this through entity=user — their own
+  // direct-deposit account — and was told tenants couldn't pay rent until
+  // they linked a bank, which was never theirs to do or true.
   const isOwner = user?.role === 'landlord'
-  const qs = isOwner ? `entity=landlord&entityId=${user!.profileId}` : 'entity=user'
-  const { data } = useQuery<{ payoutsEnabled?: boolean; detailsSubmitted?: boolean; exists?: boolean }>(
-    ['stripe-connect-status-banner', isOwner ? 'landlord' : 'user', user?.profileId],
-    () => apiGet(`/stripe/connect/status?${qs}`),
-    { enabled: !!user },
-  )
-  if (!data) return null
-  if (data.payoutsEnabled && data.detailsSubmitted) return null
+  const { data: entities = [] } = useEntities()
+  if (!isOwner) return null
+  const unpaid = companiesMissingPayouts(entities as PayoutCompany[])
+  if (unpaid.length === 0) return null
+  const names = unpaid.map(companyName).join(', ')
+  const href = unpaid.length === 1 ? `/banking?entity=${unpaid[0].id}` : '/banking'
 
   return (
     <div className="card"
-         onClick={() => navigate('/banking')}
+         onClick={() => navigate(href)}
          style={{
            padding: 14, marginBottom: 16, cursor: 'pointer',
            background: 'rgba(220,165,40,.08)',
@@ -1168,14 +1155,15 @@ function ConnectReadinessBanner() {
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
         <div>
           <div style={{ fontWeight: 600, color: 'var(--gold)' }}>
-            Bank account setup incomplete
+            Payouts not set up for {names}
           </div>
           <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginTop: 4 }}>
-            Properties can still be added now, but tenants won&apos;t be able to pay rent through GAM until you finish linking your bank account.
+            Properties can still be added now, but rent for {unpaid.length === 1 ? 'its' : 'their'} properties
+            can&apos;t be paid out until {unpaid.length === 1 ? 'it is' : 'they are'} verified with Stripe.
           </div>
         </div>
-        <button className="btn btn-ghost btn-sm" onClick={(e) => { e.stopPropagation(); navigate('/banking') }}>
-          Open Banking →
+        <button className="btn btn-ghost btn-sm" onClick={(e) => { e.stopPropagation(); navigate(href) }}>
+          Set up payouts →
         </button>
       </div>
     </div>
@@ -1188,11 +1176,21 @@ function ConnectReadinessBanner() {
 // path that any landlord can just reach so they don't need to ask
 // Claude for help."
 //
-// The code encodes {slug}.gam.biz/apply for THIS property. Because the
-// slug is the property's public identity, an application filed through
-// it is stamped with the property — and the applicant's later
-// background check inherits it, so a walk-up who never had a unit or an
-// invite still lands under the right park.
+// 10/19: this used to say the code encodes {slug}.gam.biz/apply. It does
+// not, and has not since S636 — that path does not exist on the booking
+// sites (the storefront's own page list has no 'apply', so it would have
+// quietly served the property's booking home instead). Reading this
+// comment, I told Nic the wrong thing about his own QR code.
+//
+// What it actually encodes is the screening page itself, with the
+// property and the landlord in the query string:
+//   {tenant app}/background-check?landlordId=…&propertyId=…
+// which is Nic's S636 instruction verbatim — "nothing about that link
+// should take them anywhere on the Gold Asset Management page. It should
+// take them straight into the Checkr flow." The binding rides in the URL,
+// so a walk-up who never had a unit or an invite still lands under the
+// right park. The one source of truth is the API that builds it
+// (routes/properties GET /:id/apply-link).
 //
 // The API renders the PNG rather than the browser, so print, text, and
 // email all get the identical image and there is no QR library in the

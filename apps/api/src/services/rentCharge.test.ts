@@ -21,6 +21,7 @@ import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease, seedLeaseTenant, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 
 const { paymentIntentsCancelMock } = vi.hoisted(() => ({
@@ -108,12 +109,15 @@ describe('S609 pay-ahead', () => {
   let f: Fixture
 
   beforeAll(async () => {
-    await db.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent,
-          stripe_cost_flat, stripe_cost_percent)
-       SELECT 'ach', 6, 0, 0, 0.5
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'ach')`)
+    // 10/17: the rate this file's figures are worked out on, STATED rather than
+    // seeded-if-missing: one row is open per method and cleanupAllSchema leaves the
+    // rate card alone, so an insert-if-missing took whatever an earlier file left.
+    await setEffectiveProcessingRate(db, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 6, customerFacingPercent: 0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: 'rentCharge.test.ts ACH rate',
+    })
   })
 
   beforeEach(async () => {
@@ -1010,11 +1014,12 @@ describe('money in the server\'s sentences', () => {
 // a bill on another lease, or left on the account for a later bill.
 describe('where the rest of the credit goes (one bill)', () => {
   beforeAll(async () => {
-    await db.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-       SELECT 'ach', 6, 0, 0, 0.5
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = 'ach')`)
+    await setEffectiveProcessingRate(db, {
+      paymentMethod: 'ach',
+      customerFacingFlat: 6, customerFacingPercent: 0,
+      stripeCostFlat: 0, stripeCostPercent: 0.5,
+      notes: 'rentCharge.test.ts ACH rate',
+    })
   })
 
   /** A second lease for the same tenant with the same landlord, on its own unit. */
@@ -1056,7 +1061,11 @@ describe('where the rest of the credit goes (one bill)', () => {
     expect(q.creditRestNote).toBe('$300.00 of your credit stays on your account for a later bill.')
   })
 
-  it('a credit tied to another lease is kept for that lease\'s bill', async () => {
+  // 10/18 (Nic): a credit the landlord gave is the household's — the space it
+  // was issued on is a record of where he gave it, not a fence — so a credit
+  // issued on the other space pays this bill too, and nothing is "kept
+  // elsewhere" when the other space owes nothing.
+  it('a credit the landlord gave on another space pays this bill as well', async () => {
     await cleanupAllSchema()
     const f = await fixture()
     const b = await secondLease(f)
@@ -1065,10 +1074,30 @@ describe('where the rest of the credit goes (one bill)', () => {
     await seedCredit(f, 200, { leaseId: b.leaseId })
     const q = await quote(f)
     expect(q.creditOnFile).toBe(500)
-    expect(q.usableCredit).toBe(300)
-    expect(q.creditKeptElsewhere).toBe(200)
+    expect(q.usableCredit).toBe(500)
+    expect(q.creditKeptElsewhere).toBe(0)
     expect(q.creditKeptForLater).toBe(0)
-    expect(q.creditRestNote).toBe('$200.00 of your credit is kept for a bill on another lease.')
+    expect(q.creditRestNote).toBeNull()
+  })
+
+  // What does stay with its space: money the tenant paid ahead there (10/17),
+  // and statutory interest on that space's deposit.
+  it('money paid ahead on another space, and that space\'s deposit interest, are kept for it', async () => {
+    await cleanupAllSchema()
+    const f = await fixture()
+    const b = await secondLease(f)
+    await seedCharge(f, 1000, '2026-10-01')
+    await seedCredit(f, 300)
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, funded_by, received_at)
+       VALUES ($1,$2,200,200,'landlord', now())`, [b.leaseId, f.tenantId])
+    await seedCredit(f, 50, { leaseId: b.leaseId, category: 'deposit_interest' })
+    const q = await quote(f)
+    expect(q.creditOnFile).toBe(550)
+    expect(q.usableCredit).toBe(300)
+    expect(q.creditKeptElsewhere).toBe(250)
+    expect(q.creditKeptForLater).toBe(0)
+    expect(q.creditRestNote).toBe('$250.00 of your credit is kept for a bill on another lease.')
   })
 
   it('a general credit goes first to an older bill on another lease: that part is kept for it', async () => {

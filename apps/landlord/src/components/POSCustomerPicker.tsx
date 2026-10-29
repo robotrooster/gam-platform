@@ -117,7 +117,7 @@ function letGo(customerId: string): void {
   apiPost(`/pos/customers/${customerId}/let-go`, {}).catch(() => { /* best-effort: it stays */ })
 }
 
-export function POSCustomerPicker({ propertyId, value, onChange, onAddNew, sealedPicks, placeholder, disabled, autoFocus, busy }: {
+export function POSCustomerPicker({ propertyId, value, onChange, onAddNew, sealedPicks, placeholder, disabled, autoFocus, busy, hereOnly }: {
   propertyId: string
   value: PickedPerson | null
   onChange: (p: PickedPerson | null) => void
@@ -131,6 +131,22 @@ export function POSCustomerPicker({ propertyId, value, onChange, onAddNew, seale
   placeholder?: string
   disabled?: boolean
   autoFocus?: boolean
+  /**
+   * 10/24 (Nic) — SEARCH ONLY THE PEOPLE ACTUALLY AT THIS PROPERTY.
+   *
+   *   "When I go to the checkout list and go to check somebody out, typing a
+   *    name in that flow is pulling up every customer in GAM right now. Like,
+   *    it should only pull up people that are actually specific to a lease or
+   *    stay at that property."
+   *
+   * The default search is deliberately platform-wide: a stranger can walk up
+   * and buy propane, and the register has to find them. A CHECK-OUT is the
+   * opposite question — you cannot check out somebody who was never here — so
+   * the Checkout tab passes this and gets a different endpoint entirely
+   * (/pos/checkout/people), scoped to stays and leases on this property. There
+   * is no elsewhere leg to limit, because there is no elsewhere.
+   */
+  hereOnly?: boolean
   /** The caller is saving what was picked. */
   busy?: boolean
 }) {
@@ -166,11 +182,30 @@ export function POSCustomerPicker({ propertyId, value, onChange, onAddNew, seale
     const mine = ++seq.current
     setSearching(true)
     const timer = setTimeout(() => {
-      api.get<{ data: Hit[]; elsewhereLimited?: boolean }>(`/pos/people?propertyId=${propertyId}&q=${encodeURIComponent(q)}`)
+      const url = hereOnly
+        ? `/pos/checkout/people?propertyId=${propertyId}&q=${encodeURIComponent(q)}`
+        : `/pos/people?propertyId=${propertyId}&q=${encodeURIComponent(q)}`
+      api.get<{ data: any[]; elsewhereLimited?: boolean }>(url)
         .then((r) => {
           if (seq.current !== mine) return
-          setHits(Array.isArray(r.data?.data) ? r.data.data : []); setActive(0)
-          setSearchError(null); setElsewhereLimited(!!r.data?.elsewhereLimited)
+          const raw = Array.isArray(r.data?.data) ? r.data.data : []
+          // The scoped endpoint answers with the person and where they are, and
+          // has no notion of "elsewhere" — so it is mapped into the same shape
+          // the list renders rather than the list learning a second one.
+          const list: Hit[] = hereOnly
+            ? raw.map((p: any, i: number) => ({
+                key: `h:${p.tenantId ?? p.posCustomerId ?? i}`,
+                kind: p.tenantId ? 'resident' : 'customer',
+                tenantId: p.tenantId ?? null,
+                customerId: p.posCustomerId ?? null,
+                name: p.name, hint: p.hint ?? null,
+                firstName: String(p.name ?? '').split(' ')[0] ?? '',
+                lastName: String(p.name ?? '').split(' ').slice(1).join(' '),
+                email: p.email ?? null, phone: p.phone ?? null,
+              }))
+            : raw
+          setHits(list); setActive(0)
+          setSearchError(null); setElsewhereLimited(!hereOnly && !!r.data?.elsewhereLimited)
         })
         .catch((e) => {
           if (seq.current !== mine) return
@@ -180,7 +215,7 @@ export function POSCustomerPicker({ propertyId, value, onChange, onAddNew, seale
         .finally(() => { if (seq.current === mine) setSearching(false) })
     }, 250)
     return () => clearTimeout(timer)
-  }, [text, propertyId])
+  }, [text, propertyId, hereOnly])
 
   const reset = () => { setText(''); setHits([]); setOpen(false); setDraft(null); setActive(0); setSearchError(null); setElsewhereLimited(false) }
 

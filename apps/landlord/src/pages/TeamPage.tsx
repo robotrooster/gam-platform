@@ -5,7 +5,10 @@ import { apiGet, apiPatch, apiPost, apiDel } from '../lib/api'
 import {
   LANDLORD_ASSIGNABLE_ROLE_LABEL,
   LandlordAssignableRole,
-  BOOKKEEPER_ACCESS_SUMMARY,
+  bookkeeperAccessSummary,
+  BOOKKEEPER_MONEY_IN_FILING, BOOKKEEPER_MONEY_IN_FILING_LABEL, DEFAULT_BOOKKEEPER_MONEY_IN_FILING,
+  type BookkeeperMoneyInFiling,
+  TEAM_INVITATION_TTL_HOURS,
 } from '@gam/shared'
 import { PermissionCatalogEditor } from '../components/PermissionCatalogEditor'
 import { EntityPicker, useEntities } from '../components/EntityPicker'
@@ -16,7 +19,8 @@ import { appConfirm, toast } from '../components/dialogs'
 // /team/:userId/permissions is the one permissions surface (catalog toggles +
 // property scope + direct deposit all live there). This page is now just the
 // roster: invite form, member list, pending invitations. Bookkeepers keep
-// their inline access-level select (they have no catalog permissions).
+// their boxes here (they have no catalog permissions; 10/12, Nic: and no
+// access level — one level, full bookkeeping).
 
 interface Member {
   userId: string
@@ -41,18 +45,54 @@ interface Member {
   connectDetailsSubmitted?: boolean
 }
 
-interface Invitation {
+export interface Invitation {
   id: string
   email: string
   role: LandlordAssignableRole
   status: string
   expiresAt: string
+  /** 10/13: its link has lapsed by the server's clock (still listed until the hourly sweep). */
+  expired?: boolean
   createdAt: string
+  // 10/13 review: the company it is for, as on a member's row.
+  landlordId?: string
+  companyName?: string | null
+  // 10/11: a pending bookkeeper invitation's ticked properties.
+  propertyIds?: string[] | null
+  // 10/12: and its company-wide and lease-dates boxes.
+  companyWide?: boolean | null
+  showLeaseDates?: boolean | null
+  // 10/12 (Nic): the ledger, whole-company reports and monthly report boxes.
+  companyLedger?: boolean | null
+  wholeCompanyReports?: boolean | null
+  seesMonthlyReport?: boolean | null
 }
 
 interface TeamPayload {
   members: Member[]
   invitations: Invitation[]
+  /** 10/12: the API reads the bookkeeper boxes as boxes (see BOXES_NOT_LIVE). */
+  bookkeeperBoxes?: boolean
+  /** 10/12 (Nic): the API reads the ledger, whole-company reports and monthly
+   *  report boxes. An API from before them would drop them silently, so until
+   *  it says so they are not offered. */
+  bookkeeperMoreBoxes?: boolean
+}
+
+/**
+ * 10/12 review (deploy order): the boxes below send a company-wide-only
+ * bookkeeper as no property + Company-wide, and an edit that unticks every
+ * property as no property. An API from before 10/12 reads "no property" as
+ * every property and the whole company, and ignores Company-wide, so this page
+ * reaching production ahead of the API would give full access where the owner
+ * chose almost none. The API says it reads the boxes (/scopes/team
+ * bookkeeperBoxes); until it does, no bookkeeper is saved from here.
+ */
+const BOXES_NOT_LIVE = 'Bookkeeper access is being updated. Try again in a few minutes.'
+
+/** S652: the rows belong to more than one of the account's companies, so each names its company. */
+export function spansCompanies(rows: Array<{ landlordId?: string | null }>): boolean {
+  return new Set(rows.map(r => r.landlordId).filter(Boolean)).size > 1
 }
 
 const ROLE_BADGE: Record<LandlordAssignableRole, string> = {
@@ -70,15 +110,17 @@ export function TeamPage() {
   const { data: properties = [] } = useQuery<any[]>('properties-for-invite', () => apiGet('/properties'))
   const [editingBookkeeper, setEditingBookkeeper] = useState<Member | null>(null)
 
+  // 10/11: names the company — a bookkeeper who keeps two of the account's
+  // companies' books is removed from this row's company only.
   const removeBookkeeper = useMutation(
-    (m: Member) => apiDel(`/scopes/bookkeeper/${m.userId}`),
+    (m: Member) => apiDel(`/scopes/bookkeeper/${m.userId}?landlordId=${encodeURIComponent(m.landlordId)}`),
     { onSuccess: () => { qc.invalidateQueries('team'); toast('Bookkeeper removed. Their access ends now.') },
       onError: (e: any) => toast(e?.response?.data?.error || e?.message || 'Could not remove the bookkeeper.') }
   )
 
   const members = data?.members || []
   const invitations = data?.invitations || []
-  const multiCompany = new Set(members.map(m => m.landlordId)).size > 1
+  const multiCompany = spansCompanies(members)
 
   return (
     <div>
@@ -96,9 +138,11 @@ export function TeamPage() {
       <InviteForm onSent={() => qc.invalidateQueries('team')} />
 
       {/* S592: bookkeepers are invited here too, via the email-link flow (they
-          set their own password). Distinct from staff — no property, no
-          permission catalog, just an access level. */}
-      <BookkeeperInviteForm onSent={() => qc.invalidateQueries('team')} />
+          set their own password). Distinct from staff — no permission
+          catalog: their boxes (10/11 properties; 10/12 Company-wide and lease
+          dates) are the whole of what they get. */}
+      <BookkeeperInviteForm boxesLive={data?.bookkeeperBoxes === true} moreBoxes={data?.bookkeeperMoreBoxes === true}
+        onSent={() => qc.invalidateQueries('team')} />
 
       {isLoading ? (
         <div className="card" style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
@@ -125,7 +169,7 @@ export function TeamPage() {
                   const enabledCount = isBookkeeper ? 0 : Object.values(perms).filter(Boolean).length
                   return (
                     <tr
-                      key={m.userId}
+                      key={`${m.userId}:${m.landlordId}`}
                       style={{ cursor: isBookkeeper ? 'default' : 'pointer' }}
                       onClick={() => { if (!isBookkeeper) navigate(`/team/${m.userId}/permissions`) }}
                     >
@@ -143,7 +187,7 @@ export function TeamPage() {
                           <span style={{ display: 'inline-flex', gap: 6 }}>
                             <button className="btn btn-primary btn-sm" style={{ fontSize: '.74rem' }}
                               onClick={(e) => { e.stopPropagation(); setEditingBookkeeper(m) }}>
-                              Change properties
+                              Change access
                             </button>
                             <button className="btn btn-ghost btn-sm" style={{ fontSize: '.74rem' }}
                               disabled={removeBookkeeper.isLoading}
@@ -175,6 +219,8 @@ export function TeamPage() {
 
           {editingBookkeeper && (
             <BookkeeperPropertiesEditor
+              boxesLive={data?.bookkeeperBoxes === true}
+              moreBoxes={data?.bookkeeperMoreBoxes === true}
               member={editingBookkeeper}
               properties={(properties as any[]).filter(p => p.landlordId === editingBookkeeper.landlordId)}
               onClose={() => setEditingBookkeeper(null)}
@@ -201,28 +247,118 @@ export function TeamPage() {
             )
           })()}
 
-          {invitations.length > 0 && (
-            <div className="card" style={{ padding: 0 }}>
-              <div style={{ padding: '14px 16px', borderBottom: '1px solid var(--border-1)', fontWeight: 600, fontSize: '.88rem' }}>Pending invitations</div>
-              <table className="data-table">
-                <thead>
-                  <tr><th>Email</th><th>Role</th><th>Sent</th><th>Expires</th></tr>
-                </thead>
-                <tbody>
-                  {invitations.map(inv => (
-                    <tr key={inv.id}>
-                      <td style={{ fontSize: '.82rem' }}>{inv.email}</td>
-                      <td><span className={`badge ${ROLE_BADGE[inv.role] || 'badge-muted'}`}>{LANDLORD_ASSIGNABLE_ROLE_LABEL[inv.role]}</span></td>
-                      <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{new Date(inv.createdAt).toLocaleDateString()}</td>
-                      <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{new Date(inv.expiresAt).toLocaleDateString()}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+          {/* 10/13 review: the company column, when the rows (members or
+              invitations) span more than one of the account's companies. */}
+          <PendingInvitations invitations={invitations} properties={properties as any[]}
+            multiCompany={spansCompanies([...members, ...invitations])}
+            onChanged={() => qc.invalidateQueries('team')} />
         </>
       )}
+    </div>
+  )
+}
+
+/**
+ * ── 10/13 (Nic): RESEND AND WITHDRAW ON EACH PENDING INVITATION ────────────
+ *
+ * "Team invites expire after 24 HOURS ... Add RESEND and WITHDRAW buttons on
+ * each pending invitation." The list had neither: a link that lapsed (or an
+ * email that never arrived) meant typing the whole invitation again, and one
+ * sent to the wrong address could not be taken back.
+ *
+ * Resend mails a brand-new link that works for 24 hours and kills the old one
+ * (the email says so). Withdraw asks first, then the link stops working and
+ * says "withdrawn". Both work on a row whose link has already lapsed; it shows
+ * "Expired" (by the server's clock) until the hourly sweep takes it off the
+ * list. Expires shows the time too: with a 24-hour link the date alone was
+ * nearly always "tomorrow". The company comes from the row on the server, so
+ * an owner of two companies needs to choose nothing.
+ */
+export function PendingInvitations({ invitations, properties, onChanged, multiCompany = false }: {
+  invitations: Invitation[]
+  properties: any[]
+  onChanged: () => void
+  /**
+   * 10/13 review: the account's rows span more than one company. The same
+   * address may be invited to two of them (one pending invitation per company,
+   * role and address), and those rows looked alike: each row and each
+   * question then names its company, so Withdraw takes back the one meant.
+   */
+  multiCompany?: boolean
+}) {
+  const [busy, setBusy] = useState<string | null>(null)
+  if (invitations.length === 0) return null
+  const named = (inv: Invitation) => multiCompany && inv.companyName ? `${inv.email} (${inv.companyName})` : inv.email
+
+  const run = async (inv: Invitation, path: 'resend' | 'revoke', done: string, failed: string) => {
+    setBusy(inv.id)
+    try {
+      await apiPost(`/scopes/invitations/${inv.id}/${path}`, {})
+      toast(done)
+    } catch (e: any) {
+      toast.error(e?.response?.data?.error || e?.message || failed)
+    } finally {
+      setBusy(null)
+      onChanged()
+    }
+  }
+  const resend = (inv: Invitation) => run(inv, 'resend',
+    `A new link is on its way to ${named(inv)}. It works for ${TEAM_INVITATION_TTL_HOURS} hours, and the earlier link no longer works.`,
+    'Could not resend the invitation.')
+  const withdraw = async (inv: Invitation) => {
+    const ok = await appConfirm(`Withdraw the invitation to ${named(inv)}? The link in their email stops working right away.`,
+      { title: 'Withdraw invitation', confirmLabel: 'Withdraw', danger: true })
+    if (ok) await run(inv, 'revoke', `Invitation to ${named(inv)} withdrawn. Its link no longer works.`, 'Could not withdraw the invitation.')
+  }
+
+  return (
+    <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
+      <div style={{ padding: '14px 16px', borderBottom: '1px solid var(--border-1)', fontWeight: 600, fontSize: '.88rem' }}>Pending invitations</div>
+      <table className="data-table">
+        <thead>
+          <tr><th>Email</th>{multiCompany && <th>Company</th>}<th>Role</th><th>Sent</th><th>Expires</th><th></th></tr>
+        </thead>
+        <tbody>
+          {invitations.map(inv => (
+            <tr key={inv.id} data-invitation={inv.id}>
+              <td style={{ fontSize: '.82rem' }}>{inv.email}</td>
+              {multiCompany && <td style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>{inv.companyName || '—'}</td>}
+              <td>
+                <span className={`badge ${ROLE_BADGE[inv.role] || 'badge-muted'}`}>{LANDLORD_ASSIGNABLE_ROLE_LABEL[inv.role]}</span>
+                {inv.role === 'bookkeeper' && (
+                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 3 }}>
+                    {[
+                      propertyNames(inv.propertyIds ?? [], properties) || (inv.companyWide ? null : 'No property ticked'),
+                      inv.companyWide ? 'Company-wide (bank, payouts, payroll)' : null,
+                      ...extraBoxWords({ companyWide: !!inv.companyWide, companyLedger: !!inv.companyLedger,
+                        wholeCompanyReports: !!inv.wholeCompanyReports, seesMonthlyReport: !!inv.seesMonthlyReport }),
+                      inv.showLeaseDates ? 'Lease dates shown' : null,
+                    ].filter(Boolean).join(' · ')}
+                  </div>
+                )}
+              </td>
+              <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{new Date(inv.createdAt).toLocaleDateString()}</td>
+              <td style={{ fontSize: '.78rem', color: 'var(--text-3)', whiteSpace: 'nowrap' }}>
+                {inv.expired
+                  ? <span className="badge badge-red">Expired</span>
+                  : new Date(inv.expiresAt).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
+              </td>
+              <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                <span style={{ display: 'inline-flex', gap: 6 }}>
+                  <button className="btn btn-primary btn-sm" style={{ fontSize: '.74rem' }}
+                    disabled={busy === inv.id} onClick={() => resend(inv)}>
+                    Resend
+                  </button>
+                  <button className="btn btn-primary btn-sm" style={{ fontSize: '.74rem' }}
+                    disabled={busy === inv.id} onClick={() => withdraw(inv)}>
+                    Withdraw
+                  </button>
+                </span>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }
@@ -274,7 +410,8 @@ function InviteForm({ onSent }: { onSent: () => void }) {
     {
       onSuccess: () => {
         setError(null)
-        setSuccess(`Invitation emailed to ${email.trim()}. They'll land with the permissions you set — adjust anytime on their permissions page.`)
+        // 10/13 (Nic): the link works for 24 hours; Resend is on the row below.
+        setSuccess(`Invitation emailed to ${email.trim()}. The link works for ${TEAM_INVITATION_TTL_HOURS} hours. They'll land with the permissions you set — adjust anytime on their permissions page.`)
         reset()
         onSent()
         setTimeout(() => setSuccess(null), 5000)
@@ -407,11 +544,24 @@ function InviteForm({ onSent }: { onSent: () => void }) {
 //
 // 10/11 (Nic): "I need to invite somebody to be a bookkeeper for the Mountain
 // View property. They don't need to see anything with Oak Park." A bookkeeper
-// keeps ONE company's books — and, when that company has several properties,
-// only the ones ticked here (none ticked = all of them). Their access is fixed:
-// look, and add expenses ("Look + add expenses" — Nic's choice), so there is
-// no access level to pick.
-function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
+// keeps ONE company's books, and inside it only the properties ticked here.
+// Every property is its own box, even when the company has just one, and a
+// property the company adds later arrives unticked. 10/12 (Nic, ledger
+// decision 2): "Full bookkeeping … never tenant-account actions … One level,
+// no per-bookkeeper switch" — every bookkeeper does the bookkeeping on what is
+// ticked for them (bookkeeperAccessSummary says what), so there is no access
+// level to pick.
+//
+// 10/12 (Nic): two more boxes, the owner's choice per bookkeeper —
+// "Company-wide: bank account, payouts and payroll" (its own box; ticking every
+// property no longer gives it) and "Show lease start and end dates" on their
+// rent roll (off unless ticked). A company with no property yet may have a
+// company-wide bookkeeper. Only nothing ticked at all is refused.
+//
+// 10/12 (Nic): three more boxes, all off unless ticked — "May use the
+// whole-company ledger" (BK1), "Company reports show the whole company" (BK2)
+// and "Sees the monthly property report on screen" (BookkeeperBoxes).
+function BookkeeperInviteForm({ boxesLive, moreBoxes, onSent }: { boxesLive: boolean; moreBoxes: boolean; onSent: () => void }) {
   const [firstName, setFirstName] = useState('')
   const [lastName, setLastName] = useState('')
   const [email, setEmail] = useState('')
@@ -419,11 +569,17 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
   // company's books; an account with several names which.
   const [entityId, setEntityId] = useState('')
   const [propertyIds, setPropertyIds] = useState<string[]>([])
+  const [companyWide, setCompanyWide] = useState(false)
+  const [showLeaseDates, setShowLeaseDates] = useState(false)
+  const [more, setMore] = useState<MoreBoxes>(NO_MORE_BOXES)
   const { data: entities = [] } = useEntities()
-  const { data: properties = [] } = useQuery<any[]>('properties-for-invite', () => apiGet('/properties'))
+  const { data: properties = [], isLoading: propertiesLoading } =
+    useQuery<any[]>('properties-for-invite', () => apiGet('/properties'))
   const severalCompanies = entities.length >= 2
   const company = entityId || (entities.length === 1 ? entities[0].id : '')
   const companyProperties = (properties as any[]).filter(p => !company || p.landlordId === company)
+  const noProperty = !propertiesLoading && companyProperties.length === 0
+  const nothingTicked = !propertyIds.length && !companyWide
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
 
@@ -433,16 +589,20 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
       email: email.trim(),
       firstName: firstName.trim() || undefined,
       lastName: lastName.trim() || undefined,
-      scope: { propertyIds: propertyIds.length ? propertyIds : null },
+      scope: { propertyIds, companyWide, showLeaseDates,
+               ...(moreBoxes ? effectiveMoreBoxes(more, { propertyCount: propertyIds.length, companyWide }) : {}) },
     }),
     {
       onSuccess: () => {
         setError(null)
-        const where = propertyIds.length
-          ? companyProperties.filter(p => propertyIds.includes(p.id)).map(p => p.name).join(', ')
-          : 'every property of the company'
-        setSuccess(`Invitation emailed to ${email.trim()}. They set their own password from the link, then see the money for ${where}.`)
-        setFirstName(''); setLastName(''); setEmail(''); setPropertyIds([])
+        const sees = [
+          propertyIds.length ? `the money for ${propertyNames(propertyIds, companyProperties)}` : null,
+          companyWide ? 'the company-wide books' : null,
+        ].filter(Boolean).join(' and ')
+        // 10/13 (Nic): the link works for 24 hours; Resend is on the row below.
+        setSuccess(`Invitation emailed to ${email.trim()}. The link works for ${TEAM_INVITATION_TTL_HOURS} hours. They set their own password from the link, then see ${sees}.`)
+        setFirstName(''); setLastName(''); setEmail(''); setPropertyIds([]); setCompanyWide(false); setShowLeaseDates(false)
+        setMore(NO_MORE_BOXES)
         onSent()
         setTimeout(() => setSuccess(null), 6000)
       },
@@ -459,6 +619,8 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
     if (!firstName.trim() || !lastName.trim()) { setError('First and last name are required'); return }
     if (!email.trim()) { setError('Email is required'); return }
     if (severalCompanies && !entityId) { setError('Choose whose books they keep'); return }
+    if (nothingTicked) { setError('Tick at least one property or Company-wide.'); return }
+    if (!boxesLive) { setError(BOXES_NOT_LIVE); return }
     mut.mutate()
   }
 
@@ -469,14 +631,20 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
     <div className="card" style={{ padding: 16, marginBottom: 20 }}>
       <div style={{ fontSize: '.95rem', fontWeight: 600, marginBottom: 4 }}>Invite a bookkeeper</div>
       <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
-        {BOOKKEEPER_ACCESS_SUMMARY} They set their own password from the email link, and you can change their properties or remove them anytime below.
+        {bookkeeperAccessSummary({ propertyCount: propertyIds.length, companyWide, showLeaseDates,
+          ...(moreBoxes ? effectiveMoreBoxes(more, { propertyCount: propertyIds.length, companyWide }) : {}) })} They set their own password from the email link, and you can change what they keep or remove them anytime below.
       </div>
+      <EntityPicker value={entityId} onChange={id => { setEntityId(id); setPropertyIds([]) }} label="Books of"
+        note="They see this company's money and no other company's." />
       <form onSubmit={submit} style={{ display: 'grid', gap: 10 }}>
-        <EntityPicker value={entityId} onChange={id => { setEntityId(id); setPropertyIds([]) }} label="Books of"
-          note="They see this company's money and no other company's." />
-        {company && companyProperties.length > 1 && (
-          <PropertyChecklist properties={companyProperties} value={propertyIds} onChange={setPropertyIds} />
-        )}
+        {company || !severalCompanies ? (
+          <BookkeeperBoxes
+            properties={companyProperties} noProperty={noProperty}
+            propertyIds={propertyIds} onPropertyIds={setPropertyIds}
+            companyWide={companyWide} onCompanyWide={setCompanyWide}
+            showLeaseDates={showLeaseDates} onShowLeaseDates={setShowLeaseDates}
+            more={moreBoxes ? more : null} onMore={setMore} />
+        ) : null}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
           <div>
             <label style={labelStyle}>First name</label>
@@ -494,7 +662,8 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
         {error && (<div style={{ padding: '8px 12px', borderRadius: 6, background: 'rgba(220,76,76,.08)', border: '1px solid rgba(220,76,76,.25)', color: 'var(--red, #dc4c4c)', fontSize: '.78rem' }}>{error}</div>)}
         {success && (<div style={{ padding: '8px 12px', borderRadius: 6, background: 'rgba(46,163,90,.08)', border: '1px solid rgba(46,163,90,.25)', color: 'var(--green, #2ea35a)', fontSize: '.78rem' }}>{success}</div>)}
         <div>
-          <button type="submit" className="btn btn-primary" disabled={mut.isLoading || !email.trim() || (severalCompanies && !entityId)}>
+          <button type="submit" className="btn btn-primary"
+            disabled={mut.isLoading || !email.trim() || (severalCompanies && !entityId) || nothingTicked}>
             {mut.isLoading ? 'Sending…' : 'Send invitation'}
           </button>
         </div>
@@ -503,15 +672,30 @@ function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
   )
 }
 
-/** 10/11: which of a company's properties a bookkeeper keeps. None ticked = all of them. */
+/**
+ * 10/11 (Nic): which of a company's properties a bookkeeper keeps. Every
+ * property is its own box; nothing is ticked for them by default, and "Tick
+ * all" ticks every property the company owns today (one it adds later still
+ * starts unticked).
+ */
 function PropertyChecklist({ properties, value, onChange }: {
   properties: any[]; value: string[]; onChange: (ids: string[]) => void
 }) {
   const toggle = (id: string) => onChange(value.includes(id) ? value.filter(x => x !== id) : [...value, id])
+  const allTicked = properties.length > 0 && properties.every(p => value.includes(p.id))
   return (
     <div>
-      <div style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 6 }}>
-        Properties <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(none ticked = every property of the company)</span>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 6 }}>
+        <div style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>
+          Properties <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(tick each one they keep)</span>
+        </div>
+        {properties.length > 1 && (
+          <button type="button"
+            style={{ background: 'none', border: 'none', padding: 0, color: 'var(--gold)', fontSize: '.72rem', cursor: 'pointer', textDecoration: 'underline' }}
+            onClick={() => onChange(allTicked ? [] : properties.map(p => p.id))}>
+            {allTicked ? 'Untick all' : 'Tick all'}
+          </button>
+        )}
       </div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px' }}>
         {properties.map(p => (
@@ -525,37 +709,240 @@ function PropertyChecklist({ properties, value, onChange }: {
   )
 }
 
-/** 10/11: the properties a bookkeeper keeps, in words, for their row. */
-function bookkeeperPropertiesText(m: Member, properties: any[]): string {
-  const ids: string[] | null = (m.scope as any)?.propertyIds ?? null
-  if (!ids || !ids.length) return 'Every property of the company'
-  const names = ids.map(id => properties.find(p => p.id === id)?.name).filter(Boolean)
-  return names.length ? names.join(', ') : `${ids.length} propert${ids.length === 1 ? 'y' : 'ies'}`
+/**
+ * 10/12 (Nic): the three boxes added on 10/12 evening, all off unless ticked.
+ *   companyLedger        "May use the whole-company ledger" (BK1) — offered
+ *                        only without Company-wide, which already holds it
+ *   wholeCompanyReports  "Company reports show the whole company" (BK2) —
+ *                        offered when they open company reports (Company-wide
+ *                        or the ledger)
+ *   seesMonthlyReport    "Sees the monthly property report on screen" —
+ *                        offered when a property is ticked
+ */
+interface MoreBoxes { companyLedger: boolean; wholeCompanyReports: boolean; seesMonthlyReport: boolean }
+const NO_MORE_BOXES: MoreBoxes = { companyLedger: false, wholeCompanyReports: false, seesMonthlyReport: false }
+
+/**
+ * What is saved: a box only where it is offered, so a box hidden by another
+ * choice (the ledger under Company-wide, the monthly report with no property
+ * ticked) never stays on unseen.
+ */
+function effectiveMoreBoxes(m: MoreBoxes, at: { propertyCount: number; companyWide: boolean }): MoreBoxes {
+  const companyLedger = !at.companyWide && at.propertyCount > 0 && m.companyLedger
+  return {
+    companyLedger,
+    wholeCompanyReports: (at.companyWide || companyLedger) && m.wholeCompanyReports,
+    seesMonthlyReport: at.propertyCount > 0 && m.seesMonthlyReport,
+  }
 }
 
-/** 10/11: change which of the company's properties a bookkeeper keeps. */
-function BookkeeperPropertiesEditor({ member, properties, onClose, onSaved }: {
-  member: Member; properties: any[]; onClose: () => void; onSaved: () => void
+/** 10/12 (Nic): the ledger, whole-company reports and monthly report boxes, in words, for a row. */
+function extraBoxWords(b: { companyWide: boolean } & Partial<MoreBoxes>): string[] {
+  return [
+    b.companyLedger && !b.companyWide ? 'Whole-company ledger' : null,
+    b.wholeCompanyReports ? 'Company reports: whole company' : null,
+    b.seesMonthlyReport ? 'Monthly report on screen' : null,
+  ].filter(Boolean) as string[]
+}
+
+/**
+ * 10/12 (Nic): every box a bookkeeper has, on the invite and the edit alike —
+ * the property boxes, "Company-wide: bank account, payouts and payroll", and
+ * "Show lease start and end dates". A company with no property yet shows only
+ * the company-wide box (it may have a company-wide bookkeeper). With `more`
+ * (an API that reads them), the three 10/12-evening boxes too.
+ */
+function BookkeeperBoxes({ properties, noProperty, propertyIds, onPropertyIds, companyWide, onCompanyWide, showLeaseDates, onShowLeaseDates, more, onMore }: {
+  properties: any[]; noProperty: boolean
+  propertyIds: string[]; onPropertyIds: (ids: string[]) => void
+  companyWide: boolean; onCompanyWide: (on: boolean) => void
+  showLeaseDates: boolean; onShowLeaseDates: (on: boolean) => void
+  more: MoreBoxes | null; onMore: (m: MoreBoxes) => void
 }) {
-  const [ids, setIds] = useState<string[]>(((member.scope as any)?.propertyIds ?? []) as string[])
+  const box = { display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: '.84rem', color: 'var(--text-1)', cursor: 'pointer', lineHeight: 1.4 } as const
+  const hint = { display: 'block', fontSize: '.72rem', color: 'var(--text-3)' } as const
+  const ticked = propertyIds.length > 0
+  const offersLedger = !!more && !companyWide && ticked
+  const offersWholeReports = !!more && (companyWide || (offersLedger && more.companyLedger))
+  const offersMonthly = !!more && ticked
+  return (
+    <div style={{ display: 'grid', gap: 10 }}>
+      {noProperty
+        ? <div style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>This company has no property yet. Tick Company-wide to give them its company-wide books.</div>
+        : <PropertyChecklist properties={properties} value={propertyIds} onChange={onPropertyIds} />}
+      <label style={box}>
+        <input type="checkbox" checked={companyWide} onChange={e => onCompanyWide(e.target.checked)} style={{ marginTop: 2 }} />
+        <span>
+          Company-wide: bank account, payouts and payroll
+          <span style={hint}>Also the company's whole Books ledger, P&amp;L, cash flow and owner statements. Leave it off and they see only the properties ticked above.</span>
+        </span>
+      </label>
+      {offersLedger && (
+        <label style={box}>
+          <input type="checkbox" checked={more!.companyLedger} onChange={e => onMore({ ...more!, companyLedger: e.target.checked })} style={{ marginTop: 2 }} />
+          <span>
+            May use the whole-company ledger
+            <span style={hint}>The company's Books ledger: chart of accounts, journal, bills, vendors, payroll, tax, P&amp;L and balance sheet. Never the bank account or payouts.</span>
+          </span>
+        </label>
+      )}
+      {offersWholeReports && (
+        <label style={box}>
+          <input type="checkbox" checked={more!.wholeCompanyReports} onChange={e => onMore({ ...more!, wholeCompanyReports: e.target.checked })} style={{ marginTop: 2 }} />
+          <span>
+            Company reports show the whole company
+            <span style={hint}>Their company P&amp;L{companyWide ? ', cash flow and owner statements carry' : ' carries'} every property's money. Leave it off and only the ticked properties' money is in them.</span>
+          </span>
+        </label>
+      )}
+      {!noProperty && (
+        <label style={box}>
+          <input type="checkbox" checked={showLeaseDates} onChange={e => onShowLeaseDates(e.target.checked)} style={{ marginTop: 2 }} />
+          <span>
+            Show lease start and end dates
+            <span style={hint}>On their rent roll. The dates only, never the lease itself or its documents.</span>
+          </span>
+        </label>
+      )}
+      {offersMonthly && (
+        <label style={box}>
+          <input type="checkbox" checked={more!.seesMonthlyReport} onChange={e => onMore({ ...more!, seesMonthlyReport: e.target.checked })} style={{ marginTop: 2 }} />
+          <span>
+            Sees the monthly property report on screen
+            <span style={hint}>On their Reports page, for the ticked properties only.</span>
+          </span>
+        </label>
+      )}
+    </div>
+  )
+}
+
+/** 10/11: property ids in words, by name. */
+function propertyNames(ids: string[], properties: any[]): string {
+  return ids.map(id => properties.find(p => p.id === id)?.name).filter(Boolean).join(', ')
+}
+
+/** 10/12: '2026-09-30' → 'Sep 30, 2026' (a calendar day, no time-zone shift). */
+function dayWords(ymd: string): string {
+  const d = new Date(String(ymd).slice(0, 10) + 'T12:00:00')
+  return isNaN(d.getTime()) ? ymd : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+interface BookkeeperRowScope {
+  propertyIds?: string[] | null
+  coversCompany?: boolean
+  companyWide?: boolean
+  showLeaseDates?: boolean
+  // 10/12 (Nic): the ledger, whole-company reports and monthly report boxes.
+  companyLedger?: boolean
+  wholeCompanyReports?: boolean
+  seesMonthlyReport?: boolean
+  /** 10/12 (Nic, L19): what they may file of the money coming in. */
+  moneyInFiling?: BookkeeperMoneyInFiling
+  formerProperties?: Array<{ propertyId: string; name: string; lastDay: string }>
+}
+
+/**
+ * 10/11: the properties a bookkeeper keeps, in words, for their row. "Every
+ * property" only while they have ticked every property the company owns today
+ * (the server works that out: scope.coversCompany); otherwise the ticked ones,
+ * and the company's properties they do not keep, so a park bought since shows
+ * up here as not ticked. 10/12: the company-wide and lease-dates boxes, and a
+ * sold property whose history they keep up to the day it left.
+ */
+function bookkeeperPropertiesText(m: Member, properties: any[]): string {
+  const scope = (m.scope ?? {}) as BookkeeperRowScope
+  const ids = scope.propertyIds ?? []
+  const company = properties.filter(p => p.landlordId === m.landlordId)
+  let props: string | null
+  if (scope.coversCompany) props = 'Every property'
+  else if (!ids.length) props = scope.companyWide ? null : 'No property ticked'
+  else {
+    const kept = propertyNames(ids, company) || `${ids.length} propert${ids.length === 1 ? 'y' : 'ies'}`
+    const notKept = company.filter(p => !ids.includes(p.id)).map(p => p.name).join(', ')
+    props = notKept ? `${kept} · Not ticked: ${notKept}` : kept
+  }
+  return [
+    props,
+    scope.companyWide ? 'Company-wide (bank, payouts, payroll)' : null,
+    // 10/12 (Nic) review: the boxes as they work today — the ledger and the
+    // whole-company reports end with the last property they kept (the server's
+    // rule, lib/bookkeeperScope), so a row never says "Whole-company ledger"
+    // for a bookkeeper who keeps only a sold property's history.
+    ...extraBoxWords({ companyWide: !!scope.companyWide, ...effectiveMoreBoxes(
+      { companyLedger: !!scope.companyLedger, wholeCompanyReports: !!scope.wholeCompanyReports, seesMonthlyReport: !!scope.seesMonthlyReport },
+      { propertyCount: ids.length, companyWide: !!scope.companyWide }) }),
+    scope.showLeaseDates ? 'Lease dates shown' : null,
+    // 10/12 (Nic, L19): money coming in, when it is not the default.
+    scope.companyWide && scope.moneyInFiling && scope.moneyInFiling !== DEFAULT_BOOKKEEPER_MONEY_IN_FILING
+      ? `Money in: ${BOOKKEEPER_MONEY_IN_FILING_LABEL[scope.moneyInFiling].toLowerCase()}` : null,
+    ...(scope.formerProperties ?? []).map(f => `Sold: ${f.name} (history through ${dayWords(f.lastDay)})`),
+  ].filter(Boolean).join(' · ')
+}
+
+/** 10/11: change which of the company's properties a bookkeeper keeps. 10/12: and their other boxes. */
+function BookkeeperPropertiesEditor({ boxesLive, moreBoxes, member, properties, onClose, onSaved }: {
+  boxesLive: boolean; moreBoxes: boolean; member: Member; properties: any[]; onClose: () => void; onSaved: () => void
+}) {
+  const scope = (member.scope ?? {}) as BookkeeperRowScope
+  const [ids, setIds] = useState<string[]>((scope.propertyIds ?? []) as string[])
+  const [companyWide, setCompanyWide] = useState(!!scope.companyWide)
+  const [showLeaseDates, setShowLeaseDates] = useState(!!scope.showLeaseDates)
+  // 10/12 (Nic): the ledger, whole-company reports and monthly report boxes.
+  const [more, setMore] = useState<MoreBoxes>({
+    companyLedger: !!scope.companyLedger, wholeCompanyReports: !!scope.wholeCompanyReports, seesMonthlyReport: !!scope.seesMonthlyReport,
+  })
+  const extra = moreBoxes ? effectiveMoreBoxes(more, { propertyCount: ids.length, companyWide }) : {}
+  // 10/12 (Nic, L19): "bookkeepers filing money coming in → landlord's choice
+  // per bookkeeper". Sent only when changed (the owner's alone; the server
+  // refuses anyone else).
+  const startMoneyIn = scope.moneyInFiling ?? DEFAULT_BOOKKEEPER_MONEY_IN_FILING
+  const [moneyIn, setMoneyIn] = useState<BookkeeperMoneyInFiling>(startMoneyIn)
   const [error, setError] = useState<string | null>(null)
+  const nothingTicked = !ids.length && !companyWide
   const save = useMutation(
-    () => apiPatch(`/scopes/bookkeeper/${member.userId}`, { landlordId: member.landlordId, propertyIds: ids.length ? ids : null }),
-    { onSuccess: () => { toast('Their properties are updated. It takes effect on their next click.'); onSaved() },
+    () => apiPatch(`/scopes/bookkeeper/${member.userId}`, {
+      landlordId: member.landlordId, propertyIds: ids, companyWide, showLeaseDates, ...extra,
+      ...(scope.moneyInFiling !== undefined && moneyIn !== startMoneyIn ? { moneyInFiling: moneyIn } : {}),
+    }),
+    { onSuccess: () => { toast('Their access is updated. It takes effect on their next click.'); onSaved() },
       onError: (e: any) => setError(e?.response?.data?.error || e?.message || 'Could not save.') },
   )
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" style={{ maxWidth: 520 }} onClick={e => e.stopPropagation()}>
-        <div className="modal-title">Properties {member.firstName} {member.lastName} keeps</div>
-        <div style={{ fontSize: '.78rem', color: 'var(--text-3)', margin: '6px 0 14px', lineHeight: 1.5 }}>{BOOKKEEPER_ACCESS_SUMMARY}</div>
-        {properties.length > 1
-          ? <PropertyChecklist properties={properties} value={ids} onChange={setIds} />
-          : <div style={{ fontSize: '.84rem', color: 'var(--text-2)' }}>This company has one property, and they keep it.</div>}
+        <div className="modal-title">What {member.firstName} {member.lastName} keeps</div>
+        <div style={{ fontSize: '.78rem', color: 'var(--text-3)', margin: '6px 0 14px', lineHeight: 1.5 }}>
+          {bookkeeperAccessSummary({ propertyCount: ids.length, companyWide, showLeaseDates, ...extra })}
+        </div>
+        <BookkeeperBoxes
+          properties={properties} noProperty={properties.length === 0}
+          propertyIds={ids} onPropertyIds={setIds}
+          companyWide={companyWide} onCompanyWide={setCompanyWide}
+          showLeaseDates={showLeaseDates} onShowLeaseDates={setShowLeaseDates}
+          more={moreBoxes ? more : null} onMore={setMore} />
+        {scope.moneyInFiling !== undefined && companyWide && (
+          <label style={{ display: 'grid', gap: 4, fontSize: '.84rem', color: 'var(--text-1)', marginTop: 12 }}>
+            Money coming in on the bank feed
+            <select className="form-input" value={moneyIn} onChange={e => setMoneyIn(e.target.value as BookkeeperMoneyInFiling)}>
+              {BOOKKEEPER_MONEY_IN_FILING.map(v => <option key={v} value={v}>{BOOKKEEPER_MONEY_IN_FILING_LABEL[v]}</option>)}
+            </select>
+            <span style={{ fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+              A deposit they file leaves the rent queue, so a tenant's rent filed as other income stays owed on the tenant's account. You and they can mark a deposit "Not rent" (not if they never file money coming in). Money going out is always theirs to file.
+            </span>
+          </label>
+        )}
+        {(scope.formerProperties ?? []).length > 0 && (
+          <div style={{ color: 'var(--text-3)', fontSize: '.76rem', marginTop: 10, lineHeight: 1.5 }}>
+            They also keep, read only, the history of {(scope.formerProperties ?? []).map(f => `${f.name} through ${dayWords(f.lastDay)}`).join(', ')}: the days it was this company's, and nothing after.
+          </div>
+        )}
+        {nothingTicked && <div style={{ color: 'var(--text-3)', fontSize: '.78rem', marginTop: 10 }}>Tick at least one property or Company-wide.</div>}
+        {!boxesLive && <div style={{ color: 'var(--text-3)', fontSize: '.78rem', marginTop: 10 }}>{BOXES_NOT_LIVE}</div>}
         {error && <div style={{ color: 'var(--red)', fontSize: '.78rem', marginTop: 10 }}>{error}</div>}
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 18 }}>
           <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" disabled={save.isLoading || properties.length < 2} onClick={() => save.mutate()}>
+          <button className="btn btn-primary" disabled={save.isLoading || nothingTicked || !boxesLive} onClick={() => save.mutate()}>
             {save.isLoading ? 'Saving…' : 'Save'}
           </button>
         </div>

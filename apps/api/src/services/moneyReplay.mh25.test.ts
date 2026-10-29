@@ -66,6 +66,7 @@ import { db, getClient } from '../db'
 import { webhooksRouter } from '../routes/webhooks'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedAllocationRule,
+  setEffectiveProcessingRate,
 } from '../test/dbHelpers'
 import { generateInvoices } from '../jobs/invoiceGeneration'
 import { generateLateFeesForInvoice } from '../jobs/lateFees'
@@ -198,13 +199,17 @@ const billed = (p: Park, start: string, end: string) =>
 // ─── the replay ──────────────────────────────────────────────────────────────
 
 beforeAll(async () => {
-  for (const [method, flat, pct, sflat, spct] of [['ach', 6, 0, 0, 0.5], ['card', 0.55, 3.5, 0.26, 0.7]] as const) {
-    await db.query(
-      `INSERT INTO platform_processing_rates
-         (payment_method, customer_facing_flat, customer_facing_percent, stripe_cost_flat, stripe_cost_percent)
-       SELECT $1, $2, $3, $4, $5
-        WHERE NOT EXISTS (SELECT 1 FROM platform_processing_rates WHERE payment_method = $1 AND effective_until IS NULL)`,
-      [method, flat, pct, sflat, spct])
+  // 10/17: the rate this file's figures are worked out on, STATED rather than
+  // seeded-if-missing: one row is open per method and cleanupAllSchema leaves the
+  // rate card alone, so an insert-if-missing took whatever an earlier file left.
+  for (const [paymentMethod, flat, pct, sflat, spct] of
+       [['ach', 6, 0, 0, 0.5], ['card', 0.55, 3.5, 0.26, 0.7]] as const) {
+    await setEffectiveProcessingRate(db, {
+      paymentMethod,
+      customerFacingFlat: flat, customerFacingPercent: pct,
+      stripeCostFlat: sflat, stripeCostPercent: spct,
+      notes: 'moneyReplay.mh25.test.ts rate',
+    })
   }
 })
 
@@ -331,6 +336,12 @@ describe('MH 25 replay: the $10 goes on the next bill by itself, the landlord is
   it('August: nothing paid ahead is left; unpaid after the grace days, the $25 late fee posts', async () => {
     await generateInvoices(new Date('2026-08-01T15:00:00Z'))
     const aug = await billFor(p, '2026-08-01')
+    // 10/12 (Nic): the run wrote it on August 1st (replayed today, it is
+    // stamped today — and a bill written after its due date counts from then).
+    await db.query(`UPDATE invoices SET created_at = '2026-08-01T15:00:00Z' WHERE id = $1`, [aug.id])
+    // Its lines too: the delinquency check (20261013120000) reads each line's
+    // own written day (services/lateness writtenAtSql), like Outstanding.
+    await db.query(`UPDATE payments SET created_at = '2026-08-01T15:00:00Z' WHERE invoice_id = $1`, [aug.id])
     expect(Number(aug.total_amount)).toBe(460)
     expect(await usesOf(creditId)).toHaveLength(1)    // July's $10 only
 

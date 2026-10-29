@@ -16,10 +16,10 @@ import {
   creditChoiceNeeded, creditToUseFor, deskOwedCents, oldBalanceOwedCents, postAnchor, planTender, recordedMessage, lateFeeDeleteRefusalText, lateFeeOutcomeText,
   serverMessage, serverStatus, readerChoiceParams, readerQuoteQuery, readerReady, readerLeases, withReaderTaken, readerFinishedMessage,
   postConfirmQuestion, numberRequired, tenantCreditLines, tenantCreditHeadline,
-  readShowLineItems, writeShowLineItems, ledgerMatches, stillOweLine,
   deskFigures, sameFigures, figuresMovedMessage, payerHits, matchPayerHits, returnDetail, chargeMonthsRange,
-  readChargesById, plainRefusal, localToday, calendarDay, localDayOf, chargeTimeliness, awaitingOpensAtWord,
-  type DeskQuote, type DeskQuoteRow, type TenderInput, type OutstandingRow, type LedgerPayment, type PickerLease,
+  readChargesById, plainRefusal, localToday, calendarDay, localDayOf, awaitingOpensAtWord,
+  billsBySpace, pickBillName, billsClearedByAmount, wholeBillAmountsCents,
+  type DeskQuote, type DeskQuoteBill, type DeskQuoteRow, type TenderInput, type OutstandingRow, type PickerLease,
 } from './creditDesk'
 import { PAYMENT_STATUSES, PAYMENT_STATUS_LABEL } from '@gam/shared'
 
@@ -103,8 +103,8 @@ describe('Outstanding Balances (decisions #29)', () => {
   })
   it('says how late in days (the server counts it, grace honored), and nothing when not late', () => {
     expect(daysLateText(0)).toBeNull()
-    expect(daysLateText(1)).toBe('1 day late')
-    expect(daysLateText(12)).toBe('12 days late')
+    expect(daysLateText(1)).toBe('1 day past grace')
+    expect(daysLateText(12)).toBe('12 days past grace')
   })
 
   const twoParks: OutstandingRow = {
@@ -215,6 +215,57 @@ describe('the desk window: Use or Save (Nic, 10/2)', () => {
   it('never asks when there is no credit', () => {
     expect(creditChoiceNeeded(quote())).toBe(false)
     expect(creditToUseFor(quote(), null)).toBeUndefined()
+  })
+
+  // 10/26 (Nic): "if the landlord's choice is to use it, they don't ever see
+  // anything except a statement". His worry was the cash payer — the desk has
+  // always asked Use/Save, so a cash payer COULD hold credit, but it asked
+  // without regard to the property setting, so a property set to use the
+  // credit still offered Save.
+  describe('where the landlord turned saving off (creditMustBeUsed)', () => {
+    const forced = (over: Partial<DeskQuote> = {}) =>
+      quote({ rows: [row({ amount: 935.45 })], creditAvailable: 450, creditMustBeUsed: true, ...over })
+
+    it('asks nothing and records without an answer', () => {
+      const q = forced()
+      expect(creditChoiceNeeded(q)).toBe(false)
+      const p = planTender(q, tender({ tenderedCents: 48545 }))
+      expect(p.stop).toBeNull()
+      expect(p.body).toEqual({ method: 'cash', amountTendered: 485.45, creditToUse: 450 })
+    })
+
+    it('owes the bill MINUS the credit with no answer given — the figure the server will charge', () => {
+      // The bug this guards: reading "no question asked" as "credit saved"
+      // would show $935.45 owed while the server spent the credit.
+      expect(deskOwedCents(forced(), null)).toBe(48545)
+      expect(planTender(forced(), tender({ tenderedCents: 48545 })).creditUsedCents).toBe(45000)
+    })
+
+    it('still sends the credit figure, so a credit that moved is refused not spent', () => {
+      expect(creditToUseFor(forced(), null)).toBe(450)
+      expect(creditToUseFor(forced(), null, 44000)).toBe(440)
+    })
+
+    it('takes nothing when the credit covers the whole bill', () => {
+      const q = forced({ rows: [row({ amount: 400 })], creditAvailable: 450 })
+      const p = planTender(q, tender({ tenderedCents: null }))
+      expect(p.stop).toBeNull()
+      expect(p.owedCents).toBe(0)
+    })
+
+    it('leaves the question alone where saving is allowed', () => {
+      const q = quote({ rows: [row({ amount: 935.45 })], creditAvailable: 450, creditMustBeUsed: false })
+      expect(creditChoiceNeeded(q)).toBe(true)
+      expect(planTender(q, tender({ tenderedCents: 48545 })).stop).toBe('choose_credit')
+      expect(deskOwedCents(q, null)).toBe(93545)
+    })
+
+    it('no credit means no statement either', () => {
+      const q = quote({ creditAvailable: 0, creditMustBeUsed: true })
+      expect(creditChoiceNeeded(q)).toBe(false)
+      expect(creditToUseFor(q, null)).toBeUndefined()
+      expect(planTender(q, tender({ tenderedCents: Math.round(q.currentTotal * 100) })).creditUsedCents).toBe(0)
+    })
   })
   it('Use owes exactly the bill minus the credit and sends the figure shown; Save owes the whole bill and sends 0', () => {
     const q = quote({ rows: [row({ amount: 935.45 })], creditAvailable: 450 })
@@ -543,37 +594,6 @@ describe('the tenant page shows total credit and usable credit', () => {
 })
 
 describe('the Payments ledger (decisions #26, #29)', () => {
-  const p: LedgerPayment = {
-    id: 'x', name: 'Jane Doe', unitNumber: 'RV 14', propertyName: 'Mountain View', paidOn: '2026-10-01',
-    owed: 925, amount: 925, creditApplied: 0, returned: 0, creditReturned: 0, methodLabel: 'Card', status: 'settled',
-    statusLabel: 'Paid', paidFor: 'October rent', daysLate: 0, timingLabel: 'On time',
-  }
-  it('searches who, where and what it paid for', () => {
-    expect(ledgerMatches(p, 'jane')).toBe(true)
-    expect(ledgerMatches(p, 'rv 14')).toBe(true)
-    expect(ledgerMatches(p, 'october')).toBe(true)
-    expect(ledgerMatches(p, 'trash')).toBe(false)
-  })
-  it('the current month points to Outstanding Balances with a count, never dollars', () => {
-    expect(stillOweLine(3)).toBe('3 households still owe — see Outstanding Balances')
-    expect(stillOweLine(1)).toBe('1 household still owes — see Outstanding Balances')
-    expect(stillOweLine(0)).toBeNull()
-    expect(stillOweLine(null)).toBeNull()
-  })
-  it('remembers Show line items per person, off by default', () => {
-    const data: Record<string, string> = {}
-    const store = { getItem: (k: string) => data[k] ?? null, setItem: (k: string, v: string) => { data[k] = v } }
-    expect(readShowLineItems('u1', store)).toBe(false)
-    writeShowLineItems('u1', true, store)
-    expect(readShowLineItems('u1', store)).toBe(true)
-    expect(readShowLineItems('u2', store)).toBe(false)
-  })
-  it('blocked storage never breaks the page (the toggle just is not remembered)', () => {
-    const broken = { getItem: () => { throw new Error('blocked') }, setItem: () => { throw new Error('blocked') } }
-    expect(readShowLineItems('u1', broken)).toBe(false)
-    expect(() => writeShowLineItems('u1', true, broken)).not.toThrow()
-    expect(readShowLineItems('u1', null)).toBe(false)
-  })
   it('says why a payment came back in words, with the bank code beside it and the zero-tolerance mark', () => {
     expect(returnDetail({ returnCode: 'R01', returnReason: 'Insufficient funds', zeroToleranceFlag: false }))
       .toEqual({ text: 'Bank return: there was not enough money in the account (R01)', zeroTolerance: false })
@@ -645,36 +665,16 @@ describe('days on the tenant page are calendar days, never shifted by time zone'
   })
 })
 
-describe('how on time each charge was (the tenant page’s timeliness window)', () => {
-  const today = '2026-10-10'
-  it('paid on the due day in the evening is on time; days after are late', () => {
-    const evening = new Date(2026, 9, 1, 18, 0).toISOString()
-    expect(chargeTimeliness({ status: 'settled', dueDate: '2026-10-01', settledAt: evening }, today))
-      .toMatchObject({ late: 0, label: 'On time', tone: 'good' })
-    const later = new Date(2026, 9, 4, 9, 0).toISOString()
-    expect(chargeTimeliness({ status: 'settled', dueDate: '2026-10-01', settledAt: later }, today))
-      .toMatchObject({ late: 3, label: '3 days late', tone: 'warn' })
-  })
-  it('an open charge past due is overdue by the days since', () => {
-    expect(chargeTimeliness({ status: 'pending', dueDate: '2026-10-01' }, today)).toMatchObject({ late: 9, label: '9 days overdue', tone: 'bad' })
-    expect(chargeTimeliness({ status: 'pending', dueDate: '2026-10-15' }, today)).toMatchObject({ late: 0, label: 'Not paid yet' })
-  })
-  it('a payment clearing or a charge paid from the deposit is never overdue, and every status is said in words', () => {
-    expect(chargeTimeliness({ status: 'processing', dueDate: '2026-10-01' }, today)).toMatchObject({ late: 0, label: 'Clearing', tone: 'info' })
-    expect(chargeTimeliness({ status: 'paid_via_deposit', dueDate: '2026-09-01' }, today)).toMatchObject({ late: 0, label: 'Paid from deposit' })
-    expect(chargeTimeliness({ status: 'failed', dueDate: '2026-10-01' }, today)).toMatchObject({ label: 'Failed', tone: 'bad' })
-    expect(chargeTimeliness({ status: 'returned', dueDate: '2026-10-01' }, today)).toMatchObject({ label: 'Returned', tone: 'bad' })
-  })
-  it('a voided charge (decisions #48.5) reads "Voided" — never "Unknown", never overdue, never late', () => {
-    expect(chargeTimeliness({ status: 'voided', dueDate: '2026-09-01' }, today))
-      .toEqual({ due: '2026-09-01', settled: null, late: 0, label: 'Voided', tone: 'muted' })
+// 10/12 (Nic): the tenant page's per-charge timeliness window (which counted
+// days late from the due date, with no grace) is gone — the Payment Health
+// card opens the household's payment report, where how late is days past the
+// grace period (the server's one rule).
+describe('the desk says every charge status in words', () => {
+  it('a voided charge reads as voided in a refusal', () => {
     expect(plainRefusal('This charge is not open (status: voided)')).toBe('This charge is no longer open — it is voided now.')
   })
-  it('every payment status in the shared list has its own words on the desk', () => {
-    for (const st of PAYMENT_STATUSES) {
-      expect(chargeTimeliness({ status: st, dueDate: '2026-10-20' }, today).label).not.toBe('Unknown')
-      expect(PAYMENT_STATUS_LABEL[st]).toBeTruthy()
-    }
+  it('every payment status in the shared list has its own words', () => {
+    for (const st of PAYMENT_STATUSES) expect(PAYMENT_STATUS_LABEL[st]).toBeTruthy()
   })
 })
 
@@ -809,7 +809,7 @@ describe('10/5: part payments, where the property takes them', () => {
 // ─── 10/6 (Nic): credit against the whole balance; no credit talk on a part payment ──
 
 import {
-  partPaymentLines, backdatedLateFeeText, deskBillBalance, CREDIT_USE_RULE,
+  partPaymentLines, backdatedLateFeeText, deskBillBalance, CREDIT_USE_RULE, CREDIT_REST_NOT_USABLE,
 } from './creditDesk'
 import { placePartPayment } from '@gam/shared'
 
@@ -919,8 +919,18 @@ describe('10/6 (Nic): credit goes on the bill, never held back by the pay-in-ful
     expect(deskBillBalance({ currentTotal: 300, creditAlreadyApplied: 282.36 })).toEqual({ charges: 30000, creditApplied: 28236, stillOwed: 1764 })
     expect(deskBillBalance({ currentTotal: 460, creditAlreadyApplied: 0 })).toEqual({ charges: 46000, creditApplied: 0, stillOwed: 46000 })
   })
-  it('the rule as landlords read it: paid-ahead money goes on by itself, part of a bill allowed', () => {
-    expect(CREDIT_USE_RULE).toMatch(/^Money they paid ahead goes on their balance by itself, oldest bill first — on part of a bill when it cannot pay all of it\./)
+  // 10/18 (Nic): and which money crosses spaces. Money they paid ahead stays
+  // on the space they paid it for; a credit the landlord gives goes on the
+  // oldest bill across every space they hold with him.
+  it('the rule as landlords read it: paid-ahead money goes on by itself on its own space, credit given crosses spaces', () => {
+    expect(CREDIT_USE_RULE).toBe(
+      'Money they paid ahead goes on their balance by itself, oldest bill first — on part of a bill when it cannot pay '
+      + 'all of it, and only on the space they paid it for. Credit you give them goes on their oldest bill first across '
+      + 'every space they hold with you, so credit never sits on an account while they still owe.')
+    expect(CREDIT_REST_NOT_USABLE).toBe(
+      ' The rest cannot pay these bills: money they paid ahead stops at its monthly limit and pays only the space they '
+      + 'paid it for, interest on a deposit pays only that space, and credit pays only your own rent, utilities, late '
+      + 'fees and fees.')
   })
 })
 
@@ -959,5 +969,100 @@ describe('review fix (10/6): no credit talk while a balance is owed, and no "pai
     expect(postAheadText(40000, 300)).toBe('They owe $300.00 now. That is paid first; the other $100.00 is kept as paid ahead and goes on their bills by itself as they come.')
     expect(postAheadText(40000, 0)).toBe('They owe nothing now. The $400.00 is kept as paid ahead and goes on their bills by itself as they come.')
     expect(postAheadText(40000, undefined)).toBeNull()
+  })
+})
+
+describe('10/27 (Nic): the bills are a statement, not a form — no tick boxes', () => {
+  // Billy Miranda: RV 34 and RV 35, two leases, a September and an October bill each.
+  const b = (id: string, leaseId: string, unit: string, dueDate: string, older: string[] = []): DeskQuoteBill => ({
+    id, leaseId, unitNumber: unit, dueDate, total: 100, creditAlreadyApplied: 0, owed: 100, olderBillIds: older,
+    rows: [row({ id: `${id}-rent`, leaseId, unitNumber: unit, dueDate, invoiceId: id })],
+  })
+  const bills = [
+    b('34sep', 'L34', 'RV 34', '2026-09-01'), b('35sep', 'L35', 'RV 35', '2026-09-01'),
+    b('34oct', 'L34', 'RV 34', '2026-10-01', ['34sep']), b('35oct', 'L35', 'RV 35', '2026-10-01', ['35sep']),
+  ]
+
+  it('lists the bills by space, oldest first, named by month', () => {
+    const g = billsBySpace(bills)
+    expect(g.map(x => [x.label, x.bills.map(y => y.id)])).toEqual([['Space RV 34', ['34sep', '34oct']], ['Space RV 35', ['35sep', '35oct']]])
+    expect(pickBillName(bills[2])).toBe('October bill')
+  })
+
+  // 10/27: the helpers that decided WHICH bills a payment paid are gone —
+  // canPickBill, togglePick, picksStillOpen, quoteMatchesPick. The desk takes
+  // the whole balance and the server lands it oldest bill first, so there is
+  // nothing left to choose or to keep in step. What stays is the grouping that
+  // makes the bills readable, tested above.
+
+  it('the amount names the bills: a run of whole bills from the oldest, or nothing', () => {
+    // Billy's bills come to 457.07, 445.22 and 370.13 in the quote's order.
+    const b3 = [
+      { id: '34sep', owed: 457.07 }, { id: '35sep', owed: 445.22 }, { id: '34oct', owed: 370.13 },
+    ]
+    expect(billsClearedByAmount(b3, 45707)).toEqual(['34sep'])
+    expect(billsClearedByAmount(b3, 90229)).toEqual(['34sep', '35sep'])
+    expect(billsClearedByAmount(b3, 127242)).toEqual(['34sep', '35sep', '34oct'])
+    // A cent out, a bill left half-paid, or more than the lot: names nothing.
+    expect(billsClearedByAmount(b3, 45706)).toEqual([])
+    expect(billsClearedByAmount(b3, 50000)).toEqual([])
+    expect(billsClearedByAmount(b3, 127243)).toEqual([])
+    // Never a later bill without the ones before it: 445.22 is the SECOND
+    // bill's own figure and pays no run.
+    expect(billsClearedByAmount(b3, 44522)).toEqual([])
+    expect(billsClearedByAmount(b3, 0)).toEqual([])
+    expect(billsClearedByAmount(undefined, 45707)).toEqual([])
+    expect(billsClearedByAmount([], 45707)).toEqual([])
+    // The amounts the desk can be told about.
+    expect(wholeBillAmountsCents(b3)).toEqual([45707, 90229, 127242])
+    expect(wholeBillAmountsCents([])).toEqual([])
+  })
+
+  it('Record has a charge to post to, and the reader still lists every space', () => {
+    const q = quote({ rows: [], anchorOpen: false, bills })
+    expect(postAnchor(q)).toBe('34sep-rent')
+    expect(readerLeases(q).map(x => x.leaseId)).toEqual(['L34', 'L35'])
+  })
+})
+
+// 10/26 (Nic): "the platform needs to operate the same per setting, no matter
+// which angle you're coming in from." The card reader asks its own Use/Save
+// per space, separate from the cash window's, so it needed the same fix.
+describe('the card reader where the landlord turned saving off', () => {
+  const rq = (over: Record<string, unknown> = {}) => ({
+    outstanding: 935.45, usableCredit: 450, needsCreditChoice: false, useCredit: true,
+    creditUsed: 450, creditApplied: 450, oldBalance: 0, towardOldBalance: 0, paidAhead: 0,
+    balance: 485.45, cardFee: 0, total: 485.45, lineItems: [], creditMustBeUsed: true, ...over,
+  }) as any
+
+  it('is ready to send without an answer', () => {
+    expect(readerReady(rq(), null)).toEqual({ ready: true, reason: null })
+  })
+
+  it('still waits for an answer where saving is allowed', () => {
+    const r = readerReady(rq({ creditMustBeUsed: false, needsCreditChoice: true }), null)
+    expect(r.ready).toBe(false)
+    expect(r.reason).toContain('use their')
+  })
+
+  it('sends the credit figure with the charge so a moved credit is refused', () => {
+    // Nobody answered, but the figure shown still travels with the charge —
+    // otherwise a credit that changed between quote and tap would be spent at
+    // whatever it had become.
+    expect(readerChoiceParams(450, null, null, true)).toEqual({ useCredit: true, expectedCredit: 450 })
+    // Saving allowed and unanswered: nothing to send yet.
+    expect(readerChoiceParams(450, null, null, false)).toEqual({})
+    // No credit at all: nothing either way.
+    expect(readerChoiceParams(0, null, null, true)).toEqual({})
+  })
+
+  it('an explicit answer still wins where one was given', () => {
+    expect(readerChoiceParams(450, 'save', null, false)).toEqual({ useCredit: false, expectedCredit: 450 })
+    expect(readerChoiceParams(450, 'use', null, false)).toEqual({ useCredit: true, expectedCredit: 450 })
+  })
+
+  it('an old-balance amount rides along either way', () => {
+    expect(readerChoiceParams(450, null, 2000, true))
+      .toEqual({ useCredit: true, expectedCredit: 450, towardOldBalance: 20 })
   })
 })

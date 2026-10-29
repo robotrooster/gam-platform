@@ -1,18 +1,33 @@
 /**
- * State landlord/tenant law compliance-warning engine (S442).
+ * State landlord/tenant law catalog lookup + comparison engine (S442).
  * DB mocked — pure lookup + comparison, no legal logic in code.
+ *
+ * 10/20 (Nic): the WARNINGS are hidden behind one platform flag
+ * (STATE_LAW_WARNINGS_FEATURE). Default here is hidden, exactly as in
+ * production — the suites below that exercise the comparison turn the switch
+ * on first, and the switch's own suite proves it both ways.
  */
 
 import { vi, describe, it, expect, beforeEach } from 'vitest'
 
-vi.mock('../db', () => ({ query: vi.fn() }))
+vi.mock('../db', () => ({ query: vi.fn(), queryOne: vi.fn() }))
 
-import { query } from '../db'
-import { getApplicableActs, checkAgainstStatute, buildDisclaimer, detectStubbedCategory } from './stateLaw'
+import { query, queryOne } from '../db'
+import {
+  getApplicableActs, checkAgainstStatute, checkLeaseAgainstStateLaw,
+  buildDisclaimer, detectStubbedCategory, stateLawWarningsEnabled,
+  STATE_LAW_WARNINGS_FEATURE,
+} from './stateLaw'
 
 const mockQuery = query as unknown as ReturnType<typeof vi.fn>
+const mockQueryOne = queryOne as unknown as ReturnType<typeof vi.fn>
 
-beforeEach(() => { vi.clearAllMocks() })
+/** The system_features row that turns the warnings back on. */
+const switchOn = () => mockQueryOne.mockResolvedValue({ enabled: true })
+/** No row at all — how production reads today. */
+const switchMissing = () => mockQueryOne.mockResolvedValue(undefined)
+
+beforeEach(() => { vi.clearAllMocks(); switchMissing() })
 
 describe('getApplicableActs', () => {
   it('uppercases the state and matches the unit type against unit_types', async () => {
@@ -48,6 +63,9 @@ describe('detectStubbedCategory (broad real-estate areas not yet ingested)', () 
 })
 
 describe('checkAgainstStatute (objective factual mismatch, not legal advice)', () => {
+  // The comparison itself, with the warning switch deliberately turned on.
+  beforeEach(() => { switchOn() })
+
   it('flags a value ABOVE a max figure, stated factually + hedged + cited', async () => {
     mockQuery.mockResolvedValueOnce([{
       topic: 'late_fee', rule_kind: 'max', threshold_numeric: '5', threshold_unit: 'dollars per day',
@@ -94,5 +112,67 @@ describe('buildDisclaimer (no-guidance posture)', () => {
     expect(d).toMatch(/compare it to what you/i)
     expect(d).toMatch(/newer version/i)
     expect(d).toMatch(/attorney/i)
+  })
+})
+
+describe('the state-law warning switch (10/20 — hidden, not deleted)', () => {
+  it('is OFF when no system_features row exists — how production reads today', async () => {
+    switchMissing()
+    expect(await stateLawWarningsEnabled()).toBe(false)
+    expect(mockQueryOne.mock.calls[0][1]).toEqual([STATE_LAW_WARNINGS_FEATURE])
+  })
+
+  it('hidden: checkAgainstStatute gives no flag and never opens the catalog', async () => {
+    switchMissing()
+    expect(await checkAgainstStatute('AZ', 'late_fee', 100)).toBeNull()
+    expect(mockQuery).not.toHaveBeenCalled()
+  })
+
+  it('hidden: the lease composer returns no warnings and never opens the catalog', async () => {
+    switchMissing()
+    const flags = await checkLeaseAgainstStateLaw({
+      stateCode: 'AZ', rentAmount: 1000, securityDepositAmount: 3000,
+      lateFeeInitialAmount: 25, lateFeeInitialType: 'percent_of_rent', lateFeeGraceDays: 0,
+    })
+    expect(flags).toEqual([])
+    expect(mockQuery).not.toHaveBeenCalled()
+  })
+
+  it('flipped ON: the same deposit flags again, so nothing was demolished', async () => {
+    switchOn()
+    mockQuery.mockResolvedValue([{
+      topic: 'deposit_max_months', rule_kind: 'max', threshold_numeric: '1.5',
+      threshold_unit: 'months of rent', summary: 'cap 1.5 months',
+      statute_citation: 'A.R.S. § 33-1321', source_url: 'u', source_date: '2026-06-09',
+    }])
+    const flags = await checkLeaseAgainstStateLaw({
+      stateCode: 'AZ', rentAmount: 1000, securityDepositAmount: 3000,
+    })
+    expect(flags).toHaveLength(1)
+    expect(flags[0].topic).toBe('deposit_max_months')
+    expect(flags[0].message).toMatch(/above the 1\.5 months of rent/i)
+    expect(flags[0].disclaimer).toMatch(/not legal advice/i)
+  })
+
+  it('a row that is explicitly disabled stays hidden', async () => {
+    mockQueryOne.mockResolvedValue({ enabled: false })
+    expect(await stateLawWarningsEnabled()).toBe(false)
+    expect(await checkAgainstStatute('AZ', 'late_fee', 100)).toBeNull()
+  })
+
+  it('a DB failure reading the switch reads as hidden, never as a warning', async () => {
+    mockQueryOne.mockRejectedValue(new Error('db down'))
+    expect(await stateLawWarningsEnabled()).toBe(false)
+    expect(await checkAgainstStatute('AZ', 'late_fee', 100)).toBeNull()
+    expect(await checkLeaseAgainstStateLaw({
+      stateCode: 'AZ', rentAmount: 1000, securityDepositAmount: 9000,
+    })).toEqual([])
+  })
+
+  it('a lease with no state still costs no query at all', async () => {
+    switchMissing()
+    expect(await checkLeaseAgainstStateLaw({ stateCode: null, rentAmount: 1000 })).toEqual([])
+    expect(mockQueryOne).not.toHaveBeenCalled()
+    expect(mockQuery).not.toHaveBeenCalled()
   })
 })

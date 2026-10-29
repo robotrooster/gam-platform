@@ -7,6 +7,7 @@ import { Check, DollarSign, X } from 'lucide-react'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 import { useAuth } from '../context/AuthContext'
 import { ChangeSignInEmail } from '../components/ChangeSignInEmail'
+import { BirthdayField } from '../components/BirthdayField'
 import { usePerms } from '../lib/permissions'
 import { NotificationPrefsSection } from './NotificationPrefsPage'
 
@@ -345,6 +346,10 @@ export function SettingsPage() {
                 )}
               </div>
             )}
+
+            {/* 10/13 (Nic): the landlord's own birthday, for GAM's
+                happy-birthday email. Shows for landlord accounts only. */}
+            <BirthdayField />
 
             {/* S630: the sign-in email must be one the owner keeps, not one
                 that transfers with a property being sold. */}

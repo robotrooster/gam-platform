@@ -433,8 +433,8 @@ describe('Money billed: rent a shortened stay moved to credit with no anchor bil
   })
 })
 
-describe('the charges behind a Money billed total net a shortened stay from its bill', () => {
-  it('the monthly statement lists the November rent shortened by $300 at $160 billed and $160 collected, and collected never runs past income', async () => {
+describe('the Charged column nets a shortened stay from its bill', () => {
+  it('the monthly statement charges the November rent shortened by $300 at $160, $160 collected, and collected never runs past Charged', async () => {
     process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_reports'
     const w = await world()
     const nov = await charge(w, { amount: 460, due: '2026-11-01', settledAt: '2026-10-25T10:00:00-07:00', manual: 'cash' })
@@ -451,13 +451,16 @@ describe('the charges behind a Money billed total net a shortened stay from its 
       .set('Authorization', `Bearer ${token}`)
     expect(res.status).toBe(200)
     const d = res.body.data
-    expect(d.summary.totalIncome).toBe(160)
-    expect(d.summary.totalCollected).toBe(160)
-    expect(d.rowsTotal).toBe(160)
-    expect(d.payments).toHaveLength(1)
-    expect(d.payments[0].amount).toBe(160)
-    expect(d.payments[0].parts).toEqual({ paid: 160 })
-    expect(d.payments[0].category).toBe('space_rent')
+    // 10/12 (Nic): no switch — the statement carries Charged beside Received.
+    // November's rent bill is charged at $160 (460 less the $300 the shortened
+    // stay moved to credit) and collected; the cash arrived in October, so
+    // November received nothing and lists no payment.
+    expect(d.view).toMatchObject({ charged: 160, received: 0, owed: 0, collected: 160 })
+    expect(d.view.tie.charged).toEqual({ collected: 160, clearing: 0, owed: 0, other: 0 })
+    expect(d.view.collected).toBeLessThanOrEqual(d.view.charged)
+    expect(d.view.categories).toEqual([{ category: 'space_rent', label: 'Lot/space rent', charged: 160, received: 0, owed: 0 }])
+    expect(d.summary.totalIncome).toBe(0)
+    expect(d.payments).toHaveLength(0)
   })
 })
 

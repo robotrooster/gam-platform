@@ -19,6 +19,8 @@
  * runner that charges can never disagree about which day is safe.
  */
 
+import { lateFeeStartDate } from './lateFees';
+
 const iso = (y: number, m: number, d: number) =>
   `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
 
@@ -53,7 +55,7 @@ export interface AutopayLateness {
   daysAfterDue: number;
   /** True when a late fee would apply under this lease. */
   isLate: boolean;
-  /** The first date a fee applies: dueDate + grace. */
+  /** The first date a fee applies: dueDate + grace (the day after the due date with a grace of 0). */
   lateFrom: string;
 }
 
@@ -61,10 +63,15 @@ export interface AutopayLateness {
  * Would autopay on `pullDay` be charged a late fee?
  *
  * Mirrors the late-fee engine's own gate exactly — a fee applies when the date
- * is ON OR AFTER dueDate + graceDays — so the last free day is the day before
- * that. Initiating inside the window is genuinely safe rather than merely
- * untested: the engine skips an invoice with an in-flight payment, so an ACH
- * that starts on the last free day never accrues a fee while it clears.
+ * is ON OR AFTER its first late day (lateFeeStartDate) — so the last free day is
+ * the day before that. Initiating inside the window is genuinely safe rather
+ * than merely untested: the engine skips an invoice with an in-flight payment,
+ * so an ACH that starts on the last free day never accrues a fee while it
+ * clears.
+ *
+ * 10/12 (Nic): "zero grace: NEXT DAY is late (paying on the due date is on
+ * time)". The first late day is dueDate + max(grace, 1), so with a grace of 0
+ * paying on the due date is on time. This said the due date itself was late.
  */
 export function autopayLateness(
   dueDate: string,
@@ -74,14 +81,11 @@ export function autopayLateness(
 ): AutopayLateness {
   const payDate = autopayPayDate(dueDate, pullDay);
   const daysAfterDue = Math.max(0, daysBetween(dueDate, payDate));
-  const [y, m, d] = dueDate.split('-').map(Number);
-  const lateFromMs = Date.UTC(y, m - 1, d + graceDays);
-  const lf = new Date(lateFromMs);
-  const lateFrom = iso(lf.getUTCFullYear(), lf.getUTCMonth() + 1, lf.getUTCDate());
+  const lateFrom = lateFeeStartDate(dueDate, graceDays);
   return {
     payDate,
     daysAfterDue,
     lateFrom,
-    isLate: lateFeeEnabled && daysAfterDue >= graceDays,
+    isLate: lateFeeEnabled && payDate >= lateFrom,
   };
 }

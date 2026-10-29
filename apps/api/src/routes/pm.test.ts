@@ -584,7 +584,8 @@ describe('GET /api/pm/companies/:id/properties/:propertyId/drilldown', () => {
     expect(Array.isArray(res.body.data.active_leases)).toBe(true)
     expect(Array.isArray(res.body.data.recent_maintenance)).toBe(true)
     expect(res.body.data.mtd_fee_impact).toBeDefined()
-    // S487 state-law block always present (empty when within range).
+    // S487 state-law block always present, and always empty since 10/20 — see
+    // the PM drilldown test below.
     expect(Array.isArray(res.body.data.property.state_law_warnings)).toBe(true)
   })
 
@@ -616,7 +617,12 @@ describe('GET /api/pm/companies/:id/properties/:propertyId/drilldown', () => {
     expect(res.body.error).toMatch(/suspended/i)
   })
 
-  it('S487: NV property with 10% percent-of-rent above cap → state_law_warnings populated', async () => {
+  it('hidden 10/20: NV property 10% over the seeded cap → the PM drilldown shows nothing', async () => {
+    // Nic, 10/20: "There should be no state law warnings anywhere in the
+    // system. At least not right now. Just hide all that stuff." The PM
+    // company sees what the landlord sees, which is now nothing. One switch
+    // (system_features.state_law_warnings_enabled) brings it back — proven
+    // both ways in services/stateLaw.test.ts.
     const owner = await seedUser()
     const cId = await createCompany(owner.token)
     const { propertyId } = await seedPmManagedProperty({
@@ -634,11 +640,8 @@ describe('GET /api/pm/companies/:id/properties/:propertyId/drilldown', () => {
       .get(`/api/pm/companies/${cId}/properties/${propertyId}/drilldown`)
       .set('Authorization', `Bearer ${owner.token}`)
     expect(res.status).toBe(200)
-    const warnings = res.body.data.property.state_law_warnings
-    expect(warnings.length).toBe(1)
-    expect(warnings[0].topic).toBe('late_fee_max_pct')
-    expect(warnings[0].message).toMatch(/above the 5/)
-    expect(warnings[0].message).toMatch(/NV/)
+    expect(res.body.data.property.state_law_warnings).toEqual([])
+    expect(JSON.stringify(res.body)).not.toMatch(/not legal advice|NRS /i)
   })
 })
 

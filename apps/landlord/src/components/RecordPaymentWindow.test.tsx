@@ -38,6 +38,8 @@ const server = vi.hoisted(() => ({
   showHold: null as Promise<void> | null,
   /** When set, reading the desk bill waits on it (a slow read). */
   quoteHold: null as Promise<void> | null,
+  /** When set, the desk bill is worked out from its URL (10/14: the bills ticked, ?bills=). */
+  quoteFor: null as ((url: string) => any) | null,
 }))
 
 const httpError = (status: number, error: string) =>
@@ -48,7 +50,7 @@ vi.mock('../lib/api', () => ({
     server.gets.push(url)
     if (url.includes('/record-manual/quote')) {
       if (server.quoteHold) await server.quoteHold
-      return JSON.parse(JSON.stringify(server.quote))
+      return JSON.parse(JSON.stringify(server.quoteFor ? server.quoteFor(url) : server.quote))
     }
     if (url.startsWith('/balances/')) return []
     if (url.startsWith('/payments?type=rent')) {
@@ -128,7 +130,7 @@ beforeEach(() => {
   server.recordHold = null; server.readerQuoteFor = null; server.readerGate = null; server.rentPages = null
   server.onCapture = null
   server.readers = [{ stripeReaderId: 'rdr_1', nickname: 'Front desk reader' }]
-  server.closed = new Set(); server.showHold = null; server.quoteHold = null
+  server.closed = new Set(); server.showHold = null; server.quoteHold = null; server.quoteFor = null
   server.intentStatus = 'requires_payment_method'
   server.readerQuote = null
   onClose = vi.fn(); onRecorded = vi.fn()
@@ -1127,5 +1129,138 @@ describe('a card waiting on its bank is said on its own line at the desk', () =>
     server.quote = allHeld([card])
     await act(async () => { await new Promise(r => setTimeout(r, 400)) })
     expect(quoteReads()).toBe(2)
+  })
+})
+
+// ── 10/27: NO TICK BOXES AT THE DESK ────────────────────────────────────────
+//
+// 10/14 gave each bill a tick box. On 10/27 it stopped a resident's cash:
+// "the front desk buttons are not working ... The only button working is the
+// card on the reader button, and Lisa Scheeler has cash for her trailer
+// payment." Every way of paying by hand waited on a box; the reader button was
+// the only one that never did.
+//
+// Nic's call: "that checkbox beside each bill before cash check or money order
+// can turn on, that is something you decided. That's not what I want at all.
+// That's clunky. That adds an extra step to things that just need to be
+// smooth. Disable that checkbox. There's no reason for it to exist."
+//
+// So the desk takes the whole balance, the server lands it oldest bill first,
+// and the bills are shown as a statement of what the money covered.
+describe('10/27: the desk takes the balance — no bills to tick', () => {
+  const BILL = '2f34d230-b6ae-47cb-a603-f529f4016cf4'
+  const ROW  = '3a2e0585-9ed5-4ebc-929c-55f3830b89fe'
+  const lisaRow = {
+    id: ROW, leaseId: 'LMH1', invoiceId: BILL, type: 'home_payment', entryDescription: 'HOMEPMT',
+    amount: 333.33, dueDate: '2026-10-10', creditAlreadyApplied: 0, creditIfUsed: 0,
+    notes: 'Home payment 1 of 34', unitNumber: 'MH 01', propertyName: 'Mountain View RV Ranch',
+  }
+  const lisaBill = {
+    id: BILL, leaseId: 'LMH1', unitNumber: 'MH 01', dueDate: '2026-10-10',
+    total: 333.33, creditAlreadyApplied: 0, owed: 333.33, olderBillIds: [], rows: [lisaRow],
+  }
+
+  it("Lisa's trailer payment: nothing to tick, Cash is live, and the cash records", async () => {
+    server.quote = deskQuote(0, {
+      rows: [lisaRow], currentTotal: 333.33, owedIfUsed: 333.33, owedIfSaved: 333.33,
+      fullBalance: 333.33, bills: [lisaBill], pickedBillIds: null, bankDepositAllowed: false,
+    })
+    await open()
+    // No box, no instruction to find one.
+    expect(host.querySelector('input[type=checkbox]')).toBeNull()
+    expect(text()).not.toContain('Tick the bills')
+    // The bill is read whole: no ?bills= on the read at all.
+    expect(server.gets.filter(u => u.includes('/record-manual/quote')))
+      .toEqual(['/payments/r1/record-manual/quote'])
+    // Live the moment the window opens, with the bill's own figures on screen.
+    expect(button(/^Cash$/)!.disabled).toBe(false)
+    expect(text()).toContain('Home payment')
+    expect(text()).toContain('$333.33')
+
+    await press(/^Cash$/)
+    await type(amountBox(), '333.33')
+    await press(/^Record \$333\.33/)
+    await until(() => records().length === 1, 'the cash recorded')
+    expect(records()[0]).toMatchObject({ method: 'cash', amountTendered: 333.33 })
+    // Nothing names bills any more — the server decides where it lands.
+    expect(records()[0].bills).toBeUndefined()
+  })
+
+  // Billy Miranda: RV 34 and RV 35 on two leases, three open bills between them.
+  const line = (id: string, leaseId: string, unit: string, dueDate: string, amount: number, invoiceId: string) => ({
+    id, leaseId, invoiceId, type: 'rent', entryDescription: 'RENT', amount, dueDate,
+    creditAlreadyApplied: 0, notes: null, unitNumber: unit, propertyName: 'Oak Park',
+  })
+  const bill = (id: string, leaseId: string, unit: string, dueDate: string, amount: number, older: string[] = []) => ({
+    id, leaseId, unitNumber: unit, dueDate, total: amount, creditAlreadyApplied: 0, owed: amount, olderBillIds: older,
+    rows: [line(`${id}-rent`, leaseId, unit, dueDate, amount, id)],
+  })
+  const bills = [
+    bill('34sep', 'L34', 'RV 34', '2026-09-01', 457.07),
+    bill('35sep', 'L35', 'RV 35', '2026-09-01', 445.22),
+    bill('34oct', 'L34', 'RV 34', '2026-10-01', 370.13, ['34sep']),
+  ]
+
+  it('several bills across two spaces: all of them listed and taken together, still no boxes', async () => {
+    const rows = bills.flatMap(b => b.rows)
+    server.quote = deskQuote(0, {
+      rows, currentTotal: 1272.42, owedIfUsed: 1272.42, owedIfSaved: 1272.42,
+      fullBalance: 1272.42, bills, pickedBillIds: null,
+    })
+    await open()
+    expect(host.querySelectorAll('input[type=checkbox]').length).toBe(0)
+    expect(text()).not.toContain('Tick the bills')
+    // Each bill named under its own space, oldest first — a statement to read out.
+    expect(text()).toContain('Space RV 34')
+    expect(text()).toContain('Space RV 35')
+    expect(text()).toContain('September bill')
+    expect(text()).toContain('October bill')
+    expect(text()).toContain('These bills')
+    expect(button(/^Cash$/)!.disabled).toBe(false)
+
+    await press(/^Cash$/)
+    await type(amountBox(), '1272.42')
+    await press(/^Record \$1,?272\.42/)
+    await until(() => records().length === 1, 'the record')
+    expect(records()[0]).toMatchObject({ method: 'cash', amountTendered: 1272.42 })
+    expect(records()[0].bills).toBeUndefined()
+  })
+
+  // What the boxes used to do, done by the amount instead: the bills are paid
+  // oldest first, so one month's rent pays that month's bill whole.
+  const threeBills = () => deskQuote(0, {
+    rows: bills.flatMap(b => b.rows), currentTotal: 1272.42, owedIfUsed: 1272.42,
+    owedIfSaved: 1272.42, fullBalance: 1272.42, bills, pickedBillIds: null,
+    partialPaymentsAllowed: false,
+  })
+
+  it("one space's September rent is taken where the property is pay-in-full — the amount names the bill", async () => {
+    server.quote = threeBills()
+    await open()
+    await press(/^Cash$/)
+    await type(amountBox(), '457.07')
+    await press(/^Record \$457\.07/)
+    await until(() => records().length === 1, 'September taken on its own')
+    expect(records()[0]).toMatchObject({ method: 'cash', amountTendered: 457.07 })
+  })
+
+  it('the oldest two bills together are taken as well', async () => {
+    server.quote = threeBills()
+    await open()
+    await press(/^Cash$/)
+    await type(amountBox(), '902.29')
+    await until(() => !!button(/^Record \$902\.29/) && !button(/^Record \$902\.29/)!.disabled, 'both September bills')
+  })
+
+  it('an amount that leaves a bill half-paid is still refused, and says which amounts work', async () => {
+    server.quote = threeBills()
+    await open()
+    await press(/^Cash$/)
+    await type(amountBox(), '500.00')
+    await until(() => text().includes('That is $772.42 short'), 'the pay-in-full refusal')
+    expect(text()).toContain('Whole bills can be taken: $457.07 pays the September bill')
+    expect(text()).toContain('$902.29 pays the oldest 2 bills')
+    expect(text()).toContain('$1,272.42 pays all of it')
+    expect(button(/^Record /)!.disabled).toBe(true)
   })
 })

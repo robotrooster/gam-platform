@@ -170,6 +170,20 @@ describe('moveInRentAmount — pure math', () => {
     const got = moveInRentAmount(1000, '2026-02-28')
     expect(got).toBeCloseTo(1000 / 28, 1)
   })
+
+  // 10/18 (Nic): "moving in or out at the middle of a month and also only if
+  // the landlord allows the pro rate." The park that answers No bills the whole
+  // month they moved into — this is the fallback path, for a lease with no page
+  // 8 values; a lease that has them is billed what was signed.
+  it('a park where a whole month is a whole month bills the month, not the days', () => {
+    expect(moveInRentAmount(1000, '2026-01-15', false, 1, false)).toBe(1000)
+    expect(moveInRentAmount(1000, '2026-01-15', false, 15, false)).toBe(1000)
+    // Left out, or yes: the proration every property has always had.
+    expect(moveInRentAmount(1000, '2026-01-15', false, 1, true)).toBeCloseTo(17 / 31 * 1000, 1)
+    expect(moveInRentAmount(1000, '2026-01-15', false, 1)).toBeCloseTo(17 / 31 * 1000, 1)
+    // An onboarding resident was always billed a whole month either way.
+    expect(moveInRentAmount(1000, '2026-01-15', true, 1, false)).toBe(1000)
+  })
 })
 
 describe('generateMoveInInvoice', () => {
@@ -908,10 +922,12 @@ async function seedPastDueInvoice(args: {
   const client = await getClient()
   try {
     const inv = await client.query<{ id: string }>(
+      // 10/12 (Nic): written before it came due, as the monthly run writes it
+      // (a bill written after its due date counts from the day it was written).
       `INSERT INTO invoices
          (landlord_id, tenant_id, lease_id, unit_id, invoice_number,
-          due_date, subtotal_rent, total_amount, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'pending')
+          due_date, subtotal_rent, total_amount, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'pending', $6::date - 3)
        RETURNING id`,
       [
         args.stack.landlordId, args.stack.tenantId, args.stack.leaseId,

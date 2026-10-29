@@ -201,6 +201,7 @@ export async function createFlexChargeAccount(args: {
         WHERE tenant_id = $1
           AND flex_deposit_enabled = TRUE
           AND flex_deposit_plan_status IN ('active', 'accelerated')
+          AND status <> 'voided'
         LIMIT 1`,
       [tenantId],
     )
@@ -1187,24 +1188,60 @@ export async function reconcileSettledFlexChargeStatement(paymentId: string): Pr
     const merchantPayout = takeGamFee
       ? Math.max(0, fcRound2(Number(stmt.minimum_due) - Number(stmt.service_fee)))
       : fcRound2(Number(stmt.minimum_due))
-    const stripe = getStripe()
-    await stripe.transfers.create(
-      {
-        amount:      Math.round(merchantPayout * 100),
-        currency:    'usd',
-        destination: connect.stripe_connect_account_id,
-        description: `FlexCharge merchant payout — statement ${stmt.id}`,
-        metadata: {
-          gam_purpose:      'flexcharge_merchant_payout',
-          gam_statement_id: stmt.id,
-          gam_account_id:   stmt.account_id,
-          gam_landlord_id:  stmt.landlord_id,
-        },
+    // 10/12 (Nic, ledger P0, design M0b): recorded before Stripe is asked
+    // (platform_transfer_intents, purpose 'flexcharge_merchant'), so the
+    // payout that carries it lists it and the books can post it.
+    if (merchantPayout <= 0) return
+    const { fireRecordedDirectTransfer } = await import('./landlordPassthrough')
+    await fireRecordedDirectTransfer({
+      purpose:                     'flexcharge_merchant',
+      landlordId:                  stmt.landlord_id,
+      destinationConnectAccountId: connect.stripe_connect_account_id,
+      amount:                      merchantPayout,
+      flexchargeStatementId:       stmt.id,
+      idempotencyKey:              `flexcharge_payout_${stmt.id}`,
+      description:                 `FlexCharge merchant payout — statement ${stmt.id}`,
+      metadata: {
+        gam_purpose:      'flexcharge_merchant_payout',
+        gam_statement_id: stmt.id,
+        gam_account_id:   stmt.account_id,
+        gam_landlord_id:  stmt.landlord_id,
       },
-      { idempotencyKey: `flexcharge_payout_${stmt.id}` },
-    )
+    })
   } catch (e) {
     logger.error({ err: e, ctx: stmt.id }, '[flexcharge][merchant-transfer]')
+    // 10/12 (Nic, G4): the merchant's share is owed to them and did not go —
+    // said to an admin, the way every other merchant transfer failure is
+    // (routes/webhooks, services/flexpay, and RECOVER's retry).
+    await flexChargeMerchantTransferFailed(stmt.id, stmt.landlord_id, e, 'statement')
+  }
+}
+
+/**
+ * 10/12 (Nic, G4): a FlexCharge merchant transfer that failed — the first
+ * send here, or RECOVER's automatic retry (services/landlordPassthrough) —
+ * raises the admin notice every other merchant-transfer failure raises. The
+ * money stays on GAM's balance, owed to the merchant, until someone sends it.
+ * Never throws.
+ */
+export const FLEXCHARGE_MERCHANT_TRANSFER_FAILED = 'flexcharge_merchant_transfer_failed'
+export async function flexChargeMerchantTransferFailed(
+  statementId: string | null, landlordId: string | null, err: unknown,
+  when: 'statement' | 'paydown' | 'recovery', extra: Record<string, unknown> = {},
+): Promise<void> {
+  try {
+    const { createAdminNotification } = await import('./adminNotifications')
+    const words = when === 'paydown' ? 'pay-down' : when === 'recovery' ? 'retried automatically' : 'statement'
+    await createAdminNotification({
+      severity: 'warn',
+      category: FLEXCHARGE_MERCHANT_TRANSFER_FAILED,
+      title: `FlexCharge merchant Transfer failed (${words}) — statement ${statementId ?? 'unknown'}`,
+      body: `The merchant's share was not sent: ${err instanceof Error ? err.message : String(err)}. ` +
+        'It stays on GAM\'s balance, owed to the merchant, until it is sent.',
+      context: { statement_id: statementId, landlord_id: landlordId, when, ...extra },
+    })
+  } catch (e2) {
+    logger.error({ err: e2, statementId }, '[flexcharge] could not raise the merchant-transfer failure notice')
   }
 }
 
@@ -1344,25 +1381,28 @@ export async function reconcileFlexChargePaydown(
       ? Math.max(0, fcRound2(amount - Number(stmt.service_fee)))
       : amount
     if (merchantPayout <= 0) return
-    const stripe = getStripe()
-    await stripe.transfers.create(
-      {
-        amount:      Math.round(merchantPayout * 100),
-        currency:    'usd',
-        destination: connect.stripe_connect_account_id,
-        description: `FlexCharge pay-down payout — statement ${stmt.id}`,
-        metadata: {
-          gam_purpose:      'flexcharge_merchant_payout',
-          gam_statement_id: stmt.id,
-          gam_account_id:   stmt.account_id,
-          gam_landlord_id:  stmt.landlord_id,
-          gam_paydown:      'true',
-        },
+    // 10/12 (Nic, ledger P0): recorded before Stripe is asked, as above.
+    const { fireRecordedDirectTransfer } = await import('./landlordPassthrough')
+    await fireRecordedDirectTransfer({
+      purpose:                     'flexcharge_merchant',
+      landlordId:                  stmt.landlord_id,
+      destinationConnectAccountId: connect.stripe_connect_account_id,
+      amount:                      merchantPayout,
+      flexchargeStatementId:       stmt.id,
+      idempotencyKey:              `flexcharge_paydown_${paymentId}`,
+      description:                 `FlexCharge pay-down payout — statement ${stmt.id}`,
+      metadata: {
+        gam_purpose:      'flexcharge_merchant_payout',
+        gam_statement_id: stmt.id,
+        gam_account_id:   stmt.account_id,
+        gam_landlord_id:  stmt.landlord_id,
+        gam_paydown:      'true',
       },
-      { idempotencyKey: `flexcharge_paydown_${paymentId}` },
-    )
+    })
   } catch (e) {
     logger.error({ err: e, ctx: stmt.id }, '[flexcharge][paydown-transfer]')
+    // 10/12 (Nic, G4): said to an admin, like every merchant-transfer failure.
+    await flexChargeMerchantTransferFailed(stmt.id, stmt.landlord_id, e, 'paydown', { payment_id: paymentId })
   }
 }
 

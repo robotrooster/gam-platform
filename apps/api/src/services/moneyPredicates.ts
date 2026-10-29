@@ -43,8 +43,41 @@ function ref(r: string): string {
 export const CREDIT_ELIGIBLE_TYPES = ['rent', 'utility', 'late_fee', 'fee'] as const
 /** Entries credit never pays: GAM's FlexPay pull, a home/trailer payment (M4 trigger). */
 export const CREDIT_INELIGIBLE_ENTRIES = ['FLEXPAY', 'HOMEPMT'] as const
+/**
+ * 10/26 (Nic): what a tenant's OWN overpayment may pay — the two above plus a
+ * home/trailer payment, because "let their own overpayment pay a trailer
+ * payment" (Kim Bowman's $10.40 of change could not reach the $100 he owed).
+ * FLEXPAY stays barred to every kind of credit: it is GAM's own collection.
+ * Credit the landlord ISSUED keeps the stricter lists above — hours worked and
+ * a goodwill credit do not buy somebody a trailer.
+ */
+export const CREDIT_ELIGIBLE_TYPES_PAID_AHEAD = [...CREDIT_ELIGIBLE_TYPES, 'home_payment'] as const
+export const CREDIT_INELIGIBLE_ENTRIES_PAID_AHEAD = ['FLEXPAY'] as const
 /** Who may take money at the desk, by bank deposit or by a posted payment. */
 export const BANK_PAYABLE_OWNERS = ['landlord', 'held'] as const
+
+/**
+ * THE MONEY IS WITH US — a charge whose cash has landed or is on its way, with
+ * nothing standing between it and the bank. S642 named this for "rent collected
+ * this month" (lib/rentCollected, which re-exports it); 10/22 the wash needs
+ * the same question of one month's rent, and a second spelling of a money list
+ * is how two reports start disagreeing about the same dollar.
+ *
+ * 'settled' landed. 'processing' was debited and is clearing — an ACH takes
+ * most of a week and that money is already gone from the tenant's account.
+ * 'paid_via_deposit' was swept out of their security deposit at move-out.
+ *
+ * NOT the same question as moneyTakenOrMovingRowSql below, which also counts a
+ * pending row with an intent attached and rent suspended under work trade. Both
+ * of those mean "do not ask this person for money again"; neither means the
+ * landlord is holding any.
+ */
+export const RENT_RECEIVED_STATUSES = ['settled', 'processing', 'paid_via_deposit'] as const
+
+/** `p.status IN (...)` for the list above. */
+export const rentReceivedStatusSql = (a = 'p'): string =>
+  `${alias(a)}.status IN (${RENT_RECEIVED_STATUSES.map(s => `'${s}'`).join(', ')})`
+
 
 /**
  * Nothing is moving on it and money is owed on it now, so a payer may settle it:
@@ -64,6 +97,72 @@ export function payableRowSql(a = 'p'): string {
 }
 
 /**
+ * THE OTHER QUESTION ABOUT A CHARGE, and the one nothing asked before 10/20:
+ * is the money on it ALREADY TAKEN, OR ON ITS WAY? TRUE when it is —
+ *
+ *   IN FLIGHT. An intent is attached and it has not landed: 'pending' with an
+ *     intent, or 'processing'. An ACH takes three to five business days, so
+ *     this is a state a row sits in for most of a week.
+ *   TAKEN. 'settled', or swept from the security deposit at move-out
+ *     ('paid_via_deposit', services/depositReturn).
+ *   PAID WITH HOURS, NOT MONEY. Suspended under work trade — "work trade is
+ *     hours, not wages", so there is no cash to ask anybody for.
+ *
+ * This is NOT the opposite of payableRowSql, and must not be read as one. A
+ * voided, failed or returned row is neither payable nor taken: its money came
+ * back or never went, so it is owed again and a fresh ask is right. A $0 row
+ * and GAM's FlexPay pull are not payable either and have nothing moving on
+ * them. They are two different questions about the same row, and the gap
+ * between them is where "owed again" lives.
+ *
+ * Asked wherever a SECOND door could collect money a charge has already
+ * answered for — the pay-link utility door (services/utilityPayLink) is the
+ * first, because utility_bills.status only follows a charge reaching 'settled'
+ * and so reads 'billed' through the whole in-flight week and for good after a
+ * deposit sweep.
+ */
+export function moneyTakenOrMovingRowSql(a = 'p'): string {
+  const x = alias(a)
+  return `(${x}.status IN ('processing','settled','paid_via_deposit')
+      OR (${x}.status = 'pending'
+          AND (${x}.stripe_payment_intent_id IS NOT NULL OR ${x}.work_trade_suspended_at IS NOT NULL)))`
+}
+
+/**
+ * 10/25 (Nic): A CHARGE ON A TRAILER BILL IS NOT ON THE LEASE'S BILL.
+ *
+ *   "Should trailer payments get their own invoice separately payable from lot
+ *    rent? Yeah, let's do that."
+ *
+ * An installment (home/trailer) sale is billed on its own document
+ * (invoices.home_sale_contract_id — services/homeSale). Its charge still
+ * carries the buyer's lease_id, because the lease is real and the books, the
+ * rent roll and the deposit sweep all go on reading it exactly as before. What
+ * changes is only WHICH BILL IT IS ON: the lease's Pay Now must not sweep it
+ * up, because rent is pay-in-full and that would make the trailer payment
+ * unpayable on its own — the thing Dominic Gonzalez's trust money and Lisa
+ * Scheeler's work trade both need.
+ *
+ * True when the row (alias `a`) is NOT on an installment-sale bill. Use it
+ * wherever a set is built from "this lease's charges"; never in the accounting
+ * and reporting reads, which are meant to see the money.
+ */
+export function notOnHomeSaleBillSql(a = 'p'): string {
+  const x = alias(a)
+  return `NOT EXISTS (SELECT 1 FROM invoices inv_hs
+                       WHERE inv_hs.id = ${x}.invoice_id
+                         AND inv_hs.home_sale_contract_id IS NOT NULL)`
+}
+
+/** The rows of ONE installment-sale bill: its own charges, nothing else. */
+export function homeSaleScopeRowSql(a: string, contractRef: string): string {
+  const x = alias(a)
+  const contract = ref(contractRef)
+  return `${x}.invoice_id IN (SELECT inv_hsc.id FROM invoices inv_hsc
+                               WHERE inv_hsc.home_sale_contract_id = ${contract})`
+}
+
+/**
  * The portal and autopay pay-in-full set for ONE lease: every payable row of
  * the lease, plus every payable row on the lease's invoices (a neighbor
  * landlord's utility on a converged invoice, S616; GAM's own fees), but never a
@@ -76,6 +175,7 @@ export function requiredRowSql(a: string, leaseRef: string): string {
   return `(${payableRowSql(x)}
       AND (${x}.lease_id = ${lease}
            OR ${x}.invoice_id IN (SELECT inv_req.id FROM invoices inv_req WHERE inv_req.lease_id = ${lease}))
+      AND ${notOnHomeSaleBillSql(x)}
       AND ${x}.type <> 'carried_balance')`
 }
 
@@ -93,7 +193,7 @@ export function notFlexDepositRowSql(a = 'p'): string {
   const x = alias(a)
   return `NOT (${x}.type = 'deposit' AND ${x}.lease_fee_id IS NULL
           AND EXISTS (SELECT 1 FROM security_deposits fdx
-                       WHERE fdx.lease_id = ${x}.lease_id AND fdx.flex_deposit_enabled IS TRUE))`
+                       WHERE fdx.lease_id = ${x}.lease_id AND fdx.flex_deposit_enabled IS TRUE AND fdx.status <> 'voided'))`
 }
 
 /**
@@ -153,18 +253,42 @@ export function depositOrMoveOutRowSql(a = 'p'): string {
  *   unit and a lease. (A row a dispute reopened takes only the credit that
  *   dispute gave back — creditEligibleRowForCreditSql, decisions #48.7.)
  */
-export function creditEligibleRowSql(a = 'p'): string {
+export function creditEligibleRowSql(a = 'p', opts: { paidAhead?: boolean } = {}): string {
   const x = alias(a)
-  return `(${creditEligibleBaseSql(x)}
+  return `(${creditEligibleBaseSql(x, opts)}
       AND ${x}.reversal_id IS NULL)`
 }
 
 /** The credit rule without its reopened-row term (shared by the two below). */
-function creditEligibleBaseSql(x: string): string {
+/**
+ * 10/26 (Nic): `paidAhead` admits a HOME/TRAILER PAYMENT, because a tenant's
+ * OWN overpayment may pay it — "let their own overpayment pay a trailer
+ * payment". Kim Bowman's $10.40 of change from a $550 bank deposit could not
+ * reach the $100 home payment he still owed, so the money was stuck on both
+ * sides while the net was right.
+ *
+ * It is scoped to paid-ahead credit on purpose. Credit the landlord ISSUED and
+ * work-trade credit stay barred: hours worked and a goodwill credit do not buy
+ * somebody a trailer. FLEXPAY is barred to every kind — GAM's own collection is
+ * not a landlord charge.
+ *
+ * Kept kind-aware rather than simply loosened, because this predicate also
+ * decides the "credit available" figure a tenant is SHOWN. Loosening it for
+ * everybody would quote issued credit against a trailer payment and then have
+ * the trigger refuse the payment.
+ *
+ * Mirrors credit_uses_apply (migration 20261026090000). The two must agree:
+ * the trigger is the backstop, this is the figure.
+ */
+function creditEligibleBaseSql(x: string, opts: { paidAhead?: boolean } = {}): string {
+  const types = opts.paidAhead
+    ? `'rent','utility','late_fee','fee','home_payment'`
+    : `'rent','utility','late_fee','fee'`
+  const entries = opts.paidAhead ? `'FLEXPAY'` : `'FLEXPAY','HOMEPMT'`
   return `(${payableRowSql(x)}
       AND ${x}.revenue_owner = 'landlord'
-      AND ${x}.type IN ('rent','utility','late_fee','fee')
-      AND ${x}.entry_description NOT IN ('FLEXPAY','HOMEPMT')
+      AND ${x}.type IN (${types})
+      AND ${x}.entry_description NOT IN (${entries})
       AND NOT ${depositOrMoveOutRowSql(x)}
       AND ${x}.unit_id IS NOT NULL
       AND ${x}.lease_id IS NOT NULL)`
@@ -264,6 +388,7 @@ export interface MoneyRowFacts {
 
 const PAYABLE_COLUMNS = ['status', 'amount', 'stripe_payment_intent_id', 'work_trade_suspended_at', 'entry_description'] as const
 const BANK_PAYABLE_COLUMNS = [...PAYABLE_COLUMNS, 'revenue_owner'] as const
+const TAKEN_OR_MOVING_COLUMNS = ['status', 'stripe_payment_intent_id', 'work_trade_suspended_at'] as const
 const DEPOSIT_ROW_COLUMNS = ['entry_description', 'lease_fee_id'] as const
 const CREDIT_ELIGIBLE_COLUMNS = [
   ...PAYABLE_COLUMNS, 'revenue_owner', 'type', 'lease_fee_id', 'reversal_id', 'unit_id', 'lease_id',
@@ -287,6 +412,14 @@ export function isPayableRow(r: MoneyRowFacts): boolean {
     && Number(r.amount) > 0
 }
 
+/** moneyTakenOrMovingRowSql over a row already read. */
+export function isMoneyTakenOrMovingRow(r: MoneyRowFacts): boolean {
+  requireColumns(r, TAKEN_OR_MOVING_COLUMNS, 'isMoneyTakenOrMovingRow')
+  return r.status === 'processing' || r.status === 'settled' || r.status === 'paid_via_deposit'
+    || (r.status === 'pending'
+        && (r.stripe_payment_intent_id !== null || r.work_trade_suspended_at !== null))
+}
+
 export function isBankPayableRow(r: MoneyRowFacts): boolean {
   requireColumns(r, BANK_PAYABLE_COLUMNS, 'isBankPayableRow')
   return isPayableRow(r) && (BANK_PAYABLE_OWNERS as readonly string[]).includes(r.revenue_owner)
@@ -298,16 +431,18 @@ export function isDepositOrMoveOutRow(r: MoneyRowFacts): boolean {
   return r.entry_description === 'DEPOSIT' && r.lease_fee_id === null
 }
 
-export function isCreditEligibleRow(r: MoneyRowFacts): boolean {
+export function isCreditEligibleRow(r: MoneyRowFacts, opts: { paidAhead?: boolean } = {}): boolean {
   requireColumns(r, CREDIT_ELIGIBLE_COLUMNS, 'isCreditEligibleRow')
-  return isCreditEligibleBase(r) && r.reversal_id === null
+  return isCreditEligibleBase(r, opts) && r.reversal_id === null
 }
 
-function isCreditEligibleBase(r: MoneyRowFacts): boolean {
+function isCreditEligibleBase(r: MoneyRowFacts, opts: { paidAhead?: boolean } = {}): boolean {
+  const types = opts.paidAhead ? CREDIT_ELIGIBLE_TYPES_PAID_AHEAD : CREDIT_ELIGIBLE_TYPES
+  const entries = opts.paidAhead ? CREDIT_INELIGIBLE_ENTRIES_PAID_AHEAD : CREDIT_INELIGIBLE_ENTRIES
   return isPayableRow(r)
     && r.revenue_owner === 'landlord'
-    && (CREDIT_ELIGIBLE_TYPES as readonly string[]).includes(r.type)
-    && !(CREDIT_INELIGIBLE_ENTRIES as readonly string[]).includes(r.entry_description)
+    && (types as readonly string[]).includes(r.type)
+    && !(entries as readonly string[]).includes(r.entry_description)
     && !isDepositOrMoveOutRow(r)
     && r.unit_id !== null
     && r.lease_id !== null
@@ -396,4 +531,23 @@ export async function lockPaymentRowsById(client: PoolClient, paymentIds: readon
     `SELECT id FROM payments WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
     [[...new Set(paymentIds)]])
   return res.rows.map(r => r.id)
+}
+
+/**
+ * 10/12 review: a utility bill that went out to a resident (billed, paid or
+ * disputed) — never one still unbilled (a draft) or voided. One definition for
+ * the admin metrics (services/platformMetrics) and the monthly property report
+ * ("billed back to tenants"), which counted unbilled drafts as billed.
+ */
+export function utilityBillSentSql(a = 'ub'): string {
+  return `${a}.status IN ('billed', 'paid', 'disputed')`
+}
+
+/**
+ * A stay that happened or is booked to happen — confirmed, checked in or
+ * checked out; never a tentative hold, a cancellation or a no-show. The admin
+ * metrics and the monthly property report's stays and nights read it.
+ */
+export function stayHeldSql(a = 'b'): string {
+  return `${a}.status IN ('confirmed', 'checked_in', 'checked_out')`
 }

@@ -164,7 +164,7 @@ describe('Make a bank deposit', () => {
     await click(button(/Yes, some is rent/))
     // The Bank page and the Front Desk have no Record payment button, so the
     // next step says where it is.
-    expect(text()).toContain('Record each rent payment first (Record payment, on the Outstanding Balances page or the resident\u2019s page), then tick it in the list above.')
+    expect(text()).toContain('Record each rent payment first (Record payment, on the Payments page or the resident\u2019s page), then tick it in the list above.')
     expect(button(/Make the deposit slip/)!.disabled).toBe(true)
     await click(button(/No, none of it is rent/))
     expect(button(/Make the deposit slip/)!.disabled).toBe(true)          // no note yet
@@ -351,17 +351,17 @@ describe('Make a bank deposit', () => {
     await until(() => text().includes('Is any of this rent?'), 'the rent question')
     await click(button(/Yes, some is rent/))
     expect(text()).toContain('Ask the owner or a manager to record each rent payment first, then tick it in the list above.')
-    expect(text()).not.toContain('Outstanding Balances')
+    expect(text()).not.toContain('the Payments page')
     expect(text()).not.toContain('resident\u2019s page')
   })
 
-  it('a staffer who can open Outstanding Balances but not residents is pointed only there', async () => {
+  it('a staffer who can see who owes but not residents is pointed only to the Payments page', async () => {
     server.perms = { takePayment: true, 'balances.view': true }
     await open({ canMatchBank: false })
     await type(host.querySelector('input[placeholder="$0.00"]'), '40')
     await until(() => text().includes('Is any of this rent?'), 'the rent question')
     await click(button(/Yes, some is rent/))
-    expect(text()).toContain('Record each rent payment first (Record payment, on the Outstanding Balances page), then tick it in the list above.')
+    expect(text()).toContain('Record each rent payment first (Record payment, on the Payments page), then tick it in the list above.')
   })
 
   it('a refused cash list (switch just turned on) names the switch and says to sign in again', async () => {

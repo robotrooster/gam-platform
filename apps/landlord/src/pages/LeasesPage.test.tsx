@@ -36,6 +36,11 @@ const server = vi.hoisted(() => ({
   hold: null as null | Promise<void>,   // a POST waits on this (a request still running)
   // What POST /leases/:id/never-moved-in answers, as the server sends it (null: the close's ordinary answer).
   postAnswer: null as null | Record<string, unknown>,
+  // What POST /leases/:id/discard answers, as the server sends it (null: the ordinary 'terminated').
+  discardAnswer: null as null | Record<string, unknown>,
+  // 10/19: GET /space-carryforward?all=1 — what every space carries, settled
+  // and taken-off ones included. Server-shaped.
+  spaceCarried: [] as any[],
 }))
 const httpError = (status: number, error: string, code?: string) =>
   Object.assign(new Error(error), { response: { status, data: { success: false, error, ...(code ? { code } : {}) } } })
@@ -46,6 +51,9 @@ vi.mock('../lib/api', async () => {
   return {
     apiGet: async (url: string) => {
       if (url === '/leases') { server.leaseGets++; return camel(server.leases) }
+      // 10/19: the page also reads which spaces carry an unpaid space-rent
+      // balance (for the row badge and the Change-menu item).
+      if (url.startsWith('/space-carryforward')) return camel(server.spaceCarried)
       if (!url.endsWith('/never-moved-in')) throw new Error(`unexpected GET ${url}`)
       const a = server.answers[Math.min(server.gets, server.answers.length - 1)]
       server.gets++
@@ -64,6 +72,7 @@ vi.mock('../lib/api', async () => {
           reservation_canceled: false, kept: [], kept_total: 0, kept_words: null,
         }) }
       }
+      if (url.endsWith('/discard') && server.discardAnswer) return { success: true, data: camel(server.discardAnswer) }
       return { success: true, data: camel({ id: 'lease1', status: 'terminated' }) }
     },
     apiPatch: async () => ({}),
@@ -82,7 +91,14 @@ import { LeasesPage, NeverMovedInModal, DISCARD_BECAME_SIGNED_NOTE } from './Lea
 
 /** What GET /leases/:id/never-moved-in answers, as the server sends it. */
 const applies = (o: Record<string, unknown> = {}) => ({
-  applies: true, words: null, status: 'active', start_date: '2026-09-24',
+  // 10/24 — RELATIVE, NOT A FIXED DAY. This was '2026-09-24', and the
+  // never-moved-in window shows an extra warning once a lease started more
+  // than a month ago (startedOverAMonthAgo, measured against Date.now()). So
+  // this fixture quietly became "over a month old" on 2026-10-24 and the
+  // assertion below that the warning is absent began failing — on a date, not
+  // on a change. Five days ago is always five days ago.
+  applies: true, words: null, status: 'active',
+  start_date: new Date(Date.now() - 5 * 86400000).toISOString().slice(0, 10),
   lines: [
     { payment_id: 'p1', label: 'Rent', amount: 1000, due_date: '2026-10-01', utility: false },
     { payment_id: 'p2', label: 'Security deposit', amount: 500, due_date: '2026-10-01', utility: false },
@@ -101,6 +117,8 @@ let root: Root
 let closed = 0
 beforeEach(() => {
   server.answers = [applies()]; server.gets = 0; server.posts = []; server.postFail = null; server.hold = null; server.postAnswer = null
+  server.discardAnswer = null
+  server.spaceCarried = []
   server.leases = []; server.leaseGets = 0; perms.keys = null
   toasts.length = 0; closed = 0
   host = document.createElement('div')
@@ -522,6 +540,31 @@ describe('the Leases list: which way out a waiting lease offers', () => {
     await until(() => Object.values(reads).every(n => n === 2), `every page read again (${JSON.stringify(reads)})`)
   })
 
+  // 10/14 (Nic, #6): Discard deletes the draft and its paperwork. The confirm
+  // says so before anything happens; the toast says what the server did —
+  // deleted, or kept on record with its reason.
+  it('Discard confirms that the draft and its paperwork are deleted for good, then says "Draft deleted."', async () => {
+    const { appConfirm } = await import('../components/dialogs')
+    ;(appConfirm as any).mockClear()
+    server.discardAnswer = { id: 'draft', status: 'deleted', kept_words: null }
+    await openList()
+    await click([...rowOf('RV 1').querySelectorAll('button')].find(b => (b.textContent ?? '').trim() === 'Discard'))
+    await until(() => toasts.includes('Draft deleted.'), 'the deleted toast')
+    const [message, opts] = (appConfirm as any).mock.calls[0]
+    expect(message).toMatch(/^The unsigned draft lease .* and its paperwork will be deleted for good\. /)
+    expect(message).toContain('An invite waiting on it is canceled')
+    expect(opts).toMatchObject({ title: 'Discard this draft?', confirmLabel: 'Discard draft', danger: true })
+  })
+
+  it('a draft money already touched: kept on record, and the toast says why in the server\'s words', async () => {
+    server.discardAnswer = { id: 'draft', status: 'terminated',
+      kept_words: 'Money touched this lease (something on it was billed, paid, credited or settled), so it stays on record as ended.' }
+    await openList()
+    await click([...rowOf('RV 1').querySelectorAll('button')].find(b => (b.textContent ?? '').trim() === 'Discard'))
+    await until(() => toasts.some(t => t.startsWith('Draft discarded. Money touched this lease')), 'the kept toast')
+    expect(toasts).not.toContain('Draft deleted.')
+  })
+
   it('the window Discard opens instead says why, once: a tenant signed since the list was read, nothing was changed', async () => {
     server.postFail = { status: 409, code: 'tenant_signed',
       error: 'A tenant signed this lease, so it isn’t an unsigned draft. Use “They never moved in — end the lease” — it shows exactly what would be zeroed first.' }
@@ -597,5 +640,72 @@ describe('the Leases list: which way out a waiting lease offers', () => {
     await openList()
     expect(rowButtons('RV 2')).not.toContain('Void on the GoldSign page')
     expect(rowButtons('RV 2')).not.toContain('Discard')
+  })
+})
+
+// ── 10/19: the badge for a space that carries unpaid space rent ──────────────
+
+describe('a space that carries unpaid space rent', () => {
+  /** A claim as GET /space-carryforward?all=1 sends it. */
+  const claim = (o: Record<string, unknown>) => ({
+    id: 'cf?', unit_id: 'u-mh09', space_name: 'MH 09', property_name: 'Oak Park',
+    amount: '880.00', settled_amount: '0.00', still_owed: 880, late_fees_waived: '95.00',
+    status: 'open', opened_on: '2026-10-19', oldest_due_date: '2026-09-01',
+    settled_on: null, taken_off_on: null, owed_by_name: 'Rashawn Bump',
+    assumed_by_name: null, assumed_lease_id: null, arrangement: null, installments: [],
+    ...o,
+  })
+  beforeEach(() => {
+    server.leases = [leaseRow({ id: 'mh09', unit_number: 'MH 09', unit_id: 'u-mh09', status: 'active' })]
+  })
+  // openList above waits for an 'RV' row; this park's space is a mobile home.
+  async function openMhList() {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    await cacheOffscreenPages(qc)
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter>
+            <LeasesPage />
+          </MemoryRouter>
+        </QueryClientProvider>)
+    })
+    await until(() => text().includes('MH 09'), 'the list')
+  }
+
+  it('shows what the space still carries, and names who left it', async () => {
+    server.spaceCarried = [claim({ id: 'cf-1', still_owed: 880 })]
+    await openMhList()
+    expect(text()).toContain('Space carries $880.00')
+    expect(rowOf('MH 09').querySelector('.badge-amber')?.getAttribute('title')).toContain('Rashawn Bump')
+  })
+
+  /**
+   * THE ONE THAT WAS WRONG. A space can carry more than one claim over its
+   * life: one settled or taken off, and a live one from a later close-out. The
+   * page built its lookup with `new Map(list.map(c => [c.unitId, c]))`, and a
+   * Map keeps the LAST entry for a repeated key — so the closed claim
+   * overwrote the open one and the row said nothing at all. Live shape: MH 09
+   * carries $880, the next resident clears it, he later leaves owing $500 of
+   * his own space rent.
+   */
+  it('shows the OPEN claim when the space has been through this twice — whichever order they arrive in', async () => {
+    const open500 = claim({ id: 'cf-b', still_owed: 500, amount: '500.00', opened_on: '2026-11-20' })
+    const settled880 = claim({ id: 'cf-a', still_owed: 0, settled_amount: '880.00',
+      status: 'settled', settled_on: '2026-10-25', opened_on: '2026-10-19' })
+    for (const list of [[open500, settled880], [settled880, open500]]) {
+      server.spaceCarried = list
+      await openMhList()
+      expect(text()).toContain('Space carries $500.00')
+      expect(text()).not.toContain('Space carries $0.00')
+      await act(() => { root.unmount() })
+      root = createRoot(host)
+    }
+  })
+
+  it('says nothing on a space whose balance is settled', async () => {
+    server.spaceCarried = [claim({ still_owed: 0, status: 'settled', settled_on: '2026-10-25', settled_amount: '880.00' })]
+    await openMhList()
+    expect(text()).not.toContain('Space carries')
   })
 })

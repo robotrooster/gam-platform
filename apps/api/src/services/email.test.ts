@@ -24,9 +24,27 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
-const { resendSendMock } = vi.hoisted(() => ({
-  resendSendMock: vi.fn(async () => ({ data: { id: 'msg_default' }, error: null }) as any),
-}))
+// 10/24 — WHY THIS PROVIDER ID IS GENERATED RATHER THAN A FIXED STRING.
+//
+// email_send_log.provider_message_id carries a UNIQUE index across the WHOLE
+// table (idx_email_send_log_provider_msg), and the suite runs six workers
+// against ONE gam_test database. Three files mocked the provider with the SAME
+// fixed id — email.test.ts, newLeaseEmails.test.ts and
+// teamInvitationEmail1013.test.ts — so whichever two landed together failed on
+// the duplicate key, and only ever under parallelism. Each of them passed when
+// run alone, which is why it read as a deploy-only flake: deploy.sh is the only
+// thing that runs them side by side.
+const { resendSendMock, MSG_DEFAULT } = vi.hoisted(() => {
+  // Unique per CALL, not per file: one suite sends many emails and the index is
+  // unique across the whole table, so a per-file id collided with itself too.
+  // MSG_DEFAULT is the stable prefix the assertions match on.
+  const MSG_DEFAULT = `msg_default-${Math.random().toString(36).slice(2, 10)}`
+  let n = 0
+  return {
+    MSG_DEFAULT,
+    resendSendMock: vi.fn(async () => ({ data: { id: `${MSG_DEFAULT}-${++n}` }, error: null }) as any),
+  }
+})
 
 vi.mock('resend', () => ({
   Resend: class {
@@ -41,7 +59,11 @@ import * as email from './email'
 beforeEach(async () => {
   await cleanupAllSchema()
   resendSendMock.mockReset()
-  resendSendMock.mockResolvedValue({ data: { id: 'msg_default' }, error: null } as any)
+  // 10/24: a RESOLVED VALUE is one fixed id handed to every send in the test,
+  // which duplicated against the unique index as soon as a test sent twice.
+  // An implementation gives each call its own.
+  resendSendMock.mockImplementation(async () =>
+    ({ data: { id: `${MSG_DEFAULT}-${Math.random().toString(36).slice(2, 10)}` }, error: null }) as any)
   // S553: send() suppresses the real network call in every non-production
   // mode (test included) so no other suite fires a live email to fake
   // addresses. THIS file mocks the Resend client and asserts on the send
@@ -258,6 +280,24 @@ describe('e-sign emails', () => {
     expect(log.category).toBe('esign_document_auto_voided')
   })
 
+  // 10/14 (Nic, #5) + review: the expired wording when GAM deleted it; the
+  // landlord's copy never tells them to contact the landlord; names escaped.
+  it('emailDocumentAutoVoided: expired wording when deleted, and the right next step for each reader', async () => {
+    const htmlOf = () => ((resendSendMock.mock.calls.at(-1) as any[])[0]).html as string
+    for (const id of ['msg_av_1', 'msg_av_2', 'msg_av_3']) resendSendMock.mockResolvedValueOnce({ data: { id }, error: null } as any)
+    await email.emailDocumentAutoVoided('t1@mailer-test.co', 'Tenant <b>', 'Lease & Co', 'Unit A1', { deleted: true })
+    expect(htmlOf()).toContain('This document expired and is no longer available to sign.')
+    expect(htmlOf()).toContain('please contact the landlord to send a new document')
+    expect(htmlOf()).toContain('Lease &amp; Co')
+    expect(htmlOf()).not.toContain('Tenant <b>')
+    await email.emailDocumentAutoVoided('l1@mailer-test.co', 'Landlord', 'Lease', 'Unit A1', { deleted: true, toLandlord: true })
+    expect(htmlOf()).toContain('This document expired and is no longer available to sign.')
+    expect(htmlOf()).toContain('send a new document from GoldSign')
+    expect(htmlOf()).not.toContain('contact the landlord')
+    await email.emailDocumentAutoVoided('t2@mailer-test.co', 'Tenant', 'Lease', 'Unit A1')
+    expect(htmlOf()).toContain('automatically voided because it was not signed by all parties within 48 hours')
+  })
+
   it('emailSigningReminder: category', async () => {
     await email.emailSigningReminder(
       's@mailer-test.co', 'Signer', 'Lease', 'A1', 'Landlord', 'https://x')
@@ -372,7 +412,7 @@ describe('late payment sender', () => {
     expect(resendSendMock).toHaveBeenCalledTimes(1)
     const call = (resendSendMock.mock.calls[0] as any[])[0]
     expect(call.subject).toBe('2 tenants have an overdue balance')
-    expect(call.html).toContain('2 tenants have a balance five or more days past due')
+    expect(call.html).toContain('2 tenants have a balance past its grace period')
     expect(call.html).toContain('/balances')
     for (const hidden of ['T One', 'T Two', 'A1', 'B2', 'Sunset', '1,200', '450.50', '1,650.50', '$']) {
       expect(call.html).not.toContain(hidden)
@@ -426,7 +466,7 @@ describe('account-management senders', () => {
   it('sendEmailVerification: category=email_verification; no landlordId', async () => {
     const id = await email.sendEmailVerification(
       'v@mailer-test.co', 'Alice', 'https://verify/tok')
-    expect(id).toBe('msg_default')
+    expect(id).toContain(MSG_DEFAULT)
     const log = await logRowFor('v@mailer-test.co')
     expect(log.category).toBe('email_verification')
     expect(log.landlord_id).toBeNull()
@@ -881,5 +921,32 @@ describe('where replies go', () => {
     await email.sendNotificationEmail({ to: 'someone@mailer-test.co', subject: 'x', html: '<p>x</p>', notificationType: 'x' })
     expect(replyOf()).toBe('support@gam.test')
     expect((await logRowFor('someone@mailer-test.co')).metadata?.reply_to).toBeUndefined()
+  })
+})
+
+/**
+ * 10/15 (Nic): Scott Vigne asked for twelve sign-in codes over two days and
+ * never got in. All were delivered — and all had the same subject, so Gmail
+ * collapsed them into one conversation and he kept typing a retired code. The
+ * code rides in the subject now, so each email stands on its own; the
+ * permanent log still never holds one (auth.test.ts covers that side).
+ */
+describe('10/15: the sign-in code is in the subject, so the emails stop threading', () => {
+  it('the subject carries the code, and two codes never share a subject', async () => {
+    const { emailLoginCode } = await import('./email')
+    await emailLoginCode('threading@gamcheck.io', '418902', 10, { userId: undefined })
+    await emailLoginCode('threading@gamcheck.io', '550317', 10, { userId: undefined })
+    const subjects = resendSendMock.mock.calls.map((c: any[]) => c[0].subject)
+    expect(subjects).toContain('Your GAM sign-in code: 418902')
+    expect(subjects).toContain('Your GAM sign-in code: 550317')
+    expect(new Set(subjects).size).toBe(subjects.length)
+  })
+
+  it('tells the reader that only the newest code works', async () => {
+    const { emailLoginCode } = await import('./email')
+    await emailLoginCode('newest@gamcheck.io', '111222', 10, { userId: undefined })
+    const calls = resendSendMock.mock.calls as any[][]
+    const html = calls[calls.length - 1][0].html as string
+    expect(html).toMatch(/only the newest one works/i)
   })
 })

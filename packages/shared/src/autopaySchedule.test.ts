@@ -58,13 +58,18 @@ describe('autopayLateness', () => {
     expect(autopayLateness('2026-09-15', 2, 5).daysAfterDue).toBeGreaterThan(0);
   });
 
-  // Mirrors the engine rather than what feels fair. Its gate is
-  // `today >= due_date + grace`, so a grace of ZERO makes the DUE DATE ITSELF
-  // late. Whether a landlord should be able to set that is a product question;
-  // what must not happen is this screen calling a day safe that the charge then
-  // penalizes, so it agrees with the engine and says so.
-  it('a zero-day grace makes the due date itself late', () => {
-    expect(autopayLateness('2026-09-01', 1, 0).isLate).toBe(true);
+  // 10/12 (Nic): "zero grace: NEXT DAY is late (paying on the due date is on
+  // time)". The engine's first late day is the due date + GREATEST(grace, 1)
+  // (lateFeeStartDate), so with a grace of 0 paying on the due date is safe
+  // and the day after is not. This used to say the due date itself was late.
+  it('a zero-day grace: paying on the due date is on time, the next day is late', () => {
+    const onTime = autopayLateness('2026-09-01', 1, 0);
+    expect(onTime.daysAfterDue).toBe(0);
+    expect(onTime.isLate).toBe(false);
+    const nextDay = autopayLateness('2026-09-01', 2, 0);
+    expect(nextDay.daysAfterDue).toBe(1);
+    expect(nextDay.isLate).toBe(true);
+    expect(onTime.lateFrom).toBe('2026-09-02');
     expect(autopayLateness('2026-09-01', 5, 5).isLate).toBe(false);
   });
 

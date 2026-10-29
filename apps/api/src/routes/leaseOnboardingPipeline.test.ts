@@ -218,7 +218,7 @@ describe('accept → auto-draft', () => {
     expect(third.status).toBe(409)
   })
 
-  it('whole_unit repair: adding a co-tenant voids the unsigned draft and re-drafts with all three', async () => {
+  it('whole_unit repair: adding a co-tenant deletes the unsigned draft (10/14 #4: no money touched it) and re-drafts with all three', async () => {
     const f = await seedBase('whole_unit')
     await seedDefaultTemplate(f.landlordId, 1, 12)
     const eA = `a-${randomUUID().slice(0, 6)}@x.dev`, eB = `b-${randomUUID().slice(0, 6)}@x.dev`, eC = `c-${randomUUID().slice(0, 6)}@x.dev`
@@ -232,7 +232,8 @@ describe('accept → auto-draft', () => {
     const add = await onboard(f, eC, 'Ccc')
     expect(add.status).toBe(200)
     const afterAdd = await draftsForUnit(f.unitId)
-    expect(afterAdd.find(d => d.id === firstLiveId)!.status).toBe('voided')
+    // Deleted, not voided: it never completed and nothing was billed from it.
+    expect(afterAdd.find(d => d.id === firstLiveId)).toBeUndefined()
     const live = afterAdd.filter(d => d.status !== 'voided')
     expect(live.length).toBe(1)
     const roles = await signerRoles(live[0].id)

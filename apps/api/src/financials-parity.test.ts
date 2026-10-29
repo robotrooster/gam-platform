@@ -28,6 +28,8 @@ const ENTRY_POINTS = [
   'financials/ExpensesPage.tsx',
   'financials/MaintenanceCostsPage.tsx',
   'financials/ReportsPage.tsx',
+  // 10/17 (Nic): what was sold item by item, and each tax collected per agency.
+  'financials/SalesTaxPage.tsx',
   'financials/BankActivityPage.tsx',
   'financials/PayoutsPage.tsx',
 ]
