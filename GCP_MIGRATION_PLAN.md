@@ -23,9 +23,10 @@ GAM's production backend today is a single Mac Studio: Express API (:4000, launc
 
 - Full prod migration to GCP; Mac decommissioned as prod (kept as dev machine).
 - Backend on Cloud Run + Cloud SQL for PostgreSQL.
-- LLM + embeddings move to hosted APIs.
+- ~~LLM + embeddings move to hosted APIs.~~ **Superseded 2026-10-29 (Nic):** the LLM and embeddings servers stay on the Mac. The agent code moves with the API to Cloud Run and calls them over a locked-down tunnel hostname (see A4).
 - Frontends remain on Vercel.
-- **AI privacy rule override:** the documented hard rule "no third-party AI API, no tenant data leaving GAM-controlled hardware" (`apps/api/src/services/agents/config.ts` header) is deliberately overridden. The plan includes updating that documentation, reviewing tenant-facing privacy disclosures, and signing a vendor DPA.
+- ~~**AI privacy rule override.**~~ **Withdrawn 2026-10-29:** the hard rule "no third-party AI API, no tenant data leaving GAM-controlled hardware" (`apps/api/src/services/agents/config.ts` header) stands. No DeepInfra, no DPA, no policy rewrite. Nic (10/29, on licence OCR): GAM's GCP compute counts as GAM's own server, so in-process work there (e.g. local OCR) does not breach the rule; third-party AI processors still do.
+- Region: **us-west1**. Project `golddoor-gam` (org golddoor.io), billing linked, APIs enabled 2026-10-29.
 
 ## Status & re-assessment (2026-10-11)
 
@@ -55,11 +56,12 @@ Re-checked after merging 115 commits of `main` (10/12–10/27, S656–S658) into
 - **Client IP is now stored data:** payments record the request's IP/device (63aeecd3) and every request log line carries `ip`. `TRUST_PROXY_HOPS` behind the ALB is therefore a data-correctness setting, not just rate-limit tuning. Cutover verification updated.
 - **Logging:** main added path redaction for invitation tokens (`redactLoggedUrl`) and the req serializers; merged cleanly with the stdout/`severity` mode.
 - **Mac-only one-offs added:** the Campground Master customer import (reads `~/gam-imports/…`) and pre-deploy snapshots in `~/gam-backups/` (the one-time 10/13–10/14 erase scripts go through the storage driver). `ledger:rebuild` / `ledger:check` are ongoing ops commands — after cutover run them as a `gam-migrate`-style Cloud Run job execution with an overridden command.
+- **Coming from Nic's working tree (uncommitted as of 10/29):** the guest-licence identity layer writes to a new `uploads/guest-licences/` — convert it to `storage.save` when it lands (or write it against the driver once this branch is on main). Its readers (tesseract.js 5.1.1, jimp 0.22.12, @zxing/library 0.21.3) are pure JS, so no native build in the image — but tesseract.js downloads its `traineddata` from a CDN at first use unless `langPath` points at a local copy: ship the language data in the image so OCR has no runtime network dependency. Four of its migrations are already applied on production.
 - **Migrations:** 185 new (980 files). No new `db/post-deploy/` steps. No new integrations or env vars beyond `LEDGER_DB_POOL_MAX`.
 
 ## Target architecture
 
-Cloud Run (`gam-api` + `gam-scheduler` from one image, plus `gam-storefront` and a `gam-migrate` job) + Cloud SQL for PostgreSQL 16 (databases `gam` + `gam_properties` on one instance) + GCS for uploads + Secret Manager, fronted by a Global External ALB for `api.goldassetmanagement.com` and wildcard `*.gam.biz` (Cloud Run domain mappings don't support wildcards). Cloudflare stays as DNS (grey-cloud to the LB IP). LLM/embeddings → **DeepInfra** (OpenAI-compatible; hosts `BAAI/bge-large-en-v1.5` — the exact current embedding model, same 1024-dim vectors, **no re-embedding required**; Hermes-family chat models available. Fallback vendor: Together AI). Frontends stay on Vercel; builds move into GitHub Actions.
+Cloud Run (`gam-api` + `gam-scheduler` from one image, plus `gam-storefront` and a `gam-migrate` job) + Cloud SQL for PostgreSQL 16 (databases `gam` + `gam_properties` on one instance) + GCS for uploads + Secret Manager, fronted by a Global External ALB for `api.goldassetmanagement.com` and wildcard `*.gam.biz` (Cloud Run domain mappings don't support wildcards). Cloudflare stays as DNS (grey-cloud to the LB IP). LLM/embeddings **stay on the Mac** (MLX Hermes :8080, bge-large :8081), published as tunnel hostnames behind Cloudflare Access (service token); `gam-api` reaches them over HTTPS. Same model and vectors, so no re-embedding. The Mac remains a production dependency for agent features only — when it is down, the assistant answers 503 "unavailable" and nothing else is affected. Frontends stay on Vercel; builds move into GitHub Actions.
 
 Each phase ships independently; the Mac stays production until the Phase D cutover.
 
@@ -86,12 +88,13 @@ New `apps/api/src/lib/storage.ts` with a driver interface (`save`, `stream`, `ex
 - `trust proxy` → `Number(process.env.TRUST_PROXY_HOPS ?? 1)` (`index.ts:257`); tune during cutover verification.
 - Pin Node 22: root `engines` + `.nvmrc`; bump CI from Node 20.
 
-### A4. LLM/embeddings → hosted API (DeepInfra)
-- Add `Authorization: Bearer ${LLM_API_KEY}` / `${EMBEDDINGS_API_KEY}` when set, in `services/agents/engine.ts:148-170`, `services/agents/embeddings.ts:35-58`, and the separate `services/autoFieldPlacement.ts:41-50` config path (no header today). Config-only endpoint swap via existing `LLM_ENDPOINTS`/`EMBEDDINGS_ENDPOINTS`.
+### A4. LLM/embeddings → Mac servers reached from Cloud Run (revised 2026-10-29)
+- Done: optional `Authorization: Bearer` headers in `services/agents/engine.ts`, `embeddings.ts` and `services/autoFieldPlacement.ts`. **To do:** also send Cloudflare Access service-token headers (`CF-Access-Client-Id` / `CF-Access-Client-Secret`, from Secret Manager) on those three paths; endpoints swap via existing `LLM_ENDPOINTS`/`EMBEDDINGS_ENDPOINTS` to e.g. `https://llm.<internal>.goldassetmanagement.com/v1`.
+- Cloudflare: two tunnel ingress hostnames for :8080/:8081, an Access application requiring the service token (no public reach). Keep timeouts generous — the endpoint pool's breaker already handles a slow or absent Mac.
 - Graceful degradation: agent routes currently 500 when `getLlmConfig()` throws (`services/agents/config.ts:26,56`) — catch "not set" at the route layer, return 503 "assistant unavailable".
 - Remove `/Users/nicholasrhoades/models` defaults (`services/autoFieldPlacement.ts:43`, `services/agents/agentBattery.ts:54`, `apps/api/package.json:15`).
-- **Policy updates in the same PR**: rewrite the config.ts header rule + CLAUDE.md; review `legal/` privacy disclosures re: third-party AI processing of tenant data; sign vendor DPA.
-- Verification: run the `agents:eval` battery against DeepInfra; embed known knowledge-store chunks via DeepInfra and confirm cosine ≈ 1.0 vs stored vectors (proves no re-embed). **Recommended: flip the Mac's prod to DeepInfra during Phase A** — decouples LLM risk from infra risk.
+- No policy change (the no-third-party-AI rule stands). Update the config.ts header only to say the API may run in GAM's cloud while the models stay on GAM's Mac.
+- Verification: from staging Cloud Run, `agents:eval` against the tunnel hostnames; stop the MLX server and confirm agent routes return 503 within the breaker window while payments/files are unaffected.
 
 ### A5. Per-replica in-memory state — accept it, pin `max-instances=1`
 express-rate-limit MemoryStore, agent caches, turnGate, endpointPool, metrics ring buffer all stay in-memory. At current scale one instance handles everything; Memorystore Redis (≥$35/mo + VPC connector) buys nothing yet. Add a startup warning when running on Cloud Run (`K_SERVICE` set) without a shared store; revisit only when scaling out.
@@ -142,7 +145,7 @@ Verification = a **staging pass that becomes prod**: restore recent dumps into C
 Pre-cutover (no window needed):
 1. `gam_properties` (read-only, 3.4M rows): one-shot `pg_dump -Fc` → `pg_restore -j4`; verify row counts + index queries.
 2. Uploads: `gcloud storage rsync -r` bulk, then daily incremental until cutover; verify object count/bytes + spot-download 10 files across subdirs through staging's authed routes.
-3. Embeddings: no action (same model hosted).
+3. Embeddings: no action (same servers, same vectors).
 4. Rehearse the cutover against staging, timed; target < 30 min.
 
 Cutover window (evening, landlords notified):
@@ -159,9 +162,9 @@ Backups: Cloud SQL automated daily (retain 14) + 7-day PITR; retire the pg_dump�
 
 ## Phase E — Decommission + hardening
 
-- After 2–4 quiet weeks, turn off on the Mac: `com.gam.api`, MLX LLM (:8080), embeddings (:8081), marketing fallback, storefront server, cloudflared tunnel (+ delete in Cloudflare), watchdog/start-launch-set jobs, backup cron. Keep local Postgres + repo as the dev box. Archive one final dump + uploads tarball, then **delete prod PII from the Mac** (`uploads/id-documents` especially).
+- After 2–4 quiet weeks, turn off on the Mac: `com.gam.api`, marketing fallback, storefront server, the API/storefront tunnel routes, watchdog/start-launch-set jobs for the retired services, backup cron. **Keep running:** MLX LLM (:8080), embeddings (:8081) and a tunnel carrying only their two Access-protected hostnames (plus the watchdog for those). Keep local Postgres + repo as the dev box. Archive one final dump + uploads tarball, then **delete prod PII from the Mac** (`uploads/id-documents` especially).
 - Admin infra-readiness panel (`routes/admin.ts:516`, `lib/apiMetrics.ts`): `os.loadavg` is meaningless on Cloud Run — strip the host-metrics section, keep the request-latency p95, link out to Cloud Run metrics.
-- Rough cost at current scale: Cloud SQL ~$100 (→~$55 downsized), Cloud Run ~$15–30, ALB ~$20, GCS/secrets/registry ~$5, DeepInfra ~$5–20 usage-based ≈ **$120–175/mo**.
+- Rough cost at current scale: Cloud SQL ~$100 (→~$55 downsized), Cloud Run ~$15–30, ALB ~$20, GCS/secrets/registry ~$5 ≈ **$115–155/mo** (LLM stays on the Mac).
 
 ## Sequencing & top risks
 
@@ -169,7 +172,7 @@ A1–A6 as parallel PRs (A4 can go live on the Mac immediately) → B → C stag
 
 1. A missed hardcoded uploads path → 404 post-cutover. Mitigation: grep inventory as checklist + staging smoke of every file type.
 2. Scheduler double-run during Mac/GCP overlap. Mitigation: "exactly one `RUN_SCHEDULER=1`" runbook rule + advisory locks on notification jobs.
-3. LLM behavior drift on hosted Hermes. Mitigation: flip the Mac to DeepInfra in Phase A and run `agents:eval` before any infra work.
+3. Agent features depend on the Mac's uptime and home connection after cutover. Mitigation: graceful 503 (A4), breaker in the endpoint pool, an uptime check on the Access-protected LLM hostname.
 
 ## Workstream: money-flow audit & held-balance visibility (added 2026-09-06)
 
@@ -206,7 +209,7 @@ Send secrets through a password manager / encrypted share, never chat or email.
 - `git -C ~/gam rev-parse HEAD` and `git -C ~/gam status` — prod must be running committed code, or we'll migrate the wrong thing.
 - `launchctl list | grep com.gam`, `ls ~/Library/LaunchAgents/com.gam.*`, `crontab -l`, `node -v`.
 - `~/.cloudflared/config.yml` (or the tunnel's ingress rules in the Cloudflare dashboard) — the full list of hostnames the tunnel serves.
-- The model actually served for chat (`LLM_MODEL`, MLX model directory) and embeddings (`EMBEDDINGS_MODEL`), to match on DeepInfra.
+- The model actually served for chat (`LLM_MODEL`, MLX model directory) and embeddings (`EMBEDDINGS_MODEL`) — they stay; needed for the tunnel hostnames.
 - Is `apps/property-api` (:4001) running or used anywhere? (A6: delete if not.)
 
 **4. Access**
@@ -216,7 +219,6 @@ Send secrets through a password manager / encrypted share, never chat or email.
 - GCP: billing account and project owner.
 
 **5. Decisions**
-- Re-confirm the AI-privacy override and the DeepInfra DPA (Decisions above).
 - A cutover evening, and who notifies landlords.
 
 ## Critical files
