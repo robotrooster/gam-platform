@@ -61,7 +61,7 @@ const photoUpload = multer({
 const videoUpload = multer({
   storage: multer.diskStorage({
     destination: uploadStagingDir(),
-    filename: (_req: any, file: any, cb: any) => cb(null, newStoredFilename(file.originalname)),
+    filename: (_req: any, file: any, cb: any) => cb(null, newStoredFilename(file.originalname, file.mimetype)),
   }),
   limits: { fileSize: 500 * 1024 * 1024 }, // 500MB — phone walkthrough clips
   fileFilter: (_req: any, file: any, cb: any) => {
@@ -383,7 +383,7 @@ inspectionsRouter.post('/:id/photos', photoUpload.single('file'), async (req: an
     if (insp.status === 'finalized' || insp.status === 'cancelled') {
       throw new AppError(409, `cannot add photos in status ${insp.status}`)
     }
-    const photoStoredName = newStoredFilename(req.file.originalname)
+    const photoStoredName = newStoredFilename(req.file.originalname, req.file.mimetype)
     await storage.save(`inspections/${photoStoredName}`, req.file.buffer)
     const photoUrl = '/api/inspections/photo-files/' + photoStoredName
     const r = await queryOne<{ id: string }>(

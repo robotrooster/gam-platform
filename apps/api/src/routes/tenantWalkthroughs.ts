@@ -26,7 +26,7 @@ const VIDEO_MIMES = ['video/mp4', 'video/quicktime', 'video/webm']
 const upload = multer({
   storage: multer.diskStorage({
     destination: uploadStagingDir(),
-    filename: (_req: any, file: any, cb: any) => cb(null, newStoredFilename(file.originalname)),
+    filename: (_req: any, file: any, cb: any) => cb(null, newStoredFilename(file.originalname, file.mimetype)),
   }),
   limits: { fileSize: 500 * 1024 * 1024 },
   fileFilter: (_req: any, file: any, cb: any) => {

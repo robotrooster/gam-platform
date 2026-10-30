@@ -3468,7 +3468,7 @@ landlordsRouter.post(
         if (oldKey) await storage.remove(oldKey).catch(() => {})
       }
 
-      const pendingStoredName = newStoredFilename(req.file.originalname)
+      const pendingStoredName = newStoredFilename(req.file.originalname, req.file.mimetype)
       await storage.save(`lease-pdfs-pending/${pendingStoredName}`, req.file.buffer)
 
       // S395 fix: store the actual multer filename (e.g.

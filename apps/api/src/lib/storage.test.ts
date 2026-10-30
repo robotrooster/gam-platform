@@ -110,6 +110,15 @@ describe('key helpers', () => {
   })
   it('newStoredFilename keeps a safe extension', () => {
     expect(newStoredFilename('lease v2.PDF')).toMatch(/^\d+-[0-9a-f]{16}\.pdf$/)
-    expect(newStoredFilename('noext')).toMatch(/^\d+-[0-9a-f]{16}$/)
+    expect(newStoredFilename('noext')).toMatch(/^\d+-[0-9a-f]{16}\.bin$/)
+  })
+  it('newStoredFilename takes the extension from the accepted type, never a page extension', () => {
+    // 10/29 (Nic's review): an "image/png" upload named x.html was stored as
+    // .html and served as a page on the API origin.
+    expect(newStoredFilename('x.html', 'image/png')).toMatch(/\.png$/)
+    expect(newStoredFilename('scan.jpeg', 'image/jpeg')).toMatch(/\.jpg$/)
+    expect(newStoredFilename('x.html')).toMatch(/\.bin$/)
+    expect(newStoredFilename('x.svg')).toMatch(/\.bin$/)
+    expect(newStoredFilename('x.html', 'text/html')).toMatch(/\.bin$/)
   })
 })

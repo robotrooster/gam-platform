@@ -291,7 +291,7 @@ expensesRouter.post('/:id/receipt', requireExpenseViewer, authorizeReceiptUpload
   let storedKey: string | null = null
   try {
     if (!req.file) throw new AppError(400, 'No file uploaded')
-    const storedName = newStoredFilename(req.file.originalname)
+    const storedName = newStoredFilename(req.file.originalname, req.file.mimetype)
     await storage.save(`expense-receipts/${storedName}`, req.file.buffer)
     storedKey = `expense-receipts/${storedName}`
     const row = await attachExpenseReceipt(req.params.id, req.expenseCompany, {

@@ -240,7 +240,7 @@ documentsRouter.put('/:id/properties', requirePerm('documents.upload'), async (r
 documentsRouter.post('/', requirePerm('documents.upload', 'documents.post_photo'), docUpload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) throw new AppError(400, 'No file uploaded')
-    const storedName = newStoredFilename(req.file.originalname)
+    const storedName = newStoredFilename(req.file.originalname, req.file.mimetype)
     await storage.save(`docs/${storedName}`, req.file.buffer)
     const meta = uploadMetaSchema.parse(req.body)
     // S652 (Nic): a maintenance worker with only "Add photos & posted notices"

@@ -552,7 +552,7 @@ const VIDEO_MIMES = ['video/mp4', 'video/quicktime', 'video/webm']
 const mediaUpload = multer({
   storage: multer.diskStorage({
     destination: uploadStagingDir(),
-    filename: (_req: any, file: any, cb: any) => cb(null, newStoredFilename(file.originalname)),
+    filename: (_req: any, file: any, cb: any) => cb(null, newStoredFilename(file.originalname, file.mimetype)),
   }),
   limits: { fileSize: 500 * 1024 * 1024 }, // videos up to 500MB; images far smaller
   fileFilter: (_req: any, file: any, cb: any) => {
@@ -636,7 +636,7 @@ maintenanceRouter.get('/:id/receipts', async (req, res, next) => {
 maintenanceRouter.post('/:id/receipts', requirePerm('maintenance.update'), receiptUpload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) throw new AppError(400, 'No file uploaded')
-    const storedName = newStoredFilename(req.file.originalname)
+    const storedName = newStoredFilename(req.file.originalname, req.file.mimetype)
     await storage.save(`docs/${storedName}`, req.file.buffer)
     const mr = await queryOne<any>(
       'SELECT id, landlord_id, unit_id FROM maintenance_requests WHERE id=$1', [req.params.id])

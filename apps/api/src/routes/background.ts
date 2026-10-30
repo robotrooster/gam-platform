@@ -1910,7 +1910,7 @@ backgroundRouter.post('/:id/cancel', requireAuth, async (req, res, next) => {
 backgroundRouter.post('/upload-id', requireAuth, fileField(idUpload.single('file'), 'file'), async (req: any, res: any, next: any) => {
   try {
     if (!req.file) throw new AppError(400, 'No file')
-    const storedName = newStoredFilename(req.file.originalname)
+    const storedName = newStoredFilename(req.file.originalname, req.file.mimetype)
     await storage.save(`id-documents/${storedName}`, req.file.buffer)
     res.json({ success: true, data: { url: '/api/background/id-files/' + storedName, filename: req.file.originalname } })
   } catch (e) { next(e) }
@@ -1943,7 +1943,7 @@ backgroundRouter.post('/upload-income', requireAuth, fileField(incomeUpload.sing
   async (req: any, res: any, next: any) => {
     try {
       if (!req.file) throw new AppError(400, 'No file')
-      const storedName = newStoredFilename(req.file.originalname)
+      const storedName = newStoredFilename(req.file.originalname, req.file.mimetype)
       await storage.save(`income-documents/${storedName}`, req.file.buffer)
       res.json({ success: true, data: {
         url: '/api/background/income-files/' + storedName,

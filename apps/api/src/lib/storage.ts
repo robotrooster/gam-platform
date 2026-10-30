@@ -87,9 +87,41 @@ export function uploadKeyFromStored(subdir: string, stored: string | null | unde
   return isValidKey(key) ? key : null
 }
 
-/** Random collision-proof filename, preserving the (guarded) extension. */
-export function newStoredFilename(originalName: string): string {
-  const ext = path.extname(originalName || '').toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 10)
+// The upload types GAM accepts, and the one extension each is stored under.
+const MIME_TO_STORED_EXT: Record<string, string> = {
+  'application/pdf': '.pdf',
+  'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp',
+  'image/heic': '.heic', 'image/heif': '.heif', 'image/gif': '.gif',
+  'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm',
+  'application/msword': '.doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+}
+
+// What a stored extension is served as. Anything not listed (.html, .svg,
+// .js, .bin …) is served as a download, never rendered.
+const SERVED_TYPES: Record<string, string> = {
+  '.pdf': 'application/pdf',
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp',
+  '.heic': 'image/heic', '.heif': 'image/heif', '.gif': 'image/gif',
+  '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.txt': 'text/plain', '.csv': 'text/csv',
+}
+const SERVED_MIME_TYPES = new Set(Object.values(SERVED_TYPES))
+
+/**
+ * Random collision-proof filename. The extension never comes from the
+ * client's filename alone (an "image/png" upload named x.html would be
+ * stored as .html and served as a page — stored XSS on the API origin):
+ * pass the upload's accepted MIME type and its extension is used; without
+ * one, the client's extension is kept only if it is a type we serve, else
+ * the file is stored as .bin.
+ */
+export function newStoredFilename(originalName: string, mimeType?: string | null): string {
+  const clientExt = path.extname(originalName || '').toLowerCase()
+  const ext = (mimeType && MIME_TO_STORED_EXT[mimeType])
+    ?? (clientExt in SERVED_TYPES ? clientExt : '.bin')
   return `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`
 }
 
@@ -258,8 +290,19 @@ export async function sendStoredFile(
   }
   if (opts.exposeCrossOrigin) res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
   if (opts.cacheControl) res.setHeader('Cache-Control', opts.cacheControl)
-  if (opts.disposition) res.setHeader('Content-Disposition', opts.disposition)
-  if (opts.mimeType) res.type(opts.mimeType)
+  // Content-Type is always ours: the caller's type if it is one we serve,
+  // else the stored extension's, else a download. Set before res.sendFile,
+  // which keeps an existing Content-Type rather than guessing from the name.
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  const servedType = (opts.mimeType && SERVED_MIME_TYPES.has(opts.mimeType) ? opts.mimeType : null)
+    ?? SERVED_TYPES[path.extname(key).toLowerCase()]
+  if (servedType) {
+    res.setHeader('Content-Type', servedType)
+    if (opts.disposition) res.setHeader('Content-Disposition', opts.disposition)
+  } else {
+    res.setHeader('Content-Type', 'application/octet-stream')
+    res.setHeader('Content-Disposition', opts.disposition?.startsWith('attachment') ? opts.disposition : 'attachment')
+  }
 
   if (storage.localPathFor) {
     const abs = storage.localPathFor(key)
@@ -283,7 +326,6 @@ export async function sendStoredFile(
     if (e instanceof StorageNotFoundError) throw new AppError(404, 'The file behind this record is missing')
     throw e
   }
-  res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('Accept-Ranges', 'bytes')
   if (range && opened.size !== undefined) {
     const end = range.end ?? opened.size - 1
