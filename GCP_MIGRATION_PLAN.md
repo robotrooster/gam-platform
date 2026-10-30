@@ -109,7 +109,7 @@ express-rate-limit MemoryStore, agent caches, turnGate, endpointPool, metrics ri
 ### B1. Dockerfile (repo root, multi-stage)
 - Base `node:22-bookworm-slim` (glibc required for `@napi-rs/canvas` prebuilts — never alpine). Stage 1: workspace-aware `npm ci` with `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`, build shared then api (`tsc -b`). Stage 2: `npm ci --omit=dev`, copy `apps/api/dist`, `packages/shared/dist`+package.json, **`apps/api/src/db/migrations/`** (runner reads files from disk), **repo-root `legal/`** (FlexPay/FlexDeposit terms read at runtime) **and `apps/api/geo/`, `census/`, `elections/`** (admin metrics map/overlay data, ~17.5 MB, resolved relative to `dist/`). No bundling/pruning tools — `pdfjs-dist` needs intact `node_modules` (`lib/pdfText.ts:71-80`).
 - Move `playwright` deps→devDeps in `apps/api/package.json` (only db/ingest scrapers use it; verify with grep).
-- Migrations: keep `ts-node` + `typescript` as prod deps, run job as `node -r ts-node/register src/db/migrate.ts` (ship `src/` + tsconfig in image). The `dump-schema.sh` post-migration hook is warn-only — let it warn, or gate with `SKIP_SCHEMA_DUMP=1`.
+- Migrations (as built, 2026-10-30): `ts-node` stays a dev dependency; the job runs the compiled `node dist/db/migrate.js`, and the image copies `src/db/migrations/` to `dist/db/migrations/` beside it. Ops CLIs run the same way through the `gam-ops` job (`--args dist/scripts/ledgerCheck.js`). `SKIP_SCHEMA_DUMP=1` is baked into the image.
 - Verification: build + run against local docker-compose Postgres; hit `/health/ready`; exercise a PDF-generation route (canvas + pdfjs in-container); apply every migration to a scratch DB from the image.
 
 ### B2. Migration-at-deploy
@@ -137,6 +137,15 @@ IaC: **checked-in gcloud scripts + runbook in `deploy/gcp/`, not Terraform** (~1
 | Monitoring | Uptime check on `/health`; alerts: 5xx rate, scheduler restart loops, Cloud SQL disk/CPU; log-based alert on money-job failures. |
 
 Deliberately not used: Memorystore, Cloud Scheduler, DMS, VPC connector.
+
+**As built (2026-10-30), project `golddoor-gam`, region `us-west1`.** Scripts in `deploy/gcp/`, each safe to re-run, sharing names from `env.sh`:
+1. `01-foundation.sh` (done): service accounts gam-api, gam-storefront, gam-build and gam-deployer, Artifact Registry `gam`, bucket `golddoor-gam-uploads`, and every IAM grant.
+2. `02-cloudsql.sh`: `gam-pg`, Enterprise edition, zonal, 50 GB auto-grow, PITR 7 days, connector-only TLS, `max_connections=200`. The `gam_app` password is generated into secret `gam-db-password`. **The repo's dev password is burned and never reused.**
+3. `03-secrets.sh <prod.env>`: the whole `.env` as one secret, `gam-api-env`, mounted at `/secrets/env/.env` (`GAM_ENV_FILE`). Keys the services set themselves are stripped (DB_*, PROPERTIES_DB_*, storage, RUN_SCHEDULER, logging, proxy hops). It refuses to upload while any value still points at localhost.
+4. `04-run.sh <tag> [--with-scheduler]`: jobs gam-migrate and gam-ops, gam-api (2 vCPU / 2 GiB, min=max=1, CPU always on, startup probe `/health`, LB-only ingress), and gam-storefront. gam-scheduler deploys **only with `--with-scheduler`, at cutover after the Mac's launchd service stops**. `TRUST_PROXY_HOPS=2`.
+5. `05-loadbalancer.sh`: global external ALB, DNS-authorized certs for `api.goldassetmanagement.com` and `*.gam.biz`, and an HTTP→HTTPS redirect. It prints the validation CNAMEs (add now) and the A records (at cutover).
+6. `06-github-wif.sh`: WIF trusting only `refs/heads/main` of repo id 1194021377. `.github/workflows/deploy.yml` runs after a green CI on main and does nothing until the repo variable `GCP_DEPLOY_ENABLED=true`.
+7. Monitoring: still to write.
 
 Verification = a **staging pass that becomes prod**: restore recent dumps into Cloud SQL, sync sample uploads, point a Vercel preview at the Cloud Run URL, full manual smoke (login, lease upload/download, Stripe test payment, agent chat, storefront via Host header).
 

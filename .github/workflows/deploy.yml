@@ -1,0 +1,71 @@
+name: Deploy (GCP)
+
+# GCP plan B3/C: after CI passes on main — build both images, migrate, roll
+# the services. Skips entirely until the repo variable GCP_DEPLOY_ENABLED is
+# 'true' (set at cutover; until then the Mac is production).
+#
+# Auth is keyless (deploy/gcp/06-github-wif.sh): only runs on main of this
+# repository can act as gam-deployer.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-gcp
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT: golddoor-gam
+  REGION: us-west1
+
+jobs:
+  deploy:
+    if: >-
+      vars.GCP_DEPLOY_ENABLED == 'true' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The commit CI tested, not whatever main points at now.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build images
+        run: |
+          echo "TAG=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+          gcloud --project "$PROJECT" builds submit --region "$REGION" \
+            --config deploy/gcp/cloudbuild.yaml \
+            --substitutions "_TAG=$(git rev-parse --short=12 HEAD)" .
+
+      - name: Migrate
+        # Stops the rollout on failure: the old revisions keep serving.
+        run: |
+          IMG="$REGION-docker.pkg.dev/$PROJECT/gam/api:$TAG"
+          gcloud --project "$PROJECT" run jobs update gam-migrate --region "$REGION" --image "$IMG" --quiet
+          gcloud --project "$PROJECT" run jobs update gam-ops --region "$REGION" --image "$IMG" --quiet
+          gcloud --project "$PROJECT" run jobs execute gam-migrate --region "$REGION" --wait
+
+      - name: Roll services
+        run: |
+          API="$REGION-docker.pkg.dev/$PROJECT/gam/api:$TAG"
+          SF="$REGION-docker.pkg.dev/$PROJECT/gam/storefront:$TAG"
+          gcloud --project "$PROJECT" run services update gam-api --region "$REGION" --image "$API" --quiet
+          gcloud --project "$PROJECT" run services update gam-scheduler --region "$REGION" --image "$API" --quiet
+          gcloud --project "$PROJECT" run services update gam-storefront --region "$REGION" --image "$SF" --quiet

@@ -2,6 +2,6 @@
 # .dockerignore, except deploy/gcp stays: the storefront Dockerfile and the
 # Cloud Build configs live there.
 #!include:.dockerignore
-!deploy
-deploy/*
-!deploy/gcp
+!/deploy
+/deploy/*
+!/deploy/gcp

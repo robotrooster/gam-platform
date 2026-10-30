@@ -2,27 +2,29 @@
 # need the workspace manifests (npm ci validates the lockfile against every
 # workspace), the API, the shared package, the storefront and legal/ — and
 # never anything local: env files, uploads, logs, dumps, build output.
-# Later lines win, so the never-ship rules come last.
+# Later lines win, so the never-ship rules come last. Root-only rules are
+# anchored with a leading /: .gcloudignore includes this file and reads it
+# with gitignore rules, where a bare `scripts` would also drop
+# apps/api/src/scripts and a bare `*.md` the agents' knowledge content.
 
 # Every app's contents are excluded except its package.json (workspace
 # manifest); the API and the storefront come whole. (Written as apps/*/*
 # rather than apps/* so gcloud's ignore rules, which cannot re-include a file
 # inside an excluded folder, read it the same way Docker does.)
-apps/*/*
-!apps/*/package.json
-!apps/api/*
-!apps/storefront/*
-apps/api/scratch
-apps/api/_m.ts
+/apps/*/*
+!/apps/*/package.json
+!/apps/api/*
+!/apps/storefront/*
+/apps/api/scratch
+/apps/api/_m.ts
 
-packages/shared-ui
-deploy
-scripts
-.git
-.github
-.claude
-*.md
-!legal/*.md
+/packages/shared-ui
+/deploy
+/scripts
+/.git
+/.github
+/.claude
+/*.md
 
 # Never shipped, wherever they are.
 **/node_modules

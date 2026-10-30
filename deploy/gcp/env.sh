@@ -23,6 +23,11 @@ GITHUB_REPO=robotrooster/gam-platform
 # /secrets/env/.env and read via GAM_ENV_FILE. Values set on the service
 # itself (below, per role) win over it — dotenv never overrides.
 ENV_SECRET=gam-api-env
+DB_PASSWORD_SECRET=gam-db-password      # created by 02-cloudsql.sh
+
+# Public hostnames (phase C step 5).
+API_HOST=api.goldassetmanagement.com
+STOREFRONT_DOMAIN=gam.biz                  # every {slug}.gam.biz
 
 g() { gcloud --project "$PROJECT" "$@"; }
 # Run a create; treat "already exists" as success.

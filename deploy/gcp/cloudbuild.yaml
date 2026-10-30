@@ -17,6 +17,9 @@ steps:
 images:
   - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/api:${_TAG}'
   - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/storefront:${_TAG}'
+# Runs as gam-build (push to the gam repo, read the uploaded source, write
+# logs), not the default compute account, which has none of that.
+serviceAccount: projects/golddoor-gam/serviceAccounts/gam-build@golddoor-gam.iam.gserviceaccount.com
 options:
   machineType: E2_HIGHCPU_8
   logging: CLOUD_LOGGING_ONLY

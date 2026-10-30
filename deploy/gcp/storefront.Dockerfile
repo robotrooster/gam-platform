@@ -9,7 +9,11 @@ ENV NPM_CONFIG_UPDATE_NOTIFIER=false NPM_CONFIG_FUND=false NPM_CONFIG_AUDIT=fals
 COPY . .
 # The root workspace carries the @fontsource packages the storefront imports.
 RUN npm ci -w packages/shared -w apps/storefront --include-workspace-root
-RUN npm run build -w packages/shared && npm run build -w apps/storefront
+# shared's tests import vitest, which only the API/portal workspaces install;
+# the storefront needs shared's dist/, not its tests.
+RUN echo '{"extends":"./tsconfig.json","exclude":["src/**/*.test.ts"]}' > packages/shared/tsconfig.image.json \
+ && npx tsc -p packages/shared/tsconfig.image.json \
+ && npm run build -w apps/storefront
 
 FROM node:22-bookworm-slim
 WORKDIR /app
