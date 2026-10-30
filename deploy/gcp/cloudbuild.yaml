@@ -1,0 +1,23 @@
+# Builds and pushes both GAM images to Artifact Registry (GCP plan B).
+#   gcloud builds submit --config deploy/gcp/cloudbuild.yaml \
+#     --substitutions=_TAG=$(git rev-parse --short HEAD) .
+# CI (.github/workflows/deploy.yml) runs the same config.
+substitutions:
+  _REGION: us-west1
+  _REPO: gam
+  _TAG: manual
+steps:
+  - id: api
+    name: gcr.io/cloud-builders/docker
+    args: ['build', '-t', '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/api:${_TAG}', '-f', 'Dockerfile', '.']
+  - id: storefront
+    name: gcr.io/cloud-builders/docker
+    waitFor: ['-']
+    args: ['build', '-t', '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/storefront:${_TAG}', '-f', 'deploy/gcp/storefront.Dockerfile', '.']
+images:
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/api:${_TAG}'
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/storefront:${_TAG}'
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+timeout: 1800s

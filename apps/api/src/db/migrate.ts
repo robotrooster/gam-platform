@@ -167,6 +167,9 @@ async function applyMigration(file: MigrationFile): Promise<void> {
 }
 
 function regenerateSchemaSnapshot(): void {
+  // The Cloud Run migrate job has no pg_dump and no repo to write schema.sql
+  // into — the snapshot is a dev-machine artifact (GCP plan B1).
+  if (process.env.SKIP_SCHEMA_DUMP === '1') return
   const scriptPath = path.join(__dirname, '..', '..', 'scripts', 'dump-schema.sh')
   if (!fs.existsSync(scriptPath)) {
     console.warn(`  ⚠ schema dump script missing at ${scriptPath} — schema.sql not regenerated`)
