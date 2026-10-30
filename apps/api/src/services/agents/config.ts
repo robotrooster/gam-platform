@@ -4,34 +4,47 @@ import { logger } from '../../lib/logger'
 /**
  * Agent engine — model connection config.
  *
- * The engine talks to any OpenAI-compatible endpoint. Historically that
- * was self-hosted ONLY ("no third-party AI API, no tenant data leaving
- * GAM-controlled hardware" — the old CLAUDE.md hard rule). That rule was
- * DELIBERATELY overridden for the GCP migration (2026-09-06, leadership
- * decision): hosted providers are now permitted, contingent on a signed
- * vendor DPA and updated tenant-facing privacy disclosures — see
- * GCP_MIGRATION_PLAN.md Phase A4. Dev still runs Hermes via MLX on
- * localhost:8080; a hosted provider is a config change (endpoint + model
- * id + LLM_API_KEY), never an engine rebuild.
+ * The engine talks to any OpenAI-compatible endpoint. The models are
+ * self-hosted ONLY ("no third-party AI API, no tenant data leaving
+ * GAM-controlled hardware"). The 2026-09-06 plan to override that for the
+ * GCP migration was withdrawn on 2026-10-29 (Nic): the API may run in GAM's
+ * own GCP project, but the chat and embeddings models stay on GAM's Mac
+ * (MLX Hermes :8080, bge-large :8081), reached from the cloud through
+ * Cloudflare Access-protected tunnel hostnames — see GCP_MIGRATION_PLAN.md
+ * Phase A4. Dev runs the same servers on localhost.
  *
  * Required env:
  *   - LLM_ENDPOINT  OpenAI-compatible base, e.g. http://localhost:8080/v1
  *   - LLM_MODEL     served model id, e.g. mlx-community/Hermes-4-14B-4bit
  * Optional env:
- *   - LLM_API_KEY     bearer token for a hosted provider (absent = no header)
+ *   - CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET  Cloudflare Access
+ *                     service token for the tunnel hostnames (cloud only)
+ *   - LLM_API_KEY     bearer token (absent = no header)
  *   - LLM_TIMEOUT_MS  per-request timeout; defaults to 180s (a local
  *                     model on modest hardware can be slow to first token)
  */
 
 /**
- * Bearer auth for a hosted OpenAI-compatible provider (GCP migration Phase
- * A4). The self-hosted MLX fleet takes no auth, so an absent key means no
- * header — behavior unchanged on GAM hardware. EMBEDDINGS_API_KEY falls
- * back to LLM_API_KEY because both usually point at the same provider.
+ * Cloudflare Access service-token headers (GCP migration Phase A4): from
+ * Cloud Run the model servers are reached through Access-protected tunnel
+ * hostnames, which refuse any request without the token. Absent vars = no
+ * headers — localhost on the Mac needs none.
+ */
+export function cfAccessHeaders(): Record<string, string> {
+  const id = process.env.CF_ACCESS_CLIENT_ID
+  const secret = process.env.CF_ACCESS_CLIENT_SECRET
+  return id && secret ? { 'CF-Access-Client-Id': id, 'CF-Access-Client-Secret': secret } : {}
+}
+
+/**
+ * Auth headers for a model server: the Cloudflare Access token when set,
+ * plus an optional bearer key (EMBEDDINGS_API_KEY falls back to
+ * LLM_API_KEY). The local MLX servers take neither, so absent vars mean no
+ * headers — behavior unchanged on the Mac.
  */
 export function llmAuthHeaders(keyVar: 'LLM_API_KEY' | 'EMBEDDINGS_API_KEY'): Record<string, string> {
   const key = process.env[keyVar] || process.env.LLM_API_KEY
-  return key ? { Authorization: `Bearer ${key}` } : {}
+  return { ...cfAccessHeaders(), ...(key ? { Authorization: `Bearer ${key}` } : {}) }
 }
 
 /** Parse a comma-separated endpoint list (preferred, for a worker fleet)

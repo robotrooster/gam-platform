@@ -37,6 +37,7 @@ import type { ParserExtractedConditionalFee } from '@gam/shared'
 import { isScreeningFeeText, isAutoFilledLeaseColumn } from '@gam/shared'
 import { LEASE_COLUMN_CATEGORY } from '@gam/shared'
 import { logger } from '../lib/logger'
+import { cfAccessHeaders } from './agents/config'
 
 const MODEL_URL = process.env.AUTO_FIELD_MODEL_URL || 'http://localhost:8080'
 // The default is the Mac's local MLX path because prod's .env may not set the
@@ -735,10 +736,12 @@ async function classifyChunk(targets: RawTarget[]): Promise<Map<number, Classifi
   try {
     const res = await fetch(`${MODEL_URL}/v1/chat/completions`, {
       method: 'POST',
-      // AUTO_FIELD_MODEL_API_KEY (falling back to LLM_API_KEY) for hosted
-      // providers; no key = no header, matching the local MLX server.
+      // The Cloudflare Access token when the model is reached through the
+      // tunnel (cloud), plus AUTO_FIELD_MODEL_API_KEY (falling back to
+      // LLM_API_KEY) if set; neither = no headers, matching the local MLX server.
       headers: {
         'Content-Type': 'application/json',
+        ...cfAccessHeaders(),
         ...((process.env.AUTO_FIELD_MODEL_API_KEY || process.env.LLM_API_KEY)
           ? { Authorization: `Bearer ${process.env.AUTO_FIELD_MODEL_API_KEY || process.env.LLM_API_KEY}` }
           : {}),
