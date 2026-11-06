@@ -60,8 +60,87 @@ const canHideInAnId = (needle: string): boolean => /^[0-9a-f]+$/i.test(needle)
  * value? Those are the ones a random id can poison: a stringified payload, or a
  * raw response body.
  */
-const searchesABlob = (line: string): boolean =>
-  /JSON\.stringify\s*\(/.test(line) || /\.text\s*\)\s*\.not\.to(Contain|Match)/.test(line)
+const searchesABlob = (line: string, blobVars: Set<string>): boolean => {
+  if (/JSON\.stringify\s*\(/.test(line)) return true
+  if (/\.text\s*\)\s*\.not\.to(Contain|Match)/.test(line)) return true
+  // 11/01 — THE PER-LINE HOLE, AND IT LET A REAL GAMBLE THROUGH.
+  //
+  // This test used to decide line by line, so hoisting the stringify into a
+  // local walked straight past it:
+  //
+  //     const text = JSON.stringify(r.body)
+  //     expect(text).not.toContain('900')     // ← invisible to the guard
+  //
+  // That is exactly what happened on 10/31 in a brand-new file, on the
+  // contractor marketplace's most important privacy rule (one contractor must
+  // never see another's bid). The board payload carries uuids, so that
+  // assertion passed or failed by luck — the thing this file exists to stop.
+  // Variables assigned from a stringify are now tracked across the file and
+  // searching one of them counts.
+  for (const v of blobVars) {
+    if (new RegExp(`\\b${v}\\b\\s*\\)?\\s*\\.not\\.to(Contain|Match)`).test(line)) return true
+    if (new RegExp(`expect\\(\\s*${v}\\s*\\)`).test(line)) return true
+  }
+  return false
+}
+
+/**
+ * Locals assigned from a BARE `new Date()` — the wall clock, with no argument.
+ *
+ * 11/01: the rule below catches `new Date().toISOString().slice(0,10)` written
+ * as one expression, but the same bug hides behind a local and a step:
+ *
+ *     const d = new Date(); d.setDate(d.getDate() - 1)
+ *     return d.toISOString().slice(0, 10)       // ← still the UTC calendar
+ *
+ * That one had quietly made "yesterday" equal to GAM's today, because UTC is
+ * already tomorrow after 5pm Phoenix. A local assigned from `new Date(arg)` is
+ * NOT tracked: building from a date string at noon is the safe, deliberate
+ * pattern this file must not punish.
+ */
+function wallClockVarsIn(lines: string[]): Set<string> {
+  const vars = new Set<string>()
+  for (const line of lines) {
+    if (isComment(line)) continue
+    for (const m of line.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*new Date\(\s*\)/g)) {
+      vars.add(m[1])
+    }
+  }
+  return vars
+}
+
+/** Locals assigned from a stringified payload, which are blobs by any other name. */
+function blobVarsIn(lines: string[]): Set<string> {
+  const vars = new Set<string>()
+  for (const line of lines) {
+    if (isComment(line)) continue
+    const m = line.match(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*JSON\.stringify\s*\(/)
+    if (m) vars.add(m[1])
+  }
+  return vars
+}
+
+/**
+ * 11/01 — A UTC CALENDAR DAY IN A TEST IS A SEVEN-HOUR GAMBLE.
+ *
+ * `new Date().toISOString().slice(0, 10)` is TODAY IN UTC. The database's
+ * CURRENT_DATE, and every report and bill in GAM, run on the home calendar
+ * (America/Phoenix), which UTC is ahead of from 5pm until midnight. So a
+ * fixture built this way puts tomorrow's date on a bill for seven hours of
+ * every day, and the test that reads it back fails only in that window.
+ *
+ * This bit FOUR times on 31 October alone — the pay-ahead suggestion, the
+ * card-reader installment schedule, and the report summary that ties to its own
+ * P&L — and it is a documented recurring landmine before that. Two of the four
+ * were real production bugs, not just test noise.
+ *
+ * Only a BARE `new Date()` is flagged. An offset date (`Date.now() + N`) is a
+ * relative day whose exact value no assertion usually turns on, and flagging
+ * those would make this noisy enough to be allowlisted, which is how a guard
+ * rots. The fix is always `todayIn(null)` from apps/api/src/lib/timezone.ts, or
+ * `SELECT CURRENT_DATE` in a fixture.
+ */
+const UTC_TODAY = /new Date\(\)\s*\.toISOString\(\)\s*\.(?:slice\(0, ?10\)|substring\(0, ?10\)|split\('T'\)\[0\])/
 
 /**
  * A comment is not an assertion. This file's own header quotes the banned line,
@@ -74,8 +153,21 @@ interface Gamble { file: string; line: number; needle: string; source: string }
 
 function gamblesIn(file: string): Gamble[] {
   const found: Gamble[] = []
-  readFileSync(file, 'utf8').split('\n').forEach((line, i) => {
-    if (isComment(line) || !searchesABlob(line)) return
+  const lines = readFileSync(file, 'utf8').split('\n')
+  const blobVars = blobVarsIn(lines)
+  const clockVars = wallClockVarsIn(lines)
+  const utcDayFromAClockVar = (line: string): boolean => {
+    for (const v of clockVars) {
+      if (new RegExp(`\\b${v}\\b\\s*\\.toISOString\\(\\)\\s*\\.(?:slice\\(0, ?10\\)|substring\\(0, ?10\\)|split\\('T'\\)\\[0\\])`).test(line)) return true
+    }
+    return false
+  }
+  lines.forEach((line, i) => {
+    if (!isComment(line) && (UTC_TODAY.test(line) || utcDayFromAClockVar(line))) {
+      found.push({ file: relative(ROOT, file), line: i + 1, needle: '__utc_today__',
+                   source: line.trim().slice(0, 120) })
+    }
+    if (isComment(line) || !searchesABlob(line, blobVars)) return
     const needles: string[] = []
     for (const m of line.matchAll(NOT_CONTAIN)) needles.push(m[2])
     for (const m of line.matchAll(NOT_MATCH)) needles.push(...m[1].split('|'))
@@ -95,12 +187,17 @@ describe('no test decides anything by luck', () => {
     expect(files.length).toBeGreaterThan(500)
 
     const gambles = files.flatMap(gamblesIn)
-    const said = gambles.map(g =>
-      `\n  ${g.file}:${g.line} looks for ${JSON.stringify(g.needle)} inside a stringified payload`
-      + `\n      ${g.source}`
-      + `\n      → a uuid is hex, so this passes or fails by luck. Use expectNoFigures(body, [${g.needle}])`
-      + ` (apps/api/src/test/noLeaks.ts), which asks whether the figure came back as a value`
-      + ` or inside a sentence — or assert on the field itself.`)
+    const said = gambles.map(g => g.needle === '__utc_today__'
+      ? `\n  ${g.file}:${g.line} builds a calendar day from the UTC clock`
+        + `\n      ${g.source}`
+        + `\n      → that is TOMORROW from 5pm Phoenix until midnight, while the database's`
+        + ` CURRENT_DATE and every bill, due date and report are on the home calendar.`
+        + ` Use todayIn(null) (apps/api/src/lib/timezone.ts), or SELECT CURRENT_DATE in a fixture.`
+      : `\n  ${g.file}:${g.line} looks for ${JSON.stringify(g.needle)} inside a stringified payload`
+        + `\n      ${g.source}`
+        + `\n      → a uuid is hex, so this passes or fails by luck. Use expectNoFigures(body, [${g.needle}])`
+        + ` (apps/api/src/test/noLeaks.ts), which asks whether the figure came back as a value`
+        + ` or inside a sentence — or assert on the field itself.`)
     expect(said.join('')).toBe('')
   })
 })

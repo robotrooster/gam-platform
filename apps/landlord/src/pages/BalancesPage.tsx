@@ -204,6 +204,11 @@ export function BalancesPage({ title = 'Outstanding Balances', subtitle }: {
                               {s.status === 'clearing' ? `${money(s.clearing)} payment clearing` : `+ ${money(s.clearing)} payment clearing`}
                             </div>
                           )}
+                          {/* 10/28 (Nic): a FlexDeposit deposit charge on its
+                              way in — still clearing, with no amount beside it. */}
+                          {s.clearingUnpriced && (
+                            <div className="cd-owed-sub">payment clearing</div>
+                          )}
                           {credit && s.status === 'owes' && <div className="cd-owed-credit">{credit}</div>}
                           {(r.payLinkId || r.ticketId) && (
                             <div className="cd-owed-sub">{r.payLinkId ? 'emailed pay link' : 'open register ticket'}</div>

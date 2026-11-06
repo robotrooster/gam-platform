@@ -209,7 +209,7 @@ describe('the same stamp as the Rent Roll (one payment-health rule)', () => {
     expect(await agree(w, b.invoiceId, '2026-09')).toMatchObject({ stamp: 'paid_on_time', chargedBase: 495, mark: 'payment_received_on_time', lateFeeOnBill: true })
   })
 
-  it('a bill GAM wrote after its due date counts from the day it was written (Gerald Logue\'s September)', async () => {
+  it('a bill GAM wrote after its due date counts from the day it was written (Arlo Braddock\'s September)', async () => {
     const w = await world({ existingTenancy: true })
     const b = await bill(w, '2026-09-01', '2026-09-16 09:00', [{ type: 'rent', amount: 495, status: 'settled', method: 'card', paidAt: '2026-09-17 10:13' }])
     expect(await agree(w, b.invoiceId, '2026-09')).toMatchObject({ stamp: 'paid_on_time', onboarding: true, mark: 'payment_received_on_time' })

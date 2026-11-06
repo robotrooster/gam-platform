@@ -1065,8 +1065,23 @@ export async function raiseDueInstallments(now: Date = new Date()): Promise<numb
         ORDER BY id
         FOR UPDATE`)
     for (const o of orders.rows) {
-      const shipped = new Date(o.shipped_at)
-      const monthsSince = (now.getUTCFullYear() - shipped.getUTCFullYear()) * 12 + (now.getUTCMonth() - shipped.getUTCMonth())
+      // 11/01 — GAM'S OWN CALENDAR, NOT UTC, AND THIS RAISED MONEY EARLY.
+      //
+      // This counted months with getUTCMonth() on both instants. UTC turns over
+      // at 5pm in Phoenix, so from 5pm on the last day of every month the count
+      // was already one higher than the billing calendar: a landlord's next
+      // reader piece was raised up to seven hours before the 1st, in the wrong
+      // month's book. Worse where a reader is first matched late — the suite,
+      // run at 17:41 on 31 October, raised TWO pieces at once for an order
+      // shipped the month before.
+      //
+      // Both dates are now read on the calendar GAM bills on, which is what
+      // "the piece due on the 1st" has always meant.
+      const shippedMonth = dateIn(null, new Date(o.shipped_at)).slice(0, 7)
+      const nowMonth = dateIn(null, now).slice(0, 7)
+      const [sy, sm] = shippedMonth.split('-').map(Number)
+      const [ny, nm] = nowMonth.split('-').map(Number)
+      const monthsSince = (ny - sy) * 12 + (nm - sm)
       const due = Math.min(o.installments, Math.max(0, monthsSince))
       const pieces = installmentSplit(Number(o.price), o.installments)
       for (let n = o.installments_raised + 1; n <= due; n++) {

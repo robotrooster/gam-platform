@@ -2,14 +2,14 @@
  * 10/14 (Nic) — one-time: take October late fees off three Mountain View
  * residents as if they had never been charged (deleted, not credited).
  *
- *   Selene Arvizu, RV 39: "she was already charged a late fee on the bill that
+ *   Winslow Bramhall, RV 39: "she was already charged a late fee on the bill that
  *     she paid off platform, so this would be kind of double charging her. So
  *     just remove late fees until the credit on her that I applied
  *     automatically matches down to the penny her bill." Her $840.24 credit
  *     (the Square payment) is $15.20 more than October without fees ($825.04),
  *     so the first three days' fees ($15) stay and the other eleven go (Nic
  *     chose that); the credit then pays the whole bill, 20 cents left over.
- *   Valentin Flores, MH 22, and Michael Moreno, RV 42: every October late fee
+ *   Floriane Kenworthy, MH 22, and Halcyon Kingsnorth, RV 42: every October late fee
  *     goes, and October adds no more (Nic: "Delete, and no more for Oct").
  *
  * Each fee is deleted the way services/lateFeeDelete deletes one: the full row
@@ -17,7 +17,7 @@
  * treats that day as already charged and never charges it again), then the
  * row removed (the payments triggers roll up the bill and capture the ledger
  * change). Each October bill is marked late_fee_exempt so the engine adds
- * nothing more to it. Selene's bill is then settled from her credit by the
+ * nothing more to it. Winslow's bill is then settled from her credit by the
  * whole-bill rule, with no receipt email.
  *
  *   npx ts-node -T src/scripts/oct14_waive_late_fees.ts           (dry run: rolled back)
@@ -35,9 +35,9 @@ const NIC = '8b2f26ad-173a-45cb-9c59-f7a27bfa81e3'
 
 interface Target { who: string; unit: string; tenantId: string; keepFirst: number; settleFromCredit: boolean }
 const TARGETS: Target[] = [
-  { who: 'Selene Arvizu', unit: 'RV 39', tenantId: '2c434fef-5597-45f4-a389-c138144c3667', keepFirst: 3, settleFromCredit: true },
-  { who: 'Valentin Flores', unit: 'MH 22', tenantId: '617e5f64-3ca0-4310-9436-170969dda9e6', keepFirst: 0, settleFromCredit: false },
-  { who: 'Michael Moreno', unit: 'RV 42', tenantId: 'b56cf928-b0a8-4230-9381-77127058634b', keepFirst: 0, settleFromCredit: false },
+  { who: 'Winslow Bramhall', unit: 'RV 39', tenantId: '2c434fef-5597-45f4-a389-c138144c3667', keepFirst: 3, settleFromCredit: true },
+  { who: 'Floriane Kenworthy', unit: 'MH 22', tenantId: '617e5f64-3ca0-4310-9436-170969dda9e6', keepFirst: 0, settleFromCredit: false },
+  { who: 'Halcyon Kingsnorth', unit: 'RV 42', tenantId: 'b56cf928-b0a8-4230-9381-77127058634b', keepFirst: 0, settleFromCredit: false },
 ]
 
 const MONEY_ON_IT = `

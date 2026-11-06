@@ -114,10 +114,10 @@ financesRouter.get('/me/finances', async (req, res, next) => {
     // threshold, the late-month sweep, or the weekly Tuesday batch).
     const heldBalance = await heldOwnerShareForUser(userId)
     const nextPayout = await queryOne<{ scheduled_for: string; trigger_kind: string }>(
-      `SELECT scheduled_for::text, trigger_kind
-         FROM payout_triggers
-        WHERE entity_kind = 'user' AND entity_id = $1 AND fired_at IS NULL
-        ORDER BY scheduled_for ASC
+      `SELECT t.scheduled_for::text, t.trigger_kind
+         FROM payout_triggers t
+        WHERE t.entity_kind = 'user' AND t.entity_id = $1 AND t.fired_at IS NULL
+        ORDER BY t.scheduled_for ASC
         LIMIT 1`,
       [userId])
 

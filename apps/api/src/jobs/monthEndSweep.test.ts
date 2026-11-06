@@ -75,19 +75,32 @@ describe('S641 the last business day of the month', () => {
   })
 })
 
+/**
+ * 10/28 (Nic) — THE SWEEP FIRES ON THE LAST BUSINESS DAY, NOT BEFORE IT:
+ *
+ *   "the month-end sweep shouldn't happen the two business days before. We need
+ *    the last possible sweep that hits in the month to be right on the last
+ *    day."
+ *
+ * These three asserted the two-business-days-early rule that preceded that, and
+ * went stale when autoPayouts.monthEndSweepDateUtc was changed to honour it —
+ * the lead time was a hedge from when payouts took days to land, and it only
+ * ever bought a gap: October paid out on the 28th and left the 29th and 30th to
+ * roll into November, which is the thing the sweep exists to prevent.
+ */
 describe('S641 when the sweep fires', () => {
-  it('fires two business days before the money has to be there', () => {
-    // September 2026: last business day Wed the 30th → fire Mon the 28th.
-    expect(monthEndSweepDateUtc(2026, 8)).toBe('2026-09-28')
-    expect(dow('2026-09-28')).toBe('Mon')
+  it('fires on the last business day, so nothing rolls into next month', () => {
+    // September 2026: last business day Wed the 30th → fires that day.
+    expect(monthEndSweepDateUtc(2026, 8)).toBe('2026-09-30')
+    expect(dow('2026-09-30')).toBe('Wed')
   })
 
-  // Nic's own example: a month ending on a Friday.
-  it('a month ending Friday fires on the Wednesday', () => {
-    // 2026-01-31 is a Saturday → last business day Fri the 30th → fire Wed 28th.
+  // Nic's own example: a month whose last day is a weekend.
+  it('a month ending Saturday fires on the Friday before', () => {
+    // 2026-01-31 is a Saturday → the last day a bank is open is Fri the 30th.
     expect(lastBusinessDayOfMonthUtc(2026, 0)).toBe('2026-01-30')
-    expect(monthEndSweepDateUtc(2026, 0)).toBe('2026-01-28')
-    expect(dow('2026-01-28')).toBe('Wed')
+    expect(monthEndSweepDateUtc(2026, 0)).toBe('2026-01-30')
+    expect(dow('2026-01-30')).toBe('Fri')
   })
 
   it('never fires on a weekend or a holiday, in any month of the year', () => {
@@ -98,13 +111,11 @@ describe('S641 when the sweep fires', () => {
     }
   })
 
-  it('always leaves at least two business days before arrival is due', () => {
+  it('is the last business day itself, every month of the year', () => {
     for (let m = 0; m < 12; m++) {
-      const fire = new Date(monthEndSweepDateUtc(2026, m) + 'T12:00:00Z')
-      const target = new Date(lastBusinessDayOfMonthUtc(2026, m) + 'T12:00:00Z')
-      expect(fire.getTime()).toBeLessThan(target.getTime())
-      // ...and never more than a week early, which would stop being "month end".
-      expect((target.getTime() - fire.getTime()) / 86400000).toBeLessThanOrEqual(7)
+      // The run day IS the landing day on this account (standard payouts arrive
+      // on the UTC day they are created), so there is no lead time to leave.
+      expect(monthEndSweepDateUtc(2026, m)).toBe(lastBusinessDayOfMonthUtc(2026, m))
     }
   })
 

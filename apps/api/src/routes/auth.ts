@@ -663,6 +663,99 @@ export async function sessionFromTeamInvitation(userId: string): Promise<{ token
   }
 }
 
+/**
+ * ── 10/30 (Nic): A PASSKEY REPLACES THE EMAILED CODE ────────────────────────
+ *
+ * "A passkey replaces the emailed code; password + code stays the fallback."
+ *
+ * He could not sign in on his phone: the password lives in Safari's keychain,
+ * Chrome on iOS keeps its own vault, and the emailed code then sends him out of
+ * the browser to the mail app. Face ID is already two factors — the device and
+ * the biometric — so demanding the code on top keeps exactly the friction the
+ * feature removes. Everyone without a registered device still signs in with
+ * password + emailed code, unchanged.
+ *
+ * services/passkeys.ts has already verified the challenge, the origin, the
+ * relying-party id, the signature and the sign count by the time this is
+ * called. This builds the session, exactly as /login builds one
+ * (loadUserForSession + sessionClaimsFor), because a session is made of the
+ * account's scopes and must be the same session whichever factor opened the
+ * door.
+ *
+ * THREE THINGS /login DOES THAT THIS DELIBERATELY DOES NOT:
+ *
+ *   The password lockout does not apply. It exists to stop password GUESSING
+ *   (S280), and a passkey cannot be guessed — there is nothing to try. Worse,
+ *   honouring it here would hand anybody who knows an email address a way to
+ *   lock the real owner out of their own Face ID with five bad passwords. A
+ *   verified passkey proves the owner is here, so the counter is cleared, same
+ *   as a correct password clears it.
+ *
+ *   No second factor is demanded, and no authenticator enrolment is forced: the
+ *   passkey IS the second factor. mustEnrollTotp is false for the same reason
+ *   email 2FA exempts from it (S565) — the requirement is "a second factor",
+ *   not "this particular second factor".
+ *
+ *   The email-verification gate STAYS. The address is where every notice and
+ *   every way back into the account is sent, so an unproven one is still not a
+ *   signed-in account; the verification link goes back out, as at /login.
+ */
+export async function sessionFromPasskey(
+  userId: string,
+  opts?: { portal?: SignInPortal | null; keepSignedIn?: boolean },
+): Promise<{ token: string; user: Record<string, unknown> }> {
+  const user = await loadUserForSession('id', userId)
+  if (!user) throw new AppError(401, 'That passkey\'s account no longer exists.')
+
+  if (!user.email_verified) {
+    void mintAndSendVerifyEmail(user.id, user.email, user.first_name)
+    throw new AppError(401,
+      'Please verify your email before signing in. A new verification link was just sent.')
+  }
+  // S650's portal gate, which is about which console admits which role and has
+  // nothing to do with how the person proved who they are.
+  const portal = opts?.portal ?? null
+  if (portal && !PORTAL_ROLES[portal].includes(user.role)) {
+    throw new AppError(403, PORTAL_REFUSAL[portal])
+  }
+
+  const { scope, profileId, businessId, staffRole, claims } = await sessionClaimsFor(user)
+  const token = signSessionToken(claims, sessionPolicyFor(user.role, portal, opts?.keepSignedIn))
+
+  // The owner is here: stamp the sign-in and clear any lockout their password
+  // attempts left behind. Never blocks the sign-in.
+  try {
+    await db.query(
+      `UPDATE users SET last_login_at = NOW(), failed_login_count = 0, locked_until = NULL
+        WHERE id = $1`, [user.id])
+  } catch (err) {
+    logger.warn({ err, userId: user.id }, '[auth] signed in with a passkey; last_login_at not stamped')
+  }
+  db.query(
+    `INSERT INTO product_events (portal, event, user_id, role, meta)
+     VALUES ('auth', 'login', $1, $2, '{"via":"passkey"}'::jsonb)`,
+    [user.id, user.role],
+  ).catch(() => {})
+
+  return {
+    token,
+    // The shape /login answers with, so the sign-in page needs nothing else.
+    user: {
+      id: user.id, email: user.email, role: user.role,
+      firstName: user.first_name, lastName: user.last_name,
+      profileId,
+      landlordId: scope?.landlordId || null,
+      businessId,
+      staffRole,
+      permissions: scope?.permissions || null,
+      directDepositEnabled: scope?.directDepositEnabled ?? false,
+      propertyIds: scope?.propertyIds ?? null,
+      allProperties: scope?.allProperties ?? false,
+      mustEnrollTotp: false,
+    },
+  }
+}
+
 authRouter.post('/login', async (req, res, next) => {
   try {
     const { email, password, portal, keepSignedIn, emailFactor } = loginSchema.parse(req.body)
@@ -912,7 +1005,11 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
          -- don't own. Not "is lot rent already set" — that would hide the very
          -- page where they'd go to set it.
          COALESCE(l.operates_leased_land, FALSE) AS has_mobile_home_units,
-         t.ach_verified, t.on_time_pay_enrolled, t.credit_reporting_enrolled
+         t.ach_verified, t.on_time_pay_enrolled, t.credit_reporting_enrolled,
+         -- 10/28: a bank link in flight. FlexDeposit no longer waits for
+         -- verification to let somebody enrol and read their own terms, so the
+         -- portal needs to tell "not started" from "still verifying".
+         t.bank_pending_since IS NOT NULL AS bank_pending
        FROM users u
        -- S634: users.active_landlord_id IS GONE. There is no active entity —
        -- the account owns companies and is signed into all of them at once.
@@ -1455,7 +1552,7 @@ authRouter.post('/reset-password', async (req, res, next) => {
               reset_token_expires = NULL,
               failed_login_count = 0,
               locked_until = NULL,
-              -- S650 (Ellen Gregory, Oak Park MH 02): the reset link went to
+              -- S650 (Zeph Ashcombe, Oak Park MH 02): the reset link went to
               -- her inbox and she used it, which proves the address as surely
               -- as a verification link does. Leaving email_verified FALSE sent
               -- her straight into "verify your email first" on a password she
@@ -1516,7 +1613,7 @@ export async function mintAndSendVerifyEmail(userId: string, email: string, firs
   // just shows them nothing."
   //
   // The role branch handled landlord and PM and let EVERYTHING ELSE fall to the
-  // tenant app — admins included. So Ben Ferrell and Nicholas Fausett, both
+  // tenant app — admins included. So Ben Ferrell and Lysander Oglethorpe, both
   // super_admins, were mailed a verification link to tenant.goldassetmanagement
   // .com, a product they have no account in. Login refuses an unverified account
   // and helpfully re-sends the same wrong link, which is why Ben has three of

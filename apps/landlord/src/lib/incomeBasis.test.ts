@@ -164,9 +164,9 @@ describe('the health block\'s figures tie, and say which money they count', () =
     expect(b.figures).toEqual([
       { key: 'invoiced', label: 'Rent invoiced this month', amount: 18502 },
       { key: 'paid', label: 'Rent paid', amount: 17087 },
-      { key: 'owed', label: 'Still owed', amount: 1415 },
+      { key: 'owed', label: 'Rent still owed', amount: 1415 },
     ])
-    expect(b.tieText).toBe('$18,502.00 invoiced − $17,087.00 paid = $1,415.00 still owed')
+    expect(b.tieText).toBe("$18,502.00 invoiced − $17,087.00 paid = $1,415.00 of this month's rent still owed")
     expect(b.rateText).toBe("92% of this month's rent bills paid")
     expect(b.pct).toBe(92)
   })
@@ -176,7 +176,7 @@ describe('the health block\'s figures tie, and say which money they count', () =
     // get to print a row of figures that will not come out on screen.
     const b = rentHealthFigures({ ...MV, owed: 9683.87 })!
     expect(b.figures[2].amount).toBe(1415)
-    expect(b.tieText).toContain('= $1,415.00 still owed')
+    expect(b.tieText).toContain("= $1,415.00 of this month's rent still owed")
     expect(rentHealthTies({ ...MV, owed: 9683.87 })).toBe(false)
     expect(rentHealthTies(MV)).toBe(true)
     expect(rentHealthTies(undefined)).toBe(false)
@@ -186,7 +186,7 @@ describe('the health block\'s figures tie, and say which money they count', () =
     const b = rentHealthFigures(MV)!
     expect(b.scopeNote).toBe(RENT_HEALTH_SCOPE_NOTE)
     expect(b.scopeNote).toContain("this month's rent bills only")
-    expect(b.scopeNote).toContain('every open charge of every month')
+    expect(b.scopeNote).toContain('every unpaid charge of every month')
     // S650: the fact that work trade is out, never what it is worth.
     expect(b.workTradeNote).toContain('not counted here')
     // 10/22 (Nic) — asked of the VALUES, not of the stringified object: a

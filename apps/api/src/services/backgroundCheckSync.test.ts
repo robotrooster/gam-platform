@@ -1,7 +1,7 @@
 /**
  * S640 — a screening must not depend on a webhook arriving.
  *
- * Checkr finished Anastacio Erreguin's report at 15:19 Phoenix on Sep 9. GAM
+ * Checkr finished Bryce Belmont's report at 15:19 Phoenix on Sep 9. GAM
  * never heard: not one request has reached /api/background/webhook in the whole
  * log window. His screening sat at `processing` for twenty-two hours until Nic
  * opened it and decided it by hand — on a report the page could not show him,

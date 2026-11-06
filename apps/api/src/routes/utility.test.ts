@@ -448,6 +448,45 @@ describe('PATCH /meters/:id', () => {
     expect(res.body.data.label).toBe('Updated')
     expect(Number(res.body.data.rate_per_unit)).toBe(0.1)
   })
+
+  // ── 10/31: the broken-meter estimate settings, through the endpoint ────────
+  //
+  // These went in as six new bind parameters and were inserted in the MIDDLE of
+  // the array, which silently repointed $16-$20 — the utility, billing-method
+  // and multiplier rules — and 500'd every PATCH in the suite. Exercised here so
+  // the next person to add a parameter finds out from a test and not from prod.
+  it('saves the usage band and the stated monthly usage, and clears them again', async () => {
+    const f = await seed()
+    const m = await seedMeter(f, f.propertyAId)
+    const patch = (body: any) => request(buildApp())
+      .patch(`/api/utility/meters/${m}`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send(body)
+
+    const set = await patch({ usageBand: 'upper', expectedMonthlyUsage: 786, expectedUsageNote: 'their own reads' })
+    expect(set.status).toBe(200)
+    expect(set.body.data.usage_band).toBe('upper')
+    expect(Number(set.body.data.expected_monthly_usage)).toBe(786)
+    expect(set.body.data.expected_usage_note).toBe('their own reads')
+    expect(set.body.data.expected_usage_set_at).not.toBeNull()
+    expect(set.body.data.expected_usage_set_by_user_id).not.toBeNull()
+
+    // An unrelated edit leaves both alone — the '__keep__' sentinels.
+    const other = await patch({ label: 'Renamed' })
+    expect(other.status).toBe(200)
+    expect(other.body.data.usage_band).toBe('upper')
+    expect(Number(other.body.data.expected_monthly_usage)).toBe(786)
+
+    // null clears the stated figure and the stamps with it; the band stays.
+    const cleared = await patch({ expectedMonthlyUsage: null })
+    expect(cleared.status).toBe(200)
+    expect(cleared.body.data.expected_monthly_usage).toBeNull()
+    expect(cleared.body.data.expected_usage_set_at).toBeNull()
+    expect(cleared.body.data.expected_usage_set_by_user_id).toBeNull()
+    expect(cleared.body.data.usage_band).toBe('upper')
+
+    // Not a band GAM knows about.
+    expect((await patch({ usageBand: 'highest' })).status).toBe(400)
+  })
 })
 
 // ───────────────────────────────────────────────────────────────────

@@ -89,7 +89,7 @@ describe('CheckrProvider.initiate (Tenant orders)', () => {
   // apply flow (S578), which is why GAM's intake stopped rendering consent
   // boxes and the route stopped requiring them. This adapter kept demanding
   // them anyway, so it rejected every order before Checkr was ever called —
-  // AFTER the applicant had paid. Anastacio Erreguin paid $44.99 and got
+  // AFTER the applicant had paid. Bryce Belmont paid $44.99 and got
   // nothing; he was the first person to use the link.
   it('submits without GAM-side consent flags — Checkr collects consent itself', async () => {
     mockOrderResponse({ id: 'ord_consent', status: 'pending', application_url: null })
@@ -231,7 +231,7 @@ describe('CheckrProvider.parseWebhook (Tenant events)', () => {
  *   "I don't ever want landlords going to the checker dashboard. I don't want
  *    links to pictures... They don't need the driver's license number."
  *
- * Built on the real shape of Heather Miller's report (order
+ * Built on the real shape of Dove Ellsworth's report (order
  * ord_-cyscQryRmOerADtv76XqA, 10/24) — the one that started this.
  */
 describe('fetchReport — the detail the landlord is given', () => {
@@ -259,7 +259,7 @@ describe('fetchReport — the detail the landlord is given', () => {
       id: 'dvt_1', status: 'clear',
       consider_reasons: [],
       document_type: { type: 'Identification Card', state: 'IL', country: 'USA' },
-      document_data: { first_name: 'Heather', last_name: 'Miller', dob: '1900-01-01',
+      document_data: { first_name: 'Dove', last_name: 'Ellsworth', dob: '1900-01-01',
                        document_number: 'X00000000', address: '1 Main St',
                        issue_date: '2020-01-01', expiration_date: '2030-01-01' },
       documents_zip_url: 'https://tenant.checkr.com/api/identity_verification/documents/dvt_1',

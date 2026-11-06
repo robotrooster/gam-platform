@@ -174,7 +174,7 @@ describe('GET /api/landlords/:id/dashboard', () => {
     const bx = (await request(buildApp()).get('/api/landlords/me/dashboard?basis=billed')
       .set('Authorization', `Bearer ${token}`)).body.data
     expect(bx.basis.label).toBe('Money billed')
-    expect(bx.income_card.billed).toEqual({ amount: 860, collected: 800, clearing: 60, stillOwed: 0 })
+    expect(bx.income_card.billed).toEqual({ amount: 860, collected: 800, clearing: 60, stillOwed: 0, other: 0 })
   })
 
   it('PM (team role) → 403 (canViewLandlordFinances rejects team roles)', async () => {

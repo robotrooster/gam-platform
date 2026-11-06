@@ -189,8 +189,8 @@ describe('the screen', () => {
     server.payload = {
       proposals: [{
         id: 'p1', confidence: 'strong', score: 90, reasons: ['Same name', 'Same email address'],
-        a: acct({ key: 'u:1', leases: 1, signedDocuments: 1, email: 'calvin@home.net' }),
-        b: acct({ key: 'u:2', leases: 0, signedDocuments: 0, email: 'calvin.curtis@usda.gov' }),
+        a: acct({ key: 'u:1', leases: 1, signedDocuments: 1, email: 'kesh@home.net' }),
+        b: acct({ key: 'u:2', leases: 0, signedDocuments: 0, email: 'kesh.kilbride@usda.gov' }),
       }],
       decided: [], openCount: 1, scanned: null,
     }
@@ -199,7 +199,7 @@ describe('the screen', () => {
     // merge's answer, not the card's promise — GAM only moves a sign-in it can
     // see the whole of (services/duplicatePeople), and says what it did.
     expect(text()).toMatch(/Move the sign-in address/)
-    expect(text()).toMatch(/calvin\.curtis@usda\.gov/)
+    expect(text()).toMatch(/kesh\.kilbride@usda\.gov/)
   })
 
   it('reads back what was answered before, so a decision can be looked up', async () => {

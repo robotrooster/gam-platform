@@ -2143,7 +2143,7 @@ describe('S637 manual cash overpayment', () => {
   it('a check written over the balance banks the remainder, once the written amount is confirmed', async () => {
     const f = await seed()
     const pid = await openRent(f, 460)
-    // 10/3 (Kim Harland's $0.55): the desk first confirms what is written on it.
+    // 10/3 (Yvette Bexley's $0.55): the desk first confirms what is written on it.
     const ask = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`)
       .send({ method: 'check', reference: '1042', amountTendered: 920, surplusHandling: 'credit' })
@@ -2247,7 +2247,7 @@ describe('S637 a credit reduces what is owed next month', () => {
 // money the resident hands over. Four places already knew that (the settlement
 // job, the move-in bundle, the manual settle, utility billing); the two the
 // TENANT actually sees did not. Tyler Rhoades was shown $687.57 owing on Oak
-// Park RV 03 and Matthew Conklin $776.11, every dollar of it covered by labor.
+// Park RV 03 and Gideon Jerningham $776.11, every dollar of it covered by labor.
 describe('S637 work-trade suspended charges', () => {
   it('are left out of the balance the tenant is shown', async () => {
     const f = await seed()
@@ -2285,7 +2285,7 @@ describe('S637 work-trade suspended charges', () => {
 // $935.45... When I go to record payment, it still thinks she owes the full
 // amount, and the payments page does not take partial payments."
 //
-// Kim Harland held a $450 credit against a $935.45 bill. record-manual computed
+// Yvette Bexley held a $450 credit against a $935.45 bill. record-manual computed
 // what was owed from the charge rows alone, so it wanted the gross — and since
 // rent is pay-in-full, $485.45 came back as short. She could not pay.
 describe('S638 a credit reduces what the desk collects', () => {
@@ -2346,11 +2346,11 @@ describe('S638 a credit reduces what the desk collects', () => {
 //
 // Nic: "on the outstanding balances tab six leases that are all overdue, and on
 // the payments tab it's only showing five... The outstanding balance still has
-// Steven Starr. The payments tab, his name is removed from."
+// Zelda Esterhazy. The payments tab, his name is removed from."
 //
 // Rent and utilities are all billed on the 1st, so every one of Nic's 52
 // payments carried the SAME due_date. `ORDER BY due_date DESC` was therefore one
-// flat tie, LIMIT 50 dropped an arbitrary two of them, and Steven Starr's $589
+// flat tie, LIMIT 50 dropped an arbitrary two of them, and Zelda Esterhazy's $589
 // rent and $264.39 utilities were missing from the screen the desk collects
 // money from — with nothing on the page to say so.
 describe('S639 GET /api/payments — paging is stable when every due_date ties', () => {
@@ -3503,6 +3503,42 @@ describe('3-D Secure on the pay screen', () => {
   // it is released (CARD_RELEASE_NOTE) — never inferred from whether a decline
   // fee row exists. The tenant Payments page reads this answer, as the wire
   // carries it, from one fixture.
+  // ── 11/4: THE RESIDENT'S RECEIPT NAMES THE CHARGE ──────────────────────
+  //
+  // This endpoint sent only `type`, so the tenant portal humanized a raw
+  // database enum: every utility read "Utility" whatever it was for. The server
+  // names each line with the same chargeLabel the bill, the receipt email and
+  // the landlord's screens use, and the working note (meter reads, and GAM's
+  // dedupe keys on a fee row) no longer goes to the browser at all.
+  //
+  // In a test of ITS OWN on purpose: the test below captures the golden fixture
+  // that drives the tenant portal's history tests, and seeding an extra receipt
+  // inside it changed which row that fixture's "an ordinary failure" selector
+  // picked. cleanupAllSchema runs before every test, so this is isolated.
+  it('the receipt names each line the way the bill does, and keeps the working note', async () => {
+    const f = await seed()
+    const rem = (await db.query<{ id: string }>(
+      `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, payment_method, status)
+       VALUES ($1,$2,$3,60,60,'cash','settled') RETURNING id`,
+      [f.tenant1Id, f.lease1Id, f.aLid])).rows[0]
+    const water = (await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date,
+                             entry_description, notes)
+       VALUES ($1,$2,$3,$4,'utility',60,'settled',CURRENT_DATE,'UTILITY',
+               'Water meter 02776 → 02793 (Aug 26 → Sep 30)') RETURNING id`,
+      [f.aUnitId, f.lease1Id, f.tenant1Id, f.aLid])).rows[0]
+    await db.query(
+      `INSERT INTO remittance_applications (remittance_id, payment_id, amount_applied) VALUES ($1,$2,60)`,
+      [rem.id, water.id])
+
+    const r = await request(buildApp()).get('/api/payments/remittances').set('Authorization', `Bearer ${f.tokenTenant1}`)
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    const line = r.body.data.remittances.find((x: any) => x.id === rem.id).lines[0]
+    expect(line.label).toBe('Water')                         // not "Utility"
+    expect(line.detail).toBe('meter 02776 → 02793 (Aug 26 → Sep 30)')
+    expect(line.notes).toBeUndefined()                       // the working note stays server-side
+  })
+
   it('payment history: a card payment canceled before anything was charged, and one declined by its bank, are each marked so from what was recorded; an ordinary failed card payment is neither', async () => {
     const f = await seed(); await ready(f)
     await bill(f)

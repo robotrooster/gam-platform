@@ -40,7 +40,7 @@ describe('three agreeing points make one person', () => {
   })
 
   it('case and stray spacing never decide a person', () => {
-    expect(normalizeName('  Jolyn   Whitfield ')).toBe('jolyn whitfield')
+    expect(normalizeName('  Perrin Rutherford ')).toBe('perrin rutherford')
     expect(normalizeEmail('  LISA@Example.COM ')).toBe('lisa@example.com')
   })
 })

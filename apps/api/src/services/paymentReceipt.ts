@@ -11,7 +11,7 @@
 // knows what it settled, but the receipt has to say what the resident actually
 // owes against, and that is the ledger's answer.
 //
-// S655 (10/3, Kim Harland): her 9/9 receipt said $936 for a $486 money order.
+// S655 (10/3, Yvette Bexley): her 9/9 receipt said $936 for a $486 money order.
 // It printed every line at its full amount and called the sum "Total paid",
 // though $450 of it was the landlord's move-in special. Now the money and the
 // credit are separate lines: each charge by name at its amount, "Account credit

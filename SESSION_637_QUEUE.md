@@ -17,7 +17,7 @@ last row is done and folded into a handoff.
 | 7 | Flat-rate trash billed on the arrears sweep | ✅ code done, committed, **not deployed** |
 | 8 | Dashboard "Tenants can't pay rent yet" banner | ✅ removed, committed, **not deployed** |
 | 9 | Tenant-facing landlord-bank disclosure (2 endpoints + agent tool) | ✅ removed, committed, **not deployed** |
-| 10 | Russ Fuller $37.60 carried-forward credit | ✅ applied in prod, credit sits on account |
+| 10 | Tamsin Wrenfield $37.60 carried-forward credit | ✅ applied in prod, credit sits on account |
 | 11 | Deploy rows 1–9 | ✅ shipped 18:29 by the other window; verified live |
 | 12 | August trash cleanup ($75 billed + $325 held) | ✅ RUN — 16 holds, 3 bills, 3 charges removed |
 | 13 | Financials property filters (+ Lot Rent was 400ing, same bug as Expenses) | ✅ done, committed, **not deployed** |
@@ -120,7 +120,7 @@ quick edit.
   (`connect_payouts_enabled = false`). Rent there collects and sits on GAM's
   platform balance; nothing pays out until that entity's KYC is done. Nic:
   "I will work on that bank account thing tomorrow."
-- **Fuller's credit date** — set to 2026-08-12 from "going on three weeks now."
+- **Wrenfield's credit date** — set to 2026-08-12 from "going on three weeks now."
   Confirm the real overpayment date and correct it if that's wrong.
 
 ## Two sources of truth for Connect readiness
@@ -152,7 +152,7 @@ deploy.sh gates on the full suite, so it will refuse to ship until those pass.
 
 - Mountain View RV Park Ranch LLC has no Stripe Connect. Nic: "I will work on
   that bank account thing tomorrow."
-- Fuller's credit is dated 2026-08-12, taken from "going on three weeks now."
+- Wrenfield's credit is dated 2026-08-12, taken from "going on three weeks now."
   Confirm the real overpayment date.
 - Two sources of truth for Connect readiness (users.* per account vs
   landlords.* per entity). Nothing reads it wrongly today; the split remains.

@@ -219,7 +219,14 @@ export async function autoDraftLeasesForUnit(
   // A 75-unit roster confirm used to mean 75 emails to the person who had
   // just pressed the button. The accept path, the hourly sweep and approvals
   // keep the emails: nobody is watching a screen when those draft.
-  opts: { quiet?: boolean } = {},
+  // 10/28: TAKEOVER. Every door that drafts a lease comes through here — the
+  // Tenants-page invite, the Tenant Onboarding roster and an approved
+  // background check all call this function, and GoldSign builds the same
+  // document directly. So the takeover is resolved once, here, and a door only
+  // has to say that it is one. The document carries replaces_lease_id, the
+  // lease inherits it (esign.ts), and the replacement's signature is what
+  // hands the space over (spotSuccession.replacementTookOverSpot).
+  opts: { quiet?: boolean; takeover?: boolean } = {},
 ): Promise<{ draftedDocumentIds: string[]; blocked: string[] }> {
   const quiet = opts.quiet === true
   const blocked: string[] = []
@@ -277,6 +284,25 @@ export async function autoDraftLeasesForUnit(
   const term = terms
     ? termPrefill(terms.monthToMonth ? null : (terms.termMonths ?? tmpl.default_term_months), terms.startDate ?? unit.available_date, unit.timezone)
     : termPrefill(tmpl.default_term_months, unit.available_date, unit.timezone)
+  // The tenancy this draft replaces, if the door said this is a takeover. The
+  // START DATE decides it, which is why it is resolved here rather than at the
+  // door: `term` is where the start date is finally known.
+  let replacesLeaseId: string | null = null
+  let supersedesHomeSaleContractId: string | null = null
+  if (opts.takeover === true) {
+    const { resolveTakeoverForSpace } = await import('./spotSuccession')
+    const r = await resolveTakeoverForSpace(client as any,
+      { unitId, startIso: term.start_date })
+    if (r.refused) throw new AppError(409, r.refused)
+    replacesLeaseId = r.replacesLeaseId!
+    // 10/28 (Nic): ONE PACKET. If a home is being bought on this space, the
+    // installment paper rides the same packet as the lease, so the resident
+    // signs the space and the trailer in one sitting.
+    const hs = await client.query(
+      `SELECT id FROM home_sale_contracts WHERE unit_id = $1 AND status = 'active' LIMIT 1`, [unitId])
+    supersedesHomeSaleContractId = hs.rows[0]?.id ?? null
+  }
+
   const roster = await loadRoster(client, unitId)
   const drafted: string[] = []
 
@@ -316,6 +342,7 @@ export async function autoDraftLeasesForUnit(
         targetLeaseTenantId: null, promoteLeaseTenantId: null,
         signers: [{ ...landlord, orderIndex: 1 }, ...tenantSigners],
         prefillValues: { ...term },
+        replacesLeaseId,
       })
       // S652: the rest of the packet — the package's documents, and the home
       // sale if the invite said so (terms travel on the primary's intent).
@@ -326,6 +353,7 @@ export async function autoDraftLeasesForUnit(
         homeSale: (members as any[]).find(m => m.home_sale_terms)?.home_sale_terms ?? null,
         templateIds: (members as any[]).find(m => m.package_template_ids)?.package_template_ids ?? null,
         prefill: { ...term },
+        supersedesHomeSaleContractId,
       }, createDocumentRecord)
       await client.query(
         `UPDATE pending_tenant_intents SET draft_document_id=$1, updated_at=NOW() WHERE id = ANY($2)`,

@@ -27,6 +27,8 @@ export interface HouseholdPacketInput {
   termMonths?: number | null
   monthToMonth?: boolean
   actorUserId?: string | null
+  /** 10/28: the chosen space is occupied and the landlord is taking it over. */
+  takeover?: boolean
 }
 
 export interface HouseholdPacketResult {
@@ -78,13 +80,30 @@ export async function draftPacketForHousehold(input: HouseholdPacketInput): Prom
   let draftedDocumentIds: string[] = []
   try {
     await client.query('BEGIN')
+    // 10/28: WHAT HAPPENS WHEN THE SPACE IS NOT FREE.
+    //
+    // This door had no occupancy check of any kind. The Tenants-page invite
+    // refuses a second lease on a whole-unit space (assertUnitCanAcceptNewLease)
+    // and GoldSign makes the landlord tick that the lease replaces the resident
+    // by name — but an approved screening drafted straight onto an occupied
+    // space and said nothing, leaving two live leases on one home and no
+    // handover between them. That is worse than a refusal: nobody is told.
+    //
+    // So the space decides, and the landlord's answer decides which way:
+    //   • takeover ticked  → autoDraftLeasesForUnit resolves the tenancy being
+    //     replaced and the replacement's signature hands the space over;
+    //   • not ticked       → the same refusal every other door gives.
+    if (input.takeover !== true) {
+      const { assertUnitCanAcceptNewLease } = await import('./leaseOnboarding')
+      await assertUnitCanAcceptNewLease(client as any, unit.id)
+    }
     const { autoDraftLeasesForUnit } = await import('./leaseOnboarding')
     const { createDocumentRecord } = await import('../routes/esign')
     const out = await autoDraftLeasesForUnit(client as any, unit.id, createDocumentRecord, {
       startDate: input.startDate ?? null,
       termMonths: input.termMonths ?? null,
       monthToMonth: input.monthToMonth === true,
-    })
+    }, { takeover: input.takeover === true })
     await client.query('COMMIT')
     draftedDocumentIds = out.draftedDocumentIds
   } catch (e) {

@@ -340,7 +340,58 @@ export async function processLeaseEnds(onlyLeaseId?: string | null, theyActually
       //
       // Both halves of Nic's rule, in one gate: a lease holds a space
       // indefinitely, and paying ahead is the only other way to lock one out.
-      if (lease.dwelling_ownership === 'tenant' && !theyActuallyLeft) {
+      // 10/28 (Nic, DIRECTIVE) — A SIGNED SUCCESSOR BEATS THE LAPSE.
+      //
+      //   "A lease is a rental agreement for a period of time... them owning it
+      //    has nothing to do with it. If a landlord adds a lease to replace the
+      //    other person, the new lease supersedes the old lease. Because the
+      //    only way for the new lease to even be on there is by the landlord
+      //    initiation, which means that's what the landlord wants to win.
+      //    However, the new lease only supersedes if it's signed."
+      //
+      // The space-rental rule below exists so that a date NOBODY CHOSE cannot
+      // put somebody off their space. A signed successor is the opposite of
+      // that: it is a date two parties chose. Without this check the lapse ate
+      // it — a takeover signed today had the sitting lease's end date written
+      // by spotSuccession.replacementTookOverSpot, and this sweep set it back
+      // to NULL the same night and put the departing resident on
+      // month-to-month, still billing, with the replacement's lease already
+      // signed for the same space. 73 of the 83 active leases are on
+      // tenant-owned dwellings, so it was the normal case, not an edge.
+      //
+      // WHAT COUNTS AS SIGNED, and the two cases differ on purpose:
+      //   • a REPLACEMENT (another household, replaces_lease_id) needs BOTH
+      //     signatures — the replacement's own signature is the thing that
+      //     releases the sitting resident, so a landlord-signed draft nobody
+      //     countersigned releases nobody.
+      //   • a RENEWAL (same household) needs the LANDLORD's only, matching the
+      //     successor query below and S647: a renewal is issued when the
+      //     landlord signs, and reading one the tenant has not opened yet as a
+      //     move-out is the unrecoverable direction.
+      // Either way the lease falls through to the expire path, which already
+      // knows a successor for somebody ELSE means this household is moving out
+      // while the unit stays occupied.
+      const supersededBySigned = lease.dwelling_ownership === 'tenant' && !theyActuallyLeft
+        ? await queryOne<{ one: number }>(`
+            SELECT 1 AS one FROM leases r
+             WHERE r.unit_id = $1 AND r.id <> $2
+               AND r.status IN ('pending', 'active')
+               AND (
+                 (r.replaces_lease_id = $2 AND r.signed_by_tenant = TRUE AND r.signed_by_landlord = TRUE)
+                 OR (r.signed_by_landlord = TRUE AND (
+                      r.supersedes_lease_id = $2
+                      OR EXISTS (SELECT 1 FROM lease_documents d
+                                  WHERE d.lease_id = r.id AND d.renews_lease_id = $2)))
+               )
+             LIMIT 1`, [lease.unit_id, lease.id])
+        : null
+      if (supersededBySigned) {
+        logger.info(
+          `[LeaseEnd] ${lease.unit_number}: tenant-owned dwelling, but a SIGNED successor ` +
+          `names this lease — the end date stands and the hand-over proceeds`)
+      }
+
+      if (lease.dwelling_ownership === 'tenant' && !theyActuallyLeft && !supersededBySigned) {
         await query(
           `UPDATE leases
               SET end_date = NULL, lease_type = 'month_to_month', updated_at = NOW()
@@ -439,6 +490,40 @@ export async function processLeaseEnds(onlyLeaseId?: string | null, theyActually
         // people leaving, a "renewed" credit event, work trade left running.)
         const handOff = !!successor && (successor.renews || successor.same_household)
 
+        // ── 11/4: A CHARGE HELD FOR THE NEXT BILL, WHEN THERE IS NO NEXT BILL ──
+        //
+        // The $4 a bounced bank pull costs GAM is written held, asked for by
+        // nothing, and picked up by the next bill the lease generates (11/4,
+        // Nic: "it needs to ride the next bill"). Only ACTIVE leases generate
+        // bills, so a tenancy that ends while one is held leaves it held for
+        // good: invisible on every screen, swept by nothing, collected by
+        // nobody, and GAM has already paid the bank for it.
+        //
+        // The hold is released HERE, before anything else in the ending runs,
+        // so the machinery below treats it as the ordinary owed charge it now
+        // is and does the right thing on its own in both cases: it follows a
+        // renewal with the rest of the household's open money
+        // (handOffOpenItemsToRenewal, which reads the payable rule and so could
+        // never see a held row), or on a real move-out it sweeps the deposit
+        // and what is left follows them onto the left-owing book. A fee already
+        // incurred stands when somebody leaves — only future charges are severed.
+        //
+        // Never fails the ending, the same rule as the pull-back below.
+        try {
+          const released = await query<{ id: string }>(
+            `UPDATE payments SET held_for_next_bill_at = NULL
+              WHERE lease_id = $1 AND held_for_next_bill_at IS NOT NULL
+                AND status = 'pending' AND voided_at IS NULL
+              RETURNING id`, [lease.id])
+          if (released.length > 0) {
+            logger.info({ leaseId: lease.id, charges: released.length },
+              '[LeaseEnd] charges waiting for a bill released — the tenancy is ending, so they are owed now')
+          }
+        } catch (e) {
+          logger.error({ err: e, leaseId: lease.id },
+            '[LeaseEnd] a charge waiting for a bill could not be released; tomorrow retries')
+        }
+
         // The renewal's open money follows it, before the old lease closes. If
         // the move fails the old lease stays active another night and this is
         // retried — its bills cannot overlap the renewal's (the bill run stops
@@ -468,6 +553,64 @@ export async function processLeaseEnds(onlyLeaseId?: string | null, theyActually
           SET status='removed', removed_at=NOW(), removed_reason='lease_ended', updated_at=NOW()
           WHERE lease_id=$1 AND status IN ('active','pending_remove')
         `, [lease.id])
+
+        // ── 11/1 (Nic): THE TENANCY ENDING TAKES BACK WHAT WAS BILLED PAST IT ──
+        //
+        //   "Have it pull the bill when it's if we forgot to check somebody out."
+        //
+        // Mountain View RV 20: gone about a month, never checked out, so the 7am
+        // run billed him November — correctly, from what it could see — and
+        // ending the tenancy three hours later left the $607.48 standing. Rent
+        // is paid FORWARD, so a rent or fee row due on or after the day the
+        // tenancy ended covers time nobody was there and was never owed. A row
+        // due BEFORE that day is still theirs: this never forgives arrears.
+        //
+        // Here rather than only in the register route because this is the one
+        // function every ending flows through — the 2am sweep AND the desk's
+        // "finish check-out" (routes/pos calls processLeaseEnds directly). It
+        // gets its own connection and transaction: the rest of this job runs on
+        // the pool with none, and a half-done pull-back is worse than none.
+        //
+        // NOT ON A HAND-OFF. A renewal or a same-household new lease ends this
+        // lease without anybody leaving — the open items were just moved onto
+        // the successor a few lines above. Pulling back there would take money
+        // off a household that is still living there, which is the opposite of
+        // the point. Two esign tests caught this when the gate was missing.
+        //
+        // Never fails the ending. A tenancy must still end if the money step
+        // throws; the charge stays owed, GAM is told, and tomorrow's sweep tries
+        // again (it is idempotent).
+        if (!handOff) try {
+          const { pullBackChargesPastLeaseEnd } = await import('../services/leaseEndPullBack')
+          const c = await getClient()
+          try {
+            await c.query('BEGIN')
+            const back = await pullBackChargesPastLeaseEnd(c, { leaseId: lease.id })
+            await c.query('COMMIT')
+            if (back.charges > 0 || back.kept > 0) {
+              logger.info({ leaseId: lease.id, ...back, keptCharges: undefined },
+                '[LeaseEnd] charges billed past the end of the tenancy taken back')
+            }
+            if (back.kept > 0) {
+              const { createAdminNotification } = await import('../services/adminNotifications')
+              await createAdminNotification({
+                severity: 'warn',
+                category: 'lease_end_charge_kept',
+                title: `${back.kept} charge(s) past a tenancy's end could not be taken off by themselves`,
+                body: `The tenancy on lease ${lease.id} ended ${back.endsOn}. `
+                  + `${back.charges} charge(s) billed for after that were voided; ${back.kept} could not be, `
+                  + `because another record points at each (a bank remittance applied to it, for instance). `
+                  + `Those need taking off by hand.`,
+                context: { lease_id: lease.id, ends_on: back.endsOn, kept: back.keptCharges },
+              }).catch(() => {})
+            }
+          } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e }
+          finally { c.release() }
+        } catch (e) {
+          logger.error({ err: e, leaseId: lease.id },
+            '[LeaseEnd] could not take back charges past the end of the tenancy — the tenancy still ended; retried tomorrow')
+        }
+
         if (handOff) {
           logger.info(`[LeaseEnd] Expired lease ${lease.id}; unit ${lease.unit_id} hands off to successor lease ${successor.id} — no vacate, no deposit-return draft`)
           // The renewal comes into force now, not before (see the wait above).
@@ -562,6 +705,30 @@ export async function processLeaseEnds(onlyLeaseId?: string | null, theyActually
           logger.error({ err: e }, '[LeaseEnd][deposit-return-draft]')
         }
 
+        // ── 11/5 (Nic): WHAT THEY LEFT OWING GOES ON THE BOOK ────────────────
+        //
+        //   "People are going to leave regardless of if somebody's coming in to
+        //    replace them or not."
+        //
+        // Until tonight only a REPLACEMENT SIGNING wrote this (spotSuccession),
+        // so an empty lot booked nothing: Country Acres MH 18 and MH 28 ended
+        // the same day and only one of them was on the book.
+        //
+        // AFTER the deposit-return draft on purpose. The draft is what says how
+        // much of the deposit the deductions will actually spend, and that
+        // comes off the figure (services/leftOwingFreeze) — booking the gross
+        // would flag somebody whose deposit covers everything. Never on a
+        // hand-off: nobody left, and the open money was just moved onto the
+        // successor.
+        try {
+          const { bookWhatTheyLeftOwing } = await import('../services/leftOwingFreeze')
+          await bookWhatTheyLeftOwing({ query: query as any }, {
+            leaseId: lease.id, leftOn: lease.end_date, unitLabel: lease.unit_number })
+        } catch (e) {
+          logger.error({ err: e, leaseId: lease.id },
+            '[LeaseEnd] could not book what this tenancy left owing — tonight\'s sweep retries')
+        }
+
         // S576 (B-8): work trade is rent-for-labor — it can't outlive the
         // tenancy. This branch is a real move-out (no signed successor), so
         // pause any active work-trade agreement for this unit's departing
@@ -592,6 +759,105 @@ export async function processLeaseEnds(onlyLeaseId?: string | null, theyActually
       logger.info(`[LeaseEnd] ${ended.length} lease(s) processed at end_date`)
     }
   } catch(e) { logger.error({ err: e }, '[SCHEDULER] lease end processor') }
+}
+
+/**
+ * 11/5 (Nic) — EVERY ENDED TENANCY, NOT JUST THE ONES THAT CAME THROUGH A HOOK.
+ *
+ *   "People are going to leave regardless of if somebody's coming in to replace
+ *    them or not."
+ *
+ * A tenancy can end six ways and until tonight exactly one of them wrote the
+ * left-owing book: a replacement signing for the space (spotSuccession). The
+ * move-out branch above now books it too, but hooks are the wrong shape for
+ * this on their own — services/leaseTermination ends a lease without even
+ * cutting a deposit-return draft, spaceRentCarryforward closes out a
+ * tenant-owned home, unitMove and unwindIssuedLease each end one their own way,
+ * and whatever gets added next month will not know to call anything.
+ *
+ * So the book is swept, not notified. Anything that ended and still has the
+ * landlord's money unpaid on it gets booked tonight, wherever it ended, and a
+ * figure already there is RE-COMPUTED while nobody has begun collecting against
+ * it — which is what picks up the final cycle's utilities, since they bill in
+ * arrears and do not exist on the day somebody leaves.
+ *
+ * WHAT IT WILL NOT TOUCH:
+ *   • a tenancy whose household is on a LIVE lease of the same landlord. They
+ *     renewed, or they moved to another space — either way nobody walked away,
+ *     and a renewal hand-off has already moved the open money onto the new
+ *     lease.
+ *   • a row somebody has settled, or collected anything against. The figure
+ *     stands as it is; leftOwingCollection owns it from there.
+ *   • a space-rental end date that merely LAPSED. Those leases are still
+ *     active (the gate in processLeaseEnds), so they are not in this set at
+ *     all — a date nobody chose must never put somebody on this book.
+ */
+export async function bookTenanciesThatLeftOwing(): Promise<{ booked: number; checked: number }> {
+  let booked = 0
+  let checked = 0
+  try {
+    const { leftOwingRowSql, leasePersonKeySql, bookWhatTheyLeftOwing } = await import('../services/leftOwingFreeze')
+    const ended = await query<{ id: string; unit_number: string; left_on: string | null }>(`
+      SELECT l.id, un.unit_number,
+             to_char(COALESCE(l.end_date, l.terminated_at::date), 'YYYY-MM-DD') AS left_on
+        FROM leases l
+        JOIN units un ON un.id = l.unit_id
+       WHERE l.status IN ('expired', 'terminated')
+         AND COALESCE(l.end_date, l.terminated_at::date) IS NOT NULL
+         -- They really went: nobody off this lease holds a live lease of this
+         -- same landlord (a renewal, or a move to another space).
+         AND NOT EXISTS (
+           SELECT 1 FROM lease_tenants lt
+             JOIN lease_tenants nt ON nt.tenant_id = lt.tenant_id
+             JOIN leases nl ON nl.id = nt.lease_id
+            WHERE lt.lease_id = l.id
+              AND nt.status IN ('active', 'pending_add')
+              AND nl.id <> l.id
+              AND nl.landlord_id = l.landlord_id
+              AND nl.status IN ('active', 'pending'))
+         -- There is money, by either half of the figure.
+         AND (EXISTS (SELECT 1 FROM payments lop WHERE ${leftOwingRowSql('lop', 'l.id')})
+              OR EXISTS (SELECT 1 FROM utility_bills lob
+                          WHERE lob.lease_id = l.id AND lob.payment_id IS NULL
+                            AND lob.status IN ('unbilled', 'billed') AND lob.voided_at IS NULL
+                            AND lob.landlord_id = l.landlord_id)
+              -- ...or a part of ours is still open on this very tenancy, so
+              -- that paying everything off AFTER leaving withdraws it instead
+              -- of leaving somebody flagged for a balance that no longer
+              -- exists. 11/5: the PART, keyed on the lease — the record itself
+              -- may also carry a stay or a counter tab of theirs, and those are
+              -- none of this sweep's business.
+              OR EXISTS (SELECT 1 FROM tenant_left_owing_parts lop2
+                           JOIN tenant_left_owing loo ON loo.id = lop2.owing_id
+                          WHERE loo.landlord_id = l.landlord_id
+                            AND lop2.kind = 'lease' AND lop2.source_key = l.id::text
+                            AND lop2.voided_at IS NULL
+                            AND loo.settled_at IS NULL))
+         -- Nothing to do where somebody has settled this person's debt or
+         -- started collecting against it. Found by WHO they are (person_key),
+         -- which is how the book is keyed since 11/5 — leasePersonKeySql is the
+         -- same person the writer picks, so a lease cannot be swept for one
+         -- person and written for another.
+         AND NOT EXISTS (
+           SELECT 1 FROM tenant_left_owing lo
+            WHERE lo.landlord_id = l.landlord_id
+              AND lo.person_key IS NOT NULL
+              AND lo.person_key = ${leasePersonKeySql('l.id')}
+              AND (lo.settled_at IS NOT NULL OR COALESCE(lo.collected_amount, 0) > 0))
+       ORDER BY COALESCE(l.end_date, l.terminated_at::date)`)
+    for (const l of ended) {
+      checked++
+      const r = await bookWhatTheyLeftOwing({ query: query as any }, {
+        leaseId: l.id, leftOn: l.left_on, unitLabel: l.unit_number })
+      if (r) booked++
+    }
+    if (booked > 0) {
+      logger.info({ booked, checked }, '[left-owing] nightly sweep booked or re-computed what ended tenancies left owing')
+    }
+  } catch (e) {
+    logger.error({ err: e }, '[left-owing] nightly sweep')
+  }
+  return { booked, checked }
 }
 
 /**
@@ -1162,8 +1428,8 @@ export async function processEsignTimeouts() {
         // This used to take EVERY outstanding signer and email them all in one
         // pass, stamping invite_sent_at on each. So a co-tenant two places down
         // the order got a "please sign" for a document that was not yet theirs:
-        // Brandon Valdez and Yesenia Sanchez were both mailed at 15:15:02 on the
-        // 7th, Ruben Chavarin and Obed Parra both at 13:45:02 on the 8th. They
+        // Ivey Ingersoll and Isadora Nithsdale were both mailed at 15:15:02 on the
+        // 7th, Shepherd Vexley and Nyla Quilliam both at 13:45:02 on the 8th. They
         // opened it, filled it in, could not submit, and told Nic they had
         // signed.
         //
@@ -1181,9 +1447,9 @@ export async function processEsignTimeouts() {
              --
              -- Re-sending here stamps invite_sent_at = NOW(), which makes the
              -- document 48 hours stale again two days later — so this path
-             -- re-asked forever. Jolyn Whitfield got 108 signing requests in
+             -- re-asked forever. Perrin Rutherford got 108 signing requests in
              -- October across nine documents, every two days since the 2nd;
-             -- Kyra Smith the same. Those two were 28% of every email GAM sent
+             -- Zora Crowhurst the same. Those two were 28% of every email GAM sent
              -- this month, and September came to 3,215 — over Resend's free tier.
              --
              -- The same ceiling S639 put on the 2-hour nudge one block above,
@@ -1258,11 +1524,25 @@ export async function processEsignTimeouts() {
         // packet's unfinished forms; 10/14 afternoon, the invite waiting on it
         // stays open to be drafted again); anything that test keeps is voided
         // exactly as before.
-        const ended = await endDocumentOnItsOwn(d, async (vq, live) => {
-          await cascadeLeaseTenantsOnVoid(vq, live)
-          await vq(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
-            ['auto-voided: signers did not respond within 48 hours', live.id])
-        })
+        // 11/4 (Nic): "I don't want to void things." Paperwork that money has
+        // run through is LEFT ALONE — the same answer processUnsignedDraftExpiry
+        // has given since 10/14, which this job never got.
+        //
+        // Country Acres MH 24 is why. Her installment contract was 36 of 72
+        // billed and 35 paid; her purchase agreement went unsigned, this job
+        // voided it at 23:45, and voiding a purchase agreement cancels the sale
+        // behind it (lib/voidDocument unwindHomeSaleOnVoid). Her November
+        // trailer payment was never written and every month after it would have
+        // been skipped — silently, with nobody told. A cleanup must never be
+        // able to switch off billing that has already taken money.
+        const ended = await endDocumentOnItsOwn(d, async () => {
+          throw new KeptOnItsOwn()
+        }).catch((e) => { if (e instanceof KeptOnItsOwn) return 'kept' as const; throw e })
+        if (ended === 'kept') {
+          logger.warn({ document_id: d.id, title: d.title },
+            '[ESIGN-TIMEOUTS] left alone — money has run through this paperwork; it is not voided')
+          continue
+        }
         if (ended === 'gone') continue
 
         for (const rcp of recipients) {
@@ -1373,13 +1653,17 @@ export async function processNewLeaseSignings(opts: { hour?: number } = {}) {
       `, [d.id, d.landlord_id])
       // 10/14 (Nic, #4): "a lapsed new lease ... delete them too, instead of
       // voiding" — erased when no money touched it; voided as before otherwise.
-      const ended = await endDocumentOnItsOwn(d, async (vq, live) => {
-        await cascadeLeaseTenantsOnVoid(vq, live)
-        const { unwindIssuedLease } = await import('../lib/unwindIssuedLease')
-        await unwindIssuedLease(vq, live)
-        await vq(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
-          ['auto-voided: the landlord never signed this new lease before its start date', live.id])
-      })
+      // 11/4 (Nic): "I don't want to void things." Same rule as the 48-hour
+      // timeout above — a draft the erase keeps is one money has run through,
+      // and unwinding the lease under it would take that money with it.
+      const ended = await endDocumentOnItsOwn(d, async () => {
+        throw new KeptOnItsOwn()
+      }).catch((e) => { if (e instanceof KeptOnItsOwn) return 'kept' as const; throw e })
+      if (ended === 'kept') {
+        logger.warn({ document_id: d.id, title: d.title },
+          '[ESIGN-TIMEOUTS] lapsed new lease left alone — money has run through this paperwork; it is not voided')
+        continue
+      }
       if (ended === 'gone') continue
       lapsed++
       const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
@@ -2701,6 +2985,31 @@ export function schedulerInit() {
     } catch (e) {
       logger.error({ err: e }, '[reading-runs] fatal')
     }
+    // 10/31 (Nic): "If there's nothing for a double check, why would I go back
+    // in to review bills or choose to complete? That process should happen when
+    // there are automatically no more to review." A waiting run whose last flag
+    // went away without anyone resolving it had no trigger at all and sat there
+    // asking him to settle zero readings.
+    try {
+      const { finishSettledReadingRuns } = await import('../services/utilityReadingRuns')
+      const r = await finishSettledReadingRuns()
+      if (r.finished > 0 || r.waiting > 0) logger.info(r, '[reading-runs] settled')
+    } catch (e) {
+      logger.error({ err: e }, '[reading-runs] finishing settled runs fatal')
+    }
+    // 11/1 (Nic): a landlord who reviews before billing and has not done it by
+    // month end gets chased every remaining day of the month, because an
+    // unapproved round holds EVERY invoice on the property — rent included.
+    // Country Acres' twelve households got no November bill off one flagged
+    // read. This one ignores notification preferences (critical in the
+    // catalog); it is the only utility notice that does.
+    try {
+      const { remindReviewLandlordsBeforeBilling } = await import('../services/utilityReadingRuns')
+      const r = await remindReviewLandlordsBeforeBilling()
+      if (r.reminded > 0) logger.info(r, '[reading-runs] month-end review reminders')
+    } catch (e) {
+      logger.error({ err: e }, '[reading-runs] month-end review reminder fatal')
+    }
     // S652 (Nic): tenants billed on their own date are read the business day
     // before it. Say so on that day — and keep saying it while one is overdue,
     // because a missed read holds that tenant's whole invoice.
@@ -2817,7 +3126,7 @@ export function schedulerInit() {
   //    background check. I have sent the link to a couple more people through
   //    text message today."
   //
-  // Checkr finished Anastacio Erreguin's report at 15:19 Phoenix on Sep 9 and
+  // Checkr finished Bryce Belmont's report at 15:19 Phoenix on Sep 9 and
   // GAM never heard — not one request has reached /api/background/webhook in
   // the entire log window. His screening sat at `processing` for twenty-two
   // hours until Nic decided it by hand, on a report he could not see.
@@ -2921,6 +3230,22 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // 10/29 (Nic): tell a resident their deposit can be split. The portal prompt
+  // catches anyone who logs in; this catches the ones who do not, in the inbox
+  // the bill landed in. ONCE per deposit — the job's own guard, not a cadence.
+  // 09:45 Phoenix, just after the bank-verification chase, so a resident who
+  // gets both on the same morning gets them in the order that makes sense:
+  // finish linking your bank, then here is what it lets you do.
+  cron.schedule('45 9 * * *', async () => {
+    try {
+      const { sendFlexDepositOfferEmails } = await import('./flexDepositOfferEmail')
+      const r = await sendFlexDepositOfferEmails()
+      if (r.sent > 0 || r.failed > 0) logger.info(r, '[flexdeposit-offer-email]')
+    } catch (e) {
+      logger.error({ err: e }, '[flexdeposit-offer-email] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   cron.schedule('0 10 * * *', async () => {
     try {
       const { nudgeExpiringInvites } = await import('./inviteNudge')
@@ -2977,7 +3302,7 @@ export function schedulerInit() {
       const { billDueHomeSaleInstallments, reconcileAllHomeSaleContracts } = await import('../services/homeSale')
       // S654: the day on GAM's home calendar (Phoenix), not the host's clock.
       // 10/25: the DAY, not the month's first. An installment bills when its
-      // own date arrives — Lisa Scheeler's falls on the 10th, and a month-start
+      // own date arrives — Calla Fitzhugh's falls on the 10th, and a month-start
       // comparison billed it a month late every month.
       const asOf = todayIn(null)
       const billed = await billDueHomeSaleInstallments(asOf)
@@ -3367,22 +3692,9 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
-  // S652 (Nic): the standing rule that suspends a portal, run by nobody.
-  // "I don't want it flipped by a person... choice creates the opportunity for
-  // discrimination. We need to have a standing company rule and a sweep."
-  //
-  // Runs AFTER the 08:30 debit sweep on purpose: anybody who linked a bank
-  // overnight has already been collected from by the time this looks, so the
-  // rule can never suspend somebody GAM could have charged that morning.
-  cron.schedule('0 9 * * *', async () => {
-    try {
-      const { runPortalLockSweep } = await import('../services/portalLockSweep')
-      const r = await runPortalLockSweep()
-      if (r.locked || r.warned || r.released) logger.warn(r, '[portal-lock] sweep')
-    } catch (e) {
-      logger.error({ err: e }, '[portal-lock] sweep failed')
-    }
-  }, { timezone: 'America/Phoenix' })
+  // 11/2 (Nic): the 09:00 portal-lock sweep is gone — nobody is locked out of
+  // their portal over GAM fees any more. See the header on middleware/auth for
+  // what collects instead and what trade that was.
 
   // 10/13 (Nic): "emailing tenants on their birthday and saying, Hey, happy
   // birthday from GAM ... Thank you for using GAM." Current tenants and
@@ -3968,19 +4280,15 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
-  // S246: FlexDeposit installment cron — daily at 6am Phoenix.
-  // Pulls installments 2..N from tenants whose due_date <= today.
-  cron.schedule('0 6 * * *', async () => {
-    try {
-      const { processFlexDepositInstallmentDue } = await import('../services/flexDeposit')
-      const result = await processFlexDepositInstallmentDue()
-      if (result.candidates_scanned > 0) {
-        logger.info(result, '[flexdeposit-installment]')
-      }
-    } catch (e) {
-      logger.error({ err: e }, '[flexdeposit-installment] fatal')
-    }
-  }, { timezone: 'America/Phoenix' })
+  // RETIRED 10/30 (Nic): the FlexDeposit installment bank pull.
+  //
+  //   "It needs to ride the next invoice."
+  //
+  // Installments 2..N are now a line on the next invoice the lease generates
+  // (jobs/invoiceGeneration) and are collected by whatever pays that bill. No
+  // cron debits a resident's bank for a deposit any more, so there is nothing
+  // here to schedule. processFlexDepositInstallmentDue survives as a no-op so a
+  // stale entry cannot resume pulling; see its @deprecated note for the why.
 
   // S246: FlexDeposit custody fee — monthly on the 1st at 7am
   // Phoenix. $3 charge per active FlexDeposit-enrolled tenant.
@@ -4082,6 +4390,9 @@ export function schedulerInit() {
   cron.schedule('0 2 * * *', async () => {
     await activatePendingLeases()
     await processLeaseEnds()
+    // 11/5: ...and anything that ended by one of the other five doors, or whose
+    // final arrears-billed utility has landed since. See the function.
+    await bookTenanciesThatLeftOwing()
   }, { timezone: 'America/Phoenix' })
 
   // ── LOW STOCK CHECK ─────────────────────────────────────────
@@ -4417,6 +4728,7 @@ export function schedulerInit() {
   registerLateFeeEngine()
   registerAutopayEngine()
   void import('./monthlyPropertyReportEmail').then(m => m.registerMonthlyPropertyReportEmail()).catch((e: unknown) => logger.error({ err: e }, '[Scheduler] monthly property report email')) // 10/12 (Nic): the monthly property report, emailed the 2nd
+  void import('./ownerStatementEmail').then(m => m.registerOwnerStatementEmail()).catch((e: unknown) => logger.error({ err: e }, '[Scheduler] owner statement email')) // PM readiness 4: the owner statement, emailed the 3rd
   registerRefreshCron()
   // initial population — async, will populate per-tz crons on next tick
   refreshTimezoneCrons().then(({ added }) => {

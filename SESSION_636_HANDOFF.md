@@ -51,7 +51,7 @@ single $2.25 utility rate.
 ## Mountain View state
 
 - **46 invites out** — RV batch 18:15–18:43, MH batch 18:50–19:10. Two accepted
-  (Renee Allen RV 24, Calvin Curtis RV 40), both parked on the missing template.
+  (Xiomara Yelverton RV 24, Kesh Kilbride RV 40), both parked on the missing template.
 - **Templates:** `Mountain View Mobile Home` uploaded and repaired (tenant names
   2/3/4 mapped, occupants bound, identity fields freed). **The rv_spot template
   is still missing** — 25 invites and both acceptances are waiting on it. It
@@ -102,5 +102,5 @@ single $2.25 utility rate.
    `realestaterhoades` owner of Mountain View. Reversible.
 
 ## Not touched
-`nicholasfausett12@gmail.com` — super_admin, unverified, created 2026-09-01. Nic
+`lysanderoglethorpe12@gmail.com` — super_admin, unverified, created 2026-09-01. Nic
 confirmed it is a partner admin who may not have accepted the invite yet.

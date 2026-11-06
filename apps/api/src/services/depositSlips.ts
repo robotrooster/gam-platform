@@ -59,8 +59,16 @@ const toDollars = (c: number): number => Math.round(c) / 100
 const money = (c: number): string =>
   `$${toDollars(c).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 
-/** What sits in the bag: a recorded receipt or a register cash sale. */
-export const CASH_ITEM_KINDS = ['receipt', 'register_sale'] as const
+/**
+ * What sits in the bag: a recorded receipt, a register cash sale, or — 10/31 —
+ * a counted drawer's drop.
+ *
+ * A drop and the sales inside it are the SAME MONEY, so they are never both
+ * offered: once a shift is counted, its sales stop listing on their own and the
+ * drop stands for them. The drop is also the truer figure, because a drawer that
+ * came up short sends less to the bank than its sales say it should.
+ */
+export const CASH_ITEM_KINDS = ['receipt', 'register_sale', 'drawer_drop'] as const
 export type CashItemKind = typeof CASH_ITEM_KINDS[number]
 
 export interface CashItem {
@@ -118,12 +126,15 @@ export async function cashNotBanked(
     includeOnSlip?: boolean
     receiptIds?: string[]
     saleIds?: string[]
+    /** 10/31: counted drawers whose drop goes in the bag. Its own list — a drop's id is never a sale's. */
+    dropIds?: string[]
   } = {},
 ): Promise<CashItem[]> {
   const scoped = opts.propertyIds ?? null
-  const named = !!(opts.receiptIds || opts.saleIds)
+  const named = !!(opts.receiptIds || opts.saleIds || opts.dropIds)
   const receiptIds = opts.receiptIds ?? []
   const saleIds = opts.saleIds ?? []
+  const dropIds = opts.dropIds ?? []
   const rows = (await runner.query<{
     kind: CashItemKind; id: string; amount: string; collected_on: string; method: string
     payer_name: string | null; unit_number: string | null; property_id: string | null
@@ -131,7 +142,7 @@ export async function cashNotBanked(
     payment_ids: string[] | null
   }>(
     `WITH live_slip AS (
-       SELECT i.remittance_id, i.pos_transaction_id, s.id AS slip_id, s.status,
+       SELECT i.remittance_id, i.pos_transaction_id, i.register_shift_id, s.id AS slip_id, s.status,
               to_char(s.deposit_date, 'YYYY-MM-DD') AS deposit_date
          FROM bank_deposit_slip_items i
          JOIN bank_deposit_slips s ON s.id = i.slip_id
@@ -182,8 +193,39 @@ export async function cashNotBanked(
         AND (ls.slip_id IS NULL OR (ls.status = 'open' AND $3::boolean))
         AND ($4::uuid[] IS NULL OR p.property_id = ANY($4::uuid[]))
         AND (NOT $5::boolean OR p.id = ANY($7::uuid[]))
+        -- 10/31: this sale's money is inside a counted drawer's DROP, which is
+        -- the line that goes in the bag. Offering the sale as well would bank
+        -- the same cash twice — and the drop is the truer figure, because a
+        -- drawer that came up short sends less to the bank than its sales say.
+        -- A sale on no shift, or on one still open, is unaffected.
+        AND NOT EXISTS (
+          SELECT 1 FROM pos_register_shifts cs
+           WHERE cs.id = p.register_shift_id AND cs.status = 'closed')
+     UNION ALL
+     -- ── 10/31 (Nic): THE DROP ────────────────────────────────────────────
+     -- What physically came out of the till when the drawer was counted down.
+     -- Only a closed shift has one, and only a positive one is worth banking:
+     -- a drawer counted below what it started with has nothing to carry.
+     SELECT 'drawer_drop'::text, sh.id, (sh.drop_cents / 100.0)::text,
+            to_char(sh.business_day, 'YYYY-MM-DD'),
+            'cash',
+            COALESCE(NULLIF(TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')), ''), rg.name),
+            rg.name, sh.property_id, pr2.name,
+            ls2.slip_id, ls2.deposit_date, ARRAY[]::text[]
+       FROM pos_register_shifts sh
+       JOIN pos_registers rg   ON rg.id = sh.register_id
+       LEFT JOIN properties pr2 ON pr2.id = sh.property_id
+       LEFT JOIN users cu       ON cu.id = sh.closed_by_user_id
+       LEFT JOIN live_slip ls2  ON ls2.register_shift_id = sh.id
+      WHERE sh.landlord_id = $1
+        AND sh.status = 'closed'
+        AND sh.drop_cents > 0
+        AND sh.closed_at >= now() - ($2::int || ' days')::interval
+        AND (ls2.slip_id IS NULL OR (ls2.status = 'open' AND $3::boolean))
+        AND ($4::uuid[] IS NULL OR sh.property_id = ANY($4::uuid[]))
+        AND (NOT $5::boolean OR sh.id = ANY($8::uuid[]))
       ORDER BY 4, 2`,
-    [landlordId, CASH_LOOKBACK_DAYS, opts.includeOnSlip !== false, scoped, named, receiptIds, saleIds])).rows
+    [landlordId, CASH_LOOKBACK_DAYS, opts.includeOnSlip !== false, scoped, named, receiptIds, saleIds, dropIds])).rows
   return rows.map(r => ({
     kind: r.kind, id: r.id, amountCents: toCents(r.amount), amount: toDollars(toCents(r.amount)),
     collectedOn: r.collected_on, method: r.method, payerName: r.payer_name, unitNumber: r.unit_number,
@@ -475,6 +517,8 @@ export interface CreateSlipInput {
   depositDate: string
   receiptIds?: string[]
   registerSaleIds?: string[]
+  /** 10/31: counted drawers whose drop went in the bag. */
+  drawerDropIds?: string[]
   otherAmount?: number
   otherNote?: string | null
   /**
@@ -501,6 +545,7 @@ export interface CreateSlipInput {
 export async function createSlip(input: CreateSlipInput): Promise<SlipView> {
   const receiptIds = [...new Set(input.receiptIds ?? [])]
   const saleIds = [...new Set(input.registerSaleIds ?? [])]
+  const dropIds = [...new Set(input.drawerDropIds ?? [])]
   const otherCents = toCents(input.otherAmount ?? 0)
   const note = (input.otherNote ?? '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.depositDate) || Number.isNaN(Date.parse(`${input.depositDate}T00:00:00Z`))) {
@@ -511,7 +556,7 @@ export async function createSlip(input: CreateSlipInput): Promise<SlipView> {
   if (otherCents > 0 && input.otherIsNotRent !== true) {
     throw new AppError(409, 'Is any of the other money rent? Record each rent payment first, then tick it on this slip. Answer "No, none of it is rent" to go on.')
   }
-  if (receiptIds.length === 0 && saleIds.length === 0 && otherCents === 0) {
+  if (receiptIds.length === 0 && saleIds.length === 0 && dropIds.length === 0 && otherCents === 0) {
     throw new AppError(400, 'Tick what went into the bag.')
   }
 
@@ -529,10 +574,11 @@ export async function createSlip(input: CreateSlipInput): Promise<SlipView> {
     }
 
     const items = await cashNotBanked(client, input.landlordId, {
-      receiptIds, saleIds, includeOnSlip: true, propertyIds: null,
+      receiptIds, saleIds, dropIds, includeOnSlip: true, propertyIds: null,
     })
     const byId = new Map(items.map(i => [`${i.kind}:${i.id}`, i]))
-    const wanted = [...receiptIds.map(id => `receipt:${id}`), ...saleIds.map(id => `register_sale:${id}`)]
+    const wanted = [...receiptIds.map(id => `receipt:${id}`), ...saleIds.map(id => `register_sale:${id}`),
+                    ...dropIds.map(id => `drawer_drop:${id}`)]
     for (const key of wanted) {
       const it = byId.get(key)
       if (!it) {
@@ -571,9 +617,16 @@ export async function createSlip(input: CreateSlipInput): Promise<SlipView> {
        toDollars(otherCents).toFixed(2), otherCents > 0 ? note : null, input.createdBy])).rows[0].id
     for (const it of picked) {
       await client.query(
-        `INSERT INTO bank_deposit_slip_items (slip_id, remittance_id, pos_transaction_id, amount)
-         VALUES ($1, $2, $3, $4)`,
-        [slipId, it.kind === 'receipt' ? it.id : null, it.kind === 'register_sale' ? it.id : null,
+        `INSERT INTO bank_deposit_slip_items
+           (slip_id, remittance_id, pos_transaction_id, register_shift_id, amount)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [slipId,
+         it.kind === 'receipt' ? it.id : null,
+         it.kind === 'register_sale' ? it.id : null,
+         // 10/31: a counted drawer's drop. Exactly one of the three is set
+         // (bank_deposit_slip_items_one_source) — two would be the same money
+         // under two names.
+         it.kind === 'drawer_drop' ? it.id : null,
          toDollars(it.amountCents).toFixed(2)])
     }
 

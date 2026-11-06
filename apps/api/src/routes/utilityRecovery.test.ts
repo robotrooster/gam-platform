@@ -239,7 +239,7 @@ describe('GET /api/utility/recovery (S613)', () => {
   })
 
   // S652 (Nic): "It needs to count the 387 kilowatts for $81.27 as still
-  // outstanding. It's billed back and not paid." Andres Razo had no lease — his
+  // outstanding. It's billed back and not paid." Cora Castellan had no lease — his
   // meter was billed on a pay link.
   //
   // 10/20 (Nic) — AND THE CATALOG BUTTON IS WHAT SAYS SO, NOT ITS NAME.
@@ -261,7 +261,7 @@ describe('GET /api/utility/recovery (S613)', () => {
       `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items,
                                   subtotal, total, customer_name, customer_email, created_at)
        VALUES ('tok-recovery-1', $1, $2, $3, 'one_time', '3 items', $4::jsonb, 703.27, 703.27,
-               'Andres Razo', 'razo@example.com', '2026-09-18') RETURNING id`,
+               'Cora Castellan', 'castellan@example.com', '2026-09-18') RETURNING id`,
       [f.landlordId, f.propertyId, f.userId, JSON.stringify(items)])
     const get = async () => (await request(buildApp())
       .get(`/api/utility/recovery?propertyId=${f.propertyId}&from=2026-01-01&to=2026-12-31`)
@@ -328,7 +328,7 @@ describe('GET /api/utility/recovery (S613)', () => {
   })
 
   // S652 (Nic): "He is on a work trade. It's unpaid because of a work trade."
-  // Matthew Conklin's August electric was reported as money a tenant owed.
+  // Gideon Jerningham's August electric was reported as money a tenant owed.
   it('a charge the work trade covers is worked off — never "still owed", never "paid"', async () => {
     const f = await seed()
     const { rows: [meter] } = await db.query<any>(
@@ -651,7 +651,7 @@ describe('GET /api/utility/recovery — the three-way split (10/20)', () => {
    * comes through — "a paylink's utility line settles the bill and counts as
    * recovery."
    *
-   * $163.17 of Andres Razo's power, collected in full on a link. It must be in
+   * $163.17 of Cora Castellan's power, collected in full on a link. It must be in
    * `recovered` and it must be NOWHERE in the gap: not in `notRecovered`, not
    * in `unattributed`, not in `somebodysUsage`. Before this lane his money was
    * collected and the report had no idea it had been recovered.
@@ -718,7 +718,7 @@ describe('GET /api/utility/recovery — the three-way split (10/20)', () => {
       `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items,
                                   subtotal, total, customer_name, customer_email, created_at)
        VALUES ('tok-final-bill', $1, $2, $3, 'one_time', 'Final electric', $4::jsonb, 44.94, 44.94,
-               'Andres Razo', 'razo@example.com', '2026-03-20') RETURNING id`,
+               'Cora Castellan', 'castellan@example.com', '2026-03-20') RETURNING id`,
       [f.landlordId, f.propertyId, f.userId, JSON.stringify(billLine)])
 
     // While the link is OUT: the bill says it is owed, and that is the only

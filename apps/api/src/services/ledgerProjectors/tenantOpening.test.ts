@@ -11,7 +11,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { db } from '../../db'
 import { inTx, markChanged } from '../../test/ledgerFixtures'
 import {
-  cleanupTenantLedger, tenantCo, addLease, bill, receipt, drain, bal, activeLines, triples, bankConnection, sourceError, type TenantCo,
+  cleanupTenantLedger, tenantCo, addLease, bill, receipt, drain, bal, activeLines, triples, bankConnection, sourceError,
+  openingLines, markOpenings, type TenantCo,
 } from '../../test/ledgerTenantFixtures'
 import { registeredLedgerSourceTypes, unregisterLedgerProjector, registerLedgerProjector } from '../ledgerEngine'
 import { checkOwner } from '../ledgerCheck'
@@ -33,11 +34,11 @@ describe('J1: what came before the books start opens on the start date', () => {
     const unpaid = await bill(co, { amount: 500, due: '2026-09-01' })
     const paid = await bill(co, { amount: 1000, due: '2026-08-01' })
     await receipt(co, { method: 'cash', settledAt: '2026-09-05T17:00:00Z', apps: [{ paymentId: paid, amount: 1000 }], surplus: 200 })
-    await markChanged('opening', co.landlordId, co.landlordId)
+    await markOpenings(co.landlordId)
     await drain()
     // Nothing dated before the start posts on its own.
     expect(await activeLines('payment', unpaid)).toEqual([])
-    const opening = await activeLines('opening', co.landlordId)
+    const opening = await openingLines(co.landlordId)
     expect(opening.every(l => l.day === '2026-10-01' && l.category === 'opening' && l.cash === null)).toBe(true)
     expect(triples(opening).sort()).toEqual([
       ['ar_tenants', 50000, 0], ['opening_balance_equity', 0, 150000], ['tenant_prepayments', 0, 20000], ['undeposited_funds', 120000, 0],
@@ -57,7 +58,7 @@ describe('J1: what came before the books start opens on the start date', () => {
     const co = await tenantCo({ booksStart: '2026-10-01' })
     const unpaid = await bill(co, { amount: 500, due: '2026-09-01' })
     const fixed = await bill(co, { amount: 300, due: '2026-09-05' })
-    await markChanged('opening', co.landlordId, co.landlordId)
+    await markOpenings(co.landlordId)
     await drain()
     expect(await bal(co.landlordId, 'ar_tenants')).toBe(80000)
     // Voided (it now wants nothing) and an amount fixed (still before the start).
@@ -92,7 +93,7 @@ describe('J1: what came before the books start opens on the start date', () => {
       `INSERT INTO books_opening_items (landlord_id, kind, bank_connection_id, amount, as_of) VALUES ($1, 'bank', $2, 5000, '2026-10-01')`,
       [co.landlordId, conn])
     await drain()
-    const opening = await activeLines('opening', co.landlordId)
+    const opening = await openingLines(co.landlordId)
     expect(opening.filter(l => l.role === 'bank_checking').map(l => l.dr - l.cr)).toEqual([500000])
     expect(await bal(co.landlordId, 'bank_checking')).toBe(500000)
     expect(await bal(co.landlordId, 'deposits_in_transit')).toBe(0)
@@ -119,12 +120,12 @@ describe('J1: what came before the books start opens on the start date', () => {
        VALUES ($1, $2, 'other', $3, 2500, '2026-09-15', TRUE) RETURNING id`, [co.landlordId, co.propertyId, cat])).rows[0].id
     await db.query(`INSERT INTO landlord_expense_payments (expense_id, landlord_id, paid_on, amount, method, source)
                     VALUES ($1, $2, '2026-09-15', 2500, 'other', 'payment')`, [exp, co.landlordId])
-    await markChanged('opening', co.landlordId, co.landlordId)
+    await markOpenings(co.landlordId)
     expect(await drain()).toMatchObject({ failed: 0 })
     const lines = (await db.query<{ account_id: string; dr: string; cr: string }>(
       `SELECT l.account_id, round(l.debit * 100)::bigint::text AS dr, round(l.credit * 100)::bigint::text AS cr
          FROM ledger_postings p JOIN ledger_posting_lines l ON l.posting_id = p.id
-        WHERE p.source_type = 'opening' AND p.source_id = $1 AND p.role = 'post' AND p.superseded_at IS NULL`, [co.landlordId])).rows
+        WHERE p.source_type = 'opening' AND (p.source_id = $1 OR p.source_id LIKE $1 || '|%') AND p.role = 'post' AND p.superseded_at IS NULL`, [co.landlordId])).rows
     expect(lines.find(l => l.account_id === acct)).toMatchObject({ dr: '250000', cr: '0' })
     expect(await bal(co.landlordId, 'opening_balance_equity')).toBe(-250000)
   })
@@ -136,7 +137,7 @@ describe('J1: what came before the books start opens on the start date', () => {
       `INSERT INTO books_opening_items (landlord_id, kind, bank_connection_id, amount, as_of) VALUES ($1, 'bank', $2, 5000, '2026-08-01') RETURNING id`,
       [co.landlordId, conn])).rows[0].id
     await drain()
-    expect(await activeLines('opening', co.landlordId)).toEqual([])
+    expect(await openingLines(co.landlordId)).toEqual([])
     expect(await sourceError('opening', co.landlordId)).toMatchObject({ reason_code: 'owner_not_ready' })
     // Entered again for the start date (the old one voided, never removed): it posts.
     await db.query(`UPDATE books_opening_items SET voided_at = now(), voided_by = $2, void_reason = 'start date moved' WHERE id = $1`,
@@ -157,7 +158,7 @@ describe('J1: what came before the books start opens on the start date', () => {
     const rent = await bill(co, { amount: 500, due: '2026-09-01' })
     // 10/1 01:00 in New York; 9/30 19:00 in Honolulu.
     const { remittanceId } = await receipt(co, { method: 'card', settledAt: '2026-10-01T05:00:00Z', apps: [{ paymentId: rent, amount: 500 }] })
-    await markChanged('opening', co.landlordId, co.landlordId)
+    await markOpenings(co.landlordId)
     await drain()
     expect(await activeLines('remittance', remittanceId)).toEqual([])   // before the start on its property's calendar
     expect(await bal(co.landlordId, 'ar_tenants')).toBe(0)
@@ -181,14 +182,14 @@ describe('J1: what came before the books start opens on the start date', () => {
       `INSERT INTO books_opening_items (landlord_id, kind, account_id, amount, as_of) VALUES ($1, 'other', $2, 3000, '2026-10-01'), ($1, 'other', $3, 1200, '2026-10-01')`,
       [co.landlordId, equipment, loan])
     await drain()
-    const opening = await activeLines('opening', co.landlordId)
+    const opening = await openingLines(co.landlordId)
     expect(triples(opening).filter(([r]) => r !== null && r !== 'opening_balance_equity').sort()).toEqual([
       ['bank_checking', 500000, 0], ['security_deposits_payable', 0, 75000],
     ])
     const byAccount = (await db.query<{ code: string; dr: string; cr: string }>(
       `SELECT a.code, round(l.debit * 100)::text AS dr, round(l.credit * 100)::text AS cr
          FROM ledger_postings p JOIN ledger_posting_lines l ON l.posting_id = p.id JOIN books_accounts a ON a.id = l.account_id
-        WHERE p.source_type = 'opening' AND p.source_id = $1 AND p.role = 'post' AND p.superseded_at IS NULL AND l.account_role IS NULL
+        WHERE p.source_type = 'opening' AND (p.source_id = $1 OR p.source_id LIKE $1 || '|%') AND p.role = 'post' AND p.superseded_at IS NULL AND l.account_role IS NULL
         ORDER BY a.code`, [co.landlordId])).rows
     expect(byAccount).toEqual([{ code: '1531', dr: '300000', cr: '0' }, { code: '2101', dr: '0', cr: '120000' }])
     // Balanced per property: the deposit (property 1) and the company-level items each balance with their own 3900.
@@ -223,7 +224,7 @@ describe('J1 (b) / J2: home sales', () => {
     await drain()
     expect(await activeLines('home_sale', k)).toEqual([])
     expect(await activeLines('home_installment', aug)).toEqual([])   // before the start: in the opening note
-    const opening = await activeLines('opening', co.landlordId)
+    const opening = await openingLines(co.landlordId)
     expect(triples(opening)).toEqual([['home_notes_receivable', 979900, 0], ['opening_balance_equity', 0, 979900]])
     expect(triples(await activeLines('payment', row))).toEqual([['ar_tenants', 12200, 0], ['home_notes_receivable', 0, 10200], ['home_note_interest', 0, 2000]])
     expect(await bal(co.landlordId, 'home_notes_receivable')).toBe(1000000 - 10000 - 10100 - 10200)   // financed less every principal
@@ -259,7 +260,7 @@ describe('J1 (b) / J2: home sales', () => {
     expect(await activeLines('home_sale', old)).toEqual([])
     expect(triples(await activeLines('home_sale', k))).toEqual([['suspense', 75000, 0], ['home_sales', 0, 75000]])
     expect(await bal(co.landlordId, 'home_notes_receivable')).toBe(0)
-    expect(await activeLines('opening', co.landlordId)).toEqual([])
+    expect(await openingLines(co.landlordId)).toEqual([])
   })
 
   it('not chosen yet: the sale and the opening wait on the owner', async () => {

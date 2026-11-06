@@ -2,7 +2,7 @@
  * S654 (2026-10-02) — run once at the deploy that ships
  * attachDueInstallmentsToOpenInvoices.
  *
- * Nic (Shane Rueff, Country Acres MH 11): "if he signs today and the bill was
+ * Nic (Xenia Cholmondeley, Country Acres MH 11): "if he signs today and the bill was
  * generated yesterday, that $150 needs to go on this month's bill as well
  * after he signs." A purchase agreement signed BEFORE this deploy activated
  * its contract under the old code, which leaves the installment already due

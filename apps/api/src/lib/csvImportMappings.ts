@@ -225,7 +225,7 @@ const DOORLOOP_MAPPING: ColumnMapping = {
 
 // S29X-round-3: DoorLoop's Rent Roll and Leasing reports use `Lease` (or
 // `Lease Name`) as a row identifier holding a combined-name string (e.g.,
-// "Kim Harland & Zach Harland"). GAM requires first/last separately —
+// "Yvette Bexley & Zach Bexley"). GAM requires first/last separately —
 // landlord must pre-split, same posture as AppFolio's `Tenant` column.
 // Other columns below are reporting summary / GL-side and not first-class
 // tenant fields.
@@ -1051,8 +1051,14 @@ export function buildPropertyTemplateCsv(platform: CsvImportPlatform): string {
 // Yardi receipts, etc.). Resolution order on validate is:
 //   email → exact match → if missing/unmatched → name → fuzzy match against
 //   active tenants, disambiguated by property_name + unit_number.
+// 11/1 (Nic): payer_phone. Income from an RV guest or a short stay has no
+// lease to resolve through, so the person is identified the way GAM identifies
+// everybody else — name plus phone, three agreeing points
+// (services/customerProfiles). Without a phone a line reading "Mike" names
+// nobody, and the income records against the SPACE alone rather than inventing
+// a stranger GAM thinks it knows.
 export const GAM_PAYMENT_HISTORY_CANONICAL_HEADERS = [
-  'tenant_email', 'tenant_name', 'payment_date', 'amount',
+  'tenant_email', 'tenant_name', 'payer_phone', 'payment_date', 'amount',
   'payment_type', 'payment_method',
   'property_name', 'unit_number', 'reference',
 ] as const
@@ -1082,6 +1088,7 @@ interface PaymentPlatformConfig {
 const PAYMENT_GENERIC_MAPPING: PaymentColumnMapping = {
   tenant_email:   ['tenant_email'],
   tenant_name:    ['tenant_name'],
+  payer_phone:    ['payer_phone', 'phone', 'Phone', 'Phone Number', 'phone_number', 'Mobile', 'Cell'],
   payment_date:   ['payment_date'],
   amount:         ['amount'],
   payment_type:   ['payment_type'],
@@ -1095,6 +1102,7 @@ const PAYMENT_GENERIC_MAPPING: PaymentColumnMapping = {
 const PAYMENT_BUILDIUM_MAPPING: PaymentColumnMapping = {
   tenant_email:   ['Tenant Email', 'Email', 'Email Address'],
   tenant_name:    ['Tenant Name', 'Tenant', 'Resident', 'Resident Name'],
+  payer_phone:    ['payer_phone', 'phone', 'Phone', 'Phone Number', 'phone_number', 'Mobile', 'Cell'],
   payment_date:   ['Date', 'Transaction Date', 'Payment Date',
                    'Paid Date'],
   amount:         ['Amount', 'Payment Amount', 'Total'],
@@ -1116,6 +1124,7 @@ const PAYMENT_BUILDIUM_IGNORED = [
 const PAYMENT_APPFOLIO_MAPPING: PaymentColumnMapping = {
   tenant_email:   ['Email', 'Primary Email', 'Tenant Email'],
   tenant_name:    ['Tenant', 'Tenant Name', 'Resident', 'Resident Name'],
+  payer_phone:    ['payer_phone', 'phone', 'Phone', 'Phone Number', 'phone_number', 'Mobile', 'Cell'],
   payment_date:   ['Date', 'Receipt Date', 'Posted Date',
                    'Payment Date'],
   amount:         ['Amount', 'Payment', 'Receipt Amount'],
@@ -1134,12 +1143,13 @@ const PAYMENT_APPFOLIO_IGNORED = [
 // DoorLoop "Tenant Transactions" / "Payments" export.
 // S29X-round-3: DoorLoop's Transactions report has no email column.
 // Tenants are identified by the `Lease` column (combined-name string,
-// e.g., "Kim Harland & Zach Harland") with fallback to `Name` (the
+// e.g., "Yvette Bexley & Zach Bexley") with fallback to `Name` (the
 // payment tenderer). Wired into tenant_name; validate resolves by name
 // against active tenants when email is absent.
 const PAYMENT_DOORLOOP_MAPPING: PaymentColumnMapping = {
   tenant_email:   ['Email', 'Tenant Email', 'Primary Email'],
   tenant_name:    ['Lease', 'Tenant Name', 'Tenant', 'Name', 'Lease Name'],
+  payer_phone:    ['payer_phone', 'phone', 'Phone', 'Phone Number', 'phone_number', 'Mobile', 'Cell'],
   payment_date:   ['Date', 'Payment Date', 'Transaction Date'],
   amount:         ['Amount', 'Payment Amount'],
   payment_type:   ['Type', 'Category', 'Transaction Type'],
@@ -1160,6 +1170,7 @@ const PAYMENT_DOORLOOP_IGNORED = [
 const PAYMENT_YARDI_MAPPING: PaymentColumnMapping = {
   tenant_email:   ['Email', 'Resident Email'],
   tenant_name:    ['Resident', 'Resident Name', 'Tenant', 'Tenant Name'],
+  payer_phone:    ['payer_phone', 'phone', 'Phone', 'Phone Number', 'phone_number', 'Mobile', 'Cell'],
   payment_date:   ['Date', 'Receipt Date', 'Post Date',
                    'Transaction Date'],
   amount:         ['Amount', 'Receipt Amount', 'Payment'],
@@ -1186,6 +1197,7 @@ const PAYMENT_YARDI_IGNORED = [
 const PAYMENT_RENTMANAGER_MAPPING: PaymentColumnMapping = {
   tenant_email:   ['Email', 'Tenant Email'],
   tenant_name:    ['Tenant', 'Tenant Name'],
+  payer_phone:    ['payer_phone', 'phone', 'Phone', 'Phone Number', 'phone_number', 'Mobile', 'Cell'],
   payment_date:   ['Date', 'Transaction Date', 'Payment Date'],
   amount:         ['Amount', 'Payment Amount'],
   payment_type:   ['Type', 'Charge Type', 'Category'],
@@ -1204,6 +1216,7 @@ const PAYMENT_RENTMANAGER_IGNORED = [
 const PAYMENT_PROPERTYWARE_MAPPING: PaymentColumnMapping = {
   tenant_email:   ['Email', 'Tenant Email'],
   tenant_name:    ['Tenant', 'Tenant Name'],
+  payer_phone:    ['payer_phone', 'phone', 'Phone', 'Phone Number', 'phone_number', 'Mobile', 'Cell'],
   payment_date:   ['Date', 'Payment Date', 'Transaction Date'],
   amount:         ['Amount', 'Payment Amount'],
   payment_type:   ['Type', 'Charge Type'],
@@ -1226,6 +1239,7 @@ const PAYMENT_PROPERTYWARE_IGNORED = [
 const PAYMENT_RENTEC_MAPPING: PaymentColumnMapping = {
   tenant_email:   ['Email', 'Tenant Email'],
   tenant_name:    ['Tenant Name', 'Tenant'],
+  payer_phone:    ['payer_phone', 'phone', 'Phone', 'Phone Number', 'phone_number', 'Mobile', 'Cell'],
   payment_date:   ['Date', 'Payment Date'],
   amount:         ['Amount'],
   payment_type:   ['Type', 'Category'],
@@ -1250,6 +1264,7 @@ const PAYMENT_RENTEC_IGNORED = [
 const PAYMENT_TENANTCLOUD_MAPPING: PaymentColumnMapping = {
   tenant_email:   ['Email', 'Tenant Email'],
   tenant_name:    ['Tenant', 'Tenant Name'],
+  payer_phone:    ['payer_phone', 'phone', 'Phone', 'Phone Number', 'phone_number', 'Mobile', 'Cell'],
   payment_date:   ['Date', 'Payment Date', 'Transaction Date'],
   amount:         ['Amount', 'Payment Amount', 'Money In'],
   // S29X-round-3: TenantCloud's payment-activity report uses
@@ -1339,6 +1354,7 @@ const squarePreprocess: PaymentPreprocess = (records) => {
 const PAYMENT_SQUARE_MAPPING: PaymentColumnMapping = {
   tenant_email:   [],
   tenant_name:    ['Customer Name'],
+  payer_phone:    ['payer_phone', 'phone', 'Phone', 'Phone Number', 'phone_number', 'Mobile', 'Cell'],
   payment_date:   ['Date'],
   amount:         ['Total Collected'],
   payment_type:   ['__derived_type'],
@@ -1455,8 +1471,12 @@ export function buildPaymentTemplateCsv(platform: CsvImportPlatform): string {
 
   if (platform === 'generic') {
     const header = GAM_PAYMENT_HISTORY_CANONICAL_HEADERS.join(',')
+    // In the order of GAM_PAYMENT_HISTORY_CANONICAL_HEADERS. 11/1: payer_phone
+    // is third — it is how a payer with NO lease is identified, so the example
+    // shows it filled in rather than leaving an operator guessing whether it
+    // matters.
     const exampleRow = [
-      'jane@example.com', '', '2025-06-01', '1850',
+      'jane@example.com', '', '', '2025-06-01', '1850',
       'rent', 'ach',
       'Sunset Apartments', '4B',
       'June rent',

@@ -47,6 +47,65 @@ so it stops being re-proposed at him.
   work rather than a side effect of other builds.
 - **GAM logo** — still a word mark.
 
+### The contractor marketplace — BUILT 10/31, ONE LEG MISSING
+
+Landlords post a job, contractors bid **privately**, the landlord awards one,
+and GAM takes **3% of the finished price** off the contractor's payout. Joining
+is free. The board shows a browsing contractor the **city and state only** — not
+the park name, the street, the landlord or the unit — and the full address the
+moment they win. Landlord portal → Operations → **Contractor Bids**; the
+contractor's side is the business portal → **Job bids**.
+
+**Priced 10/31: the paid top spot.** One contractor at the top of one trade in
+one area, exclusive, with the free board open to everybody underneath. The price
+is `$55 x (index/100)^6` rounded to $5, banded in nine, off the Bureau of
+Economic Analysis's published Regional Price Parities — 388 metro areas plus
+"the rest of <state>", 439 areas, every figure traceable to a number BEA
+published. **$20** a month in Monroe LA and Enid OK, $25 Tulsa, $35 Oklahoma
+City and rural Wyoming, $55 at the national average, $70 Phoenix, $105 Seattle
+and San Jose, **$120** New York and Los Angeles. Nic set both ends himself: $20
+in the cheapest areas is one Angi lead, and $120 at the top is a third of their
+monthly package, against a platform that is free to join.
+
+**Financing a job is BUILT AND HELD OFF** — `system_features.job_financing_enabled`,
+default FALSE, refused in the service every quote runs through. $235 a month of
+GAM's money on a $10,000 job, 2/4/6/12 payments, with the payment capped at 25%
+of monthly flat rent. What is missing is not code: GAM fronts about 70% of a
+four-payment job the day it finishes, and **where the reserve pool's money comes
+from is undecided** (Nic, 10/31: "Reserve pool comes later").
+
+**NOT BUILT — the money leg, and it is what stands between here and a launch.**
+A finished job records GAM's 3% on the revenue ledger and moves no money. Nic
+decided the shape: "Contractors will be paid directly out of disbursement
+amounts from that said landlord. That way it's less money transfers pulling,
+debiting from a landlord's bank." So the landlord's next payout should carry the
+job out of it, GAM keep its 3%, and the contractor's net reach their Connect
+account. None of that is wired, and until it is, a landlord pays their
+contractor the ordinary way and GAM's cut is recorded without being collected.
+
+**The contractor's side had never been deployed — fixed 10/31.** `apps/business`
+had no Vercel project and no entry in deploy.sh's FRONTENDS list, so landlords
+could post a job and no contractor had anywhere to go. Now `gam-business` on
+Vercel, answering at **business.goldassetmanagement.com** and
+**contractors.goldassetmanagement.com** (Nic picked both — one deployment, two
+doors), with its `.env.production`, `vercel.json`, Vercel link and FRONTENDS
+entry all in place and the production build proven to point at the live API. The
+next deploy ships it. **`apps/listings` is still in that position** and has
+nobody waiting on it.
+
+**Also not built:** buying the top spot (the price card is done; charging a
+contractor who may have won nothing is not); the **contractor directory** —
+hiring somebody you have worked with without an open bid, which is where the
+paid spot actually sits; and re-pricing a job after it is finished ("that's
+going to be a toughie").
+
+`apps/business` had **no test infrastructure at all** until 10/31 — zero files.
+It now has its own vitest config and a first suite on the contractor screen (10
+tests: the board names the town and nothing nearer, no bid count or low bid or
+spread reaches the page, the cut is read from the price card and not hardcoded),
+and deploy.sh runs and gates it beside the API, tenant, landlord and register
+suites.
+
 ### Features raised, specified, not built
 - **"Left owing" flag across landlords** (10/20–21, spec'd in full; the reveal
   is TWO doors, 10/21 — step 1 is the date and place and costs nothing, step 2
@@ -63,18 +122,23 @@ so it stops being re-proposed at him.
   what it refuses to say. The flag is three words and a count; the first door
   gives the month and the town and nothing nearer; the second door throws in
   words rather than quietly doing nothing.
-  **Two pieces are NOT built, and nothing can flag anybody until the first of
-  them is:** (a) the sweep that WRITES a record — it needs a grace period
-  decided, because "left owing" the day after a move-out is a late bill, not a
-  person who has gone quiet; and (b) the second door, which is money moving a
-  way it never has in GAM.
-  **Held for Nic's eyes on purpose (10/21), not skipped.** He said to keep
-  building overnight and deploy, and everything else in that batch shipped. This
-  one did not, for two reasons worth stating: its output is shown to OTHER
-  landlords about a named person, and its second door creates a real debt
-  between two landlords that GAM then collects. Neither is a thing to put in
-  front of third parties, unreviewed, while he is asleep. It is the first thing
-  to build with him awake.
+  **BUILT 10/27–10/29 — this entry was stale and is corrected here (11/4).**
+  Both pieces it called missing exist. A record is WRITTEN on each of the three
+  ways somebody leaves owing (spot succession, early check-out, and the
+  deposit-return carry-forward), so people can actually be flagged.
+  **And the second door is no longer the one described above.** Nic replaced
+  "reveal the total and assume the debt" with COLLECTING ON BEHALF, and made it
+  non-optional: *"We phrase it as the landlord will be collecting this debt on
+  behalf of the previous landlord. It's not optional. If they allow them on the
+  platform, that's it."* It settles at **80%** — 50% to the landlord who was
+  owed, 15% to GAM, 15% to the collecting landlord, 20% wiped — billed to the
+  RESIDENT over 6 or 4 months on their own bill, divided as each payment
+  arrives against the running total, with the shares landing in Stripe Connect
+  balances. Nobody fronts anything.
+  `leftOwing.theTotal()` still throws on purpose: it is the old buy-the-debt
+  door, kept as a guard so nobody wires a button to a door that was replaced.
+  **Nothing here is open except the thing that was always his** — the Square
+  archived invoices that give it its first real data.
 - ~~**The maintenance person's one screen**~~ — it already existed (the
   Maintenance portal's Tasks tab reads `GET /api/property-task-list` and groups
   by park). What was missing, and was BUILT 10/21: the SUPPLY list on that same
@@ -91,9 +155,17 @@ so it stops being re-proposed at him.
   who knows these people looks at those pairs first.
 - **Booking-site customization** — Wix-style drag/drop, photos, FAQ, a guided
   walkthrough for a landlord setting up their own `{slug}.gam.biz`.
+  **Scoped 10/27, not built on purpose** (`BOOKING_SITE_CUSTOMIZATION_SCOPE.md`):
+  a page builder is weeks, and a tenth of one is the worst version. One question
+  for him — "make it look like mine" (branding; days, and better after the design
+  pass) or a real builder (its own project)?
 - **Native apps** — landlord and tenant, wanted before the PM deal.
-- **"What do PM companies use that we don't have"** — a competitive audit he
-  asked for and nobody has run.
+  The 10/27 note under this ("the tenant portal has no phone layout at all") is
+  **no longer true and has been removed**: S655 gave that portal a drawer, a
+  scrim, a bottom tab bar and safe-area insets, and S661 finished its tables.
+  Every portal that has a deploy target now has a phone layout — landlord, pos,
+  tenant, admin, admin-ops and books — and the storefront was already
+  mobile-first. So this item is native apps alone, not shell work.
 - **PM portal demo login / walkthrough**.
 
 ### Known defects and loose ends
@@ -108,22 +180,37 @@ so it stops being re-proposed at him.
   forward to actually order the scan."*).
 - **Card reader order $331.73** — tax and shipping split unknown; needs his
   Stripe order page.
-- **Mountain View and TruBlu have no fee-debit bank path** — GAM cannot collect
-  its own fee from either entity yet.
-- **A work-trade document raised from a resident's page is not linked to its
-  work-trade agreement record.**
-- **Evening UTC-today flakes** — ~24 test files and ~20 source sites use
-  `new Date().toISOString().slice(0,10)`, which is tomorrow after 5pm Phoenix.
+- ~~**A work-trade document raised from a resident's page is not linked to its
+  work-trade agreement record.**~~ FIXED 10/27. The two doors inside the
+  work-trade flow always set it; the door a landlord actually reaches for —
+  "send a document" from the resident's page — did not, so the agreement's own
+  page never showed the paper that made it. Matched on the template's purpose
+  (`work_trade_addendum`) and the resident's live agreement; a paused agreement
+  still counts, an ended one never does.
+- ~~**Evening UTC-today flakes**~~ — FIXED 10/27 in the SOURCE: 15 sites across
+  10 files now use `todayIn()` (the property's day, Phoenix by default) instead
+  of a UTC date that is tomorrow after 5pm. Some of these were price lookups,
+  which could quote a schedule not yet in effect. The remaining uses are in test
+  files, where the date is a fixture rather than a decision.
 - **The repo is PUBLIC** (`robotrooster/gam-platform`) and the dev password in
   14 tracked files is the production DB password. Tolerable only while Postgres
   listens on localhost. Ben makes it private before the GCP migration.
+  10/27: every real resident's NAME is now out of the tracked tree — 85 people
+  across 220 code files, 24 handoff docs and 8 filenames, plus the lowercase and
+  email forms. **This does not close the exposure**: git history keeps every old
+  commit readable, so the names are still there for anyone who clones it. Making
+  the repo private is the only thing that actually works, and it is still Ben's
+  to do.
 
 ### Decided NO — do not re-propose
-- **Ray Artiaga's late fees** (10/21). No due-date exception ("That's not how we
+- **A fee-debit bank path for Mountain View and TruBlu** (10/29). CLOSED. GAM
+  collects by netting out of money already on its way; a direct debit is the
+  last resort and these two do not need one. Never raise it again.
+- **Quinlan Thrushwood's late fees** (10/21). No due-date exception ("That's not how we
   run the property"), no property-wide late-fee cap, and no catch-up
   arrangement. He wants FlexPay for this when it launches.
 - **Work-trade agreements drafted ahead of him** for the Nielsens, Susan
-  Geisman or Brandon Valdez — "not on my priority list" (10/21).
+  Geisman or Ivey Ingersoll — "not on my priority list" (10/21).
 - **Marking anybody deceased or alive** on a customer record — "That's not our
   determination to make. We just have a record of people that were here when
   they were here." (10/21)
@@ -131,9 +218,9 @@ so it stops being re-proposed at him.
 ### His, not Claude's
 - Leases: the Nielsens (RV 71 year-round + work trade, hibernated while away),
   Susan Geisman (MH 26, work trade, out June 2027, the home comes to the park),
-  Rick Moran (a lease when they arrive — no site assigned, 30 amp), Ray Artiaga
+  Rick Moran (a lease when they arrive — no site assigned, 30 amp), Quinlan Thrushwood
   (full-time, pays late).
-- Brandon Valdez: answered 10/21 — he was never on MH 17; MH 17 is a wreck that
+- Ivey Ingersoll: answered 10/21 — he was never on MH 17; MH 17 is a wreck that
   may be torn down. His work trade is MH 10, ending 2028-03-31.
 
 ---
@@ -352,7 +439,31 @@ left is the inventory.
 
 ## 2c. Open items raised S624 (2026-08-26)
 
-### Documents tab has no way to UPLOAD a document — only "send" one
+### ~~Documents tab has no way to UPLOAD a document~~ — BUILT (S641), note was stale
+
+**Already done, and the 10/27 answer is already satisfied.** Checked against the
+code on 10/27 after nearly building a second copy of it:
+
+* `documents.is_reference` — paper nobody signs, which is the distinction this
+  note said was missing.
+* `documents.property_id` plus the `document_properties` join table — one
+  document shown at several properties.
+* `routes/documents.ts` resolves exactly the rule Nic restated on 10/27: the
+  named property, OR any property in `document_properties`, OR nothing named at
+  all, which means the whole company and shows everywhere. His words: "if it's
+  a document that's used at multiple properties, have it show up in both spots."
+* `DocumentsPage.tsx` has an **Upload Document** button behind the
+  `documents.upload` permission, and the page subtitle is already "Park rules,
+  notices, and anything else you print and hand over".
+
+Left here, struck through rather than deleted, because the note itself is the
+lesson: it described S624's reality and was never updated when S641 built the
+thing, and reading it instead of the code cost a duplicate table pair that had
+to be dropped the same night (migration 20261028080000).
+
+The original note follows.
+
+### Documents tab has no way to UPLOAD a document — only "send" one (S624, SUPERSEDED)
 Nic: "do I want to upload my specific property notices to the templates page?
 It's not something people are gonna be signing, but if we have to print and give
 notice at a property, I'd like to have all my other documents that have to
@@ -495,8 +606,10 @@ capped at collected — acceleration RETIRED, no recourse); FlexCharge statement
 already shipped S550; PostHog/etc. optional); DB scale tuning past ~100
 properties (pool sizing, read replicas, query-plan review); POS multi-terminal
 SSE realtime (only when 20+ simultaneous carts or multi-staff carts ship);
-tenant-pool endpoint refinements (S177, scope TBD); mobile/responsive +
-WCAG-AA audits; load-testing baselines; support infra; GDPR/CCPA export +
+tenant-pool endpoint refinements (S177, scope TBD); WCAG-AA audit (the
+mobile/responsive half of this shipped S661 — every deployable portal has a
+phone layout; `apps/business` and `apps/listings` are the two
+left; both still have no deploy target, which is now its own item above); load-testing baselines; support infra; GDPR/CCPA export +
 deletion flows; vendor-outage kill switch.
 
 **Vendor-blocked:** Plaid production keys (tenant ACH live); Stripe Terminal

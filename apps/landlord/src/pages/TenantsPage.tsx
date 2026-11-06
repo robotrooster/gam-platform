@@ -12,7 +12,7 @@ import { healthColor } from '../lib/paymentStamps'
 /**
  * S651 — mail that never arrived.
  *
- * Nic invited Arnoldo Arvizu to RV 39 three times and all three bounced. A
+ * Nic invited Dell Dunmore to RV 39 three times and all three bounced. A
  * lease signing request to RV 08 bounced. Bounce events only ever raised a
  * GAM-side admin notification, so the landlord — the one person who can fix the
  * address — saw nothing, and could only conclude the tenant was ignoring them.

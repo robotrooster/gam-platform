@@ -16,6 +16,7 @@ import { ReturningGuestChoice, useReturningGuestOffer, RETURNING_GUEST_WORDS, RE
 import { NeverMovedInBody, type NeverMovedInPreview, refreshAfterLeaseClose } from './LeasesPage'
 import { ReservationImportModal, MIGRATED_DOOR_LABEL, stayLockWords } from './ReservationImport'
 import { sentence } from '../lib/meterReadToast'
+import { localToday } from '../lib/creditDesk'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -752,7 +753,18 @@ export function promisedSiteWords(b: any, toUnitNumber: string): string {
 export function SchedulePage() {
   const qc = useQueryClient()
   const { can } = usePerms()
-  const today = new Date().toISOString().split('T')[0]
+  // 11/01 — THE TODAY LINE WAS A DAY AHEAD EVERY EVENING.
+  //
+  // This was `new Date().toISOString().split('T')[0]`, the UTC day, which is
+  // TOMORROW from 5pm Phoenix until midnight. So from late afternoon the
+  // schedule drew its today marker on the wrong column and a front-desk person
+  // checking the evening's arrivals was reading the next day's. localToday is
+  // the operator's own calendar day.
+  //
+  // The two other date conversions in this file are safe and deliberately so:
+  // they build from `new Date(dateStr + 'T12:00:00')` — noon LOCAL — before
+  // converting, and noon never crosses the boundary.
+  const today = localToday()
   const [view, setView] = useUrlTab('view', 'timeline', ['timeline','list','units','history','reservations','requests','booking_page'] as const)
   // Perpetual calendar (S576): the window starts ~1 month back, ~5 months
   // forward, but the forward horizon EXTENDS on demand — infinite forward
@@ -2517,7 +2529,15 @@ export function SchedulePage() {
           <div ref={headerRef} style={{position:'sticky',top:0,zIndex:3,display:'flex',background:'var(--bg-3)',borderBottom:'1px solid var(--border-1)'}}>
             <div style={{width:UNIT_COL_W,flexShrink:0,boxSizing:'border-box',padding:'8px 12px',textAlign:'left',fontSize:'.72rem',color:'var(--text-3)',fontWeight:600}}>Unit</div>
             <div style={{flex:1,minWidth:0,overflow:'hidden'}}>
-              <div ref={headerStripRef} style={{display:'flex',width:days.length*colW,willChange:'transform'}}>
+              {/* flexWrap nowrap is load-bearing on a phone, not decoration. The 10/30
+                  package gives any inline flex row `flex-wrap: wrap` unless the row
+                  says otherwise, and this strip is the day ruler that has to stay on
+                  ONE line and stay exactly as wide as the timeline under it. It
+                  survives today only because its declared width equals the sum of its
+                  children to the pixel; one rounding change and the ruler would wrap
+                  and stop lining up with the grid. Saying nowrap is the documented
+                  way for a row to opt out. */}
+              <div ref={headerStripRef} style={{display:'flex',flexWrap:'nowrap',width:days.length*colW,willChange:'transform'}}>
                 {days.map(d => (
                   <div key={d} style={{boxSizing:'border-box',width:colW,flexShrink:0,padding:'6px 2px',fontSize:'.6rem',color:d===today?'var(--gold)':'var(--text-3)',fontWeight:d===today?700:400,textAlign:'center',borderLeft:'1px solid var(--border-1)',display:'flex',alignItems:'center',justifyContent:'center'}}>
                     {new Date(d+'T12:00:00').toLocaleDateString('en-US',{month:'numeric',day:'numeric'})}
@@ -2552,9 +2572,21 @@ export function SchedulePage() {
               </div>
             ))}
           </div>
+          {/* 10/30 REGRESSION FIX — data-no-stack.
+              The phone package shipped earlier tonight turns every table into
+              cards at 820px and below, which is right for a list of residents
+              and destroys this. The timeline is a GRID THAT IS A PICTURE: its
+              cells are positioned by the table's own geometry, and the inline
+              width (one column per day) is what the scroller scrolls. The card
+              rules clamp it with max-width:100% and make tbody/tr/td blocks, so
+              on a phone the timeline became a single vertical column of cells
+              with nothing left for the scroller to move. This attribute is the
+              opt-out the rules were written with, and Nic's call on 10/30 was
+              to leave the timeline itself alone for now — which this restores. */}
           <div
             ref={scrollContainerRef}
             className="schedule-scroll"
+            data-no-stack
             onScroll={() => { updateHbar(); maybeExtendForward() }}
             style={{flex:1,minWidth:0,position:'relative',overflowX:'auto',overflowY:'hidden',overscrollBehaviorX:'contain'}}
           >
@@ -2654,7 +2686,8 @@ export function SchedulePage() {
                           background: isDragTarget ? (preview?.mismatch ? 'rgba(239,68,68,.16)' : 'rgba(201,162,39,.18)') : d===today ? 'rgba(201,162,39,.04)' : '',
                           outline: selectedCell?.unitId===unit.id && selectedCell?.date===d ? '2px solid var(--gold)' : isDragTarget ? `2px solid ${preview?.mismatch?'var(--red)':'var(--gold)'}` : 'none',
                           outlineOffset: '-2px',
-                          cursor: isBooked && !barLocked ? 'grab' : unit.isBookable && !isBooked ? 'pointer' : 'default'
+                          cursor: isBooked && !barLocked && can('schedule.edit_reservation') ? 'grab'
+                            : unit.isBookable && !isBooked ? 'pointer' : 'default'
                         }}
                         onDragOver={e => onDragOver(e, unit.id, d)}
                         onDrop={onDrop}
@@ -2711,8 +2744,17 @@ export function SchedulePage() {
                                   // cell resizes that edge; anywhere else moves the stay.
                                   // (One draggable element — nested draggable grips were
                                   // unreliable, the browser kept choosing the parent.)
-                                  const w = (e.currentTarget as HTMLElement).offsetWidth || colW
-                                  const x = e.nativeEvent.offsetX
+                                  // 11/3: measured off the BAR's own box, not off
+                                  // `offsetX`. offsetX is relative to the event's target,
+                                  // which is the ack dot or the stated-stay ring when the
+                                  // grab lands on one, while `w` below is the bar's — two
+                                  // different frames compared against each other. Firefox
+                                  // also reports offsetX as 0 on dragstart, so every grab
+                                  // there read as the left edge. clientX minus the bar's
+                                  // own left edge is the same number in every browser.
+                                  const box = (e.currentTarget as HTMLElement).getBoundingClientRect()
+                                  const w = box.width || colW
+                                  const x = e.clientX - box.left
                                   const mode: 'move'|'resize-start'|'resize-end' =
                                     (isStart && x <= 10) ? 'resize-start'
                                     : (isEnd && x >= w - 10) ? 'resize-end'
@@ -2748,7 +2790,11 @@ export function SchedulePage() {
                                   fontSize:'.72rem', fontWeight:700, color: (isGhostCell && isDragTarget) ? '#000' : SCHEDULE_BAR_TEXT[barKind], overflow:'visible',
                                   whiteSpace:'nowrap', paddingLeft: isStart?7:0,
                                   opacity: (isGhostCell && !isDragTarget) ? 0.2 : 0.92,
-                                  cursor: barLocked ? 'default' : 'grab',
+                                  // 11/3: a desk person who may not edit reservations gets
+                                  // `draggable={false}` above, so the bar must not show a grab
+                                  // hand either — the cursor is the only thing that tells them
+                                  // whether the board is theirs to move.
+                                  cursor: (barLocked || !can('schedule.edit_reservation')) ? 'default' : 'grab',
                                   position:'relative', zIndex: showsLabel?2:1,
                                   // 10/18 (Nic): "it's almost highlighted like you have it
                                   // clicked on." The acknowledgment-pending border was drawn
@@ -2756,7 +2802,17 @@ export function SchedulePage() {
                                   // every square, which reads as a selection outline. The dot
                                   // at the bar's start is the whole signal now.
                                   border: 'none',
-                                  userSelect: 'none',
+                                  // 11/3 — NO `userSelect: 'none'` HERE. In Gecko the drag
+                                  // gesture is wired to the selection machinery, so content
+                                  // marked unselectable cannot start a native HTML5 drag:
+                                  // Firefox refused to move or stretch any bar on the Mountain
+                                  // View desk computer while Safari on Nic's Mac dragged them
+                                  // fine. WebKit and Blink decoupled the two, which is why it
+                                  // looked like a rendering fault on one machine. The bar
+                                  // carries no text of its own any more (S575 moved the name to
+                                  // the floating overlay), so there was nothing left for it to
+                                  // stop selecting either. Do not add it back; if a bar ever
+                                  // carries text again, stop the selection on that text node.
                                 }}
                                 title={
                                   (booking.guestName || booking.firstName || 'Tenant')

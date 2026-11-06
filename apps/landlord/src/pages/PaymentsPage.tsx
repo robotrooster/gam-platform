@@ -74,7 +74,7 @@ export { BankReceiptPhoto } from '../components/BankReceiptPhoto'
 // Outstanding Balances tab"; anyone who may see neither is told whom to ask
 // (the server refuses the month to them too).
 //
-// 10/14 (Nic), about Lisa Scheeler (Mountain View's on-site manager: "View
+// 10/14 (Nic), about Calla Fitzhugh (Mountain View's on-site manager: "View
 // who owes" and "Take payments", not "View all payments"): "they should see
 // at least the payments tab on the financials tab ... kind of the same way
 // that I see it, but not with that top view. Like it should just have the
@@ -361,6 +361,14 @@ export function PaymentsPage() {
         {!readOnly && can('payments.import_history') && (
           <button className="btn btn-primary" onClick={() => navigate('/payment-history-onboarding')}>
             Import payment history
+          </button>
+        )}
+        {/* 11/1 (Nic): "People switching to gam may not use software so lots of
+            stuff may go in manual." An operator coming off a paper ledger has no
+            file to import, so the no-file way in sits right beside it. */}
+        {!readOnly && can('payments.import_history') && (
+          <button className="btn btn-primary" onClick={() => navigate('/type-in-past-payments')}>
+            Type in past payments
           </button>
         )}
       </div>

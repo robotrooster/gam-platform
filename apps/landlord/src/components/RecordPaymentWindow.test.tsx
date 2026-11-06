@@ -147,7 +147,7 @@ async function open(qc = new QueryClient({ defaultOptions: { queries: { retry: f
   await act(async () => {
     root.render(
       <QueryClientProvider client={qc}>
-        <RecordPaymentWindow anchorPaymentId="r1" tenantId="t1" name="Kim Harland" onClose={onClose} onRecorded={onRecorded} />
+        <RecordPaymentWindow anchorPaymentId="r1" tenantId="t1" name="Yvette Bexley" onClose={onClose} onRecorded={onRecorded} />
       </QueryClientProvider>)
   })
   await until(() => text().includes('Full balance'), 'the bill')
@@ -330,7 +330,7 @@ describe('cash taken here is ready for the bank deposit', () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={qc}>
-          <PostPaymentForm tenantId="t1" name="Kim Harland" onClose={onClose} onPosted={onPosted} />
+          <PostPaymentForm tenantId="t1" name="Yvette Bexley" onClose={onClose} onPosted={onPosted} />
         </QueryClientProvider>)
     })
     await press(/^Cash$/)
@@ -488,7 +488,7 @@ describe('the window closes only from its own buttons, and not while money is mo
     expect(onClose).not.toHaveBeenCalled()
     await act(async () => { release() })
     await until(() => !!button(/^Done$/), 'the result')
-    expect(onRecorded).toHaveBeenCalledWith('Recorded $460.00 from Kim Harland.')
+    expect(onRecorded).toHaveBeenCalledWith('Recorded $460.00 from Yvette Bexley.')
   })
 
   it('while the reader waits for the card the window cannot be closed; once canceled on the reader it can', async () => {
@@ -619,7 +619,7 @@ describe('the card reader: nothing moves the window while a card is being taken'
     await until(() => text().includes('Taken.'), 'the first space taken')
     expect(onRecorded).not.toHaveBeenCalled()
     await press(/^Close$/)
-    expect(onRecorded).toHaveBeenCalledWith('Took $476.65 by card on the reader from Kim Harland. The rest of what they owe is still open.')
+    expect(onRecorded).toHaveBeenCalledWith('Took $476.65 by card on the reader from Yvette Bexley. The rest of what they owe is still open.')
     expect(onClose).toHaveBeenCalledTimes(1)
   })
 })
@@ -703,7 +703,7 @@ describe('a space taken on the reader is never asked for again', () => {
     await type(amountBox(), '460')
     await press(/^Record \$460\.00/)
     await until(() => !!button(/^Done$/), 'recorded')
-    const both = 'Took $476.65 by card on the reader. Recorded $460.00 from Kim Harland.'
+    const both = 'Took $476.65 by card on the reader. Recorded $460.00 from Yvette Bexley.'
     expect(host.querySelector('.alert-success')?.textContent).toBe(both)
     await press(/^Done$/)
     expect(onRecorded.mock.calls).toEqual([[both]])
@@ -750,7 +750,7 @@ describe('the reader takes one space at a time', () => {
     await act(async () => { sends()[0].click() })
     await until(() => !!button(/^Done$/), 'both taken')
     expect(charges()).toEqual(['/payments/r1/reader/charge', '/payments/r2/reader/charge'])
-    expect(onRecorded.mock.calls).toEqual([['Took $953.30 by card on the reader from Kim Harland.']])
+    expect(onRecorded.mock.calls).toEqual([['Took $953.30 by card on the reader from Yvette Bexley.']])
   })
 })
 
@@ -782,7 +782,7 @@ describe('the done screen stays as it was', () => {
     await press(/^Give \$40\.00 change/)
     await press(/^Record \$500\.00/)
     await until(() => !!button(/^Done$/), 'recorded')
-    const said = 'Took $476.65 by card on the reader. Recorded $460.00 from Kim Harland — give $40.00 change.'
+    const said = 'Took $476.65 by card on the reader. Recorded $460.00 from Yvette Bexley — give $40.00 change.'
     // The household is paid in full now: a fresh read would list only the space taken.
     server.quote = allPaid()
     const reads = quoteReads()
@@ -890,7 +890,7 @@ describe('an old balance left after the reader', () => {
     await press(/^Card on the reader$/)
     await press(/^Send \$476\.65 to the reader/)
     await until(() => !!button(/^Done$/), 'finished')
-    const said = 'Took $476.65 by card on the reader from Kim Harland. Their $200.00 old balance is still open (it is paid last) — use Record payment again to take it.'
+    const said = 'Took $476.65 by card on the reader from Yvette Bexley. Their $200.00 old balance is still open (it is paid last) — use Record payment again to take it.'
     expect(host.querySelector('.alert-success')?.textContent).toBe(said)
     expect(onRecorded.mock.calls).toEqual([[said]])
   })
@@ -941,7 +941,7 @@ describe('closing the window after the last space is taken on the reader', () =>
     expect(onClose).not.toHaveBeenCalled()
     // The read is too slow: the take alone is said, once, and the window closes.
     await act(async () => { await new Promise(r => setTimeout(r, CLOSE_READ_WAIT_MS + 100)) })
-    expect(onRecorded.mock.calls).toEqual([['Took $476.65 by card on the reader from Kim Harland.']])
+    expect(onRecorded.mock.calls).toEqual([['Took $476.65 by card on the reader from Yvette Bexley.']])
     expect(onClose).toHaveBeenCalledTimes(1)
     // The slow read lands afterwards: nothing is said a second time.
     await act(async () => { release() })
@@ -996,7 +996,7 @@ describe('Close pressed before the bill is read again after the last card', () =
     }
     return () => release()
   }
-  const oldLeftSaid = 'Took $476.65 by card on the reader from Kim Harland. Their $200.00 old balance is still open (it is paid last) — use Record payment again to take it.'
+  const oldLeftSaid = 'Took $476.65 by card on the reader from Yvette Bexley. Their $200.00 old balance is still open (it is paid last) — use Record payment again to take it.'
 
   it('an old balance the desk left off the card is said in the closing notice, once, when the read comes back', async () => {
     const release = takeWithOldBalanceLeft()
@@ -1028,7 +1028,7 @@ describe('Close pressed before the bill is read again after the last card', () =
     server.quote = undefined   // JSON.parse(undefined) throws: the read fails
     await act(async () => { release() })
     await until(() => onClose.mock.calls.length === 1, 'closed')
-    expect(onRecorded.mock.calls).toEqual([['Took $476.65 by card on the reader from Kim Harland.']])
+    expect(onRecorded.mock.calls).toEqual([['Took $476.65 by card on the reader from Yvette Bexley.']])
   })
 })
 
@@ -1067,7 +1067,7 @@ describe('a space already taken on the reader shows no error when its block come
 // "Already on its way — not owed".
 
 const heldCard = (over: any = {}) => ({
-  amount: 476.65, heldAmount: 460, payerName: 'Kim Harland',
+  amount: 476.65, heldAmount: 460, payerName: 'Yvette Bexley',
   confirmBy: new Date(Date.now() + 20 * 60_000).toISOString(), ...over,
 })
 const allHeld = (awaitingCard: any[], over: any = {}) => deskQuote(0, {
@@ -1089,7 +1089,7 @@ describe('a card waiting on its bank is said on its own line at the desk', () =>
     await open()
     // No time zone on the quote: this browser's clock, with its zone named.
     const at = new Date(card.confirmBy).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })
-    expect(text()).toContain(`Waiting on Kim Harland’s card bank to confirm — nothing charged yet. If it is not confirmed, this opens here at ${at}.$460.00`)
+    expect(text()).toContain(`Waiting on Yvette Bexley’s card bank to confirm — nothing charged yet. If it is not confirmed, this opens here at ${at}.$460.00`)
     expect(text()).not.toContain('Already on its way')
   })
 
@@ -1105,7 +1105,7 @@ describe('a card waiting on its bank is said on its own line at the desk', () =>
     server.quote = allHeld([heldCard()], { clearing: 700 })
     await open()
     expect(text()).toContain('Already on its way (a card or bank payment clearing) — not owed$240.00')
-    expect(times('Waiting on Kim Harland’s card bank')).toBe(1)
+    expect(times('Waiting on Yvette Bexley’s card bank')).toBe(1)
   })
 
   it('no name on file: "Waiting on a card bank"', async () => {
@@ -1136,7 +1136,7 @@ describe('a card waiting on its bank is said on its own line at the desk', () =>
 //
 // 10/14 gave each bill a tick box. On 10/27 it stopped a resident's cash:
 // "the front desk buttons are not working ... The only button working is the
-// card on the reader button, and Lisa Scheeler has cash for her trailer
+// card on the reader button, and Calla Fitzhugh has cash for her trailer
 // payment." Every way of paying by hand waited on a box; the reader button was
 // the only one that never did.
 //
@@ -1160,7 +1160,7 @@ describe('10/27: the desk takes the balance — no bills to tick', () => {
     total: 333.33, creditAlreadyApplied: 0, owed: 333.33, olderBillIds: [], rows: [lisaRow],
   }
 
-  it("Lisa's trailer payment: nothing to tick, Cash is live, and the cash records", async () => {
+  it("Calla's trailer payment: nothing to tick, Cash is live, and the cash records", async () => {
     server.quote = deskQuote(0, {
       rows: [lisaRow], currentTotal: 333.33, owedIfUsed: 333.33, owedIfSaved: 333.33,
       fullBalance: 333.33, bills: [lisaBill], pickedBillIds: null, bankDepositAllowed: false,

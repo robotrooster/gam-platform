@@ -19,6 +19,7 @@ import { gunzipSync } from 'zlib'
 import { METRICS_MAP_LEVELS, METRICS_MAP_LEVEL_LABEL } from '@gam/shared'
 import { MetricsHeatMap, type PlatformMapData } from './MetricsHeatMap'
 import { forgetCensus, forgetElections, forgetLayers, forgetWorld, leanColor } from './metricsMapGeo'
+import { METRICS_THEME as THEME, recordCanvas } from './__fixtures__/metricsCanvasRecorder'
 
 const GEO = resolve(__dirname, '../../../api/geo')
 /** 10/17 (Nic): the census numbers the saturation overlay divides by (apps/api/census). */
@@ -121,6 +122,8 @@ const countrySelect = () => host.querySelector('select[aria-label="Countries on 
 /** The flat picture's zoom and pan, as it is drawn. */
 const flatTransform = () => host.querySelector('svg[role="img"] > g')?.getAttribute('transform') ?? ''
 const mapSvg = () => host.querySelector('svg[role="img"]') as SVGSVGElement
+/** The globe's own picture — where the theme's variables are set, jsdom having no stylesheet. */
+const globeCanvas = () => host.querySelector('canvas.mhm-globe') as HTMLCanvasElement | null
 const press = async (key: string) => {
   await act(async () => { mapSvg().dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true })) })
 }
@@ -546,7 +549,7 @@ describe('MetricsHeatMap globe', () => {
   it('toggles to the globe and back to the flat map', async () => {
     await render()
     await click('Globe')
-    const canvas = host.querySelector('canvas.mhm-globe')!
+    const canvas = globeCanvas()!
     expect(canvas.getAttribute('role')).toBe('img')
     expect(canvas.getAttribute('aria-label')).toMatch(/^Globe of the United States by state.*Drag or use the arrow keys/)
     expect(host.querySelector('button[aria-label="Zoom in"]')).not.toBeNull()
@@ -556,7 +559,7 @@ describe('MetricsHeatMap globe', () => {
     expect(listRows()).toEqual(['Arizona64 occupied units', 'Illinois16 occupied units'])
     await act(async () => { button('Flat map').click() })
     await settle()
-    expect(host.querySelector('canvas.mhm-globe')).toBeNull()
+    expect(globeCanvas()).toBeNull()
     expect(host.querySelector('svg[role="img"]')).not.toBeNull()
   })
 
@@ -682,7 +685,7 @@ describe('MetricsHeatMap keeps the view', () => {
     // The globe cannot show the same picture, but it must not snap home: the
     // depth and the middle come back when the flat map does.
     await click('Globe')
-    expect(host.querySelector('canvas.mhm-globe')).not.toBeNull()
+    expect(globeCanvas()).not.toBeNull()
     await click('Flat map')
     expect(flatTransform()).toBe(at)
     // A world level is a different projection; the depth still holds.
@@ -1038,75 +1041,13 @@ describe('MetricsHeatMap lean overlay', () => {
 
 /**
  * jsdom has no canvas, so the globe is given a stand-in that records what it
- * painted: every fill's color, and every stroke with its color, its width and
- * how many line commands went into it. The stand-in also answers the globe's
- * own color reader (which asks a 1×1 canvas what a CSS color comes out as), so
- * the colors recorded here are the colors it really used.
+ * painted — every fill and every stroke with its color, its width and how many
+ * line commands went into it (metricsCanvasRecorder, shared with the globe's
+ * own tests). The stand-in also answers the globe's own color reader (which
+ * asks a 1x1 canvas what a CSS color comes out as), so the colors recorded
+ * here are the colors it really used, once `dress` has set the theme's own
+ * variables on the canvas.
  */
-const THEME: Record<string, string> = {
-  // The dark theme's own values (main.tsx), so this reads what he sees.
-  '--b1': 'rgb(34, 42, 56)',          // #222a38
-  '--b2': 'rgb(42, 53, 71)',          // #2a3547 — the light gray-blue
-  '--bg2': 'rgb(18, 21, 25)',         // #121519 — what the state lines used to be
-  '--heat-none': 'rgb(24, 28, 34)',   // #181c22 — the land
-  '--heat-hi': 'rgb(201, 162, 39)',   // the gold
-  '--heat-base': 'rgb(18, 21, 25)',
-  '--t0': 'rgb(238, 240, 246)',
-  '--t1': 'rgb(184, 196, 216)',
-}
-const rgbOf = (css: string): [number, number, number] | null => {
-  const m = /^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/.exec(css.trim())
-  if (m) return [Number(m[1]), Number(m[2]), Number(m[3])]
-  const hex = /^#([0-9a-f]{6})$/i.exec(css.trim())
-  if (hex) return [0, 2, 4].map(i => parseInt(hex[1].slice(i, i + 2), 16)) as [number, number, number]
-  return null
-}
-
-function recordCanvas() {
-  const fills: string[] = []
-  const strokes: Array<{ color: string; width: number; lines: number }> = []
-  const arcs: Array<[number, number]> = []
-  let lines = 0
-  let fillStyle = '#808080'
-  let painted = '#808080'
-  const ctx: any = {
-    strokeStyle: '', lineWidth: 0, globalAlpha: 1,
-    setTransform() {}, clearRect() {},
-    // The color reader's own 1×1 probe: a real canvas keeps the last VALID
-    // color, so an unknown one (a theme variable that is not set) reads as the
-    // gray it was given first.
-    fillRect() { painted = fillStyle },
-    getImageData: () => ({ data: rgbOf(painted) ?? [128, 128, 128] }),
-    beginPath() { lines = 0 },
-    moveTo() { lines++ }, lineTo() { lines++ }, closePath() {},
-    arc(x: number, y: number) { lines++; arcs.push([x, y]) },
-    fill() { fills.push(fillStyle) },
-    stroke() { strokes.push({ color: String(ctx.strokeStyle), width: Number(ctx.lineWidth), lines }) },
-  }
-  Object.defineProperty(ctx, 'fillStyle', {
-    get: () => fillStyle,
-    set: (v: string) => { if (rgbOf(v)) fillStyle = v },
-  })
-  vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(ctx)
-  vi.spyOn(HTMLCanvasElement.prototype, 'getBoundingClientRect').mockReturnValue({
-    width: 975, height: 610, top: 0, left: 0, right: 975, bottom: 610, x: 0, y: 0, toJSON: () => ({}),
-  })
-  /**
-   * The theme's variables, which jsdom has no stylesheet for — set on the
-   * canvas itself, then the globe is asked to draw again the way a theme
-   * change asks it to (it watches the page's own theme attribute).
-   */
-  const dress = async () => {
-    const canvas = host.querySelector('canvas.mhm-globe') as HTMLCanvasElement | null
-    for (const [k, v] of Object.entries(THEME)) canvas?.style.setProperty(k, v)
-    fills.length = 0; strokes.length = 0; arcs.length = 0
-    await act(async () => {
-      document.documentElement.setAttribute('data-theme', 'dark')
-      await new Promise(r => setTimeout(r, 400))
-    })
-  }
-  return { fills, strokes, arcs, dress }
-}
 
 describe('MetricsHeatMap globe divisions', () => {
   it('fetches the same country borders and provinces the flat map draws, once each', async () => {
@@ -1139,12 +1080,12 @@ describe('MetricsHeatMap globe divisions', () => {
     const painted = recordCanvas()
     await render()
     await click('Globe')
-    await painted.dress()
+    await painted.dress(globeCanvas())
 
     // At the state level the only heavy lines on it are the world's own: the
     // provinces (4,367 lines) and the country borders (204 of them). Before
     // this neither was drawn at all.
-    const drawn = painted.strokes.filter(s => s.lines > 0)
+    const drawn = painted.all.strokes.filter(s => s.lines > 0)
     // The two heaviest lines on the globe are the world's own, which were not
     // drawn at all before this: the provinces and the borders between
     // countries. Everything else on it is a few thousand points at most.
@@ -1174,15 +1115,16 @@ describe('MetricsHeatMap globe divisions', () => {
     await act(async () => { button('How it votes').click() })
     await settle()
     await click('Globe')
-    await painted.dress()
+    await painted.dress(globeCanvas())
     // Santa Cruz County, Arizona at Democratic +18.6 and Yavapai at
     // Republican +33.9 — the same two colors the flat map gives them.
-    expect(painted.fills).toContain(leanColor(-18.6))
-    expect(painted.fills).toContain(leanColor(33.9))
+    const filled = painted.all.fills.map(f => f.color)
+    expect(filled).toContain(leanColor(-18.6))
+    expect(filled).toContain(leanColor(33.9))
     // And a gold marker for each county GAM is in, whatever its size, because
     // the county's own color is its vote.
-    expect(painted.arcs.length).toBeGreaterThanOrEqual(3)
-    expect(painted.fills.some(f => f === `rgb(${[201, 162, 39].join(', ')})`
+    expect(painted.all.arcs.length).toBeGreaterThanOrEqual(3)
+    expect(filled.some(f => f === `rgb(${[201, 162, 39].join(', ')})`
       || /^rgb\(\d+, \d+, \d+\)$/.test(f))).toBe(true)
   })
 })

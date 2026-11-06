@@ -670,7 +670,7 @@ describe('S609 autopay runner', () => {
     return { oldLeaseId, creditId, lastMonth }
   }
   const heldUsesOf = async (creditId: string) => (await db.query<{ payment_id: string; amount: string }>(
-    `SELECT payment_id, amount::text AS amount FROM credit_uses WHERE tenant_credit_id = $1 AND status = 'held' ORDER BY amount`, [creditId])).rows
+    `SELECT payment_id, amount::text AS amount FROM credit_uses WHERE tenant_credit_id = $1 AND status = 'held' ORDER BY credit_uses.amount`, [creditId])).rows
   const oldRetry = async (id: string) => (await db.query<any>(
     `SELECT status, next_retry_at IS NOT NULL AS retry FROM payments WHERE id = $1`, [id])).rows[0]
   const sentBodies = () => (createNotification as any).mock.calls.map((x: any[]) => x[0].body).join(' ')

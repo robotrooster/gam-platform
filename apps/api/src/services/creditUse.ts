@@ -99,6 +99,7 @@ import { createAdminNotification } from './adminNotifications'
 // Type only (erased): bookingLeaseBilling imports this file, so its hook is
 // loaded on use (bankShortenedStaysAfter).
 import type { StayShortenedBanked } from './bookingLeaseBilling'
+import { todayIn } from '../lib/timezone'
 
 // ─── Money in cents ───────────────────────────────────────────────────────────
 
@@ -2571,7 +2572,7 @@ export async function undoIssuedCredit(
   }
 
   // ── Put it all back ─────────────────────────────────────────────────────────
-  const day = new Date().toISOString().slice(0, 10)
+  const day = todayIn(null)
   const useIds = applied.map(u => u.id)
   if (useIds.length > 0) {
     const r = await client.query(

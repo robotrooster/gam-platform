@@ -6,8 +6,8 @@ Previous handoff: `SESSION_653_HANDOFF.md`.
 
 - Work-trade residents (Mountain View, Oak Park) were sent October bills.
 - Every Country Acres resident looked wrong; Bowman "$489.60" vs the sheet's $550 base.
-- Myria Skinner's screenshot: "$200 outstanding in addition to the invoice."
-- Troy Street asking about a missing water bill.
+- Valentina Vallancey's screenshot: "$200 outstanding in addition to the invoice."
+- Delphine Illingworth asking about a missing water bill.
 
 ## Causes (all verified against prod data + code)
 
@@ -16,8 +16,8 @@ Previous handoff: `SESSION_653_HANDOFF.md`.
    the amount due. `jobs/invoiceGeneration.ts` issued gross (the S624 month-close
    model), so the SECOND bill of every work-trade tenancy read as owed, the
    who-owes page counted it, and the bill email headlined "$460.00 due".
-   Nine residents: Scheeler, N. Rhoades, Negrete, B. Valdez, Robinson, Gutierrez,
-   Conklin (Mountain View), T. Rhoades (Oak Park), Clabough (Country Acres).
+   Nine residents: Scheeler, N. Rhoades, Negrete, B. Mawdsley, Robinson, Gutierrez,
+   Conklin (Mountain View), T. Rhoades (Oak Park), Stillwell (Country Acres).
 2. **Nobody has ever logged a work-trade hour** (`work_trade_logs` is empty), so
    the Oct 1 month-close credited nothing for September; with
    `carry_forward_months = 1` the Nov 1 close would have billed September back as
@@ -25,12 +25,12 @@ Previous handoff: `SESSION_653_HANDOFF.md`.
 3. **Rent-to-own installment billed standalone.** `billDueHomeSaleInstallments`
    (4:20 cron) wrote a `home_payment` row with no invoice; the 5:00 invoice run
    had no home-sale code. Invoice, email headline, and who-owes page omitted it;
-   the tenant Pay page showed a second box with no lease. Myria's "$200
+   the tenant Pay page showed a second box with no lease. Valentina's "$200
    outstanding in addition to the invoice" IS this box (I misread the dictation
    as $2,200 and chased a number that never existed — see memory
    `feedback-no-narrated-side-quests`).
-4. **Three purchase agreements unsigned by the tenant** (Rueff MH 11 $150, Smith
-   MH 18 $100, Whitfield MH 24 $150): Blu signed 9/22, tenants were sent links.
+4. **Three purchase agreements unsigned by the tenant** (Cholmondeley MH 11 $150, Crowhurst
+   MH 18 $100, Rutherford MH 24 $150): Blu signed 9/22, tenants were sent links.
    Nothing bills until they sign. Not a code problem.
 5. **Water: zero-movement reads.** Blu entered 9/30 reads equal to July and
    August on lot 22 (2072) and lot 24 (8576) → zero usage → no line. Lot 18 got
@@ -39,13 +39,13 @@ Previous handoff: `SESSION_653_HANDOFF.md`.
    netted suspended rows against totals that already excluded them (S634
    shape) → RV 50 / RV 51 showed −$589 and Bret's/Ruben's October hid behind
    September. `landlords.ts` dashboard + `reports.ts` subtracted `traded` and
-   clamped, which would have shown Curtis (rent traded, water owed) at $0.
+   clamped, which would have shown Sage (rent traded, water owed) at $0.
 
 ## Nic's directives this session
 
 - **"Work trade people are on work trade. There's no bills going out to those
   people. My people at my properties are auto complete work trade until I
-  change it back."** Other landlords may track hours (Curtis/Blu does).
+  change it back."** Other landlords may track hours (Sage/Blu does).
 - The home payment belongs ON the rent invoice ("$450 + $200 = $650").
 
 ## Data repair (prod, committed — `scripts/oct1_billing_repair.ts`, DRY=1 to replay the plan)
@@ -54,13 +54,13 @@ Previous handoff: `SESSION_653_HANDOFF.md`.
   two paused: Johnson RV 50, Kvasnicka RV 51).
 - 14 covered October lines suspended across the 9 invoices; 13 invoices rebuilt
   to the S634 total (incl. the four pre-S634 September invoices that still
-  carried gross totals: INV-2026-00001/00006/00012/00015). Curtis's October =
+  carried gross totals: INV-2026-00001/00006/00012/00015). Sage's October =
   $110.55 water only.
 - 15 open settlement periods on Nic's agreements set to 0 hours (the Nov 1
-  close settles them as covered). Curtis's pre-created October period linked to
+  close settles them as covered). Sage's pre-created October period linked to
   INV-2026-00027. A September period created for MH 02 (never had one).
 - The six standalone October home payments moved onto their invoices:
-  Sheptock $757.25, Skinner $815.00, Street $525.00, McCoy $689.60,
+  Sheptock $757.25, Vallancey $815.00, Illingworth $525.00, McCoy $689.60,
   Mitchell $678.05, Bowman $589.60. `invoices.subtotal_home_payments` added
   (migration `20261001100000`).
 - Verified: who-owes shows $0 for all nine work-trade residents; Lisa's Pay
@@ -69,7 +69,7 @@ Previous handoff: `SESSION_653_HANDOFF.md`.
   pass, confirmed in the data): this morning's run created August-cycle
   electric bills for RV 49 Parker ($96.81), RV 36 Avalos ($81.27), RV 04 Kenyon
   ($93.87) — all three already had August on their September bills, recorded
-  as cash — and RV 44 Dakota Lane ($93.87, the previous occupant's usage; his
+  as cash — and RV 44 Tobin Thornbury ($93.87, the previous occupant's usage; his
   lease started 9/2). Cause: August was collected by hand in September as
   payment rows with no `utility_bills` row, so the engine saw August readings
   with no bill and re-billed the cycle as a straggler. Voided all four with
@@ -81,21 +81,21 @@ Previous handoff: `SESSION_653_HANDOFF.md`.
 - **Tenant Pay page: one button** (`apps/tenant/src/pages/PaymentsPage.tsx`).
   Nic: "They can't choose what they pay. They pay everything that's owed." With
   two or more payable leases the page showed a bare "Pay all" card plus a Pay
-  button per lease; Myria read her standalone $200 home-payment box as "a
+  button per lease; Valentina read her standalone $200 home-payment box as "a
   previous outstanding balance". Now: one card in the single-lease shape —
   total, what each space contributes, the fee for each way of paying (summed
   per lease, since each lease is still charged separately), a report-deposit
   button per space, ONE Pay. Per-lease cards render only when there is one.
-- **Country Acres water, one unit each (Nic, for Blu):** lots 18 Smith, 22
-  Street, 24 Whitfield had no water read to bill. Blu wants each billed one
+- **Country Acres water, one unit each (Nic, for Blu):** lots 18 Crowhurst, 22
+  Illingworth, 24 Rutherford had no water read to bill. Blu wants each billed one
   unit = 1,000 gal = $16.50 at $0.0165/gal. `scripts/oct1_country_acres_water_estimates.ts`
   wrote a September water bill per lot (estimated, no reading rows — meter
   history untouched) onto the October invoice: MH 18 $466.50, MH 22 $541.50,
-  MH 24 $466.50. Lots 22/24 stay out of service until Curtis fixes them and
+  MH 24 $466.50. Lots 22/24 stay out of service until Sage fixes them and
   Blu clicks Mark repaired; the next real read bills real gallons.
 - **NOT done: no emails re-sent.** Fourteen residents hold this morning's email
   with a stale headline: the six Country Acres rent-to-own households and the
-  three one-unit water lots (too low), Curtis Clabough ($560.55 → $110.55), and
+  three one-unit water lots (too low), Sage Stillwell ($560.55 → $110.55), and
   the five Mountain View August voids (too high). Re-send = reset `sent_at` on those invoices and run
   `sendPendingInvoiceNotices({ invoiceId })` — only on Nic's word. Work-trade
   residents get nothing (directive).
@@ -139,8 +139,7 @@ Previous handoff: `SESSION_653_HANDOFF.md`.
   payment); a check/landlord credit settles the row like recorded cash
   (`platform_held=false`, note "collected by the landlord"). Data:
   `scripts/oct1_prepaid_check_money_not_paid_out.ts` flipped the four rows and
-  removed their owner-share ledger rows. Next-payout card now: $539 (Robert
-  Housley RV 14, card) ready; Fierro/Cox ACH clearing. Tests: prepaidRelease
+  removed their owner-share ledger rows. Next-payout card now: $539 (Rowena Ulverston RV 14, card) ready; Fierro/Cox ACH clearing. Tests: prepaidRelease
   (+2; fixture now seeds an ACH remittance for the held case).
 - **Outstanding Balances page = property folders** (`BalancesPage.tsx`): one
   folder per property, closed until opened, no property dropdown; people
@@ -279,7 +278,7 @@ None is the default. They should not be merged in any way." (memory
 ## Night: the reader's screen, the charge that survives, the customer base
 
 - **Reader screen (Nic): name + breakdown.** Before the reader asks for the
-  card it shows a cart: at the desk "Rent — Selene Arvizu (RV 39)", each
+  card it shows a cart: at the desk "Rent — Winslow Bramhall (RV 39)", each
   charge by name, "Card processing fee", total; at the register each item
   with quantity, tax, card fee, total. Server-priced (`showCartOnReader` in
   posTerminal.ts; the register's /process re-prices the cart and refuses a
@@ -478,7 +477,7 @@ counts a bounced payment once and never quotes work-trade lines as owed).
 ### Decisions for Nic (numbered; recommendation first)
 1. **Deploy** the overnight batch — the security fixes are the reason.
 2. **Country Acres late fees** — Blu's answer before 10 pm Oct 5 Arizona time
-   (11 × $50). Stamp MH 15 (Mike Boyd) exempt under S638? (one invoice).
+   (11 × $50). Stamp MH 15 (Isolde Lanthorne) exempt under S638? (one invoice).
 3. **Credit netting (MH 25 and every paid-ahead tenant):** today the bill email
    nets paid-ahead credit and the portal does not, so they show different
    numbers. Options: (a) portal matches the email for the simple case only,
@@ -532,7 +531,7 @@ counts a bounced payment once and never quotes work-trade lines as owed).
   9/14, two days before the question shipped). Overnight build: the question
   now shows for any property where it is unanswered (Tenant Onboarding page).
   The void-history count was already fixed (061e2f5, live); overnight added the
-  tests. MH 15 (Mike Boyd) started 9/25 and would be exempt under S638 (after
+  tests. MH 15 (Isolde Lanthorne) started 9/25 and would be exempt under S638 (after
   the 20th) but his bill was written by the move-in bundle before that rule
   reached it — code fixed overnight; his one invoice needs Nic's OK to stamp.
 - Fixed overnight (see Overnight section): Oak Park late digest, business fee
@@ -540,10 +539,10 @@ counts a bounced payment once and never quotes work-trade lines as owed).
   email was RIGHT ($450); the tenant PORTAL asked $460 (ignored the $10 paid-
   ahead credit). The $10 is still on the account for November. Not fixed on
   main — see Overnight, decision 3.
-- Shane Rueff, Kyra Smith, Jolyn Whitfield sign their purchase agreements.
-- Myria's contract record is $24,000 / 120 × $200; the agreement Blu signed says
+- Xenia Cholmondeley, Zora Crowhurst, Perrin Rutherford sign their purchase agreements.
+- Valentina's contract record is $24,000 / 120 × $200; the agreement Blu signed says
   "$12,000 + taxes" and the sheet says $650 × 5 years (= $12,000). Monthly is the
   same; the payoff is wrong. Nic to confirm with Blu.
-- Lot 17 (Cameron Valdez) 19,800 gal / $326.70 and lot 21 (Skinner) 10,000 gal /
+- Lot 17 (Mabel Mawdsley) 19,800 gal / $326.70 and lot 21 (Vallancey) 10,000 gal /
   $165 — flagged in S653, unanswered.
 - Carried from S653: waitlist design; Oak Park RV 24 September water share.

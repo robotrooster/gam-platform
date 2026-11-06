@@ -77,6 +77,16 @@ const NOT_JOURNALED: Record<string, string> = {
   // its own history and never overwrites a price that was charged.
   flexpay_fee_schedule: 'a rate table — re-pricing appends a row, never an update',
   flexdeposit_fee_schedule: 'a rate table — re-pricing appends a row, never an update',
+  job_financing_fee_schedule:
+    'a rate table — what GAM charges a landlord to spread a finished job over payments. '
+    + 'Re-pricing appends a forward-dated row and never touches a plan already quoted, so '
+    + 'there is no prior value to journal. The money that actually moves is the plan\'s '
+    + 'payments and GAM\'s fee when it is earned, which post on their own rows.',
+  marketplace_placement_rates:
+    'a rate table — what a contractor pays for the top spot in one trade in one area, '
+    + 'banded by the area\'s published cost of living. Re-pricing appends a forward-dated '
+    + 'row and never touches a spot already sold, so there is no prior value to journal. '
+    + 'The money that moves is the monthly charge for a spot actually bought.',
   flexdeposit_move_fee_schedule: 'a rate table — re-pricing appends a row, never an update',
   scheduled_lease_changes: 'a change waiting to be made — the lease it makes is journaled',
   sublessee_invitations: 'an invitation (subleasing is shelved)',

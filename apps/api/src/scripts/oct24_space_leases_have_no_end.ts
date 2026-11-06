@@ -10,14 +10,14 @@
  *    an RV, that doesn't matter. It can be month to month. It can auto renew."
  *
  * processLeaseEnds now lapses a space rental's end date instead of freeing the
- * space — but it only runs WHEN the date arrives. James Fenton's says 2027-01-31
- * and Mike Boyd's says 2027-03-01, so until those days come the leases still
+ * space — but it only runs WHEN the date arrives. Juno Kendrew's says 2027-01-31
+ * and Isolde Lanthorne's says 2027-03-01, so until those days come the leases still
  * carry an end, and every availability check reads an end date as "free after
  * that": RV 15 is bookable for February TODAY. Which is the thing Nic is afraid
  * of, nine months early.
  *
  * Both dates came from the applicant's own "how long do you want to stay" answer
- * on a screening form (background_checks.desired_term_months — Fenton said 3),
+ * on a screening form (background_checks.desired_term_months — Kendrew said 3),
  * handed to the lease drafter as a contract term. That door is now shut in both
  * places that opened it; this clears what came through it.
  *

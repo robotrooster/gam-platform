@@ -24,9 +24,16 @@ async function main() {
   const text = fs.existsSync(bodyArg) ? fs.readFileSync(bodyArg, 'utf8') : bodyArg
   const resend = new Resend(process.env.RESEND_API_KEY)
   const from = process.env.EMAIL_FROM_SUPPORT || process.env.EMAIL_FROM_NOREPLY || ''
+  // 11/5 (Nic): ONE address, not two. "You keep emailing both of my emails. I
+  // don't know why I need two copies. That just wastes a lot of room in our
+  // resend amounts. I only need one email thread to one of the emails."
+  //
+  // realestaterhoades@gmail.com is the one: it is his account of record in GAM,
+  // so operator mail lands in the same thread as everything else the platform
+  // sends him. Changing it is this one line.
   const r = await resend.emails.send({
     from,
-    to: ['nic@golddoor.io', 'realestaterhoades@gmail.com'],
+    to: ['realestaterhoades@gmail.com'],
     subject,
     text,
   })

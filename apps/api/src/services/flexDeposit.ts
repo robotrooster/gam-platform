@@ -5,6 +5,7 @@ import { isFeatureEnabled } from './systemFeatures'
 import { getStripe } from '../lib/stripe'
 import { createRentPlatformCharge } from './stripeConnect'
 import { computeTenantGamOutstandingTotal } from './supersedence'
+import { openAmountSql } from './openBalances'
 // S527: single source for the Stripe ACH-return pass-through (same Stripe
 // fee regardless of product; Consumer ToS § 9.1.4 promises it "per retry at
 // actual cost, no markup" for FlexDeposit exactly as § 4.2 does for FlexPay).
@@ -12,6 +13,8 @@ import { FLEXPAY_ACH_RETURN_FEE as ACH_RETURN_FEE } from './flexpay'
 import {
   getFlexDepositMaxInstallments,
   isAllowedFlexDepositPaymentCount,
+  flexDepositPaymentChoicesForLeaseType,
+  flexDepositScheduleFitsLease,
   FLEX_DEPOSIT_PAYMENT_CHOICES,
   FLEX_DEPOSIT_CUSTODY_FEE,
   type FlexDepositRiskLevel,
@@ -37,8 +40,11 @@ import { dateIn, todayIn, monthStartOf } from '../lib/timezone'
 // (held_by='gam_escrow'), never transferred to the landlord at move-in.
 // Installment 1 is paid at move-in alongside rent + utilities in a
 // single combined ACH pull; installments 2..N are pulled monthly.
-// A $3/mo custody fee (FLEX_DEPOSIT_CUSTODY_FEE) applies while GAM
-// holds the deposit. At lease-end the deposit-return flow settles
+// There is NO monthly custody fee (10/26, Nic): the whole service fee
+// is priced from flexdeposit_fee_schedule and rides the first pull
+// alongside installment 1. FLEX_DEPOSIT_CUSTODY_FEE is deprecated and
+// processFlexDepositCustodyFee is a documented no-op.
+// At lease-end the deposit-return flow settles
 // against collected_amount — i.e. only what the tenant actually funded
 // (see services/depositReturn.ts).
 //
@@ -120,11 +126,14 @@ export interface FlexDepositEligibility {
   eligible:        boolean
   blockers:        Array<
     | 'ach_unverified'
+    // 10/28: a bank that has not been STARTED. Distinct from 'ach_unverified',
+    // which other products still use to mean "not verified yet" — FlexDeposit
+    // no longer refuses that, it only refuses somebody who has not begun.
+    | 'no_bank_started'
     | 'no_deposit_row'
     | 'no_bg_result'
     | 'bg_not_approved'
     | 'risk_level_missing'
-    | 'not_ssi_ssdi'
     | 'already_funded'
     | 'tenant_not_found'
     // 10/27: the LANDLORD is not established enough to offer FlexDeposit at —
@@ -138,6 +147,10 @@ export interface FlexDepositEligibility {
     // 10/26: the platform is at its FlexDeposit ceiling. Nothing about this
     // tenant — they qualify, there is simply no room right now.
     | 'at_capacity'
+    // 10/27: the tenancy ends before even the shortest schedule could finish,
+    // so the deposit would be short on the day the landlord is owed it. A
+    // two-month lease, not a judgement about the resident.
+    | 'lease_too_short_for_any_plan'
   >
   max_installments: number | null
   risk_level:       FlexDepositRiskLevel | null
@@ -192,6 +205,27 @@ export async function isFlexDepositVisible(): Promise<boolean> {
  *
  * Platform-wide on purpose: the capacity is GAM's, so one busy park cannot
  * consume it. No row, or NULL limits, means unlimited.
+ *
+ * ── 10/27: WHY THE RESERVE IS NOT A GATE HERE ──────────────────────────────
+ *
+ * GAM now covers a landlord for the part of a deposit a resident never funded
+ * (services/depositReturn.ts), so it is tempting to refuse a plan the reserve
+ * could not cover. That would be wrong, and Nic said why:
+ *
+ *   "we need no capital until the first leases end. we hold custody so its
+ *    pure money now. we start building the seed asap to protect against
+ *    defaults."
+ *
+ * The money is not due at enrollment — it is due the day that tenancy ends,
+ * which on a year lease is a year of fee income away. A reserve test would
+ * refuse the FIRST plan, whose fee is what starts the reserve, and refuse it
+ * for a bill that cannot arrive for months.
+ *
+ * So the reserve is INFORMATION, not a brake: services/flexDepositExposure.ts
+ * reports it beside the cash each upcoming month actually needs, and these two
+ * hand-set ceilings stay the brake. Nic raises them himself — "Proposes, you
+ * approve" — which is why they live in a table with an `updated_by`, and not
+ * in a formula that moves on its own.
  */
 export async function flexDepositCapacity(): Promise<{
   room: boolean
@@ -222,8 +256,8 @@ export async function flexDepositCapacity(): Promise<{
 
 /**
  * Compute the tenant's FlexDeposit eligibility based on:
- *  - SSDI/SSI recipient (tenants.ssi_ssdi) — ToS § 9.1.1 service-tier
- *    qualification, income verified at onboarding (not a credit decision)
+ *  - a bank link BEGUN (10/29: FlexDeposit is open to anybody — the
+ *    fixed-income rule is FlexPay's alone, see the gate below)
  *  - ach_verified
  *  - background_checks.status = 'approved' AND risk_level set
  *  - security_deposits exists for an upcoming/active lease
@@ -253,28 +287,155 @@ export async function flexDepositCapacity(): Promise<{
 export async function flexDepositSignPrompt(
   userId: string,
 ): Promise<{ depositAmount: number } | null> {
+  const offer = await flexDepositOffer({ userId })
+  return offer ? { depositAmount: offer.depositAmount } : null
+}
+
+/** What a resident is offered on a deposit they still owe. */
+export interface FlexDepositOffer {
+  tenantId: string
+  /** The whole deposit, which is what they owe today if they do nothing. */
+  depositAmount: number
+  /** Already funded toward it (a part payment), so the prompt can say so. */
+  collected: number
+  /** Priced 2- and 4-payment splits, exactly as the enrollment screen shows. */
+  choices: FlexDepositEligibility['choices']
+  /** The least they could pay today instead of the whole deposit. */
+  lowestFirstPull: number
+  /**
+   * Everything else the resident owes RIGHT NOW besides the deposit — their
+   * first month's rent and any move-in fees. The plan changes only the deposit
+   * part, so this is what has to sit beside it for "due at move-in" to be the
+   * real figure rather than deposit arithmetic.
+   */
+  otherDueNow: number
+  /**
+   * They have not begun linking a bank, so the plan cannot be taken yet —
+   * installments are bank-only. The offer still stands, because that is the
+   * one blocker the resident can clear themselves in a minute, and telling
+   * them about the plan is exactly how they learn it is worth doing. Every
+   * other blocker is a reason there is NO offer at all.
+   */
+  needsBank: boolean
+}
+
+/**
+ * ── 10/29 (Nic): THE OFFER STANDS UNTIL THE DEPOSIT IS SETTLED ──────────────
+ *
+ *   "We need the prompt to pop up for any tenants when the deposit has not
+ *    been paid yet. If they log in to go and pay their bill, that needs to ask
+ *    if they want to sign up for flex deposit at that point. It needs to be
+ *    there until the deposit is handled one way or another."
+ *
+ * One signal, read by every surface, so they cannot disagree: the signing
+ * prompt, the portal's home and payments screens, and the one-time email.
+ *
+ * What it replaces was a nudge that fired ONLY for somebody whose bank was
+ * "neither verified nor already begun" — which skipped exactly the people most
+ * ready to enrol, and fired once, at signing, never again. The resident who
+ * signed MH 28 on 10/28 verified her bank at 5:29 the next morning and would
+ * have paid a $450 deposit in full on November 1st without ever being shown
+ * the $225 or $112.50 she could have paid instead. Nothing in the product
+ * would have told her it existed.
+ *
+ * It goes quiet on the FACT, not on the click: when the deposit is funded or a
+ * plan is running, there is no offer. Closing the prompt is "not now".
+ *
+ * Takes a user id (what a signer row carries) or a tenant id (what the portal
+ * has). Returns null whenever there is nothing to offer — product off, deposit
+ * settled, already enrolled, or not eligible — so a caller never has to know
+ * why, and an error is never a reason to block a resident's screen.
+ */
+/**
+ * ── 10/29 (Nic): WHAT THEY ACTUALLY HAND OVER AT MOVE-IN ────────────────────
+ *
+ *   "That's only showing the total of payments what they'll pay. It's not
+ *    showing what's due at move-in. It needs to generate whatever their first
+ *    month is."
+ *
+ * The plan's own numbers describe the DEPOSIT and nothing else, so a resident
+ * reading "$273.00 at move-in" against a $900 bill is reading a figure that
+ * was never what they would pay. This is the rest of that bill: every unpaid
+ * charge on the same lease except the security deposit the plan replaces.
+ *
+ * Credit already applied comes off (openAmountSql), so it is what is owed and
+ * not what was billed. A lease with nothing else outstanding returns 0, and
+ * the screen then shows the deposit figures alone, which is correct.
+ */
+export async function depositSiblingChargesDue(tenantId: string): Promise<number> {
+  const r = await queryOne<{ total: string }>(
+    `SELECT COALESCE(SUM(${openAmountSql('p')}), 0)::text AS total
+       FROM payments p
+      WHERE p.lease_id = (SELECT sd.lease_id FROM security_deposits sd
+                           WHERE sd.tenant_id = $1 AND sd.status IN ('pending', 'partial')
+                             AND sd.voided_at IS NULL
+                           ORDER BY sd.created_at DESC LIMIT 1)
+        AND p.status IN ('pending', 'failed')
+        AND p.amount > 0
+        -- The security deposit itself is what the plan replaces; a pet or key
+        -- deposit (it carries its own lease_fees row) is a separate charge they
+        -- still owe in full, so it stays in.
+        AND NOT (p.type = 'deposit' AND p.lease_fee_id IS NULL)`,
+    [tenantId])
+  return Math.round(Number(r?.total ?? 0) * 100) / 100
+}
+
+export async function flexDepositOffer(
+  who: { userId?: string; tenantId?: string },
+): Promise<FlexDepositOffer | null> {
+  if (!who.userId && !who.tenantId) return null
   if (!await isFlexDepositVisible()) return null
-  return await queryOne<{ depositAmount: number }>(
-    `SELECT sd.total_amount::float8 AS "depositAmount"
-       FROM tenants t
-       JOIN security_deposits sd ON sd.tenant_id = t.id
-      WHERE t.user_id = $1
+
+  // Cheap first: is there a deposit still owed that no plan is covering? This
+  // runs on the portal's own /me, so the expensive eligibility pass below is
+  // reached only by someone who could actually be offered something.
+  const dep = await queryOne<{
+    tenant_id: string; total: number; collected: number
+  }>(
+    `SELECT sd.tenant_id, sd.total_amount::float8 AS total,
+            sd.collected_amount::float8 AS collected
+       FROM security_deposits sd
+       JOIN tenants t ON t.id = sd.tenant_id
+      WHERE ${who.tenantId ? 't.id = $1' : 't.user_id = $1'}
         AND sd.status IN ('pending', 'partial')
         AND sd.total_amount > 0
-        AND t.ach_verified IS NOT TRUE
-        AND t.bank_pending_since IS NULL
+        AND sd.collected_amount < sd.total_amount
+        AND sd.flex_deposit_enabled IS NOT TRUE
+        AND sd.voided_at IS NULL
       ORDER BY sd.created_at DESC
       LIMIT 1`,
-    [userId])
+    [who.tenantId ?? who.userId])
+  if (!dep) return null
+
+  const elig = await getFlexDepositEligibility(dep.tenant_id)
+  // 10/27's original nudge existed precisely to tell somebody with no bank to
+  // go and link one, so a missing bank cannot be the reason they are never
+  // told. It is the one blocker the resident clears themselves; everything
+  // else — the landlord's standing, capacity, the background check, the lease
+  // being too short — is a reason there is nothing to offer, and prompting
+  // anyway would be offering something they cannot have.
+  const blocking = elig.blockers.filter(b => b !== 'no_bank_started')
+  if (blocking.length || !elig.choices.length) return null
+
+  return {
+    tenantId: dep.tenant_id,
+    depositAmount: dep.total,
+    collected: dep.collected,
+    choices: elig.choices,
+    lowestFirstPull: Math.min(...elig.choices.map(c => c.firstPull)),
+    otherDueNow: await depositSiblingChargesDue(dep.tenant_id),
+    needsBank: elig.blockers.includes('no_bank_started'),
+  }
 }
 
 export async function getFlexDepositEligibility(tenantId: string): Promise<FlexDepositEligibility> {
   const t = await queryOne<{
     ach_verified: boolean
-    ssi_ssdi: boolean
     bg_status: string | null
+    bank_pending: boolean
   }>(
-    `SELECT ach_verified, ssi_ssdi, background_check_status AS bg_status
+    `SELECT ach_verified, background_check_status AS bg_status,
+            bank_pending_since IS NOT NULL AS bank_pending
        FROM tenants WHERE id = $1`,
     [tenantId],
   )
@@ -287,12 +448,72 @@ export async function getFlexDepositEligibility(tenantId: string): Promise<FlexD
 
   const blockers: FlexDepositEligibility['blockers'] = []
 
-  // ToS § 9.1.1: FlexDeposit is limited to SSDI/SSI recipients. The flag is
-  // set + income-verified at tenant onboarding; this is a service-tier
-  // qualification, not a credit decision, and uses no consumer report.
-  if (!t.ssi_ssdi) blockers.push('not_ssi_ssdi')
+  // ── 10/29 (Nic): FLEXDEPOSIT IS FOR ANYBODY. THE FIXED-INCOME RULE IS
+  //    FLEXPAY'S, AND ONLY FLEXPAY'S ─────────────────────────────────────
+  //
+  //   "FlexPay is for fixed income people. FlexDeposit is for anybody. Two
+  //    different requirements for two different products."
+  //
+  // Until now this refused everyone who was not an SSDI/SSI recipient, which
+  // is where the two products had been conflated: FlexPay fronts the
+  // landlord's rent and is gated on verified fixed income, while FlexDeposit
+  // floats nothing — the resident funds their own deposit in two or four
+  // pulls off their own verified bank. There is no exposure to tier for, so
+  // there is nothing for an income test to decide.
+  //
+  // Found live: the resident who signed MH 28 on 10/28 could not have been
+  // offered it, on a $450 deposit this product exists for.
+  //
+  // What still gates it is unchanged and is about the MONEY, not the person:
+  // a bank link begun, an approved background check, the landlord
+  // established, capacity, and the signing window below.
 
-  if (!t.ach_verified) blockers.push('ach_unverified')
+  // ── 10/28 (Nic): ENROLLMENT LEADS INTO THE BANK FLOW, NOT BLOCKED BY IT ──
+  //
+  //   "Let's enroll and see the terms with the bank still pending, because they
+  //    should be able to be like, hey, I'm interested in signing up. Okay, add
+  //    your bank account and go into the bank account flow."
+  //
+  // Verification is microdeposits only and takes days, so an unverified bank
+  // used to mean the resident saw NOTHING — the tile would not even open, let
+  // alone show them their schedule, their two-or-four choice and their fee.
+  // Nothing in the money path ever read this flag: installments resolve a
+  // payment method at pull time and mark the row missed when there is none.
+  //
+  // Safe only because the recording now follows real money (10/28): the
+  // landlord's books take the deposit when the first installment SETTLES, so
+  // enrolling on a bank that never verifies records no funded deposit and
+  // leaves the deposit simply owed, like any other unpaid one.
+  //
+  // Somebody who has not STARTED a bank link is still refused — there is
+  // nothing in flight to wait for. The signing-day gate further down is
+  // untouched: it already reads bank_pending_since and is the thing that keeps
+  // this from becoming an open-ended window.
+  if (!t.ach_verified && !t.bank_pending) blockers.push('no_bank_started')
+
+  // ── 10/29 (Nic): FLEXDEPOSIT IS NOT GATED BY STATE ──────────────────────
+  //
+  //   "no we are not blocking by state. let her use flex deposit"
+  //
+  // Raised and decided the same day. Enrollment force-sets held_by =
+  // 'gam_escrow' regardless of the S604 custody rules, and that stands as
+  // written: FlexDeposit does not consult state_deposit_custody_rules, and a
+  // resident in a state recorded `blocked` enrolls like anyone else. The first
+  // real case was MH 28 at Country Acres - Mattoon — Illinois, recorded
+  // blocked with reason `vehicle_unconfirmed` (765 ILCS 745/18 wants a
+  // federally insured depository and no commingling with the park owner's
+  // assets; Illinois qualifies with a segregated account, which is a banking
+  // decision, not a code one).
+  //
+  // This is the standing platform rule applied to GAM's own side: GAM
+  // accommodates and does not block ([[gam-never-gate-on-legality]]). A gate
+  // was added here earlier today and taken straight back out on his
+  // instruction — do NOT re-add one. If the custody vehicle changes, the
+  // rules table is where that gets recorded, not an eligibility blocker.
+  //
+  // What this does NOT touch: leaseFeesSync's gate, which decides who HOLDS an
+  // ordinary deposit (landlord vs gam_escrow). That is routing, not a refusal,
+  // and no one asked for it to change.
 
   // 10/26: the ceiling. Checked here so a tenant who cannot be taken on is
   // told before they fill anything in, rather than at the first pull.
@@ -456,10 +677,37 @@ export async function getFlexDepositEligibility(tenantId: string): Promise<FlexD
   // 10/26: price BOTH choices, so the resident chooses with the fee in front
   // of them. Priced from the table, identical for everybody at this deposit
   // size — the uniformity is the point.
+  // ── 10/27 (Nic): THE LEASE DECIDES HOW MANY SPLITS ARE ON OFFER ───────────
+  //
+  //   "month to month possibly being gated to 2 payments only and fixed term
+  //    being 2 or 4 payments ... because we can't control what lease types a
+  //    landlord offers, and we don't want the landlord to block people from
+  //    using our product."
+  //
+  // So the PRODUCT is never gated on lease type — a month-to-month resident is
+  // still offered FlexDeposit — only the number of splits is. Plus the hard
+  // one: a schedule that ends after the tenancy does is short on the day the
+  // landlord is owed the money, by arithmetic rather than by bad luck. Nothing
+  // here looked at the lease's end date until now.
+  //
+  // Both rules live in @gam/shared so this surface and the enrollment gate
+  // below cannot drift apart. Keyed to the LEASE, never to the applicant —
+  // see flexDepositPaymentChoicesForLeaseType on why that distinction matters.
+  const leaseTerms = dep ? await fetchUnfundedDeposit(tenantId) : null
+  const allowedCounts = flexDepositPaymentChoicesForLeaseType(leaseTerms?.lease_type)
+  // Kept separate from the pricing loop so an empty offer can say WHICH thing
+  // was wrong: a tenancy too short to carry any schedule is a different fact
+  // from a price table with a hole in it, and they need different answers.
+  const fittingCounts = FLEX_DEPOSIT_PAYMENT_CHOICES.filter((payments) =>
+    allowedCounts.includes(payments)
+    && (!leaseTerms || flexDepositScheduleFitsLease(
+          leaseTerms.start_date.slice(0, 10), payments, leaseTerms.lease_end)))
+  if (dep && fittingCounts.length === 0) blockers.push('lease_too_short_for_any_plan')
+
   const choices: FlexDepositEligibility['choices'] = []
   if (depositAmount !== null && depositAmount > 0) {
-    const asOf = new Date().toISOString().slice(0, 10)
-    for (const payments of FLEX_DEPOSIT_PAYMENT_CHOICES) {
+    const asOf = todayIn(null)
+    for (const payments of fittingCounts) {
       // 10/27: a deposit over the top of the grid is no longer refused — the
       // plan covers the ceiling and the rest is paid up front with payment 1.
       const { quoteFlexDepositFeeCapped } = await import('./flexFees')
@@ -621,12 +869,17 @@ export async function quoteFlexDepositServiceFee(
 interface FlexDepositDepositRow {
   id: string; total_amount: string; lease_id: string;
   start_date: string; rent_due_day: number;
+  lease_type: string | null; lease_end: string | null;
 }
 
 async function fetchUnfundedDeposit(tenantId: string): Promise<FlexDepositDepositRow | null> {
   return queryOne<FlexDepositDepositRow>(
+    // 10/27: lease_type and end_date come along because they decide how many
+    // splits this lease can carry, and whether a schedule would outlive the
+    // tenancy. Every caller that builds a schedule needs both.
     `SELECT sd.id, sd.total_amount::text, sd.lease_id,
-            l.start_date::text, l.rent_due_day
+            l.start_date::text, l.rent_due_day,
+            l.lease_type, l.end_date::text AS lease_end
        FROM security_deposits sd
        JOIN leases l ON l.id = sd.lease_id
       WHERE sd.tenant_id = $1
@@ -656,6 +909,19 @@ export async function previewFlexDepositSchedule(args: {
   }
   const dep = await fetchUnfundedDeposit(args.tenantId)
   if (!dep) return { ok: false, reason: 'No unfunded deposit on file' }
+  // 10/27: the preview must refuse what enrollment will refuse, or the resident
+  // reads and accepts an agreement for a plan they cannot actually have.
+  if (!flexDepositPaymentChoicesForLeaseType(dep.lease_type)
+        .includes(args.installmentCount as 2 | 4)) {
+    return {
+      ok: false,
+      reason: 'A month-to-month lease splits a deposit across 2 payments. Four is available on a fixed term.',
+    }
+  }
+  if (!flexDepositScheduleFitsLease(
+        dep.start_date.slice(0, 10), args.installmentCount, dep.lease_end)) {
+    return { ok: false, reason: 'This lease ends before that schedule would finish. Choose fewer payments.' }
+  }
   // 10/26: the plan's price from the table; a payment count the product does
   // not sell has none, and is refused rather than read as free.
   // 10/27 (Nic): a deposit ABOVE the top of the grid is no longer refused — the
@@ -709,6 +975,28 @@ export async function enrollFlexDeposit(args: {
   }
   if (elig.max_installments === null || args.installmentCount > elig.max_installments) {
     return { ok: false, reason: `Max allowed installments for this deposit and risk profile: ${elig.max_installments}` }
+  }
+
+  // 10/27: the lease's own two limits, enforced HERE and not only on the offer
+  // screen. getFlexDepositEligibility hides a split the lease cannot carry, but
+  // that is a read — this is the write, and a stale page or a direct POST would
+  // otherwise walk straight past it.
+  const leaseRow = await fetchUnfundedDeposit(args.tenantId)
+  if (leaseRow) {
+    const allowed = flexDepositPaymentChoicesForLeaseType(leaseRow.lease_type)
+    if (!allowed.includes(args.installmentCount as (typeof allowed)[number])) {
+      return {
+        ok: false,
+        reason: 'A month-to-month lease splits a deposit across 2 payments. Four is available on a fixed term.',
+      }
+    }
+    if (!flexDepositScheduleFitsLease(
+          leaseRow.start_date.slice(0, 10), args.installmentCount, leaseRow.lease_end)) {
+      return {
+        ok: false,
+        reason: 'This lease ends before that schedule would finish. Choose fewer payments.',
+      }
+    }
   }
 
   // Fetch the unfunded deposit row + lease start date + rent_due_day.
@@ -797,9 +1085,10 @@ export async function enrollFlexDeposit(args: {
     // rent_due_day − 5, retry pull at rent_due_day − 1, computed
     // against the cycle month each installment covers.
     for (const inst of schedule.installments) {
-      const pullDates = inst.number === 1
-        ? null
-        : computeInstallmentPullDates(schedule.startDate, inst.number, schedule.rentDueDay)
+      // 10/30 (Nic): NO PULL DATES. Installments no longer run on their own
+      // ACH schedule -- each one rides the next invoice the lease generates
+      // (jobs/invoiceGeneration), so there is no date to compute here and
+      // nothing correlates with the day the resident happened to sign up.
       await client.query(
         `INSERT INTO flex_deposit_installments
            (security_deposit_id, tenant_id, installment_number, installment_count,
@@ -808,8 +1097,8 @@ export async function enrollFlexDeposit(args: {
         [
           dep.id, args.tenantId, inst.number, args.installmentCount,
           inst.amount.toFixed(2), inst.dueDate,
-          pullDates?.primary ?? null,
-          pullDates?.retry ?? null,
+          null,
+          null,
         ],
       )
     }
@@ -843,6 +1132,148 @@ export async function enrollFlexDeposit(args: {
         schedule.serviceFee.toFixed(2),
       ],
     )
+
+    // ── 10/30 (Nic): ENROLLING AFTER THE BILL WENT OUT ──────────────────
+    //
+    // The move-in path converts the deposit line into installment 1 only when
+    // the plan already exists as the invoice is written (jobs/moveInBundle).
+    // Heather Miller was invoiced 10/28 and enrolled 10/29, so her bill kept
+    // the FULL deposit price and installment 1 was linked to nothing -- she was
+    // asked for $450 against a $112.50 installment, and because the plan looked
+    // unfunded the tenant pay-ahead banner then offered to debit the whole $450
+    // again. There was no path for "enrolled after invoicing" at all.
+    //
+    // So: adopt the deposit line that is already billed. Rewrite it to
+    // installment 1 and link installment 1 to it, write GAM's service fee as
+    // its own row off the invoice, and rebuild the bill from its own lines —
+    // exactly as the move-in path would have.
+    //
+    // Only an UNPAID line with no plan link is touched -- never a deposit that
+    // has already settled, and never one some other plan already owns.
+    const billed = await client.query<{
+      id: string; invoice_id: string | null; unit_id: string | null
+      tenant_id: string | null; landlord_id: string; due_date: string
+    }>(
+      `SELECT id, invoice_id, unit_id, tenant_id, landlord_id, due_date::text AS due_date
+         FROM payments
+        WHERE lease_id = $1 AND type = 'deposit' AND status = 'pending'
+          AND flex_deposit_security_deposit_id IS NULL
+        ORDER BY created_at
+        LIMIT 1`,
+      [dep.lease_id],
+    )
+    const billedRow = billed.rows[0]
+    if (billedRow) {
+      // 11/1 — ONE ROW EACH, HERE TOO.
+      //
+      // This used to rewrite the billed line to firstPullTotal: installment 1
+      // AND the whole service fee, in a single row typed 'deposit' and owned by
+      // the landlord. The move-in path has never done that, on purpose
+      // (jobs/moveInBundle 10/26): installment 1 is the resident's own money and
+      // comes back to them at move-out, while the fee is GAM's revenue. Folded
+      // together, the fee rides into the custody balance — so at settlement the
+      // trust liability counts $67 that is not the resident's deposit, the same
+      // $67 is booked again as GAM revenue (recordPlatformRevenue), and the
+      // landlord's "Tenant owes GAM" reads $0 because openBills derives it from
+      // revenue_owner = 'gam'. Every dollar has to be counted once.
+      await client.query(
+        `UPDATE payments
+            SET amount = $1,
+                flex_deposit_security_deposit_id = $2,
+                notes = $3
+          WHERE id = $4`,
+        [
+          schedule.firstAmount.toFixed(2),
+          dep.id,
+          'Security deposit — installment 1 of ' + args.installmentCount
+            + '. Deposit line adopted into the plan at enrollment, which came'
+            + ' after this invoice was written.',
+          billedRow.id,
+        ],
+      )
+      await client.query(
+        `UPDATE flex_deposit_installments
+            SET payment_id = $1, updated_at = NOW()
+          WHERE security_deposit_id = $2 AND installment_number = 1 AND status = 'pending'`,
+        [billedRow.id, dep.id],
+      )
+      // GAM's fee, its own row, off the landlord's invoice — the same shape the
+      // move-in bundle writes. ON CONFLICT is not available here (no unique key
+      // on this pair), so the guard is the NOT EXISTS: enrolling twice writes
+      // one fee, never two.
+      if (schedule.serviceFee > 0) {
+        await client.query(
+          `INSERT INTO payments (
+             unit_id, lease_id, tenant_id, landlord_id,
+             type, amount, status, due_date, entry_description, revenue_owner, notes,
+             flex_deposit_security_deposit_id
+           )
+           SELECT $1, $2, $3, $4, 'fee', $5, 'pending', $6::date, 'FLEXDEP', 'gam', $7, $8
+            WHERE NOT EXISTS (
+              SELECT 1 FROM payments
+               WHERE flex_deposit_security_deposit_id = $8
+                 AND type = 'fee' AND entry_description = 'FLEXDEP'
+                 AND status <> 'voided')`,
+          [
+            billedRow.unit_id, dep.lease_id, billedRow.tenant_id, billedRow.landlord_id,
+            schedule.serviceFee.toFixed(2), billedRow.due_date,
+            `FlexDeposit service fee (deposit ${dep.id})`, dep.id,
+          ],
+        )
+      }
+      if (billedRow.invoice_id) {
+        // 11/1: every subtotal, not just the total. This re-totalled
+        // total_amount alone and left subtotal_deposits at the full deposit
+        // price, so the bill's own line figures stopped adding up to it. The
+        // other four re-total sites rebuild all five (leaseEndPullBack,
+        // renewalSuccessor, registerFinalUtility, utilityPayLink); this is the
+        // same statement.
+        // Word for word the statement services/utilityPayLink retotalInvoice
+        // runs, because the differences matter and a fifth spelling of them is
+        // how they drift:
+        //   * a landlord DEPOSIT-tagged box (pet, key, cleaning) is written
+        //     type='deposit' WITH lease_fee_id (jobs/moveInBundle), and belongs
+        //     in subtotal_FEES — not in deposits;
+        //   * only money still standing counts: 'failed' and 'returned' are out;
+        //   * the TOTAL skips a work-trade-suspended line (labor pays it) while
+        //     the subtotal still shows it — what the month was worth against
+        //     what is owed;
+        //   * never touch a voided bill, and roll the status after.
+        // NOTE: four copies of this now exist (utilityPayLink, leaseEndPullBack,
+        // renewalSuccessor, registerFinalUtility) and they are NOT identical —
+        // leaseEndPullBack counts 'failed' on purpose. Worth one shared helper
+        // with the status set as its argument; not a change to make blind.
+        await client.query(
+          `WITH lines AS (
+             SELECT p.type, p.amount, p.lease_fee_id, p.work_trade_suspended_at
+               FROM payments p
+              WHERE p.invoice_id = $1
+                AND p.status IN ('pending', 'processing', 'settled', 'paid_via_deposit')),
+           t AS (
+             SELECT COALESCE(SUM(amount) FILTER (WHERE work_trade_suspended_at IS NULL AND type <> 'late_fee'), 0) AS total,
+                    COALESCE(SUM(amount) FILTER (WHERE type = 'rent'), 0) AS rent,
+                    COALESCE(SUM(amount) FILTER (WHERE type = 'fee'
+                                                 OR (type = 'deposit' AND lease_fee_id IS NOT NULL)), 0) AS fees,
+                    COALESCE(SUM(amount) FILTER (WHERE type = 'deposit' AND lease_fee_id IS NULL), 0) AS deposits,
+                    COALESCE(SUM(amount) FILTER (WHERE type = 'utility'), 0) AS utilities,
+                    COALESCE(SUM(amount) FILTER (WHERE type = 'home_payment'), 0) AS home
+               FROM lines)
+           UPDATE invoices i
+              SET total_amount = t.total, subtotal_rent = t.rent, subtotal_fees = t.fees,
+                  subtotal_deposits = t.deposits, subtotal_utilities = t.utilities,
+                  subtotal_home_payments = t.home, updated_at = NOW()
+             FROM t
+            WHERE i.id = $1 AND i.status <> 'void'
+              AND (i.total_amount, i.subtotal_rent, i.subtotal_fees, i.subtotal_deposits,
+                   i.subtotal_utilities, i.subtotal_home_payments)
+                  IS DISTINCT FROM (t.total, t.rent, t.fees, t.deposits, t.utilities, t.home)`,
+          [billedRow.invoice_id],
+        )
+        await client.query(`SELECT fn_invoice_status_rollup_single($1::uuid)`, [billedRow.invoice_id])
+      }
+      logger.info({ deposit_id: dep.id, payment_id: billedRow.id },
+        '[flexdeposit] an already-billed deposit line was adopted into the plan at enrollment')
+    }
 
     // Also flip the tenant flag so OTP and other consumers can
     // recognize FlexDeposit-active status quickly.
@@ -970,67 +1401,75 @@ export async function cancelFlexDeposit(tenantId: string): Promise<{ ok: true } 
  * held in gam_escrow throughout the lease (forced at enrollment). GAM holds
  * the partial-collected funds, marks the deposit 'funded' on the
  * landlord-visible dashboard once the total is collected, and the
- * deposit-return flow settles against collected_amount at lease-end —
- * GAM advances nothing, so there is no gap for GAM to "eat": the amount
- * available to landlord/tenant is exactly what the tenant funded into
- * custody (ToS § 9.1.3 / § 9.1.5).
+ * deposit-return flow settles against collected_amount at lease-end
+ * (ToS § 9.1.3 / § 9.1.5).
+ *
+ * 10/27 — CORRECTION. This docblock used to end "GAM advances nothing, so
+ * there is no gap for GAM to 'eat'". That is not the product. Nic:
+ *
+ *   "Any deposits we hold are absolutely going to the landlord. That is our
+ *    risk to take, and that is why we are making the money on the flex
+ *    deposit... The landlord gets what they're owed, full stop."
+ *
+ * GAM still advances nothing AT MOVE-IN — that part was right, and it is what
+ * keeps this custody rather than credit. But at LEASE END, if the landlord's
+ * deductions reach into the part the resident never funded, GAM pays the
+ * difference in cash and never pursues the resident for it
+ * (services/depositReturn.ts, flexDepositShortfall). The resident's own
+ * refund absorbs the gap first, because a deposit refund is computed against
+ * what is actually held (§ 8(ii)) — so the money GAM finds is only ever what
+ * the deductions reach past that.
  *
  * Returns null stripeTransferId always (no transfer fires under custody).
  */
-export async function settleFlexDepositMoveIn(args: {
+/**
+ * LINK installment 1 to the payment that will fund it — and settle nothing.
+ *
+ * 10/28 (Nic): "We would only record the deposit as paid in full when they make
+ * their first installment on it... On our books, they still owe. On the
+ * landlord's books, it's paid in full. But they only get that when the first
+ * payment happens."
+ *
+ * This used to be settleFlexDepositMoveIn, and it flipped installment 1 to
+ * 'settled', raised collected_amount, moved the deposit to partial/funded and
+ * booked GAM's whole service fee — all at LEASE FINALIZE, against a payments
+ * row inserted seconds earlier as 'pending' with no PaymentIntent. No cash was
+ * involved anywhere in it. With enrollment now allowed while a bank is still
+ * verifying, that would have recorded a funded deposit for residents who never
+ * paid a cent.
+ *
+ * So installment 1 is now funded the way 2..N always were: the payment row
+ * carries the link, and whatever settles it — the ACH pull, a card, or cash at
+ * the front desk — runs reconcileSettledFlexDepositPayment, which settles the
+ * installment, raises the counters and books the fee. One path, one set of
+ * rules, and the money has to exist.
+ */
+export async function linkFlexDepositMoveInPayment(args: {
   tenantId:                 string
   securityDepositId:        string
   movInPaymentId:           string
-}): Promise<{ stripeTransferId: string | null }> {
-  const installment = await queryOne<{
-    id: string; amount: string; installment_count: number;
-  }>(
-    `SELECT id, amount::text, installment_count
-       FROM flex_deposit_installments
-      WHERE security_deposit_id = $1 AND installment_number = 1
-      LIMIT 1`,
-    [args.securityDepositId],
+}): Promise<{ linked: boolean }> {
+  const linked = await query<{ id: string }>(
+    `UPDATE flex_deposit_installments
+        SET payment_id = $1, updated_at = NOW()
+      WHERE security_deposit_id = $2 AND installment_number = 1
+        AND status = 'pending' AND payment_id IS DISTINCT FROM $1
+      RETURNING id`,
+    [args.movInPaymentId, args.securityDepositId],
   )
-  if (!installment) {
-    throw new Error('No installment 1 row for FlexDeposit settlement')
+  if (!linked.length) {
+    // Either already linked to this payment (a re-run) or installment 1 is no
+    // longer pending (already funded). Both are fine; neither is a settle.
+    const exists = await queryOne<{ id: string }>(
+      `SELECT id FROM flex_deposit_installments
+        WHERE security_deposit_id = $1 AND installment_number = 1 LIMIT 1`,
+      [args.securityDepositId])
+    if (!exists) throw new Error('No installment 1 row for FlexDeposit move-in')
   }
-
-  const firstAmount = Number(installment.amount)
-
-  const client = await getClient()
-  try {
-    await client.query('BEGIN')
-    await client.query(
-      `UPDATE flex_deposit_installments
-          SET status = 'settled', payment_id = $1, settled_at = NOW(), updated_at = NOW()
-        WHERE id = $2`,
-      [args.movInPaymentId, installment.id],
-    )
-    await client.query(
-      `UPDATE security_deposits
-          SET installments_paid     = installments_paid + 1,
-              installments_remaining = GREATEST(installments_remaining - 1, 0),
-              collected_amount      = LEAST(collected_amount + $1, total_amount),
-              status                = CASE
-                                        WHEN collected_amount + $1 >= total_amount THEN 'funded'
-                                        ELSE 'partial'
-                                      END,
-              updated_at            = NOW()
-        WHERE id = $2`,
-      [firstAmount.toFixed(2), args.securityDepositId],
-    )
-    await client.query('COMMIT')
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw e
-  } finally {
-    client.release()
-  }
-
-  return { stripeTransferId: null }
+  return { linked: linked.length > 0 }
 }
 
-// ── Installment cron (installments 2..N) ─────────────────────────
+// ── Installments 2..N (billed on invoices; see jobs/invoiceGeneration) ────────
 
 export interface InstallmentDueResult {
   candidates_scanned: number
@@ -1039,157 +1478,100 @@ export interface InstallmentDueResult {
 }
 
 /**
- * Daily cron — walks pending installment rows ready for an ACH pull.
+ * ── 10/27 (Nic): A NEW BANK OR CARD RESTARTS A STUCK SCHEDULE ───────────────
  *
- * Pull schedule: each installment has TWO pull attempts:
- *   - primary at rent_due_day − 5 (fires when attempt_count = 0)
- *   - retry   at rent_due_day − 1 (fires when attempt_count = 1
- *                                  AND primary failed; if primary
- *                                  succeeded, status flipped to
- *                                  'settled' and retry is skipped)
+ *   "the other way is an automatic payment when payment method is changed at
+ *    all. new bank or new debit card. it rides the invoice so the tenant
+ *    cannot pay the landlord without paying us. for partial payments we
+ *    recoup first."
  *
- * On retry failure (attempt_count = 2) the webhook NSF handler marks the
- * installment 'missed'. There is NO acceleration and no plan-level default
- * (ToS § 9.1.5): the deposit is simply under-funded by that installment,
- * and the custody balance keeps funding from later installments + GAM-First
- * routing. See handleFlexDepositPaymentNsf.
+ * The riding-the-invoice half has worked since S261 (services/supersedence.ts:
+ * a missed installment is satisfied GAM-first out of any payment the resident
+ * makes, oldest first, and a plan never leaves 'active' except by completing).
+ * This is the other half: the usual reason an installment goes 'missed' is that
+ * the bank it was pulling from stopped working, and the daily cron never looks
+ * at a missed row again — only 'pending' ones with a pull date. So the schedule
+ * sits stuck on a dead account even after the resident fixes the account.
  *
- * One PaymentIntent per pull (platform charge, gross to GAM platform
- * balance — the deposit lives entirely in gam_escrow; no Connect Transfer
- * fires under the custody model).
+ * WHAT THIS DELIBERATELY IS NOT. It does not charge anything. It re-arms the
+ * row — back to 'pending', attempt count zero, pull date today — so the next
+ * run of the ordinary installment cron pulls it on the method that now works.
+ * One charge path, already tested, with its own locks and idempotency; a second
+ * one fired straight from a webhook would be a new way to take money and a new
+ * way to take it twice.
+ *
+ * It is also not a new authorisation. The resident authorised this schedule at
+ * enrollment and still owes these installments toward their own deposit; what
+ * changed is only which account the agreed pull reaches. `defaulted_at` and
+ * `default_reason` are LEFT IN PLACE, so the history still says the pull failed
+ * and why — re-arming is not the same as pretending it never happened.
+ *
+ * Returns how many rows were re-armed, for the log.
  */
-export async function processFlexDepositInstallmentDue(now: Date = new Date()): Promise<InstallmentDueResult> {
-  const out: InstallmentDueResult = { candidates_scanned: 0, pulls_initiated: 0, errors: 0 }
-  if (!await isFlexDepositVisible()) return out
-
-  // S654: pull dates sit on the tenant's lease, so "due today" is asked on the
-  // property's calendar. UTC turns over at 5 pm in Phoenix, which pulled a day
-  // early and stamped the payment with tomorrow's date.
-  const rows = await query<{
-    installment_id:    string
-    security_deposit_id: string
-    tenant_id:         string
-    amount:            string
-    landlord_id:       string
-    lease_id:          string
-    unit_id:           string
-    stripe_customer_id: string | null
-    attempt_count:     number
-    pull_kind:         'primary' | 'retry'
-    timezone:          string
-  }>(
-    `SELECT i.id AS installment_id, i.security_deposit_id, i.tenant_id,
-            i.amount::text, i.attempt_count,
-            l.landlord_id, l.id AS lease_id, l.unit_id,
-            t.stripe_customer_id,
-            CASE WHEN i.attempt_count = 0 THEN 'primary' ELSE 'retry' END AS pull_kind,
-            p.timezone
-       FROM flex_deposit_installments i
-       JOIN security_deposits sd ON sd.id = i.security_deposit_id
-       JOIN leases l ON l.id = sd.lease_id
-       JOIN units u ON u.id = l.unit_id
+export async function rearmMissedFlexDepositInstallments(tenantId: string): Promise<number> {
+  if (!await isFlexDepositVisible()) return 0
+  const rows = await query<{ id: string }>(
+    `UPDATE flex_deposit_installments i
+        SET status            = 'pending',
+            attempt_count     = 0,
+            -- 10/30 (Nic): no pull dates. Nothing debits a bank on a schedule
+            -- of its own any more -- re-armed back to 'pending' is all it takes,
+            -- because the next invoice this lease generates picks up any
+            -- installment that is not settled and not already sitting on a live
+            -- bill (jobs/invoiceGeneration).
+            primary_pull_date = NULL,
+            retry_pull_date   = NULL,
+            updated_at        = NOW()
+       FROM security_deposits sd
+       JOIN leases l     ON l.id = sd.lease_id
+       JOIN units u      ON u.id = l.unit_id
        JOIN properties p ON p.id = u.property_id
-       JOIN tenants t ON t.id = i.tenant_id
-      WHERE i.status = 'pending'
+      WHERE i.security_deposit_id = sd.id
+        AND i.tenant_id = $1
+        AND i.status = 'missed'
         AND i.installment_number > 1
         AND sd.flex_deposit_plan_status = 'active'
-        AND (
-          (i.attempt_count = 0 AND i.primary_pull_date IS NOT NULL
-             AND i.primary_pull_date <= ($1::timestamptz AT TIME ZONE p.timezone)::date)
-          OR
-          (i.attempt_count = 1 AND i.retry_pull_date   IS NOT NULL
-             AND i.retry_pull_date   <= ($1::timestamptz AT TIME ZONE p.timezone)::date)
-        )`,
-    [now],
+        AND sd.voided_at IS NULL
+        AND sd.status <> 'voided'
+        -- Nothing to collect on a deposit already fully funded, however it got
+        -- there (GAM-first routing may have satisfied this very installment).
+        AND COALESCE(sd.collected_amount, 0) < sd.total_amount
+      RETURNING i.id`,
+    [tenantId],
   )
-  out.candidates_scanned = rows.length
-
-  const stripe = getStripe()
-  for (const r of rows) {
-    try {
-      const today = dateIn(r.timezone, now)
-      if (!r.stripe_customer_id) {
-        await markInstallmentMissed(r.installment_id, r.security_deposit_id, r.tenant_id, 'no_stripe_customer')
-        out.errors += 1
-        continue
-      }
-
-      // Resolve tenant's default payment method (same as FlexPay).
-      let paymentMethodId: string | null = null
-      try {
-        const cust = await stripe.customers.retrieve(r.stripe_customer_id)
-        if (cust && !(cust as any).deleted) {
-          const c = cust as any
-          paymentMethodId = c.invoice_settings?.default_payment_method ?? c.default_source ?? null
-        }
-      } catch {}
-      if (!paymentMethodId) {
-        await markInstallmentMissed(r.installment_id, r.security_deposit_id, r.tenant_id, 'no_default_payment_method')
-        out.errors += 1
-        continue
-      }
-
-      const baseAmount = Number(r.amount)
-      // S261: supersedence boost — pull older outstanding GAM debt on
-      // top of the installment amount. Distributed FIFO on webhook
-      // settle by applyTenantSupersedence. Excludes this installment
-      // itself (status='pending', so it's not in the outstanding list).
-      const boost = await computeTenantGamOutstandingTotal(r.tenant_id)
-      // S527: retry pulls carry the bounced primary attempt's Stripe
-      // ACH-return fee, passed through at cost (ToS § 9.1.4). The
-      // installment amount itself stays fixed — only the pass-through
-      // rides on top. Primary pulls carry nothing extra.
-      const returnFee = r.pull_kind === 'retry' ? ACH_RETURN_FEE : 0
-      const amount = Math.round((baseAmount + returnFee + boost) * 100) / 100
-      const intent = await createRentPlatformCharge({
-        amount,
-        stripeCustomerId:    r.stripe_customer_id,
-        paymentMethodId,
-        paymentMethodTypes:  ['us_bank_account'],
-        entryDescription:    'DEPOSIT',
-        metadata: {
-          gam_purpose:        'flexdeposit_installment',
-          gam_installment_id: r.installment_id,
-          gam_deposit_id:     r.security_deposit_id,
-          gam_tenant_id:      r.tenant_id,
-          ...(returnFee > 0 ? { gam_ach_return_fee: String(returnFee) } : {}),
-        },
-      })
-
-      const pay = await queryOne<{ id: string }>(
-        `INSERT INTO payments (
-           landlord_id, tenant_id, lease_id, unit_id,
-           type, amount, status, entry_description,
-           due_date, stripe_payment_intent_id, notes,
-           gam_supersedence_amount
-         ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', 'DEPOSIT', $6, $7, $8, $9)
-         RETURNING id`,
-        [
-          r.landlord_id, r.tenant_id, r.lease_id, r.unit_id,
-          amount.toFixed(2), today, intent.id,
-          `FlexDeposit installment ${r.pull_kind} pull (deposit ${r.security_deposit_id})` +
-            (returnFee > 0 ? ` + ACH-return $${returnFee.toFixed(2)}` : ''),
-          boost.toFixed(2),
-        ],
-      )
-      // Stamp latest payment id + bump attempt_count. attempt_count
-      // goes 0→1 on primary fire, 1→2 on retry fire.
-      await query(
-        `UPDATE flex_deposit_installments
-            SET payment_id    = $1,
-                attempted_at  = NOW(),
-                attempt_count = attempt_count + 1,
-                updated_at    = NOW()
-          WHERE id = $2`,
-        [pay!.id, r.installment_id],
-      )
-      out.pulls_initiated += 1
-    } catch (e: any) {
-      logger.error({ err: e, ctx: r.installment_id }, '[flexdeposit][installment-pull]')
-      out.errors += 1
-    }
+  if (rows.length > 0) {
+    logger.info({ tenant_id: tenantId, rearmed: rows.length },
+      '[flexdeposit] a working payment method restarted a stuck installment schedule')
   }
-  return out
+  return rows.length
+}
+
+/**
+ * @deprecated 10/30 (Nic): DEAD AS A PULL. FlexDeposit installments no longer
+ * run on an ACH schedule of their own.
+ *
+ *   "It needs to ride the next invoice."
+ *
+ * Installments 2..N are billed as a line on the next invoice the lease
+ * generates (jobs/invoiceGeneration) and are collected by whatever pays that
+ * bill -- the same path as rent, utilities and propane. Installment 1 rides the
+ * move-in invoice.
+ *
+ * Why it ever pulled on its own: the dates were computed from the ENROLLMENT
+ * month, five days ahead of a due date with no relation to the lease or the
+ * landlord's billing day. A resident who signed up on the 20th drew a bank pull
+ * on the 26th forever, and it debited a month they had already been invoiced
+ * for. Heather Miller's plan found it on 10/29 -- an unauthorized $450 debit
+ * that had to be cancelled at Stripe before it settled.
+ *
+ * Kept as a no-op instead of deleted on purpose: a stale scheduler entry, an
+ * operator script or an older deploy must not be able to start debiting banks
+ * again. It scans nothing and charges nobody.
+ */
+export async function processFlexDepositInstallmentDue(
+  _now: Date = new Date(),
+): Promise<InstallmentDueResult> {
+  return { candidates_scanned: 0, pulls_initiated: 0, errors: 0 }
 }
 
 // Mark an installment 'missed'. Under the custody model (ToS § 9.1.5) this
@@ -1340,6 +1722,40 @@ export async function reconcileSettledFlexDepositPayment(
             WHERE id = $2`,
           [Number(inst.amount).toFixed(2), inst.security_deposit_id],
         )
+        // ── 10/28: GAM'S FEE BOOKS WITH THE FIRST INSTALLMENT THAT LANDS ────
+        //
+        // The whole service fee rides the first pull, so this is the moment the
+        // money is actually GAM's. It used to be booked by the move-in settle,
+        // at lease finalize, against a payment nobody had made — so a resident
+        // who never funded a cent still produced revenue on GAM's book. Now it
+        // books here, on real money, with the installment it rode in on.
+        //
+        // At the figure STAMPED ON THE PLAN, never re-quoted from the schedule:
+        // a re-price tomorrow must not restate what this resident was sold
+        // today (the trap that silently under-booked FlexPay when its grid
+        // moved off the flat $25).
+        //
+        // In this transaction, on this client: the fee and the installment are
+        // one event. recordPlatformRevenue swallows its own write failures by
+        // design, so it cannot roll a settled installment back.
+        if (inst.installment_number === 1) {
+          const feeRow = await client.query<{ fee: string | null; property_id: string | null }>(
+            `SELECT sd.flex_deposit_service_fee::text AS fee, u.property_id
+               FROM security_deposits sd JOIN units u ON u.id = sd.unit_id
+              WHERE sd.id = $1`, [inst.security_deposit_id])
+          const fee = Number(feeRow.rows[0]?.fee ?? 0)
+          if (fee > 0) {
+            const { recordPlatformRevenue } = await import('./platformRevenue')
+            await recordPlatformRevenue({
+              type:          'flexdeposit_fee',
+              amount:        fee,
+              referenceId:   inst.security_deposit_id,
+              referenceType: 'flexdeposit_plan',
+              propertyId:    feeRow.rows[0]?.property_id ?? null,
+              notes:         'FlexDeposit service fee — collected with installment 1',
+            }, client)
+          }
+        }
         await client.query('COMMIT')
       } catch (e) {
         await client.query('ROLLBACK').catch(() => {})
@@ -1465,15 +1881,45 @@ export async function payAheadFlexDeposit(args: {
 
   // Sum unfunded (pending + missed) installments. This is the amount the
   // tenant has yet to fund into their own custody balance — not a debt to GAM.
+  //
+  // 11/1 — AN INSTALLMENT ALREADY ASKED FOR IS NOT UNFUNDED.
+  //
+  // An installment stays 'pending' until its own pull settles, so status alone
+  // cannot tell "nobody has asked for this yet" from "it is on a bill the
+  // resident has already paid". MH 28 is the case: installment 1 was billed on
+  // her move-in invoice and her ACH for it was clearing, yet it still counted
+  // here, so her lease page offered to debit the whole $450 — charging that
+  // $112.50 a second time. An installment whose payment row is pending,
+  // processing or settled has been asked for; only the rest is fundable.
   const balanceRow = await queryOne<{ remaining: string }>(
-    `SELECT COALESCE(SUM(amount), 0)::text AS remaining
-       FROM flex_deposit_installments
-      WHERE security_deposit_id = $1
-        AND status IN ('pending', 'missed')`,
+    `SELECT COALESCE(SUM(i.amount), 0)::text AS remaining
+       FROM flex_deposit_installments i
+      WHERE i.security_deposit_id = $1
+        AND i.status IN ('pending', 'missed')
+        AND NOT EXISTS (
+          SELECT 1 FROM payments p
+           WHERE p.id = i.payment_id
+             AND p.status IN ('pending', 'processing', 'settled'))`,
     [dep.id],
   )
   const remaining = Number(balanceRow?.remaining ?? 0)
   if (remaining <= 0) return { ok: false, reason: 'Deposit is already fully funded' }
+
+  // 11/1 — ONE PAY-AHEAD AT A TIME.
+  //
+  // The route takes an empty body, so a double tap, a retried request or a
+  // second tab reached this twice and each pass created its own live ACH debit
+  // for the same money. The in-flight row is the lock: while one pull is still
+  // out, there is nothing to ask for again.
+  const inFlight = await queryOne<{ id: string }>(
+    `SELECT id FROM payments
+      WHERE flex_deposit_security_deposit_id = $1
+        AND notes LIKE 'FlexDeposit voluntary pay-ahead%'
+        AND status IN ('pending', 'processing')
+      LIMIT 1`,
+    [dep.id],
+  )
+  if (inFlight) return { ok: false, reason: 'A pay-ahead payment is already clearing' }
   if (!dep.stripe_customer_id) return { ok: false, reason: 'No Stripe customer on tenant' }
 
   const stripe = getStripe()
@@ -1500,6 +1946,11 @@ export async function payAheadFlexDeposit(args: {
         gam_deposit_id: dep.id,
         gam_tenant_id:  args.tenantId,
       },
+      // 11/1: a lost reply must not pull the bank twice. Keyed on the deposit
+      // and the amount asked for, so a retry of the SAME request returns
+      // Stripe's existing intent, while a genuinely later pay-ahead for a
+      // different remaining balance is its own charge.
+      idempotencyKey: `flexdeposit_payahead_${dep.id}_${remaining.toFixed(2)}`,
     })
 
     // S654: the payment is dated on the property's calendar, not UTC's.
@@ -1508,13 +1959,15 @@ export async function payAheadFlexDeposit(args: {
       `INSERT INTO payments (
          landlord_id, tenant_id, lease_id, unit_id,
          type, amount, status, entry_description,
-         due_date, stripe_payment_intent_id, notes
-       ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', 'DEPOSIT', $6, $7, $8)
+         due_date, stripe_payment_intent_id, notes,
+         flex_deposit_security_deposit_id
+       ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', 'DEPOSIT', $6, $7, $8, $9)
        RETURNING id`,
       [
         dep.landlord_id, args.tenantId, dep.lease_id, dep.unit_id,
         remaining.toFixed(2), today, intent.id,
         `FlexDeposit voluntary pay-ahead (deposit ${dep.id})`,
+        dep.id,
       ],
     )
     paymentId = pay?.id ?? null
@@ -1750,9 +2203,11 @@ export async function electFlexDepositTopUp(
     await client.query(
       `INSERT INTO payments (
          unit_id, lease_id, tenant_id, landlord_id,
-         type, amount, status, due_date, entry_description, revenue_owner, notes
-       ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', CURRENT_DATE, 'FLEXDEP', 'gam', $6)`,
-      [info.unit_id, info.lease_id, info.tenant_id, info.landlord_id, amount.toFixed(2), note])
+         type, amount, status, due_date, entry_description, revenue_owner, notes,
+         flex_deposit_security_deposit_id
+       ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', CURRENT_DATE, 'FLEXDEP', 'gam', $6, $7)`,
+      [info.unit_id, info.lease_id, info.tenant_id, info.landlord_id, amount.toFixed(2), note,
+       args.depositId])
   }
 
   if (args.route === 'in_full') {
@@ -1761,12 +2216,14 @@ export async function electFlexDepositTopUp(
     await client.query(
       `INSERT INTO payments (
          unit_id, lease_id, tenant_id, landlord_id,
-         type, amount, status, due_date, entry_description, notes
-       ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', CURRENT_DATE, 'DEPOSIT', $6)`,
+         type, amount, status, due_date, entry_description, notes,
+         flex_deposit_security_deposit_id
+       ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', CURRENT_DATE, 'DEPOSIT', $6, $7)`,
       [
         info.unit_id, info.lease_id, info.tenant_id, info.landlord_id,
         quote.topUpAmount.toFixed(2),
         `FlexDeposit top-up, paid in full (deposit ${args.depositId})`,
+        args.depositId,
       ])
     await feeRow(quote.payInFull.fee,
       `FlexDeposit move — top-up recorded at once (deposit ${args.depositId})`)
@@ -1794,7 +2251,7 @@ export async function electFlexDepositTopUp(
   const grandTotal = maxNum + payments
   for (let i = 1; i <= payments; i++) {
     const inst = schedule.installments[i - 1]
-    const pulls = computeInstallmentPullDates(startDate, i, info.rent_due_day)
+    // 10/30 (Nic): no pull dates -- a top-up installment rides an invoice too.
     await client.query(
       `INSERT INTO flex_deposit_installments
          (security_deposit_id, tenant_id, installment_number, installment_count,
@@ -1802,7 +2259,7 @@ export async function electFlexDepositTopUp(
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')`,
       [
         args.depositId, info.tenant_id, maxNum + i, grandTotal,
-        inst.amount.toFixed(2), inst.dueDate, pulls.primary, pulls.retry,
+        inst.amount.toFixed(2), inst.dueDate, null, null,
       ])
   }
   await feeRow(chosen.fee, `FlexDeposit top-up split into ${payments} (deposit ${args.depositId})`)
@@ -1840,31 +2297,3 @@ function addMonths(isoDate: string, months: number): string {
   return date.toISOString().slice(0, 10)
 }
 
-/**
- * S260: compute the (primary_pull_date, retry_pull_date) for a
- * FlexDeposit installment N >= 2. Each installment covers the rent
- * cycle that lands N-1 months after move-in. Primary pull fires 5 days
- * before that cycle's rent_due_date; retry fires 1 day before. Both
- * clamped to month-length when rent_due_day exceeds the cycle month's
- * days (e.g., rent_due_day=31 in February → 28/29 → primary=23/24).
- */
-function computeInstallmentPullDates(
-  startDate: string,
-  installmentNumber: number,
-  rentDueDay: number,
-): { primary: string; retry: string } {
-  const [sy, sm] = startDate.split('-').map(Number)
-  // Installment N covers the cycle (N-1) months after the move-in month.
-  const cycleMonth = sm - 1 + (installmentNumber - 1)
-  const cycleYear = sy
-  // Clamp rent_due_day to the cycle month's actual days.
-  const lastDayOfCycle = new Date(Date.UTC(cycleYear, cycleMonth + 1, 0)).getUTCDate()
-  const clampedDueDay = Math.min(rentDueDay, lastDayOfCycle)
-  const rentDue = new Date(Date.UTC(cycleYear, cycleMonth, clampedDueDay))
-  const primary = new Date(rentDue.getTime() - 5 * 86_400_000)
-  const retry   = new Date(rentDue.getTime() - 1 * 86_400_000)
-  return {
-    primary: primary.toISOString().slice(0, 10),
-    retry:   retry.toISOString().slice(0, 10),
-  }
-}

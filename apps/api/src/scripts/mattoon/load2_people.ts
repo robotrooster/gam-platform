@@ -23,19 +23,19 @@ const LANDLORD = 'e8904104-ab16-4d02-b6f8-cac88d738aae'
 
 /** Households where more than one person has their own mailbox. */
 const EXTRA_EMAILS: Record<string, string[]> = {
-  '30': ['Jeffbowman1971sr@gmail.com'],   // Kim + Jeff Bowman
+  '30': ['linneamerriweather1971sr@gmail.com'],   // Kim + Linnea Merriweather
 }
 
 /**
  * Whose mailbox it actually is, where the sheet's name order does not say.
  *
- * Lot 1 reads "John Sheptock / Nancy Sheptock" against one address. The account
+ * Lot 1 reads "Opal Prescott / Nancy Prescott" against one address. The account
  * created in error during setup was NANCY's, which is the evidence for whose
- * mailbox the5ways2005@ is — so she holds the account and signs, and John is
+ * mailbox the5ways2005@ is — so she holds the account and signs, and Opal is
  * the occupant. (Nic: "Nancy needs to be on the lot one lease.")
  */
 const PRIMARY_NAME: Record<string, string> = {
-  '1': 'Nancy Sheptock',
+  '1': 'Nancy Prescott',
 }
 
 function splitNames(s: string): string[] {
@@ -64,7 +64,7 @@ async function main() {
     const phones = splitPhones(r.phone)
     // The sheet puts several addresses in one cell for some lots, and
     // EXTRA_EMAILS names the ones typed elsewhere. Dedupe: lot 30 carries both
-    // Bowman addresses in the cell AND in the map, and creating Jeff twice
+    // Merriweather addresses in the cell AND in the map, and creating Linnea twice
     // would collide on the unique index.
     const emails = [...new Set([r.email, ...(EXTRA_EMAILS[r.lot] ?? [])]
       .flatMap((e: string | null) => (e ?? '').split(/\n/))
@@ -96,7 +96,7 @@ async function main() {
     `SELECT email FROM users WHERE lower(email) = ANY($1::text[])`, [allEmails])
   // An address already on GAM belongs to a real person and is never touched.
   // Lot 1's mailbox is one: the5ways2005@yahoo.com already exists as NANCY
-  // Sheptock with role 'landlord' — created the day the property was set up,
+  // Prescott with role 'landlord' — created the day the property was set up,
   // never logged in, owning nothing. That is almost certainly a mis-click
   // during setup, but changing somebody's account role unattended is not a
   // call to make at 4am, so the household is left out and flagged instead.

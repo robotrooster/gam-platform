@@ -10,9 +10,10 @@ import '@fontsource/dm-sans/600.css'
 import '@fontsource/dm-mono/400.css'
 import '@fontsource/dm-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
+import { PasskeySignIn, PasskeySettings } from '../../../packages/shared-ui/Passkeys'
 import React, { useState, useCallback, useContext } from 'react'
 import ReactDOM from 'react-dom/client'
-import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import axios from 'axios'
 import { applyCamelizeInterceptor, humanize } from '@gam/shared'
@@ -35,6 +36,19 @@ applyCamelizeInterceptor(api)
 const get = <T,>(url: string) => api.get<{success:boolean;data:T}>(url).then(r=>r.data.data)
 const post = <T,>(url: string, body?: any) => api.post<{success:boolean;data:T;message?:string}>(url,body).then(r=>r.data)
 
+// 10/30 (Nic): "a passkey replaces the emailed code." The shared component
+// speaks this console's own client — post hands back the whole envelope and the
+// component wants the payload, and nothing here had needed a DELETE.
+// 10/31: this console names its gold button `bp`, not `btn-primary` (its
+// stylesheet was cloned from admin's, which predates the long names), so it has
+// to say so or the one control the feature IS paints no background at all.
+const passkeyApi = {
+  get:  (url: string) => get<any>(url),
+  post: (url: string, body?: any) => post<any>(url, body).then(r => r.data),
+  del:  (url: string) => api.delete(url).then(r => r.data),
+}
+const PASSKEY_CLASSES = { button: 'bp btn', buttonSmall: 'bp btn bsm', buttonGhost: 'bg btn bsm' }
+
 interface AuthUser { id:string; email:string; role:string; firstName:string; lastName:string; totpEnabled?:boolean; mustEnrollTotp?:boolean }
 // S289: login() returns a discriminated result so LoginPage can branch
 // into the TOTP second step when the backend gates on 2FA.
@@ -46,6 +60,10 @@ interface AuthCtx {
   loginWithTotp:(totpSession:string,code:string)=>Promise<void>
   loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>
   resendEmailOtp:(emailOtpSession:string)=>Promise<void>
+  // 10/30 (Nic): "a passkey replaces the emailed code." The server has already
+  // verified the device and minted a FULL pass, so there is no second step to
+  // pivot into — this just stores what came back.
+  loginWithPasskey:(session:{token:string;user?:any})=>Promise<void>
   refresh:()=>Promise<void>
   logout:()=>void
 }
@@ -55,7 +73,17 @@ const useAuth = () => useContext(Ctx)
 function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser|null>(null)
   const [loading, setLoading] = useState(true)
-  const logout = useCallback(() => { localStorage.removeItem(TOKEN); delete api.defaults.headers.common['Authorization']; setUser(null) }, [])
+
+  // S639 SECURITY, 10/31: a change of identity empties the client cache. Every
+  // other portal got this when Maren Pemberton signed in on a browser where
+  // somebody else was signed in and landed in THEIR profile — the token swapped
+  // correctly and react-query kept serving the previous person's responses under
+  // the same keys. This console was the one that never got it, and two support
+  // staff sharing a desk is its normal case. Called wherever the person changes.
+  const _qc = useQueryClient()
+  const wipeCache = () => { try { _qc.clear() } catch { /* no cache yet */ } }
+
+  const logout = useCallback(() => { wipeCache(); localStorage.removeItem(TOKEN); delete api.defaults.headers.common['Authorization']; setUser(null) }, [])
 
   // S655: a sign-in here ends 7 days after it started, even mid-task, unless
   // "Keep me signed in on this device" was ticked. sessionRenewalDue() says no
@@ -115,6 +143,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     const { token: tk, user: u } = data
     if (!u || (u.role !== 'admin' && u.role !== 'super_admin' && u.role !== 'portfolio_manager')) throw new Error('Admin access required')
+    wipeCache()
     localStorage.setItem(TOKEN, tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
     setUser({ id:u.id, email:u.email, role:u.role, firstName:u.firstName||'', lastName:u.lastName||'', totpEnabled:!!u.totpEnabled, mustEnrollTotp:!!u.mustEnrollTotp })
@@ -128,6 +157,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     const res = await axios.post(`${API}/api/auth/totp/verify`, { totpSession, code })
     const { token: tk, user: u } = res.data.data
     if (!u || (u.role !== 'admin' && u.role !== 'super_admin' && u.role !== 'portfolio_manager')) throw new Error('Admin access required')
+    wipeCache()
     localStorage.setItem(TOKEN, tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
     setUser({ id:u.id, email:u.email, role:u.role, firstName:'', lastName:'' })
@@ -139,6 +169,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     const res = await axios.post(`${API}/api/auth/email-otp/verify`, { emailOtpSession, code })
     const { token: tk, user: u } = res.data.data
     if (!u || (u.role !== 'admin' && u.role !== 'super_admin' && u.role !== 'portfolio_manager')) throw new Error('Admin access required')
+    wipeCache()
     localStorage.setItem(TOKEN, tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
     setUser({ id:u.id, email:u.email, role:u.role, firstName:'', lastName:'' })
@@ -148,100 +179,49 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     await axios.post(`${API}/api/auth/email-otp/resend`, { emailOtpSession })
   }
 
-  return <Ctx.Provider value={{ user, loading, login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, refresh, logout }}>{children}</Ctx.Provider>
+  // 10/30 (Nic): a passkey sign-in. routes/passkeys.ts has already checked the
+  // challenge, the origin, the relying party, the signature and the sign count,
+  // and portal 'admin_ops' refused anyone this console does not serve before any
+  // of it reached the browser — so the role check here is the belt the other two
+  // paths also wear. Stored exactly as the code step stores its pass.
+  const loginWithPasskey = async (session: { token: string; user?: any }): Promise<void> => {
+    const u = session.user
+    if (!u || (u.role !== 'admin' && u.role !== 'super_admin' && u.role !== 'portfolio_manager')) throw new Error('Admin access required')
+    wipeCache()
+    localStorage.setItem(TOKEN, session.token)
+    api.defaults.headers.common['Authorization'] = 'Bearer ' + session.token
+    setUser({ id:u.id, email:u.email, role:u.role, firstName:u.firstName||'', lastName:u.lastName||'' })
+    await refresh()
+  }
+
+  return <Ctx.Provider value={{ user, loading, login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, loginWithPasskey, refresh, logout }}>{children}</Ctx.Provider>
 }
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry:1, staleTime:30000, refetchOnWindowFocus:false } } })
 
 const fmt = (n: any) => n!=null ? new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(+n) : '—'
 
-const css = `
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg0:#080a0c;--bg1:#0d1014;--bg2:#121519;--bg3:#181c22;--bg4:#1e2330;
-  --b0:#1a1f28;--b1:#222a38;--b2:#2a3547;
-  --t0:#eef0f6;--t1:#b8c4d8;--t2:#7a8aaa;--t3:#475060;
-  --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;
-  --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace
-}
-html{-webkit-font-smoothing:antialiased;height:100%}
-body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
-h1,h2,h3{font-family:var(--font-d);color:var(--t0)}
-button{cursor:pointer;font-family:var(--font-b)}
-input,select,textarea{font-family:var(--font-b)}
-.shell{display:flex;height:100vh;overflow:hidden}
-.sidebar{width:220px;flex-shrink:0;background:var(--bg1);border-right:1px solid var(--b0);position:fixed;top:0;left:0;bottom:0;z-index:50;display:flex;flex-direction:column;overflow-y:auto}
-.main{flex:1;margin-left:220px;height:100vh;display:flex;flex-direction:column;min-width:0;overflow:hidden}
-.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40;flex-shrink:0}
-.page{flex:1;min-height:0;padding:28px;max-width:1600px;width:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:none}
-.logo{padding:18px;border-bottom:1px solid var(--b0)}
-.logo-n{font-family:var(--font-d);font-size:1rem;font-weight:800;color:var(--gold)}
-.logo-s{font-size:.65rem;color:var(--t3);margin-top:2px;text-transform:uppercase;letter-spacing:.1em}
-.nav{padding:10px;flex:1}
-.nl{font-size:.62rem;color:var(--t3);text-transform:uppercase;letter-spacing:.12em;padding:10px 8px 4px;font-weight:600}
-.ni{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:7px;color:var(--t2);font-size:.82rem;font-weight:500;transition:all .12s;width:100%;background:none;border:none;cursor:pointer;text-decoration:none}
-.ni:hover{background:var(--bg3);color:var(--t0)}
-.ni.active{background:rgba(201,162,39,.1);color:var(--gold);border:1px solid rgba(201,162,39,.2)}
-.sfooter{padding:10px;border-top:1px solid var(--b0)}
-.card{background:var(--bg2);border:1px solid var(--b1);border-radius:10px;padding:18px}
-.ct{font-size:.72rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.07em;margin-bottom:14px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
-.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-.ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding-bottom:14px;border-bottom:1px solid var(--b0);flex-wrap:wrap;gap:10px}
-.pt{font-family:var(--font-d);font-size:1.4rem;font-weight:800;color:var(--t0)}
-.ps{font-size:.78rem;color:var(--t3);margin-top:2px}
-.kpi{background:var(--bg2);border:1px solid var(--b1);border-radius:10px;padding:16px;position:relative;overflow:hidden}
-.kpi::after{content:'';position:absolute;bottom:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--gold),transparent);opacity:.4}
-.kl{font-size:.65rem;color:var(--t3);text-transform:uppercase;letter-spacing:.09em;font-weight:600;margin-bottom:6px}
-.kv{font-family:var(--font-d);font-size:1.6rem;font-weight:800;color:var(--t0);line-height:1;margin-bottom:4px}
-.ks{font-size:.7rem;color:var(--t3)}
-.kv.g{color:var(--green)}.kv.r{color:var(--red)}.kv.a{color:var(--amber)}.kv.gold{color:var(--gold)}.kv.b{color:var(--blue)}
-.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:7px;font-size:.78rem;font-weight:600;border:none;cursor:pointer;transition:all .12s;font-family:var(--font-b)}
-.b-gold{background:var(--gold);color:#080a0c}
-.b-gold:hover{filter:brightness(1.08)}
-.bp{background:var(--gold);color:#080a0c}.bp:hover{background:#d9af3a}
-.bg{background:var(--bg4);color:var(--t1);border:1px solid var(--b2)}.bg:hover{background:var(--bg3)}
-.bsm{padding:4px 9px;font-size:.72rem}
-.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:20px;font-size:.65rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
-.bg2{background:rgba(34,197,94,.08);color:var(--green);border:1px solid rgba(34,197,94,.18)}
-.ba{background:rgba(245,158,11,.08);color:var(--amber);border:1px solid rgba(245,158,11,.18)}
-.br{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.18)}
-.bgold{background:rgba(201,162,39,.08);color:var(--gold);border:1px solid rgba(201,162,39,.18)}
-.bmu{background:var(--bg4);color:var(--t3);border:1px solid var(--b1)}
-.bb{background:rgba(59,130,246,.08);color:var(--blue);border:1px solid rgba(59,130,246,.18)}
-.tbl{width:100%;border-collapse:collapse;font-size:.78rem}
-.tbl th{background:var(--bg3);color:var(--t3);font-size:.64rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;padding:9px 12px;text-align:left;border-bottom:1px solid var(--b1)}
-.tbl td{padding:9px 12px;border-bottom:1px solid var(--b0);color:var(--t1)}
-.tbl tr:last-child td{border-bottom:none}
-.tbl tr:hover td{background:rgba(255,255,255,.012)}
-.mono{font-family:var(--font-m);font-size:.8rem}
-.alert{display:flex;align-items:flex-start;gap:10px;padding:10px 14px;border-radius:8px;font-size:.78rem;margin-bottom:14px}
-.ae{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.18);color:#fca5a5}
-.aw{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.18);color:#fcd34d}
-.ag{background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.18);color:#86efac}
-.agold{background:rgba(201,162,39,.08);border:1px solid rgba(201,162,39,.18);color:var(--gold)}
-.empty{text-align:center;padding:48px 20px;color:var(--t3)}
-.loading{display:flex;align-items:center;justify-content:center;height:100vh;font-family:var(--font-d);font-size:1.1rem;color:var(--t3)}
-.spinner{width:16px;height:16px;border:2px solid var(--b2);border-top-color:var(--gold);border-radius:50%;animation:spin .6s linear infinite}
-.dr{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--b0);font-size:.78rem}
-.dr:last-child{border-bottom:none}
-.dk{color:var(--t3)}.dv{color:var(--t0);font-weight:500}
-.tabs{display:flex;gap:2px;border-bottom:1px solid var(--b0);margin-bottom:20px}
-.tab{padding:9px 14px;background:none;border:none;color:var(--t3);font-size:.78rem;font-weight:600;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .12s;font-family:var(--font-b)}
-.tab:hover{color:var(--t1)}.tab.on{color:var(--gold);border-bottom-color:var(--gold)}
-.search-input{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:7px;color:var(--t0);padding:7px 10px;font-size:.78rem;outline:none}
-.search-input:focus{border-color:var(--gold)}
-@keyframes spin{to{transform:rotate(360deg)}}
-@media(max-width:900px){.grid2,.grid3,.grid4{grid-template-columns:1fr}}
-`
+// 10/31: the stylesheet moved out of a JS template literal into a real file,
+// for the same reason admin's did — the phone rules in it carry backticks in
+// their comments, and every one would have closed the literal early.
+import { installTableStacking } from '@gam/shared'
+import './styles/globals.css'
 
 function Layout() {
   const { user, logout } = useAuth()
   const navigate = useNavigate()
+  // 10/31: the support console had no phone layout at all — a fixed 220px
+  // sidebar with the page pushed over by the same 220. Same drawer as the
+  // other portals; the shell class names are identical because this console
+  // was cloned from admin's.
+  const [navOpen, setNavOpen] = React.useState(false)
+  const navLoc = useLocation()
+  React.useEffect(() => { setNavOpen(false) }, [navLoc.pathname])
+  // Column names onto stacked cells, so a card is not a column of bare values.
+  React.useEffect(() => installTableStacking(document.body), [])
   return (
     <div className="shell">
-      <aside className="sidebar">
+      <aside className={"sidebar" + (navOpen ? " is-open" : "")}>
         <div className="logo">
           <div className="logo-n">GAM Support</div>
           <div className="logo-s">Support Console</div>
@@ -271,9 +251,13 @@ function Layout() {
           <button className="ni" onClick={()=>{logout();navigate('/login')}} style={{color:'var(--red)'}}>🚪 Sign out</button>
         </div>
       </aside>
+      {navOpen && <button className="nav-scrim" aria-label="Close menu" onClick={() => setNavOpen(false)} />}
       <div className="main">
         <header className="topbar">
-          <span style={{fontSize:'.72rem',color:'var(--t3)',fontFamily:'var(--font-m)'}}>GAM Platform — Support Console</span>
+          <button className="hamburger" onClick={() => setNavOpen(v => !v)}
+                  aria-label="Menu" aria-expanded={navOpen}
+                  style={{fontSize:'1.1rem',lineHeight:1}}>☰</button>
+          <span className="topbar-name" style={{fontSize:'.72rem',color:'var(--t3)',fontFamily:'var(--font-m)'}}>GAM Platform — Support Console</span>
         </header>
         <div className="page"><Outlet /></div>
       </div>
@@ -705,8 +689,39 @@ function Payments() {
 // S655: remembered per browser so the box starts the way it was last left.
 const KEEP_SIGNED_IN_KEY = 'gam_admin_ops_keep_signed_in'
 
+// ── THE CODE STEP MUST SURVIVE LEAVING THE PAGE (S639/S654, ported 10/30) ────
+//
+// Nic: "they go back out to get the two-factor authentication code, [and] it
+// boots them out." Nothing was ever signed in — the pending OTP session lived
+// in React state, so switching to the mail app let the phone browser discard
+// and reload the page, and it came back as the email/password form with the
+// code they are now holding useless. Every login hits this, because email 2FA
+// is on for every account.
+//
+// localStorage, not sessionStorage: sessionStorage is PER TAB, and somebody who
+// reads the code in their mail app and returns through a link lands in a NEW
+// tab with no pending session. The stored token is PRE-auth, useless without
+// the emailed code, and expires in 15 minutes — the same trust level as the
+// page holding it in memory. Cleared the moment the code is accepted.
+//
+// The tenant portal has the canonical copy of this (usePendingOtpSession in
+// apps/tenant/src/main.tsx); POS, business, admin and admin-ops never got it.
+function usePendingOtpSession(key: string): [string | null, (v: string | null) => void] {
+  const [v, setV] = useState<string | null>(() => {
+    try { return localStorage.getItem(key) ?? sessionStorage.getItem(key) } catch { return null }
+  })
+  const set = (next: string | null) => {
+    setV(next)
+    try {
+      if (next) localStorage.setItem(key, next)
+      else { localStorage.removeItem(key); sessionStorage.removeItem(key) }
+    } catch { /* private mode — behaves exactly as before */ }
+  }
+  return [v, set]
+}
+
 function LoginPage() {
-  const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp } = useAuth()
+  const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, loginWithPasskey } = useAuth()
   const [keepSignedIn, setKeepSignedIn] = useState(() => readKeepSignedInChoice(KEEP_SIGNED_IN_KEY))
   const navigate = useNavigate()
   React.useEffect(() => {
@@ -719,7 +734,7 @@ function LoginPage() {
   const [loading, setLoading] = useState(false)
   const [totpSession, setTotpSession] = useState<string|null>(null)
   // S578: universal email-2FA second step.
-  const [emailOtpSession, setEmailOtpSession] = useState<string|null>(null)
+  const [emailOtpSession, setEmailOtpSession] = usePendingOtpSession('gam.otp.adminops.login')
   const [resent, setResent] = useState(false)
   const [code, setCode] = useState('')
 
@@ -819,14 +834,20 @@ function LoginPage() {
         </div>
         <div className="card" style={{padding:24}}>
           {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
+          {/* 10/30 (Nic): Face ID alone signs you in. Renders nothing on a
+              device with no sensor, so the password form below is exactly what
+              it has always been for everybody else. keepSignedIn is the same
+              choice the password form offers, remembered the same way. */}
+          <PasskeySignIn api={passkeyApi} classes={PASSKEY_CLASSES} portal="admin_ops" keepSignedIn={keepSignedIn}
+            onSignedIn={async sess=>{ rememberKeepSignedInChoice(KEEP_SIGNED_IN_KEY, keepSignedIn); await loginWithPasskey(sess); navigate('/onboarding') }} />
           <form onSubmit={onCredentialsSubmit}>
             <div style={{marginBottom:14}}>
               <label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Email</label>
-              <input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',outline:'none'}} type="email" value={email} onChange={e=>setEmail(e.target.value)} autoFocus required/>
+              <input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',outline:'none'}} type="email" value={email} onChange={e=>setEmail(e.target.value)} autoFocus required autoComplete="username webauthn" name="email"/>
             </div>
             <div style={{marginBottom:14}}>
               <label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Password</label>
-              <input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',outline:'none'}} type="password" value={pw} onChange={e=>setPw(e.target.value)} required/>
+              <input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',outline:'none'}} type="password" value={pw} onChange={e=>setPw(e.target.value)} required autoComplete="current-password" name="password"/>
             </div>
             {/* S655: off by default. Off, this sign-in ends 7 days after it
                 starts, even mid-task; on, it stays signed in while in use. */}
@@ -1040,7 +1061,17 @@ function SecurityPage() {
 
   return (
     <div>
-      <div className="ph"><div><h1 className="pt">Security</h1><p className="ps">Two-factor authentication</p></div></div>
+      <div className="ph"><div><h1 className="pt">Security</h1><p className="ps">How you sign in to this console</p></div></div>
+
+      {/* 10/30 (Nic): "a passkey replaces the emailed code; password + code
+          stays the fallback." ONE list for the whole platform — in production
+          every portal is a subdomain of one apex, so a device added here is the
+          same device everywhere. Above the authenticator card because this is
+          the way IN; what follows it is the fallback. */}
+      <div style={{maxWidth:560,marginBottom:16}}>
+        <PasskeySettings api={passkeyApi} classes={PASSKEY_CLASSES} />
+      </div>
+
       <div className="card" style={{padding:20,maxWidth:560,marginBottom:16}}>
         <div className="ct">Two-factor authentication</div>
         <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:14}}>
@@ -1296,7 +1327,6 @@ function Root() {
   return (
     <QueryClientProvider client={qc}>
       <AuthProvider>
-        <style dangerouslySetInnerHTML={{__html:css}}/>
         <App/>
       </AuthProvider>
     </QueryClientProvider>

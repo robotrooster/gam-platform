@@ -47,11 +47,6 @@ describe('nextAccrualDate — accrualFrom modes', () => {
     expect(nextAccrualDate(DUE, GRACE, 'weekly', 2, 'due_date_inclusive')).toBe('2026-05-08')
     expect(nextAccrualDate(DUE, GRACE, 'weekly', 1, 'due_date')).toBe('2026-05-08')
   })
-
-  it('monthly retroactive anchors on the due date with last-day clamp', () => {
-    expect(nextAccrualDate('2026-01-31', 0, 'monthly', 1, 'due_date_inclusive')).toBe('2026-01-31')
-    expect(nextAccrualDate('2026-01-31', 0, 'monthly', 2, 'due_date_inclusive')).toBe('2026-02-28')
-  })
 })
 
 // 10/12 (Nic): "zero grace: NEXT DAY is late (paying on the due date is on
@@ -73,11 +68,13 @@ describe('a grace of 0: the first late day is the day after', () => {
 })
 
 describe('addAccrualPeriods', () => {
-  it('days, weeks, and months clamped from the anchor day', () => {
+  // 10/30 (Nic): no monthly cadence any more, so no month-length clamping — both
+  // cadences are plain day arithmetic and an accrual day can never drift.
+  it('days and weeks, counted off the anchor', () => {
     expect(addAccrualPeriods('2026-05-06', 'daily', 3)).toBe('2026-05-09')
     expect(addAccrualPeriods('2026-05-06', 'weekly', 2)).toBe('2026-05-20')
-    expect(addAccrualPeriods('2026-01-31', 'monthly', 1)).toBe('2026-02-28')
-    expect(addAccrualPeriods('2026-01-31', 'monthly', 2)).toBe('2026-03-31')
-    expect(addAccrualPeriods('2026-11-15', 'monthly', 3)).toBe('2027-02-15')
+    expect(addAccrualPeriods('2026-01-31', 'daily', 1)).toBe('2026-02-01')
+    expect(addAccrualPeriods('2026-01-31', 'weekly', 1)).toBe('2026-02-07')
+    expect(addAccrualPeriods('2026-12-28', 'weekly', 1)).toBe('2027-01-04')
   })
 })

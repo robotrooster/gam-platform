@@ -14,7 +14,7 @@
  *     counted ONCE (the recovery report's register sweep must not also pick the
  *     line up, or the same $44.94 reads as $89.88 recovered).
  *
- *   RUNG UP BY HAND — Andres Razo's shape, read out of production: a clerk taps
+ *   RUNG UP BY HAND — Cora Castellan's shape, read out of production: a clerk taps
  *     the "Electric (per kWh)" button at $0.21, 387 kWh, on a pay link, with no
  *     utility bill behind it at all. It still has to count as recovery, and it
  *     has to do so WITHOUT inventing a utility_bills row for a cycle nobody
@@ -90,7 +90,7 @@ async function seed(opts: { onInvoice?: boolean } = {}) {
     const unitId = await seedUnit(c, { propertyId, landlordId, unitType: 'rv_spot', rentAmount: 589 })
     // S652: display_label is what the park calls the space and what prints.
     await c.query(`UPDATE units SET display_label = 'RV 27' WHERE id = $1`, [unitId])
-    const tenantId = await seedTenant(c, { email: `razo-${Math.random().toString(36).slice(2)}@example.com` })
+    const tenantId = await seedTenant(c, { email: `castellan-${Math.random().toString(36).slice(2)}@example.com` })
     const leaseId = await seedLease(c, { unitId, landlordId, rentAmount: 589 })
     await seedLeaseTenant(c, { leaseId, tenantId })
     const meterId = await seedUtilityMeter(c, { propertyId, utilityType: 'electric' })
@@ -156,7 +156,7 @@ async function seedNeighbor(f: any): Promise<{ tenantId: string; unitId: string;
   try {
     const unitId = await seedUnit(c, { propertyId: f.propertyId, landlordId: f.landlordId, unitType: 'rv_spot', rentAmount: 589 })
     await c.query(`UPDATE units SET display_label = 'RV 10' WHERE id = $1`, [unitId])
-    const tenantId = await seedTenant(c, { email: `cardoza-${Math.random().toString(36).slice(2)}@example.com` })
+    const tenantId = await seedTenant(c, { email: `mapperley-${Math.random().toString(36).slice(2)}@example.com` })
     const leaseId = await seedLease(c, { unitId, landlordId: f.landlordId, rentAmount: 589 })
     await seedLeaseTenant(c, { leaseId, tenantId })
     const meterId = await seedUtilityMeter(c, { propertyId: f.propertyId, utilityType: 'electric' })
@@ -217,7 +217,7 @@ describe('sending a utility bill as a pay link', () => {
     const link = (await db.query<any>(`SELECT * FROM pos_pay_links WHERE id = $1`, [res.body.data.id])).rows[0]
     expect(Number(link.total)).toBe(44.94)
     expect(link.expires_at).toBeNull()          // a final bill does not die quietly
-    expect(link.customer_email).toMatch(/razo-/)
+    expect(link.customer_email).toMatch(/castellan-/)
     // THE MATCH IS CARRIED, not guessed: the line names its bill, and carries no
     // merchandising category (a bill being collected is not a catalog sale).
     expect(link.items).toHaveLength(1)
@@ -308,14 +308,14 @@ describe('a pay link\'s utility line settles the bill', () => {
     expect(lines[0]).toMatchObject({ item_category: 'misc', recovers_utility: null, swept: false })
   })
 
-  it('the Andres shape: an electric line rung up by hand with no bill behind it still counts as recovery', async () => {
+  it('the Cora shape: an electric line rung up by hand with no bill behind it still counts as recovery', async () => {
     const f = await seed()
     // 387 kWh of August power at $0.21 — exactly how $81.27 was collected from
-    // Andres Razo on a link in production, with no utility bill in existence.
+    // Cora Castellan on a link in production, with no utility bill in existence.
     const sent = await request(buildApp()).post('/api/pos/pay-links')
       .set('Authorization', `Bearer ${f.token}`)
       .send({ propertyId: f.propertyId, items: [{ id: f.electricItemId, name: 'Electric (per kWh)', cat: 'Utilities', qty: 387, price: 0.21 }],
-              customer: { name: 'Andres Razo', email: 'razoandres60@example.com' } })
+              customer: { name: 'Cora Castellan', email: 'castellancora60@example.com' } })
     expect(sent.status, JSON.stringify(sent.body)).toBe(201)
     expect(Number(sent.body.data.total)).toBe(81.27)
     const { charged } = payLinkCharge(81.27)
@@ -381,7 +381,7 @@ describe('a pay link\'s utility line settles the bill', () => {
  * nothing: the bill stayed 'billed', the charge stayed on the payer's invoice,
  * the settlement row stayed 'open' forever (so the bill could never be sent
  * again, and /cancel refuses a link that is not open), and the recovery report
- * still read the money as owed. Andres Razo's $163.17 is the live shape.
+ * still read the money as owed. Cora Castellan's $163.17 is the live shape.
  */
 describe('a utility bill settled at the counter, not online', () => {
   const settle = (f: any, body: any = {}) => request(buildApp()).post('/api/pos/transactions')
@@ -429,14 +429,14 @@ describe('a utility bill settled at the counter, not online', () => {
     expect(list.body.data).toHaveLength(0)
   })
 
-  it('the Andres shape at the counter: an electric line rung by hand counts as recovery', async () => {
+  it('the Cora shape at the counter: an electric line rung by hand counts as recovery', async () => {
     const f = await seed()
     // 387 kWh of August power at $0.21 — the link he was actually sent — paid
     // in cash at the desk instead of on the card page.
     const sent = await request(buildApp()).post('/api/pos/pay-links')
       .set('Authorization', `Bearer ${f.token}`)
       .send({ propertyId: f.propertyId, items: [{ id: f.electricItemId, name: 'Electric (per kWh)', cat: 'Utilities', qty: 387, price: 0.21 }],
-              customer: { name: 'Andres Razo', email: 'razoandres60@example.com' } })
+              customer: { name: 'Cora Castellan', email: 'castellancora60@example.com' } })
     expect(sent.status, JSON.stringify(sent.body)).toBe(201)
 
     const res = await settle(f, { payLinkId: sent.body.data.id })
@@ -610,11 +610,11 @@ describe('a refund undoes the recovery', () => {
   // September, $752.17 in lines. If the desk hands back the $589 because the
   // stay was cancelled, every cent of the $163.17 of power is still here — and
   // the sale's other line is exactly why a part refund proves nothing about it.
-  it('the Andres shape: refunding the rent off a mixed link leaves all the power counted as recovered', async () => {
+  it('the Cora shape: refunding the rent off a mixed link leaves all the power counted as recovered', async () => {
     const f = await seed()
     const sent = await request(buildApp()).post('/api/pos/pay-links')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ propertyId: f.propertyId, customer: { name: 'Andres Razo', email: 'razoandres60@example.com' },
+      .send({ propertyId: f.propertyId, customer: { name: 'Cora Castellan', email: 'castellancora60@example.com' },
               items: [
                 { id: null, name: 'RV site — monthly', cat: 'Stays', qty: 1, price: 589 },
                 { id: f.electricItemId, name: 'Electric (per kWh)', cat: 'Utilities', qty: 387, price: 0.21 },
@@ -717,11 +717,11 @@ describe('the migration is expand-only and re-runnable', () => {
  * recovered.
  *
  * So two households' bills on ONE link is one household paying off the other's
- * debt without knowing it. Send Andres his $81.27 of power and Victor's $63.40
- * on the same link, and when Andres pays $144.67: Victor's utility charge is
+ * debt without knowing it. Send Cora his $81.27 of power and Horatio's $63.40
+ * on the same link, and when Cora pays $144.67: Horatio's utility charge is
  * voided off his bill as though he had paid it, his invoice is retotaled down,
  * his bill reads paid, and the $63.40 is recorded as money given back. GAM has
- * lost both the right to ask Victor for it and any sign it was ever owed — and
+ * lost both the right to ask Horatio for it and any sign it was ever owed — and
  * the void is the same void every honest collection writes, so nothing
  * downstream can tell them apart afterwards.
  *
@@ -732,9 +732,9 @@ describe('the migration is expand-only and re-runnable', () => {
 describe('one link is one person\'s bill', () => {
   it('refuses two people\'s bills on one link, and sends each of them their own', async () => {
     const f = await seed({ onInvoice: true })
-    await nameResident(f.tenantId, 'Andres', 'Razo')
+    await nameResident(f.tenantId, 'Cora', 'Castellan')
     const n = await seedNeighbor(f)
-    await nameResident(n.tenantId, 'Victor', 'Cardoza')
+    await nameResident(n.tenantId, 'Horatio', 'Mapperley')
 
     // Both on the sendable list — one property, so one list, which is exactly
     // how a clerk comes to pick across two households.
@@ -747,8 +747,8 @@ describe('one link is one person\'s bill', () => {
     // Plain words that name both people and both bills, and a next step the
     // clerk has on the screen they are looking at.
     expect(both.body.error).toMatch(/not all one person's/i)
-    expect(both.body.error).toContain('Andres Razo')
-    expect(both.body.error).toContain('Victor Cardoza')
+    expect(both.body.error).toContain('Cora Castellan')
+    expect(both.body.error).toContain('Horatio Mapperley')
     expect(both.body.error).toContain('(RV 27)')
     expect(both.body.error).toContain('(RV 10)')
     expect(both.body.error).toMatch(/nothing was sent/i)
@@ -773,9 +773,9 @@ describe('one link is one person\'s bill', () => {
       [[his.body.data.id, hers.body.data.id]])
     expect(named.rows.find((r: any) => r.id === his.body.data.id).tenant_id).toBe(f.tenantId)
     expect(named.rows.find((r: any) => r.id === hers.body.data.id).tenant_id).toBe(n.tenantId)
-    expect(named.rows.find((r: any) => r.id === hers.body.data.id).customer_email).toMatch(/cardoza-/)
+    expect(named.rows.find((r: any) => r.id === hers.body.data.id).customer_email).toMatch(/mapperley-/)
 
-    // AND THE MONEY STAYS WHERE IT BELONGS. Andres pays his; Victor's bill is
+    // AND THE MONEY STAYS WHERE IT BELONGS. Cora pays his; Horatio's bill is
     // as owed as it ever was — the charge still on his invoice, unvoided, at
     // its full figure.
     const { charged } = payLinkCharge(44.94)
@@ -788,7 +788,7 @@ describe('one link is one person\'s bill', () => {
     expect(victorsCharge.void_reason).toBeNull()
     expect(Number((await db.query<any>(
       `SELECT total_amount FROM invoices WHERE id = $1`, [n.invoiceId])).rows[0].total_amount)).toBe(63.40)
-    // Nothing recorded Victor's $63.40 as recovered.
+    // Nothing recorded Horatio's $63.40 as recovered.
     expect((await db.query<any>(
       `SELECT 1 FROM utility_pay_link_settlements WHERE utility_bill_id = $1 AND status = 'settled'`,
       [n.billId])).rows).toHaveLength(0)
@@ -799,7 +799,7 @@ describe('one link is one person\'s bill', () => {
     // tenancy rows — a resident who rents two spaces in the same park gets one
     // link for both, the way they get one balance.
     const f = await seed({ onInvoice: true })
-    await nameResident(f.tenantId, 'Andres', 'Razo')
+    await nameResident(f.tenantId, 'Cora', 'Castellan')
     const n = await seedNeighbor(f)
     // The second space is the SAME person's: one user, two tenancies.
     await db.query(`UPDATE tenants SET user_id = (SELECT user_id FROM tenants WHERE id = $2) WHERE id = $1`,

@@ -30,7 +30,7 @@
  * properties (getScopedPropertyIds). Sums across households (`totals`) ride
  * only for a viewer seesGrandTotals admits (decisions #25).
  *
- * 10/14 (Nic), about Lisa Scheeler, Mountain View's on-site manager ("View who
+ * 10/14 (Nic), about Calla Fitzhugh, Mountain View's on-site manager ("View who
  * owes", "Take payments", not "View all payments"): "they should see at least
  * the payments tab on the financials tab ... kind of the same way that I see
  * it, but not with that top view. Like it should just have the header that
@@ -149,6 +149,9 @@ import {
   type RentRollMonthCount, type RentRollMovedOutOwing, type RentRollHistory, type RentRollRowStatus, type UnitStatus,
   type OpenMonthStay, type BookingStatus, type OpenMonthOtherMoney, type OpenMonthSalePart, type RentRollStayLine, type RentRollStayUnit,
   type RentRollStayVia, UTILITY_TYPE_LABEL, type UtilityType, type OpenMonthMovedOut,
+  // 11/4: GAM's one charge order, so the Payments page reads a bill the same
+  // way the money is allocated instead of alphabetically.
+  ALLOCATION_TYPE_ORDER,
 } from '@gam/shared'
 import {
   householdMonths, householdLines, paymentHealth, addMonths, monthsBetween, leaseOfRowSql, householdOfRowSql,
@@ -158,8 +161,8 @@ import { listPaymentsByMonth, type LedgerPayment } from './paymentsByMonth'
 import { openBalanceSql, WORK_TRADE_MARKER_LABEL } from './openBalances'
 import { bankPayableRowSql, allocationOrderSql } from './moneyPredicates'
 import { reservationDue, soldCheckOutSql } from './registerStay'
-import { todayIn } from '../lib/timezone'
 import { HIDDEN_HISTORY, type PropertyCutoff } from '../lib/bookkeeperScope'
+import { todayIn } from '../lib/timezone'
 
 const cents = (v: number | string | null | undefined) => Math.round(Number(v ?? 0) * 100)
 const dollars = (c: number) => Math.round(c) / 100
@@ -659,7 +662,7 @@ export function unitInName(name: string | null | undefined): string | null {
 }
 
 /**
- * 10/13 (Nic): "When Andres Razo paid by card online for his stay ... it
+ * 10/13 (Nic): "When Cora Castellan paid by card online for his stay ... it
  * looks like that charge is just for electric. It's not ... It's not got a
  * good breakdown between what's a billback on the electricity and what is
  * not." The breakdown of a sale's money that came in (`shareC`, cents): each
@@ -781,7 +784,7 @@ export function splitRegisterMoney(sales: readonly RegisterSale[]): {
 // ─── A space a sale names (10/13, Nic) ───────────────────────────────────────
 //
 //   "Pay links / register sales that name a space go ON that space's row."
-//   (Andres Razo's $752.17 pay link — "Electric (per kWh) — September, RV 27"
+//   (Cora Castellan's $752.17 pay link — "Electric (per kWh) — September, RV 27"
 //   — is RV 27's.) "only money with no space stays in the folder."
 //
 // A register sale or a pay link names a space when its words — an item's name,
@@ -1488,14 +1491,39 @@ export async function buildOpenMonth(opts: {
     const m = b.month
     const money = m ? sumMonths([m]) : { ...zeroTotals(), clearing: 0 }
     const payments = b.spaceOnly ? [] : (paymentsOf.get(b.key) ?? [])
-    // By due date, late fees last, by what it is for; two lines for the same
-    // thing (a bill paid in part) the paid part first, then what is still
-    // owed — one order every time, never the database's.
+    // ── 11/4 (Nic): ONE ORDER, AND RENT FIRST ────────────────────────────
+    //
+    //   "GAM shows Nathan September rent as 50 dollars. Something about the
+    //    layout is off even if final number reconciled."
+    //
+    // This comparator is the Payments page's own, and it threw away the order
+    // the reader gives it (householdLines ORDER BY). Two faults:
+    //
+    //   · `label.localeCompare` sorted ALPHABETICALLY, so "Electric" printed
+    //     above "Rent" — the rent is not even the first line of the month on
+    //     the screen a landlord opens to read the month;
+    //   · the paid half of a bill paid in part came before the rest only via
+    //     `owed > 0`, which is equal the moment BOTH halves are paid — October
+    //     on MH 29 exactly — and then it fell through to a raw uuid.
+    //
+    // Now: due date, late fees last, then GAM's own charge order (shared
+    // ALLOCATION_TYPE_ORDER — rent, utility, late fee, fee, home payment, so
+    // every surface agrees and the bill reads the way the money is allocated),
+    // then the slice that was paid before the rest of it (is_remainder), then
+    // the name, and a deterministic id last so a tie is never the database's
+    // choice (S639: a tie is not an order).
+    const typeRank = (t: string) => {
+      const i = (ALLOCATION_TYPE_ORDER as readonly string[]).indexOf(t)
+      return i === -1 ? ALLOCATION_TYPE_ORDER.length : i
+    }
     const charges = [...b.charges].sort((a, z) => a.due_date.localeCompare(z.due_date)
-      || Number(a.is_late_fee) - Number(z.is_late_fee) || a.label.localeCompare(z.label)
-      || Number(cents(a.owed) > 0) - Number(cents(z.owed) > 0) || a.payment_id.localeCompare(z.payment_id))
+      || Number(a.is_late_fee) - Number(z.is_late_fee)
+      || typeRank(a.type) - typeRank(z.type)
+      || Number(a.is_remainder) - Number(z.is_remainder)
+      || a.label.localeCompare(z.label)
+      || a.payment_id.localeCompare(z.payment_id))
     const base = charges.filter(l => BASE_TYPES.has(l.type))
-    // 10/26 (Nic, Lisa Scheeler MH 01): the date on the pill is the oldest due
+    // 10/26 (Nic, Calla Fitzhugh MH 01): the date on the pill is the oldest due
     // date of what is OWED, never of a charge that is settled or suspended.
     //
     // Her space rent is due the 1st and her trailer payment the 10th. The rent

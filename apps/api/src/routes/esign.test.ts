@@ -247,7 +247,7 @@ async function seedDoc(f: SeedFixture, opts: {
   return { documentId, landlordSignerId: ls.rows[0].id, tenantSignerId: ts.rows[0].id }
 }
 
-// ─── S652 (Blu, MH 18): the landlord's typed sale terms are read at submit ──
+// ─── S652 (Hollis, MH 18): the landlord's typed sale terms are read at submit ──
 //
 // The submit route's field query did not select lease_column, so the
 // installment-contract pre-check saw no tagged boxes and rejected every
@@ -1853,7 +1853,7 @@ describe('POST /sign/:documentId — completion handler (original_lease)', () =>
     expect(r.alreadyBuilt).toBe(true)
   })
 
-  // S652 (Blu, MH 06): a packet's disclosures are drafted beside the lease before
+  // S652 (Hollis, MH 06): a packet's disclosures are drafted beside the lease before
   // the lease exists. Signing one first must not raise "Addendum has no parent
   // lease_id" — it waits; and once the packet's lease has issued, a sibling
   // binds to it on its own.
@@ -3940,7 +3940,7 @@ describe('POST /documents/addendum-terms — S582 money add-on', () => {
     const signers = await db.query<{ role: string; order_index: number }>(
       `SELECT role, order_index FROM lease_document_signers WHERE document_id = $1 ORDER BY order_index, role`, [docId])
     expect(signers.rows.map(r => r.role).sort()).toEqual(['co_tenant_1', 'landlord', 'primary'])
-    // S652 (Blu): every signer sat at position 1 and the send step refused the
+    // S652 (Hollis): every signer sat at position 1 and the send step refused the
     // document. Landlord first, tenants after, like every other drafting path.
     expect(signers.rows.map(r => `${r.role}:${r.order_index}`)).toEqual(['landlord:1', 'primary:2', 'co_tenant_1:3'])
     const sent = await request(buildApp())
@@ -4166,7 +4166,7 @@ describe('S637 — GET /esign/sign/:id rejects a malformed id cleanly', () => {
 // S636 seeded the unit's rent onto a new document (Nic wanted a per-unit rent
 // arrangement to reach the paper). The same loop also seeded the unit's
 // SECURITY DEPOSIT — and every Oak Park space carries a standing $350 for new
-// residents. Cameron Gaefcke signed an onboarding lease that papers a tenancy
+// residents. Lane Lowrance signed an onboarding lease that papers a tenancy
 // already in place and was billed $350 he never owed; the fifteen residents who
 // signed before the change were billed nothing, because nothing prefilled the
 // box. ~50 more onboarding invites were outstanding when it was caught.
@@ -4363,9 +4363,9 @@ describe('the lease adopts a home sale that predates it', () => {
 /**
  * S652 — the adults who do not sign are still on the lease.
  *
- * Nic, catching the same omission a second time: "you didn't add john as
+ * Nic, catching the same omission a second time: "you didn't add opal as
  * authorized occupant. why?" Because the packet was built from SIGNERS, and
- * John Sheptock has no email so he is not one.
+ * Opal Prescott has no email so he is not one.
  *
  * The occupant box was filled from the signer roster and sat ABOVE the caller's
  * own value in the precedence chain, so a caller who knew the household — the
@@ -4392,8 +4392,8 @@ describe('S652: the occupant box names the whole household', () => {
         title: 'Lease', basePdfUrl: null, documentType: 'original_lease',
         targetLeaseTenantId: null, promoteLeaseTenantId: null,
         signers: [
-          { userId: f.landlordUserId, role: 'landlord', name: 'Blu Haws', email: 'll@test.dev', orderIndex: 1 },
-          { userId: f.tenantUserId, role: 'primary', name: 'Nancy Sheptock', email: f.tenantEmail, orderIndex: 2 },
+          { userId: f.landlordUserId, role: 'landlord', name: 'Hollis Harkness', email: 'll@test.dev', orderIndex: 1 },
+          { userId: f.tenantUserId, role: 'primary', name: 'Nancy Prescott', email: f.tenantEmail, orderIndex: 2 },
         ],
         ...(occupantNames ? { prefillValues: { occupant_names: occupantNames } } : {}),
       } as any)
@@ -4414,26 +4414,26 @@ describe('S652: the occupant box names the whole household', () => {
 
   it('keeps a named adult who has no account, alongside the signer', async () => {
     const f = await seedFixture()
-    const id = await docWithOccupantField(f, 'John Sheptock')
+    const id = await docWithOccupantField(f, 'Opal Prescott')
     const value = await occupantValue(id)
     // The form asks who lives here. The answer is everybody.
-    expect(value).toMatch(/Nancy Sheptock/)
-    expect(value).toMatch(/John Sheptock/)
+    expect(value).toMatch(/Nancy Prescott/)
+    expect(value).toMatch(/Opal Prescott/)
   })
 
   it('does not print the same person twice', async () => {
     const f = await seedFixture()
     // A household sheet naming somebody who is already a signer, in other case.
-    const id = await docWithOccupantField(f, 'nancy sheptock, John Sheptock')
+    const id = await docWithOccupantField(f, 'nancy prescott, Opal Prescott')
     const value = (await occupantValue(id)).toLowerCase()
-    expect((value.match(/nancy sheptock/g) || []).length).toBe(1)
-    expect(value).toMatch(/john sheptock/)
+    expect((value.match(/nancy prescott/g) || []).length).toBe(1)
+    expect(value).toMatch(/opal prescott/)
   })
 
   it('still names the roster when the caller says nothing', async () => {
     const f = await seedFixture()
     const id = await docWithOccupantField(f)
-    expect(await occupantValue(id)).toMatch(/Nancy Sheptock/)
+    expect(await occupantValue(id)).toMatch(/Nancy Prescott/)
   })
 })
 

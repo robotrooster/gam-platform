@@ -117,7 +117,16 @@ export async function projectHomeSale(client: PoolClient, contractId: string): P
   const method = requireHomeSaleMethod(co)
   const d = { propertyId: c.property_id, unitId: c.unit_id, leaseId: c.lease_id, tenantId: c.tenant_id }
   const out: DesiredPosting[] = []
-  const pre = preBooks(c, co.booksStart)
+  // 11/3 — THE CONTRACT'S OWN PROPERTY decides whether this sale is before the
+  // books start, because that is the property whose books it belongs to. This
+  // test is the exact complement of the one projectOpening (b) makes: get them
+  // out of step and a sale is either opened AND posted, or neither. A contract
+  // with no property answers to the company's earliest, as it always did.
+  const saleStart = c.property_id
+    ? (await client.query<{ d: string | null }>(
+        `SELECT books_start_date::text AS d FROM properties WHERE id = $1`, [c.property_id])).rows[0]?.d ?? null
+    : co.booksStart
+  const pre = preBooks(c, saleStart)
 
   if (!pre) {
     const L = new Lines()
@@ -197,8 +206,18 @@ async function categoryOpensToEquity(client: PoolClient, cache: Map<string, bool
   return out
 }
 
-/** (a): every posting the registered projectors want dated before the start, netted. */
-async function nettedBeforeStart(client: PoolClient, landlordId: string, start: string): Promise<Map<string, NetLine>> {
+/**
+ * (a): every posting the registered projectors want dated before the start,
+ * netted.
+ *
+ * 11/3 — `propertyId` is the slice being opened: that property's lines, or
+ * (null) the lines that name no property at all, which are the company's own.
+ * `start` is that same slice's books start day, so a property bought later
+ * nets its own history against its own day and never against its sibling's.
+ */
+async function nettedBeforeStart(
+  client: PoolClient, landlordId: string, start: string, propertyId: string | null,
+): Promise<Map<string, NetLine>> {
   const net = new Map<string, NetLine>()
   const owner: LedgerOwner = { landlordId }
   // 10/12 (Nic, ledger P7): a line that names its account itself (a
@@ -238,6 +257,11 @@ async function nettedBeforeStart(client: PoolClient, landlordId: string, start: 
           for (const id of unknown) toEquity.set(id, eq.has(id))
         }
         for (const l of p.lines) {
+          // Only this slice. A posting may carry lines for a property whose
+          // books began earlier and lines for one that has not started: each
+          // belongs to its own opening, so the other slice is skipped here and
+          // picked up when that property's opening is projected.
+          if ((l.propertyId ?? null) !== propertyId) continue
           if (!l.role && l.accountId && toEquity.get(l.accountId)) continue
           if (l.role === 'home_notes_receivable') continue
           // 10/12 review (ledger P6): a category's line posts to the account
@@ -275,15 +299,47 @@ async function nettedBeforeStart(client: PoolClient, landlordId: string, start: 
   return net
 }
 
-export async function projectOpening(client: PoolClient, landlordId: string): Promise<DesiredPosting[]> {
-  if (!isUuid(landlordId)) return []
+/**
+ * 11/3 — ONE OPENING PER PROPERTY, plus one for the company's own.
+ *
+ * Nic, 11/2: "my books for that property are going to start from when I bought
+ * that property... It's a completely separate business revenue stream." A
+ * single company-wide opening cannot say that: it would sit on one date and
+ * fold a property's pre-purchase history into its sibling's equity.
+ *
+ * `sourceId` is therefore `landlordId|propertyId` for a property's opening, or
+ * the bare `landlordId` for the company's — the lines that name no property at
+ * all, which is where a bank balance lives, because a bank account cannot be
+ * split between properties. That split is what makes the "stale item" test
+ * below come out right with no special case: a bank item belongs to the
+ * company's opening, whose day IS the company's earliest, which is exactly the
+ * day a bank balance has to be stated as of.
+ */
+export async function projectOpening(client: PoolClient, sourceId: string): Promise<DesiredPosting[]> {
+  const bar = sourceId.indexOf('|')
+  const landlordId = bar === -1 ? sourceId : sourceId.slice(0, bar)
+  const propertyId = bar === -1 ? null : sourceId.slice(bar + 1)
+  // Never `return []` on something unparseable: an opening that returns no
+  // lines SUPERSEDES the one on the books, so a typo would quietly take the
+  // balance sheet's opening away. A malformed id is a bug and says so.
+  if (!isUuid(landlordId) || (propertyId !== null && !isUuid(propertyId))) {
+    throw new LedgerSourceError('projector_error',
+      `An opening's source id is a company id, or a company id and a property id joined by "|" — got "${sourceId}".`)
+  }
   const co: CompanyBooks = await loadCompanyBooks(client, landlordId)
-  if (!co.booksStart) return []
-  const start = co.booksStart
+  const start = propertyId === null
+    ? co.booksStart
+    : (await client.query<{ d: string | null }>(
+        `SELECT books_start_date::text AS d FROM properties WHERE id = $1 AND landlord_id = $2`,
+        [propertyId, landlordId])).rows[0]?.d ?? null
+  // Not picked yet (or a property of another company): nothing to open. This
+  // is the one empty answer that is correct, because there is genuinely no
+  // opening balance for books that have not begun.
+  if (!start) return []
   const L = new Lines()
 
   // (a) what the history before the start leaves on the balance sheet.
-  for (const e of [...(await nettedBeforeStart(client, landlordId, start)).values()]) {
+  for (const e of [...(await nettedBeforeStart(client, landlordId, start, propertyId)).values()]) {
     const t = e.template
     const dims = {
       propertyId: t.propertyId ?? null, unitId: t.unitId ?? null, leaseId: t.leaseId ?? null, tenantId: t.tenantId ?? null,
@@ -297,6 +353,10 @@ export async function projectOpening(client: PoolClient, landlordId: string): Pr
   // (b) home-sale notes owed on the start date (whole sale at signing only).
   const contracts = (await client.query<Contract>(
     `${CONTRACT_SQL} WHERE c.landlord_id = $1 AND c.activated_at IS NOT NULL`, [landlordId])).rows
+    // 11/3: this slice's contracts only, measured against this slice's day —
+    // the exact complement of the test projectHomeSale makes, so a sale is
+    // either opened here or posted there and never both or neither.
+    .filter(c => (c.property_id ?? null) === propertyId)
     .filter(c => preBooks(c, start) && !(c.cancelled_day && c.cancelled_day < start))
   if (contracts.length) {
     const method = requireHomeSaleMethod(co)
@@ -321,7 +381,12 @@ export async function projectOpening(client: PoolClient, landlordId: string): Pr
             o.bank_connection_id, o.account_id
        FROM books_opening_items o
       WHERE o.landlord_id = $1 AND o.voided_at IS NULL
-      ORDER BY o.entered_at, o.id`, [landlordId])).rows
+        -- 11/3: this slice's items. $2 NULL takes the ones that name no
+        -- property, which is every bank balance and any account balance
+        -- entered for the company rather than a property.
+        AND COALESCE(o.property_id, (SELECT u.property_id FROM leases l JOIN units u ON u.id = l.unit_id WHERE l.id = o.lease_id))
+            IS NOT DISTINCT FROM $2::uuid
+      ORDER BY o.entered_at, o.id`, [landlordId, propertyId])).rows
   // 10/12 (Nic, ledger review): an item entered for a different start date
   // (the owner moved the start after entering it — the page marks it "stale",
   // services/booksSettings) is not this start date's balance: a bank balance
@@ -331,7 +396,8 @@ export async function projectOpening(client: PoolClient, landlordId: string): Pr
   const stale = items.filter(i => i.as_of !== start || (i.kind === 'deposit_held' && !!i.paid_on && i.paid_on > start))
   if (stale.length) {
     throw new LedgerSourceError('owner_not_ready',
-      `Waiting on the owner: ${stale.length} opening balance(s) on the Opening balances step were entered for a different books start date than ${start}. Enter them again for the start date, or void them.`)
+      `Waiting on the owner: ${stale.length} opening balance(s) on the Opening balances step were entered for a different books start date than ${start}. Enter them again for the start date, or void them.`,
+      'opening_balances_stale')
   }
   const signs = await openingAccountSigns(client, items.filter(i => i.kind === 'other' && i.account_id).map(i => i.account_id!))
   for (const i of items) {
@@ -372,8 +438,19 @@ export const openingProjector: LedgerProjector = {
   project: (client, sourceId) => projectOpening(client, sourceId),
   async listSources(client, owner: LedgerOwner): Promise<LedgerSourceRef[]> {
     if (!owner.landlordId) return []
-    const r = await client.query<{ d: string | null }>(`SELECT books_start_date::text AS d FROM landlords WHERE id = $1`, [owner.landlordId])
-    const d = r.rows[0]?.d
-    return d ? [{ id: owner.landlordId, day: d }] : []
+    // 11/3: one source per property that has picked a day, plus the company's
+    // own (its earliest) for the lines that name no property. A rebuild walks
+    // the list, so a property missing from it would never have its opening
+    // rebuilt. An opening with nothing in it posts nothing, so listing the
+    // company's own when it holds no company-level balance costs one no-op.
+    const r = await client.query<{ id: string; d: string }>(
+      `SELECT l.id::text AS id, l.books_start_date::text AS d
+         FROM landlords l WHERE l.id = $1 AND l.books_start_date IS NOT NULL
+       UNION ALL
+       SELECT l.id::text || '|' || p.id::text, p.books_start_date::text
+         FROM properties p JOIN landlords l ON l.id = p.landlord_id
+        WHERE p.landlord_id = $1 AND p.books_start_date IS NOT NULL
+        ORDER BY 1`, [owner.landlordId])
+    return r.rows.map(x => ({ id: x.id, day: x.d }))
   },
 }

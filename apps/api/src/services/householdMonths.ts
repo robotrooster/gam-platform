@@ -13,7 +13,7 @@
  * tenant profile (10/13, Nic: "split health BY LEASE" — healthByLease, each
  * lease its own household), the tenant's own heartbeat and the credit history's one mark
  * per bill (services/creditBillMarks judges each bill by the same rule). Before this there were five
- * formulas and none of them measured on-time: Gerald Logue read 25% on the
+ * formulas and none of them measured on-time: Arlo Braddock read 25% on the
  * Tenants list (paid rows ÷ rows), 6% on his profile (every $5 daily late fee
  * counted as its own bill) and 0% on his own screen (a blank lease grace read
  * as 0 days).
@@ -241,6 +241,9 @@ function rowsCteSql(): string {
            ${propertyDaySql(writtenAtSql('p'), 'pr')} AS written_day,
            ${today} AS today,
            ${openBalanceSql('p')} AS is_open,
+           -- 11/4: brought in from another platform, so it is not a bill GAM
+           -- wrote and its month is not counted toward health (see the WHERE).
+           (p.import_source IS NOT NULL) AS imported,
            ${inFlightRowSql('p')} AS in_flight,
            ${workTradeOpenRowSql('p')} AS wt_open,
            (${payableRowSql('p')} AND NOT ${openBalanceSql('p')}) AS not_owed_any_more,
@@ -287,8 +290,24 @@ function rowsCteSql(): string {
        -- payment health — health starts with the first bill GAM wrote." A row
        -- brought in from another platform (import_source) is never a GAM bill:
        -- the tenant report lists it as imported history (importedHistory),
-       -- never as a month here, on the Rent Roll or on any health figure.
-       AND p.import_source IS NULL
+       -- never a month on any health figure.
+       --
+       -- 11/4: EXCEPT ONE THAT IS STILL OWED. His rule is about HEALTH, and
+       -- taking the row out of this query took it out of the money as well: MH
+       -- 29's September arrears, $169.80 the landlord really is collecting,
+       -- showed on his statement, on Outstanding and at the desk and was
+       -- invisible on the Rent Roll and the Payments page. That is the S639
+       -- complaint exactly — "on the outstanding balances tab six leases that
+       -- are all overdue, and on the payments tab it's only showing five."
+       --
+       -- So a still-owed imported charge is money here, and health is kept
+       -- clean the way his rule means it: a month whose every BASE charge is
+       -- imported is not counted (judgeMonth importedOnly). An arrears balance
+       -- is a carried_balance, which is not a base charge at all, so it moves
+       -- no stamp and no percentage either way. A settled imported row stays
+       -- out — that one is history, and importedHistory lists it, so nothing
+       -- is counted twice.
+       AND (p.import_source IS NULL OR ${openBalanceSql('p')})
        AND COALESCE(inv.due_date, p.due_date) >= $3::date
        AND COALESCE(inv.due_date, p.due_date) <  $4::date
   ),
@@ -458,6 +477,8 @@ export interface MonthAgg {
   first_paid_on: string | null; last_paid_on: string | null
   first_late_day: string | null
   onboarding: boolean; late_fee_on_bill: boolean
+  /** 11/4: every base charge of the month came in from another platform (judgeMonth importedOnly). */
+  base_all_imported: boolean
   grace: number | null
 }
 
@@ -469,6 +490,15 @@ export function judgeMonth(a: {
   chargedBaseC: number; workTradeBaseC: number; owedBaseC: number; baseInC: number
   openPastGrace: boolean; daysPastGraceOpen: number; daysPastGracePaid: number
   onboarding: boolean; lateFeeOnBill: boolean
+  /**
+   * 11/4: every base charge of this month came in from another platform, so
+   * there is no bill GAM wrote here to judge — "health starts with the first
+   * bill GAM wrote" (Nic, 10/12). The month still SHOWS its money, which is why
+   * the rows are read at all now; it is simply never one of the months the
+   * percentage divides by. Required rather than optional, so a new caller has
+   * to answer the question instead of inheriting a silent false.
+   */
+  importedOnly: boolean
 }): { stamp: PaymentStamp | null; days: number; counted: boolean; onTime: boolean; workTradeOnly: boolean; leftOutOnboarding: boolean } {
   if (a.chargedBaseC <= 0) return { stamp: null, days: 0, counted: false, onTime: false, workTradeOnly: false, leftOutOnboarding: false }
   const workTradeOnly = a.workTradeBaseC >= a.chargedBaseC
@@ -492,6 +522,9 @@ export function judgeMonth(a: {
   // 10/13 (Nic): "Keep it out, but say so" — said as left out (paymentHealth).
   const leftOutOnboarding = counted && a.onboarding && !onTime && !a.lateFeeOnBill
   if (leftOutOnboarding) counted = false
+  // 11/4: a month that is only another platform's charges is never counted,
+  // good news or bad — it is not a bill GAM wrote.
+  if (a.importedOnly) counted = false
   return { stamp, days, counted, onTime: counted && onTime, workTradeOnly, leftOutOnboarding }
 }
 
@@ -573,6 +606,9 @@ function foldAggsBy(aggs: readonly MonthAgg[], keyOf: (r: MonthAgg) => string, k
     o.first_late_day = pick(o.first_late_day, r.first_late_day, min)
     o.onboarding = o.onboarding || r.onboarding
     o.late_fee_on_bill = o.late_fee_on_bill || r.late_fee_on_bill
+    // Folded with AND: a month is only another platform's charges when EVERY
+    // part of it is — one GAM-written bill in it makes the month GAM's to judge.
+    o.base_all_imported = o.base_all_imported && r.base_all_imported
     o.grace = pick(o.grace, r.grace, Math.max)
   }
   return [...out.values()].sort((a, z) => a.month.localeCompare(z.month) || a.household_id.localeCompare(z.household_id))
@@ -603,12 +639,14 @@ async function monthAggs(scope: HouseholdMonthScope): Promise<MonthAgg[]> {
     ${closedWorkTradeCteSql()},
     parts AS (
       SELECT j.landlord_id, j.household_id, j.lease_key, j.property_id, j.property_name, j.unit_number, j.bill_due,
-             j.is_base, j.is_late_fee, j.charged, j.paid, j.clearing, j.credit, j.wt, j.owed,
+             j.is_base, j.is_late_fee, j.imported, j.charged, j.paid, j.clearing, j.credit, j.wt, j.owed,
              j.days_past_grace, j.past_grace_now, j.paid_day, j.first_late_day, j.onboarding, j.grace
         FROM judged j
       UNION ALL
       SELECT w.landlord_id, w.household_id, w.lease_key, w.property_id, w.property_name, w.unit_number, w.bill_due,
-             TRUE, FALSE, w.amount, 0, 0, 0, w.amount, 0,
+             -- is_base, is_late_fee, imported: a work-trade close is GAM's own
+             -- bill, never another platform's.
+             TRUE, FALSE, FALSE, w.amount, 0, 0, 0, w.amount, 0,
              0, FALSE, w.bill_due, NULL::date, FALSE, NULL::int
         FROM wt_closed_hh w
     )
@@ -633,6 +671,9 @@ async function monthAggs(scope: HouseholdMonthScope): Promise<MonthAgg[]> {
            to_char(MAX(x.paid_day) FILTER (WHERE x.is_base AND x.owed = 0), 'YYYY-MM-DD') AS last_paid_on,
            to_char(MIN(x.first_late_day) FILTER (WHERE x.is_base), 'YYYY-MM-DD') AS first_late_day,
            COALESCE(bool_or(x.onboarding) FILTER (WHERE x.is_base), FALSE)        AS onboarding,
+           -- 11/4: every base charge of the month came from another platform,
+           -- so there is no bill GAM wrote to judge (judgeMonth importedOnly).
+           COALESCE(bool_and(x.imported) FILTER (WHERE x.is_base), FALSE)         AS base_all_imported,
            COALESCE(bool_or(x.is_late_fee AND x.charged > 0), FALSE)              AS late_fee_on_bill,
            MAX(x.grace) FILTER (WHERE x.is_base)::int                             AS grace
       FROM parts x
@@ -651,6 +692,7 @@ function judgeAgg(r: MonthAgg): HouseholdMonth {
     baseInC: cents(r.base_in), openPastGrace: r.open_past_grace === true,
     daysPastGraceOpen: Number(r.dpg_open ?? 0), daysPastGracePaid: Number(r.dpg_paid ?? 0),
     onboarding: r.onboarding === true, lateFeeOnBill: r.late_fee_on_bill === true,
+    importedOnly: r.base_all_imported === true,
   })
   const paidInFull = cents(r.charged_base) > 0 && cents(r.owed_base) <= 0
   return {
@@ -898,6 +940,8 @@ export interface ChargeLine {
   /** The invoice it is on (late fees collapse per bill). */
   invoice_id: string | null
   is_late_fee: boolean
+  /** 11/4: the rest of a bill paid in part (payments.is_remainder). */
+  is_remainder: boolean
   /** 10/6 (Nic): logged by hand after its bill's late fee — counted as paid the day GAM recorded it. */
   logged_after_late_fee: boolean
   /** Money on it is still clearing (counted as paid: the postmark rule). */
@@ -913,7 +957,7 @@ interface LineRow {
   paid_day: string | null; days_past_grace: number; invoice_id: string | null
   manual_method: string | null; receipt_method: string | null; payment_channel: string | null
   stripe_payment_intent_id: string | null
-  logged_after_fee: boolean; clearing: string
+  logged_after_fee: boolean; clearing: string; is_remainder: boolean
 }
 
 /** Every charge line of these households in the months, newest first. */
@@ -929,9 +973,19 @@ export async function householdLines(scope: HouseholdMonthScope): Promise<Charge
            to_char(CASE WHEN j.owed = 0 THEN j.paid_day END, 'YYYY-MM-DD') AS paid_day,
            j.days_past_grace::int AS days_past_grace, j.invoice_id,
            j.manual_method, j.receipt_method, j.payment_channel, j.stripe_payment_intent_id,
-           j.logged_after_fee, j.clearing::text AS clearing
+           j.logged_after_fee, j.clearing::text AS clearing, j.is_remainder
       FROM judged j
-     ORDER BY j.bill_due DESC, j.type, j.created_at DESC, j.id`,
+     -- 11/4 (Nic): "GAM shows Nathan September rent as 50 dollars. Something
+     -- about the layout is off even if final number reconciled." A charge paid
+     -- in part becomes TWO rows — the paid slice keeps the row, the rest gets
+     -- its own (is_remainder) — and created_at DESC put the REST FIRST,
+     -- because it was written later. So MH 29's $450 rent read
+     -- "Rent $50 / Rent $400" under the month, and the first line is the one
+     -- anybody reads as the rent. The rest of a bill now sorts after the slice
+     -- it is left over from, in every month of every household, and
+     -- created_at DESC still breaks every other tie (S639: a tie is not an
+     -- order).
+     ORDER BY j.bill_due DESC, j.type, j.is_remainder ASC, j.created_at DESC, j.id`,
     rowsParams(scope))
   const out: ChargeLine[] = rows.map(r => {
     const wt = cents(r.wt), paidC = cents(r.paid), creditC = cents(r.credit)
@@ -963,6 +1017,10 @@ export async function householdLines(scope: HouseholdMonthScope): Promise<Charge
       days_past_grace: Number(r.days_past_grace) || 0,
       invoice_id: r.invoice_id,
       is_late_fee: r.type === 'late_fee',
+      // 11/4: the rest of a bill paid in part, so every screen can sort the
+      // slice that was paid before the rest (rentRoll buildOpenMonth re-sorts
+      // these lines with its own comparator and had no way to tell them apart).
+      is_remainder: r.is_remainder === true,
       logged_after_late_fee: r.logged_after_fee === true,
       clearing: dollars(cents(r.clearing)),
     }
@@ -1004,6 +1062,8 @@ export async function householdLines(scope: HouseholdMonthScope): Promise<Charge
     const amount = dollars(cents(w.amount))
     return {
       payment_id: `work-trade:${w.invoice_id}`,
+      // A month close is GAM's own line, never the rest of a part payment.
+      is_remainder: false,
       household_id: w.household_id,
       lease_id: w.lease_id ?? null,
       month: w.bill_due.slice(0, 7),
@@ -1112,6 +1172,11 @@ export async function importedHistory(scope: {
        WHERE p.landlord_id = ANY($1::uuid[])
          AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
          AND p.import_source IS NOT NULL
+         -- 11/4: a still-owed imported charge is a LINE now (the rows CTE
+         -- reads it), so listing it here too would show the same dollar twice
+         -- (every-dollar-counted-once). Only what was settled before GAM is
+         -- history.
+         AND NOT ${openBalanceSql('p')}
          AND p.status NOT IN ('voided', 'returned')
     ) x
      WHERE CASE WHEN $4::uuid[] IS NULL THEN x.household_id = ANY($3::text[]) ELSE x.lease_key = ANY($4::uuid[]) END

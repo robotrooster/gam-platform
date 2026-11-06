@@ -2,11 +2,11 @@
  * S654 — four prepaid-credit releases this morning booked a payout to the
  * landlord for money GAM never held.
  *
- * Nic: "Glenda Greek and Todd Niemeyer also paid by check… Mark Rensberger…
+ * Nic: "Birdie Calloway and Todd Niemeyer also paid by check… Mark Rensberger…
  * he's not paid with card ever. Why is that saying that that's going to be
  * dispersed to our account? That's a huge problem."
  *
- * The credits were funded by checks the landlord already has (Greek: a check
+ * The credits were funded by checks the landlord already has (Calloway: a check
  * remittance; Niemeier, Renspurger, Rader: credit entered by the landlord).
  * The release settled the October rows correctly but stamped them
  * platform_held and booked an allocation_owner_share, so Tuesday's batch would

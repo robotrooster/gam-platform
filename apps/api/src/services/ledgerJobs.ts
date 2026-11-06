@@ -68,5 +68,20 @@ export function registerLedgerJobs(): void {
     } catch (e) {
       logger.error({ err: e }, '[ledger-parity] fatal')
     }
+    // 11/1 (Nic) — AND SAY WHO IS WAITING ON AN ANSWER.
+    //
+    // Runs beside the parity check and never inside its try, because parity
+    // SKIPS a company whose books start is NULL (ledgerParity: WHERE
+    // books_start_date IS NOT NULL) — which is precisely the company that needs
+    // to be named. Country Acres was invisible to this cron for two months with
+    // 67 postings parked. Its own errors are swallowed, so a notice failing
+    // never costs the parity run.
+    try {
+      const { noticeWaitingOnOwner } = await import('./ledgerWaitingNotice')
+      const w = await noticeWaitingOnOwner()
+      if (w.raised) logger.warn(w, '[ledger-waiting] nightly notices raised')
+    } catch (e) {
+      logger.error({ err: e }, '[ledger-waiting] fatal')
+    }
   }, { timezone: 'America/Phoenix' })
 }

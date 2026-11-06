@@ -69,6 +69,7 @@ function pageHref(slug: string, page: '' | 'gallery' | 'faq' | 'book' | 'contact
 }
 
 const css = `
+:root{--vh:100vh}@supports(height:1dvh){:root{--vh:100dvh}}
 :root{
   --bg:#080a0c; --bg2:#0d1014; --bg3:#141820; --border:#1e2435;
   --t0:#f0f2f7; --t2:#aeb7cc; --t3:#8a96b0; --dim:#475060;
@@ -149,7 +150,7 @@ label.fl{display:block;font-size:.75rem;color:var(--t3);text-transform:uppercase
 .pc-in button{width:40px;flex-shrink:0;border-radius:9px;background:var(--gold);color:#14100a;border:none;cursor:pointer;font-size:1.1rem}
 .pc-in button:disabled{opacity:.4;cursor:not-allowed}
 @media(prefers-reduced-motion:reduce){.pc-typing i{animation:none;opacity:.55}}
-@media(max-width:480px){.pc-panel{width:calc(100vw - 20px);height:calc(100dvh - 30px);bottom:10px;right:10px}}
+@media(max-width:480px){.pc-panel{width:calc(100vw - 20px);height:calc(var(--vh) - 30px);bottom:10px;right:10px}}
 `
 
 interface SiteType { id: string; name: string; unitType: string; siteCount: number; nightlyRate: number | null; weeklyRate: number | null; minStayNights: number | null; maxStayNights: number | null; checkInTime: string | null; checkOutTime: string | null }
@@ -749,6 +750,15 @@ function BookedView({ slug, propertyName }: { slug: string; propertyName: string
             {info.screeningPaid != null && (
               <p className="rate" style={{ marginTop: 10 }}>
                 Your background check (<span className="price">{money(info.screeningPaid)}</span>) is paid. We’ve emailed you the link to fill it out — check-in waits until the results are back and {propertyName} has reviewed them.
+              </p>
+            )}
+            {info.idCaptureUrl && (
+              // 10/29 (Nic): "Ask for the ID during the deposit checkout that
+              // they already go through. No sign in, no flow change." This is
+              // that page — the deposit is paid, nothing was added in front of
+              // it, and the step is optional and says so.
+              <p className="rate" style={{ marginTop: 10 }}>
+                If you have a minute: <a href={info.idCaptureUrl} style={{ color: 'var(--gold)' }}>add a photo of your licence</a> so {propertyName} has it on file. It is optional.
               </p>
             )}
             <p className="rate" style={{ marginTop: 10 }}>Your exact site number is assigned and emailed to you the morning of check-in.</p>

@@ -18,7 +18,7 @@
  *      'failed' for the audit trail
  *
  * Daily cron (processAchRetries) walks payments where:
- *   status='failed' AND next_retry_at <= NOW() AND retry_count < 2
+ *   status='failed' AND next_retry_at <= NOW() AND retry_count < ACH_MAX_RETRIES
  * grouped by payment intent (S654: one bank pull, however many charge lines
  * it covered). For each, calls stripe.paymentIntents.confirm once to fire the
  * retry, increments retry_count on every row, clears next_retry_at (the next
@@ -45,11 +45,11 @@
  */
 
 import type Stripe from 'stripe'
-import { ACH_RETURN_CONFIG, STRIPE_ACH_FAILURE_CODE_TO_RETURN_CODE } from '@gam/shared'
+import { ACH_MAX_RETRIES, ACH_RETURN_CONFIG, STRIPE_ACH_FAILURE_CODE_TO_RETURN_CODE } from '@gam/shared'
 import type { PoolClient } from 'pg'
 import { query, getClient } from '../db'
 import { getStripe } from '../lib/stripe'
-import { lockHousehold } from './moneyPredicates'
+import { allocationOrderSql, lockHousehold } from './moneyPredicates'
 import { createAdminNotification } from './adminNotifications'
 import { logger } from '../lib/logger'
 
@@ -223,6 +223,69 @@ export async function pullNoticeContext(paymentId: string): Promise<PullNoticeCo
 }
 
 /**
+ * ── 11/4 (Nic): WHAT THE BANK WILL ACTUALLY BE ASKED FOR ────────────────────
+ *
+ *   "Have the retry email state the correct amount that is actually going to be
+ *    charged. Pull up line items at the time of, that the email is going out."
+ *
+ * Heather Miller was told a $100 payment would be retried. $106.00 was debited:
+ * the $6 ACH fee rides every bank payment and the notice never named it. The
+ * notice's figure was the sum of the CHARGE ROWS, which is what she owes, not
+ * what her bank is asked for.
+ *
+ * A retry re-confirms the SAME PaymentIntent, so the debit is the intent's own
+ * amount — the one number nothing can drift from — and the caller passes it
+ * (`debitDollars`, from the live Stripe object it already holds).
+ *
+ * The lines come from the database at the moment the notice is written, named
+ * the way every other bill, receipt and reminder names them (invoiceNotice
+ * chargeLabel), plus one "Bank fee" line for the processing fee the pull
+ * carries.
+ *
+ * IF THE LINES DO NOT ADD UP TO THE DEBIT, NO LINES ARE SHOWN. A total with
+ * parts that do not sum to it is worse than a total alone: it reads as an
+ * arithmetic error by the sender, and whoever reads it starts doing their own
+ * sums. That happens when something about the charge is not a line of it — a
+ * credit that covered part of a row, money paid ahead on top — so the figure
+ * stands by itself and the resident is still told the truth about the debit.
+ */
+export interface PullDebitLine { label: string; amount: number }
+
+export async function pullDebitLines(piId: string, debitDollars: number): Promise<PullDebitLine[]> {
+  const { chargeLabel, chargeLabelColumnsSql } = await import('./invoiceNotice')
+  const rem = (await query<{ id: string; fee: string }>(
+    `SELECT id, COALESCE(processing_fee_amount, 0)::text AS fee FROM tenant_remittances
+      WHERE stripe_payment_intent_id = $1 ORDER BY created_at LIMIT 1`, [piId]))[0]
+  const rows = await query<any>(
+    `SELECT p.id, p.type, p.entry_description, p.amount::text AS amount, p.notes,
+            p.lease_fee_id, p.reversal_id,
+            ${chargeLabelColumnsSql('p')},
+            COALESCE((SELECT SUM(cu.amount) FROM credit_uses cu
+                       WHERE cu.payment_id = p.id
+                         AND ($2::uuid IS NOT NULL AND cu.remittance_id = $2::uuid)
+                         AND cu.status IN ('held', 'applied')), 0)::text AS credit
+       FROM payments p
+      WHERE p.stripe_payment_intent_id = $1
+      ORDER BY ${allocationOrderSql('p')}`,
+    [piId, rem?.id ?? null])
+  if (rows.length === 0) return []
+
+  const lines: PullDebitLine[] = []
+  for (const r of rows) {
+    // What the BANK is being asked for on this row: the charge, less anything
+    // credit is paying of it (credit is not processed, so Stripe never sees it).
+    const money = Math.round((Number(r.amount) - Number(r.credit)) * 100) / 100
+    if (money <= 0) continue
+    lines.push({ label: chargeLabel(r), amount: money })
+  }
+  const fee = Math.round(Number(rem?.fee ?? 0) * 100) / 100
+  if (fee > 0) lines.push({ label: 'Bank fee', amount: fee })
+
+  const sum = Math.round(lines.reduce((t, l) => t + l.amount, 0) * 100) / 100
+  return Math.abs(sum - Math.round(debitDollars * 100) / 100) < 0.005 ? lines : []
+}
+
+/**
  * NACHA retry decision based on the return code.
  *   'retry'      — schedule a retry attempt
  *   'permanent'  — no retry; status stays 'failed'
@@ -236,6 +299,129 @@ export function decideRetry(returnCode: string | null): 'retry' | 'permanent' {
   const cfg = ACH_RETURN_CONFIG[returnCode]
   if (!cfg) return 'permanent'
   return cfg.retryEligible ? 'retry' : 'permanent'
+}
+
+/**
+ * The unpaid return fees that will ride this household's next bank pull.
+ *
+ * ONE definition, read by two places that must agree: the fold that raises the
+ * pull (below) and the notice that tells the resident what their bank will be
+ * asked for (routes/webhooks). They are written at different moments — the
+ * notice when the bank refuses, the fold three days later as the retry goes out
+ * — so a second copy of this rule would drift, and the resident would be
+ * quoted one number and charged another. That is the exact defect 11/4 fixed
+ * ("Heather Miller was told $100 and charged $106") and it must not come back
+ * from the other side.
+ */
+export async function returnFeesRidingPull(
+  piId: string,
+): Promise<{ id: string; amount: number; returnedOn: string | null }[]> {
+  const rows = await query<{ id: string; amount: string; returned_on: string | null }>(
+    // 11/5 (Nic): "just separate the line items by putting the bounce date on
+    // there." The day each refusal happened comes back with it, so a notice
+    // quoting two $4s names two different days instead of the same words twice.
+    `SELECT f.id, f.amount::text AS amount,
+            to_char(f.returned_on, 'YYYY-MM-DD') AS returned_on
+       FROM payments f
+      WHERE f.entry_description = 'RETURNFEE'
+        AND f.status = 'pending'
+        AND f.voided_at IS NULL
+        AND f.held_for_next_bill_at IS NULL
+        AND f.stripe_payment_intent_id IS NULL
+        AND f.lease_id = (SELECT p.lease_id FROM payments p
+                           WHERE p.stripe_payment_intent_id = $1
+                             AND p.lease_id IS NOT NULL LIMIT 1)
+      ORDER BY f.created_at, f.id`, [piId])
+  return rows.map(r => ({ id: r.id, amount: Number(r.amount), returnedOn: r.returned_on }))
+}
+
+/**
+ * 11/5 (Nic) — THE RETURNED-PAYMENT FEE RIDES THE RETRY.
+ *
+ *   "Every time going forward, the fee needs to ride the retry amount."
+ *
+ * A refused bank debit costs GAM $4 that Stripe keeps. Until today that $4 was
+ * written held and waited for the next bill (11/4), which meant GAM carried it
+ * for up to a month. The retry three days later is already pulling from the
+ * same account for the same bill, so the fee goes with it.
+ *
+ * ── WHY THIS RUNS AFTER claimPull AND NOT BEFORE ──────────────────────────
+ *
+ * claimPull treats any row on the intent it did NOT claim as a "stray" and
+ * abandons the retry — that guard is what stops a re-pull taking money for a
+ * line somebody already paid at the desk. A fee row stamped onto the intent
+ * beforehand is exactly such a row ('pending', never 'failed'), so stamping it
+ * early would make every bounced pull refuse its own retry. It joins the pull
+ * only once the claim has succeeded.
+ *
+ * ── WHICH FEES RIDE: THIS HOUSEHOLD'S, NOT THIS INTENT'S ──────────────────
+ *
+ * Every unpaid return fee on the same LEASE rides, not only the ones whose note
+ * names this payment intent. Scoping to the intent looks tighter and is wrong:
+ * Heather in MH 28 bounced on 11/1 and again on 11/3, and Stripe gave the
+ * second attempt a NEW intent, so one of her two $4 fees would never have been
+ * collected by any pull. A second attempt usually is a new intent, so that was
+ * not an edge case — it was the normal one.
+ *
+ * The lease is the right boundary: it is one household's money, and the pull is
+ * being made from that household's bank. A fee on another lease is another
+ * household's and never rides.
+ *
+ * A HELD fee is deliberately left behind. Heather in Space 28 has one from
+ * 11/4, written under the old rule, and Nic kept it riding her next bill. The
+ * `held_for_next_bill_at IS NULL` test is what honours that without a
+ * one-off exception for her.
+ *
+ * ── THE ORDER IS THE SAFETY ───────────────────────────────────────────────
+ *
+ * Raise the amount at Stripe, then stamp the rows; if the stamp fails, put the
+ * amount straight back. The intent has not been confirmed yet, so that really
+ * is a rollback and not a repair. Getting this backwards gives one of two bad
+ * ends: money pulled with no row to land on, or rows marked paid for money the
+ * bank never sent.
+ *
+ * Returns what was added, 0 when there was nothing to add. It never throws:
+ * the rent is the thing that must be collected, and a fee that misses this
+ * pull is still ordinary owed money that rides whatever comes next.
+ */
+export async function foldReturnFeesIntoRetry(piId: string): Promise<number> {
+  try {
+    const fees = await returnFeesRidingPull(piId)
+    if (fees.length === 0) return 0
+
+    const added = Math.round(fees.reduce((s, f) => s + f.amount, 0) * 100) / 100
+    if (added <= 0) return 0
+
+    const stripe = getStripe()
+    const live = await stripe.paymentIntents.retrieve(piId)
+    const was = live.amount
+    // ADDED TO WHAT THE PULL ALREADY ASKS FOR, never rebuilt from the charge
+    // rows. The intent carries the payer's processing fee as well as the
+    // charges — Heather's $106 is a $100 trailer payment plus the $6 flat ACH
+    // fee, and there is no row for that $6 (it rides tenant_remittances). So
+    // summing the rows and adding the fee would have pulled $108 and quietly
+    // given the $6 away, on this retry and every other one.
+    const want = was + Math.round(added * 100)
+
+    await stripe.paymentIntents.update(piId, { amount: want })
+    try {
+      await query(
+        `UPDATE payments
+            SET stripe_payment_intent_id = $1, status = 'processing'
+          WHERE id = ANY($2::uuid[]) AND status = 'pending'`,
+        [piId, fees.map(f => f.id)])
+    } catch (e) {
+      await stripe.paymentIntents.update(piId, { amount: was }).catch(() => {})
+      throw e
+    }
+    logger.info({ piId, added, fees: fees.length },
+      '[ach-retry] returned-payment fee(s) folded into the retry')
+    return added
+  } catch (e) {
+    logger.error({ err: e, piId },
+      '[ach-retry] could not fold the returned-payment fee into the retry — it stays owed on its own')
+    return 0
+  }
 }
 
 interface RetryResult {
@@ -273,7 +459,7 @@ export async function processAchRetries(): Promise<RetryResult> {
       WHERE status = 'failed'
         AND next_retry_at IS NOT NULL
         AND next_retry_at <= NOW()
-        AND retry_count < 2
+        AND retry_count < ${ACH_MAX_RETRIES}
         AND stripe_payment_intent_id IS NOT NULL
       GROUP BY stripe_payment_intent_id
       ORDER BY MIN(next_retry_at) ASC, stripe_payment_intent_id
@@ -361,6 +547,13 @@ export async function processAchRetries(): Promise<RetryResult> {
         await endFlexPayRetries(claimed, 'GAM could not re-price the retry')
       }
       continue  // skip the confirm — don't re-pull the original (wrong) amount
+    }
+
+    // 11/5: GAM's own $4 for the bounce goes out with this same pull. Only for
+    // an ordinary pull — FlexPay already folds its returned-pull fees into the
+    // reprice above, and doing it twice would charge the bounce twice.
+    if (!claimed.some((r) => r.entry_description === 'FLEXPAY')) {
+      await foldReturnFeesIntoRetry(piId)
     }
 
     let confirmSent = false
@@ -467,7 +660,7 @@ async function claimPull(piId: string): Promise<{ claimed: ClaimedRow[]; stray: 
               status = 'processing'
         WHERE stripe_payment_intent_id = $1
           AND status = 'failed'
-          AND retry_count < 2
+          AND retry_count < ${ACH_MAX_RETRIES}
           AND next_retry_at <= NOW()
         RETURNING id, entry_description, type, amount::text AS amount, retry_count, return_code`,
       [piId])).rows.sort((a, b) => a.id.localeCompare(b.id))
@@ -530,6 +723,21 @@ async function giveBackClaim(piId: string, claimedIds: string[], reason: 'supers
       `UPDATE payments SET status = 'failed', next_retry_at = NULL
         WHERE id = ANY($1::uuid[]) AND status = 'processing'`, [claimedIds])
     const mine = (moved.rowCount ?? 0) > 0
+    // 11/5: AND the return fees the fold put on this pull. They are not in
+    // claimedIds — claimPull never saw them, foldReturnFeesIntoRetry stamped
+    // them on afterwards — so a give-back left them 'processing' on an intent
+    // that was then cancelled: invisible to every ask and resolved by nothing.
+    // Heather's two $4 fees landed exactly there on the first real run.
+    //
+    // They go back to plainly owed, not 'failed': nothing was ever sent for
+    // them, and they are off this intent so the next pull can pick them up.
+    if (mine) {
+      await client.query(
+        `UPDATE payments
+            SET status = 'pending', stripe_payment_intent_id = NULL
+          WHERE stripe_payment_intent_id = $1 AND status = 'processing'
+            AND NOT (id = ANY($2::uuid[]))`, [piId, claimedIds])
+    }
     if (mine) await releasePullCredit(client, piId, reason)
     await client.query('COMMIT')
     return mine

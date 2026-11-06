@@ -50,7 +50,8 @@ import type { PoolClient } from 'pg'
 import { getClient, query } from '../db'
 import type { AuthPayload } from '../middleware/auth'
 import { addDaysTo, todayIn } from '../lib/timezone'
-import { payableRowSql, bankPayableRowSql, allocationOrderSql } from './moneyPredicates'
+import { payableRowSql, bankPayableRowSql, allocationOrderSql,
+         landlordsFlexDepositRowSql, wholeFlexDepositAmountSql } from './moneyPredicates'
 import { householdQuote, planCredit, rentPastStayEndSql, HOUSEHOLD_MEMBER_STATUSES, type HouseholdQuote } from './creditUse'
 
 // ─── The rule, as SQL ────────────────────────────────────────────────────────
@@ -110,10 +111,18 @@ export function householdRowSql(a = 'p', tenantParam = '$1'): string {
                           (SELECT ob_i.lease_id FROM invoices ob_i WHERE ob_i.id = ${x}.invoice_id))))`
 }
 
-/** What the row still owes in money: its amount less credit already spent on it. */
-export function openAmountSql(a = 'p'): string {
+/**
+ * What the row still owes in money: its amount less credit already spent on it.
+ *
+ * `amountExpr` renders the figure off something other than the row's own
+ * amount, for the one case that needs it: a landlord's bill shows a
+ * FlexDeposit installment at the WHOLE deposit (openBills), so what it owes
+ * them is that figure less the credit spent, by this same definition rather
+ * than a second copy of it.
+ */
+export function openAmountSql(a = 'p', amountExpr?: string): string {
   const x = alias(a)
-  return `(${x}.amount - COALESCE((SELECT SUM(ob_u.amount) FROM credit_uses ob_u
+  return `((${amountExpr ?? `${x}.amount`}) - COALESCE((SELECT SUM(ob_u.amount) FROM credit_uses ob_u
                                     WHERE ob_u.payment_id = ${x}.id AND ob_u.status = 'applied'), 0))`
 }
 
@@ -406,6 +415,15 @@ export interface OpenSpace {
   days_late: number
   /** A card or bank payment made and still clearing: already paid, never owed, never late. */
   clearing: number
+  /**
+   * 10/28 (Nic): a FlexDeposit deposit charge is clearing here — shown as
+   * CLEARING with no amount beside it, the way work trade is a mark and never a
+   * figure. "Just have it not show an amount. Just have it stay still
+   * clearing." The figure is the thing that cannot be stated plainly for a week
+   * (the charge is a part of a deposit their bill already reads in full), and
+   * the only thing they need from this screen is that the money is on its way.
+   */
+  clearing_unpriced: boolean
 }
 
 /** Where Record payment opens for a household: the oldest open charge the desk may take, per company. */
@@ -441,6 +459,8 @@ export interface OpenTenantBalance {
   days_late: number
   /** Money clearing (beside the balance, never in it). */
   clearing: number
+  /** Money clearing that is shown without an amount (a FlexDeposit deposit charge). */
+  clearing_unpriced: boolean
   /** Work trade covers some of their charges (shown as "Work trade", never an amount). Only for viewers who may see work trade. */
   work_trade: boolean
   status: OutstandingRowStatus
@@ -514,6 +534,7 @@ interface ClearingGroup {
   property_id: string | null
   property_name: string | null
   clearing: string
+  clearing_unpriced: boolean
   oldest_due_date: string
 }
 
@@ -582,7 +603,7 @@ export async function listOpenTenantBalances(opts: OpenBalanceFilter): Promise<O
       SELECT
         ${SPACE_SELECT},
         to_char(${BILL_DUE}, 'YYYY-MM')               AS month,
-        SUM(${openAmountSql('p')})::text              AS open_amount,
+        SUM(${openAmountSql('p', wholeFlexDepositAmountSql('p'))})::text AS open_amount,
         (COUNT(DISTINCT p.invoice_id) + COUNT(*) FILTER (WHERE p.invoice_id IS NULL))::int AS open_invoices,
         COUNT(*)::int                                 AS open_charges,
         to_char(MIN(${BILL_DUE}), 'YYYY-MM-DD')       AS oldest_due_date,
@@ -590,9 +611,14 @@ export async function listOpenTenantBalances(opts: OpenBalanceFilter): Promise<O
       ${OUTSTANDING_FROM}
       WHERE p.landlord_id = ANY($1::uuid[])
         AND ${openBalanceSql('p')}
+        -- 10/28: a FlexDeposit plan is ONE charge on a landlord's balance — the
+        -- one on the invoice, carrying the whole deposit above. Without this
+        -- their Outstanding list and the bill they print disagree about the
+        -- same deposit, and GAM's service fee reads as their receivable.
+        AND ${landlordsFlexDepositRowSql('p')}
         AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))${owedFilters}
       GROUP BY ${SPACE_GROUP}, to_char(${BILL_DUE}, 'YYYY-MM')
-      HAVING SUM(${openAmountSql('p')}) > 0
+      HAVING SUM(${openAmountSql('p', wholeFlexDepositAmountSql('p'))}) > 0
     `, owedParams)
 
   // Money clearing: already paid, not owed, not late.
@@ -603,14 +629,22 @@ export async function listOpenTenantBalances(opts: OpenBalanceFilter): Promise<O
     clearing = await query<ClearingGroup>(`
       SELECT
         ${SPACE_SELECT},
-        SUM(${inFlightMoneySql('p')})::text           AS clearing,
+        SUM(CASE WHEN p.flex_deposit_security_deposit_id IS NULL
+                 THEN ${inFlightMoneySql('p')} ELSE 0 END)::text AS clearing,
+        BOOL_OR(p.flex_deposit_security_deposit_id IS NOT NULL) AS clearing_unpriced,
         to_char(MIN(${BILL_DUE}), 'YYYY-MM-DD')       AS oldest_due_date
       ${OUTSTANDING_FROM}
       WHERE p.landlord_id = ANY($1::uuid[])
         AND ${inFlightRowSql('p')}
+        -- 10/28: the same rule as the owed figure above, so GAM's fee and the
+        -- plan's later installments never read as the landlord's money here
+        -- either. What survives is the one charge on the invoice.
+        AND ${landlordsFlexDepositRowSql('p')}
         AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))${clearingFilters}
       GROUP BY ${SPACE_GROUP}
-      HAVING SUM(${inFlightMoneySql('p')}) > 0
+      HAVING SUM(CASE WHEN p.flex_deposit_security_deposit_id IS NULL
+                      THEN ${inFlightMoneySql('p')} ELSE 0 END) > 0
+          OR BOOL_OR(p.flex_deposit_security_deposit_id IS NOT NULL)
     `, clearingParams)
   }
 
@@ -646,6 +680,7 @@ export async function listOpenTenantBalances(opts: OpenBalanceFilter): Promise<O
           property_id: r.property_id, property_name: r.property_name,
           balance: 0, credit_available: 0, open_invoices: 0, open_charges: 0,
           oldest_due_date: r.oldest_due_date, months: [], days_late: 0, clearing: 0,
+          clearing_unpriced: false,
         },
         months: new Map(),
       }
@@ -669,6 +704,7 @@ export async function listOpenTenantBalances(opts: OpenBalanceFilter): Promise<O
     const s = b.space
     if (s.balance === 0 && g.oldest_due_date < s.oldest_due_date) s.oldest_due_date = g.oldest_due_date
     s.clearing = dollars(cents(s.clearing) + cents(g.clearing))
+    if (g.clearing_unpriced) s.clearing_unpriced = true
   }
 
   const tenantIds = [...byTenant.keys()]
@@ -719,11 +755,15 @@ export async function listOpenTenantBalances(opts: OpenBalanceFilter): Promise<O
   const listed: Array<{ tenantId: string; built: Building[]; balanceCents: number; clearingCents: number }> = []
   for (const tenantId of tenantIds) {
     const built = [...byTenant.get(tenantId)!.spaces.values()]
-      .filter(b => b.space.balance > 0 || b.space.clearing > 0)
+      // 10/28: money clearing with no amount beside it still belongs on the
+      // list — it is the only sign the landlord gets that the deposit is on its
+      // way, and dropping it for having no figure would hide it for the week.
+      .filter(b => b.space.balance > 0 || b.space.clearing > 0 || b.space.clearing_unpriced)
       .sort((a, b) => String(a.space.oldest_due_date).localeCompare(String(b.space.oldest_due_date)))
     const balanceCents = built.reduce((s, x) => s + cents(x.space.balance), 0)
     const clearingCents = built.reduce((s, x) => s + cents(x.space.clearing), 0)
-    if (balanceCents <= 0 && !(opts.includeClearing && clearingCents > 0)) continue
+    const anyClearing = clearingCents > 0 || built.some(x => x.space.clearing_unpriced)
+    if (balanceCents <= 0 && !(opts.includeClearing && anyClearing)) continue
     listed.push({ tenantId, built, balanceCents, clearingCents })
   }
 
@@ -843,6 +883,7 @@ export async function listOpenTenantBalances(opts: OpenBalanceFilter): Promise<O
         .map(([month, amt]) => ({ month, amount: dollars(amt) })),
       days_late: Math.max(0, ...owingSpaces.map(x => x.days_late)),
       clearing: dollars(clearingCents),
+      clearing_unpriced: built.some(x => x.space.clearing_unpriced),
       work_trade: workTrade.has(tenantId),
       status,
       status_label: OUTSTANDING_ROW_STATUS_LABEL[status],

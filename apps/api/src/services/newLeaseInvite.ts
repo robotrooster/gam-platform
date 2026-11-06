@@ -130,6 +130,17 @@ export interface InviteHouseholdOpts {
    * still be screening when the landlord sets the unit up).
    */
   requireUnitSetup?: boolean
+  /**
+   * 10/26 (Nic): "that unit list only populates with vacancies. It doesn't
+   * populate with the ability to click on one that's occupied and then initiate
+   * that takeover process."
+   *
+   * The modal has offered occupied spaces under "Taking over an occupied spot"
+   * since 10/26 — and this service refused every one of them with the
+   * whole-unit occupancy 409, because nothing told it a takeover was intended.
+   * A screen offering a button the server cannot honour. Set by the door.
+   */
+  takeover?: boolean
   /** Which email the fallback invite uses when no lease could be drafted. */
   fallbackEmail?: 'onboarded' | 'invite'
   /**
@@ -246,7 +257,15 @@ export async function inviteHouseholdToNewLease(o: InviteHouseholdOpts): Promise
 
     if (unit.occupancy_mode !== 'by_room') {
       // Occupancy-mode cap (whole_unit → 1 lease).
-      await assertUnitCanAcceptNewLease(client as any, unit.id)
+      //
+      // 10/28: EXCEPT a takeover. A replacement is by definition a second lease
+      // on an occupied space, and this cap is what refused every click on the
+      // modal's "Taking over an occupied spot" group. The space is not
+      // unguarded for it — autoDraftLeasesForUnit resolves which tenancy is
+      // being replaced and runs spotSuccession's own refusals (no sitting
+      // lease, a rival replacement already signed, a month already invoiced
+      // past the handover), which is what GoldSign has always done.
+      if (o.takeover !== true) await assertUnitCanAcceptNewLease(client as any, unit.id)
       // whole_unit repair: new people invalidate any UNSIGNED draft for the
       // unit (it's missing them). Void it so the household re-drafts complete.
       const draft = await client.query(
@@ -299,6 +318,9 @@ export async function inviteHouseholdToNewLease(o: InviteHouseholdOpts): Promise
         if (mine) {
           if (mine.draft_document_id) await voidUnsignedDraft(client, unit.id, mine.draft_document_id, erasedFiles)
         } else {
+          // by_room keeps its cap even for a takeover: rooms STACK, so a
+          // replacement there is an ordinary new lease in a free slot, and a
+          // full house is full.
           await assertUnitCanAcceptNewLease(client as any, unit.id)
         }
       }
@@ -413,7 +435,8 @@ export async function inviteHouseholdToNewLease(o: InviteHouseholdOpts): Promise
     await draftClient.query('BEGIN')
     const { autoDraftLeasesForUnit } = await import('./leaseOnboarding')
     const { createDocumentRecord, autoSendDraftedDocument } = await import('../routes/esign')
-    const out = await autoDraftLeasesForUnit(draftClient as any, unit.id, createDocumentRecord, undefined, { quiet: true })
+    const out = await autoDraftLeasesForUnit(draftClient as any, unit.id, createDocumentRecord, undefined,
+      { quiet: true, takeover: o.takeover === true })
     await draftClient.query('COMMIT')
     draftedDocumentIds = out.draftedDocumentIds
     draftBlocked = out.blocked

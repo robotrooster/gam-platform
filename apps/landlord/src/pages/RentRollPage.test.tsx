@@ -76,9 +76,9 @@ const health = (percent: number | null, label: string) => ({
 })
 const resident = (tenantId: string, name: string, primary = true) => ({ tenantId, name, primary })
 
-function gerald(months: string[]) {
+function arlo(months: string[]) {
   return {
-    key: 'lease:l48', leaseId: 'l48', householdId: 'g1', residents: [resident('g1', 'Gerald Logue'), resident('g2', 'Gina Logue', false)],
+    key: 'lease:l48', leaseId: 'l48', householdId: 'g1', residents: [resident('g1', 'Arlo Braddock'), resident('g2', 'Gina Braddock', false)],
     spaces: ['RV 10'], movedOut: false,
     invoiced: 577.47, lateFees: 60, paid: 0, credit: 0, workTrade: 0, owed: 577.47,
     health: health(50, '50%, 1 of 2 months'),
@@ -114,7 +114,7 @@ function history(q: URLSearchParams, over: any = {}) {
       { status: 'due', label: 'Due', households: 0 },
     ] })),
     // In space order, as the server sends them: RV 2 before RV 10.
-    rows: [ana(months), gerald(months)],
+    rows: [ana(months), arlo(months)],
     movedOutOwing: [],
     ...over,
   }
@@ -252,21 +252,21 @@ describe('the Rent Roll: one property at a time', () => {
     await render(undefined, '?range=this_year')
     const fixed = [...host.querySelectorAll('.rr-split .rr-fixed tbody tr')].map(r => r.textContent)
     expect(fixed[0]).toBe('RV 2Ana Ruiz')
-    expect(fixed[1]).toBe('RV 10Gerald Logue+ Gina Logue')
+    expect(fixed[1]).toBe('RV 10Arlo Braddock+ Gina Braddock')
     const scroll = host.querySelector('.rr-split .rr-scroll')!
     const heads = [...scroll.querySelectorAll('thead th')].map(th => th.textContent)
     expect(heads.slice(0, 4)).toEqual(['Invoiced', 'Paid', 'Owed', 'Health'])
     const range = rangeOfPick('this_year', today) as { from: string; to: string }
     const monthHeads = [...scroll.querySelectorAll('thead th.rrh-stampcol')].map(th => th.getAttribute('title'))
     expect(monthHeads[0]).toBe(new Date(Number(range.to.slice(0, 4)), Number(range.to.slice(5)) - 1, 1).toLocaleString('en-US', { month: 'long', year: 'numeric' }))
-    const gerald = [...scroll.querySelectorAll('tbody tr')][1]
-    const cells = [...gerald.querySelectorAll('td')].map(td => td.textContent)
+    const arlo = [...scroll.querySelectorAll('tbody tr')][1]
+    const cells = [...arlo.querySelectorAll('td')].map(td => td.textContent)
     expect(cells[0]).toBe('$577.47incl. $60.00 late fees')
     expect(cells[1]).toBe('$0.00')
     expect(cells[2]).toBe('$577.47')
     expect(cells[3]).toBe('50%')
     // Newest month first: the red "Owes +7" sits right after Health.
-    const geraldStamps = [...gerald.querySelectorAll('.rrs')]
+    const geraldStamps = [...arlo.querySelectorAll('.rrs')]
     expect(geraldStamps[0].textContent).toBe('Owes +7')
     expect(geraldStamps[0].className).toContain('red')
     const anaStamps = [...[...scroll.querySelectorAll('tbody tr')][0].querySelectorAll('.rrs')]
@@ -347,7 +347,7 @@ describe('the Rent Roll: one property at a time', () => {
 
   it('a name opens that household’s report — its lease', async () => {
     await render()
-    const link = [...host.querySelectorAll('.rr-split .rr-name-link')].find(b => b.textContent === 'Gerald Logue') as HTMLButtonElement
+    const link = [...host.querySelectorAll('.rr-split .rr-name-link')].find(b => b.textContent === 'Arlo Braddock') as HTMLButtonElement
     await click(link)
     await until(() => text().includes('REPORT g1 ?leaseId=l48'), 'the report')
   })
@@ -362,7 +362,7 @@ describe('the Rent Roll: one property at a time', () => {
     try {
       await render()
       const names = [...host.querySelectorAll('.rr-split .rr-name-link')]
-      expect(names.map(n => n.textContent)).toEqual(['Ana Ruiz', 'Gerald Logue'])
+      expect(names.map(n => n.textContent)).toEqual(['Ana Ruiz', 'Arlo Braddock'])
       expect(names.every(n => n.tagName === 'SPAN')).toBe(true)
       expect(button(/Print/)).toBeDefined()
       expect(button(/Export CSV/)).toBeDefined()
@@ -480,7 +480,7 @@ describe('the spreadsheet and the helpers', () => {
     const lines = rentRollCsv(h).trimEnd().split('\n')
     expect(lines[0]).toBe('Space,Tenant,Moved out,Invoiced,Late fees,Paid,Account credit,Work trade,Owed,Payment health,September 2026,August 2026')
     expect(lines[1]).toBe('RV 2,Ana Ruiz,,990,0,990,0,0,0,100%,Paid late +5,No bill')
-    expect(lines[2]).toBe('RV 10,"Gerald Logue, Gina Logue",,577.47,60,0,0,0,577.47,50%,Owes +7,Paid')
+    expect(lines[2]).toBe('RV 10,"Arlo Braddock, Gina Braddock",,577.47,60,0,0,0,577.47,50%,Owes +7,Paid')
     expect(lines[3]).toBe(',"Moved out, still owes — bills in this range",,515,20,0,0,0,515')
     expect(lines[4]).toBe(',Total,,2082.47,80,990,0,0,1092.47')
     // The Total is the lines above it, column by column.
@@ -503,7 +503,7 @@ describe('the spreadsheet and the helpers', () => {
     expect(csvField('-x')).toBe(`'-x`)
     expect(csvField('@sum')).toBe(`'@sum`)
     expect(csvField(-5)).toBe('-5')
-    expect(csvField('Gerald Logue')).toBe('Gerald Logue')
+    expect(csvField('Arlo Braddock')).toBe('Arlo Braddock')
     expect(csvLine(['a,b', 3, null])).toBe('"a,b",3,')
     const h = history(q, { rows: [{ ...ana(['2026-08', '2026-09']), residents: [resident('x', '=cmd()')] }] })
     expect(rentRollCsv(h).split('\n')[1]).toMatch(/^RV 2,'=cmd\(\),/)

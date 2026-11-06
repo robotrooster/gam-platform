@@ -1,6 +1,6 @@
 /**
  * 10/12 (Nic) — a day a bill was fined is a day it was fined, whatever has
- * happened to the money since; and a monthly fee charges once a month.
+ * happened to the money since.
  *
  *   1. A bounced pull. Autopay or "pay in full" pulls the rent and the late
  *      fees in one bank debit; when the bank refuses it, every line of that
@@ -12,9 +12,11 @@
  *      and the retry of the whole pull — rent included — then ran into the
  *      one-fee-per-day index (ux_payments_late_fee_idempotent) and could never
  *      run. A fee paid from the deposit was the same: charged again.
- *   2. A monthly fee whose first charge landed on a short month's last day (a
- *      calendar on the 31st: June 30th) moved every later month onto the 30th
- *      and charged July and August twice.
+ *   2. (The monthly cadence this file also covered was removed 10/30 — Nic: it
+ *      was an exact duplicate of the one-time fee, since a monthly late fee is
+ *      one fee on that bill and the next invoice carries its own. It was the
+ *      only cadence with month-length clamping, and that clamping was the sole
+ *      source of its bugs. Day and week are plain day arithmetic.)
  *   3. Nic, 10/12: a charge added to a bill after it went late "rides the
  *      original due date. landlord can issue credit against late fee if
  *      desired" — the bill's own late clock, as the engine has always done.
@@ -45,7 +47,6 @@ vi.mock('../services/email', async (importOriginal) => {
 
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant } from '../test/dbHelpers'
-import { addAccrualPeriods } from '@gam/shared'
 import { generateLateFeesForTimezone } from './lateFees'
 import { processAchRetries } from '../services/achRetry'
 
@@ -64,7 +65,7 @@ async function seedBill(o: {
   propertyGrace?: number
   initial?: number
   accrual?: number
-  period?: 'daily' | 'weekly' | 'monthly'
+  period?: 'daily' | 'weekly'
   cap?: number
   /** The first fee and the cap as a percent of the rent (default: flat dollars). */
   percent?: boolean
@@ -118,8 +119,6 @@ const fees = async (invoiceId: string) => (await db.query<Fee>(
 const days = (f: Fee[]) => f.map(x => x.due_date)
 const plusDays = async (d: string, n: number) =>
   (await db.query<{ d: string }>(`SELECT ($1::date + $2::int)::text AS d`, [d, n])).rows[0].d
-const parkToday = async () =>
-  (await db.query<{ d: string }>(`SELECT (NOW() AT TIME ZONE $1)::date::text AS d`, [TZ])).rows[0].d
 
 /** The bank refuses the pull that covered every line still owed on the bill; a retry is scheduled (webhooks failIntentRows). */
 async function bounce(invoiceId: string, pi: string) {
@@ -193,49 +192,6 @@ describe('a bounced pull: the fees it covered stay charged', () => {
       `UPDATE payments SET status = 'paid_via_deposit' WHERE invoice_id = $1 AND type = 'late_fee'`, [s.invoiceId])
     await generateLateFeesForTimezone(TZ)
     expect(await fees(s.invoiceId)).toEqual(fined.map(f => ({ ...f, status: 'paid_via_deposit' })))
-  })
-})
-
-describe('a monthly fee charges once a month', () => {
-  // Due 5/26 with 5 days of grace: the first late day is 5/31, and a monthly
-  // fee falls on the 31st — clamped to the last day of a shorter month.
-  async function monthlyBill(propertyGrace?: number) {
-    const s = await seedBill({
-      due: '2026-05-26', leaseGrace: propertyGrace === undefined ? 5 : null, propertyGrace,
-      initial: 0, accrual: 10, period: 'monthly',
-    })
-    const today = await parkToday()
-    const expected: string[] = []
-    for (let n = 1; ; n++) {
-      const d = addAccrualPeriods('2026-05-31', 'monthly', n)
-      if (d > today) break
-      expected.push(d)
-    }
-    return { s, expected }
-  }
-
-  it('a first fee on June 30th keeps the calendar on the 31st: a second night charges no month twice', async () => {
-    const { s, expected } = await monthlyBill()
-    expect(expected.slice(0, 4)).toEqual(['2026-06-30', '2026-07-31', '2026-08-31', '2026-09-30'])
-    await generateLateFeesForTimezone(TZ)
-    expect(days(await fees(s.invoiceId))).toEqual(expected)
-    await generateLateFeesForTimezone(TZ)
-    const f = await fees(s.invoiceId)
-    expect(days(f)).toEqual(expected)
-    const months = f.map(x => x.due_date.slice(0, 7))
-    expect(new Set(months).size).toBe(months.length)
-  })
-
-  it('a grace edit after the first monthly fee charges no month twice either', async () => {
-    const { s, expected } = await monthlyBill(5)
-    await generateLateFeesForTimezone(TZ)
-    expect(days(await fees(s.invoiceId))).toEqual(expected)
-    for (const g of [3, 7, 0, 5]) {
-      await db.query(`UPDATE properties SET late_fee_grace_days = $2
-                       WHERE id = (SELECT property_id FROM units WHERE id = $1)`, [s.unitId, g])
-      await generateLateFeesForTimezone(TZ)
-      expect(days(await fees(s.invoiceId))).toEqual(expected)
-    }
   })
 })
 

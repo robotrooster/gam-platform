@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useQuery } from 'react-query'
 import { apiGet } from '../lib/api'
 import { Scale, BookOpen, FileText } from 'lucide-react'
@@ -24,7 +25,9 @@ type LawDoc = {
   publishedBy: string; edition: string | null; effectiveFrom: string | null
   pdfUrl: string; pageCount: number
 }
-type Home = { leaseId: string; state: string; propertyName: string; unitNumber: string; documents: LawDoc[] }
+type ActSection = { number: string; title: string | null }
+type Act = { actKey: string; sectionCount: number; effectiveYear: number; sections: ActSection[] }
+type Home = { leaseId: string; state: string; propertyName: string; unitNumber: string; documents: LawDoc[]; act: Act | null }
 
 async function openPdf(url: string) {
   // The file needs the sign-in, which a plain link cannot carry.
@@ -37,6 +40,36 @@ async function openPdf(url: string) {
 
 // Strip the "Arizona: " in front — the section already says which state.
 const short = (name: string) => name.replace(/^[A-Z][A-Za-z .]+:\s+/, '')
+
+/** One section of the act — the text is fetched only when it is opened, so a
+ *  fifty-section act is a list and not a megabyte. */
+function LawSection({ state, actKey, sec }: { state: string; actKey: string; sec: { number: string; title: string | null } }) {
+  const [open, setOpen] = useState(false)
+  const { data, isLoading } = useQuery<{ sectionTitle: string | null; fullText: string; sourceUrl: string | null }>(
+    ['law-section', state, actKey, sec.number],
+    () => apiGet(`/tenants/me/laws/${state}/${encodeURIComponent(actKey)}/section?number=${encodeURIComponent(sec.number)}`),
+    { enabled: open },
+  )
+  return (
+    <div style={{ borderTop: '1px solid var(--b1, var(--border-0))' }}>
+      <button
+        onClick={() => setOpen(v => !v)}
+        style={{ display: 'flex', gap: 10, alignItems: 'flex-start', width: '100%', textAlign: 'left',
+                 background: 'none', border: 'none', padding: '10px 0', color: 'var(--t0)' }}>
+        <Scale size={14} style={{ color: 'var(--gold)', flexShrink: 0, marginTop: 3 }} />
+        <span style={{ flex: 1, minWidth: 0 }}>
+          <span style={{ fontWeight: 600, fontSize: '.85rem' }}>{sec.number}</span>
+          {sec.title && <span style={{ color: 'var(--t2)', fontSize: '.82rem' }}> — {sec.title}</span>}
+        </span>
+      </button>
+      {open && (
+        <div style={{ fontSize: '.8rem', color: 'var(--t2)', lineHeight: 1.6, padding: '0 0 12px 24px', whiteSpace: 'pre-wrap' }}>
+          {isLoading ? 'Loading…' : (data?.fullText ?? 'Not available.')}
+        </div>
+      )}
+    </div>
+  )
+}
 
 export function LawsPage() {
   const { data, isLoading } = useQuery<Home[]>('tenant-laws', () => apiGet<Home[]>('/tenants/me/laws'))
@@ -68,7 +101,27 @@ export function LawsPage() {
             <div style={{ fontWeight: 700, color: 'var(--t0)', marginBottom: 2 }}>{h.propertyName}{h.unitNumber ? ` · ${h.unitNumber}` : ''}</div>
             <div style={{ fontSize: '.75rem', color: 'var(--t3)', marginBottom: 14 }}>{state}</div>
 
-            {h.documents.length === 0 && (
+            {/* 10/30 (Nic): "we have every Landlord-Tenant Act for every type
+                of unit across the United States" — and we do, as statute TEXT
+                for all fifty states. This page used to read only the PDF shelf,
+                which holds two states, and told everyone else their state was
+                missing. The text is the fallback, so no resident is ever told
+                their own law does not exist. */}
+            {h.act && h.act.sections.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: '.68rem', fontWeight: 700, letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--t3)', marginBottom: 6 }}>
+                  {acts.length > 0 ? 'Section by section' : 'The law'}
+                </div>
+                <div style={{ fontSize: '.75rem', color: 'var(--t3)', marginBottom: 8 }}>
+                  {h.act.sectionCount} sections · {state} · {h.act.effectiveYear}
+                </div>
+                {h.act.sections.map(sec => (
+                  <LawSection key={sec.number} state={h.state} actKey={h.act!.actKey} sec={sec} />
+                ))}
+              </div>
+            )}
+
+            {h.documents.length === 0 && !(h.act && h.act.sections.length > 0) && (
               <div style={{ fontSize: '.82rem', color: 'var(--t2)' }}>
                 GAM doesn't have {state}'s landlord-tenant act in its library yet.
               </div>

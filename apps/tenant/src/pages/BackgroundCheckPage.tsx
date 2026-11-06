@@ -231,7 +231,7 @@ export function BackgroundCheckPage() {
         //
         // It is — in two of the three places that needed it. The price lookup
         // and the payment intent both fall back to the landlordId in the URL,
-        // which is why Anastacio Erreguin's $44.99 charge carried Mountain View
+        // which is why Bryce Belmont's $44.99 charge carried Mountain View
         // in its metadata. This line did not, so a walk-up with no account
         // linkage submitted with landlordId null, the server read that as a
         // SPECULATIVE renter-pool intake, and his screening filed itself under

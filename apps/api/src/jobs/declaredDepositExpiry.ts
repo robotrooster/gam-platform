@@ -39,16 +39,35 @@ const REPORT_TZ_SQL = (d: string) => `COALESCE(
 /**
  * SQL: GAM was reading this company's bank for the report's deposit — an
  * active link that was ALREADY THERE on the day of the deposit, for a day
- * inside the company's books (bank rows before books_start_date are set aside,
- * never matched). S655 (Step 9): a bank linked after the report was never
- * looking for it.
+ * inside the books (bank rows before the books start are set aside, never
+ * matched). S655 (Step 9): a bank linked after the report was never looking
+ * for it.
+ *
+ * 11/3 — THE REPORT'S OWN PROPERTY decides which books start applies, not the
+ * company's. The company's is now the EARLIEST of its properties', so reading
+ * it would say GAM was watching the bank for a deposit at a property whose
+ * books had not begun — and this predicate is what decides whether a resident
+ * is judged on a bank match that could never have happened. That is a strike
+ * on somebody's payment history for a date their landlord had not started
+ * keeping books on, which is why it is a per-property read and not a MIN.
+ *
+ * A report whose lease resolves no property falls back to the company's
+ * earliest, which is the old behaviour. The NOT EXISTS shape is kept
+ * deliberately: a company with NO books start date at all has a NULL here, and
+ * `NULL > date` matches nothing, so the predicate passes exactly as it did
+ * before — a direct `<=` comparison would silently flip that case.
  */
+const REPORT_BOOKS_START_SQL = (d: string) => `COALESCE(
+  (SELECT pr.books_start_date FROM leases l JOIN units u ON u.id = l.unit_id JOIN properties pr ON pr.id = u.property_id
+    WHERE l.id = ${d}.lease_id),
+  (SELECT min(p2.books_start_date) FROM properties p2 WHERE p2.landlord_id = ${d}.landlord_id))`
+
 const BANK_WATCHED_REPORT_SQL = (d: string) => `(
   EXISTS (SELECT 1 FROM bank_connections c
            WHERE c.landlord_id = ${d}.landlord_id AND c.status = 'active'
              AND (c.created_at AT TIME ZONE ${REPORT_TZ_SQL(d)})::date <= ${d}.declared_date)
-  AND NOT EXISTS (SELECT 1 FROM landlords ll
-                   WHERE ll.id = ${d}.landlord_id AND ll.books_start_date > ${d}.declared_date))`
+  AND NOT EXISTS (SELECT 1 FROM (SELECT ${REPORT_BOOKS_START_SQL(d)} AS s) bs
+                   WHERE bs.s > ${d}.declared_date))`
 
 /**
  * S655 (decisions #11): WHICH hand-recorded receipt may close a report — the

@@ -418,6 +418,7 @@ describe('one scripted month at one park: invariants, money in, and every report
       expect(sum.body.data.incomeCard.received).toEqual({ amount: RECEIVED.total, paidAhead: RECEIVED.paidAhead, clearing: RECEIVED.clearing })
       expect(sum.body.data.incomeCard.billed).toEqual({
         amount: BILLED.total, collected: BILLED.paid + BILLED.coveredByPaidAhead, clearing: BILLED.clearing, stillOwed: BILLED.stillOwed,
+        other: 0,
       })
       const ytdRow = sum.body.data.ytdMonthly.find((m: any) => m.month === MONTH)
       expect(basis === 'received' ? ytdRow?.collected : ytdRow?.charged).toBe(want)
@@ -445,6 +446,7 @@ describe('one scripted month at one park: invariants, money in, and every report
       collected: BILLED.paid + BILLED.coveredByPaidAhead,
       clearing: BILLED.clearing,
       stillOwed: BILLED.stillOwed,
+      other: 0,
     })
     for (const basis of ['received', 'billed'] as const) {
       const dash = await request(app()).get(`/api/landlords/me/dashboard?basis=${basis}`).set('Authorization', `Bearer ${p.token}`)

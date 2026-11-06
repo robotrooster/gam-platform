@@ -23,9 +23,13 @@
  *   words, rather than pretending the door is missing.
  */
 import { query, queryOne } from '../db'
+import { logger } from '../lib/logger'
 // 10/22 (Nic): two contact points agreeing, with nicknames and partial names
 // counting — the name half of that rule, written down as a rule.
 import { nameAgreement, normalizedEmail, normalizedPhone, type NameAgreement } from './nameMatch'
+// 10/29: the same normalizer the scanner and the typed form both run through,
+// so 'd1234567', 'D-1234567' and 'D1234567' are one number here too.
+import { normalizedIdNumber, type LeftOwingMatchPoint } from '@gam/shared'
 
 /** What ANY other landlord may know. Three words and a number of debts. */
 export interface LeftOwingFlag {
@@ -35,10 +39,26 @@ export interface LeftOwingFlag {
   count: number
   /** The words a landlord reads. Fixed — nothing about this is per-case. */
   words: string
+  /** Every one of them came from another platform: a heads-up, not a finding. */
+  watchOnly?: boolean
 }
 
 export const LEFT_OWING_WORDS =
   'High risk — owes other people money and needs to settle up.'
+
+/**
+ * 10/27 (Nic) — WHAT AN IMPORTED BALANCE SAYS INSTEAD.
+ *
+ *   "Carry forward balances from landlords that migrate from other platforms
+ *    are only a kind of watch list... GAM is only going to treat that as a
+ *    watch list for other landlords. They're not going to treat it as not
+ *    rentable."
+ *
+ * GAM did not see that money not get paid; another system did. So it is said
+ * as a heads-up rather than a finding, and nothing is ever collected on it.
+ */
+export const LEFT_OWING_WATCH_WORDS =
+  'Worth knowing — another operator recorded an unpaid balance before this platform.'
 
 /**
  * WHO IS BEING CHECKED. An account they clicked, or just the name, email and
@@ -51,6 +71,17 @@ export interface PersonToCheck {
   name?: string | null
   email?: string | null
   phone?: string | null
+  /**
+   * 10/29 — THE POINT THAT TELLS TWO JOHN SMITHS APART. A licence number is
+   * state-issued and does not move when somebody changes their phone, their
+   * email or their surname, so it both FINDS the person who changed all three
+   * and PROVES the one at the counter is somebody else. Filled from the
+   * identification on file, or from the card they just scanned.
+   */
+  idNumber?: string | null
+  idState?: string | null
+  /** Corroborates a name; never a match point alone. */
+  dateOfBirth?: string | null
 }
 
 /** A bare user id still works: every caller that has one passes it. */
@@ -60,16 +91,37 @@ async function whoIsBeingChecked(person: PersonRef): Promise<PersonToCheck | nul
   if (!person) return null
   const p: PersonToCheck = typeof person === 'string' ? { userId: person } : person
   if (!p.userId) return p.name || p.email || p.phone ? p : null
-  // An account fills in whatever the caller did not pass.
-  const u = await queryOne<{ name: string; email: string; phone: string | null }>(
-    `SELECT NULLIF(TRIM(COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')), '') AS name,
-            email, phone
-       FROM users WHERE id = $1`, [p.userId])
+  // An account fills in whatever the caller did not pass — including the
+  // identification on file, so every existing caller gets the licence match
+  // for free without passing anything new.
+  const u = await queryOne<{
+    name: string; email: string; phone: string | null
+    id_number: string | null; id_state: string | null; date_of_birth: string | null
+  }>(
+    `SELECT NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') AS name,
+            u.email, u.phone,
+            ident.id_number, ident.issuing_state AS id_state,
+            to_char(ident.date_of_birth, 'YYYY-MM-DD') AS date_of_birth
+       FROM users u
+       LEFT JOIN LATERAL (
+              SELECT i.id_number, i.issuing_state, i.date_of_birth
+                FROM tenants t
+                JOIN tenant_identifications i ON i.tenant_id = t.id
+               WHERE t.user_id = u.id
+                 AND i.id_number IS NOT NULL
+                 -- One a person is still arguing about is not an identity point.
+                 AND i.needs_review = false
+               ORDER BY i.is_primary DESC, i.verified_at DESC NULLS LAST, i.created_at DESC
+               LIMIT 1) ident ON true
+      WHERE u.id = $1`, [p.userId])
   return {
     userId: p.userId,
     name: p.name ?? u?.name ?? null,
     email: p.email ?? u?.email ?? null,
     phone: p.phone ?? u?.phone ?? null,
+    idNumber: p.idNumber ?? u?.id_number ?? null,
+    idState: p.idState ?? u?.id_state ?? null,
+    dateOfBirth: p.dateOfBirth ?? u?.date_of_birth ?? null,
   }
 }
 
@@ -77,17 +129,30 @@ async function whoIsBeingChecked(person: PersonRef): Promise<PersonToCheck | nul
  * The one thing that identifies this person across reads, so a close call is
  * raised ONCE and not again on every search. The strongest thing we have:
  * their account, else the email, else the phone.
+ *
+ * 11/5: EXPORTED, because it is now also the key the BOOK is written under —
+ * tenant_left_owing.person_key, one live debt per person per landlord
+ * (services/leftOwingParts). The two must be the same function and not two
+ * copies of one rule: a writer that disagreed with this matcher about who
+ * somebody is would quietly split one person into two debts, which is the
+ * exact thing the person key exists to stop.
  */
-function personKey(p: PersonToCheck): string | null {
+export function personKey(p: PersonToCheck): string | null {
   if (p.userId) return `user:${p.userId}`
   const e = normalizedEmail(p.email)
   if (e) return `email:${e}`
   const ph = normalizedPhone(p.phone)
-  return ph ? `phone:${ph}` : null
+  if (ph) return `phone:${ph}`
+  // The licence sits BELOW the phone deliberately. It is the stronger point,
+  // but the key only dedupes the review queue, and promoting it would hand a
+  // new key to everybody already keyed on their email and ask GAM to review
+  // every one of those pairs a second time.
+  const id = normalizedIdNumber(p.idNumber)
+  return id ? `id:${p.idState ? p.idState.toUpperCase() + ':' : ''}${id}` : null
 }
 
 /** Which contact point agreed. */
-export type MatchedOn = 'account' | 'email' | 'phone'
+export type MatchedOn = LeftOwingMatchPoint
 
 /** A debt that came up for this person, and what is to be done about it. */
 export interface MatchedDebt {
@@ -104,6 +169,19 @@ export interface MatchedDebt {
   leftOn: string | null
   city: string | null
   state: string | null
+  /**
+   * 10/27 (Nic): a BAND, never the figure. "an approximate, like if it's like
+   * $600 or something, it'll say over $500."
+   */
+  about: string | null
+  /**
+   * 10/27 (Nic): where the debt came from, because it changes what it MEANS.
+   * "Carry forward balances from landlords that migrate from other platforms
+   * are only a kind of watch list... They're not going to treat it as not
+   * rentable." A GAM balance can be collected; an imported one is hearsay from
+   * another system and only ever a heads-up.
+   */
+  watchOnly: boolean
 }
 
 /**
@@ -145,18 +223,33 @@ export async function debtsMatching(
   if (!key) return []
   const email = normalizedEmail(p.email)
   const phone = normalizedPhone(p.phone)
-  if (!p.userId && !email && !phone) return []
+  const idNumber = normalizedIdNumber(p.idNumber)
+  const idState = p.idState ? p.idState.trim().toUpperCase() : null
+  const dob = p.dateOfBirth || null
+  if (!p.userId && !email && !phone && !idNumber) return []
 
   const rows = await query<{
     id: string; who: string | null; left_on: string | null
+    amount: string | null; source_kind: string | null
     city: string | null; state: string | null
     matched_on: MatchedOn; review_status: string | null
+    their_id: string | null; their_id_state: string | null; their_dob: string | null
   }>(
     `SELECT o.id, o.who, to_char(o.left_on, 'YYYY-MM-DD') AS left_on, pr.city, pr.state,
+            o.amount, o.source_kind,
+            -- Strongest point first, so the 'why' names the thing that found
+            -- them rather than whichever branch happened to come first.
             CASE WHEN $1::uuid IS NOT NULL AND o.user_id = $1::uuid THEN 'account'
+                 WHEN $6::text IS NOT NULL AND upper(btrim(o.id_number)) = $6::text
+                      AND ($7::text IS NULL OR o.id_state IS NULL
+                           OR upper(btrim(o.id_state)) = $7::text) THEN 'licence'
                  WHEN $2::text IS NOT NULL AND lower(btrim(o.email)) = $2::text THEN 'email'
                  ELSE 'phone' END AS matched_on,
-            rv.status AS review_status
+            rv.status AS review_status,
+            -- Read back whatever the originating landlord knew, so a point
+            -- that DISAGREES can settle it the other way.
+            upper(btrim(o.id_number)) AS their_id, upper(btrim(o.id_state)) AS their_id_state,
+            to_char(o.date_of_birth, 'YYYY-MM-DD') AS their_dob
        FROM tenant_left_owing o
        LEFT JOIN properties pr ON pr.id = o.property_id
        LEFT JOIN tenant_left_owing_match_reviews rv
@@ -164,16 +257,23 @@ export async function debtsMatching(
       WHERE o.settled_at IS NULL
         AND NOT (o.landlord_id = ANY($5::uuid[]))
         AND ( ($1::uuid IS NOT NULL AND o.user_id = $1::uuid)
+           OR ($6::text IS NOT NULL AND upper(btrim(o.id_number)) = $6::text
+               AND ($7::text IS NULL OR o.id_state IS NULL
+                    OR upper(btrim(o.id_state)) = $7::text))
            OR ($2::text IS NOT NULL AND lower(btrim(o.email)) = $2::text)
            OR ($3::text IS NOT NULL
                AND right(regexp_replace(COALESCE(o.phone, ''), '[^0-9]', '', 'g'), 10) = $3::text) )
       ORDER BY o.left_on NULLS LAST, o.id`,
-    [p.userId ?? null, email, phone, key, askingLandlordIds])
+    [p.userId ?? null, email, phone, key, askingLandlordIds, idNumber, idState])
 
   const out: MatchedDebt[] = []
   for (const r of rows) {
     const agreement = nameAgreement(r.who, p.name)
-    const where = { leftOn: r.left_on, city: r.city, state: r.state }
+    const where = {
+      leftOn: r.left_on, city: r.city, state: r.state,
+      about: amountBand(Number(r.amount)),
+      watchOnly: r.source_kind === 'import',
+    }
 
     // A person at GAM has already looked at this pair. Their answer stands,
     // whichever way it went, and is not asked again.
@@ -191,6 +291,59 @@ export async function debtsMatching(
     if (r.matched_on === 'account') {
       out.push({ owingId: r.id, matchedOn: 'account', agreement, verdict: 'flag',
         why: 'The landlord who was owed pointed this debt at this account when they brought it in.', ...where })
+      continue
+    }
+
+    /**
+     * 10/29 — THE SAME-NAME ANSWER, AND IT RUNS BEFORE THE FLAG.
+     *
+     * Where both sides know an identity point and the points DISAGREE, this is
+     * a different person wearing the same name, and the contact point that
+     * matched is a shared household phone, a recycled number or a relative's
+     * email. Saying so here is what stops the review queue filling with the
+     * John Smiths and stops a landlord reading a stranger's debt onto an
+     * applicant.
+     *
+     * Only a point that BOTH sides know can contradict: an unknown field is
+     * silence, never a denial. A GAM admin's own answer still outranks this —
+     * the review_status checks above already ran.
+     */
+    const theirId = r.their_id ? normalizedIdNumber(r.their_id) : null
+    const sameStateish = !idState || !r.their_id_state || idState === r.their_id_state
+    if (idNumber && theirId && (idNumber !== theirId || !sameStateish)) {
+      out.push({ owingId: r.id, matchedOn: r.matched_on, agreement, verdict: 'no',
+        why: 'The identification on this debt is a different licence, so this is somebody else with the same name.', ...where })
+      continue
+    }
+    if (dob && r.their_dob && dob !== r.their_dob) {
+      out.push({ owingId: r.id, matchedOn: r.matched_on, agreement, verdict: 'no',
+        why: 'The date of birth on this debt is a different one, so this is somebody else with the same name.', ...where })
+      continue
+    }
+
+    /**
+     * A licence number is state-issued and unique, so it identifies on its own
+     * — a near name goes straight through where an email would have waited for
+     * a person. A name that plainly disagrees still waits, because the other
+     * way this pair happens is a clerk mistyping a digit.
+     */
+    if (r.matched_on === 'licence') {
+      if (agreement !== 'different') {
+        out.push({ owingId: r.id, matchedOn: 'licence', agreement, verdict: 'flag',
+          why: 'The licence number matches, which identifies a person on its own.', ...where })
+        continue
+      }
+      const why = `The licence number matches but the name does not — "${r.who ?? '(no name)'}" against "${p.name ?? '(no name)'}" — so a person needs to look.`
+      out.push({ owingId: r.id, matchedOn: 'licence', agreement, verdict: 'review', why, ...where })
+      if (opts.raiseReviews !== false) await raiseReview(r.id, p, key, 'licence', agreement, why)
+      continue
+    }
+
+    /** A birthday that AGREES corroborates a near name the way a second contact point would. */
+    if (agreement === 'unsure' && dob && r.their_dob && dob === r.their_dob) {
+      const point0 = r.matched_on === 'email' ? 'email address' : 'phone number'
+      out.push({ owingId: r.id, matchedOn: r.matched_on, agreement, verdict: 'flag',
+        why: `The ${point0} and the date of birth both match and the name is close.`, ...where })
       continue
     }
 
@@ -223,7 +376,15 @@ async function raiseReview(
      ON CONFLICT (owing_id, person_key) DO NOTHING`,
     [owingId, p.userId ?? null, p.name ?? null, p.email ?? null, p.phone ?? null,
      key, matchedOn, agreement, why],
-  ).catch(() => { /* the answer the caller asked for matters more than the note */ })
+  ).catch((err) => {
+    // The answer the caller asked for still matters more than the note, so
+    // this does not throw. But it must not be silent either: on 10/29 a
+    // widened match point hit the old CHECK here and the close call it was
+    // raising disappeared — the flag read "not them" and no person was ever
+    // asked to look.
+    logger.error({ err, owingId, matchedOn, key },
+      '[left-owing] could not put a close call in front of a person')
+  })
 }
 
 /**
@@ -241,8 +402,18 @@ export async function leftOwingFlagFor(
 ): Promise<LeftOwingFlag> {
   const none: LeftOwingFlag = { flagged: false, count: 0, words: '' }
   if (!person || !askingLandlordIds.length) return none
-  const count = (await debtsMatching(person, askingLandlordIds)).filter(d => d.verdict === 'flag').length
-  return count > 0 ? { flagged: true, count, words: LEFT_OWING_WORDS } : none
+  const flagged = (await debtsMatching(person, askingLandlordIds)).filter(d => d.verdict === 'flag')
+  if (flagged.length === 0) return none
+  // Only when EVERY debt is an import does it drop to a watch-list note: one
+  // real GAM balance in the set is still a debt that needs settling, and the
+  // softer words would bury it.
+  const watchOnly = flagged.every(d => d.watchOnly)
+  return {
+    flagged: true,
+    count: flagged.length,
+    words: watchOnly ? LEFT_OWING_WATCH_WORDS : LEFT_OWING_WORDS,
+    watchOnly,
+  }
 }
 
 /** STEP ONE: the month and the place. No amount, nobody named. */
@@ -252,6 +423,36 @@ export interface WhereAndWhen {
   when: string | null
   /** "Las Vegas, NV" — the town, never the park and never the landlord. */
   where: string | null
+  /** "over $500" — a band, never the figure (amountBand). */
+  about: string | null
+  /**
+   * True for a balance imported from another platform. Nic 10/27: those are
+   * "only a kind of watch list... not rentable" is explicitly NOT what they
+   * mean, and nothing is ever collected on them.
+   */
+  watchOnly: boolean
+}
+
+/**
+ * 10/27 (Nic) — AN APPROXIMATE FIGURE, NOT THE FIGURE.
+ *
+ *   "I think initial site needs to say... this area, like maybe this city and
+ *    this month and an approximate, like if it's like $600 or something, it'll
+ *    say over $500."
+ *
+ * Rounded DOWN to the nearest $500, so the band never overstates what somebody
+ * owes — "over $500" on a $600 debt, "over $1,000" on $1,200. Under the first
+ * boundary it says "under $500" rather than "over $0", which would read as an
+ * accusation of nothing.
+ *
+ * The exact figure stays in the table and goes to a GAM admin only. A band is
+ * enough for the thing a landlord actually decides with it, and an exact number
+ * would identify the debt to anyone who already knew the park.
+ */
+export function amountBand(amount: number | null | undefined): string | null {
+  if (!Number.isFinite(amount as number) || (amount as number) <= 0) return null
+  const floor = Math.floor((amount as number) / 500) * 500
+  return floor <= 0 ? 'under $500' : `over $${floor.toLocaleString('en-US')}`
 }
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
@@ -283,7 +484,8 @@ export async function whereAndWhen(args: {
   // is the one thing this whole file exists to prevent.
   const rows = (await debtsMatching(args.person ?? args.userId, args.askingLandlordIds))
     .filter(d => d.verdict === 'flag')
-    .map(d => ({ id: d.owingId, left_on: d.leftOn, city: d.city, state: d.state }))
+    .map(d => ({ id: d.owingId, left_on: d.leftOn, city: d.city, state: d.state,
+                 about: d.about, watchOnly: d.watchOnly }))
 
   // Written down because a landlord who looked should be on the record as
   // having looked — and because the second door, when it lands, has to be able
@@ -300,6 +502,8 @@ export async function whereAndWhen(args: {
     owingId: r.id,
     when: monthInWords(r.left_on),
     where: [r.city, r.state].filter(Boolean).join(', ') || null,
+    about: r.about,
+    watchOnly: r.watchOnly,
   }))
 }
 

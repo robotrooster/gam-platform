@@ -1,5 +1,5 @@
 /**
- * S639 (Nic): "I accidentally put Gerald Logue as a lower case, and I have no
+ * S639 (Nic): "I accidentally put Alan Mercer as a lower case, and I have no
  * way to change that invite."
  *
  * The rule is deliberately narrow: fix a name typed in ONE case, leave anything
@@ -15,11 +15,11 @@ import { normalizePersonName } from './index'
 
 describe('normalizePersonName', () => {
   it('fixes the mistake actually reported', () => {
-    expect(normalizePersonName('gerald')).toBe('Gerald')
+    expect(normalizePersonName('alan')).toBe('Alan')
   })
 
   it('fixes shouting too', () => {
-    expect(normalizePersonName('ANASTACIO ERREGUIN')).toBe('Anastacio Erreguin')
+    expect(normalizePersonName('ANASTASIO VILLALOBOS')).toBe('Anastasio Villalobos')
   })
 
   it('capitalizes after an apostrophe or hyphen', () => {

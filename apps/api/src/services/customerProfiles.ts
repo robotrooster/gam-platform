@@ -217,12 +217,15 @@ export async function appearancesForAdmin(
       'Only GAM staff can see everywhere a customer appears. A business sees the people it deals with.')
   }
   const rows = await query<any>(
-    `SELECT kind, ref_id, landlord_id, business_id, matched_on, created_at::text AS created_at
+    // The cast is aliased away from the column so ORDER BY means the
+    // timestamp. A timestamptz rendered as text sorts by its clock reading
+    // before its offset, so across a DST change the text order inverts.
+    `SELECT kind, ref_id, landlord_id, business_id, matched_on, created_at::text AS linked_at
        FROM customer_profile_links WHERE profile_id = $1 ORDER BY created_at`,
     [profileId])
   return rows.map(r => ({
     kind: r.kind, refId: r.ref_id, landlordId: r.landlord_id, businessId: r.business_id,
-    matchedOn: r.matched_on ?? [], linkedAt: r.created_at,
+    matchedOn: r.matched_on ?? [], linkedAt: r.linked_at,
   }))
 }
 

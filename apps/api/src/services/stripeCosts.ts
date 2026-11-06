@@ -1571,7 +1571,7 @@ export async function marginForMonth(month: string, exec?: SqlExec): Promise<Mar
 // 10/3: the card said $1,336.55. GAM's own was $318.76 — and of that, $75.88
 // was background-check money applicants paid that is Checkr's, and $6.85 the
 // fees on two bank payments still clearing. The rest of the gap ($1,017.79) was
-// Mireya Fierro's and Randall Cox's rent: bank payments still clearing sit in
+// Jarrah Mortmain's and Osric Rookwood's rent: bank payments still clearing sit in
 // Stripe's pending balance the moment Stripe records them, but GAM books the
 // landlord's share only when they settle, so the card counted landlords' rent
 // as GAM's. Every part of the balance is now named, and the card checks itself

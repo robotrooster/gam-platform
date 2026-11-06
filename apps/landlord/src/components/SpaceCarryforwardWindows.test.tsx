@@ -4,7 +4,7 @@
  *
  *   "I wanted to get the payment arrangement situation set up first, and I
  *    wanted to get the setup correctly so I can I want to go through and mark
- *    Rashawn as moved out in the system when it's time to do that."
+ *    Phaedra as moved out in the system when it's time to do that."
  *
  * What a screen can get wrong that the engine cannot:
  *
@@ -75,8 +75,8 @@ import { SpaceCarriedBalanceModal } from './SpaceCarriedBalanceModal'
 
 /** MH 09's live figures: $880 carries, $1,051 stays, $95 of late fees go. */
 const preview = (over: any = {}) => ({
-  leaseId: 'L-rashawn', unitId: 'u-mh09', spaceName: 'MH 09', propertyId: 'p-oak', propertyName: 'Oak Park',
-  landlordId: 'll-1', departingTenantId: 't-rashawn', departingTenantName: 'Rashawn Bump',
+  leaseId: 'L-phaedra', unitId: 'u-mh09', spaceName: 'MH 09', propertyId: 'p-oak', propertyName: 'Oak Park',
+  landlordId: 'll-1', departingTenantId: 't-phaedra', departingTenantName: 'Phaedra Stanhope',
   dwellingOwnership: 'tenant', recordedHomeOwnerName: null, eligible: true, reason: null,
   carries: [
     { id: 'r1', type: 'rent', amount: 440, dueDate: '2026-09-01', label: 'Space rent', detail: null },
@@ -100,13 +100,13 @@ const balance = (over: any = {}) => ({
   id: 'cf-1', unitId: 'u-mh09', spaceName: 'MH 09', propertyName: 'Oak Park',
   amount: 880, settledAmount: 0, stillOwed: 880, lateFeesWaived: 95, status: 'open',
   openedOn: '2026-10-19', oldestDueDate: '2026-09-01', settledOn: null, takenOffOn: null,
-  owedByName: 'Rashawn Bump', assumedByName: null, assumedLeaseId: null,
+  owedByName: 'Phaedra Stanhope', assumedByName: null, assumedLeaseId: null,
   chargeLabel: 'Unpaid space rent left on this space by the previous owner of the home',
   arrangement: null, installments: [], role: 'origin',
   ...over,
 })
 
-const lease = { id: 'L-rashawn', unitNumber: 'MH 09', propertyName: 'Oak Park', names: 'Rashawn Bump' }
+const lease = { id: 'L-phaedra', unitNumber: 'MH 09', propertyName: 'Oak Park', names: 'Phaedra Stanhope' }
 
 let host: HTMLDivElement
 let root: Root
@@ -158,7 +158,7 @@ async function openBalance(opts: { canArrange?: boolean; canTakeOff?: boolean } 
   await act(async () => {
     root.render(
       <QueryClientProvider client={qc()}>
-        <SpaceCarriedBalanceModal leaseId="L-rashawn" onClose={onClose}
+        <SpaceCarriedBalanceModal leaseId="L-phaedra" onClose={onClose}
           canArrange={opts.canArrange ?? true} canTakeOff={opts.canTakeOff ?? true} />
       </QueryClientProvider>)
   })
@@ -176,7 +176,7 @@ describe('the window that closes a departing resident out', () => {
     expect(text()).toContain("Becomes MH 09's balance")
     expect(text()).toContain('$880.00')
     // 2. what stays the departing resident's own debt
-    expect(text()).toContain("Stays Rashawn Bump's own debt")
+    expect(text()).toContain("Stays Phaedra Stanhope's own debt")
     expect(text()).toContain('$1,051.00')
     // 3. what late fees are voided
     expect(text()).toContain('Dropped outright')
@@ -287,7 +287,7 @@ describe('the window that shows what a space carries', () => {
     await openBalance()
     expect(text()).toContain('MH 09')
     expect(text()).toContain('$880.00')
-    expect(text()).toContain('Rashawn Bump')
+    expect(text()).toContain('Phaedra Stanhope')
     expect(text()).toContain('Still owed')
     expect(text()).toContain('Unpaid space rent left on this space by the previous owner of the home')
     // The status reads in words, never the enum value.
@@ -392,7 +392,7 @@ describe('the window that shows what a space carries', () => {
     await press(/Take this balance off/)
     // No native confirm: the question is in the window, with the figures.
     expect(text()).toMatch(/Take \$780\.00 off and nobody is asked for it again/)
-    expect(text()).toContain('Rashawn Bump')
+    expect(text()).toContain('Phaedra Stanhope')
     expect(text()).toMatch(/\$100\.00 already paid stays recorded/)
     expect(server.posts).toEqual([])
 

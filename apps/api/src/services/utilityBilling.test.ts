@@ -240,8 +240,10 @@ describe('generateBillsForMeter — unit/reading gates', () => {
 describe('generateBillsForMeter — submeter', () => {
   async function seedSubmeterWithUnit(opts: {
     rate?: number; base?: number; tenantResponsible?: boolean
+    /** 10/31: reuse a property, so comparable neighbours can be seeded beside a meter. */
+    reuse?: BaseCtx
   } = {}): Promise<{ meterId: string; unitId: string; tenantId: string; base: BaseCtx }> {
-    const base = await seedBaseProperty()
+    const base = opts.reuse ?? await seedBaseProperty()
     const c = await db.connect()
     let meterId = ''
     try {
@@ -336,13 +338,198 @@ describe('generateBillsForMeter — submeter', () => {
     ).resolves.not.toThrow()
   })
 
-  it('negative usage (meter rollback) → noop with reason; no bill', async () => {
-    const { meterId, base } = await seedSubmeterWithUnit()
+  // ── 10/31 (Nic): THE DIAL MOVED, SO THAT MOVEMENT BILLS ──────────────────
+  //
+  //   "It's defensible to go by what's on the meter. If the meter turned
+  //    backwards, that's the number we're going to go off of."
+  //
+  // Mountain View's old discs run backwards for months, then stall, then climb
+  // again, with nobody touching the wiring. The alternative in practice was the
+  // landlord re-keying a number by hand to force the series upward, which on
+  // RV 25 billed 467 and 675 kWh against a park median of 115 and 166.
+  it('a dial that ran backwards bills the movement as usage', async () => {
+    const { meterId, unitId, base } = await seedSubmeterWithUnit({ rate: 0.05, base: 0 })
     await seedReading(meterId, '2026-04-01', 1000, base.landlordUserId)
     await seedReading(meterId, '2026-05-01',  900, base.landlordUserId)
     const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(res.billsCreated).toBe(1)
+    const { rows: [bill] } = await db.query<any>(
+      `SELECT usage_amount::float AS usage, charge_amount::float AS charge
+         FROM utility_bills WHERE meter_id = $1 AND unit_id = $2`, [meterId, unitId])
+    expect(bill.usage).toBe(100)            // |900 − 1000|
+    expect(bill.charge).toBeCloseTo(5, 2)   // 100 × 0.05
+    // The meter is NOT marked broken — it is reading, just downward.
+    const meter = await db.query(`SELECT out_of_service FROM utility_meters WHERE id = $1`, [meterId])
+    expect(meter.rows[0].out_of_service).toBe(false)
+  })
+
+  // ── 10/31 (Nic): A UNIT OR TWO DOWN IS THE MARGIN OF ERROR, NOT A ROLLBACK ─
+  //
+  //   "I thought we built a thing to kind of ignore the rollback by just like a
+  //    single digit. That's within a margin of error, especially on some of
+  //    these old meters where the dial is kind of whatever."
+  //
+  // Mountain View RV 37 read 64063 then 64062 and held its whole run for that
+  // one unit. READING_BARELY_MOVED_UNITS already said a drop of one or two is a
+  // rounding error or a face that is not turning; it just was not wired into
+  // the stuck test, which demanded a delta of exactly zero. Treating it as a
+  // ROLLBACK would be worse than the old flag: at a property that estimates it
+  // would bill a comparable estimate off a rounding error.
+  it('a one-unit drop is the stuck-meter case, never a rollback', async () => {
+    const { meterId, base } = await seedSubmeterWithUnit()
+    await seedReading(meterId, '2026-04-01', 64063, base.landlordUserId)
+    await seedReading(meterId, '2026-05-01', 64062, base.landlordUserId)
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
     expect(res.billsCreated).toBe(0)
-    expect(res.reason).toMatch(/negative usage/)
+    // The stuck-meter sentence, not the rollback one — and this property does
+    // not estimate, so nothing is billed.
+    expect(res.reason).toMatch(/meter not reading/)
+    expect(res.reason).not.toMatch(/negative/)
+  })
+
+  // ── 10/31 (Nic): A HEAVY USER IS NOT ESTIMATED OFF THE PARK FLOOR ─────────
+  //
+  // Mountain View RV 39's dial stopped at 54100 and has jittered within a
+  // hundred of it ever since. The household runs about 786 kWh a month (the
+  // landlord's own earlier reads: 801, 728, 837, 349, 1,215). The park median
+  // those months was 115 and 166, floor near zero — so the comparable estimate
+  // would have under-billed by roughly $130 every month the meter stayed dead.
+  // GAM cannot work her figure out for itself: every read it holds for that
+  // meter is jitter, and her real history was in the landlord's old system.
+  it("a broken meter uses the landlord's stated usage instead of the park's low end", async () => {
+    const { meterId, unitId, base } = await seedSubmeterWithUnit({ rate: 0.21, base: 0 })
+    await db.query(`UPDATE properties SET estimates_stuck_meters = TRUE WHERE id = $1`, [base.propertyId])
+    await db.query(
+      `UPDATE utility_meters SET expected_monthly_usage = 786, expected_usage_set_at = NOW() WHERE id = $1`,
+      [meterId])
+    // A face that did not move on an occupied space — the broken path.
+    await seedReading(meterId, '2026-04-01', 54000, base.landlordUserId)
+    await seedReading(meterId, '2026-05-01', 54000, base.landlordUserId)
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(res.billsCreated).toBe(1)
+    const { rows: [bill] } = await db.query<any>(
+      `SELECT usage_amount::float AS usage, charge_amount::float AS charge, allocation_method
+         FROM utility_bills WHERE meter_id = $1 AND unit_id = $2`, [meterId, unitId])
+    expect(bill.usage).toBe(786)
+    expect(bill.charge).toBeCloseTo(165.06, 2)      // 786 × 0.21
+    // Still recorded as an estimate, so the landlord can void it if the meter
+    // turns out to have been fine (services/meterRepair flaggedPeriodEstimates).
+    expect(bill.allocation_method).toBe('comparable_low')
+  })
+
+  // ── 10/31 (Nic): THE UPPER END OF THE SPREAD, NOT THE TOP OF IT ───────────
+  //
+  //   "I'd like a way to flag high usage people as billing kind of not the
+  //    highest in the park, but on the upper end of the spectrum... The RV zoos
+  //    have 4 people in that RV, 2 young kids... There's a difference between
+  //    that and a single person that's working 12-hour shifts."
+  //
+  // The band moves WHERE in the neighbours' usage a broken meter estimates. It
+  // never touches a meter that reads, and 'upper' is the 75th percentile rather
+  // than the maximum so one heavy outlier cannot set somebody else's bill.
+  it("estimates a broken meter at the band the landlord put the household in", async () => {
+    const pick = async (band: string) => {
+      const first = await seedSubmeterWithUnit({ rate: 1, base: 0 })
+      const base = first.base
+      await db.query(`UPDATE properties SET estimates_stuck_meters = TRUE WHERE id = $1`, [base.propertyId])
+      await db.query(`UPDATE utility_meters SET usage_band = $2 WHERE id = $1`, [first.meterId, band])
+      // Five occupied neighbours on the SAME property this cycle: 100..500.
+      for (const used of [100, 200, 300, 400, 500]) {
+        const n = await seedSubmeterWithUnit({ rate: 1, base: 0, reuse: base })
+        await seedReading(n.meterId, '2026-04-01', 1000, base.landlordUserId)
+        await seedReading(n.meterId, '2026-05-01', 1000 + used, base.landlordUserId)
+      }
+      // The broken one: a face that did not move on an occupied space.
+      await seedReading(first.meterId, '2026-04-01', 7000, base.landlordUserId)
+      await seedReading(first.meterId, '2026-05-01', 7000, base.landlordUserId)
+      await generateBillsForMeter(first.meterId, new Date(2026, 4, 1))
+      const { rows } = await db.query<any>(
+        `SELECT usage_amount::float AS usage FROM utility_bills WHERE meter_id = $1 AND unit_id = $2`,
+        [first.meterId, first.unitId])
+      return rows[0]?.usage ?? null
+    }
+    // Nearest-rank over 100..500: 25th -> 200, 50th -> 300, 75th -> 400.
+    // Always a figure a real neighbour actually had, never the 500 outlier.
+    expect(await pick('low')).toBe(200)
+    expect(await pick('typical')).toBe(300)
+    expect(await pick('upper')).toBe(400)
+  })
+
+  it('clusterAt is nearest-rank: every answer is a real neighbour\'s figure', async () => {
+    const { clusterAt } = await import('./utilityBilling')
+    const xs = [100, 200, 300, 400, 500]
+    expect(clusterAt(xs, 0.25)).toBe(200)
+    expect(clusterAt(xs, 0.50)).toBe(300)
+    expect(clusterAt(xs, 0.75)).toBe(400)
+    expect(clusterAt([42], 0.75)).toBe(42)          // one neighbour is the answer
+    expect(clusterAt(xs, 1)).toBe(500)              // never past the end
+  })
+
+  // ── 10/31 (Nic): A VACANT SPOT OFF BY ONE OR TWO IS HANDLED SILENTLY ──────
+  //
+  //   "On a vacant spot when the meter read is off by only one or two, either
+  //    forward or backward, it just needs to use that as the base... I don't
+  //    want to be involved with every fucking meter that's off by just one spot.
+  //    Especially in a slow season when a bunch of vacant spaces may be off by
+  //    one or two."
+  //
+  // Downward was already silent (the margin clamps usage to zero). Upward was
+  // not: one turn times the rate is a charge above zero, so every empty space
+  // that ticked raised a "nobody could be billed for this" notice.
+  it('an empty spot that ticked one or two turns raises no notice, either way', async () => {
+    const quiet = async (from: number, to: number) => {
+      const { meterId, base } = await seedSubmeterWithUnit({ rate: 0.21, base: 0 })
+      // No lease on the space at all — nobody to bill.
+      await db.query(`DELETE FROM leases WHERE unit_id IN
+        (SELECT unit_id FROM utility_meter_units WHERE meter_id = $1)`, [meterId])
+      await seedReading(meterId, '2026-04-01', from, base.landlordUserId)
+      await seedReading(meterId, '2026-05-01', to, base.landlordUserId)
+      await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+      const { rows } = await db.query<any>(
+        `SELECT COUNT(*)::int AS n FROM notifications
+          WHERE type = 'utility_usage_unbilled' AND data->>'meterId' = $1`, [meterId])
+      return rows[0].n
+    }
+    expect(await quiet(50000, 50001)).toBe(0)   // one turn up
+    expect(await quiet(50000, 50002)).toBe(0)   // two turns up
+    expect(await quiet(50000, 49999)).toBe(0)   // one turn down
+    // Three turns is a real figure and the landlord still hears about it.
+    expect(await quiet(50000, 50003)).toBe(1)
+  })
+
+  it('a meter that READS is never touched by the stated usage', async () => {
+    const { meterId, unitId, base } = await seedSubmeterWithUnit({ rate: 0.21, base: 0 })
+    await db.query(
+      `UPDATE utility_meters SET expected_monthly_usage = 786, expected_usage_set_at = NOW() WHERE id = $1`,
+      [meterId])
+    await seedReading(meterId, '2026-04-01', 54000, base.landlordUserId)
+    await seedReading(meterId, '2026-05-01', 54100, base.landlordUserId)   // moved 100
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(res.billsCreated).toBe(1)
+    const { rows: [bill] } = await db.query<any>(
+      `SELECT usage_amount::float AS usage, allocation_method FROM utility_bills
+        WHERE meter_id = $1 AND unit_id = $2`, [meterId, unitId])
+    expect(bill.usage).toBe(100)                 // its own reads, not 786
+    expect(bill.allocation_method).toBe('submeter')
+  })
+
+  it('a two-unit drop is the margin of error; three units is movement that bills', async () => {
+    const two = await seedSubmeterWithUnit()
+    await seedReading(two.meterId, '2026-04-01', 500, two.base.landlordUserId)
+    await seedReading(two.meterId, '2026-05-01', 498, two.base.landlordUserId)
+    const r2 = await generateBillsForMeter(two.meterId, new Date(2026, 4, 1))
+    expect(r2.billsCreated).toBe(0)
+    expect(r2.reason).toMatch(/meter not reading/)
+
+    // Three units down is past the margin, so it is real movement and bills.
+    const three = await seedSubmeterWithUnit({ rate: 0.05, base: 0 })
+    await seedReading(three.meterId, '2026-04-01', 500, three.base.landlordUserId)
+    await seedReading(three.meterId, '2026-05-01', 497, three.base.landlordUserId)
+    const r3 = await generateBillsForMeter(three.meterId, new Date(2026, 4, 1))
+    expect(r3.billsCreated).toBe(1)
+    const { rows: [bill] } = await db.query<any>(
+      `SELECT usage_amount::float AS usage FROM utility_bills WHERE meter_id = $1`, [three.meterId])
+    expect(bill.usage).toBe(3)
   })
 
   it('happy: charge = usage × rate + base_fee', async () => {
@@ -2724,7 +2911,7 @@ describe('S637 — flat-rate meters bill ahead only, never on a catch-up sweep',
 // The estimation existed, but fired only for a meter someone had flagged
 // out_of_service BY HAND — and not one meter in the system had ever been
 // flagged. So a submeter reading the identical number two cycles running billed
-// NOTHING, and Chris Ast paid a month at Mountain View RV 07 with no
+// NOTHING, and Orin Oakhurst paid a month at Mountain View RV 07 with no
 // electricity on it at all.
 describe('S637 stuck meter on an occupied spot', () => {
   const CYCLE = '2026-09-01'

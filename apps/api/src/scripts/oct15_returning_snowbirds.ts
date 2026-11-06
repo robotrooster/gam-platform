@@ -1,6 +1,6 @@
 /**
- * 10/15 (Nic, urgent): "I've drafted two leases, one for Kay Howard and one for
- * Clint Cook. I forgot to do that through the workflow of them having been here
+ * 10/15 (Nic, urgent): "I've drafted two leases, one for Verity Winthrop and one for
+ * Quill Quarrier. I forgot to do that through the workflow of them having been here
  * before ... I want you to hurry and migrate those so that they don't get
  * prompted for the background check because they're two of my snowbirds that
  * come seasonally."
@@ -26,8 +26,8 @@ const PROPERTY = 'dcccb7b8-7ac9-4ec2-b3ff-40bde536df01'
 const NIC = '8b2f26ad-173a-45cb-9c59-f7a27bfa81e3'
 
 const PEOPLE = [
-  { who: 'Kay Howard', tenantId: '52af5509-10a3-429a-9f97-88aef59269a4', unit: 'RV 21' },
-  { who: 'Clint Cook', tenantId: '1a61b0f4-1e35-4523-baa6-3b83bbd7ebe2', unit: 'RV 18' },
+  { who: 'Verity Winthrop', tenantId: '52af5509-10a3-429a-9f97-88aef59269a4', unit: 'RV 21' },
+  { who: 'Quill Quarrier', tenantId: '1a61b0f4-1e35-4523-baa6-3b83bbd7ebe2', unit: 'RV 18' },
 ]
 
 async function state(tenantId: string) {

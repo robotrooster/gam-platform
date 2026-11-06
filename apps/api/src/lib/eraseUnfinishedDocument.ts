@@ -295,6 +295,7 @@ export function leaseInUseSql(l: string, d = 'd'): string {
        OR ${onLease('tenant_complaints')}
        OR ${onLease('documents')}
        OR ${onLease('liability_insurance_policies')}
+       OR ${onLease('insurance_policies')}
        OR ${onLease('stay_checkout_decisions')}
        OR ${onLease('seasonal_tenancies')}
        OR ${onLease('lease_renewal_requests')}

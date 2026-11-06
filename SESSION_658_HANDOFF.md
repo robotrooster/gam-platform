@@ -242,7 +242,7 @@ so a future reader would grep for them and find nothing.
 - **Printing is always light.** A balance summary printed in dark mode came out
   a solid black sheet and wasted a cartridge. `installPrintLightTheme()` in all
   eleven portals, plus a CSS backstop. See `PRINT_FIX_NOTE.md`.
-- **Lisa Scheeler's card.** It took its due date from the earliest charge on the
+- **Calla Fitzhugh's card.** It took its due date from the earliest charge on the
   bill whether or not anything was owed on it — her work-trade rent is suspended
   on the 1st and her trailer payment is the 10th, so it read "Due Oct 1" and
   would have gone red on the 2nd. Now the date comes from the oldest thing
@@ -328,8 +328,8 @@ now — the page is open, the person clicks.
 ## One thing worth a sweep
 
 The repo is **public**, and code comments throughout name real residents
-alongside their payment problems (this session added Lisa Scheeler; the pattern
-predates it — Shane Rueff, Kim Bowman and others are already in there). I kept
+alongside their payment problems (this session added Calla Fitzhugh; the pattern
+predates it — Xenia Cholmondeley, Xander Allerton and others are already in there). I kept
 to the existing convention rather than inventing a new one mid-deploy, but it is
 worth a deliberate decision about whether real names belong in a public
 repository.
@@ -340,7 +340,7 @@ repository.
 
 ## The tick boxes are gone from the desk window
 
-Lisa Scheeler stood at the counter with cash for her trailer payment and every
+Calla Fitzhugh stood at the counter with cash for her trailer payment and every
 way of paying by hand was greyed out. 10/14 had given each bill a tick box and
 gated Cash / Check / Money order on it; "Card on the reader" was the one button
 never gated, which is why it was the only one that worked. She had ONE open

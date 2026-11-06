@@ -161,7 +161,7 @@ describe('a dispute GAM wins on its own fee pull', () => {
     const costCharge = (await db.query<{ id: string }>(
       `SELECT id FROM landlord_gam_charges WHERE landlord_id = $1 AND source_type = 'gam_bank_debit_disputed'`, [co.landlordId])).rows[0].id
     const lines = (await db.query<{ id: string; source_id: string; amount: string }>(
-      `SELECT id, source_id, amount::text FROM held_payout_items WHERE landlord_id = $1 AND source_type = 'refund' ORDER BY amount`,
+      `SELECT id, source_id, amount::text FROM held_payout_items WHERE landlord_id = $1 AND source_type = 'refund' ORDER BY held_payout_items.amount`,
       [co.landlordId])).rows
     expect(lines.map(l => [l.source_id, l.amount])).toEqual([
       [gamChargeVoidedGiveBackSourceId(costCharge), '15.27'],

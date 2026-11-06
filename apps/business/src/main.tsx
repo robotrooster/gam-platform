@@ -43,6 +43,7 @@ import { POSPage } from './pages/POSPage'
 import { DiscountsPage } from './pages/DiscountsPage'
 import { PayoutsPage } from './pages/PayoutsPage'
 import { WorkOrdersPage } from './pages/WorkOrdersPage'
+import { ContractorBidsPage } from './pages/ContractorBidsPage'
 import { CustomerVehiclesPage } from './pages/CustomerVehiclesPage'
 import { QuotesPage } from './pages/QuotesPage'
 import { ReportsPage } from './pages/ReportsPage'
@@ -92,6 +93,7 @@ function App() {
             <Route path="/discounts"    element={<DiscountsPage />} />
             <Route path="/payouts"      element={<PayoutsPage />} />
             <Route path="/work-orders"  element={<WorkOrdersPage />} />
+            <Route path="/job-bids"     element={<ContractorBidsPage />} />
             <Route path="/customer-vehicles" element={<CustomerVehiclesPage />} />
             <Route path="/quotes"       element={<QuotesPage />} />
             <Route path="/reports"      element={<ReportsPage />} />

@@ -1,11 +1,11 @@
 /**
  * 10/12 (Nic) — "$0 lines are ignored."
  *
- * Gerald Logue's October bill carried a $0.00 electric line (his August
+ * Arlo Braddock's October bill carried a $0.00 electric line (his August
  * reading, 49083 → 49083, released when he signed): the monthly run wrote a
  * line for a reading that billed nothing. It read like rent on his profile,
  * counted against his payment health and kept his late fees running. And a
- * $0 line recorded as paid earned a credit mark (Ignacio Gutierrez).
+ * $0 line recorded as paid earned a credit mark (Flint Grantham).
  *
  *   - the monthly run writes no line for a $0 reading: it is marked billed
  *     (read, charged nothing) and never picked up again;
@@ -91,7 +91,7 @@ describe('a $0 line and the credit history', () => {
     `SELECT e.event_type, e.event_data FROM credit_events e JOIN credit_subjects cs ON cs.id = e.subject_id
       WHERE cs.subject_ref_id = $1 AND e.event_type LIKE 'payment_received_%' AND e.superseded_by IS NULL`, [tenantId])).rows
 
-  it('a $0 line recorded as paid earns no mark (Ignacio Gutierrez\'s $0.00 electric)', async () => {
+  it('a $0 line recorded as paid earns no mark (Flint Grantham\'s $0.00 electric)', async () => {
     const s = await stack([])
     const id = await zeroLine(s, 'Electric meter 00645 → 00645 · 0 kWh — Recorded as manual cash payment')
     await tx(c => emitPaymentSettledEvent(c, {

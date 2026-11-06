@@ -970,6 +970,37 @@ export async function writeCheckOut(client: PoolClient, s: StayRow, leftOn: stri
                 ...(opts.key ? { checkout_key: opts.key } : {}), ...(opts.endsLease ? { ends_lease: true } : {}) },
     })
   }
+
+  // ── 10/29 (Nic): A STAY THAT ENDS OWING BECOMES A DEBT ──────────────────
+  //
+  //   "If they leave without paying their last electric bill and do the same
+  //    thing next month at another place and the same thing a third month at a
+  //    third place, nothing..."
+  //
+  // Until now the only thing that recorded a departing resident's balance was
+  // a LEASE move-out, so the mobile guest this product exists for drove off
+  // leaving no trace — nothing to flag at the next park, nothing for the
+  // collection machinery to collect. The debt is raised against the guest's
+  // own name and phone, which every booking carries.
+  //
+  // Best-effort on purpose: a guest must never be stuck at the desk because a
+  // debt could not be written. It is idempotent per booking, so the next
+  // check-out press catches it up.
+  try {
+    const { stayDebtOnCheckOut } = await import('./leftOwingCollection')
+    const raised = await stayDebtOnCheckOut({ client, bookingId: s.id })
+    if (raised) {
+      await recordBookingEvent({
+        ...base, eventType: 'status_changed',
+        summary: `${who} checked out owing ${money(raised.amount)} — recorded as a balance they left owing`,
+        detail: { left_owing: raised.amount, owing_id: raised.owingId },
+      })
+    }
+  } catch (e) {
+    logger.error({ err: e, booking_id: s.id },
+      '[checkout] a balance left owing could not be recorded')
+  }
+
   return { newOut, early }
 }
 
@@ -2593,8 +2624,17 @@ export async function tellOwnerMoneyWaits(bookingId: string): Promise<void> {
  * not go out (refundNeedsRetrySql), and a long stay whose lease did not end on
  * the day they left. Each opens the stay's Check out window.
  */
-export async function pendingMoneyTodos(landlordIds: readonly string[]): Promise<Array<{ id: string; type: string; title: string; subtitle: string; href: string }>> {
+export async function pendingMoneyTodos(
+  landlordIds: readonly string[],
+  // 10/29 (Nic): the to-do list narrows with the rest of the dashboard. Its
+  // two siblings (paidAheadChoiceTodos, depositRefundTodos) already took this;
+  // this one did not, so the stay-money tasks were the last ones that stayed
+  // blended. null means every property, as before.
+  opts: { propertyIds?: readonly string[] | null } = {},
+): Promise<Array<{ id: string; type: string; title: string; subtitle: string; href: string }>> {
   if (!landlordIds.length) return []
+  const props = opts.propertyIds == null ? null : [...opts.propertyIds]
+  if (props && !props.length) return []
   const retry = await query<any>(
     `SELECT b.id AS booking_id, b.unit_id, b.guest_name, u.unit_number, p.name AS property_name,
             (SELECT SUM(rp.amount) FROM stay_refund_parts rp JOIN stay_checkout_decisions sd ON sd.id = rp.decision_id
@@ -2603,14 +2643,16 @@ export async function pendingMoneyTodos(landlordIds: readonly string[]): Promise
        FROM unit_bookings b
        JOIN units u ON u.id = b.unit_id JOIN properties p ON p.id = u.property_id
       WHERE b.landlord_id = ANY($1::uuid[]) AND ${refundNeedsRetrySql('b')}
-      ORDER BY b.updated_at`, [[...landlordIds]])
+        AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
+      ORDER BY b.updated_at`, [[...landlordIds], props])
   const leaseRuns = await query<any>(
     `SELECT b.id AS booking_id, b.unit_id, b.guest_name, u.unit_number, p.name AS property_name,
             to_char(b.check_out, 'YYYY-MM-DD') AS left_on
        FROM unit_bookings b JOIN leases l ON l.source_booking_id = b.id
        JOIN units u ON u.id = b.unit_id JOIN properties p ON p.id = u.property_id
       WHERE b.landlord_id = ANY($1::uuid[]) AND ${LEASE_RUNS_PAST_SQL}
-      ORDER BY b.updated_at`, [[...landlordIds]])
+        AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
+      ORDER BY b.updated_at`, [[...landlordIds], props])
   const extra = [
     ...retry.map((r) => ({
       id: `stay-refund-${r.booking_id}`,
@@ -2634,7 +2676,8 @@ export async function pendingMoneyTodos(landlordIds: readonly string[]): Promise
        JOIN unit_bookings b ON b.id = d.booking_id
        JOIN units u ON u.id = b.unit_id JOIN properties p ON p.id = u.property_id
       WHERE d.landlord_id = ANY($1::uuid[]) AND d.status = 'pending'
-      ORDER BY d.created_at`, [[...landlordIds]])
+        AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
+      ORDER BY d.created_at`, [[...landlordIds], props])
   return rows.map((r) => ({
     id: `stay-money-${r.booking_id}`,
     type: 'stay_money_decision',

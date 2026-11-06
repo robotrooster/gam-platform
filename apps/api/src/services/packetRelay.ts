@@ -3,7 +3,7 @@
  *
  * Nic: "it needs to be bundled as a true package." Until now every document in
  * a packet ran its own relay: the moment Blu signed one, that one went to the
- * tenant. Shane Rueff got nine "please sign" emails for Lot 11 in a morning,
+ * tenant. Xenia Cholmondeley got nine "please sign" emails for Lot 11 in a morning,
  * one per document, while Blu was still working through the packet.
  *
  * The rule now: a signer is invited to a packet ONCE, when everyone before

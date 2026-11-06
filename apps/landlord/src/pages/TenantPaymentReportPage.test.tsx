@@ -66,8 +66,8 @@ const line = (over: any = {}) => ({
 function report(over: any = {}) {
   return {
     householdId: 'g1',
-    members: [{ tenantId: 'g1', name: 'Gerald Logue', role: 'primary' }, { tenantId: 'g2', name: 'Gina Logue', role: 'co_tenant' }],
-    name: 'Gerald Logue',
+    members: [{ tenantId: 'g1', name: 'Arlo Braddock', role: 'primary' }, { tenantId: 'g2', name: 'Gina Braddock', role: 'co_tenant' }],
+    name: 'Arlo Braddock',
     leases: [{ leaseId: 'l1', propertyName: 'Mountain View', unitNumber: 'RV 48', status: 'active', leaseTypeLabel: 'Month to month',
       startDate: '2026-09-01', endDate: null, rentAmount: 495, rentDueDay: 1, graceDays: 5, graceSourceLabel: "the property's",
       firstLateDayText: 'the 6th',
@@ -141,8 +141,8 @@ describe('the tenant payment report', () => {
   it('the household, its health, the lease terms in words and how late — always days past grace', async () => {
     await render()
     expect(server.gets).toEqual(['/tenants/t1/payment-report'])
-    expect(text()).toContain('Payment report — Gerald Logue')
-    expect(text()).toContain('Household: Gerald Logue, Gina Logue')
+    expect(text()).toContain('Payment report — Arlo Braddock')
+    expect(text()).toContain('Household: Arlo Braddock, Gina Braddock')
     expect(text()).toContain('50%, 1 of 2 months')
     // 10/12: the first late day is the server's (services/lateness), never grace + 1.
     expect(text()).toContain("5 days (the property's) — late from the 6th")
@@ -258,7 +258,7 @@ describe('the tenant payment report', () => {
     server.report = report({ leaseId: 'l1' })
     await render('Payment report', '/tenants/t1/report?leaseId=l1')
     expect(server.gets).toEqual(['/tenants/t1/payment-report?leaseId=l1'])
-    expect(host.querySelector('.page-subtitle')?.textContent).toMatch(/^RV 48 · Mountain View · Household: Gerald Logue, Gina Logue/)
+    expect(host.querySelector('.page-subtitle')?.textContent).toMatch(/^RV 48 · Mountain View · Household: Arlo Braddock, Gina Braddock/)
   })
 
   it('partial payments: how many, the average first payment, the days to settle the rest, and what is still open', async () => {

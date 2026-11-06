@@ -2,6 +2,8 @@ import { useState } from 'react'
 import { useNavigate, useLocation, useSearchParams, Link, type NavigateFunction } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { useAuth } from '../context/AuthContext'
+import { PasskeySignIn } from '../../../../packages/shared-ui/Passkeys'
+import { apiGet, apiPost, apiDelete } from '../lib/api'
 
 // ── 10/13 (Nic): A NEW TEAM MEMBER, AND THE WAY BACK ─────────────────────────
 //
@@ -75,8 +77,17 @@ function usePendingOtpSession(key: string): [string | null, (v: string | null) =
 }
 
 
+// 10/30 (Nic): "a passkey replaces the emailed code." The shared component
+// speaks the portal's own API client — apiPost hands back the whole envelope,
+// and the component wants the payload.
+const passkeyApi = {
+  get:  (url: string) => apiGet(url),
+  post: (url: string, body?: any) => apiPost(url, body).then((r: any) => r.data),
+  del:  (url: string) => apiDelete(url),
+}
+
 export function LoginPage() {
-  const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp } = useAuth()
+  const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, loginWithPasskey } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
   const [searchParams] = useSearchParams()
@@ -265,14 +276,20 @@ export function LoginPage() {
           {/* 10/13: an account set up on an invitation that could not be signed in from the link. */}
           {joined && !err && <div className="alert alert-success" style={{marginBottom:16}}>Your account is set up. Sign in with {joined.email} and the password you just chose.</div>}
           {err && <div className="alert alert-danger" style={{marginBottom:16}}>{err}</div>}
+          {/* 10/30 (Nic): Face ID alone signs you in. Renders nothing on a
+              device with no sensor, so the password form below is unchanged for
+              everybody else. */}
+          <PasskeySignIn api={passkeyApi} onSignedIn={async s => { await loginWithPasskey(s); signedInGoTo() }} />
           <form onSubmit={handleSubmit(onSubmit)}>
             <div className="form-group">
               <label className="form-label">Email</label>
-              <input className="form-input" type="email" {...register('email',{required:true})} placeholder="you@example.com" autoFocus />
+              <input className="form-input" type="email" {...register('email',{required:true})} placeholder="you@example.com"
+                     autoComplete="username webauthn" name="email" autoFocus />
             </div>
             <div className="form-group">
               <label className="form-label">Password</label>
-              <input className="form-input" type="password" {...register('password',{required:true})} placeholder="••••••••" />
+              <input className="form-input" type="password" {...register('password',{required:true})} placeholder="••••••••"
+                     autoComplete="current-password" name="password" />
             </div>
             <button className="btn btn-primary w-full" type="submit" disabled={loading} style={{justifyContent:'center',marginTop:8}}>
               {loading ? <span className="spinner" /> : 'Sign in'}

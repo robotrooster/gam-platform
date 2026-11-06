@@ -38,6 +38,22 @@ describe('10/13: a live invitation token never reaches the log', () => {
     expect(redactLoggedUrl(undefined)).toBeUndefined()
   })
 
+  /**
+   * 10/29 (review): the same reasoning covers every PUBLIC route that carries
+   * a capability in its path, and two were missing. The guest licence-capture
+   * token is the worse of them: it never expires, and it is a WRITE capability
+   * over an identification a GAM admin may already have confirmed.
+   */
+  it('redacts the public guest-licence and pay-link tokens as well', () => {
+    const t = 'a'.repeat(48)
+    expect(redactLoggedUrl(`/api/public/id/${t}`)).toBe('/api/public/id/:token')
+    expect(redactLoggedUrl(`/api/public/id/${t}?x=1`)).toBe('/api/public/id/:token?x=1')
+    expect(redactLoggedUrl('/api/public/pay/deadbeef1234')).toBe('/api/public/pay/:token')
+    expect(redactLoggedUrl('/api/public/pay/deadbeef1234/done')).toBe('/api/public/pay/:token/done')
+    // An ordinary path is untouched, so a request stays traceable.
+    expect(redactLoggedUrl('/api/payments/123')).toBe('/api/payments/123')
+  })
+
   it("the request line's serializer writes the path without the token", () => {
     expect(httpLogSerializers.req({ id: 'r1', method: 'POST', url: `/api/invitations/${TOKEN}/accept`, headers: { a: 1 } }))
       .toEqual({ id: 'r1', method: 'POST', url: '/api/invitations/:token/accept' })

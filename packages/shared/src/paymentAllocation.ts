@@ -73,7 +73,7 @@ const priority = (p: AllocatablePayment): number =>
 
 /**
  * S655 (money plan §1.4): on the same due date, the order charges are paid in.
- * Kim Harland's rent, water and trash were all due the same day and created in
+ * Robin Nithsdale's rent, water and trash were all due the same day and created in
  * the same second; her $450 move-in special belongs on the rent, and only a
  * fixed type order puts it there every time.
  */

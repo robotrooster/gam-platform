@@ -146,6 +146,67 @@ describe('"Works, tenant uses no power" on a meter marked broken', () => {
     expect(fresh).toEqual([{ v: 0 }])
   })
 
+  // ── 10/31 (Nic): "IT WAS READING FINE — BILL ITS OWN READS" ──────────────
+  //
+  //   "on meter 22, mark it working again and make that bill use the used water
+  //    reading."
+  //
+  // The third way back into service, and the only one that keeps the usage.
+  // Country Acres Lot 22 was marked broken for reading 2072 twice and estimated
+  // a flat 1,000 gallons; then it read 2082 — ten turns, 1,000 real gallons.
+  // "Repaired" would have re-baselined to 2082 and billed nothing; "Works,
+  // nobody using it" would have billed $0.
+  describe('"It was reading fine" — back in service on its own reads', () => {
+    it('clears the broken mark, writes NO reading and claims NO zero use', async () => {
+      const p = await park({ estimates: false })
+      const s = await space(p, 'RV 22', 2072, 2082)
+      await broken(s.meterId)
+      const res = await patch(p, s.meterId, { outOfService: false, readsStand: true })
+      expect(res.status).toBe(200)
+      const m = await meterRow(s.meterId)
+      expect(m).toMatchObject({
+        out_of_service: false, out_of_service_since: null,
+        zero_use_confirmed_at: null, zero_use_confirmed_by_user_id: null,
+      })
+      // Nothing replaced: no meter_replaced read, and the reads it had stand.
+      const reads = (await db.query(
+        `SELECT reason FROM utility_meter_readings WHERE meter_id = $1 ORDER BY reading_date`,
+        [s.meterId])).rows
+      expect(reads.map((r: any) => r.reason)).toEqual(['monthly_cycle', 'monthly_cycle'])
+    })
+
+    it('is refused together with a replacement reading — they are opposite claims', async () => {
+      const p = await park({ estimates: false })
+      const s = await space(p, 'RV 23', 2072, 2082)
+      await broken(s.meterId)
+      const res = await patch(p, s.meterId,
+        { outOfService: false, readsStand: true, repairedStartingReading: 2082 })
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/throw away this cycle/i)
+      expect((await meterRow(s.meterId)).out_of_service).toBe(true)
+    })
+
+    it('is refused together with "nobody is using it"', async () => {
+      const p = await park({ estimates: false })
+      const s = await space(p, 'RV 24', 2072, 2082)
+      await broken(s.meterId)
+      const res = await patch(p, s.meterId,
+        { outOfService: false, readsStand: true, zeroUseConfirmed: true })
+      expect(res.status).toBe(400)
+      expect((await meterRow(s.meterId)).out_of_service).toBe(true)
+    })
+
+    it('the error on a bare outOfService:false now names all three choices', async () => {
+      const p = await park({ estimates: false })
+      const s = await space(p, 'RV 25', 100, 100)
+      await broken(s.meterId)
+      const res = await patch(p, s.meterId, { outOfService: false })
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/reading fine all along/i)
+      expect((await meterRow(s.meterId)).out_of_service).toBe(true)
+    })
+  })
+
   it('is refused alongside marking it broken', async () => {
     const p = await park({ estimates: false })
     const s = await space(p, 'RV 08', 100, 100)

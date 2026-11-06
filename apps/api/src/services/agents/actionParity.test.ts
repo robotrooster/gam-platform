@@ -70,7 +70,13 @@ describe('action parity — what a person can do, the agent should be able to do
     // 10/20: 501 after the utility pay link, the reservation importer and the
     // duplicate-person screens — six mutating routes, every one of them named
     // in actionGap DELIBERATE because a person pressing them is the feature.
-    expect(reachable).toBeLessThan(530)
+    // 10/31–11/01: 536 after three builds landed in one night, every route of
+    // all three named in actionGap DELIBERATE: passkeys (5 — an assistant never
+    // touches somebody's sign-in credential), the one insurance home (8 — the
+    // facts are transcribed off a certificate the person is holding), and the
+    // contractor marketplace (9 — posting work, naming a price and choosing
+    // between bids are commitments between two parties with money on them).
+    expect(reachable).toBeLessThan(560)
   })
 
   it('nothing from another portal has crept into a landlord or tenant agent', async () => {

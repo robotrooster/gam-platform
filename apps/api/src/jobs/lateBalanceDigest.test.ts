@@ -86,10 +86,10 @@ describe('S654 runLateBalanceDigest', () => {
   it('the total is rent PLUS utilities, one line per person', async () => {
     const p = await company()
     const billy = await resident('Billy Miranda')
-    const rashawn = await resident('Rashawn Bump')
+    const phaedra = await resident('Phaedra Stanhope')
     await owes(p, billy, 'RV 34', daysAgo(30), [['rent', 440], ['utility', 17.07]])
     await owes(p, billy, 'RV 35', daysAgo(30), [['rent', 440], ['utility', 5.22]])
-    await owes(p, rashawn, 'RV 10', daysAgo(30), [['rent', 440], ['utility', 997], ['utility', 25]])
+    await owes(p, phaedra, 'RV 10', daysAgo(30), [['rent', 440], ['utility', 997], ['utility', 25]])
 
     const r = await runLateBalanceDigest()
     expect(r).toEqual({ accounts: 1, sent: 1, failed: 0 })
@@ -102,15 +102,15 @@ describe('S654 runLateBalanceDigest', () => {
     // days are the due day and the 4 after it, so 26 days past grace.
     expect(billyLine).toMatchObject({ tenantName: 'Billy Miranda', amount: 902.29, daysLate: 26 })
     expect(billyLine.unitNumber.split(', ').sort()).toEqual(['RV 34', 'RV 35'])
-    expect(items.find((i: any) => i.tenantId === rashawn).amount).toBe(1462)
+    expect(items.find((i: any) => i.tenantId === phaedra).amount).toBe(1462)
     expect(items.reduce((s: number, i: any) => s + i.amount, 0)).toBeCloseTo(2364.29, 2)
   })
 
   it('one email for an account with two companies', async () => {
     const a = await company()
     const b = await company(a.userId)
-    await owes(a, await resident('Jay Jones'), 'RV 25', daysAgo(10), [['rent', 440]])
-    await owes(b, await resident('Lena Christian'), 'MH 09', daysAgo(10), [['rent', 300], ['utility', 22.68]])
+    await owes(a, await resident('Kipp Larkspur'), 'RV 25', daysAgo(10), [['rent', 440]])
+    await owes(b, await resident('Brisa Elsmore'), 'MH 09', daysAgo(10), [['rent', 300], ['utility', 22.68]])
 
     await runLateBalanceDigest()
     expect(digestMock).toHaveBeenCalledTimes(1)
@@ -135,7 +135,7 @@ describe('S654 runLateBalanceDigest', () => {
 
   it('nothing is sent when nothing is five days late', async () => {
     const p = await company()
-    await owes(p, await resident('Josh Roby'), 'MH 03', daysAgo(2), [['rent', 440]])
+    await owes(p, await resident('Soren Tremaine'), 'MH 03', daysAgo(2), [['rent', 440]])
     expect(await runLateBalanceDigest()).toEqual({ accounts: 0, sent: 0, failed: 0 })
     expect(digestMock).not.toHaveBeenCalled()
   })
@@ -162,7 +162,7 @@ describe('S654 runLateBalanceDigest', () => {
 
   it('a unit in eviction mode is left out', async () => {
     const p = await company()
-    const s = await owes(p, await resident('Josh Roby'), 'MH 03', daysAgo(10), [['rent', 440]])
+    const s = await owes(p, await resident('Soren Tremaine'), 'MH 03', daysAgo(10), [['rent', 440]])
     await db.query(`UPDATE units SET payment_block = TRUE WHERE id = $1`, [s.unitId])
     await runLateBalanceDigest()
     expect(digestMock).not.toHaveBeenCalled()

@@ -192,9 +192,9 @@ describe('S637 — a typed signature is stamped in the chosen style', () => {
     const plain  = path.join(os.tmpdir(), `s637-plain-${randomUUID()}.pdf`)
     cleanupPaths.push(styled, plain)
 
-    await stampPdf(src, [{ ...base, value: 'Mireya Fierro',
+    await stampPdf(src, [{ ...base, value: 'Jarrah Mortmain',
       font_css: "40px 'Snell Roundhand', 'Apple Chancery', cursive" } as any], [], styled)
-    await stampPdf(src, [{ ...base, value: 'Mireya Fierro', font_css: null } as any], [], plain)
+    await stampPdf(src, [{ ...base, value: 'Jarrah Mortmain', font_css: null } as any], [], plain)
 
     // S652: ask which face actually DREW the name. Comparing file lengths
     // failed the day two different faces happened to produce equal lengths.
@@ -206,7 +206,7 @@ describe('S637 — a typed signature is stamped in the chosen style', () => {
     const src = await makeSourcePdf(1)
     const out = path.join(os.tmpdir(), `s637-nofont-${randomUUID()}.pdf`)
     cleanupPaths.push(out)
-    await stampPdf(src, [{ ...base, value: 'Mireya Fierro' } as any], [], out)
+    await stampPdf(src, [{ ...base, value: 'Jarrah Mortmain' } as any], [], out)
     expect(fs.existsSync(out)).toBe(true)
   })
 })

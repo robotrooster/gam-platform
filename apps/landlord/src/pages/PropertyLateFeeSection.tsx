@@ -224,7 +224,7 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
               {(() => {
                 const retro = o.lateFeeAccrualFrom && o.lateFeeAccrualFrom !== 'grace_end'
                 const hasAcc = o.lateFeeAccrualAmount != null
-                const per = String(o.lateFeeAccrualPeriod || '').replace('daily', 'day').replace('weekly', 'week').replace('monthly', 'month')
+                const per = String(o.lateFeeAccrualPeriod || '').replace('daily', 'day').replace('weekly', 'week')
                 const accStr = hasAcc ? (o.lateFeeAccrualType === 'percent_of_rent' ? `${Number(o.lateFeeAccrualAmount)}% of rent` : `$${Number(o.lateFeeAccrualAmount).toFixed(2)}`) : ''
                 return (
                 <>
@@ -326,7 +326,6 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
               <select className="form-select" value={accrualPeriod} onChange={e => setAccrualPeriod(e.target.value)} style={{ width: 90 }}>
                 <option value="daily">Day</option>
                 <option value="weekly">Week</option>
-                <option value="monthly">Month</option>
               </select>
             </div>
             <div>

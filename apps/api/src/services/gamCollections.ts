@@ -17,7 +17,7 @@
  */
 import { query } from '../db'
 import { logger } from '../lib/logger'
-import { debitThresholdForLandlord } from './landlordGamAccount'
+import { debitThresholdForLandlord, NETTING_ROUTE_SQL } from './landlordGamAccount'
 
 export interface CollectionsRow {
   landlordId: string
@@ -59,7 +59,11 @@ export async function collectionsBook(): Promise<CollectionsBook> {
             COALESCE(SUM(c.collected_amount), 0)::float            AS collected,
             MIN(c.created_at) FILTER (WHERE c.collected_amount < c.amount) AS oldest_unpaid,
             EXISTS (SELECT 1 FROM properties p
-                     WHERE p.landlord_id = l.id AND p.review_status = 'active') AS has_property
+                     WHERE p.landlord_id = l.id AND p.review_status = 'active') AS has_property,
+            -- 11/2: the route came from a per-landlord query inside the loop
+            -- below, with its own copy of what netting means. One definition
+            -- now (landlordGamAccount NETTING_ROUTE_SQL), read once per row.
+            ${NETTING_ROUTE_SQL('l')} AS has_flow
        FROM landlords l
        -- 10/12 (ledger P0): a voided charge (taken back, kept on file) was never
        -- owed — billed and outstanding leave it out, as when it was deleted.
@@ -82,15 +86,7 @@ export async function collectionsBook(): Promise<CollectionsBook> {
     // Netting is the preferred route and costs nothing: it takes GAM's fee out
     // of money already moving to the landlord. It only exists if money IS
     // moving, which is why an all-cash park falls through to the bank debit.
-    // 'settled' is the only status that means the money actually moved —
-    // payments.status is pending/processing/settled/failed/returned, and there
-    // is no 'succeeded'. A query for one silently matches nothing, which would
-    // have reported every landlord on earth as having no way to pay.
-    const netting = await query<{ n: string }>(
-      `SELECT COUNT(*)::text AS n FROM payments
-        WHERE landlord_id = $1 AND status = 'settled'
-          AND created_at >= NOW() - INTERVAL '35 days'`, [r.id])
-    const hasFlow = Number(netting[0]?.n ?? 0) > 0
+    const hasFlow = r.has_flow === true
     const route: CollectionsRow['route'] = hasFlow ? 'netting'
       : r.gam_debit_payment_method_id ? 'bank_debit' : 'none'
     if (outstanding > 0 && route === 'none') uncollectable += outstanding
@@ -155,9 +151,15 @@ export async function noticeUncollectableLandlords(): Promise<{ notified: number
       landlordId: c.landlordId,
       type: 'gam_balance_uncollectable',
       title: `We can't collect your Gold Asset Management balance`,
+      // 11/2 (Nic): "I don't want that semi-threatening email that says, hey,
+      // we're gonna be blocking access to the landlord account." The suspension
+      // sentence that used to close this is gone. It is also no longer true by
+      // default: this only reaches a landlord with no money moving through GAM
+      // AND no bank on file, because anyone with either is collected from
+      // automatically (landlordGamAccount NETTING_ROUTE_SQL).
       body: `Your account has an outstanding balance of $${c.owed.toFixed(2)}. `
         + (why ? `${why} ` : `We have no bank account we can collect it from. Connecting one under Banking takes a minute and settles it automatically. `)
-        + `If we cannot collect, access to the portal is eventually suspended — your tenants are never affected.`,
+        + `Once a bank is linked, GAM takes what it is owed out of your rent payouts and you never have to think about it. Your tenants are never affected.`,
       actionUrl: '/banking',
       sendEmail: true,
       emailTo: o.email,
@@ -169,8 +171,8 @@ export async function noticeUncollectableLandlords(): Promise<{ notified: number
             ? `<p>${why}</p>`
             : `<p>There is no bank account on file we can collect it from. Connecting one under <strong>Banking</strong> in your portal settles it automatically — `
               + `we take it from the same account your rent already moves through, and you never have to think about it again.</p>`)
-        + `<p>If we cannot collect, portal access is eventually suspended. Your tenants are not `
-        + `affected either way — rent keeps being collected as normal.</p>`,
+        + `<p>Once a bank is linked, GAM takes what it is owed out of your rent payouts — nothing to pay by hand. `
+        + `Your tenants are not affected either way: rent keeps being collected as normal.</p>`,
     }).catch(() => {})
     await query(
       `UPDATE landlords SET uncollectable_notice_at = NOW(), updated_at = NOW() WHERE id = $1`,

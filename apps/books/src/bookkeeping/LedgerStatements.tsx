@@ -25,7 +25,7 @@ import {
 } from '@gam/shared'
 import { booksGet as get } from './adapter'
 import { MoneyThreeTable, MoneyTieLines, type MoneyThreeRow } from './common'
-import { loadErrorText } from './booksMoney'
+import { loadErrorText, splitBeside, PAID_AHEAD_COUNTED_NOTE } from './booksMoney'
 
 const money = (n: number | string | null | undefined) => formatCurrency(Number(n ?? 0))
 const signed = (n: number) => (n < 0 ? `(${formatCurrency(-n)})` : formatCurrency(n))
@@ -111,13 +111,27 @@ export function LedgerProfitLossView({ data, startDate, endDate, setStartDate, s
         </div>
         <MoneyThreeTable rows={rows} totalLabel="Total income" total={{ received: view.received, charged: view.charged, owed: view.owed }} />
         <MoneyTieLines lines={view.tieText} />
-        {(view.beside ?? []).length > 0 && (
-          <div style={{ marginTop: 8, paddingTop: 6, borderTop: '1px dashed var(--b1)' }}>
-            {view.beside.map((b: any) => (
-              <div key={b.key} className="dr"><span className="dk">{b.label} (beside the total)</span><span className="dv mono">{money(b.amount)}</span></div>
-            ))}
-          </div>
-        )}
+        {/* 11/4: paid-ahead money STILL ON HAND is already counted inside the
+            total, on the day it arrived, so "(beside the total)" told the
+            landlord they held that much more than the report counted — the one
+            presentation booksMoney's splitBeside exists to prevent, and the
+            same figure Nic questioned on 11/4 ("$971.82... that does not seem
+            accurate"). It gets its own line with the counted-note, as the
+            P&L page has always shown it. */}
+        {(() => {
+          const { aside, onHand } = splitBeside(view.beside)
+          if (!aside.length && !onHand) return null
+          return (
+            <div style={{ marginTop: 8, paddingTop: 6, borderTop: '1px dashed var(--b1)' }}>
+              {aside.map(b => (
+                <div key={b.key} className="dr"><span className="dk">{b.label} (beside the total)</span><span className="dv mono">{money(b.amount)}</span></div>
+              ))}
+              {onHand && (
+                <div className="dr dr-sub"><span className="dk">{onHand.label} — {PAID_AHEAD_COUNTED_NOTE}</span><span className="dv mono">{money(onHand.amount)}</span></div>
+              )}
+            </div>
+          )
+        })()}
         {(data?.chargedBeside ?? []).length > 0 && (
           <div style={{ marginTop: 8, paddingTop: 6, borderTop: '1px dashed var(--b1)' }}>
             {data.chargedBeside.map((b: any) => (

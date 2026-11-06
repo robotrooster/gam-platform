@@ -12,14 +12,16 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { db } from '../db'
 import {
-  tenantCo, bill, receipt, spend, drain, addLease, cleanupTenantLedger, type TenantCo,
+  tenantCo, bill, receipt, spend, drain, addLease, issuedCredit, cleanupTenantLedger, type TenantCo,
 } from '../test/ledgerTenantFixtures'
+import { viewForViewer } from '../routes/reports'
 import { registerProductionLedgerProjectors, unregisterProductionLedgerProjectors } from './ledgerProjectors'
 import { incomeEvents, incomeBoth, moneyViewFrom, breakdownFrom, summarize, paidAheadUnusedAt } from './incomeBasis'
 import {
   ledgerReportsLive, ledgerLiveCompanyIds, ledgerIncomeEvents, ledgerPLExpenses, ledgerBalanceSheet,
   ledgerTrialBalance, ledgerGeneralLedger, ledgerCashFlow, ledgerMoneyOut, ledgerProfitAndLoss, snapshotDays,
   ledgerTaxSummary, ledgerReceivables, agingBucketOf, ledgerNotLiveReason, LEDGER_REPORTS_ENV,
+  chargedPartFacts, fateKey, type BillFate, type LineRow,
 } from './ledgerReports'
 import { computeLandlordPL, landlordPLExpenses, processingFeesByProperty } from './landlordPL'
 import { createLandlordExpense, recordExpensePayment } from './landlordExpenses'
@@ -136,7 +138,10 @@ describe('Received, Charged and Owed from the ledger (design §10)', () => {
     expect([oct.received, oct.charged, oct.owed]).toEqual([0, 460, 0])
     // The strip: owed $0 at the start + billed $460 − paid from money paid ahead $460 = $0.
     expect(oct.proof).toMatchObject({ owedAtStart: 0, billed: 460, received: 0, paidAhead: 460, owedAtEnd: 0 })
-    expect(oct.tieText[1]).toMatch(/paid from money paid ahead \$460\.00 = owed \$0\.00 at the end of Oct 31, 2026/)
+    // 11/4: matched by what the sentence SAYS, not by where it sits — the
+    // books path gained a charged sentence before it and an index would move
+    // again the next time a sentence is added.
+    expect(oct.tieText.some(s => /paid from money paid ahead \$460\.00 = owed \$0\.00 at the end of Oct 31, 2026/.test(s))).toBe(true)
     expect(oct.beside.find(b => b.key === 'paidAheadUnused')).toBeUndefined()
   })
 
@@ -399,5 +404,177 @@ describe('readers switched without changing their callers', () => {
     expect(await ledgerIncomeEvents({ landlordIds: [co.landlordId], start: '2026-09-01', end: '2026-09-30', basis: 'billed', propertyIds: [] })).toEqual([])
     const ex = await ledgerPLExpenses({ landlordIds: [co.landlordId] }, '2026-09-01', '2026-09-30')
     expect(ex.total).toBe(0)
+  })
+})
+
+// ─── 11/4 (Nic): WHAT BECAME OF WHAT WAS CHARGED ───────────────────────────
+//
+//   "Rent is showing $15,000 received, almost $16,000, but over $18,500
+//    charged, and owed is only $955... every line is actually wrong. Nothing
+//    maths out exactly right except for the home and trailer payments, $333
+//    received, $333 charged, $0 owed."
+//
+// The columns were right and the page never said what the difference WAS.
+// moneyViewFrom has carried four buckets for Charged since the records path
+// was built and the books path filled none of them, so every report a company
+// on the books could open read collected $0 + clearing $0 + owed $0 + other
+// <the whole total>. These cover the buckets, the one thing they must never
+// touch (the Owed column, which is every unpaid bill and not just this
+// period's), and the fact that they are stripped for a viewer who may not see
+// Owed — the buckets would otherwise hand that figure straight back.
+describe('what became of what was charged', () => {
+  /** September billed and never paid; October billed, $60 of it forgiven with a credit. */
+  async function twoMonths(co: TenantCo) {
+    await bill(co, { amount: 460, due: '2026-09-01' })
+    const oct = await bill(co, { amount: 460, due: '2026-10-01' })
+    const credit = await issuedCredit(co, { amount: 60, category: 'goodwill' })
+    await spend(co, { paymentId: oct, amount: 60, appliedAt: '2026-10-05T18:00:00Z', tenantCreditId: credit, settle: false })
+    await drain()
+    return { oct }
+  }
+
+  it('the four buckets add back to Charged, on every line and on the total', async () => {
+    const co = await tenantCo()
+    await twoMonths(co)
+    await markLedgerLive(co.landlordId)
+    const v = await view(co, '2026-10-01', '2026-10-31', 'October 2026')
+    expect(v.source).toBe('ledger')
+    const t = v.tie.charged
+    expect(Math.round((t.collected + t.clearing + t.owed + t.other) * 100) / 100).toBe(v.charged)
+    for (const l of v.lines) {
+      if (!l.parts) continue
+      const p = l.parts
+      expect(Math.round((p.collected + p.clearing + p.owed + p.other) * 100) / 100).toBe(l.charged)
+    }
+  })
+
+  it('a bill forgiven with a credit is "settled without money", never collected', async () => {
+    const co = await tenantCo()
+    await twoMonths(co)
+    await markLedgerLive(co.landlordId)
+    const v = await view(co, '2026-10-01', '2026-10-31', 'October 2026')
+    const rent = v.lines.find(l => l.line === 'rent')!
+    expect(rent.charged).toBe(460)
+    expect(rent.parts).toEqual({ collected: 0, clearing: 0, owed: 400, other: 60 })
+    // The credit's own minus line takes the same $60 off the report's total,
+    // so `other` nets back out across the whole view.
+    const given = v.lines.find(l => l.line === 'creditsGiven')!
+    expect(given.charged).toBe(-60)
+    expect(given.parts).toEqual({ collected: 0, clearing: 0, owed: 0, other: -60 })
+    expect(v.tie.charged.other).toBe(0)
+  })
+
+  it('the Owed column keeps every unpaid bill; the bucket counts only this period\'s charges', async () => {
+    const co = await tenantCo()
+    await twoMonths(co)
+    await markLedgerLive(co.landlordId)
+    const v = await view(co, '2026-10-01', '2026-10-31', 'October 2026')
+    // $460 unpaid from September carried in, $400 of October still open.
+    expect(v.owed).toBe(860)
+    expect(v.tie.charged.owed).toBe(400)
+    expect(v.proof!.owedAtStart).toBe(460)
+    expect(v.proof!.offBy).toBe(0)
+  })
+
+  it('the charged sentence is back on the books path, and says which day it is as of', async () => {
+    const co = await tenantCo()
+    await twoMonths(co)
+    await markLedgerLive(co.landlordId)
+    const v = await view(co, '2026-10-01', '2026-10-31', 'October 2026')
+    expect(v.tieText.some(s => s.includes('$400.00 was still owed on Oct 31, 2026'))).toBe(true)
+    // ... and the proof strip is still there with it.
+    expect(v.tieText.some(s => s.startsWith('Owed $460.00 at the end of Sep 30, 2026'))).toBe(true)
+  })
+
+  it('a viewer who may not see Owed gets no buckets either — they add back to it', async () => {
+    const co = await tenantCo()
+    await twoMonths(co)
+    await markLedgerLive(co.landlordId)
+    const v = await view(co, '2026-10-01', '2026-10-31', 'October 2026')
+    const staff: any = viewForViewer(v, false)
+    expect(staff.owed).toBeUndefined()
+    expect(staff.lines.every((l: any) => l.parts === undefined && l.owed === undefined)).toBe(true)
+    expect(staff.tie.charged).toBeUndefined()
+    for (const s of staff.tieText) expect(s).not.toContain('still owed')
+  })
+})
+
+// ─── 11/4: THE PART FACTS' GRAIN — the bug a one-month check cannot see ────
+//
+// /reports/summary reads TWELVE months in one call and slices the facts back
+// into months afterwards (routes/reports monthView, incomeBasis byMonth); the
+// landlord dashboard reads six. So a part fact that carries a whole group's
+// amount on one day lands ENTIRELY in that month, and a figure that ties for
+// every single-month read can still be wrong on every month of the long one.
+//
+// That is what happened on the first cut of this: every income line with no
+// bill behind it (a register sale, a stay, other income — same landlord, same
+// null lease, same null payment) pooled into ONE group dated in the earliest
+// month with books. Against production that moved $1,100.96 into September
+// 2026 and took $949.49 out of October. Two single-month diagnostics said it
+// tied, because within one month the pooling is invisible.
+describe('what became of what was charged: the grain', () => {
+  const row = (o: Partial<LineRow> & { day: string }): LineRow => ({
+    landlord_id: 'L', property_id: 'P', unit_id: null, lease_id: null, payment_id: null,
+    due_date: null, report_category: 'register_sales', account_role: 'register_sales',
+    account_type: 'income', amount: '0', ...o,
+  })
+  const noFates = new Map<string, BillFate>()
+  const monthEnd = (day: string) => `${day.slice(0, 7)}-28`
+
+  it('money with no bill behind it keeps its own day — it is never pooled with another month', () => {
+    const { facts } = chargedPartFacts([
+      { row: row({ day: '2026-09-10' }), amount: 100 },
+      { row: row({ day: '2026-10-12' }), amount: 250 },
+      { row: row({ day: '2026-10-20' }), amount: 40 },
+    ], noFates, new Map(), monthEnd)
+    const byDay = facts.map(f => [f.day, f.amount, f.part] as const)
+    expect(byDay).toEqual([
+      ['2026-09-10', 100, 'paid'],
+      ['2026-10-12', 250, 'paid'],
+      ['2026-10-20', 40, 'paid'],
+    ])
+    // The whole point: September's explanation is $100, not $390.
+    const sep = facts.filter(f => f.day.startsWith('2026-09')).reduce((s, f) => s + f.amount, 0)
+    expect(sep).toBe(100)
+  })
+
+  it('a bill and a credit against it in a LATER month: the fate stays in the charge\'s month', () => {
+    const bill = { payment_id: 'B1', report_category: 'space_rent', account_role: 'space_rent' }
+    const fates = new Map<string, BillFate>([
+      // At October's end the bill is wholly open; by November's a credit took $60.
+      [fateKey('B1', 'space_rent', '2026-10-28'),
+        { received: 0, paidAhead: 0, deposits: 0, open: 46000, processing: false, otherTerms: 0 }],
+      [fateKey('B1', 'space_rent', '2026-11-28'),
+        { received: 0, paidAhead: 0, deposits: 0, open: 40000, processing: false, otherTerms: 6000 }],
+    ])
+    const { facts } = chargedPartFacts([
+      { row: row({ ...bill, day: '2026-10-01' }), amount: 460 },
+      // November's minus line for the same bill, on its own report line.
+      { row: row({ payment_id: 'B1', report_category: 'credits_given', account_role: 'credits_given', day: '2026-11-05' }), amount: -60 },
+    ], fates, new Map(), monthEnd)
+    const oct = facts.filter(f => f.day.startsWith('2026-10'))
+    const nov = facts.filter(f => f.day.startsWith('2026-11'))
+    // October reads October's state: $460 charged, all of it still owed then.
+    expect(oct.map(f => [f.part, f.amount])).toEqual([['stillOwed', 460]])
+    // November carries only its own minus line, and it is not money.
+    expect(nov.map(f => [f.part, f.amount])).toEqual([[null, -60]])
+    // Neither month's explanation leaks into the other.
+    expect(oct.reduce((s, f) => s + f.amount, 0)).toBe(460)
+    expect(nov.reduce((s, f) => s + f.amount, 0)).toBe(-60)
+  })
+
+  it('the drift check compares the residual with the receivable\'s own credits, and flags a mismatch', () => {
+    const bill = { payment_id: 'B2', report_category: 'space_rent', account_role: 'space_rent' }
+    const agrees = new Map<string, BillFate>([[fateKey('B2', 'space_rent', '2026-10-28'),
+      { received: 40000, paidAhead: 0, deposits: 0, open: 0, processing: false, otherTerms: 6000 }]])
+    const rows = [{ row: row({ ...bill, day: '2026-10-01' }), amount: 460 }]
+    // $460 charged, $400 received, $60 forgiven: the residual IS the $60 the
+    // receivable says was forgiven, so they agree.
+    expect(chargedPartFacts(rows, agrees, new Map(), monthEnd).drift).toBe(0)
+    // Now claim the receivable forgave nothing. The $60 has no explanation.
+    const disagrees = new Map<string, BillFate>([[fateKey('B2', 'space_rent', '2026-10-28'),
+      { received: 40000, paidAhead: 0, deposits: 0, open: 0, processing: false, otherTerms: 0 }]])
+    expect(chargedPartFacts(rows, disagrees, new Map(), monthEnd).drift).toBe(60)
   })
 })

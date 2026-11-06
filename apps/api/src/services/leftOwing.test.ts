@@ -16,9 +16,11 @@ import { db, query } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import {
   leftOwingFlagFor, whereAndWhen, theTotal, monthInWords, LEFT_OWING_WORDS,
+  LEFT_OWING_WATCH_WORDS, amountBand,
   debtsMatching, openMatchReviews, decideMatchReview,
 } from './leftOwing'
 import { expectNoFigures } from '../test/noLeaks'
+import { LEFT_OWING_MATCH_POINTS } from '@gam/shared'
 
 beforeEach(async () => { await cleanupAllSchema() })
 
@@ -58,13 +60,16 @@ async function personWhoLeftOwing(w: any, o: { verified?: boolean; amount?: numb
 async function importedDebt(w: any, o: {
   who?: string | null; email?: string | null; phone?: string | null
   amount?: number; leftOn?: string
+  idNumber?: string | null; idState?: string | null; dateOfBirth?: string | null
 }) {
   const r = await db.query<{ id: string }>(
     `INSERT INTO tenant_left_owing
-       (landlord_id, property_id, user_id, email, phone, who, amount, source_kind, source_key, left_on)
-     VALUES ($1,$2,NULL,$3,$4,$5,$6,'import',$7,$8) RETURNING id`,
+       (landlord_id, property_id, user_id, email, phone, who, amount, source_kind, source_key, left_on,
+        id_number, id_state, date_of_birth)
+     VALUES ($1,$2,NULL,$3,$4,$5,$6,'import',$7,$8,$9,$10,$11) RETURNING id`,
     [w.owed.landlordId, w.propertyId, o.email ?? null, o.phone ?? null, o.who ?? null,
-     o.amount ?? 1430.55, randomUUID(), o.leftOn ?? '2024-08-14'])
+     o.amount ?? 1430.55, randomUUID(), o.leftOn ?? '2024-08-14',
+     o.idNumber ?? null, o.idState ?? null, o.dateOfBirth ?? null])
   return r.rows[0].id
 }
 
@@ -82,10 +87,19 @@ describe('the flag another landlord sees', () => {
     // first so the digit checks below can never start reading a random id: a
     // fourth field fails this line deterministically instead of failing the
     // ones under it one deploy in six.
-    expect(Object.keys(flag).sort()).toEqual(['count', 'flagged', 'words'])
+    // 10/27: 'watchOnly' joins the set. It says the debts all came from
+    // another platform, which changes the WORDS — it carries nothing about the
+    // amount, the landlord or the date, so the guard this assertion is holds.
+    // Anything else appearing here still fails, which is the point of pinning
+    // the exact keys rather than checking a few of them.
+    expect(Object.keys(flag).sort()).toEqual(['count', 'flagged', 'watchOnly', 'words'])
     const everything = JSON.stringify(flag)
-    expect(everything).not.toContain('1430')
-    expect(everything).not.toContain('2024')
+    // The amount and the year are bare digits, and a uuid is hex, so searching
+    // the blob for them decided by luck (testsAreDeterministic). The figures go
+    // through the helper that asks whether they came back as a value or in
+    // prose; the landlord id has dashes in a shape no amount can take, so that
+    // one stays a text search.
+    expectNoFigures(flag, [1430, 2024])
     expect(everything).not.toContain(w.owed.landlordId)
     // And nothing resembling a figure at all.
     expect(everything).not.toMatch(/\$|\d+\.\d\d/)
@@ -126,7 +140,12 @@ describe('the flag another landlord sees', () => {
       [w.owed.landlordId, w.propertyId, userId, randomUUID()])
     const flag = await leftOwingFlagFor(userId, [w.asking.landlordId])
     expect(flag.count).toBe(2)
-    expect(Object.keys(flag).sort()).toEqual(['count', 'flagged', 'words'])
+    // 10/27: 'watchOnly' joins the set. It says the debts all came from
+    // another platform, which changes the WORDS — it carries nothing about the
+    // amount, the landlord or the date, so the guard this assertion is holds.
+    // Anything else appearing here still fails, which is the point of pinning
+    // the exact keys rather than checking a few of them.
+    expect(Object.keys(flag).sort()).toEqual(['count', 'flagged', 'watchOnly', 'words'])
     expectNoFigures(flag, [99, 2023])
   })
 })
@@ -165,7 +184,10 @@ describe('the first door — where and when, free', () => {
     expect(seen.where).toBe('Las Vegas, NV')
     // THE SHAPE IS THE GUARANTEE: three fields and no more, so a fourth cannot
     // be added later carrying the amount or the park without this failing.
-    expect(Object.keys(seen).sort()).toEqual(['owingId', 'when', 'where'])
+    // 'about' is a BAND ("over $500"), never the figure, and 'watchOnly' says
+    // the debt came from another platform. Both are deliberate (Nic 10/27);
+    // anything beyond them still fails here.
+    expect(Object.keys(seen).sort()).toEqual(['about', 'owingId', 'watchOnly', 'when', 'where'])
     // Not the day, not the amount, not the park, not the landlord — read off
     // the two fields that carry WORDS. (Not off the whole row stringified: that
     // drags in a random id, and this failed on a deploy the day it was written,
@@ -216,7 +238,12 @@ describe('TWO CONTACT POINTS AGREEING — the rule Nic gave on 10/22', () => {
     const w = await world()
     await importedDebt(w, { who: 'Dale Pruitt', email: 'dale@old.dev' })
     const flag = await leftOwingFlagFor(DALE, [w.asking.landlordId])
-    expect(flag).toMatchObject({ flagged: true, count: 1, words: LEFT_OWING_WORDS })
+    // 10/27 (Nic): this debt was IMPORTED from another platform, and those are
+    // "only a kind of watch list... They're not going to treat it as not
+    // rentable." GAM never watched this money go unpaid, so it is said as a
+    // heads-up and nothing is ever collected on it.
+    expect(flag).toMatchObject({
+      flagged: true, count: 1, watchOnly: true, words: LEFT_OWING_WATCH_WORDS })
   })
 
   it('name + phone is enough — "most of the time they don\'t change both"', async () => {
@@ -278,8 +305,139 @@ describe('TWO CONTACT POINTS AGREEING — the rule Nic gave on 10/22', () => {
     // The second is an initial — close, not decided by rule — so it is NOT
     // counted and NOT shown. One flag, one debt, until a person says otherwise.
     expect(flag.count).toBe(1)
-    expect(Object.keys(flag).sort()).toEqual(['count', 'flagged', 'words'])
+    // 10/27: 'watchOnly' joins the set. It says the debts all came from
+    // another platform, which changes the WORDS — it carries nothing about the
+    // amount, the landlord or the date, so the guard this assertion is holds.
+    // Anything else appearing here still fails, which is the point of pinning
+    // the exact keys rather than checking a few of them.
+    expect(Object.keys(flag).sort()).toEqual(['count', 'flagged', 'watchOnly', 'words'])
     expectNoFigures(flag, [500, 99.99])
+  })
+})
+
+/**
+ * 10/29 (Nic) — THE LICENCE, WHICH IS WHY IDENTITY CAPTURE EXISTS AT ALL:
+ *
+ *   "One other workflow that I'm thinking of that will help attach debt
+ *    correctly to people with the same name... a lot of parks will take a copy
+ *    of the driver's license."
+ */
+/**
+ * The drift that cost a close call on 10/29: the matcher gained a fourth match
+ * point, this constraint still allowed three, and the insert that raises a
+ * review is wrapped in a catch — so it vanished. One definition, asserted.
+ */
+describe('the match points the code knows and the ones the column allows', () => {
+  it('are the same set', async () => {
+    const r = await db.query<{ def: string }>(
+      `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+        WHERE conrelid = 'tenant_left_owing_match_reviews'::regclass
+          AND conname = 'tenant_left_owing_match_reviews_matched_on_check'`)
+    expect(r.rows).toHaveLength(1)
+    const allowed = [...r.rows[0].def.matchAll(/'([a-z_]+)'::text/g)].map((m) => m[1]).sort()
+    expect(allowed).toEqual([...LEFT_OWING_MATCH_POINTS].sort())
+  })
+
+  it('and every one of them can actually be written', async () => {
+    const w = await world()
+    for (const point of LEFT_OWING_MATCH_POINTS) {
+      const owingId = await importedDebt(w, { who: 'Dale Pruitt' })
+      await expect(db.query(
+        `INSERT INTO tenant_left_owing_match_reviews
+           (owing_id, person_key, matched_on, name_agreement, why)
+         VALUES ($1, $2, $3, 'unsure', 'a drift guard')`,
+        [owingId, `probe:${point}`, point])).resolves.toBeTruthy()
+    }
+  })
+})
+
+describe('the licence number, and the two John Smiths', () => {
+  it('finds the person who changed their email AND their phone', async () => {
+    const w = await world()
+    await importedDebt(w, {
+      who: 'Dale Pruitt', email: 'dale@old.dev', phone: '602-555-9999',
+      idNumber: 'D1234567', idState: 'AZ' })
+    // Everything a person can change HAS changed. The licence has not.
+    const flag = await leftOwingFlagFor(
+      { name: 'Dale Pruitt', email: 'dale@totallynew.dev', phone: '480-555-0000',
+        idNumber: 'd-1234567', idState: 'az' },
+      [w.asking.landlordId])
+    expect(flag.flagged).toBe(true)
+    const [m] = await debtsMatching(
+      { name: 'Dale Pruitt', idNumber: 'D1234567', idState: 'AZ' },
+      [w.asking.landlordId], { raiseReviews: false })
+    expect(m).toMatchObject({ matchedOn: 'licence', verdict: 'flag' })
+  })
+
+  /**
+   * The valuable half. A shared household phone matched and the names are the
+   * same, which is exactly the shape that used to flag a stranger.
+   */
+  it('a DISAGREEING licence proves the same name is somebody else', async () => {
+    const w = await world()
+    await importedDebt(w, {
+      who: 'Dale Pruitt', phone: '602-555-9999', idNumber: 'D1234567', idState: 'AZ' })
+    const them = { name: 'Dale Pruitt', phone: '602-555-9999', idNumber: 'D7654321', idState: 'AZ' }
+    expect((await leftOwingFlagFor(them, [w.asking.landlordId])).flagged).toBe(false)
+    // And it does NOT go to a person: there is nothing left to research.
+    expect(await openMatchReviews()).toEqual([])
+    const [m] = await debtsMatching(them, [w.asking.landlordId], { raiseReviews: false })
+    expect(m.verdict).toBe('no')
+  })
+
+  it('and so does a disagreeing date of birth', async () => {
+    const w = await world()
+    await importedDebt(w, {
+      who: 'Dale Pruitt', phone: '602-555-9999', dateOfBirth: '1979-03-14' })
+    const them = { name: 'Dale Pruitt', phone: '602-555-9999', dateOfBirth: '1991-11-02' }
+    expect((await leftOwingFlagFor(them, [w.asking.landlordId])).flagged).toBe(false)
+    expect(await openMatchReviews()).toEqual([])
+  })
+
+  /** An unknown field is silence. It must never read as a denial. */
+  it('a licence on only one side changes nothing', async () => {
+    const w = await world()
+    await importedDebt(w, { who: 'Dale Pruitt', email: 'dale@old.dev' })
+    expect((await leftOwingFlagFor(
+      { name: 'Dale Pruitt', email: 'dale@old.dev', idNumber: 'D1234567', idState: 'AZ' },
+      [w.asking.landlordId])).flagged).toBe(true)
+  })
+
+  it('the same number in a different state is a different person', async () => {
+    const w = await world()
+    await importedDebt(w, { who: 'Dale Pruitt', idNumber: 'D1234567', idState: 'AZ' })
+    expect((await leftOwingFlagFor(
+      { name: 'Dale Pruitt', idNumber: 'D1234567', idState: 'NV' }, [w.asking.landlordId])).flagged).toBe(false)
+  })
+
+  /** A clerk mistyping one digit looks exactly like this, so a person looks. */
+  it('a matching licence under a plainly different name waits for a person', async () => {
+    const w = await world()
+    await importedDebt(w, { who: 'Ann Reed', idNumber: 'D1234567', idState: 'AZ' })
+    const them = { name: 'Dale Pruitt', idNumber: 'D1234567', idState: 'AZ' }
+    expect((await leftOwingFlagFor(them, [w.asking.landlordId])).flagged).toBe(false)
+    const open = await openMatchReviews()
+    expect(open).toHaveLength(1)
+    expect(open[0]).toMatchObject({ matchedOn: 'licence', nameAgreement: 'different' })
+  })
+
+  /** A birthday that AGREES does the job a second contact point would. */
+  it('a near name plus a matching birthday flags without waiting', async () => {
+    const w = await world()
+    await importedDebt(w, { who: 'D. Pruitt', email: 'dale@old.dev', dateOfBirth: '1979-03-14' })
+    expect((await leftOwingFlagFor(
+      { name: 'Dale Pruitt', email: 'dale@old.dev', dateOfBirth: '1979-03-14' },
+      [w.asking.landlordId])).flagged).toBe(true)
+  })
+
+  /** The flag still says nothing: a licence number is not three words. */
+  it('says nothing about the licence to the landlord asking', async () => {
+    const w = await world()
+    await importedDebt(w, { who: 'Dale Pruitt', idNumber: 'D1234567', idState: 'AZ' })
+    const flag = await leftOwingFlagFor(
+      { name: 'Dale Pruitt', idNumber: 'D1234567', idState: 'AZ' }, [w.asking.landlordId])
+    expect(Object.keys(flag).sort()).toEqual(['count', 'flagged', 'watchOnly', 'words'])
+    expectNoFigures(flag, ['D1234567', 1234567])
   })
 })
 
@@ -332,7 +490,11 @@ describe('the close calls go to a person, and nothing is shown while they wait',
 
     expect((await leftOwingFlagFor(person, [w.asking.landlordId])).flagged).toBe(true)
     const door = await whereAndWhen({ person, askingLandlordIds: [w.asking.landlordId], byUserId: w.asking.userId })
-    expect(door).toEqual([{ owingId, when: 'August of 2024', where: 'Las Vegas, NV' }])
+    // 10/27: the band joins the month and the town — "an approximate, like if
+    // it's like $600 or something, it'll say over $500". $1,430.55 floors to
+    // over $1,000, never the figure itself.
+    expect(door).toEqual([{ owingId, when: 'August of 2024', where: 'Las Vegas, NV',
+                            about: 'over $1,000', watchOnly: true }])
     expect(await openMatchReviews()).toEqual([])
   })
 
@@ -385,5 +547,69 @@ describe('reading without raising anything', () => {
     expect(seen).toHaveLength(1)
     expect(seen[0].verdict).toBe('review')
     expect(await openMatchReviews()).toEqual([])
+  })
+})
+
+// ── 10/27 (Nic): THE FIRST DOOR GAINS A BAND, AND IMPORTS ARE A WATCH LIST ──
+//
+//   "I think initial site needs to say... this area, like maybe this city and
+//    this month and an approximate, like if it's like $600 or something, it'll
+//    say over $500."
+//
+//   "Carry forward balances from landlords that migrate from other platforms
+//    are only a kind of watch list... They're not going to treat it as not
+//    rentable."
+describe('what the first door says about the size of it', () => {
+  const DALE = { name: 'Dale Pruitt', email: 'dale@old.dev', phone: '602-555-9999' }
+
+  it('rounds DOWN to the nearest $500, so it never overstates a debt', () => {
+    expect(amountBand(600)).toBe('over $500')
+    expect(amountBand(500)).toBe('over $500')
+    expect(amountBand(1200)).toBe('over $1,000')
+    expect(amountBand(4999.99)).toBe('over $4,500')
+  })
+
+  it('says "under $500" rather than "over $0"', () => {
+    // "over $0" reads as an accusation of nothing.
+    expect(amountBand(499.99)).toBe('under $500')
+    expect(amountBand(1)).toBe('under $500')
+  })
+
+  it('says nothing at all for no debt', () => {
+    expect(amountBand(0)).toBeNull()
+    expect(amountBand(null)).toBeNull()
+    expect(amountBand(undefined)).toBeNull()
+  })
+
+  it('never carries the figure itself to the landlord', async () => {
+    const w = await world()
+    await importedDebt(w, { who: 'Dale Pruitt', email: 'dale@old.dev', amount: 1430.55 })
+    const door = await whereAndWhen({
+      person: DALE, askingLandlordIds: [w.asking.landlordId], byUserId: w.asking.userId })
+    expect(door[0].about).toBe('over $1,000')
+    // The band, and nowhere the figure behind it — asked of the VALUES, because
+    // the row carries a uuid and "1430" can land inside one by luck (four hex
+    // characters, about one row in two thousand). testsAreDeterministic bans
+    // the stringify-and-search shape for exactly that reason, and caught this.
+    expectNoFigures(door, [1430.55, 1430, '1,430'])
+  })
+})
+
+describe('a GAM balance and an imported one do not mean the same thing', () => {
+  const DALE = { name: 'Dale Pruitt', email: 'dale@old.dev', phone: '602-555-9999' }
+
+  it('one real GAM debt in the set keeps the full words', async () => {
+    // A watch-list phrasing would bury a debt that genuinely needs settling.
+    const w = await world()
+    await importedDebt(w, { who: 'Dale Pruitt', email: 'dale@old.dev' })
+    await db.query(
+      `INSERT INTO tenant_left_owing
+         (landlord_id, property_id, user_id, email, who, amount, source_kind, source_key, left_on)
+       VALUES ($1,$2,NULL,'dale@old.dev','Dale Pruitt',300,'lease',$3,'2025-02-01')`,
+      [w.owed.landlordId, w.propertyId, randomUUID()])
+    const flag = await leftOwingFlagFor(DALE, [w.asking.landlordId])
+    expect(flag.count).toBe(2)
+    expect(flag.watchOnly).toBe(false)
+    expect(flag.words).toBe(LEFT_OWING_WORDS)
   })
 })

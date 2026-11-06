@@ -98,7 +98,7 @@ import {
 } from '@gam/shared'
 import type { DesiredLine, DesiredPosting, LedgerProjector, LedgerSourceRef } from '../ledgerEngine'
 import { LedgerSourceError } from '../ledgerEngine'
-import type { LedgerOwner } from '../ledgerOwner'
+import { booksStartSql, type LedgerOwner } from '../ledgerOwner'
 import { dr, cr, companyTzSql } from './registerBookingPayoutKit'
 import { cSql, centsOf, isUuid } from './tenantShared'
 import { costPlaceSpread, drSpread } from './companyCosts'
@@ -116,7 +116,7 @@ function loanSub(loanId: string, name: string): DesiredLine['sub'] {
 }
 
 function needsBooksStart(): LedgerSourceError {
-  return new LedgerSourceError('no_books_start', 'The company has no books start date yet; nothing posts until it picks one.')
+  return new LedgerSourceError('no_books_start', 'The company has no books start date yet; nothing posts until it picks one.', 'books_start')
 }
 
 // ─── Loans ───────────────────────────────────────────────────────────────────
@@ -143,7 +143,7 @@ const LOAN_SQL = `
          CASE WHEN l.opening_balance IS NULL THEN NULL ELSE ${cSql('l.opening_balance')} END AS opening_c,
          CASE WHEN l.opening_escrow IS NULL THEN NULL ELSE ${cSql('l.opening_escrow')} END AS opening_escrow_c,
          l.voided_at::text AS voided_at,
-         (SELECT x.books_start_date::text FROM landlords x WHERE x.id = l.landlord_id) AS books_start,
+         ${booksStartSql('l.property_id', 'l.landlord_id')}::text AS books_start,
          (SELECT b.posted_date::text FROM bank_transactions b WHERE b.id = l.funded_bank_transaction_id) AS funded_line_day
     FROM books_loans l`
 
@@ -162,7 +162,8 @@ export async function projectLoan(client: PoolClient, loanId: string): Promise<D
   if (loan.start_date < start) {
     if (loan.opening_c == null) {
       throw new LedgerSourceError('owner_not_ready',
-        `Waiting on the owner: what was still owed on the loan "${loan.name}" on the books start date (${start}) is not entered yet on the Loans page.`)
+        `Waiting on the owner: what was still owed on the loan "${loan.name}" on the books start date (${start}) is not entered yet on the Loans page.`,
+        'loan_opening_balance')
     }
     const owed = centsOf(loan.opening_c)
     const escrow = centsOf(loan.opening_escrow_c)
@@ -188,7 +189,8 @@ export async function projectLoan(client: PoolClient, loanId: string): Promise<D
     case 'equipment': target = { role: 'equipment' }; break
     default:
       throw new LedgerSourceError('owner_not_ready',
-        `Waiting on the owner: where the money from the loan "${loan.name}" went is not entered yet on the Loans page.`)
+        `Waiting on the owner: where the money from the loan "${loan.name}" went is not entered yet on the Loans page.`,
+        'loan_proceeds_destination')
   }
   lines.push(
     ...dr(target.role, borrowed, { ...d, ...(target.sub ? { sub: target.sub } : {}), memo: `Borrowed: ${loan.name}` }),
@@ -211,7 +213,7 @@ export const loanProjector: LedgerProjector = {
     if (!owner.landlordId) return []
     const r = await client.query<{ id: string; day: string }>(
       `SELECT l.id::text AS id,
-              GREATEST(l.start_date, COALESCE((SELECT x.books_start_date FROM landlords x WHERE x.id = l.landlord_id), l.start_date),
+              GREATEST(l.start_date, COALESCE(${booksStartSql('l.property_id', 'l.landlord_id')}, l.start_date),
                        COALESCE((SELECT b.posted_date FROM bank_transactions b WHERE b.id = l.funded_bank_transaction_id), l.start_date))::text AS day
          FROM books_loans l WHERE l.landlord_id = $1
         ORDER BY l.start_date, l.id`, [owner.landlordId])
@@ -253,7 +255,7 @@ export async function projectLoanPayment(client: PoolClient, paymentId: string):
             ${cSql('p.principal')} AS principal_c, ${cSql('p.interest')} AS interest_c, ${cSql('p.escrow')} AS escrow_c,
             p.method, p.bank_connection_id, p.voided_at::text AS voided_at,
             l.name AS loan_name, l.property_id, l.vendor_id, l.voided_at::text AS loan_voided_at,
-            (SELECT x.books_start_date::text FROM landlords x WHERE x.id = p.landlord_id) AS books_start,
+            ${booksStartSql('l.property_id', 'p.landlord_id')}::text AS books_start,
             p.bank_transaction_id, bt.posted_date::text AS line_day, bt.bank_connection_id AS line_connection,
             l.cost_place, l.unit_id, l.created_at::text AS logged_at
        FROM books_loan_payments p JOIN books_loans l ON l.id = p.loan_id
@@ -375,7 +377,7 @@ const ASSET_SQL = `
          a.source_expense_id,
          (SELECT e.status = 'active' AND e.voided_at IS NULL FROM landlord_expenses e WHERE e.id = a.source_expense_id) AS source_expense_active,
          a.voided_at::text AS voided_at,
-         (SELECT x.books_start_date::text FROM landlords x WHERE x.id = a.landlord_id) AS books_start,
+         ${booksStartSql('a.property_id', 'a.landlord_id')}::text AS books_start,
          a.funded_by, a.cost_place, a.unit_id, a.created_at::text AS logged_at,
          (SELECT jsonb_object_agg(x.kind, x.c) FROM (
             SELECT y.kind, ${cSql('sum(y.amount)')} AS c FROM books_fixed_asset_funding y

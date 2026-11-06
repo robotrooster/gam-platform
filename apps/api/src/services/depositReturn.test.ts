@@ -432,6 +432,50 @@ describe('finalizeDepositReturn — workflow', () => {
       .toContain('deposit_returned_full')
   })
 
+  // ── 10/27 (Nic): LEFT OWING IS REAL TIME ────────────────────────────────
+  //
+  //   "if they have an outstanding bill and they are trying to onboard with
+  //    another landlord on GAM, like, that landlord needs to see that they
+  //    already owe. that's a real-time situation."
+  //
+  // So finalising a move-out that ends owing money records the debt THEN —
+  // there is no sweep and no grace period to wait out.
+  it('a move-out that ends owing money records the debt on the spot', async () => {
+    const stack = await buildLeaseStack({ depositTotal: 300, cleaningFeeAmount: 500 })
+    const draftId = await makeDraft(stack, {
+      totalDeposit: 300, cleaningFeeAmount: 500,
+      totalDeductions: 500, refundAmount: 0, gapAmount: 200,
+    })
+    await finalizeDepositReturn(draftId, stack.ownerUserId)
+
+    const owed = await db.query<any>(
+      `SELECT amount::float8 AS amount, source_kind, settled_at, landlord_id
+         FROM tenant_left_owing WHERE user_id = (SELECT user_id FROM tenants WHERE id = $1)`,
+      [stack.tenantId])
+    expect(owed.rows).toHaveLength(1)
+    expect(owed.rows[0]).toMatchObject({
+      amount: 200,
+      // A balance GAM itself watched go unpaid — which is what makes it
+      // collectable at all. An imported one is only ever a watch-list note.
+      source_kind: 'lease',
+      settled_at: null,
+      landlord_id: stack.landlordId,
+    })
+  })
+
+  it('a move-out that ends square records no debt at all', async () => {
+    const stack = await buildLeaseStack({ depositTotal: 300, cleaningFeeAmount: 100 })
+    const draftId = await makeDraft(stack, {
+      totalDeposit: 300, cleaningFeeAmount: 100,
+      totalDeductions: 100, refundAmount: 200, gapAmount: 0,
+    })
+    await finalizeDepositReturn(draftId, stack.ownerUserId)
+    const owed = await db.query(
+      `SELECT 1 FROM tenant_left_owing WHERE user_id = (SELECT user_id FROM tenants WHERE id = $1)`,
+      [stack.tenantId])
+    expect(owed.rows).toHaveLength(0)
+  })
+
   it('gap branch: status → sent_gap, positive-amount payment row, gap_charge_failed=TRUE for missing Stripe customer', async () => {
     const stack = await buildLeaseStack({
       depositTotal: 300, cleaningFeeAmount: 500,

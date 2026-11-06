@@ -46,7 +46,7 @@ export const CREDIT_INELIGIBLE_ENTRIES = ['FLEXPAY', 'HOMEPMT'] as const
 /**
  * 10/26 (Nic): what a tenant's OWN overpayment may pay — the two above plus a
  * home/trailer payment, because "let their own overpayment pay a trailer
- * payment" (Kim Bowman's $10.40 of change could not reach the $100 he owed).
+ * payment" (Xander Allerton's $10.40 of change could not reach the $100 he owed).
  * FLEXPAY stays barred to every kind of credit: it is GAM's own collection.
  * Credit the landlord ISSUED keeps the stricter lists above — hours worked and
  * a goodwill credit do not buy somebody a trailer.
@@ -84,7 +84,8 @@ export const rentReceivedStatusSql = (a = 'p'): string =>
  *   pending with no intent, or failed (a failed row with a retry scheduled is
  *   payable; claiming it supersedes that retry — creditUse.supersedeScheduledRetry);
  *   not work-trade suspended (labor is paying it); not GAM's FlexPay pull (never
- *   part of a tenant balance); more than $0.
+ *   part of a tenant balance); not held for the next bill (11/4: a between-bills
+ *   fee nobody is asked for until a bill carries it); more than $0.
  * A row whose retry is in flight is 'processing', so it is not payable.
  */
 export function payableRowSql(a = 'p'): string {
@@ -92,6 +93,7 @@ export function payableRowSql(a = 'p'): string {
   return `(${x}.status IN ('pending','failed')
       AND (${x}.status = 'failed' OR ${x}.stripe_payment_intent_id IS NULL)
       AND ${x}.work_trade_suspended_at IS NULL
+      AND ${x}.held_for_next_bill_at IS NULL
       AND ${x}.entry_description IS DISTINCT FROM 'FLEXPAY'
       AND ${x}.amount > 0)`
 }
@@ -140,7 +142,7 @@ export function moneyTakenOrMovingRowSql(a = 'p'): string {
  * rent roll and the deposit sweep all go on reading it exactly as before. What
  * changes is only WHICH BILL IT IS ON: the lease's Pay Now must not sweep it
  * up, because rent is pay-in-full and that would make the trailer payment
- * unpayable on its own — the thing Dominic Gonzalez's trust money and Lisa
+ * unpayable on its own — the thing Vesper Vanterpool's trust money and Lisa
  * Scheeler's work trade both need.
  *
  * True when the row (alias `a`) is NOT on an installment-sale bill. Use it
@@ -194,6 +196,57 @@ export function notFlexDepositRowSql(a = 'p'): string {
   return `NOT (${x}.type = 'deposit' AND ${x}.lease_fee_id IS NULL
           AND EXISTS (SELECT 1 FROM security_deposits fdx
                        WHERE fdx.lease_id = ${x}.lease_id AND fdx.flex_deposit_enabled IS TRUE AND fdx.status <> 'voided'))`
+}
+
+/**
+ * ── 10/28 (Nic): WHAT A FLEXDEPOSIT PLAN IS ON A LANDLORD'S FIGURES ─────────
+ *
+ *   "The landlord sees the amount of the invoice in total and when it gets
+ *    paid, it looks like it's paid in full, even when only the first
+ *    installment is done."
+ *
+ * The plan writes SEVEN kinds of payment row and exactly ONE of them — the
+ * charge on the move-in invoice — is a line of the landlord's bill. It stands
+ * for the WHOLE deposit (wholeFlexDepositAmountSql below). Everything else the
+ * plan writes is money toward that same figure (the part above the price grid,
+ * installments 2..N, a voluntary pay-ahead, a move's top-up) or GAM's own
+ * revenue (the service fees), and all of it has `invoice_id` NULL.
+ *
+ * So TRUE when the row (alias `a`) is one a landlord's own balance counts: not
+ * a FlexDeposit row at all, or the one that is on the invoice. Showing the rest
+ * would bill their resident two, three or five times for one deposit
+ * (every-dollar-counted-once) and would read as the landlord's receivable money
+ * that is GAM's.
+ *
+ * NOT a replacement for notFlexDepositRowSql, which asks a different question —
+ * whether the row's LEASE has a plan — and answers it for the desk, where the
+ * point is that GAM's custody money must not be taken in cash. This asks what a
+ * row IS, which is what a rendering needs.
+ */
+export function landlordsFlexDepositRowSql(a = 'p'): string {
+  const x = alias(a)
+  return `(${x}.flex_deposit_security_deposit_id IS NULL
+      OR ${x}.invoice_id IS NOT NULL)`
+}
+
+/**
+ * The amount a charge carries on a LANDLORD's figures: its own, except that the
+ * one FlexDeposit charge on the invoice carries the WHOLE deposit —
+ *
+ *   "The landlord sees the full move-in fees, first month's rent, last month's
+ *    rent, security deposits, all that stuff."
+ *
+ * Which is what makes their books read PAID IN FULL from the FIRST installment
+ * while GAM's side and the tenant's still show the rest owed: three views of
+ * one deposit, from one row, with nothing to keep in step.
+ */
+export function wholeFlexDepositAmountSql(a = 'p'): string {
+  const x = alias(a)
+  return `(CASE WHEN ${x}.type = 'deposit' AND ${x}.invoice_id IS NOT NULL
+                  AND ${x}.flex_deposit_security_deposit_id IS NOT NULL
+             THEN (SELECT fdw.total_amount FROM security_deposits fdw
+                    WHERE fdw.id = ${x}.flex_deposit_security_deposit_id)
+             ELSE ${x}.amount END)`
 }
 
 /**
@@ -263,7 +316,7 @@ export function creditEligibleRowSql(a = 'p', opts: { paidAhead?: boolean } = {}
 /**
  * 10/26 (Nic): `paidAhead` admits a HOME/TRAILER PAYMENT, because a tenant's
  * OWN overpayment may pay it — "let their own overpayment pay a trailer
- * payment". Kim Bowman's $10.40 of change from a $550 bank deposit could not
+ * payment". Xander Allerton's $10.40 of change from a $550 bank deposit could not
  * reach the $100 home payment he still owed, so the money was stuck on both
  * sides while the net was right.
  *
@@ -379,6 +432,23 @@ export interface MoneyRowFacts {
    */
   flex_deposit?: boolean | null
   /**
+   * 11/4: the charge is HELD FOR THE NEXT BILL — real, on GAM's books, and
+   * asked for by nothing until a bill run adopts it (migration
+   * 20261104160000).
+   *
+   * REQUIRED, and it was optional for half a day. The reasoning for optional
+   * was that payableRowSql BUILDS every row set and already leaves held rows
+   * out, so a reader working from one never sees a held row. That is true of
+   * every reader that works from the predicate — and services/bankDepositConfirm
+   * does not: it selects charges BY ID from what the screen sent, then asks
+   * isBankPayableRow. With the column absent that read `undefined`, which is
+   * not null, so a held charge passed the guard and a bank deposit could
+   * collect money nobody had been asked for. Required means the guard throws
+   * by name instead ("add payments.held_for_next_bill_at to the SELECT list"),
+   * which is the whole point of requireColumns.
+   */
+  held_for_next_bill_at: string | Date | null
+  /**
    * For a row a dispute reopened: the paid-ahead credits that dispute gave back
    * on it (disputeGaveBackCreditIdsSql). Required by
    * isCreditEligibleRowForCredit on a row with reversal_id.
@@ -386,7 +456,7 @@ export interface MoneyRowFacts {
   dispute_credit_ids?: string[] | null
 }
 
-const PAYABLE_COLUMNS = ['status', 'amount', 'stripe_payment_intent_id', 'work_trade_suspended_at', 'entry_description'] as const
+const PAYABLE_COLUMNS = ['status', 'amount', 'stripe_payment_intent_id', 'work_trade_suspended_at', 'entry_description', 'held_for_next_bill_at'] as const
 const BANK_PAYABLE_COLUMNS = [...PAYABLE_COLUMNS, 'revenue_owner'] as const
 const TAKEN_OR_MOVING_COLUMNS = ['status', 'stripe_payment_intent_id', 'work_trade_suspended_at'] as const
 const DEPOSIT_ROW_COLUMNS = ['entry_description', 'lease_fee_id'] as const
@@ -408,6 +478,7 @@ export function isPayableRow(r: MoneyRowFacts): boolean {
   return (r.status === 'pending' || r.status === 'failed')
     && (r.status === 'failed' || r.stripe_payment_intent_id === null)
     && r.work_trade_suspended_at === null
+    && r.held_for_next_bill_at === null
     && r.entry_description !== 'FLEXPAY'
     && Number(r.amount) > 0
 }

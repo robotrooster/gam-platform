@@ -28,20 +28,20 @@
  *      money in it ($0 rows) writes none; prior arrangements write none; rows a
  *      receipt already covers (a posted payment) are left alone.
  *   3. SPENDS as credit_uses ('applied', dated when they happened):
- *      - Kim Harland: the $450 Move In Special on her September rent (desk,
+ *      - Yvette Bexley: the $450 Move In Special on her September rent (desk,
  *        9/9, on her money-order receipt). The trigger sets that rent's
  *        issued_credit_amount = 450, so Oak Park's September drops $450 under
  *        "Money received" (a credit the landlord gives is never income).
  *      - the Oct 1 bill-run draws of paid-ahead money (lease_prepaid_credit_draws:
  *        RV 52 $14.70, MH 04 $460, MH 08 $460, RV 33 $5.22), each matched to the
  *        one charge it settled.
- *      - Russ Fuller (decision): his $37.60 "carried-forward overpayment" was
+ *      - Tamsin Wrenfield (decision): his $37.60 "carried-forward overpayment" was
  *        CASH paid ahead before GAM (received Aug 12), not a landlord credit. It
  *        is re-recorded as landlord-held paid-ahead money; its three spends
  *        ($5.22 and $25.00 at the Oct 1 bill run, $7.38 at the desk Oct 1 17:03)
  *        move onto it; the tenant credit is restored to $37.60 and voided; the
  *        two Oct 1 notes say "paid from money paid ahead (Aug 12)".
- *   4. WITHDRAWN. Kim Harland's $0.55 (4cd989a7) — Nic, 10/3: the money order
+ *   4. WITHDRAWN. Yvette Bexley's $0.55 (4cd989a7) — Nic, 10/3: the money order
  *      was $485.45, typed in as $486.00; nothing was paid ahead. It was zeroed
  *      by hand (2026-10-03 11:09:46 Phoenix — voided_at records THAT moment,
  *      not this run's); it is now withdrawn the ledger's way (voided_at,
@@ -57,7 +57,7 @@
  *      unfiltered on 10/3: routes/leases.ts ~314 (prepaid_credit_remaining,
  *      the monthly-draw control: no step owns that line yet) and
  *      services/depositReturn.ts (the move-out preview ~367 and the finalize
- *      pool ~650, Step 9). (Russ's tenant credit is voided with status 'void';
+ *      pool ~650, Step 9). (Tamsin's tenant credit is voided with status 'void';
  *      every tenant_credits reader already filters status = 'active'.)
  *      The OLD code that runs until the restart (P3) filters nothing — it has
  *      no voided_at — so run DRY=0 right before the restart, never hours ahead.
@@ -108,7 +108,7 @@ export interface KnownHistory {
 
 export const PRODUCTION_HISTORY: KnownHistory = {
   issuedSpends: [{
-    label: 'Kim Harland — Move In Special on September rent',
+    label: 'Yvette Bexley — Move In Special on September rent',
     tenantCreditId: 'e063a957-d1c4-43da-b57d-a379ca75c9b3',
     paymentId: '76262ebb-9cd5-4a8b-ba33-cc10d1c5ca46',
     amount: 450,
@@ -117,7 +117,7 @@ export const PRODUCTION_HISTORY: KnownHistory = {
     deskAction: true,
   }],
   reRecorded: [{
-    label: 'Russ Fuller — $37.60 cash paid ahead before GAM',
+    label: 'Tamsin Wrenfield — $37.60 cash paid ahead before GAM',
     tenantCreditId: '5dded090-e217-48f5-b795-632f82f45430',
     leaseId: 'f5d6de02-863c-488f-b0df-53b52b6f5c26',
     receivedAt: '2026-08-12T12:00:00-07:00',
@@ -130,7 +130,7 @@ export const PRODUCTION_HISTORY: KnownHistory = {
     ],
   }],
   voidedPaidAhead: [{
-    label: 'Kim Harland — $0.55 that was never paid ahead',
+    label: 'Yvette Bexley — $0.55 that was never paid ahead',
     creditId: '4cd989a7-60e2-4090-9cef-ceb3908a88de',
     reason: 'Money order 55109266912 was $485.45, typed in as $486.00 — nothing was paid ahead (Nic, 10/3)',
     // When Nic zeroed it by hand (production updated_at, read-only check 10/3).
@@ -214,7 +214,7 @@ export async function runMoneyHistoryBackfill(client: PoolClient, history: Known
     .filter(u => (u.tenant_credit_id === creditId || u.prepaid_credit_id === creditId) && (u.status === 'held' || u.status === 'applied'))
     .reduce((s, u) => s + cents(u.amount), 0)
 
-  // Russ's re-recorded credit, if an earlier run already wrote it.
+  // Tamsin's re-recorded credit, if an earlier run already wrote it.
   const reRecordedIds = new Map<string, string>()
   for (const rr of history.reRecorded) {
     const ex = await client.query<{ id: string }>(
@@ -323,7 +323,7 @@ export async function runMoneyHistoryBackfill(client: PoolClient, history: Known
     if (r.rows[0]) report.voided.push({ creditId: v.creditId, restoredTo: r.rows[0].amount_original, reason: v.reason, voidedAt: r.rows[0].voided_at })
   }
 
-  // ── 3a. Russ: the re-recorded paid-ahead credit ────────────────────────────
+  // ── 3a. Tamsin: the re-recorded paid-ahead credit ────────────────────────────
   for (const rr of history.reRecorded) {
     if (reRecordedIds.has(rr.tenantCreditId)) continue
     const tc = (await client.query<{ tenant_id: string; amount_original: string }>(
@@ -445,7 +445,7 @@ export async function runMoneyHistoryBackfill(client: PoolClient, history: Known
     await writeUse({ prepaidCreditId: d.credit_id }, { paymentId: pid, amount: Number(d.amount), appliedAt: d.created_at, billingMonth: d.billing_month }, d.lease_id)
   }
 
-  // ── Russ's tenant credit: restored whole, then voided ──────────────────────
+  // ── Tamsin's tenant credit: restored whole, then voided ──────────────────────
   for (const rr of history.reRecorded) {
     const r = await client.query<{ amount_original: string }>(
       `UPDATE tenant_credits
@@ -619,7 +619,7 @@ if (require.main === module) {
   ;(async () => {
     const dry = process.env.DRY !== '0'
     // The precondition (header, step 4): no DRY=0 while a balance read would
-    // show Kim's withdrawn $0.55 again or pool it into a move-out refund.
+    // show Yvette's withdrawn $0.55 again or pool it into a move-out refund.
     const unfiltered = unfilteredPaidAheadReaders()
     if (unfiltered.length > 0) {
       const list = unfiltered.map(u => `   ${u.file}:${u.line}  ${u.sql}`).join('\n')

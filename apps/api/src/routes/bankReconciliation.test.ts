@@ -92,8 +92,14 @@ describe('the landlord\'s bank reconciliation door, on the ledger', () => {
     const b = (await db.query<{ id: string }>(
       `INSERT INTO landlords (user_id, billing_starts_at, books_start_date) VALUES ($1, DATE '2000-01-01', DATE '2026-01-01') RETURNING id`,
       [a.ownerUserId])).rows[0].id
-    await db.query(`DELETE FROM ledger_outbox WHERE source_type = 'opening' AND source_id = $1`, [b])
     const propB = await inTx(c => seedProperty(c, { landlordId: b, ownerUserId: a.ownerUserId, managedByUserId: a.ownerUserId }))
+    // 11/3: the books start lives on the PROPERTY and the company's is derived
+    // from it, so the date has to be set after the property exists — a company
+    // whose only property has no date has no books start, which is the point.
+    await db.query(`UPDATE properties SET books_start_date = DATE '2026-01-01' WHERE id = $1`, [propB])
+    await db.query(
+      `DELETE FROM ledger_outbox
+        WHERE source_type = 'opening' AND (source_id = $1 OR source_id LIKE $1 || '|%')`, [b])
     await companyWithBank({ ...a, landlordId: b, propertyId: propB, owner: { landlordId: b } })
     const auth = { Authorization: `Bearer ${passFor(a.ownerUserId, [a.landlordId, b])}` }
 

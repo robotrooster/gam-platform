@@ -86,7 +86,10 @@ describe('the P&L', () => {
     expect(d.lead).toBe('received')
     expect([d.view.received, d.view.charged, d.view.owed]).toEqual([400, 1300, 900])
     expect(d.view.proof).toMatchObject({ owedAtStart: 0, billed: 1300, received: 400, owedAtEnd: 900 })
-    expect(d.view.tieText[1]).toMatch(/= owed \$900\.00 at the end of Oct 31, 2026\./)
+    // 11/4: matched by what it SAYS, not where it sits — the books path gained
+    // a charged sentence ahead of the strip (moneyViewFrom), and an index would
+    // move again the next time a sentence is added.
+    expect(d.view.tieText.some((s: string) => /= owed \$900\.00 at the end of Oct 31, 2026\./.test(s))).toBe(true)
     expect(d.nets).toEqual({ received: 400, charged: 1300 })
     expect(d.meta.columns.map((c: any) => c.key)).toEqual(['received', 'charged', 'owed'])
     expect(d.meta.columns[2].note).toMatch(/at the end of the period/)

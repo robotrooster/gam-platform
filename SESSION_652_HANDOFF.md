@@ -187,7 +187,7 @@ ones: mobile homes only (S613), park-owned only, buyer must have standing.
 previously added 11, but never onboarded the right way. And I'm thinking you just
 added a bunch more and ignored his existing 11... I can see he has 47 units which
 doesn't make sense."* He was right. The load script wrote 36 lots with raw SQL,
-bypassing `canonicalUnitNumber`, so Blu's own eleven `MH NN` units sat beside 36
+bypassing `canonicalUnitNumber`, so Hollis's own eleven `MH NN` units sat beside 36
 new `Lot N` ones and nothing joined them — the property's own water meters were
 already named `MH 01`, so the park had been disagreeing with itself. The eleven
 empty duplicates are deleted and the 35 renamed; Country Acres reads 36 units.
@@ -211,7 +211,7 @@ Country Acres is backfilled: MH 00–MH 34 in the system, "Lot 0"–"Lot 34" on 
 page. The label never decides what a space IS; an RV spot called "Lot 1" is still
 short-stay inventory.
 
-**The acknowledgements are their own document now.** Nic, on Blu's lease: *"is
+**The acknowledgements are their own document now.** Nic, on Hollis's lease: *"is
 that acknowledgement a legal requirement? And is that also in your disclosure
 list?"* — then *"can you get those acknowledgements, a copy of those into the
 system?"* It is, and it was, but only as four initial lines on page 4 of one
@@ -221,7 +221,7 @@ cannot be reused by the next Illinois park. It is now a one-page form tagged
 pamphlet, the lease exhibited before signing, the written 24-month offer on a
 date preceding signature, and the park rules.
 `apps/api/src/scripts/mattoon/load9_il_acknowledgements.ts` built it; template
-`c5ad6ff1-d085-4053-91cd-aba3b0774fc9`. **Deliberately NOT added to Blu's
+`c5ad6ff1-d085-4053-91cd-aba3b0774fc9`. **Deliberately NOT added to Hollis's
 packet** — his lease already carries these lines, and asking one household to
 initial them twice is worse than once.
 
@@ -232,7 +232,7 @@ upload their own form the same way they upload their own lease."* And on why the
 statute text stays off the screen: *"a landlord may have properties in multiple
 states. We don't want to clutter all that screen."*
 
-The case was already in the data — Blu uploaded his own copies of the FEDERAL
+The case was already in the data — Hollis uploaded his own copies of the FEDERAL
 lead-based paint disclosures, identical for every landlord in the country, and
 every landlord after him would have uploaded them again.
 
@@ -261,7 +261,7 @@ each with a title-case name that says what it is:
 - Lead-Based Paint Disclosure — Sales (EPA Form 9600-040)
 - Protect Your Family From Lead in Your Home (January 2026)
 - Living in a Manufactured Home Community (Illinois, 2018) — the statutory
-  pamphlet; its introduction cites Section 14-1, which Blu's acknowledgement
+  pamphlet; its introduction cites Section 14-1, which Hollis's acknowledgement
   refers to
 - Illinois Mobile Home Landlord and Tenant Rights Act (765 ILCS 745)
 
@@ -287,7 +287,7 @@ looked at it logged in — that needs Nic.
 
 **The first refresh case arrived before the mechanism did.** EPA reissued
 "Protect Your Family From Lead in Your Home" in **January 2026** for the new
-dust-lead action levels. Every copy downloaded before that is stale. Blu's
+dust-lead action levels. Every copy downloaded before that is stale. Hollis's
 lead-paint FORMS are fine — that wording is fixed federal regulation — but the
 PAMPHLET he hands over with them is the thing that changed, so the Sheptocks
 should get the January 2026 one.
@@ -296,16 +296,16 @@ should get the January 2026 one.
 those forms in there for the package... he needs to edit whatever box is on his
 template first."* Nothing was signed. The three live documents are voided (not
 erased), zero signing requests remain open, and the pending sale is cancelled.
-On Blu's shelf: EPA's Sales form, the January 2026 pamphlet, and IDPH's
+On Hollis's shelf: EPA's Sales form, the January 2026 pamphlet, and IDPH's
 community guide. Retired (one click restores any of them): his own two
 lead-paint uploads — tagged as LEASES, so the lease picker offered them — and the
 acknowledgements form I wrote on S652, which is GAM-authored and so falls
 outside the rule Nic set today. `load10_clear_lot1_stock_blu.ts` did it.
 
-**NOTHING HAS BEEN REDRAFTED OR SENT.** The order is Nic's: Blu fixes the box
+**NOTHING HAS BEEN REDRAFTED OR SENT.** The order is Nic's: Hollis fixes the box
 on his lease template (the Lot # box that sits off to the right) → Nic confirms
 → draft Lot 1 as lease + installment contract + EPA Sales form + lead pamphlet +
-IDPH pamphlet → Blu blesses it → then the other twelve.
+IDPH pamphlet → Hollis blesses it → then the other twelve.
 
 **A void left the sale behind — fixed at the table.** Clearing Lot 1 found that
 voiding an unsigned installment agreement left its sale at `pending_signature`
@@ -340,7 +340,7 @@ document in it.
   Government forms sit in theirs already. Nothing says required. Upload into a
   sleeve and it takes the sleeve's type, unit type and state. Unfileable
   templates show under Other documents. All seven existing templates filed.
-- **"Already in…"** — Blu's lease carries his park rules and owner disclosure as
+- **"Already in…"** — Hollis's lease carries his park rules and owner disclosure as
   exhibits; a sleeve can be covered by a document he already has
   (`sleeve_coverings`) instead of reading as missing.
 - **Library is relevant-only** again — Federal plus their states, for the spaces
@@ -349,7 +349,7 @@ document in it.
   for that state and unit type (default lease if two; Sales or Rentals lead form,
   never both; nothing covered).
 
-For Blu's Lot 1 packet the order is unchanged, but step 3 is now one click: a
+For Hollis's Lot 1 packet the order is unchanged, but step 3 is now one click: a
 package for Illinois / mobile home with "Includes a home sale" ticked fills with
 exactly lease + installment contract + EPA Sales form + lead pamphlet + IDPH
 guide — once he has marked his park rules and owner disclosure as "Already in"
@@ -370,7 +370,7 @@ his lease.
     leases, sale contracts or notices).
   - `scripts/disclosures/redetectAll.ts` re-reads everything after a detector
     change.
-- **Duplicates.** Blu is an owner-member of Oak Park, so his view spans two
+- **Duplicates.** Hollis is an owner-member of Oak Park, so his view spans two
   companies. The library now dedupes to one copy per viewer.
 - **Cards are wide and short**, nothing is truncated, and every group starts
   collapsed.
@@ -467,15 +467,15 @@ board when an agreement ends or sleeps for the season. Field permissions
 (`field_permissions`, first one `read_meters`): the meter walk moved to
 `packages/shared-ui/MeterWalk.tsx` and a work trader with Read meters takes it
 from their Work Trade tab, own property only, never the review. Indefinite
-carry-forward (`carry_forward_indefinite`). Curtis Clabough: 25 hrs, no limit,
+carry-forward (`carry_forward_indefinite`). Sage Stillwell: 25 hrs, no limit,
 reads meters.
 
-**Utility bills wait for the landlord — when the company chooses.** Blu asked to
+**Utility bills wait for the landlord — when the company chooses.** Hollis asked to
 see and correct bills before tenants do. It went platform-wide for an hour, then
 Nic separated two things: WHO may enter readings is a per-person permission
 (Team page; a work-trade agreement's Read meters), WHETHER the bills wait for
 approval is the company's own toggle on Settings (`landlords.review_utility_bills`,
-off by default; TruBlu / Country Acres on). A month's readings are priced by the
+off by default; TruHollis / Country Acres on). A month's readings are priced by the
 same engine (`services/utilityReview.ts`), left unissued, and shown on the
 Meters page (Review bills & approve) with previous / this month / usage / bill
 per site. A read can be fixed in place until approved; approving completes the
@@ -506,7 +506,7 @@ the draft writes the sale and links the contract; refused if the package has no
 installment contract). Future (Nic): counsel-reviewed GAM-approved documents
 per state as free-version slot fillers.
 
-**Blu's package save.** Documents and packages belong to the ACCOUNT
+**Hollis's package save.** Documents and packages belong to the ACCOUNT
 (`account_companies()`, `fileUnderCompany()`); no "choose which company"
 question anywhere on documents. Errors show the server's sentence in both
 portals.
@@ -535,10 +535,10 @@ either way.
 
 ## Outstanding
 
-### Needs Nic or Blu
+### Needs Nic or Hollis
 1. **Money fields on Mattoon's installment contracts** — the sheet records what
    is LEFT ($11,000 over 55 months), never the original price or down payment.
-2. **Lisa Scheeler's permissions** — Nic checks Tuesday, she is not in before then.
+2. **Calla Fitzhugh's permissions** — Nic checks Tuesday, she is not in before then.
 3. **Stripe rep: card reader.** Nic is ordering the **S710** (same price as the
    S700, adds offline mode; cellular optional and not needed — WiFi/Ethernet or a
    phone hotspot). Worth asking the rep, in these words: can an S710 run a custom
@@ -547,15 +547,15 @@ either way.
    (check whether it is the Ethernet one), the $5 test card is a **platform-side**
    purchase for proving the flow once, the case only matters once the reader
    travels — which it now will, for propane.
-4. **Lot 1 waits on Blu's template fix, then a redraft.** (See "Lot 1 cleared"
+4. **Lot 1 waits on Hollis's template fix, then a redraft.** (See "Lot 1 cleared"
    above — the earlier packet is voided.) History: The 13 originally-sent leases were
    deleted, not voided: they were drafted before the co-tenant roles were fixed,
    so 70 of 125 template fields never landed, nobody had signed them and nothing
    referenced them. Nic: something *"that was never a real issue, of real
    substance or value to the system... needs to just kind of be pruned
    completely."* Lot 1 went back out as the real three-document packet (lot
-   lease + installment contract + lead-based-paint SALE form) with John Sheptock
-   as signer and Nancy as authorised occupant. The other twelve wait on Blu
+   lease + installment contract + lead-based-paint SALE form) with Opal Prescott
+   as signer and Nancy as authorised occupant. The other twelve wait on Hollis
    blessing this one. Invoicing backfills 30 days, so a signature any time
    through about **30 October** still bills October in full; after that, October
    has to be billed by hand.
@@ -564,15 +564,15 @@ either way.
    display label. Nic: *"the office building is I think it's a single wide
    trailer that's on its own lot that they may be trying to sell off so that
    might actually be considered a mobile home too"* — he is unsure and wants
-   Blu's answer. It matters because the type, not the label, is what decides
+   Hollis's answer. It matters because the type, not the label, is what decides
    whether a space can ever be scheduled as short-stay inventory. One field
-   change once Blu says.
+   change once Hollis says.
 
 ### Still to do at Mattoon
 7. **The 11 installment contracts**, after the leases are signed. The packet now
    works either way, so they can go out with a lease or on their own.
 8. **Six adults are occupants, not signers.** If any should be liable co-tenants,
-   Blu collects their addresses and they go on by addendum.
+   Hollis collects their addresses and they go on by addendum.
 
 ### Built but never exercised
 8. **The ACH fee debit has still never run against a real bank.** Both links
@@ -598,7 +598,7 @@ cancel on the 30th. Now exempt only if cancelled before the check-in date, with
 a database trigger stamping the moment so no call site can forget it. No-show is
 out of billing entirely, per Nic: the site was held either way.
 
-**Mattoon's leases were unsignable, and the cause was not Mattoon.** Blu read
+**Mattoon's leases were unsignable, and the cause was not Mattoon.** Hollis read
 the thirteen and reported that tenant names did not populate on pages 1, 5 and
 7, and that the date area could not be filled. They were not blank — those
 fields were **absent**. 70 of the template's 125 fields never reached the
@@ -608,10 +608,10 @@ so every tenant field was pruned as an unused role slot. That drafter is the
 normal invite path, so every household lease drafted through it carried this.
 
 The thirteen were **deleted**, not voided — no signature existed on any of them
-and nothing referenced them, and a voided row would sit in Blu's history forever
+and nothing referenced them, and a voided row would sit in Hollis's history forever
 implying something had happened. Lot 1 was then reissued alone, as the real
 packet: lease + installment contract (\$11,000 over 55 months, no down payment)
-+ the SALE version of the lead-paint addendum. Delivered to Blu only.
++ the SALE version of the lead-paint addendum. Delivered to Hollis only.
 
 **The packet now knows a sale from a rental.** A live home-sale contract means a
 sale — it beats the ownership flag, because the home stays the park's on paper
@@ -624,12 +624,12 @@ and 17), no plain rentals yet.
 statute sections across all fifty states — I had wrongly reported that corpus as
 nearly empty, having looked at the structured-rules table (3 rows) instead of
 the text. Every category was measured against it. The first pass found 28 and
-Nic caught it missing the acknowledgement block on Blu's own lease; the second
+Nic caught it missing the acknowledgement block on Hollis's own lease; the second
 pass found fifteen more, and the gap was framing rather than recall — the first
 search asked what can be WRONG with a building, never what a landlord must TELL
 or HAND to a tenant. Security deposit terms (41 states) and park rules (38)
 outrank almost everything found first time. Park rules is the fourth line of the
-acknowledgement Blu was reading.
+acknowledgement Hollis was reading.
 
 A template also carries which transaction it belongs to (sale/rental/any) and
 which state it was written for. Lead paint is federal, so one form travels;
@@ -639,7 +639,7 @@ Most-specific-wins, and the general form shows as superseded rather than
 vanishing. **Nothing anywhere claims a disclosure is required** — a test fails
 on the words "required", "must" and "compliance" appearing in the API response.
 
-**A name on a lease is never shortened again.** Blu saw "S-H-E dot dot dot". The
+**A name on a lease is never shortened again.** Hollis saw "S-H-E dot dot dot". The
 signing screen shrinks text, stops at a 6px floor and lets CSS hide the rest;
 the PDF stamper sized on the box's HEIGHT alone and would have drawn the whole
 name straight out past its box. The page he was reading and the page that would
@@ -658,13 +658,13 @@ out of a box gets fixed and "She…" does not.
   leaves no money trail at all, so the bank feed is useless — but utility
   consumption on a unit the schedule calls empty is close to un-fakeable, and
   GAM already holds the readings.
-- **Blu is double-checking the template.** Nic's read: "I'm thinking he didn't
+- **Hollis is double-checking the template.** Nic's read: "I'm thinking he didn't
   save some of the boxes he edited." Two open items from his list are template
   AUTHORING, not code — the lot-number box sits off to the right of its line on
   one page, and the tenant-name box on Exhibit A was too narrow. The narrowness
   no longer truncates anything, but the box is still small. Nothing to do until
   he reports back.
-- **The other twelve are ready to go** once Blu blesses Lot 1 — eleven as
+- **The other twelve are ready to go** once Hollis blesses Lot 1 — eleven as
   rent-to-own packets, and Lots 6 and 17 as lot leases with no lead-paint
   addendum, since those two households already own their homes.
 - **Should the portal let a landlord set a unit `active` with no lease?** Nic's
@@ -695,14 +695,14 @@ out of a box gets fixed and "She…" does not.
 18. **PM `books.view` / `books.edit` reach no screen.** Grantable, honoured at the
     API, no PM portal surface. Zero PM scopes exist in prod.
 19. **Three stale Resend suppressions** on GAM's own test addresses.
-20. **Nancy Sheptock's three email-log rows** still carry her old address.
+20. **Nancy Prescott's three email-log rows** still carry her old address.
 
 ---
 
 ## Closed this session, do not re-raise
 
-- **Curtis Clabough's hours.** Nic: "just leave Curtis at 20 hours. Blu can deal
-  with that. Stop bringing Curtis up."
+- **Sage Stillwell's hours.** Nic: "just leave Sage at 20 hours. Hollis can deal
+  with that. Stop bringing Sage up."
 - **Oak Park's register Stays items.** Its prices were always on its units; the
   three buttons now exist.
 - **Tenants as POS customers.** Already true — the picker has always unioned them.
@@ -733,21 +733,21 @@ Nic: "I want to see all of Oak Park's disbursements, total disbursed and total p
 - API: `next-payout` rows, `gam-charges` charges/debits and `absorbed-manual-fees` rows now carry `landlord_id` so the page can cut them.
 - **Not done — a separate pass:** Nic's "search everywhere" for anything that lets the first company on an account stand in for the account (`profileId` is used ~419 times across routes/services/jobs). That is an audit, by hand, in order, not a grep-and-replace.
 
-Lot 15 (Mike Boyd) was drafted, then voided at Nic's instruction — Blu gets the figure from the previous owner tomorrow. Lots 6 and 17 (tenant-owned) went in the batch and stay sent. Deploy 36 = this page.
+Lot 15 (Isolde Lanthorne) was drafted, then voided at Nic's instruction — Hollis gets the figure from the previous owner tomorrow. Lots 6 and 17 (tenant-owned) went in the batch and stay sent. Deploy 36 = this page.
 
-## Blu's two morning problems (2026-09-22) — both fixed, deploy 37
+## Hollis's two morning problems (2026-09-22) — both fixed, deploy 37
 
-**"None of the packets included the installment contract."** They all did (document 2 of 9, status sent). Blu signed each lease, the done screen said "Signatures Submitted — the next party will be notified", and nothing led him to the other eight documents, which were waiting on HIS signature. Fix: `packageSiblings(documentId, forUserId)` now carries each sibling's signer status + token for the current signer; both signing pages show "Document N of 9 · M more for you to sign" in the header and the done screen's primary button is **Next: <title> →** into the next document that still needs them. Test: signingPackages "siblings carry the signer's own status and token". Until Blu opens a packet document again, the E-Sign page lists the eight per lot as "waiting on Blu Haws".
+**"None of the packets included the installment contract."** They all did (document 2 of 9, status sent). Hollis signed each lease, the done screen said "Signatures Submitted — the next party will be notified", and nothing led him to the other eight documents, which were waiting on HIS signature. Fix: `packageSiblings(documentId, forUserId)` now carries each sibling's signer status + token for the current signer; both signing pages show "Document N of 9 · M more for you to sign" in the header and the done screen's primary button is **Next: <title> →** into the next document that still needs them. Test: signingPackages "siblings carry the signer's own status and token". Until Hollis opens a packet document again, the E-Sign page lists the eight per lot as "waiting on Hollis Harkness".
 
-**"Late payment alerts, Day 2090."** The packets were drafted by script with no INVITE row, and the invite is the only place GAM learns "existing tenancy". Issuance read each lease's start date off the sheet (2018/2021/2023…) as a move-in and billed the first month there; the late-fee job (22:00) and the monthly run (05:00) piled on for MH 01 (rent 2021, $50 late fee, Sept rent, the August water $57.75). Only Blu was emailed (five alerts at 07:00); tenants got only their "Please sign" mails. Repair (`scripts/mattoon/load17_no_history_billed.ts`, applied): nine leases flagged `is_existing_tenancy`; twelve never-owed charges removed and ten invoices voided (unwindIssuedLease's own primitives; leases kept); the thirteen August reads stamped `billed_off_platform` — Blu billed that cycle himself, nothing bills from it, September measures from it and lands on October's invoice after he approves the run (Nic confirmed); invite rows (existing tenancy) written for MH 06 / 08 / 17 so their signatures issue correctly. Lot 15 needs the same invite row before it is drafted again. The completed August reading run now shows no cycle reads (cosmetic — they are the off-platform ones).
+**"Late payment alerts, Day 2090."** The packets were drafted by script with no INVITE row, and the invite is the only place GAM learns "existing tenancy". Issuance read each lease's start date off the sheet (2018/2021/2023…) as a move-in and billed the first month there; the late-fee job (22:00) and the monthly run (05:00) piled on for MH 01 (rent 2021, $50 late fee, Sept rent, the August water $57.75). Only Hollis was emailed (five alerts at 07:00); tenants got only their "Please sign" mails. Repair (`scripts/mattoon/load17_no_history_billed.ts`, applied): nine leases flagged `is_existing_tenancy`; twelve never-owed charges removed and ten invoices voided (unwindIssuedLease's own primitives; leases kept); the thirteen August reads stamped `billed_off_platform` — Hollis billed that cycle himself, nothing bills from it, September measures from it and lands on October's invoice after he approves the run (Nic confirmed); invite rows (existing tenancy) written for MH 06 / 08 / 17 so their signatures issue correctly. Lot 15 needs the same invite row before it is drafted again. The completed August reading run now shows no cycle reads (cosmetic — they are the off-platform ones).
 
 Rule for any future hand-drafted onboarding: write the `pending_tenant_intents` row (is_existing_tenancy=TRUE) BEFORE drafting, or the signature bills history.
 
 ## "Lease did not issue" ×4 on MH 06 (2026-09-22 08:25) — fixed, deploy 38
 
-Blu signed four disclosure addenda before/around the lease; each landlord signature runs issuance, and an `addendum_terms` with no `lease_id` threw "Addendum has no parent lease_id" → critical alert. Packet siblings are drafted before the lease exists (`packetDraft.ts`), so none carried a lease id. `buildLeaseFromDocument` now: a packet document with no lease_id binds to the packet's lease if it has issued (stamps it, proceeds), otherwise returns `deferred` quietly; and when the packet's `original_lease` issues, every sibling is stamped with the lease. Backfilled: 77 sibling documents at Country Acres now carry their lease; the four alerts acknowledged. Test: esign "S652: a packet sibling waits for its lease, then binds to it". Signing the installment contract (`purchase_agreement`) is a standalone type — no build runs; the sale was linked at draft.
+Hollis signed four disclosure addenda before/around the lease; each landlord signature runs issuance, and an `addendum_terms` with no `lease_id` threw "Addendum has no parent lease_id" → critical alert. Packet siblings are drafted before the lease exists (`packetDraft.ts`), so none carried a lease id. `buildLeaseFromDocument` now: a packet document with no lease_id binds to the packet's lease if it has issued (stamps it, proceeds), otherwise returns `deferred` quietly; and when the packet's `original_lease` issues, every sibling is stamped with the lease. Backfilled: 77 sibling documents at Country Acres now carry their lease; the four alerts acknowledged. Test: esign "S652: a packet sibling waits for its lease, then binds to it". Signing the installment contract (`purchase_agreement`) is a standalone type — no build runs; the sale was linked at draft.
 
-## Template features (Nic, 2026-09-22) + Blu's date entry — deploy 40
+## Template features (Nic, 2026-09-22) + Hollis's date entry — deploy 40
 
 - **Choice group** (`field_type='choice'`): several boxes on the page, one group name (stored in `options`), pick ONE. Marked X (default), a check, or the signer's initials (`checkbox_mark`). Required means one box in the group, enforced as a group on the sign submit and counted once on the page. A child field can be "only shown if [box] is chosen" (`parent_option='chosen'`). Stamped like a ticked checkbox or an initial.
 - **Fixed text** (`field_type='fixed_text'`): typed once on the template (`default_value`), printed as plain text on every document; landlord role, never required; the landlord can change it on one document by clicking the pencil while it is his turn (opens the text editor); the tenant only reads it (sign submit writes only your own role). Excluded from the review list.
@@ -763,8 +763,8 @@ Still held for Nic's go: tenant packet email bundling (tenant is emailed per doc
 - Both signing pages: the "Document N of M" line opens the whole packet — every document with its state for this signer (this one / needs you / you signed / not yours yet / done); click any that is theirs to open it. Order is the signer's choice.
 - Tenants at Country Acres already invited per document before this change keep those links; nothing re-sends.
 
-## Year field (Blu) — deploy 42
-`field_type='year'`: template palette "Year (pick from a list)"; on the signing page a scroll list (next year back a century) that stays open until Save; stamped as text. Blu's installment contract "Year of manufacture" box (page 4) switched to it on the template; documents already drafted keep their text box until re-drafted.
+## Year field (Hollis) — deploy 42
+`field_type='year'`: template palette "Year (pick from a list)"; on the signing page a scroll list (next year back a century) that stays open until Save; stamped as text. Hollis's installment contract "Year of manufacture" box (page 4) switched to it on the template; documents already drafted keep their text box until re-drafted.
 
 ## The paper is the record — installment contract terms (Nic, 2026-09-22) — deploy 43
 
@@ -773,9 +773,9 @@ Nic: "If I want my payment to be $19 for one hundred payments I need to type tho
 - Shared: sale columns (`sale_price`, `sale_down_payment`, `sale_monthly_payment`, `sale_term_months`, `sale_interest_rate`, `sale_first_payment_month`) are category **'sale'** — typed by the landlord, value-bearing (required on his pass), NOT locked. `sale_financed_amount` and the new `sale_final_payment_amount` / `sale_final_payment_month` are derived (identity). Migration `20260922050000_the_paper_is_the_record_final_payment_labels.sql` adds the two labels to both CHECKs.
 - `services/homeSale.ts`: `saleTermsFromFields` / `resolveTypedSaleTerms` read the boxes as typed ("$19", "100", "10/2026", "October 2026"); `applySaleTermsFromDocument(docId)` runs on the LANDLORD's signature of a purchase agreement — writes the sale record (pending the tenant's signature, which starts billing), cancels a stale pending record on the unit, stamps the derived boxes. Typed terms are validated BEFORE the signature commits, so a bad box is fixed on the spot. Tests: `homeSaleTyped.test.ts`, signingPackages "what the landlord types … becomes the sale record".
 - No record at draft anywhere now (packetDraft, the send flow, load16): a sale on the invite is a yes/no ("Selling them this home on installments"); any numbers given only prefill. The invite form lost its number boxes.
-- Blu's installment contract template re-tagged: Monthly payment amount → Monthly payment; Number of monthly installments → Number of payments; First payment date → First payment month; Final payment amount / Final payment due date → the two derived labels (not required). The $450 was the box being tagged with the LOT RENT label; the 55 was right per lot (each contract had its own) but the box lost its tag when the template was re-fielded.
+- Hollis's installment contract template re-tagged: Monthly payment amount → Monthly payment; Number of monthly installments → Number of payments; First payment date → First payment month; Final payment amount / Final payment due date → the two derived labels (not required). The $450 was the box being tagged with the LOT RENT label; the 55 was right per lot (each contract had its own) but the box lost its tag when the template was re-fielded.
 - Template editor: every box kind offers the data-label dropdown (signature → signature labels, initials → initial labels, year/choice/checkbox → text labels); "Fixed text" renamed **Template text**.
-- Still waiting on Nic/Blu: the Template-text wording for the lead-paint form's "List documents below", then the go for the full re-draft (load20 then load16 --only 1,6,11,17,18,21,22,24,28,29,30).
+- Still waiting on Nic/Hollis: the Template-text wording for the lead-paint form's "List documents below", then the go for the full re-draft (load20 then load16 --only 1,6,11,17,18,21,22,24,28,29,30).
 
 ## Post a payment (Nic, 2026-09-22) — deploy 45
 "There's only a way to add a charge. There's no way to post a payment." Tenant page → **Payments** card → **Post a payment** (amount, cash/check/money order, check number, date received, note). `POST /payments/post-payment` → `services/postPayment.ts`: settles what is open oldest-first through the same manual-settle rules (cash free, first-payment waiver, pay-in-full — a short amount is refused), banks the rest on the active lease as paid ahead (`lease_prepaid_credits`, drawn down by the next invoice before it goes out), and writes ONE receipt (`tenant_remittances` — now allows cash/check/money_order, with `reference`, `notes`, `received_by`; migration `20260922060000_a_payment_posted_ahead.sql`). No credit is created. Profile returns `paidAhead`; the card shows "Paid ahead: $X — covers their next invoice." Tests: `postPayment.test.ts`.
@@ -783,9 +783,9 @@ Nic: "If I want my payment to be $19 for one hundred payments I need to type tho
 ## Banking tab: Sync asked "which business" (Nic, 2026-09-22) — deploy 47
 The page carried the chosen company on its lists but not on its actions; on a two-company account, Sync / Disconnect / Categorize / Ignore / the deposit-match actions fell back to "choose which company." Fixed on both sides: a per-row action now reads its company OFF THE ROW (`scopeFromRow` in routes/bankFeed.ts — a connection or transaction belongs to one company; a stranger's is a 404), and the page sends the picked company on every call (books start date, the two panels' queries keyed by company). Test: bankFeedEntity "the row knows its company".
 
-## Blu's packets refreshed; Shannon Gregory's email (2026-09-22) — deploy 48
-- `scripts/mattoon/load21_refresh_unsigned.ts` (applied): every Country Acres document Blu had NOT signed — 63 across MH 01 (7) and 18/21/22/24/28/29/30 (8 each) — voided and drafted fresh from today's templates into the same packet at the same position with the same signers; his signed leases and the fully-signed lots (06, 11, 17) untouched. Installment boxes prefilled from the sheet; what he signs is the record. Tenants who had been emailed about old copies but never opened anything were set back to not-yet-invited so the packet invites them once when Blu finishes it. Then load18: eight continuation emails to Blu in lot order.
-- Shannon Gregory (Oak Park MH 02, co-tenant): her account and signer line moved to rayvinmoonnyte136669@gmail.com by hand and her signing link sent there (set-password-then-sign email). Guard fixed in the invite email-change route: it blocked on the invite being resolved — which happens for the whole household when the lease issues on the landlord's signature — instead of on whether THIS person signed.
+## Hollis's packets refreshed; Yorick Drakeford's email (2026-09-22) — deploy 48
+- `scripts/mattoon/load21_refresh_unsigned.ts` (applied): every Country Acres document Hollis had NOT signed — 63 across MH 01 (7) and 18/21/22/24/28/29/30 (8 each) — voided and drafted fresh from today's templates into the same packet at the same position with the same signers; his signed leases and the fully-signed lots (06, 11, 17) untouched. Installment boxes prefilled from the sheet; what he signs is the record. Tenants who had been emailed about old copies but never opened anything were set back to not-yet-invited so the packet invites them once when Hollis finishes it. Then load18: eight continuation emails to Hollis in lot order.
+- Yorick Drakeford (Oak Park MH 02, co-tenant): her account and signer line moved to rayvinmoonnyte136669@gmail.com by hand and her signing link sent there (set-password-then-sign email). Guard fixed in the invite email-change route: it blocked on the invite being resolved — which happens for the whole household when the lease issues on the landlord's signature — instead of on whether THIS person signed.
 
 ## The account is omnipresent (Nic, DIRECTIVE, 2026-09-22) — deploy 49
 "You cannot be logged into two companies. You operate the companies. Your account is set aside of that... you're logged in omnipresent." The session now carries `homeLandlordId` (the company the account founded, refreshed with memberships in middleware/auth). `resolveLandlordTarget`: explicit wins; one company is that company; otherwise the account's OWN company — no more "You own more than one company. Choose which one." The only writes that must still name a company are a NEW property and a NEW bank link (`mustName=true`) — attributes of one LLC that are unwound by hand if filed wrong; the UI names them. Reads span all companies; per-row actions take the company from the row. Tests updated: expenses (write with no target lands on the founding company); property-create and bank-link still ask.
@@ -800,14 +800,14 @@ The 7:00 banking-day job asked Stripe to refresh the balance and read the accoun
 The $4,154.89 and $413 payouts were in the feed (imported at midnight, matched to their disbursements) but no view showed matched rows. Bank feed tab now has **GAM payouts** beside Needs review / Categorized / Ignored.
 
 ## Old signing links forward; invite acceptance stamps (2026-09-22) — deploy 54
-Blu kept opening links from the earlier emails; every one pointed at a document voided by the 2:25 PM re-draft and answered 410. `authOrSignerToken`: a token for a voided document now forwards to its replacement — same packet group, same slot, same signer — and only a document with no replacement is 410. Both signing pages show the server's reason instead of a generic "Invalid Signing Link". Shannon Gregory: the accept step stamped only invites still waiting to draft, so an invite already resolved by the landlord's signature never showed accepted on the front desk; every non-cancelled invite of the person is stamped on accept (hers stamped by hand).
+Hollis kept opening links from the earlier emails; every one pointed at a document voided by the 2:25 PM re-draft and answered 410. `authOrSignerToken`: a token for a voided document now forwards to its replacement — same packet group, same slot, same signer — and only a document with no replacement is 410. Both signing pages show the server's reason instead of a generic "Invalid Signing Link". Yorick Drakeford: the accept step stamped only invites still waiting to draft, so an invite already resolved by the landlord's signature never showed accepted on the front desk; every non-cancelled invite of the person is stamped on accept (hers stamped by hand).
 
 ## Bank feed is the whole log (Nic, 2026-09-22) — deploy 55
 "The transaction log of the bank account is all money going in and out." The feed opens on **All transactions**, newest first, GAM payouts included and labelled "matched to its disbursement — never counted twice"; Needs review / Categorized / Ignored are filters over the same log; a row's controls follow the row's own state. The separate "GAM payouts" view (deploy 53) is gone.
 
-## Deploy 56 — Blu's installment contract would not submit (2026-09-22 ~16:40)
+## Deploy 56 — Hollis's installment contract would not submit (2026-09-22 ~16:40)
 
-**What Blu saw:** Review & Sign on the MH 18 installment contract, page reloads, no message. Four POSTs, every one a 400, log showed only the status code.
+**What Hollis saw:** Review & Sign on the MH 18 installment contract, page reloads, no message. Four POSTs, every one a 400, log showed only the status code.
 
 **Cause (reproduced, not guessed):** cloned the document, signers and fields into `gam_test` and replayed the submit in-process — `"The installment contract needs the number of payments."` The submit route's field SELECT did not fetch `lease_column`, so the typed-sale-terms pre-check saw no tagged boxes at all. Every installment contract was un-signable since the pre-check shipped (deploy 43/44).
 
@@ -815,7 +815,7 @@ Blu kept opening links from the earlier emails; every one pointed at a document 
 - `lease_column` selected; regression test proven to fail without the fix (`esign.test.ts` "installment contract reads the typed terms").
 - Both SignPages keep the review sheet open on a rejected submit and print the server's reason ("Not submitted. …") instead of a lost toast.
 - Error handler logs every non-GET 4xx with its reason (`request rejected (4xx)`).
-- Blu re-saved the installment template fields at 16:20 (dropped the untagged "Late fee initial flat/percent" boxes, added co-tenant initials). Re-drafted the 8 unsigned installment contracts (MH 01, 18, 21, 22, 24, 28, 29, 30) from the current template in place — same packet slot, same signers, sale terms carried — with `load21 --purpose installment_sale --apply`. Old links forward to the new copies; no new emails needed. MH 11 (Blu already signed) untouched.
+- Hollis re-saved the installment template fields at 16:20 (dropped the untagged "Late fee initial flat/percent" boxes, added co-tenant initials). Re-drafted the 8 unsigned installment contracts (MH 01, 18, 21, 22, 24, 28, 29, 30) from the current template in place — same packet slot, same signers, sale terms carried — with `load21 --purpose installment_sale --apply`. Old links forward to the new copies; no new emails needed. MH 11 (Hollis already signed) untouched.
 - Payments page: one person + one company = ONE outstanding row and balance across their leases (Billy RV 34 + 35); Record payment sends `settleHousehold: true`; credits are the household pool.
 - Issue credit: type a name / space / property, pick from matches (no more spot scroll).
 - Unit page: "Turn off for this lease" beside every billed utility; route now allows switching a lease-billed utility off as a recorded addendum (was a 409 — Billy's trash had to be written by hand).
@@ -824,12 +824,12 @@ Blu kept opening links from the earlier emails; every one pointed at a document 
 
 ## Deploy 57 — one reminder per packet, one late-rent digest per landlord (2026-09-22 ~17:15)
 
-**Why Blu got ~50 emails at 16:30:** the signing-reminder job (every 15 min) nudges a landlord once, two hours after a document is sent — per DOCUMENT. The 8 installment contracts re-drafted at 14:25 plus the other unsigned documents in those packets came due together: 54 reminders in one tick, 6 more at 16:45. Not the re-draft itself (that sent nothing); the reminder pass behind it.
+**Why Hollis got ~50 emails at 16:30:** the signing-reminder job (every 15 min) nudges a landlord once, two hours after a document is sent — per DOCUMENT. The 8 installment contracts re-drafted at 14:25 plus the other unsigned documents in those packets came due together: 54 reminders in one tick, 6 more at 16:45. Not the re-draft itself (that sent nothing); the reminder pass behind it.
 
 **Shipped:**
 - Reminders are per signer per PACKET: one email, "your N documents for Unit MH 18 — Country Acres", link opens the first document and the sign page walks through the rest; every document in the packet is stamped so the cadence and the five-reminder cap count packets. Same for renewal reminders. Test: `esignTimeouts.test.ts` "one reminder per signer per packet".
 - 7am late-rent alerts: ONE digest per landlord (table of tenant · unit · owed · days late, total in the banner), category unchanged so the email dashboard still sees them. The per-tenant sender still exists but nothing calls it. Test: `email.test.ts` "sendLatePaymentDigest".
-- Verified the Day-2090 alerts are gone: no open rent charges before June 2026 remain on Blu's account after the load17 repair.
+- Verified the Day-2090 alerts are gone: no open rent charges before June 2026 remain on Hollis's account after the load17 repair.
 
 **Flagged, not changed (needs Nic):** the 7am job adds 1 to a tenant's `late_payment_count` EVERY morning a balance is still open, so a tenant 30 days late is counted as 30 late payments. It should count once per late charge. Needs a marker on the charge (migration) and a decision on what a "late payment" is for screening purposes.
 
@@ -849,22 +849,22 @@ Blu kept opening links from the earlier emails; every one pointed at a document 
 - Every payment method counts (deploy 58 added desk cash/check/money order).
 - Windows unchanged (grace / 3 days / 15 days past grace). Stamps kept: due date, paid date, grace on every event.
 
-**Backfill applied (positive only):** 14 desk payments from September paid within grace → `late_grace` good marks for Russ Fuller, Jonathan Covey, Coreen Covarrubias, Henry Cisneros, Illyana Gonzalez, Jeremy Parker, Julie Kenyon. 55 late desk payments and 8 prior-arrangement rows left out — nobody gained a late mark. Script: `src/scripts/backfillDeskLedger.ts` (dry run by default).
+**Backfill applied (positive only):** 14 desk payments from September paid within grace → `late_grace` good marks for Tamsin Wrenfield, Rilla Satterlee, Rune Ravensworth, Rosalind Rathbone, Greta Holloway, Margo Northcott, Ulric Vandermere. 55 late desk payments and 8 prior-arrangement rows left out — nobody gained a late mark. Script: `src/scripts/backfillDeskLedger.ts` (dry run by default).
 
 Tests: `creditLedgerEmitters.test.ts` "onboarding month is never negative", `workTradeSettlement.test.ts` on-time event on a covered rent row.
 
 ## Deploy 60 — sign page reset, lease packets, front desk dates (2026-09-22 ~7:00 pm)
 
-- **Sign page "4/2, no boxes" (Blu):** the route changed the token but React kept the component, so page 4 of the installment contract carried into the two-page lead-paint disclosure. Every per-document state (page, boxes, stage, error) now resets when the document changes. Both landlord and tenant SignPages.
-- **Leases tab = the packet (Nic: "I only wanted to see that package — what was sent to who... and what they signed"):** a row expands under the tenant to every document drafted with that lease (`GET /leases/:id/documents`: the lease document plus package-group siblings, never voided): title, when it was sent, each signer's answer (signed + date / not signed / declined), and Open (signed copy once complete, draft until then). Nothing else in the expansion. Jay Jones' one-page "lease" was the generated summary shown when a packet is not complete.
+- **Sign page "4/2, no boxes" (Hollis):** the route changed the token but React kept the component, so page 4 of the installment contract carried into the two-page lead-paint disclosure. Every per-document state (page, boxes, stage, error) now resets when the document changes. Both landlord and tenant SignPages.
+- **Leases tab = the packet (Nic: "I only wanted to see that package — what was sent to who... and what they signed"):** a row expands under the tenant to every document drafted with that lease (`GET /leases/:id/documents`: the lease document plus package-group siblings, never voided): title, when it was sent, each signer's answer (signed + date / not signed / declined), and Open (signed copy once complete, draft until then). Nothing else in the expansion. Kipp Larkspur' one-page "lease" was the generated summary shown when a packet is not complete.
 - **Front desk "owes Sept 30":** the October 1 due date parsed as midnight UTC, which is the evening before in Phoenix. Dates are read as calendar dates now. And a bill that is not due yet no longer puts anyone in "Owes" — Nic: "it shouldn't show until it's due."
 - **Register stays (Mountain View) — NOT changed (Nic: "don't do anything with the point of sale right now").** Finding only: a stay item has no price of its own by the S652 rule; the SITE's rate is the price ($49 / $269 / $589 on all 53 sites) and the server refuses a stay sale without a site. The cart shows $0.00 until "Pick a site and dates" is answered. The public booking site quotes from the unit rate (verified live: 2 nights = $98 + tax) — nobody books free online.
 
 ## Deploy 61 — "Send an addendum" from the lease packet (2026-09-24)
 
-**Blu's deposit question ($0 on page 1, $450 on page 5):** not a tag error, not derived from rent. Page 1's tagged `security_deposit` box prints what GAM holds ($0 — onboarding leases bill no deposit; Blu physically holds none). Page 5 is his Exhibit A whose PDF TEXT says "Security Deposit: $450"; the only boxes there are the untagged five-year rent history he typed (450/450/400/350/300) on every lease. Nic: leave the existing leases; he corrects contradictions by addendum. No change made.
+**Hollis's deposit question ($0 on page 1, $450 on page 5):** not a tag error, not derived from rent. Page 1's tagged `security_deposit` box prints what GAM holds ($0 — onboarding leases bill no deposit; Hollis physically holds none). Page 5 is his Exhibit A whose PDF TEXT says "Security Deposit: $450"; the only boxes there are the untagged five-year rent history he typed (450/450/400/350/300) on every lease. Nic: leave the existing leases; he corrects contradictions by addendum. No change made.
 
-**Addendum sending (built):** the `addendum-terms` route existed and no screen used it. Leases tab → expand a name → gold "Send an addendum": pick a template (any of his except installment/work-trade), title prefilled, "Everyone on the lease" (agreement) or "Notice only"; drafted onto the lease and sent at once — landlord signs first, tenants invited by the relay after. Appears in the packet list. Blu's two new addendum templates are saved with purpose 'lease'; they work from the button as-is.
+**Addendum sending (built):** the `addendum-terms` route existed and no screen used it. Leases tab → expand a name → gold "Send an addendum": pick a template (any of his except installment/work-trade), title prefilled, "Everyone on the lease" (agreement) or "Notice only"; drafted onto the lease and sent at once — landlord signs first, tenants invited by the relay after. Appears in the packet list. Hollis's two new addendum templates are saved with purpose 'lease'; they work from the button as-is.
 
 **Answered, not built (Nic: curiosity):**
 - One-signature property-wide notice with per-household acknowledgement: not built. The batch route drafts one document per lease, each needing his signature. ~1 day if wanted.
@@ -872,23 +872,23 @@ Tests: `creditLedgerEmitters.test.ts` "onboarding month is never negative", `wor
 
 Nic's baby was born 2026-09-24; he is away. POS: untouched by instruction.
 
-## Deploy 62 — addendum send fixed and sent for Blu; Leases row actions collapsed (2026-09-25)
+## Deploy 62 — addendum send fixed and sent for Hollis; Leases row actions collapsed (2026-09-25)
 
-**Blu's "Draft and send" red error (Country Acres Addendum Troy — MH 22):** the addendum route built every signer at signing position 1, so the send step refused it: "The landlord must sign before all other signers — no signer may share the landlord's signing position." (Found straight from the 4xx reason now in the log — deploy 56 paid off.) Fix: landlord = position 1, tenants 2, 3… like every other drafting path. The draft he made at 1:15 pm was repaired by hand (primary → position 2) and sent through the real send route as him at 4:06 pm; "Please sign" went to hawshomes.llc@gmail.com; Troy is invited once Blu signs. Test extended: signer order + a successful send.
+**Hollis's "Draft and send" red error (Country Acres Addendum Delphine — MH 22):** the addendum route built every signer at signing position 1, so the send step refused it: "The landlord must sign before all other signers — no signer may share the landlord's signing position." (Found straight from the 4xx reason now in the log — deploy 56 paid off.) Fix: landlord = position 1, tenants 2, 3… like every other drafting path. The draft he made at 1:15 pm was repaired by hand (primary → position 2) and sent through the real send route as him at 4:06 pm; "Please sign" went to hawshomes.llc@gmail.com; Delphine is invited once Hollis signs. Test extended: signer order + a successful send.
 
 **Leases page too wide (Nic):** eight row buttons ran off the right edge. Now three: Details, a **Charge** menu (Bill a fee · Charge an amount · Recurring add-on or rent change · Carried balance) and a **Change** menu (Move to another space · Move out · Hibernate/Resume). Discard stays on drafts. No modal changed; the same actions, fewer buttons. Nic's further thought — fold "bill a fee" and "charge an amount" into ONE form with a recurring toggle — not done; a design decision for him.
 
 MEMORY.md index trimmed under its size limit (entries ≤128 chars).
 
-## Deploy 63 — the first billing cycle is the floor; Country Acres history erased; April off MH 05 (2026-09-25)
+## Deploy 63 — the first billing cycle is the floor; Country Acres history erased; Querida off MH 05 (2026-09-25)
 
-**Cause of "Country Acres overdue":** (1) the nightly invoice job never read `properties.first_billing_cycle` (Oct 2026); on the 23rd it billed September for 8 households and the late-fee job added $50 each on the 6th-of-month rule. (2) John Sheptock's installment contract was typed with its true start (Jan 2021, 120 × $200); on his signature the sale engine billed 69 months, $13,800. Eight more contracts carry real historical starts and would have done the same.
+**Cause of "Country Acres overdue":** (1) the nightly invoice job never read `properties.first_billing_cycle` (Oct 2026); on the 23rd it billed September for 8 households and the late-fee job added $50 each on the 6th-of-month rule. (2) Opal Prescott's installment contract was typed with its true start (Jan 2021, 120 × $200); on his signature the sale engine billed 69 months, $13,800. Eight more contracts carry real historical starts and would have done the same.
 
 **Shipped:** the property's first billing cycle is the hard floor on every bill's DUE month — nightly invoices (`invoiceGeneration`, filter on candidate due dates), home payments (`billDueHomeSaleInstallments` stamps earlier installments `settled_off_platform_at`, never bills them, counts them paid in `reconcileHomeSaleContract`; migration 20260925180000). Nic: the floor is on the cycle, not on consumption — the Oct 1 invoice still carries September's utilities (arrears), untouched. New property: "First bill from GAM" is a required month on the add-property form and the onboarding property step (defaults to next month); the API defaults it when a caller omits it. Tests: invoiceMoveInMonth "first billing cycle is the floor".
 
-**Data (Nic: "completely erase them, they are not real — a void is for a mistake made ON platform"):** 8 September invoices + 16 charges (8 rent, 8 late fees) at Country Acres DELETED; John's 69 pre-October home payments DELETED and the 69 installments stamped settled outside GAM → contract reads 69 paid / 51 to go. Now open at Country Acres: MH 06 and MH 17 October rent only.
+**Data (Nic: "completely erase them, they are not real — a void is for a mistake made ON platform"):** 8 September invoices + 16 charges (8 rent, 8 late fees) at Country Acres DELETED; Opal's 69 pre-October home payments DELETED and the 69 installments stamped settled outside GAM → contract reads 69 paid / 51 to go. Now open at Country Acres: MH 06 and MH 17 October rent only.
 
-**April Hendrickson (Mountain View MH 05):** never lived there. Her signer row and 17 fields removed from the lease document, her lease_tenants row voided, her invite cancelled; the document completed with `completed_at` = Ruben Negrete's signature (Sept 16, 3:08 pm), executed PDF re-stamped; lease `signed_by_tenant` set.
+**Querida Quillfeather (Mountain View MH 05):** never lived there. Her signer row and 17 fields removed from the lease document, her lease_tenants row voided, her invite cancelled; the document completed with `completed_at` = Yannick Ashdown's signature (Sept 16, 3:08 pm), executed PDF re-stamped; lease `signed_by_tenant` set.
 
 **Mountain View tax:** both rows 6.35% → 6.60% (Santa Cruz County: 5.6% state + 1.0% county retail; transient lodging 6.60%). 6.35% was Yavapai's rate.
 
@@ -898,7 +898,7 @@ MEMORY.md index trimmed under its size limit (entries ≤128 chars).
 
 **Deploy 63 (floor) shipped on its second run** — API restarted 4:58 pm with the floor; the landlord front end's Vercel alias lagged ("still serves index-CglFOWsJ.js"), redone here. First run failed 4 home-sale tests because gam_test is rebuilt from schema.sql and I had ALTERed it by hand — process fix in memory (migrate → dump-schema → tests).
 
-**Nic: "We are not in October. There shouldn't be open bills at all."** The move-in bundle made an existing resident's first invoice at signing (weeks early, no meter reads; Curtis got an empty October statement Sept 23). Now: an existing tenancy whose first cycle is in the future gets NO invoice at signing; the nightly job makes it when the cycle arrives, with the month's utilities. Country Acres' two premature October invoices (MH 06, MH 17) and their charges ERASED. Open charges at Country Acres: none. Test: invoiceMoveInMonth "signing an existing resident before the first cycle makes no invoice; the cycle does".
+**Nic: "We are not in October. There shouldn't be open bills at all."** The move-in bundle made an existing resident's first invoice at signing (weeks early, no meter reads; Sage got an empty October statement Sept 23). Now: an existing tenancy whose first cycle is in the future gets NO invoice at signing; the nightly job makes it when the cycle arrives, with the month's utilities. Country Acres' two premature October invoices (MH 06, MH 17) and their charges ERASED. Open charges at Country Acres: none. Test: invoiceMoveInMonth "signing an existing resident before the first cycle makes no invoice; the cycle does".
 
 **Register (Nic's go):** stay buttons show the property's base rate = cheapest site of that length ("$49 from"); the cart line starts there and takes the chosen site's rate when picked (`base_rate` on GET /pos/items). Quantities take two decimals (10.5 gallons). Clear: a named sale (tenant or POS customer) is held as a ticket; an anonymous one is dropped and the open-tab banner no longer resurrects it. Both registers byte-identical.
 
@@ -914,7 +914,7 @@ MEMORY.md index trimmed under its size limit (entries ≤128 chars).
 
 - **Money card (Nic: "why is it guessing an all-time figure?")**: the headline was already cash (Stripe balance minus everyone else's money); the sub-line quoted the revenue BOOK as if it were money. Now: "cash on the balance… · book: $X earned this month, $Y all time — $Z of that still owed by landlords" (`owed_by_landlords_uncollected` from landlord_gam_charges). Five August $10 minimums on accounts with no billable units (one "GAM Renter Pool", four orphaned accrual rows with no landlord) were never billed to anyone: REVERSED with adjustment rows (`phantom_minimum_reversal`). Book all-time 218.87 → 168.87.
 - **Schedule**: row = space number only (type + property moved to a tooltip), rows 88 → 56 px; sticky Unit column zIndex 3 → 5 (header 6) so bars and floating names never paint over it on a fast scroll.
-- **Tenants list**: "Payment health" column between Property and Rent (`payment_health` on GET /units: charges due before today; paid = settled OR covered by work trade; NULL until there is a bill). Profile stats count work-trade-suspended charges as settled — Curtis-style residents read 100%, not 0.
+- **Tenants list**: "Payment health" column between Property and Rent (`payment_health` on GET /units: charges due before today; paid = settled OR covered by work trade; NULL until there is a bill). Profile stats count work-trade-suspended charges as settled — Sage-style residents read 100%, not 0.
 - **Maintenance kinds per property (Nic's "option 2")**: `properties.maintenance_categories` (NULL = all) + `maintenance_note`; Settings → "Maintenance requests" card per property (checkboxes + note); tenant form shows only allowed kinds and the note; POST /maintenance refuses a disallowed kind with the landlord's note. Migration 20260925200000.
 - **Returning residents (Nic chose option 2)**: invite form has three doors — New applicant (screen, default) · Returning resident (landlord attests, no check, recorded) · Already lives here (only while the onboarding window is open). The free "uncheck to skip screening" is gone from the UI (the API still accepts a plain unit invite for scripts/onboarding). `applyReturningResidentWaive`: tenant waived, intent stamped `waive_reason='returning_resident'`, rolling-365-day count vs allowance = ceil(25% of sites, min 1); over it → admin notification `returning_resident_over_allowance` (landlord never sees the count). Tests in screening-grandfather.test.ts.
 
@@ -931,16 +931,16 @@ MEMORY.md index trimmed under its size limit (entries ≤128 chars).
 
 Card payments last settled Sept 17; cash/checks through Sept 22.
 
-## Deploy 67 — Troy's contract re-drafted; why the PNC pull failed; front desk sees every household (2026-09-26 morning)
+## Deploy 67 — Delphine's contract re-drafted; why the PNC pull failed; front desk sees every household (2026-09-26 morning)
 
-- **Troy Street, MH 22 (Nic):** Blu typed the ORIGINAL 2018 contract (120 × $75, ends Feb 2028) over the prefilled remaining schedule; Troy said signing it would show him paid off early. Script `load22_redraft_contract.ts` voided the landlord-signed copy, cancelled its sale record, drafted a fresh copy in the same packet slot with the sheet's remaining terms ($75 × 33 from 10/1/2026 = $2,475), sent it (Blu first), one continuation email to Blu. Reusable: `--unit "MH 30" --monthly 100 --payments 55 --first 10/1/2026`.
-- **Jeff Bowman, MH 30 — NOT touched:** the whole packet including the installment contract is COMPLETED (all three signed Sept 25–26). Blu typed 120 × $100 from Jan 2021 → 51 left after the October floor; the sheet says 55 left, ending Jan 2031. A completed contract can only be corrected by voiding it and re-signing with all three, or by amending the active sale record's term. Waiting on Nic's call with Blu.
+- **Delphine Illingworth, MH 22 (Nic):** Hollis typed the ORIGINAL 2018 contract (120 × $75, ends Feb 2028) over the prefilled remaining schedule; Delphine said signing it would show him paid off early. Script `load22_redraft_contract.ts` voided the landlord-signed copy, cancelled its sale record, drafted a fresh copy in the same packet slot with the sheet's remaining terms ($75 × 33 from 10/1/2026 = $2,475), sent it (Hollis first), one continuation email to Hollis. Reusable: `--unit "MH 30" --monthly 100 --payments 55 --first 10/1/2026`.
+- **Linnea Merriweather, MH 30 — NOT touched:** the whole packet including the installment contract is COMPLETED (all three signed Sept 25–26). Hollis typed 120 × $100 from Jan 2021 → 51 left after the October floor; the sheet says 55 left, ending Jan 2031. A completed contract can only be corrected by voiding it and re-signing with all three, or by amending the active sale record's term. Waiting on Nic's call with Hollis.
 - **Oak Park $48 pull ("it's already linked"):** root cause: the PNC feed link (Aug 17) was created with `balances, transactions` only — no `payment_method` permission — so Stripe refuses to mint a debit method from it ("missing the payment_method permission"). The sweep swallowed that as "no usable bank link" and the morning notice said "no bank account on file". Newer links already request payment_method (bankFeed.ts:114). Fixes: `createDebitPaymentMethod` sends the required `billing_details.name`; `debitLinkProblem()` names the real reason; the sweep logs it (`detail`) and the notice email says it: "…link was made without permission to debit. Link the same account once more under Settings → Bank feed." **Nic must relink PNC once** (and Wells Fargo for Mountain View, same vintage). Oak Park threshold left at $10 so the pull fires the morning after the relink; restore to $100 after.
-- **Front desk "only two people":** the desk lists households from `pending_tenant_intents`; the eight Country Acres households hand-drafted by script had no intent row, so they never appeared. Inserted intents (is_existing_tenancy, resolved, draft_document_id = the lease doc) for all nine missing. Desk now shows all 12; actually unsigned this morning: MH 17 Cameron Valdez, MH 18 Kyra Smith, MH 22 Troy Street, MH 24 Jolyn Whitfield (the rest signed since yesterday).
+- **Front desk "only two people":** the desk lists households from `pending_tenant_intents`; the eight Country Acres households hand-drafted by script had no intent row, so they never appeared. Inserted intents (is_existing_tenancy, resolved, draft_document_id = the lease doc) for all nine missing. Desk now shows all 12; actually unsigned this morning: MH 17 Mabel Mawdsley, MH 18 Zora Crowhurst, MH 22 Delphine Illingworth, MH 24 Perrin Rutherford (the rest signed since yesterday).
 
-## Deploy 68 — bank link is two-way; first billing cycle locked; Troy ends March 2029 (2026-09-26)
+## Deploy 68 — bank link is two-way; first billing cycle locked; Delphine ends March 2029 (2026-09-26)
 
-- **Troy Street, MH 22:** re-drafted again per Blu's corrected sheet — $75 × 30 from 10/1/2026 ($2,250), final payment March 2029 — and sent to Blu (one email).
+- **Delphine Illingworth, MH 22:** re-drafted again per Hollis's corrected sheet — $75 × 30 from 10/1/2026 ($2,250), final payment March 2029 — and sent to Hollis (one email).
 - **Bank link is two-way (Nic, DIRECTIVE):** "a person cannot opt in to get paid out and not be charged when they owe." (1) Linking a bank in the feed now mints the debit method on the spot (`finalizeConnection`). (2) Every linked bank on the Bank page says "GAM can pay out to and debit this account" or the exact problem with a **Relink** button beside it. (3) Auto-payouts HOLD for a landlord whose bank cannot be debited (`skippedNoDebitLink`), and the landlord is emailed the reason and the fix ("Financials → Bank → Relink"). Oak Park and Mountain View will be held until their banks are relinked once — by design.
 - **Where to relink:** Financials → Bank → "Connect feed" (or the Relink button beside the bank). Nic's Stripe/Link identity offered his personal account first; in the Stripe window choose "link a different account", search PNC, sign in. Company picker must be on the right company.
 - **First billing cycle locked:** once a property has any lease or invoice, PATCH refuses (409) and the Settings row shows "set when the property was added · locked".
@@ -948,20 +948,20 @@ Card payments last settled Sept 17; cash/checks through Sept 22.
 
 ## Deploy 69 — Team roster across companies; nobody can decline; payouts never held; MH 30 disclosure re-drafted; MH 06 + MH 17 expired at issuance (2026-09-26 evening)
 
-- **Team page showed no one (Nic):** his account owns Oak Park AND Mountain View; the roster resolved ONE company (the one the account founded) and Lisa Scheeler is on Mountain View's front desk. `GET /scopes/team` and every per-member route (`/scopes/:role/:userId`, permissions, connect-status, direct-deposit) now span `landlordScopeIds` — a member is found by user id across the account's companies. Roster shows a Company column when there is more than one. Lisa now also has **Sales history** (`pos.tab.history`) — data update, done.
-- **Nobody can decline (Nic, DIRECTIVE):** the tenant sign page's Decline button, modal and "you declined" screen are gone; `POST /esign/sign/:id/decline` answers 410 with a sentence. This is how Jeff Bowman voided MH 30's lead-paint sales disclosure after Blu and Kim had signed it. Memory: gam-no-decline-ever.
-- **MH 30 lead-based paint sales disclosure:** drafted again in its packet slot (3) from the template, same three signers, sent; Blu emailed his link once (`load23_redraft_doc.ts --doc <voided id> --apply --email`). Kim and Jeff sign after him.
+- **Team page showed no one (Nic):** his account owns Oak Park AND Mountain View; the roster resolved ONE company (the one the account founded) and Calla Fitzhugh is on Mountain View's front desk. `GET /scopes/team` and every per-member route (`/scopes/:role/:userId`, permissions, connect-status, direct-deposit) now span `landlordScopeIds` — a member is found by user id across the account's companies. Roster shows a Company column when there is more than one. Calla now also has **Sales history** (`pos.tab.history`) — data update, done.
+- **Nobody can decline (Nic, DIRECTIVE):** the tenant sign page's Decline button, modal and "you declined" screen are gone; `POST /esign/sign/:id/decline` answers 410 with a sentence. This is how Linnea Merriweather voided MH 30's lead-paint sales disclosure after Hollis and Kim had signed it. Memory: gam-no-decline-ever.
+- **MH 30 lead-based paint sales disclosure:** drafted again in its packet slot (3) from the template, same three signers, sent; Hollis emailed his link once (`load23_redraft_doc.ts --doc <voided id> --apply --email`). Kim and Linnea sign after him.
 - **Payouts are never held (Nic, reversing my deploy-68 hold):** `holdUnlessDebitable` is gone from auto-payouts; what GAM is owed nets from the balance first, the Bank page still shows readiness + Relink. Memory amended.
 - **Relink dedupe:** relinking the same bank (same institution + last four) retires the older active `bank_connections` row (status `disconnected`); history stays attached. Nic's duplicate PNC row was retired by hand earlier today.
-- **A lease cannot be issued already over (found, NOT resolved — Nic's call):** Blu signed MH 06 with end 8/1/2026 and MH 17 with end 2/26/2026 on 9/22. The landlord's signature issued both; the midnight lease-end job expired them, removed Curtis Clabough (MH 06) and Cameron Valdez (MH 17), vacated both sites and drafted deposit returns. Neither will be invoiced Oct 1. Their five signed disclosures sit in execution_failed ("no active primary"). Guard added: send and every signature refuse an original lease whose end date is on or before today (`assertLeaseNotAlreadyOver`; '-' = month to month passes). Options for the two households: (1) void both leases + lease docs and re-draft with the real term (Blu + tenants sign again); (2) set the two leases active/month-to-month by hand and restore the tenants and units (paper won't match). `retryDocumentExecution.ts <ids> --apply` finishes the five disclosures once the lease is live again.
+- **A lease cannot be issued already over (found, NOT resolved — Nic's call):** Hollis signed MH 06 with end 8/1/2026 and MH 17 with end 2/26/2026 on 9/22. The landlord's signature issued both; the midnight lease-end job expired them, removed Sage Stillwell (MH 06) and Mabel Mawdsley (MH 17), vacated both sites and drafted deposit returns. Neither will be invoiced Oct 1. Their five signed disclosures sit in execution_failed ("no active primary"). Guard added: send and every signature refuse an original lease whose end date is on or before today (`assertLeaseNotAlreadyOver`; '-' = month to month passes). Options for the two households: (1) void both leases + lease docs and re-draft with the real term (Hollis + tenants sign again); (2) set the two leases active/month-to-month by hand and restore the tenants and units (paper won't match). `retryDocumentExecution.ts <ids> --apply` finishes the five disclosures once the lease is live again.
 - Disclosures (template purpose state_disclosure) no longer fail on lease status at completion — they amend nothing.
 - Test fixtures: esign + esign-issuance seeded lease end dates moved to 2027-12-31 (the guard tripped 39 tests on a 2025 date; first deploy run failed on it, 69b shipped).
 
 ## Deploy 70 — propane sales complete (fractional stock); Refund/Void hidden without the permission (2026-09-28)
 
 - **"Propane at Mountain View… staying as a suspended ticket, not completing the sale" (Nic):** the register takes decimal quantities (deploy 64) but the sale wrote the stock change into INTEGER columns; 4.6 gallons was refused by Postgres (`invalid input syntax for type integer: "-4.6"`), the whole sale rolled back, and the register had no error handler — the tab just stayed open. Whole-number sales (13 gal Sept 24, 20 gal Sept 26) went through, so it looked random. Migration `20260928100000_pos_stock_decimal.sql`: `pos_items.stock_qty`, `pos_item_variants.stock_qty`, `pos_inventory_log.change_qty/stock_before/stock_after` → numeric(12,3). The API hands stock back as a number (items list, variants, adjust-stock) since the driver returns numerics as text. A failed sale now shows the server's reason and keeps the cart. Regression test: 4.6 gallons completes and moves stock by 4.6.
-- **Lisa's unrecorded propane sale:** open tab `0124a3c7` (Sept 26 12:49 pm, 4.6 gal, $16.18) is still open on purpose — the register offers "resume" and she can charge it. The stale $0 Sept 25 tab was voided.
-- **Refund / Void (Nic):** `pos.refund` and `pos.void` were already separate permissions and Lisa has neither — the API refused them — but the History tab showed the buttons to everyone. Buttons now appear only with the permission (both register copies).
+- **Calla's unrecorded propane sale:** open tab `0124a3c7` (Sept 26 12:49 pm, 4.6 gal, $16.18) is still open on purpose — the register offers "resume" and she can charge it. The stale $0 Sept 25 tab was voided.
+- **Refund / Void (Nic):** `pos.refund` and `pos.void` were already separate permissions and Calla has neither — the API refused them — but the History tab showed the buttons to everyone. Buttons now appear only with the permission (both register copies).
 - Not in the log: the live API log has no entry for any register sale POST (Aug 30 → today), so the failure had to be reconstructed from the sessions table. Worth a look later — sales may be logged under a different path or not at all.
 
 ## Staged for deploy 71 (NOT deployed — Nic: no deploys until his full list) — API log keeps a full history (2026-09-28)
@@ -973,7 +973,7 @@ Card payments last settled Sept 17; cash/checks through Sept 22.
 
 ### Also staged for deploy 71 — meter reads and the Leases page (2026-09-28)
 
-- **Curtis Clabough (Country Acres MH 06) IS the Mattoon work trader:** agreement 25 hrs/month covering rent, starts 10/1/2026, "Read meters" ticked. It is PAUSED — the lease-end job paused it on 9/23 when the mis-dated lease expired (work trade cannot outlive the tenancy). Resumes with the MH 06 lease repair.
+- **Sage Stillwell (Country Acres MH 06) IS the Mattoon work trader:** agreement 25 hrs/month covering rent, starts 10/1/2026, "Read meters" ticked. It is PAUSED — the lease-end job paused it on 9/23 when the mis-dated lease expired (work trade cannot outlive the tenancy). Resumes with the MH 06 lease repair.
 - **Tenant portal had NO meter screen.** The API has allowed a work trader with read_meters to take the property's reading walk since deploy ~60 (`requireMeterReader`), but nothing in the tenant portal reached it. New: Meter Readings page (`/meter-readings`, nav shows only when the agreement carries read_meters) — same blind walk (`packages/shared-ui/MeterWalk`) the landlord's Utilities page uses; the trader can start a run early. `/tenants/work-trade` now carries `propertyId`.
 - **Landlord on-demand read already exists:** Utilities → (property) → "Take a reading" button above Master bills (pick submeter, reason, value) — records without a run. Nic asked how; it's there.
 - **Moving a resident now takes both readings:** the Move screen's "Moved" step has an input per meter (closing on the old space, opening on the new), saved by `POST /leases/:id/move-reads`, dated the MOVE day (closing = reason other + note, opening = baseline). Tests in unitMove.test.ts.
@@ -981,7 +981,7 @@ Card payments last settled Sept 17; cash/checks through Sept 22.
 
 ### Done live (data) + staged (code) — 2026-09-28 afternoon
 
-- **MH 06 + MH 17 reinstated (live, `load24_reinstate_leases.ts --apply`):** both leases active, month-to-month, no end date; Curtis Clabough and Cameron Valdez back on their leases; both sites occupied; the two deposit-return drafts removed; Curtis's work trade active again; the six ledger entries the expiry wrote (`lease_terminated_natural` ×4, Cameron's `tenancy_ended_with_balance` $450 + `balance_paid_post_move`) superseded as data-entry errors by the lease signing. The five signed disclosures completed and stamped. MH 17's lease document end date set to "-" so Cameron can sign — he tried twice on 9/27 and the new guard refused him ("ends 2/26/2026, already passed"); his link still works.
+- **MH 06 + MH 17 reinstated (live, `load24_reinstate_leases.ts --apply`):** both leases active, month-to-month, no end date; Sage Stillwell and Mabel Mawdsley back on their leases; both sites occupied; the two deposit-return drafts removed; Sage's work trade active again; the six ledger entries the expiry wrote (`lease_terminated_natural` ×4, Mabel's `tenancy_ended_with_balance` $450 + `balance_paid_post_move`) superseded as data-entry errors by the lease signing. The five signed disclosures completed and stamped. MH 17's lease document end date set to "-" so Mabel can sign — he tried twice on 9/27 and the new guard refused him ("ends 2/26/2026, already passed"); his link still works.
 - **Screening stuck (Nic: a prospect "wasn't letting them continue… to make their payment"):** cause — the legal-name fields on the Consent step only rendered on a first visit (`needsAccountStep`), but Continue requires a name. Anyone returning with a session (ronaldomendoza958@gmail.com registered 9/18 with no name on the account) had no field and a dead button. Fields now show whenever the account has no name; name prefills from the account. STAGED (tenant app).
 - **Move = readings at the time of move (Nic: "we can't close it and take them later"):** `GET /leases/:id/move-reads?toUnitId=` lists the meters; `POST /leases/:id/move` now takes `reads[]` and REFUSES (409, names the meters) when any submeter on either space is missing; readings are written inside the move, dated the move. The separate move-reads route is gone. Tests: unitMove.test.ts.
 - **Where the on-demand read lives:** S605 removed Utilities from the top nav by directive; it is Properties → the property → **Utilities** tab → gold "Take a reading" (needs properties.edit or utility.read_meters). Nic could not find it. Proposed, NOT built: a top-level "Meter Readings" nav entry (category utility) so front-counter staff with utility.read_meters get there without the Properties tab.
@@ -991,7 +991,7 @@ Card payments last settled Sept 17; cash/checks through Sept 22.
 - **What already existed (live):** work-order photos/videos (`POST /maintenance/:id/media`, Maintenance page), inspection photos, walkthrough media, unit listing photos. What did NOT exist: a photo on a RESIDENT's record outside a work order — the taped-to-the-door notice.
 - **Built on the existing documents store, not a new mechanism:** permission `documents.post_photo` ("Add photos & posted notices to a resident"); `POST /documents` accepts it — a holder without `documents.upload` may add ONLY an image, ONLY as `notice`/`other`, ONLY for a resident at a property in their scope (unit derived from the current lease). `documents` gained `note`, `posted_at`, `uploaded_by_user_id` (migration 20260928120000). `GET /documents?tenantId=` and `GET /documents/photo-targets[?propertyId=]` (scoped properties → residents).
 - **Screens:** landlord portal "Photos & Notices" (`/tenant-photos`, nav under Documents' category, phone camera input, property → resident → kind → date → note → save); Tenant profile "Photos & Notices" card (View opens the file); the resident sees it under their Documents (type badge "Notice", date). Tests: documentsPhoto.test.ts.
-- Grant Lisa / maintenance staff `documents.post_photo` on their permissions page to use it.
+- Grant Calla / maintenance staff `documents.post_photo` on their permissions page to use it.
 
 ### Deploy 71 shipped (2026-09-28 12:13 pm) — with a scare
 - Suite green (7869), every frontend deployed. The API restart (now bootout + bootstrap so plist changes load) hit launchd's "Input/output error" on the first bootstrap; in that gap `com.gam.watchdog` saw :4000 empty and started the DEV api (ts-node, source) on the production port — public traffic ran off it for ~4 minutes. Fixed by hand (killed it, launchd's job took the port), then: deploy.sh waits for the port, retries the bootstrap until launchd lists the job, waits up to 60 s for an answer, and refuses a ts-node process on :4000; the watchdog never touches :4000 while launchd has com.gam.api. Demo API reloaded onto its own log (`gam-api-demo.*`).
@@ -1006,9 +1006,9 @@ Card payments last settled Sept 17; cash/checks through Sept 22.
 
 ## Deploy 73 — "Meter Readings" in the sidebar; the permission that was never grantable (2026-09-28)
 
-- **Found:** `utility.read_meters` ("Enter meter readings") existed in the legacy onsite-manager key list and in the API gates, but was NOT in PERMISSION_CATALOG — so no landlord could ever grant it from a staff member's permissions page. Nic thought Lisa "has the capability"; she did not. Added a catalog group "Meter readings" (category `utilities`) with that one key; granted it to Lisa Scheeler directly.
+- **Found:** `utility.read_meters` ("Enter meter readings") existed in the legacy onsite-manager key list and in the API gates, but was NOT in PERMISSION_CATALOG — so no landlord could ever grant it from a staff member's permissions page. Nic thought Calla "has the capability"; she did not. Added a catalog group "Meter readings" (category `utilities`) with that one key; granted it to Calla Fitzhugh directly.
 - **Nav:** "Meter Readings" (→ `/utilities`, the existing walk page) shows to owners and to anyone holding the key. S605 folded utility SETUP into the property page; this entry is the walk, not the setup.
-- **MH 30 (Nic asked):** the installment contract IS fully executed (all three signed 9/22): $100 × 120 from Jan 2021, 69 settled off-platform, 51 remaining on GAM through Dec 2030. The only thing ever flagged was that Blu's sheet said 55 left (to Jan 2031) — four payments' difference. Nic: "leave Jeff Bowman at 51 payments, not the 55. We don't need to change any more contracts." CLOSED.
+- **MH 30 (Nic asked):** the installment contract IS fully executed (all three signed 9/22): $100 × 120 from Jan 2021, 69 settled off-platform, 51 remaining on GAM through Dec 2030. The only thing ever flagged was that Hollis's sheet said 55 left (to Jan 2031) — four payments' difference. Nic: "leave Linnea Merriweather at 51 payments, not the 55. We don't need to change any more contracts." CLOSED.
 - **Deploy 73 shipped (2026-09-28 ~1:45 pm):** suite green (7871), every surface live, "Meter Readings" in the sidebar, launchd's com.gam.api (dist) on :4000. The script again printed "launchd did not load com.gam.api" although it had — the check is being debugged; the API and the port were verified by hand after each deploy.
 - **Deploy 74 (2026-09-28 1:25 pm) — the false "launchd did not load" solved:** launchd's own words showed attempt 1 loaded the job (rc=0, process up at 13:23:32) and every later attempt was "already loaded" (EIO). The check was `launchctl list | grep -q` under `set -o pipefail`: grep exits on the first match, launchctl dies of SIGPIPE (141), and the pipeline reports failure. Proven standalone (rc=141 with pipefail, 0 without). Now `launchctl print gui/$UID/com.gam.api` — no pipe. The dev-process check lost its `-q` for the same reason. Nothing was ever wrong with the API after any of the four deploys.
 
@@ -1025,15 +1025,15 @@ Card payments last settled Sept 17; cash/checks through Sept 22.
 - Built: the request emails every super admin at once with the model, "standard shipping", the Terminal location to pre-register to, the ship-to, the shop link and a button to the desk (`reader_order_requested`); `chaseReaderOrders()` runs 8:05 am Phoenix — ONE digest while anything waits (NOT ORDERED every day; CHECK STRIPE after 3 days ordered with no serial; NOT IN USE after 10 days shipped and unregistered), silent otherwise; the admin sidebar shows a gold count of unordered requests on every page.
 - Shipping: standard only (Nic: "keep it consistent with only one option"). Ordering stays by hand in the Stripe shop — Nic: "let's just do our free version"; no paid Stripe ordering access. Landlords never see Stripe's shop; model and shipping are chosen by whoever places the order.
 
-## Deploy 77 — returning residents pay no deposit; Donald Hamp at Mountain View RV 47 (2026-09-29)
+## Deploy 77 — returning residents pay no deposit; Wren Westbrook at Mountain View RV 47 (2026-09-29)
 
-- **Donald Hamp** (hampdonald01948@gmail.com), seasonal returning guest: invited to RV 47 as a returning resident (1 of 20 Mountain View slots used, background check waived by attestation), invite email sent; lease drafted from "Mountain View RV Spot Lease" (doc c9a2fbc9), Nic signs first. Fields set: start 2026-09-24, rent $589.00, September prorated 7/30 = $137.43, deposit $0.00, total due $137.43. Lease type / end date left for Nic at signing (seasonal; other MV leases are month to month).
+- **Wren Westbrook** (westbrookwren01948@gmail.com), seasonal returning guest: invited to RV 47 as a returning resident (1 of 20 Mountain View slots used, background check waived by attestation), invite email sent; lease drafted from "Mountain View RV Spot Lease" (doc c9a2fbc9), Nic signs first. Fields set: start 2026-09-24, rent $589.00, September prorated 7/30 = $137.43, deposit $0.00, total due $137.43. Lease type / end date left for Nic at signing (seasonal; other MV leases are month to month).
 - **Rule (Nic, DIRECTIVE):** a returning resident is exempt from the security deposit; new people pay it. The draft's deposit prefill is skipped when a resident on the document holds a `returning_resident` intent at the property. Test in esign.test.ts.
 - Note: the e-sign router refused a hand-minted landlord token (401) while /tenants/invite accepted it — the draft was run through the service instead. Not investigated; normal portal logins are unaffected.
 
 ## Deploy 78 — the master schedule splits a moved stay; space-number order; last reading on the move screen (2026-09-29)
 
-- **Dakota Lane, Mountain View RV 18 → RV 44 (Nic did the move himself, to test the flow):** moved 2026-09-27, reason "Shade". History: RV 18 9/2→9/27, RV 44 9/27→open. Readings recorded by the move, dated 9/27: RV 18 closing 91765, RV 44 opening 22646. RV 18 vacant, RV 44 active. No refused or failed calls. CAUTION given to Nic: RV 44's 22646 (9/2) carries a note that the prior occupant was still vacating and a final read was due the day they left — never entered; if they stayed past 9/2, Dakota's opening is low by their last days.
+- **Tobin Thornbury, Mountain View RV 18 → RV 44 (Nic did the move himself, to test the flow):** moved 2026-09-27, reason "Shade". History: RV 18 9/2→9/27, RV 44 9/27→open. Readings recorded by the move, dated 9/27: RV 18 closing 91765, RV 44 opening 22646. RV 18 vacant, RV 44 active. No refused or failed calls. CAUTION given to Nic: RV 44's 22646 (9/2) carries a note that the prior occupant was still vacating and a final read was due the day they left — never entered; if they stayed past 9/2, Tobin's opening is low by their last days.
 - **Found by Nic's suspicion, real defect:** `/units/schedule/master` drew ONE bar per lease on the lease's CURRENT unit from the lease's start — a move would have painted the resident's whole history onto the new space and emptied the old one. Now one row per `lease_unit_history` stretch: unit = the stretch's space, start = max(lease start, stretch start), end = the day BEFORE the move for a stretch that ended (so the move day shows once, on the new space). Adds `segment_id`, `moved_out`, `current_unit_number`. Test in unitMove.test.ts.
 - **Invoice after a move:** already two utility lines, each naming its space (S641 `bill_unit_number`).
 - Leases page: within each property folder, sorted by space number (numeric). Move dropdown: open spaces only (vacant/available, same property), now in space-number order. Move screen: each meter shows "Last on file: NNNNN on <date>"; the space being moved INTO gets a one-tap "Nobody's been there — use it".
@@ -1041,7 +1041,7 @@ Card payments last settled Sept 17; cash/checks through Sept 22.
 
 ## Deploy 79 — a move emails nobody about meter reads (2026-09-29)
 
-- Nic: "after I moved Dakota, I got an email saying that the meter reads were needed for a space move… I can't do the move without the meter reads in the first place. So that email is kind of redundant." The S641 chase (`move_meter_reads_due`, landlord + every staffer who can read meters, email + in-app) is REMOVED from `moveLeaseToUnit`; the move refuses without both readings, so there is nothing to chase. Test in unitMove.test.ts.
+- Nic: "after I moved Tobin, I got an email saying that the meter reads were needed for a space move… I can't do the move without the meter reads in the first place. So that email is kind of redundant." The S641 chase (`move_meter_reads_due`, landlord + every staffer who can read meters, email + in-app) is REMOVED from `moveLeaseToUnit`; the move refuses without both readings, so there is nothing to chase. Test in unitMove.test.ts.
 
 ## Deploy 80 — the Utilities page: reading history in the system, a recovery table that adds up, propane settings that say "Saved"; American spelling everywhere (2026-09-29)
 
@@ -1051,20 +1051,20 @@ Card payments last settled Sept 17; cash/checks through Sept 22.
 - **Propane price:** delivered-to-the-unit propane bills at the property's utility rate ($2.25/gal, `property_utility_rates`); the register sells it at the POS item price ($3.30/gal, `pos_items`). Two tables, no overlap.
 - **Stuck-meter estimate:** already the low end of the CLUSTER (S647): drops near-zero spots (< 10% of the median), then the 25th percentile of occupied neighbors, nearest rank. No change.
 - **American spelling (Nic, DIRECTIVE):** 790 replacements in 267 files (code, comments, UI, tests) by word-family rules with explicit stems (script: scratchpad/american.py). Never touched: db/migrations, the generated schema, `cancelled` as a stored status/column. User-visible ones included "neighbours", "Mould", "Cancelling…", "totalling", "labelled".
-- Dakota Lane's RV 44 opening read (22646) CONFIRMED correct by Nic. Donald Hamp's lease: Nic signed his side.
+- Tobin Thornbury's RV 44 opening read (22646) CONFIRMED correct by Nic. Wren Westbrook's lease: Nic signed his side.
 
 ### After deploy 80 — utility bills follow their payment (DB rule, live without a deploy) (2026-09-29)
 
 - Nic: "tenants do not still owe $744.45… I have one guy that hasn't paid." CAUSE: a utility bill was marked paid ONLY by the Stripe webhook; cash, check, bank-deposit confirm, applied credit and released prepayments settled the PAYMENT and left the bill "billed". Mountain View had 5 ($532.14), Oak Park 33.
 - FIX: migration 20260929120000 — trigger `trg_utility_bills_follow_payment` on payments: status → settled marks the payment's utility bills paid (paid_at = settled_at); settled → anything else puts them back to billed. Backfilled 38 bills. Test in utilityRecovery.test.ts.
-- Mountain View now: billed $1,538.25 · paid $1,325.94 · still owed $212.31 = RV 45 Matthew Conklin $187.11 (September utility invoice pending, alongside his $589 rent, also pending) + RV 23 Jared Coyle $25.20 (August estimate "used before the lease was signed", billed 9/10, on NO invoice; RV 07 and RV 41's identical August estimates were voided in S642 as pre-onboarding). Waiting on Nic: void RV 23's? and is Matthew's $187.11 right (Nic remembers ~$90)?
+- Mountain View now: billed $1,538.25 · paid $1,325.94 · still owed $212.31 = RV 45 Gideon Jerningham $187.11 (September utility invoice pending, alongside his $589 rent, also pending) + RV 23 Sebastien Stourbridge $25.20 (August estimate "used before the lease was signed", billed 9/10, on NO invoice; RV 07 and RV 41's identical August estimates were voided in S642 as pre-onboarding). Waiting on Nic: void RV 23's? and is Gideon's $187.11 right (Nic remembers ~$90)?
 
 ## Deploys 81–82 (2026-09-29) — utilities table truth + propane delivery screen
 
 **Nic's corrections (all three were right):**
-- Jared Coyle RV 23 $25.20 was settled 9/10 on INV-2026-00022. The utility bill row had lost its `payment_id` (hand-made payment in an earlier session), so it read "billed". Re-linked in production, now `paid`. It was the only orphan at any property.
-- Matthew Conklin RV 45 $187.11 (and his $589 rent) are parked under his work trade — not owed.
-- The only real open utility at Mountain View is Andres Razo's pay link ($670.27 = $589 site + 387 kWh × $0.21 = $81.27). No lease; Nic sent a pay link.
+- Sebastien Stourbridge RV 23 $25.20 was settled 9/10 on INV-2026-00022. The utility bill row had lost its `payment_id` (hand-made payment in an earlier session), so it read "billed". Re-linked in production, now `paid`. It was the only orphan at any property.
+- Gideon Jerningham RV 45 $187.11 (and his $589 rent) are parked under his work trade — not owed.
+- The only real open utility at Mountain View is Cora Castellan's pay link ($670.27 = $589 site + 387 kWh × $0.21 = $81.27). No lease; Nic sent a pay link.
 
 **Shipped:**
 - `GET /utility/recovery`: three buckets now — paid, covered by work trade, still owed. Work trade = payment pending with `work_trade_suspended_at`, or settled at $0 with "work-trade credit" in the note.
@@ -1138,14 +1138,14 @@ Email: support@ is a Cloudflare forward; Nic replies from nic@golddoor.io until 
 
 ## Deploys 91–92 (2026-09-30) — move billing; pay links as tickets; Front Desk fixes
 
-- **Move bills the old space** (`unitMove.ts`): closing reads are inserted and billed via `billMoveOutRead` BEFORE the lease changes unit. Dakota Lane's RV 18 September bill corrected by hand to 481 kWh / $101.01 (was 0). Test in unitMove.test.ts.
+- **Move bills the old space** (`unitMove.ts`): closing reads are inserted and billed via `billMoveOutRead` BEFORE the lease changes unit. Tobin Thornbury's RV 18 September bill corrected by hand to 481 kWh / $101.01 (was 0). Test in unitMove.test.ts.
 - **Pay links on the register's open list** (`GET /pos/tickets` unions open one-time links, `kind: 'pay_link'`); `POST /pos/transactions` takes `payLinkId` — the link's items/discount are charged (stay lines as plain amounts), link marked paid inside the sale transaction, `pos_transactions.pay_link_id` set. POSPage (both apps, byte-identical) has `payLinkId` state; picker shows a PAY LINK badge.
 - **Front Desk / outstanding**: `/balances` now includes open register tickets (`ticket_id`, `ticket`); FrontDeskPage words pay-link and ticket rows; BalancesPage renders ticket rows with a breakdown.
-- **Tenants-page unit invite** now writes the unit-bound `pending_tenant_intents` row (was waiver-only → invisible on Front Desk). Donald Hamp's row inserted by hand (draft doc + resolved lease).
-- **Invoice notice** skips settled/void invoices (Donald was emailed "$137.43 due" the morning after paying by check).
-- Mountain View Sept vacant-spot electric: Razo = RV 27 (link now $752.17: site + Aug 387 kWh + Sept 390 kWh); Scott Duffy RV 30 = open ticket $22.47 (107 kWh); RV 37 read marked billed_off_platform; RV 05/16 ignored; RV 33 (650 kWh) vs RV 34 (2 kWh, Alvarado lease) — Nic checking physically; RV 43 (228 kWh, nobody) — Nic checking.
-- Razo leaves after Oct 1: final read on RV 27 + prorated days to be added to his link before settling Friday.
-- Dakota Lane is a man (he/him).
+- **Tenants-page unit invite** now writes the unit-bound `pending_tenant_intents` row (was waiver-only → invisible on Front Desk). Wren Westbrook's row inserted by hand (draft doc + resolved lease).
+- **Invoice notice** skips settled/void invoices (Wren was emailed "$137.43 due" the morning after paying by check).
+- Mountain View Sept vacant-spot electric: Castellan = RV 27 (link now $752.17: site + Aug 387 kWh + Sept 390 kWh); Ulyssa Yoxall RV 30 = open ticket $22.47 (107 kWh); RV 37 read marked billed_off_platform; RV 05/16 ignored; RV 33 (650 kWh) vs RV 34 (2 kWh, Alvarado lease) — Nic checking physically; RV 43 (228 kWh, nobody) — Nic checking.
+- Castellan leaves after Oct 1: final read on RV 27 + prorated days to be added to his link before settling Friday.
+- Tobin Thornbury is a man (he/him).
 
 ## Deploy 93 (2026-09-30) — pay-link adjust; invite drafts at once
 

@@ -220,11 +220,11 @@ function DeleteConfirmModal({ name, onCancel, onConfirm, busy }: {
 // the only way to fix a mistyped address was to cancel and start over — losing
 // the held space and any work-trade or screening state along with it. Correcting
 // it in place keeps all of that and issues a fresh link.
-// S639 (Nic): "I accidentally put Gerald Logue as a lower case, and I have no
+// S639 (Nic): "I accidentally put Arlo Braddock as a lower case, and I have no
 // way to change that invite." The route has always accepted a name; this modal
 // only ever offered the address, so a mistyped name had no fix at all short of
 // canceling the invite and losing the held space. Names are normalized on save
-// (gerald → Gerald), so most of the time there is nothing to retype.
+// (arlo → Arlo), so most of the time there is nothing to retype.
 function FixEmailModal({
   name, current, value, onChange,
   firstName, lastName, onFirstName, onLastName,
@@ -662,9 +662,9 @@ function IntentCard({
             {/* S639 (Nic): "me sending it and them accepting it is two different
                 states. I need you to mark it how it really was." Accepting is
                 not the end of the process, and one word was standing in for the
-                whole pipeline — Dakota Lane read "accepted" while what mattered
+                whole pipeline — Tobin Thornbury read "accepted" while what mattered
                 was that his lease had been signed by Nic and had sat unsigned by
-                Dakota for a week. The lease stage sits beside the invite state
+                Tobin for a week. The lease stage sits beside the invite state
                 rather than replacing it: one says whether we reached them, the
                 other says what the next move is. */}
             {(() => {

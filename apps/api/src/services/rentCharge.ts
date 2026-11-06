@@ -75,6 +75,7 @@
 import type { PoolClient } from 'pg'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
+import { todayIn } from '../lib/timezone'
 import { AppError } from '../middleware/errorHandler'
 import { sortForAllocation, paymentMethodCosts, formatCurrency, type PaymentMethodCost } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
@@ -388,9 +389,21 @@ export async function suggestedPayAheadFor(leaseId: string): Promise<number> {
   const MONTH_TO_MONTH_HORIZON = 12
   let months = MONTH_TO_MONTH_HORIZON
   if (row.end_date) {
-    const now = new Date()
-    const end = new Date(`${row.end_date}T00:00:00Z`)
-    months = (end.getUTCFullYear() - now.getUTCFullYear()) * 12 + (end.getUTCMonth() - now.getUTCMonth())
+    // 11/01 — GAM'S OWN CALENDAR, NOT UTC, AND THIS WAS A REAL BUG.
+    //
+    // This read `new Date()` and compared UTC months against a lease end date
+    // that is a plain calendar date. UTC turns over at 5pm in Phoenix, so from
+    // 5pm on the last day of every month until midnight, the "months left"
+    // count was one short and the screen suggested a month less than the lease
+    // has to run — $1,000 light on a $1,000 lease, for seven hours, every
+    // month. Found when the suite ran at 17:41 on 31 October and this test
+    // returned 5,000 against the 6,000 a six-month lease is worth.
+    //
+    // todayIn(null) is the house answer: the date on GAM's home calendar, the
+    // same calendar Postgres's CURRENT_DATE gave the lease its end date on.
+    const [ty, tm] = todayIn(null).split('-').map(Number)
+    const [ey, em] = row.end_date.slice(0, 10).split('-').map(Number)
+    months = (ey - ty) * 12 + (em - tm)
     months = Math.max(0, Math.min(months, MONTH_TO_MONTH_HORIZON))
   }
   return Math.round(perMonth * months * 100) / 100

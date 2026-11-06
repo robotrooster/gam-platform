@@ -1394,6 +1394,24 @@ export async function cascadeLeaseEnd(c: { query: PoolClient['query'] }, leaseId
                          WHERE l.unit_id = $1 AND l.id <> $2 AND l.status IN ('active','pending'))`,
     [unitId, leaseId])
   await c.query('UPDATE leases SET terminated_at=NOW() WHERE id=$1 AND terminated_at IS NULL', [leaseId])
+  // ── 11/1: THE MOVE-OUT PULL-BACK DELIBERATELY DOES *NOT* GO HERE ───────────
+  //
+  // It was put here first and nine tests caught it, which is what they are for.
+  // This cascade serves "They never moved in", Discard and Cancel reservation,
+  // and those have their own settled money rules that say the opposite:
+  // decisions #46.4 and #53 zero ONLY the move-in bill and leave a later bill,
+  // a charge billed on purpose ("Charge an amount") and GAM's own declined-card
+  // fee STILL OWED — in those exact words, in the confirm the landlord reads.
+  //
+  // Never moving in and moving out are not the same event. Somebody who never
+  // arrived was never billed for time they occupied, so there is a specific
+  // bill to zero and everything else stands. Somebody who lived there and left
+  // has rent paid FORWARD past the day they went, and that is what comes back
+  // (services/leaseEndPullBack, called from the ending sweep in jobs/scheduler
+  // and from the early-termination path).
+  //
+  // If a future session wants these to converge, that is a question for Nic
+  // about #46.4, not a refactor.
 }
 
 /**

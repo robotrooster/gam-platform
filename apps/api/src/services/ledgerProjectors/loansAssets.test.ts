@@ -155,6 +155,29 @@ describe('a loan', () => {
     expect(await active('loan_payment', early)).toEqual([])
   })
 
+  // 11/3 — Nic, 11/2: "my books for that property are going to start from when
+  // I bought that property." A loan belongs to a property, so the day it opens
+  // on is THAT property's, never the company's earliest — which is what every
+  // one of these reads used to be, and which would open a later property's
+  // borrowing months before the owner bought the place.
+  it("a loan at a later-starting property opens on THAT property's day, not the company's earliest", async () => {
+    const co = await ledgerCompany({ booksStart: '2026-01-01', booksStart2: '2026-06-01' })
+    const early = await loan(co, { property_id: co.propertyId, start_date: '2020-05-01', funded_to: null,
+      opening_balance: 150000, opening_escrow: 1200 })
+    const later = await loan(co, { property_id: co.propertyId2, start_date: '2020-05-01', funded_to: null,
+      opening_balance: 90000, opening_escrow: 600 })
+    await drainLedgerOutbox({ ignoreBackoff: true })
+    const daysOf = async (id: string) => [...new Set((await active('loan', id)).map(l => l.day))]
+    // Same company, same loan date, two different opening days — one per property.
+    expect(await daysOf(early)).toEqual(['2026-01-01'])
+    expect(await daysOf(later)).toEqual(['2026-06-01'])
+    // And the amounts stayed with their own loan.
+    expect((await active('loan', later)).map(l => [l.role, l.dr, l.cr]).sort()).toEqual([
+      ['loan_escrow', 600, 0], ['mortgage_payable', 0, 90000],
+      ['opening_balance_equity', 0, 600], ['opening_balance_equity', 90000, 0],
+    ].sort())
+  })
+
   it('the opening posting carries nothing of a loan (it opens through its own posting, never twice)', async () => {
     const co = await ledgerCompany({ booksStart: '2026-01-01' })
     for (const p of TENANT_LEDGER_PROJECTORS) registerLedgerProjector(p)

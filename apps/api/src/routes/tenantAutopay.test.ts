@@ -183,6 +183,10 @@ describe('PUT /api/autopay — the credit setting and the method it charges', ()
 
   it('use my credit first is off by default, saved when the tenant turns it on, and kept when not sent', async () => {
     const f = await seed()
+    // 10/30: autopay cannot be turned on with nothing linked, so this tenant
+    // gets a real method. The test is about the CREDIT setting; it used to pass
+    // only because the method-less path skipped every check.
+    await db.query(`UPDATE tenants SET stripe_customer_id = 'cus_autopay' WHERE id = $1`, [f.tenantId])
     expect((await put(f, { enabled: true })).status).toBe(200)
     expect(await setting(f)).toBe(false)
     const on = await put(f, { enabled: true, useCredit: true })
@@ -194,6 +198,36 @@ describe('PUT /api/autopay — the credit setting and the method it charges', ()
     expect(await setting(f)).toBe(true)
     expect((await put(f, { enabled: true, useCredit: false })).status).toBe(200)
     expect(await setting(f)).toBe(false)
+  })
+
+  // 10/30 (Nic): autopay with nothing linked never charges anything — the
+  // runner finds no method and gives up — so the resident believes rent is
+  // handled and is simply late. The method check used to live ONLY inside the
+  // branch that runs when a specific card is pinned, and the default choice
+  // ("whichever is my default at the time") sends none, so it skipped
+  // everything and wrote enabled = true.
+  it('cannot be turned on with no payment method linked at all', async () => {
+    const f = await seed()
+    const res = await put(f, { enabled: true })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/Add a bank account or card first/)
+    const { rows } = await db.query(`SELECT 1 FROM tenant_autopay WHERE lease_id = $1`, [f.leaseId])
+    expect(rows).toHaveLength(0)
+  })
+
+  it('cannot be turned on when the only bank is still verifying', async () => {
+    const f = await seed()
+    await db.query(`UPDATE tenants SET stripe_customer_id = 'cus_autopay' WHERE id = $1`, [f.tenantId])
+    pmList.mockImplementation(async (o: any) => ({ data: [] }))
+    siList.mockResolvedValue({ data: [{
+      id: 'seti_wait', status: 'requires_action', created: 1,
+      next_action: { type: 'verify_with_microdeposits', verify_with_microdeposits: {} },
+      payment_method: { id: 'pm_bank_wait', type: 'us_bank_account', us_bank_account: { bank_name: 'First', last4: '2222' } },
+    }] })
+    const res = await put(f, { enabled: true })
+    expect(res.status).toBe(409)
+    const { rows } = await db.query(`SELECT 1 FROM tenant_autopay WHERE lease_id = $1`, [f.leaseId])
+    expect(rows).toHaveLength(0)
   })
 
   it('a bank still waiting on its microdeposits cannot be pinned for autopay', async () => {

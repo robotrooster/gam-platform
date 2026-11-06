@@ -1,0 +1,213 @@
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg0:#0a0b0e;--bg1:#0f1116;--bg2:#141720;--bg3:#1a1f2e;--bg4:#212636;
+  --b0:#1e2435;--b1:#252d42;--b2:#2f3a55;
+  --t0:#f0f2f7;--t1:#c4ccde;--t2:#8a96b0;--t3:#555f7a;
+  --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;
+  /* S562: long-form token aliases — newer feature pages (LeasePage, SignPage,
+     dialogs) reference the text / border / bg tokens by their long names, which
+     were never defined, so those surfaces rendered with browser-default
+     (invisible) colors. Map them to the canonical short tokens. Same fix class
+     as .inp (S544). */
+  --text-0:var(--t0);--text-1:var(--t1);--text-2:var(--t2);--text-3:var(--t3);
+  --border-0:var(--b0);--border-1:var(--b1);
+  --bg-0:var(--bg0);--bg-1:var(--bg1);--bg-2:var(--bg2);--bg-3:var(--bg3);
+  --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace}
+html{-webkit-font-smoothing:antialiased;height:100%}
+body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
+h1,h2,h3{font-family:var(--font-d);color:var(--t0);line-height:1.2}
+h1{font-size:1.8rem;font-weight:800}h2{font-size:1.3rem;font-weight:700}h3{font-size:1.1rem;font-weight:700}
+a{color:var(--gold);text-decoration:none}
+button{cursor:pointer;font-family:var(--font-b)}
+input,select,textarea{font-family:var(--font-b)}
+.shell{display:flex;height:100vh;overflow:hidden}
+.sidebar{width:220px;flex-shrink:0;background:var(--bg1);border-right:1px solid var(--b0);display:flex;flex-direction:column;position:fixed;top:0;left:0;bottom:0;z-index:50}
+.main{flex:1;margin-left:220px;height:100vh;display:flex;flex-direction:column;min-width:0;overflow:hidden}
+.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40;flex-shrink:0}
+.page{flex:1;min-height:0;padding:28px;max-width:1200px;width:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:none}
+.logo{padding:20px;border-bottom:1px solid var(--b0)}
+.logo-name{font-family:var(--font-d);font-size:1.1rem;font-weight:800;color:var(--gold)}
+.logo-sub{font-size:.7rem;color:var(--t3);margin-top:2px;text-transform:uppercase;letter-spacing:.08em}
+.nav{padding:12px;flex:1}
+.nav-lbl{font-size:.65rem;color:var(--t3);text-transform:uppercase;letter-spacing:.1em;padding:10px 8px 4px;font-weight:600}
+.ni{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;color:var(--t2);font-size:.875rem;font-weight:500;transition:all .15s;width:100%;background:none;border:none;cursor:pointer;text-decoration:none}
+.ni:hover{background:var(--bg3);color:var(--t0)}
+.ni.active{background:rgba(201,162,39,.08);color:var(--gold);border:1px solid rgba(201,162,39,.2)}
+.footer{padding:12px;border-top:1px solid var(--b0)}
+.card{background:var(--bg2);border:1px solid var(--b1);border-radius:12px;padding:20px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+@media(max-width:1100px){.grid4{grid-template-columns:1fr 1fr}}
+@media(max-width:600px){.grid4{grid-template-columns:1fr}}
+@media(max-width:900px){.grid2,.grid3{grid-template-columns:1fr}}
+/* ── PHONE LAYOUT (S655) ──────────────────────────────────────────────────
+   The shell was desktop-only: a 220px sidebar pinned open with .main pushed
+   over by the same 220. On a ~390px phone that is more than half the screen
+   spent on a menu the resident cannot dismiss, and the only small-screen rules
+   that existed just restacked grids. Below 820px the sidebar becomes a drawer,
+   the content takes the full width, and the destinations a resident actually
+   uses move to a thumb-reachable bar along the bottom.
+   100dvh, not 100vh: a phone browser's address bar makes 100vh TALLER than the
+   visible area, which buries the last row of every page under the chrome.
+   --tabbar-h lets the floating chat button clear the bar (it is positioned
+   inline, so CSS alone cannot move it).                                      */
+:root{--tabbar-h:0px}
+
+/* ── VIEWPORT HEIGHT ─────────────────────────────────────── */
+/* 11/3 — `dvh` arrived in Chrome 108, and an auto-update-expired Chromebook
+   sits on Chrome 103, where the whole declaration is DROPPED rather than
+   approximated: a shell written `height:100dvh` gets no height at all, grows
+   past a body that is height:100% + overflow:hidden, and the browser clips it
+   with no scrollbar anywhere. Declared in vh and upgraded to dvh only where dvh
+   parses, so an old engine keeps a working height and a phone still gets the
+   address-bar-aware one. Write var(--vh), never 100dvh. */
+:root { --vh: 100vh; }
+@supports (height: 1dvh) { :root { --vh: 100dvh; } }
+
+.tabbar{display:none}
+.tbl--stack{min-width:640px}
+@media(max-width:820px){
+  :root{--tabbar-h:calc(54px + env(safe-area-inset-bottom,0px))}
+
+  /* 10/31 — EVERY TABLE, not the two that asked.
+     The .tbl--stack rules further down this block are the S655 original, and
+     they work; the trouble was that stacking was opt-in by class, so only the
+     documents table and one payments table ever got it. The other nine still
+     carried inline min-widths of 600 to 720 inside a 375px screen — including
+     the resident's own payment history, which is the same cut-off Nic reported
+     from the landlord's side of the same data.
+     These rules make it automatic, and installTableStacking (shared) reads
+     each column's name off the header. They come FIRST on purpose: .tbl--stack
+     is declared later in this block with equal specificity, so its hand-tuned
+     padding and action-cell treatment still win on the two tables that have it.
+     A grid that is a picture rather than a list opts out with [data-no-stack]. */
+  table:not([data-no-stack] table),
+  table:not([data-no-stack] table) tbody,
+  table:not([data-no-stack] table) tr,
+  table:not([data-no-stack] table) td{
+    display:block;width:auto;max-width:100%;min-width:0!important}
+  table:not([data-no-stack] table) thead{
+    position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  table:not([data-no-stack] table) tr{padding:12px 2px;border-bottom:1px solid var(--b0)}
+  table:not([data-no-stack] table) td{border:none;padding:3px 0;white-space:normal}
+  table:not([data-no-stack] table) td[data-label]{
+    display:flex;gap:10px;align-items:baseline;justify-content:space-between}
+  table:not([data-no-stack] table) td[data-label]::before{
+    content:attr(data-label);font-size:.68rem;font-weight:700;letter-spacing:.06em;
+    text-transform:uppercase;color:var(--t3);flex:0 0 auto}
+  table:not([data-no-stack] table) td .btn{width:100%;justify-content:center}
+  .shell{height:var(--vh)}
+  .sidebar{width:min(84vw,300px);transform:translateX(-100%);
+           transition:transform .22s ease;will-change:transform}
+  .sidebar.open{transform:translateX(0);box-shadow:0 0 40px rgba(0,0,0,.55)}
+  .nav{overflow-y:auto;-webkit-overflow-scrolling:touch}
+  .scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:45;border:none;padding:0;margin:0}
+  .main{margin-left:0;height:var(--vh)}
+  .topbar{padding:0 10px;height:calc(52px + env(safe-area-inset-top,0px));
+          padding-top:env(safe-area-inset-top,0px)}
+  .page{padding:16px max(14px,env(safe-area-inset-left,0px))
+              calc(20px + var(--tabbar-h)) max(14px,env(safe-area-inset-right,0px))}
+  .ph{flex-direction:column;align-items:flex-start;gap:8px;margin-bottom:18px;padding-bottom:12px}
+  .pt{font-size:1.25rem}
+  .card{padding:14px;border-radius:10px}
+  .kpi{padding:14px;border-radius:10px}
+  .kpi-v{font-size:1.35rem}
+  .grid2,.grid3,.grid4{gap:12px}
+  h1{font-size:1.4rem}h2{font-size:1.15rem}
+  .tabbar{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:48;
+          background:var(--bg1);border-top:1px solid var(--b0);
+          padding-bottom:env(safe-area-inset-bottom,0px)}
+  .tabbar a,.tabbar button{flex:1 1 0;min-width:0;display:flex;flex-direction:column;
+          align-items:center;justify-content:center;gap:3px;padding:7px 2px 5px;
+          background:none;border:none;color:var(--t3);font-size:.6rem;font-weight:600;
+          text-decoration:none;min-height:54px;font-family:var(--font-b)}
+  .tabbar a.active{color:var(--gold)}
+  .tabbar span{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* S655 (Nic): the documents table is five columns in a 360px box, so Download
+     sat off the right edge and had to be scrolled to. Five columns cannot fit a
+     phone even without the old inline min-width, so each row becomes a card:
+     the header is dropped and every cell carries its own label instead. The
+     width lives in .tbl--stack rather than inline, because a media query cannot
+     override an inline style. */
+  .tbl--stack{min-width:0}
+  .tbl--stack thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  .tbl--stack, .tbl--stack tbody, .tbl--stack tr, .tbl--stack td{display:block;width:auto}
+  .tbl--stack tr{padding:12px 14px;border-bottom:1px solid var(--b0)}
+  .tbl--stack td{border:none;padding:3px 0}
+  .tbl--stack td[data-label]{display:flex;gap:10px;align-items:baseline;justify-content:space-between}
+  .tbl--stack td[data-label]::before{content:attr(data-label);font-size:.68rem;font-weight:700;
+       letter-spacing:.06em;text-transform:uppercase;color:var(--t3);flex:0 0 auto}
+  .tbl--stack td.td-act{padding-top:10px}
+  .tbl--stack td.td-act .btn{width:100%;justify-content:center}
+}
+.ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--b0)}
+.pt{font-family:var(--font-d);font-size:1.5rem;font-weight:800;color:var(--t0)}
+.ps{font-size:.82rem;color:var(--t3);margin-top:2px}
+.kpi{background:var(--bg2);border:1px solid var(--b1);border-radius:12px;padding:20px}
+.kpi-l{font-size:.7rem;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;font-weight:600;margin-bottom:8px}
+.kpi-v{font-family:var(--font-d);font-size:1.6rem;font-weight:800;color:var(--t0);line-height:1;margin-bottom:4px}
+.kpi-s{font-size:.72rem;color:var(--t3)}
+.btn{display:inline-flex;align-items:center;gap:7px;padding:8px 16px;border-radius:8px;font-size:.82rem;font-weight:600;border:none;cursor:pointer;transition:all .15s;font-family:var(--font-b);text-decoration:none}
+.btn-p,.btn-primary{background:var(--gold);color:#0a0b0e}.btn-p:hover,.btn-primary:hover{background:#d9af3a}
+.btn-g,.btn-ghost{background:var(--bg4);color:var(--t1);border:1px solid var(--b2)}.btn-g:hover,.btn-ghost:hover{background:var(--bg3);color:var(--t0)}
+.btn-link{background:none;border:none;color:var(--gold);padding:0;font-weight:600;text-decoration:underline;font-size:.82rem}
+.btn-d{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.25)}
+.btn-sm{padding:5px 10px;font-size:.75rem}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.b-green{background:rgba(34,197,94,.08);color:var(--green);border:1px solid rgba(34,197,94,.2)}
+.b-amber{background:rgba(245,158,11,.08);color:var(--amber);border:1px solid rgba(245,158,11,.2)}
+.b-red{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.2)}
+.b-gold{background:rgba(201,162,39,.08);color:var(--gold);border:1px solid rgba(201,162,39,.2)}
+.b-muted{background:var(--bg4);color:var(--t3);border:1px solid var(--b1)}
+.alert{display:flex;align-items:flex-start;gap:12px;padding:12px 16px;border-radius:8px;font-size:.82rem;margin-bottom:16px}
+.a-gold{background:rgba(201,162,39,.08);border:1px solid rgba(201,162,39,.2);color:var(--gold)}
+.a-green{background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);color:#86efac}
+.a-red{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);color:#fca5a5}
+.a-warn{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);color:#fcd34d}
+.a-blue{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:#93c5fd}
+.modal-ov,.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;backdrop-filter:blur(4px)}
+.modal{background:var(--bg2);border:1px solid var(--b2);border-radius:16px;padding:24px;width:100%;max-width:500px;max-height:90vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.5)}
+.modal-t,.modal-title{font-family:var(--font-d);font-size:1.1rem;font-weight:800;color:var(--t0);margin-bottom:20px}
+.modal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+.modal-f{display:flex;justify-content:flex-end;gap:10px;margin-top:20px;padding-top:16px;border-top:1px solid var(--b0)}
+.fg{margin-bottom:16px}
+.fl{display:block;font-size:.75rem;font-weight:600;color:var(--t2);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
+/* S544: .inp was used in 5 places but never defined — fields rendered
+   browser-default white on the dark theme. */
+.inp,.input,.form-input{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:10px 12px;font-size:.9rem;color-scheme:dark}
+.inp:focus,.input:focus,.form-input:focus{outline:none;border-color:var(--gold)}
+textarea.inp{resize:vertical}
+/* S595: same drift as .inp (S544) — className="input" fields were never aliased,
+   so they fell back to white browser boxes. Alias + uniform +6% type lift +
+   readable disabled (overrides the blanket :disabled{opacity:.4} so disabled
+   field VALUES stay legible instead of washing out). */
+html{font-size:17px}
+.inp:disabled,.input:disabled,.form-input:disabled,.fi:disabled,.fs:disabled,.fta:disabled,input:disabled,select:disabled,textarea:disabled,input[readonly],textarea[readonly]{background:var(--bg2);border-color:var(--b0);color:var(--t1);-webkit-text-fill-color:var(--t1);opacity:1;cursor:not-allowed}
+/* S595 LIGHT THEME (short token names; hyphenated aliases map to these so both flip). */
+:root[data-theme="light"]{color-scheme:light;--bg0:#f4f5f7;--bg1:#ffffff;--bg2:#ffffff;--bg3:#eef0f4;--bg4:#e5e8ee;--b0:#e7e9ef;--b1:#dde0e8;--b2:#ccd2de;--t0:#12151c;--t1:#333b49;--t2:#5b6474;--t3:#8a93a5;--gold-ink:#7a5f0f}
+:root[data-theme="light"] .inp,:root[data-theme="light"] .input,:root[data-theme="light"] .form-input,:root[data-theme="light"] .fi,:root[data-theme="light"] .fs,:root[data-theme="light"] .fta{color-scheme:light}
+:root[data-theme="light"] a,:root[data-theme="light"] .logo-name{color:var(--gold-ink)}
+:root[data-theme="light"] .ni.active{color:var(--gold-ink);background:rgba(201,162,39,.12);border-color:rgba(201,162,39,.32)}
+.fi,.fs,.fta{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:9px 12px;font-size:.875rem;font-family:var(--font-b);outline:none;transition:border-color .15s}
+.fi:focus,.fs:focus,.fta:focus{border-color:var(--gold)}
+.fi::placeholder{color:var(--t3)}
+.fta{resize:vertical;min-height:80px}
+.fg2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.dr{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--b0);font-size:.82rem}
+.dr:last-child{border-bottom:none}
+.dk{color:var(--t3)}.dv{color:var(--t0);font-weight:500}
+.mono{font-family:var(--font-m);font-size:.875rem}
+.tbl{width:100%;border-collapse:collapse;font-size:.82rem}
+.tbl th{background:var(--bg3);color:var(--t3);font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.07em;padding:10px 14px;text-align:left;border-bottom:1px solid var(--b1)}
+.tbl td{padding:11px 14px;border-bottom:1px solid var(--b0);color:var(--t1)}
+.tbl tr:last-child td{border-bottom:none}
+.empty{text-align:center;padding:48px 20px;color:var(--t3)}
+.loading{display:flex;align-items:center;justify-content:center;height:100vh;font-family:var(--font-d);font-size:1.2rem;color:var(--t3)}
+.spinner{width:18px;height:18px;border:2px solid var(--b2);border-top-color:var(--gold);border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.service-card{background:var(--bg3);border:1px solid var(--b1);border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:12px;transition:border-color .2s}
+.service-card:hover{border-color:var(--b2)}
+.service-card.enrolled{border-color:rgba(34,197,94,.3);background:rgba(34,197,94,.03)}
+.price-tag{font-family:var(--font-d);font-size:1.4rem;font-weight:800;color:var(--t0)}
+.price-sub{font-size:.75rem;color:var(--t3)}

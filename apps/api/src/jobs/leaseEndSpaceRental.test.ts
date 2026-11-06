@@ -131,3 +131,70 @@ describe('the deposit return a lease end leaves behind', () => {
     expect(mine).toHaveLength(1)
   })
 })
+
+/**
+ * 10/28 (Nic, DIRECTIVE) — A SIGNED SUCCESSOR BEATS THE LAPSE.
+ *
+ *   "If a landlord adds a lease to replace the other person, the new lease
+ *    supersedes the old lease. Because the only way for the new lease to even
+ *    be on there is by the landlord initiation, which means that's what the
+ *    landlord wants to win. However, the new lease only supersedes if it's
+ *    signed. If the signature fails or doesn't complete, the old lease does
+ *    not end."
+ *
+ * The lapse above protects a resident from a date nobody chose. It is not
+ * supposed to undo a date two parties signed. Before this, a takeover signed
+ * today had the sitting lease's end date written by the succession, and this
+ * sweep set it back to NULL the same night — the departing resident back on
+ * month-to-month and still billing, with the replacement's signed lease
+ * already on the same space.
+ */
+describe('a takeover on a tenant-owned dwelling', () => {
+  const replacement = async (
+    f: { unitId: string; leaseId: string; landlordId: string },
+    signed: { tenant: boolean; landlord: boolean },
+  ) => {
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO leases (unit_id, landlord_id, status, lease_type, start_date, rent_amount,
+                           replaces_lease_id, signed_by_tenant, signed_by_landlord)
+       VALUES ($1, $2, 'pending', 'month_to_month', CURRENT_DATE, 589, $3, $4, $5)
+       RETURNING id`,
+      [f.unitId, f.landlordId, f.leaseId, signed.tenant, signed.landlord])
+    return r.rows[0].id
+  }
+
+  it('BOTH signed: the end date stands, the lease ends, the space stays occupied', async () => {
+    const f = await leaseEndingYesterday({ ownership: 'tenant', unitType: 'mobile_home' })
+    await replacement(f, { tenant: true, landlord: true })
+    await processLeaseEnds()
+    const l = await leaseNow(f.leaseId)
+    expect(l.status).toBe('expired')             // the hand-over happened
+    expect(l.end_date).not.toBeNull()            // the signed date was NOT wiped
+    expect(l.lease_type).not.toBe('month_to_month')
+    // The replacement is taking the space, so it is never freed.
+    expect((await unitNow(f.unitId)).status).toBe('active')
+  })
+
+  it('replacement NOT countersigned: the old lease does not end', async () => {
+    const f = await leaseEndingYesterday({ ownership: 'tenant', unitType: 'mobile_home' })
+    await replacement(f, { tenant: false, landlord: true })
+    await processLeaseEnds()
+    const l = await leaseNow(f.leaseId)
+    // Nic: "if the signature fails or doesn't complete, the old lease does not
+    // end." A landlord-signed draft nobody countersigned releases nobody, so
+    // the ordinary space-rental lapse is what happens.
+    expect(l.status).toBe('active')
+    expect(l.lease_type).toBe('month_to_month')
+    expect(l.end_date).toBeNull()
+  })
+
+  it('a withdrawn replacement is not a successor at all', async () => {
+    const f = await leaseEndingYesterday({ ownership: 'tenant', unitType: 'mobile_home' })
+    const rid = await replacement(f, { tenant: true, landlord: true })
+    await db.query(`UPDATE leases SET status = 'terminated' WHERE id = $1`, [rid])
+    await processLeaseEnds()
+    const l = await leaseNow(f.leaseId)
+    expect(l.status).toBe('active')
+    expect(l.end_date).toBeNull()
+  })
+})

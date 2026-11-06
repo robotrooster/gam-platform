@@ -2,17 +2,17 @@
 
 ## Handoff corrections (S649 said X, the code says Y)
 - **"pos.goldassetmanagement.com not live"** — it was live (Ready, 15 h before this session).
-- **Andres Razo** — listed as both "waiting on Nic's yes" and "done". Done: no invite, no lease, no holds on RV 27.
+- **Cora Castellan** — listed as both "waiting on Nic's yes" and "done". Done: no invite, no lease, no holds on RV 27.
 - **Ray's RV 09 meter "will keep producing held electric"** — no. Holds need an open invite (Ray's are cancelled), and a new RV 09 tenant can't inherit his usage (S649 rule).
 - **"Tax can only be set on a category"** — wrong. Items could pick a named tax, but that pick was **never charged** (see Register below).
-- **"9 units on work trade = snowbirds"** — wrong. They are the 9 active work-trade agreements at Mountain View (Lisa Scheeler MH 01, Nic MH 02, Ruben Negrete MH 05, Brandon Valdez MH 10, Bret Robinson MH 20, Ignacio Gutierrez RV 08, Matthew Conklin RV 45, Scott Johnson RV 50, John Kvasnicka RV 51). 32 + 9 = 41, so the counts reconcile.
+- **"9 units on work trade = snowbirds"** — wrong. They are the 9 active work-trade agreements at Mountain View (Calla Fitzhugh MH 01, Nic MH 02, Yannick Ashdown MH 05, Ivey Ingersoll MH 10, Joss Jessup MH 20, Flint Grantham RV 08, Gideon Jerningham RV 45, Zephyrine Brandeston RV 50, Theodora Thistlewood RV 51). 32 + 9 = 41, so the counts reconcile.
 - **Dashboard small print** was the work-trade suspended balance, not utilities.
 - **"Keep the concurrency gate at 1"** — the code has 6 (AGENT_MAX_CONCURRENT default). Left at 6; memory is now byte-capped (below).
 - **gam_demo was 3 weeks behind on migrations** (last applied 2026-08-29). Agent evals were crashing on missing columns. Migrated this session; one demo fee row parked in `s650_demo_fee_schedule_backup`.
 - **Eval harness landlord actor had no `landlordIds`** since S634, so every landlord eval case saw an empty portfolio. Fixed.
 
 ## Nic's answers this session (directives, saved to memory)
-- Held utilities nobody claims by the onboarding window's close = settled off-platform; bill nobody. (RV 16 = Harold Cunningham, off-platform; RV 30 moved out.)
+- Held utilities nobody claims by the onboarding window's close = settled off-platform; bill nobody. (RV 16 = Cedric Danforth, off-platform; RV 30 moved out.)
 - Taxes: landlord-named taxes, assigned to single items or whole categories. AZ TPT is one combined tax. Propane = 6.35% TPT; electricity untaxed.
 - Landlord new-reservation form: dates → "Show available" (filter out any site with any overlap) → pick site → lock vs let auto-schedule move it → name/phone/email → deposit pay link. **Nic expects follow-up questions before build.**
 - Screening: availability should be checked BEFORE the paid background check (unit type / RV size / has RV). **Design with Nic.**
@@ -20,8 +20,8 @@
 - Mattoon water meters: Nic sends details later.
 - Agents: priority one. Primary goal = narrow a vague question, confirm, then resolve.
 - Agent pacing is deliberate: back-end speed is fair game, the customer-facing reply stays human-paced (reading delay + typing). Do not speed that up.
-- Ellen Gregory's two emails are two different people (her and her daughter), not duplicates.
-- Lisa Scheeler rings sales and takes payments; only the administrative register functions (tax rates, discounts, inventory counts, item setup) stay restricted.
+- Zeph Ashcombe's two emails are two different people (her and her daughter), not duplicates.
+- Calla Fitzhugh rings sales and takes payments; only the administrative register functions (tax rates, discounts, inventory counts, item setup) stay restricted.
 - Nothing in the register is freely typable except a quantity. "+ Open Item" removed — a one-off goes on a lease or a pay link.
 - FlexCharge is not a launch item and must not be visible or named anywhere.
 - Email gets verified by the invite → signup → lease-signing flow, not by a separate email.
@@ -54,12 +54,12 @@
 - **#8 Disbursements** — page opens with one flow: clearing at tenants' banks → cleared, held for you → sent to your bank on <date> (or "link your bank"), with every payment in the next payout listed. The $495 = one Mountain View rent payment.
 - **#12 Hibernation** — hibernating leases now bill no utilities, take no RUBS share, and sit apart on the rent roll / Expected Monthly Rent.
 - **#14 Admin 2FA** — the admin console used the plain login, so a landlord email + password got a code sent to the landlord inbox. Staff consoles now refuse non-staff accounts before any code goes out; autofill off on the admin email field.
-- **#16 Landlord count** — counts people who brought a property (4: Nic, Blu Haws, Nicholas Fausett, Phil Brewerton) plus "3 signed up, no property yet". Co-owners and second LLCs don't inflate it.
+- **#16 Landlord count** — counts people who brought a property (4: Nic, Hollis Harkness, Lysander Oglethorpe, Phil Brewerton) plus "3 signed up, no property yet". Co-owners and second LLCs don't inflate it.
 - API: `GAM_DISABLE_SCHEDULER=1` lets a preview API run against gam_demo without the nightly jobs.
 
 ## Production data changes this session (backups: ~/gam-backups/s650-*)
 - Mountain View RV 16 ($192.36) and RV 30 ($147.42) held electric closed out as settled off-platform (Nic's directive).
-- Scott Johnson (RV 50) and John Kvasnicka (RV 51) leases hibernated; their work-trade agreements paused with them.
+- Zephyrine Brandeston (RV 50) and Theodora Thistlewood (RV 51) leases hibernated; their work-trade agreements paused with them.
 - Mountain View register taxes: "Lodging tax" 6.35% on RV site daily + weekly; "Transaction privilege tax" 6.35% on Propane. Monthly stay and electric untaxed.
 - gam_demo migrated to current (one stale demo fee row parked in s650_demo_fee_schedule_backup).
 
@@ -80,7 +80,7 @@
 
 **Result:** the retry fired Saturday and went through — transfer `tr_1UHXhVDNEru9AEpKpLggYn5G`, $4,154.89 to Mountain View. Weekend transfer, so it shows in the bank Monday.
 
-### Ellen Gregory couldn't log in
+### Zeph Ashcombe couldn't log in
 Two separate faults, both fixed:
 1. Her account was never email-verified (she never clicked an invite — the lease got signed in person), and the login refused unverified accounts.
 2. The tenant portal ran **two** 401 interceptors. One had the `/auth/` carve-out, the other didn't; the second one caught the refusal first and reloaded the page, so she got a blank screen with no message. The same duplicate/missing carve-out existed in **pos, admin and property-intel** — all four fixed.
@@ -89,7 +89,7 @@ Going forward, signing a lease marks the signer's email verified (`routes/esign.
 
 ### Register
 - **"+ Open Item" is gone** from both registers. Every line has to be an item somebody set up; the server refuses a sale line that isn't in the catalog, at any price other than the catalog's, unless the cashier holds "Apply discounts".
-- Lisa's "Ring sales" permission is on. Nic to eyeball the rest of her permissions logged in as her.
+- Calla's "Ring sales" permission is on. Nic to eyeball the rest of her permissions logged in as her.
 
 ### GAM's own money — this took the rest of the night
 Nic's question: *"where is our profit pooling, and why don't any of the numbers match?"*
@@ -134,7 +134,7 @@ Today the pool lives under a "GAM Renter Pool" landlord and property, which also
 - Screening margin + card spread backfilled ($5.49).
 - September platform fee billed: Mountain View $82, Oak Park $48 — netting from their next payouts.
 - September margin trued up to Stripe's real numbers (+$33.11).
-- Ellen Gregory's account marked email-verified; Lisa Scheeler granted "Ring sales".
+- Zeph Ashcombe's account marked email-verified; Calla Fitzhugh granted "Ring sales".
 - Stuck passthrough transfer re-fired: $4,154.89 to Mountain View.
 
 ## Deploy status
@@ -144,7 +144,7 @@ Everything through commit `6e59722` is built, deployed and verified (API, landlo
 1. Reservation form follow-ups (Nic expects questions before the build).
 2. Screening: check availability before the paid background check — design with Nic.
 3. Still open from S649: Stripe rep question, card reader order.
-4. Nic to eyeball Lisa's permissions logged in as her.
+4. Nic to eyeball Calla's permissions logged in as her.
 
 ## Next session
 **Mattoon / Country Acres onboarding, from Nic's spreadsheet.** Owner wants billing ready for October rent through the portal; "build fast and break stuff", he'll fix details later.

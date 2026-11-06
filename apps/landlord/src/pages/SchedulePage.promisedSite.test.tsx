@@ -58,7 +58,6 @@ vi.mock('../lib/api', async () => {
     apiDel: async () => ({}),
     apiDelete: async () => ({}),
     openPdfInNewTab: async () => {},
-    ACCOUNT_LOCKED_EVENT: 'gam:account-locked',
   }
 })
 vi.mock('../components/dialogs', () => ({
@@ -69,6 +68,7 @@ vi.mock('../components/dialogs', () => ({
 }))
 vi.mock('../lib/permissions', () => ({ usePerms: () => ({ can: () => true, isOwner: true }) }))
 
+import { localToday } from '../lib/creditDesk'
 import {
   SchedulePage, isScheduleBarLocked, isScheduleBarSiteLocked,
   promisedSiteWords, scheduleStayLockWords, SITE_MOVED_BY_HAND_REASON,
@@ -77,7 +77,9 @@ import {
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
 ;(globalThis as any).ResizeObserver = class { observe() {} unobserve() {} disconnect() {} }
 
-const TODAY = new Date().toISOString().split('T')[0]
+// The same day the PAGE calls today — its own calendar day, not UTC's,
+// which is tomorrow from 5pm Phoenix (testsAreDeterministic).
+const TODAY = localToday()
 const day = (n: number) => {
   const d = new Date(TODAY + 'T12:00:00Z')
   d.setUTCDate(d.getUTCDate() + n)

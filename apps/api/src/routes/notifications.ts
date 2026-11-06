@@ -7,6 +7,12 @@ import { landlordIdForProperty, landlordScopeIds } from '../lib/landlordScope'
 import { AppError } from '../middleware/errorHandler'
 import { isKnownNotificationType, isCriticalNotificationType } from '@gam/shared'
 
+/**
+ * How long a notice stays on a resident's own list. 10/30 (Nic): 60 days.
+ * The row itself lives forever — this only decides what is still on screen.
+ */
+export const NOTIFICATION_VISIBLE_DAYS = 60
+
 export const notificationsRouter = Router()
 notificationsRouter.use(requireAuth)
 
@@ -24,16 +30,46 @@ notificationsRouter.get('/', async (req, res, next) => {
       ? Math.min(rawLimit, 200)
       : 20
     const unread = req.query.unread === 'true'
+    // 10/30 (Nic): a resident sees their own, undismissed, not-yet-aged-out
+    // notices. The rows are never deleted — see the retention migration — so
+    // "how many times did we tell them, and did they open it" stays answerable
+    // forever. This WHERE is the only thing standing between the record and
+    // the screen.
     const notes  = await query<any>(`
       SELECT * FROM notifications
       WHERE user_id = $1
+        AND dismissed_at IS NULL
+        AND retention_from > NOW() - ($3 || ' days')::interval
       ${unread ? 'AND read = FALSE' : ''}
       ORDER BY created_at DESC LIMIT $2`,
-      [req.user!.userId, limit])
+      [req.user!.userId, limit, String(NOTIFICATION_VISIBLE_DAYS)])
     const unreadCount = await queryOne<any>(
-      'SELECT COUNT(*)::int as count FROM notifications WHERE user_id=$1 AND read=FALSE',
-      [req.user!.userId])
+      `SELECT COUNT(*)::int as count FROM notifications
+        WHERE user_id = $1 AND read = FALSE AND dismissed_at IS NULL
+          AND retention_from > NOW() - ($2 || ' days')::interval`,
+      [req.user!.userId, String(NOTIFICATION_VISIBLE_DAYS)])
     res.json({ success: true, data: notes, unreadCount: unreadCount?.count || 0 })
+  } catch (e) { next(e) }
+})
+
+// DELETE /api/notifications/:id — "clear this off my list".
+//
+// 10/30 (Nic): "they should still also be able to manually delete it. And if
+// they manually delete it, then that can show that they were at least on that
+// page and can be assumed to have read it enough to go through with deleting
+// it." So a dismiss is EVIDENCE, not an erasure: the row stays, dismissed_at
+// records when they did it, and read is stamped too, because you cannot clear
+// something off a screen you were not looking at.
+notificationsRouter.delete('/:id', async (req, res, next) => {
+  try {
+    await query(
+      `UPDATE notifications
+          SET dismissed_at = NOW(),
+              read = TRUE,
+              read_at = COALESCE(read_at, NOW())
+        WHERE id = $1 AND user_id = $2 AND dismissed_at IS NULL`,
+      [req.params.id, req.user!.userId])
+    res.json({ success: true })
   } catch (e) { next(e) }
 })
 

@@ -2,7 +2,7 @@
  * S651 — knowing which addresses the provider has given up on.
  *
  * A bounce fires a webhook. A suppression fires nothing, ever: the send is
- * accepted, given a message id, and discarded. Thirteen emails to Rashawn Bump
+ * accepted, given a message id, and discarded. Thirteen emails to Phaedra Stanhope
  * disappeared that way over three weeks, every one logged 'sent'.
  */
 import { describe, it, expect, beforeEach } from 'vitest'

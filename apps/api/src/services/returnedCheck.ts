@@ -122,6 +122,7 @@ import { db, getClient, query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
 import { lockHousehold, lockPaymentRowsById } from './moneyPredicates'
+import { todayIn } from '../lib/timezone'
 
 /** A returned item is taken back by itself only against deposits the bank posted up to this many days before it. */
 export const RETURNED_ITEM_WINDOW_DAYS = 30
@@ -1230,7 +1231,7 @@ export async function undoReturnedCheck(client: PoolClient, o: {
     `Returned ${item} put back: the late fee the bounce brought is not owed`, 'A late fee the bounce brought has a payment or credit on it since.'))
     .map(v => v.id)
 
-  const day = new Date().toISOString().slice(0, 10)
+  const day = todayIn(null)
   for (const r of u.rows) {
     const res = await client.query(
       `UPDATE payments

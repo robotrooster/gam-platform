@@ -125,6 +125,22 @@ export const NOTIFICATION_CATALOG_SOURCE = [
   { type: 'autopay_failed', label: 'A scheduled payment failed', group: 'money_in', audience: 'both',
     critical: true, whyAlways: 'Nobody checks on a payment they believe is handled — silence here ends in a late fee nobody saw coming, so GAM always emails it.',
     when: 'A scheduled (autopay) rent pull fails. The resident and the landlord are both told.' },
+  // 10/30 (Nic, asked and answered): "If autopay turns off, it needs to inform
+  // them." So this is always sent — the sixth. A resident cannot notice autopay
+  // going quiet on their own: they believe rent is handled right up until they
+  // are late, which is the exact shape of the failure the always-send list
+  // exists for. It was in-app only until he ruled.
+  { type: 'autopay_disarmed', label: 'Autopay was switched off', group: 'money_in', audience: 'tenant',
+    critical: true, whyAlways: 'Autopay stopping is the one thing you cannot notice on your own — you would believe rent was handled until it was late, so GAM always emails it.',
+    when: 'Your bank refuses a scheduled payment and no retry is coming, so GAM stops using that method rather than failing again next month.' },
+  // 11/4 (Nic): "We also need to know when auto pay went off." The resident's
+  // copy above has existed since 10/30; the operator had none, so from their
+  // side the autopay badge simply vanished and they learned of it when the
+  // resident was late. Critical for the same reason utility_review_blocks_billing
+  // joined on 11/1 — it is money they have to chase, and nothing else tells them.
+  { type: 'autopay_disarmed_info', label: 'A resident’s autopay was switched off', group: 'money_in', audience: 'landlord',
+    critical: true, whyAlways: 'Nobody else can tell you this. The resident believed rent was handled, their method has been removed, and the money is still owed — so GAM always emails it.',
+    when: 'A resident’s bank refuses a scheduled payment and no retry is coming, so GAM switches their autopay off and removes the method.' },
   { type: 'autopay', label: 'Scheduled payment notices', group: 'money_in', audience: 'tenant',
     inAppOnly: true,
     when: 'Your scheduled rent payment is about to run, ran, or was switched off.' },
@@ -140,6 +156,14 @@ export const NOTIFICATION_CATALOG_SOURCE = [
     when: 'The bank returns a check or money order that was already recorded as paid.' },
   { type: 'flexdeposit_payment_failed', label: 'A FlexDeposit payment failed', group: 'money_in', audience: 'tenant',
     when: 'A scheduled FlexDeposit installment does not go through.' },
+  // 10/29 (Nic): a resident owing a deposit is told, ONCE, that it can be
+  // split. Gated and not critical on purpose — it is an offer, not a fact
+  // about their account, so somebody who does not want to hear about it can
+  // switch it off and still get every bill and receipt. Their portal shows the
+  // same offer either way, which is where it stands until the deposit is
+  // settled; nothing about what they OWE depends on this switch.
+  { type: 'flexdeposit_offer', label: 'Your deposit can be split into payments', group: 'money_in', audience: 'tenant',
+    when: 'You owe a security deposit that could be paid in instalments instead of all at once. Sent once.' },
   { type: 'flexpay_bill_covered', label: 'FlexPay covered your bill', group: 'money_in', audience: 'tenant',
     critical: true, whyAlways: 'It says what FlexPay paid and what is still owed on that bill, so GAM always emails it.',
     when: 'FlexPay pays a bill of yours — with what, if anything, is still owed on it.' },
@@ -221,10 +245,9 @@ export const NOTIFICATION_CATALOG_SOURCE = [
     when: 'A recorded payment out of your bank account is voided.' },
   { type: 'gam_balance_uncollectable', label: 'GAM could not collect its fees', group: 'money_out', audience: 'landlord',
     when: 'GAM’s fee debit cannot be collected from your bank account.' },
-  { type: 'gam_portal_lock_warning', label: 'Your portal will lock', group: 'money_out', audience: 'landlord',
-    when: 'Two billing cycles of GAM fees are uncollected, 48 hours before the portal locks.' },
-  { type: 'gam_portal_locked', label: 'Your portal is locked', group: 'money_out', audience: 'landlord',
-    when: 'The portal locks over uncollected GAM fees.' },
+  // 11/2 (Nic): gam_portal_lock_warning and gam_portal_locked are gone with the
+  // lock itself. Nothing raises them, so leaving them here would offer a
+  // landlord a preference switch for mail that can never arrive.
   // 10/12 (Nic): "Home payments", not "home sale" — the notice is about the
   // buyer's payments, which is what the landlord acts on.
   { type: 'home_sale_started', label: 'Home payments started', group: 'money_out', audience: 'landlord',
@@ -247,6 +270,13 @@ export const NOTIFICATION_CATALOG_SOURCE = [
   { type: 'monthly_property_report', label: 'Last month’s property report', group: 'money_out', audience: 'landlord',
     emailOnly: true,
     when: 'The 2nd of each month, with last month’s report for your properties attached as a PDF.' },
+  // PM readiness 4: the owner statement, emailed with its PDF. An owner whose
+  // park a manager runs on GAM was sent nothing at all — the statement existed
+  // only for whoever opened the portal, and most owners never open one.
+  // jobs/ownerStatementEmail.
+  { type: 'owner_statement', label: 'Last month’s owner statement', group: 'money_out', audience: 'landlord',
+    emailOnly: true,
+    when: 'Early each month, with last month’s statement from the company that manages your properties attached as a PDF.' },
   { type: 'manager_direct_deposit_enabled', label: 'Direct deposit was turned on for you', group: 'account', audience: 'landlord',
     when: 'An owner turns on direct deposit for your staff pay.' },
 
@@ -409,6 +439,38 @@ export const NOTIFICATION_CATALOG_SOURCE = [
     when: 'A reading round finishes with numbers worth checking before billing.' },
   { type: 'utility_bills_ready_to_review', label: 'Utility bills are ready to review', group: 'utilities', audience: 'landlord',
     when: 'A cycle’s utility bills are calculated and waiting on your review.' },
+  // ── 11/1 (Nic, DIRECTIVE) — THE ONE THAT HAS TO ARRIVE ──────────────────────
+  //
+  //   "we need when a landlord is opted to review things before billing goes out
+  //    and they haven't done it, they need to get emailed the last business day
+  //    of the month plus any following days that are still at the end of the
+  //    month that says, hey, you need to review these, otherwise nobody's going
+  //    to get billed. So he should have got an email going forward. He should
+  //    have got an email both Friday and Saturday telling him to check that."
+  //
+  // What it cost to learn. Country Acres' October round held on ONE flagged read
+  // (Lot 21's replaced water meter read 6 against 5901). The landlord reviews
+  // before billing, so an unapproved round holds every invoice on the property
+  // WHOLE — rent included. Twelve households got no November bill; the only
+  // thing that went out was the trailer payments, which ride their own bill. He
+  // was told once, in the app, on 10/28, and never again, because he has turned
+  // off every utility email there is (96 preference rows, none emailing — both
+  // gates working exactly as designed). The owner found out when tenants rang.
+  //
+  // So this one is CRITICAL. That is the whole override: `critical: true` makes
+  // createNotification force both channels on regardless of preference, and the
+  // settings page renders the row locked with `whyAlways` under it. No bypass
+  // code, no new flag, no second sender.
+  //
+  // It is deliberately NOT a nicer `utility_bills_ready_to_review`. That one
+  // says the bills are ready and is fine to decline — the stakes are a delayed
+  // water charge. This one only ever fires once the month is ending and says
+  // the true thing: nothing at all gets billed until you act. Those are
+  // different facts and only the second may ignore a preference.
+  { type: 'utility_review_blocks_billing', label: 'Your review is holding the month’s bills', group: 'utilities', audience: 'landlord',
+    critical: true,
+    whyAlways: 'Until you review, NOBODY at that property is billed — not rent, not water. A whole month can pass with no income and no warning, so GAM always emails this one.',
+    when: 'The month is ending, you review utility bills before they go out, and a round is still waiting on you. Sent on the last business day of the month and again every remaining day of that month.' },
   { type: 'utility_meter_broken', label: 'A meter is not reading', group: 'utilities', audience: 'landlord',
     inAppOnly: true,
     when: 'A meter reads the same number twice while the space was occupied.' },

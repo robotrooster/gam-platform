@@ -26,6 +26,7 @@ import {
   type PaymentHealth,
 } from '../services/householdMonths'
 import { portalLink } from '../lib/portalUrls'
+import { todayIn } from '../lib/timezone'
 
 export const tenantsRouter = Router()
 
@@ -316,7 +317,7 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       // the newest invite and left the other sitting there for ever, with the
       // tenant given no way to reach it. Every open invite is accepted and
       // drafted on the way in.
-      // S652 (Nic, Shannon Gregory): the invite is ACCEPTED the moment the person
+      // S652 (Nic, Yorick Drakeford): the invite is ACCEPTED the moment the person
       // sets their account up — whether or not the lease already issued on the
       // landlord's signature. Only the invites still waiting to draft were being
       // stamped, so a co-tenant whose lease had existed since the 16th accepted
@@ -864,6 +865,28 @@ tenantsRouter.get('/me', async (req, res, next) => {
       ) nlw ON TRUE
       WHERE t.id = $1`, [req.user!.profileId!])
     if (!tenant) throw new AppError(404, 'Tenant not found')
+
+    // ── 10/29 (Nic): THE DEPOSIT OFFER TRAVELS WITH THE RESIDENT ───────────
+    //
+    //   "If they log in to go and pay their bill, that needs to ask if they
+    //    want to sign up for flex deposit at that point. It needs to be there
+    //    until the deposit is handled one way or another."
+    //
+    // One signal on the record every tenant screen already reads, so home and
+    // payments cannot disagree about it. Null whenever there is nothing to
+    // offer — deposit settled, plan running, product off, or not eligible —
+    // and the prompt goes quiet on the FACT, never on the click.
+    //
+    // Deliberately non-fatal: an offer that cannot be worked out must never be
+    // the reason a resident cannot open their own portal.
+    try {
+      const { flexDepositOffer } = await import('../services/flexDeposit')
+      tenant.flex_deposit_offer = await flexDepositOffer({ tenantId: tenant.id })
+    } catch (err) {
+      logger.warn({ err, ctx: tenant.id }, '[flexdeposit] offer could not be read')
+      tenant.flex_deposit_offer = null
+    }
+
     res.json({ success: true, data: tenant })
   } catch (e) { next(e) }
 })
@@ -1094,6 +1117,45 @@ tenantsRouter.get('/me/laws', async (req, res, next) => {
             AND (unit_types IS NULL OR $2 = ANY(unit_types))
           ORDER BY (disclosure_type = 'landlord_tenant_act') DESC, lower(name)`,
         [h.state, h.unit_type])
+      // 10/30 (Nic): THE LIBRARY ABOVE IS PDFs, AND WE ONLY HAVE TWO STATES OF
+      // THEM. A resident in any other state was told their state's act "isn't
+      // in the library yet" — which was never true. GAM holds the statute TEXT
+      // for ALL FIFTY STATES in state_law_section_texts; the page simply read
+      // the wrong shelf.
+      //
+      // Which act applies is already decided elsewhere and must not be guessed
+      // again here: state_deposit_interest_rates maps state + unit type -> act
+      // (mobile_home -> the mobile-home park act, rv_spot -> the RV act,
+      // apartment/single_family -> residential). Reusing that mapping keeps one
+      // answer to "which law governs this home" instead of two that can drift.
+      // Act names differ by state — residential vs general_landlord_tenant,
+      // mobile_home_park vs manufactured_home_park — so a fallback list covers
+      // the states that file their law under a different name.
+      const mapped = await query<{ act_key: string }>(
+        `SELECT act_key FROM state_deposit_interest_rates
+          WHERE state_code = $1 AND $2 = ANY(unit_types)
+          ORDER BY effective_year DESC`,
+        [h.state, h.unit_type])
+      const actKeys = [
+        ...mapped.map(m => m.act_key),
+        'residential', 'general_landlord_tenant',
+        'mobile_home_park', 'manufactured_home_park',
+      ]
+      const act = await queryOne<{ act_key: string; sections: string; effective_year: number }>(
+        `SELECT act_key, count(*)::text AS sections, max(effective_year) AS effective_year
+           FROM state_law_section_texts
+          WHERE state_code = $1 AND act_key = ANY($2::text[])
+          GROUP BY act_key
+          ORDER BY array_position($2::text[], act_key)
+          LIMIT 1`,
+        [h.state, actKeys])
+      const sections = act ? await query<{ section_number: string; section_title: string | null }>(
+        `SELECT section_number, section_title
+           FROM state_law_section_texts
+          WHERE state_code = $1 AND act_key = $2
+          ORDER BY effective_year DESC, section_number`,
+        [h.state, act.act_key]) : []
+
       out.push({
         leaseId: h.lease_id, state: h.state, propertyName: h.property_name, unitNumber: h.unit_number,
         documents: docs.map(d => ({
@@ -1102,9 +1164,40 @@ tenantsRouter.get('/me/laws', async (req, res, next) => {
           publishedBy: d.source_name, edition: d.publication_ref, effectiveFrom: d.effective_from,
           pdfUrl: d.base_pdf_url, pageCount: d.page_count,
         })),
+        act: act ? {
+          actKey: act.act_key,
+          sectionCount: Number(act.sections),
+          effectiveYear: act.effective_year,
+          sections: sections.map(x => ({ number: x.section_number, title: x.section_title })),
+        } : null,
       })
     }
     res.json({ success: true, data: out })
+  } catch (e) { next(e) }
+})
+
+// One section of the resident's own landlord-tenant act. Scoped to a state
+// their own lease is in, so this is not a general statute-browsing API.
+tenantsRouter.get('/me/laws/:state/:actKey/section', async (req, res, next) => {
+  try {
+    const tenantId = req.user!.profileId!
+    const mine = await queryOne<{ ok: boolean }>(
+      `SELECT TRUE AS ok FROM lease_tenants lt
+         JOIN leases l ON l.id = lt.lease_id
+         JOIN units u ON u.id = l.unit_id
+         JOIN properties p ON p.id = u.property_id
+        WHERE lt.tenant_id = $1 AND l.status IN ('active','pending') AND p.state = $2
+        LIMIT 1`,
+      [tenantId, req.params.state])
+    if (!mine) throw new AppError(404, 'Not found')
+    const row = await queryOne<{ section_title: string | null; full_text: string; source_url: string | null }>(
+      `SELECT section_title, full_text, source_url
+         FROM state_law_section_texts
+        WHERE state_code = $1 AND act_key = $2 AND section_number = $3
+        ORDER BY effective_year DESC LIMIT 1`,
+      [req.params.state, req.params.actKey, String(req.query.number ?? '')])
+    if (!row) throw new AppError(404, 'Not found')
+    res.json({ success: true, data: row })
   } catch (e) { next(e) }
 })
 
@@ -1159,11 +1252,10 @@ tenantsRouter.get('/me/deposit-interest', async (req, res, next) => {
     // resolver now; the tenant is quoted the same rule that accrues.
     const currentYear = new Date().getUTCFullYear()
     let rate: {
-      source:           'statutory' | 'landlord_override'
+      source:           'landlord_override'
       state_code:       string
       effective_year:   number
       annual_rate_pct:  string
-      statute_citation: string | null
       notes:            string | null
     } | null = null
 
@@ -1177,13 +1269,26 @@ tenantsRouter.get('/me/deposit-interest', async (req, res, next) => {
         const resolved = await resolveRateForLandlord(
           landlordRow.landlord_id, deposit.state, currentYear, deposit.unit_type,
         )
-        if (resolved) {
+        // 10/30 (Nic): NOTHING ABOUT STATE LAW REACHES A RESIDENT. A statutory
+        // rate is the STATE telling the LANDLORD what they owe; putting it on
+        // the resident's screen hands them an argument with their landlord that
+        // is built out of our data — and if our rate or our citation is ever
+        // wrong, our mistake becomes their dispute. His rule: "we can track it
+        // and provide that data to the landlord, but we're not going to start a
+        // confrontation by telling the tenant that the landlord owes them
+        // money." The accrual still runs and the landlord still sees every
+        // cent; the resident simply is not told the state requires it.
+        //
+        // A rate the LANDLORD set is a different thing — their own lease term,
+        // chosen by them — so that one still shows. The statute citation goes
+        // out on neither path, which is the S18/S177 rule (rates are the
+        // carve-out; citations never were).
+        if (resolved && resolved.source === 'landlord_override') {
           rate = {
-            source:           resolved.source,
+            source:           'landlord_override',
             state_code:       resolved.state_code,
             effective_year:   resolved.effective_year,
             annual_rate_pct:  resolved.annual_rate_pct.toFixed(4),
-            statute_citation: resolved.statute_citation ?? null,
             notes:            resolved.notes ?? null,
           }
         }
@@ -1471,6 +1576,46 @@ tenantsRouter.post('/me/fixed-income', async (req: any, res, next) => {
   } catch (e) { next(e) }
 })
 
+// ── FLEXPAY "LEARN MORE": PROBE, THEN REVEAL (10/26, Nic) ────
+//
+// The screen a resident reaches from the fixed-income banner's "Yes". It asks
+// ONE thing — when their money arrives — and then shows them their own
+// history: what being late could have cost them against what FlexPay would
+// have cost them.
+//
+// It never shows the price grid ("We don't want to show tenants the table")
+// and never shows anybody else's late fee ("that's just going to create them
+// haggling with the landlord"). Their own lease, their own property, their own
+// price. The loss case is shown just as plainly and the enrol path stays open.
+//
+// Both routes sit ABOVE /:id — a literal path below it is read as an id and
+// comes back 403, which looks exactly like a permission bug and is not one.
+
+// GET /api/tenants/me/flexpay-learn-more
+tenantsRouter.get('/me/flexpay-learn-more', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const { flexPayLearnMore } = await import('../services/flexpaySavings')
+    res.json({ success: true, data: await flexPayLearnMore(req.user!.profileId!) })
+  } catch (e) { next(e) }
+})
+
+// POST /api/tenants/me/flexpay-money-arrives { day }
+tenantsRouter.post('/me/flexpay-money-arrives', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const parsed = z.object({ day: z.number().int().min(1).max(28) }).safeParse(req.body ?? {})
+    if (!parsed.success) {
+      throw new AppError(400, 'Pick the day of the month your money arrives, from the 1st to the 28th.')
+    }
+    const { recordMoneyArrivesDay, flexPayLearnMore } = await import('../services/flexpaySavings')
+    await recordMoneyArrivesDay(req.user!.profileId!, parsed.data.day)
+    // The answer and what it reveals come back together: the screen has
+    // everything it needs without a second round trip.
+    res.json({ success: true, data: await flexPayLearnMore(req.user!.profileId!) })
+  } catch (e) { next(e) }
+})
+
 // GET /api/tenants/flex-visibility — S541: which Flex products the
 // tenant portal may surface. Per-product rollout flags drive the UI
 // (the old client-side LAUNCH_HIDDEN gate showed all-or-nothing);
@@ -1492,7 +1637,7 @@ tenantsRouter.get('/flex-visibility', async (req, res, next) => {
 tenantsRouter.get('/flexpay', async (req, res, next) => {
   try {
     const { isFlexPayVisible, isFlexPayEnrollmentOpen, getFlexPayEligibility,
-            quoteFlexPayCycleFee, flexPayAmountToFront } = await import('../services/flexpay')
+            flexPayCycleFeeForTenant, flexPayAmountToFront } = await import('../services/flexpay')
     const visible = await isFlexPayVisible()
     if (!visible) return res.json({ success: true, data: { visible: false } })
     // S544: survey mode — visible but not launched. Drives the
@@ -1550,10 +1695,15 @@ tenantsRouter.get('/flexpay', async (req, res, next) => {
         // and their benefit Wednesday — never a flat figure, and null rather
         // than a number when there is no bracket (a bill of $3,000 or more) or
         // no open bill to price against.
+        // 10/27: THIS resident's price, so a returning one sees the re-entry
+        // surcharge here and not for the first time on the pull.
         previewFee: row?.flexpay_pull_day
-          ? await quoteFlexPayCycleFee(
-              await flexPayAmountToFront(req.user!.profileId!), row.flexpay_pull_day,
-              new Date().toISOString().slice(0, 10))
+          ? (await flexPayCycleFeeForTenant({
+              tenantId:      req.user!.profileId!,
+              amountFronted: await flexPayAmountToFront(req.user!.profileId!),
+              pullDay:       row.flexpay_pull_day,
+              asOf:          todayIn(null),
+            }))?.fee ?? null
           : null,
       },
     })
@@ -1661,7 +1811,7 @@ tenantsRouter.patch('/flexpay/pull-day', async (req, res, next) => {
 // same render fn that runs at acceptance, returned for display.
 tenantsRouter.get('/flexpay/terms', async (req, res, next) => {
   try {
-    const { requireFlexPayCycleFee, flexPayAmountToFront } = await import('../services/flexpay')
+    const { flexPayCycleFeeForTenant, flexPayAmountToFront } = await import('../services/flexpay')
     const { renderFlexPayAcceptanceText, FLEXPAY_TEMPLATE_VERSION } =
       await import('../services/flexsuiteAcceptance')
     const pullDay = Number(req.query.pullDay)
@@ -1671,9 +1821,18 @@ tenantsRouter.get('/flexpay/terms', async (req, res, next) => {
     // 10/26: the terms state the price they will actually be charged, from the
     // table. A bill with no bracket refuses here rather than rendering terms
     // around a price that does not exist.
-    const fee = await requireFlexPayCycleFee(
-      await flexPayAmountToFront(req.user!.profileId!), pullDay,
-      new Date().toISOString().slice(0, 10))
+    // 10/27: the terms must state what they will actually be charged, which
+    // for a returning resident includes the re-entry surcharge.
+    const priced = await flexPayCycleFeeForTenant({
+      tenantId:      req.user!.profileId!,
+      amountFronted: await flexPayAmountToFront(req.user!.profileId!),
+      pullDay,
+      asOf:          todayIn(null),
+    })
+    if (priced === null) {
+      throw new AppError(409, 'FlexPay is not offered on a bill of $3,000 or more.')
+    }
+    const fee = priced.fee
     const { renderedText } = await renderFlexPayAcceptanceText({
       tenantId:  req.user!.profileId!,
       userId:    req.user!.userId,
@@ -1815,11 +1974,21 @@ tenantsRouter.get('/flexdeposit', async (req, res, next) => {
       `SELECT sd.id, sd.flex_deposit_plan_status,
               sd.total_amount::text     AS total_amount,
               sd.collected_amount::text AS collected_amount,
+              -- 11/1: an installment already asked for is not unfunded. It
+              -- stays 'pending' until its pull settles, so without this the
+              -- banner counted an installment billed on the move-in invoice
+              -- and still clearing, and offered to debit it again (MH 28).
+              -- Same predicate as services/flexDeposit payAheadFlexDeposit —
+              -- the figure shown and the figure pulled must be one number.
               COALESCE((
-                SELECT SUM(amount)
-                  FROM flex_deposit_installments
-                 WHERE security_deposit_id = sd.id
-                   AND status IN ('pending', 'missed')
+                SELECT SUM(i.amount)
+                  FROM flex_deposit_installments i
+                 WHERE i.security_deposit_id = sd.id
+                   AND i.status IN ('pending', 'missed')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM payments p
+                      WHERE p.id = i.payment_id
+                        AND p.status IN ('pending', 'processing', 'settled'))
               ), 0)::text               AS unfunded_amount
          FROM security_deposits sd
         WHERE sd.tenant_id = $1
@@ -1830,7 +1999,13 @@ tenantsRouter.get('/flexdeposit', async (req, res, next) => {
       [req.user!.profileId!],
     )
 
-    res.json({ success: true, data: { visible: true, eligibility, plan, deposit } })
+    // 10/29 (Nic): the enrollment screen must show what is DUE AT MOVE-IN, not
+    // the deposit arithmetic on its own — "it needs to generate whatever their
+    // first month is". Their other unpaid move-in charges ride along so the
+    // screen can add them to the first pull.
+    const otherDueNow = await (await import('../services/flexDeposit'))
+      .depositSiblingChargesDue(req.user!.profileId!).catch(() => 0)
+    res.json({ success: true, data: { visible: true, eligibility: { ...eligibility, otherDueNow }, plan, deposit } })
   } catch (e) { next(e) }
 })
 
@@ -2307,6 +2482,11 @@ tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, ne
         // Tenant Onboarding page.
         existingResident: req.body.existingResident === true,
         returningResident,
+        // 10/28: the modal's "Taking over an occupied spot" group. The server
+        // resolves WHICH tenancy is replaced from the space and the start date
+        // — the browser never names a lease id, so it cannot point a takeover
+        // at somebody else's.
+        takeover: req.body.takeover === true,
         homeSale: req.body.homeSale ? (typeof req.body.homeSale === 'object' ? req.body.homeSale : { selling: true }) : null,
         packageTemplateIds: packetIds(req.body.packageTemplateIds),
         source: 'invite',
@@ -2935,7 +3115,7 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
     // since its first bill on GAM; services/householdMonths), with this
     // company's (and property's) scope —
     // never paid rows ÷ rows, which read each $5 daily late fee as another
-    // unpaid bill (Gerald Logue: 6%, one month of two on time).
+    // unpaid bill (Arlo Braddock: 6%, one month of two on time).
     //
     // Over the same companies every other screen judges this viewer's
     // households on — the Tenants list and the Rent Roll read the viewer's
@@ -2965,7 +3145,7 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
       // Rent Roll row shows; a person on two leases reads each lease's. The
       // current leases first, then the newest. `status` is the lease's own
       // (shared LEASE_STATUSES): one not signed yet is 'pending' — never
-      // "ended" (10/13 review: Arturo Melendez's new MH 15 lease read "Ended"
+      // "ended" (10/13 review: Elan Everly's new MH 15 lease read "Ended"
       // beside his MH 23 while it waited for signatures).
       const leases = await query<{
         lease_id: string; unit_number: string | null; property_name: string | null; status: string

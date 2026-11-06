@@ -89,6 +89,7 @@ import {
 } from './lateFeeCredit'
 import type { ManualPaymentMethod } from '@gam/shared'
 import { activateBillingForMoneyMoved } from './billingActivation'
+import { todayIn } from '../lib/timezone'
 
 export interface ConfirmDepositInput {
   bankTransactionId: string
@@ -782,6 +783,13 @@ export async function confirmDepositMatch(
               to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
               p.stripe_payment_intent_id, p.work_trade_suspended_at, p.entry_description,
               p.revenue_owner, p.lease_fee_id, p.reversal_id,
+              -- 11/4: isBankPayableRow below reads this. Without it in the
+              -- SELECT the rule saw undefined (which is not null) and a charge held
+              -- for the next bill passed the guard, so a bank deposit could
+              -- collect the $4 a bounced pull costs before anybody had been
+              -- asked for it. moneyPredicates requires the column now, so
+              -- leaving it out throws by name rather than answering wrongly.
+              p.held_for_next_bill_at,
               p.next_retry_at::text AS next_retry_at,
               vm.money_part::text AS money_part,
               COALESCE(u.payment_block, FALSE) AS payment_block
@@ -1653,7 +1661,7 @@ export async function undoDepositMatch(input: {
     }
 
     // ── Put everything back ──────────────────────────────────────────────────
-    const day = new Date().toISOString().slice(0, 10)
+    const day = todayIn(null)
     const reopenedIds: string[] = []
     for (const r of snap.rows) {
       // Owed again as it was: pending, or failed (payable). A bank retry this

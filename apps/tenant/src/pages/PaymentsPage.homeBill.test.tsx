@@ -51,7 +51,7 @@ import { PaymentsPage } from './PaymentsPage'
 
 const LEASE = 'lease-mh01'
 const CONTRACT = 'contract-mh01'
-/** Lisa Scheeler's shape: work trade, so no rent bill — and a $333.33 trailer bill. */
+/** Calla Fitzhugh's shape: work trade, so no rent bill — and a $333.33 trailer bill. */
 const trailerOnly = {
   totalOutstanding: 333.33,
   paymentBlocked: false,
@@ -154,7 +154,7 @@ describe('the trailer payment on the tenant\'s payments page', () => {
 
 describe('the trailer bill\'s own payment rules', () => {
   it('says so, and offers no card, when the contract bars cards', async () => {
-    // 10/25 (Nic): Dominic Gonzalez's installment is the trust's money, so a
+    // 10/25 (Nic): Vesper Vanterpool's installment is the trust's money, so a
     // chargeback would have to be unwound across two sets of books.
     await render({
       ...trailerOnly,

@@ -78,6 +78,7 @@ import * as stripeConnect from './stripeConnect'
 import { heldOwnerShareForUser } from './landlordPassthrough'
 import { incomeTotals, paidAheadUnusedAt } from './incomeBasis'
 import { checkMoneyInvariants } from '../scripts/oct3_money_invariants_check'
+import { todayIn } from '../lib/timezone'
 
 // ─── harness ────────────────────────────────────────────────────────────────
 
@@ -389,7 +390,7 @@ describe('MH 25 replay: the $10 goes on the next bill by itself, the landlord is
     expect(augB.parts.paid).toBe(460 + LATE_FEE)
     expect(augB.parts.coveredByPaidAhead).toBe(0)
     expect(augB.parts.stillOwed).toBe(0)
-    const today = new Date().toISOString().slice(0, 10)
+    const today = todayIn(null)
     expect(await paidAheadUnusedAt({ landlordIds: [p.landlordId], end: today })).toBe(0)
     // Before any of it was spent, the $10 was on hand at the end of June.
     expect((await received(p, '2026-06-01', '2026-06-30')).paidAheadUnused).toBe(10)

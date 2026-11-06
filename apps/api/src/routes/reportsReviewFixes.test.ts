@@ -114,7 +114,10 @@ describe('Reports overview: each month row nets the way the P&L it opens nets', 
        VALUES ($1,$2,'insurance',50,$3::date,'Policy')`, [f.lid, f.propId, today])
     for (const basis of ['received', 'billed']) {
       const sum = (await get(f.owner, `/api/reports/summary?basis=${basis}`)).body.data
-      expect(sum.monthly.length).toBe(6)
+      // 11/3 (Nic): "12 rows on the table for rolling 12 at a glance" — this
+      // month and the eleven before it. Every one of them is checked against
+      // the P&L it opens below, empty months included.
+      expect(sum.monthly.length).toBe(12)
       for (const row of sum.monthly) {
         const [y, m] = row.month.split('-').map(Number)
         const pl = (await get(f.owner, `/api/reports/monthly-pl?year=${y}&month=${m}&basis=${basis}`)).body.data
@@ -165,8 +168,8 @@ describe('decisions #25: the grand total of what everyone owes', () => {
     expect(res.status).toBe(200)
     expect('outstanding' in res.body.data).toBe(false)
     expect(JSON.stringify(res.body)).not.toMatch(/"outstanding"/)
-    // The rest of the summary is still theirs.
-    expect(res.body.data.monthly.length).toBe(6)
+    // The rest of the summary is still theirs — the rolling twelve included.
+    expect(res.body.data.monthly.length).toBe(12)
   })
 })
 

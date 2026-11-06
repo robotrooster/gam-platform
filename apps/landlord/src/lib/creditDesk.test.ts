@@ -6,7 +6,7 @@
  * pays a bill by itself only when it covers the whole bill. Decisions #25,
  * #26, #29, #35.1, #36.A (10/3): Record payment on Outstanding Balances, the
  * Payments tab a ledger by month, no grand total for on-site staff.
- * Harland-credits (10/3): a typed round-up on a check or money order is asked
+ * Bexley-credits (10/3): a typed round-up on a check or money order is asked
  * about before it becomes a credit; cash over the bill is never defaulted.
  */
 import { describe, it, expect } from 'vitest'
@@ -78,16 +78,16 @@ describe('the credit beside a balance (Nic, 10/2: shown beside it, never taken o
     expect(creditBesideText(0, 0)).toBeNull()
   })
   it('the Front Desk sentence keeps the full balance and asks about the credit, never "already taken off"', () => {
-    const said = deskBalanceSentence({ first: 'Kim', owed: 935.45, credit: 450, when: 'Sep 1', overdue: true })
-    expect(said).toBe('Kim owes $935.45 — oldest bill was due Sep 1. They have $450.00 of credit that can go toward it — ask whether they want to use it or save it. Whatever is left is taken in full; rent cannot be part-paid.')
+    const said = deskBalanceSentence({ first: 'Yvette', owed: 935.45, credit: 450, when: 'Sep 1', overdue: true })
+    expect(said).toBe('Yvette owes $935.45 — oldest bill was due Sep 1. They have $450.00 of credit that can go toward it — ask whether they want to use it or save it. Whatever is left is taken in full; rent cannot be part-paid.')
     expect(said).not.toMatch(/taken off/)
-    expect(deskBalanceSentence({ first: 'Russ', owed: 460, credit: 0, when: null, overdue: false }))
-      .toBe('Russ owes $460.00. Take the full amount; rent cannot be part-paid.')
+    expect(deskBalanceSentence({ first: 'Tamsin', owed: 460, credit: 0, when: null, overdue: false }))
+      .toBe('Tamsin owes $460.00. Take the full amount; rent cannot be part-paid.')
   })
   it('10/5: where the property takes part payments, the Front Desk never says rent cannot be part-paid', () => {
-    expect(deskBalanceSentence({ first: 'Russ', owed: 460, credit: 0, when: null, overdue: false, partialOk: true }))
-      .toBe('Russ owes $460.00. They can pay part; what they do not pay stays owed, and late fees still apply.')
-    const withCredit = deskBalanceSentence({ first: 'Kim', owed: 935.45, credit: 450, when: 'Sep 1', overdue: true, partialOk: true })
+    expect(deskBalanceSentence({ first: 'Tamsin', owed: 460, credit: 0, when: null, overdue: false, partialOk: true }))
+      .toBe('Tamsin owes $460.00. They can pay part; what they do not pay stays owed, and late fees still apply.')
+    const withCredit = deskBalanceSentence({ first: 'Yvette', owed: 935.45, credit: 450, when: 'Sep 1', overdue: true, partialOk: true })
     expect(withCredit).toMatch(/ask whether they want to use it or save it\. They can pay part of what is left; what they do not pay stays owed, and late fees still apply\.$/)
     expect(withCredit).not.toMatch(/cannot be part-paid/)
   })
@@ -336,7 +336,7 @@ describe('the desk window: pay in full, and every dollar over accounted for', ()
     expect(p.body).toEqual({ method: 'cash', amountTendered: 460 })
   })
 
-  it('a money order typed over the bill asks "is it really $X?" before anything is recorded (Kim Harland, $486 vs $485.45)', () => {
+  it('a money order typed over the bill asks "is it really $X?" before anything is recorded (Yvette Bexley, $486 vs $485.45)', () => {
     const q = quote({ rows: [row({ amount: 485.45 })] })
     const p = planTender(q, tender({ method: 'money_order', tenderedCents: 48600 }))
     expect(p.stop).toBe('written_confirm')
@@ -462,10 +462,10 @@ describe('the desk window self-heals', () => {
     expect(serverStatus(new Error('offline'))).toBeNull()
   })
   it('after Record it says what happened, the change to hand back included', () => {
-    expect(recordedMessage('Kim Harland', { amountSettled: 485.45, creditUsed: 450 }))
-      .toBe('Recorded $485.45 from Kim Harland — $450.00 of their credit used.')
-    expect(recordedMessage('Russ Fuller', { amountSettled: 460, changeGiven: 40, surplus: 40 }))
-      .toBe('Recorded $460.00 from Russ Fuller — give $40.00 change.')
+    expect(recordedMessage('Yvette Bexley', { amountSettled: 485.45, creditUsed: 450 }))
+      .toBe('Recorded $485.45 from Yvette Bexley — $450.00 of their credit used.')
+    expect(recordedMessage('Tamsin Wrenfield', { amountSettled: 460, changeGiven: 40, surplus: 40 }))
+      .toBe('Recorded $460.00 from Tamsin Wrenfield — give $40.00 change.')
     expect(recordedMessage('Todd', { amountSettled: 460, surplus: 460, creditId: 'c' }))
       .toBe('Recorded $460.00 from Todd — $460.00 kept on their account as credit.')
     expect(recordedMessage('Todd', { amountSettled: 0, creditUsed: 460 })).toBe("Paid Todd's bill with their credit.")
@@ -546,21 +546,21 @@ describe('the card reader at the desk', () => {
       .toEqual([['L1', 'a'], ['L2', 'b']])
   })
   it('a household paid on the reader and at the desk in one visit hears both', () => {
-    expect(withReaderTaken('Recorded $460.00 from Kim Harland.', 476.65))
-      .toBe('Took $476.65 by card on the reader. Recorded $460.00 from Kim Harland.')
-    expect(withReaderTaken('Recorded $460.00 from Kim Harland.', 0)).toBe('Recorded $460.00 from Kim Harland.')
+    expect(withReaderTaken('Recorded $460.00 from Yvette Bexley.', 476.65))
+      .toBe('Took $476.65 by card on the reader. Recorded $460.00 from Yvette Bexley.')
+    expect(withReaderTaken('Recorded $460.00 from Yvette Bexley.', 0)).toBe('Recorded $460.00 from Yvette Bexley.')
   })
   it('every space taken on the reader: what was taken, and an old balance still open is said', () => {
     const paid = quote({ rows: [], oldBalance: [] })
-    expect(readerFinishedMessage('Kim', 476.65, paid)).toBe('Took $476.65 by card on the reader from Kim.')
+    expect(readerFinishedMessage('Yvette', 476.65, paid)).toBe('Took $476.65 by card on the reader from Yvette.')
     const oldLeft = quote({ rows: [], oldBalance: [row({ id: 'o', type: 'carried_balance', amount: 200 })] })
-    expect(readerFinishedMessage('Kim', 476.65, oldLeft))
-      .toBe('Took $476.65 by card on the reader from Kim. Their $200.00 old balance is still open (it is paid last) — use Record payment again to take it.')
+    expect(readerFinishedMessage('Yvette', 476.65, oldLeft))
+      .toBe('Took $476.65 by card on the reader from Yvette. Their $200.00 old balance is still open (it is paid last) — use Record payment again to take it.')
     const moreLeft = quote({ rows: [row({ id: 'w', type: 'utility', amount: 40 })], oldBalance: [row({ id: 'o', type: 'carried_balance', amount: 200 })] })
-    expect(readerFinishedMessage('Kim', 476.65, moreLeft))
-      .toBe('Took $476.65 by card on the reader from Kim. $240.00 is still open — use Record payment again to take it.')
+    expect(readerFinishedMessage('Yvette', 476.65, moreLeft))
+      .toBe('Took $476.65 by card on the reader from Yvette. $240.00 is still open — use Record payment again to take it.')
     // The read after the last card failed: nothing more is claimed.
-    expect(readerFinishedMessage('Kim', 476.65, null)).toBe('Took $476.65 by card on the reader from Kim.')
+    expect(readerFinishedMessage('Yvette', 476.65, null)).toBe('Took $476.65 by card on the reader from Yvette.')
   })
 })
 

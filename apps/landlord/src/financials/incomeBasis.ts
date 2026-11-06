@@ -33,8 +33,15 @@ export function moneyColumns(fromBooks = false): Array<{ key: MoneyColumn; label
   return MONEY_COLUMNS.map(k => ({ key: k, label: MONEY_COLUMN_LABEL[k], note: notes[k] }))
 }
 
-export interface MoneyViewLine extends MoneyThree { line: string; label: string }
-export interface MoneyViewCategory extends MoneyThree { category: string; label: string }
+/**
+ * 11/4 (Nic): of a row's Charged, what became of it — the four buckets add
+ * back to `charged` to the cent. Absent for a viewer who may not see Owed
+ * (routes/reports dropOwed), and absent on a row with nothing charged.
+ */
+export interface ChargedParts { collected: number; clearing: number; owed: number; other: number }
+
+export interface MoneyViewLine extends MoneyThree { line: string; label: string; parts?: ChargedParts }
+export interface MoneyViewCategory extends MoneyThree { category: string; label: string; parts?: ChargedParts }
 /** 10/14 (Nic I1): a Detailed-view line (services/incomeBasis MoneyViewDetail) with its subtypes. */
 export interface MoneyViewDetail extends MoneyThree { key: string; label: string; category: string | null; subtypes: Array<MoneyThree & { name: string }> }
 
@@ -58,6 +65,17 @@ export interface MoneyView extends MoneyThree {
   source?: 'ledger'
   /** 10/14 (Nic I1): the Detailed view's lines (income itemized by space, home sales), when the books itemized it. */
   details?: MoneyViewDetail[]
+  /**
+   * 10/12 (ledger P8): the strip that proves Owed — owed at the start, what
+   * was billed and what settled it, owed at the end, and `offBy` when the
+   * terms miss. The server has shipped this all along; `tieText` carries it
+   * as a sentence (ledgerProofText) and that is what the page prints.
+   */
+  proof?: {
+    startDay: string; endDay: string; owedAtStart: number; billed: number; received: number
+    creditsGiven: number; workTrade: number; paidAhead: number; deposits: number
+    corrections: number; owedAtEnd: number; offBy: number
+  }
 }
 
 /** Add rows of the three columns to the cent. */
@@ -73,6 +91,13 @@ export function sumThree(rows: ReadonlyArray<Partial<MoneyThree>>): MoneyThree {
 export function threeAddUp(rows: ReadonlyArray<Partial<MoneyThree>>, total: Partial<MoneyThree>): boolean {
   const s = sumThree(rows)
   return MONEY_COLUMNS.every(k => Math.abs(s[k] - round2(Number(total[k]) || 0)) < 0.005)
+}
+
+/** A row's four Charged buckets add back to its Charged, to the cent. */
+export function partsAddUp(r: Pick<MoneyThree, 'charged'> & { parts?: ChargedParts }): boolean {
+  if (!r.parts) return true
+  const p = r.parts
+  return Math.abs(round2(p.collected + p.clearing + p.owed + p.other) - round2(r.charged)) < 0.005
 }
 
 /** Every split in the tie adds back to its column (the line under the table can be trusted). */
@@ -259,7 +284,7 @@ export const HEALTH_STATUS_LABEL: Record<HealthStatus, string> = {
 export const RENT_HEALTH_FIGURE_LABEL = {
   invoiced: 'Rent invoiced this month',
   paid: 'Rent paid',
-  owed: 'Still owed',
+  owed: 'Rent still owed',
 } as const
 
 export type RentHealthFigureKey = keyof typeof RENT_HEALTH_FIGURE_LABEL
@@ -287,7 +312,7 @@ export interface RentHealthFigures {
  * screen that must not read as one claim, so each says what it counts.
  */
 export const RENT_HEALTH_SCOPE_NOTE =
-  "This counts this month's rent bills only. The Outstanding card above counts every open charge of every month, so the two are different numbers."
+  "This counts this month's rent bills only. The Outstanding card above counts every unpaid charge of every month, so the two are different numbers."
 
 /**
  * Invoiced less paid is still owed, to the cent. An assertion helper, like
@@ -326,7 +351,10 @@ export function rentHealthFigures(
       { key: 'paid', label: RENT_HEALTH_FIGURE_LABEL.paid, amount: paid },
       { key: 'owed', label: RENT_HEALTH_FIGURE_LABEL.owed, amount: owed },
     ],
-    tieText: `${fmt(invoiced)} invoiced − ${fmt(paid)} paid = ${fmt(owed)} still owed`,
+    // 11/3 (Nic): the word "owed" carries what it is owed ON, every time it
+    // appears on this screen — the money card's Owed is every kind of money,
+    // this is rent, and the two sat ten lines apart saying just "owed".
+    tieText: `${fmt(invoiced)} invoiced − ${fmt(paid)} paid = ${fmt(owed)} of this month's rent still owed`,
     rateText: `${pct}% of this month's rent bills paid`,
     pct,
     workTradeNote: Number(health.workTradeHeld)

@@ -27,7 +27,7 @@
  * that company.
  */
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import { autopayLateness } from '@gam/shared'
 import { apiGet, apiPut } from '../lib/api'
@@ -49,6 +49,7 @@ interface AutopayRow {
   useCredit?:      boolean | null
   lastSuccessCycle: string | null
   disarmedAt:      string | null
+  everSet?:        boolean
   disarmedReason:  string | null
 }
 
@@ -58,8 +59,45 @@ const ordinal = (n: number): string => {
   return `${n}${s[(v - 20) % 10] ?? s[v] ?? s[0]}`
 }
 
+/**
+ * 10/30 (Nic): autopay comes ON with the first payment method.
+ *
+ * "it goes in line with our save and pay button... I want it to default on and
+ * not be so obnoxiously loud that they all turn it off... It'll be a slider
+ * bar. It'll be visible. It's not going to be hidden."
+ *
+ * So the moment a resident has something chargeable and has never made a choice
+ * about autopay, it is switched on and the card above says so with a working
+ * toggle a tap away. Not silent — the card is right there, on, and reversible.
+ *
+ * Only ever fires when the resident has made NO choice yet (never enabled, never
+ * disarmed by us, no failures on file). Somebody who deliberately turned autopay
+ * off is left alone; turning their own setting back on behind their back would
+ * be the obnoxious version.
+ */
+function useAutopayOnByDefault(rows: AutopayRow[], hasChargeableMethod: boolean) {
+  const qc = useQueryClient()
+  const tried = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    if (!hasChargeableMethod) return
+    for (const r of rows) {
+      // everSet is false ONLY when no tenant_autopay row exists — i.e. this
+      // resident has never decided either way. Someone who turned it off has a
+      // row, so they are left alone.
+      const untouched = r.everSet === false
+      if (!untouched || tried.current.has(r.leaseId)) continue
+      tried.current.add(r.leaseId)
+      apiPut('/autopay', { leaseId: r.leaseId, enabled: true })
+        .then(() => qc.invalidateQueries('autopay'))
+        .catch(() => { /* nothing chargeable yet, or the server said no — leave it off */ })
+    }
+  }, [rows, hasChargeableMethod])
+}
+
 export function AutopaySection() {
   const { data: rows = [] } = useQuery<AutopayRow[]>('autopay', () => apiGet('/autopay'))
+  const { data: methods = [] } = useTenantPaymentMethods()
+  useAutopayOnByDefault(rows, methods.some((m: SavedPaymentMethod) => isChargeable(m)))
   if (rows.length === 0) return null
   return (
     <>
@@ -124,6 +162,18 @@ function AutopayCard({ row, multi }: { row: AutopayRow; multi: boolean }) {
   // A bank still verifying — or with bank payments paused — cannot be charged,
   // so it must not be offered as the method a monthly schedule depends on.
   const usable = methods.filter((m: SavedPaymentMethod) => isChargeable(m))
+
+  // 10/30 (Nic): "auto pay disappears. It doesn't even show up when no payment
+  // method is there." A resident could switch autopay ON with nothing linked,
+  // because the method check only ran when they pinned ONE specific card — the
+  // default choice ("whichever method is my default") sent no method and
+  // skipped every check. Nothing was ever debited, which is the quiet part:
+  // the resident believed rent was handled, the runner found no method and gave
+  // up, and they were late with no warning. An autopay schedule with nothing
+  // behind it is not a setting, it is a false promise, so it is not offered.
+  // Already-on schedules still render, so somebody whose last method was
+  // removed can still see and turn off what is set.
+  if (!on && usable.length === 0) return null
 
   return (
     <div className="card" style={{ padding: 16, marginTop: 16 }}>

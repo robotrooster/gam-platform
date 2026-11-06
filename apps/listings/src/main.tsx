@@ -9,6 +9,7 @@ import '@fontsource/dm-sans/600.css'
 import '@fontsource/dm-mono/400.css'
 import '@fontsource/dm-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
+import { PasskeySignIn } from '../../../packages/shared-ui/Passkeys'
 import React, { useState, useEffect, useCallback } from 'react'
 import ReactDOM from 'react-dom/client'
 import axios from 'axios'
@@ -31,6 +32,16 @@ const setTok = (t: string) => { try { localStorage.setItem(TOK_KEY, t) } catch {
 const clearTok = () => { try { localStorage.removeItem(TOK_KEY) } catch { /* ignore */ } }
 const authCfg = () => { const t = getTok(); return t ? { headers: { Authorization: `Bearer ${t}` } } : {} }
 
+// 10/30 (Nic): "a passkey replaces the emailed code." The shared component
+// speaks this site's own client: the bare axios every other call here uses,
+// which carries the camelize interceptor installed above and the renter's pass
+// when there is one.
+const passkeyApi = {
+  get:  (url: string) => axios.get(`${API}/api${url}`, authCfg()).then(r => r.data?.data ?? r.data),
+  post: (url: string, body?: any) => axios.post(`${API}/api${url}`, body ?? {}, authCfg()).then(r => r.data?.data ?? r.data),
+  del:  (url: string) => axios.delete(`${API}/api${url}`, authCfg()).then(r => r.data),
+}
+
 // Only a completed background check counts here. A landlord's grandfather
 // waiver is that company's own decision and never opens other listings; the
 // server's apply gate enforces the same rule.
@@ -50,7 +61,18 @@ const css = `
   --b0:#e0ddd6;--b1:#d4d0c8;
   --t0:#1a1814;--t1:#3d3a32;--t2:#6b6760;--t3:#9c9890;
   --gold:#b8860b;--green:#2d6a4f;--red:#c1121f;--blue:#1d4e89;
-  --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace
+  --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace;
+  /* 10/31 — the long names every other portal uses, aliased onto these. Same
+     drift the support console had: a shared component asks for --text-3 and
+     --border-0, nothing here defined them, and an undefined variable is not a
+     fallback — the declaration is simply invalid and paints nothing. */
+  --bg-0:var(--bg0);--bg-1:var(--bg1);--bg-2:var(--bg2);--bg-3:var(--bg3);
+  --border-0:var(--b0);--border-1:var(--b1);
+  /* The alert tints too, in THIS site's light palette — the same values
+     .alert-error and .alert-success below use. A shared component built for a
+     dark portal would otherwise fall back to a dark border on white. */
+  --red-bg:#ffe0e0;--red-dim:#ffb3b3;--green-bg:#d8f3dc;--green-dim:#b7e4c7;
+  --text-0:var(--t0);--text-1:var(--t1);--text-2:var(--t2);--text-3:var(--t3)
 }
 html{-webkit-font-smoothing:antialiased}
 body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;min-height:100vh}
@@ -234,13 +256,20 @@ function AuthFlow({ onClose, onAuthed }: { onClose: () => void; onAuthed: (token
                 : 'Log in to see full listing details and apply.'}
             </div>
             {err && <div className="alert alert-error">{err}</div>}
+            {/* 10/30 (Nic): Face ID alone signs you in. Renders nothing on a
+                device with no sensor, and nothing in signup mode either — a
+                passkey belongs to an account that already exists. The password
+                form below is untouched for everybody else. */}
+            {mode === 'login' && (
+              <PasskeySignIn api={passkeyApi} onSignedIn={s => finish(s.token)} />
+            )}
             {mode === 'signup' && (
               <div className="frow2">
                 <div><label className="fl">First name</label><input className="inp" value={f.firstName} onChange={e => set('firstName', e.target.value)} /></div>
                 <div><label className="fl">Last name</label><input className="inp" value={f.lastName} onChange={e => set('lastName', e.target.value)} /></div>
               </div>
             )}
-            <div className="frow"><label className="fl">Email</label><input className="inp" type="email" value={f.email} onChange={e => set('email', e.target.value)} /></div>
+            <div className="frow"><label className="fl">Email</label><input className="inp" type="email" name="email" autoComplete="username webauthn" value={f.email} onChange={e => set('email', e.target.value)} /></div>
             {mode === 'signup' && (
               <div className="frow"><label className="fl">Phone (optional)</label><input className="inp" value={f.phone} onChange={e => set('phone', e.target.value)} /></div>
             )}

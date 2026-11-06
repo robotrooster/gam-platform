@@ -111,9 +111,14 @@ describe('the resident page lists every notification GAM can send them', () => {
 describe('the ones GAM always sends a resident are shown as uncheckable', () => {
   const tenantCritical = CRITICAL_NOTIFICATION_TYPES.filter(t => TENANT.some(e => e.type === t))
 
-  it('all five reach a resident, and all five are on their page', async () => {
+  it('every one that reaches a resident is on their page', async () => {
     await open()
-    expect(tenantCritical).toHaveLength(5)
+    // 10/30: six, not five — autopay_disarmed joined on Nic's word ("If autopay
+    // turns off, it needs to inform them"). The count is asserted so that a
+    // type cannot quietly join or leave the always-send list, which is his
+    // call; the authoritative naming of the list lives in the API's
+    // notificationCatalog test.
+    expect(tenantCritical).toHaveLength(6)
     for (const t of tenantCritical) expect(rowFor(t)).toBeTruthy()
   })
 

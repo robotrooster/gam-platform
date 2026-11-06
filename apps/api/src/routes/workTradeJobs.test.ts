@@ -14,6 +14,7 @@ import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant, see
 import { workTradeRouter } from './workTrade'
 import { maintenanceRouter } from './maintenance'
 import { errorHandler } from '../middleware/errorHandler'
+import { expectNoFigures } from '../test/noLeaks'
 
 function app() {
   const a = express()
@@ -79,7 +80,10 @@ describe('what a work trader sees', () => {
     expect(d.available.map((j: any) => j.title)).toEqual(['Pull weeds by lot 4'])
     const body = JSON.stringify(d)
     expect(body).not.toContain('Neighbor')
-    expect(body).not.toContain('5551234567')
+    // A phone number is all digits and a uuid is hex, so a substring search
+    // here decided by luck (testsAreDeterministic). expectNoFigures asks the
+    // real question — did it come back as a value, or said out loud.
+    expectNoFigures(d, [5551234567])
 
     await db.query(`UPDATE work_trade_agreements SET skills='{plumbing}' WHERE tenant_id=$1`, [w.trader.tenant])
     d = await jobs(w.traderToken)

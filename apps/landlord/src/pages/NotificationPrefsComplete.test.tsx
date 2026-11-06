@@ -10,7 +10,7 @@
  * still getting these emails. Make it known that that's the ones that they're
  * still going to get on those rare instances where it happens."
  *
- * Blu Haws unchecked every box this page showed him on 10/19 and kept getting
+ * Hollis Harkness unchecked every box this page showed him on 10/19 and kept getting
  * email, because the page was sixteen hand-typed rows out of a hundred-odd
  * types. So the test that matters is not "a checkbox saves" — it is "every type
  * GAM can send has a row here", which is what the first case asserts.
@@ -196,7 +196,7 @@ describe('"turn off every optional email" records an answer for all of them', ()
     expect(sent.map((u: any) => u.type).sort()).toEqual([...optionalEmails].sort())
     // And nothing for a notice that has no email to begin with.
     expect(sent.filter((u: any) => LANDLORD.find(e => e.type === u.type)?.inAppOnly)).toEqual([])
-    // Email off, in-app left on — Nic, on Blu: he would rather log in and see
+    // Email off, in-app left on — Nic, on Hollis: he would rather log in and see
     // what needs attention.
     expect(sent.filter((u: any) => u.emailEnabled !== false)).toEqual([])
     expect(sent.filter((u: any) => u.inAppEnabled !== true)).toEqual([])
@@ -221,7 +221,7 @@ describe('"turn off every optional email" records an answer for all of them', ()
 
 describe('a double click cannot turn an email back on by accident', () => {
   /**
-   * 10/19, from the data: three of Blu's fifteen rows read email-ON with an
+   * 10/19, from the data: three of Hollis's fifteen rows read email-ON with an
    * updated_at a minute after they were created. The old page gave no sign a
    * save was in flight, so a second click on a box that still looked ticked
    * wrote TRUE back. The box is disabled while its own save is running.

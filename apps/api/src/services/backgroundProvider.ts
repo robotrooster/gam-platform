@@ -104,7 +104,7 @@ export interface BackgroundProvider {
    * S640: ask the provider where an order stands, without waiting to be told.
    *
    * A webhook is one HTTP request that either arrives or does not. Checkr
-   * finished Anastacio Erreguin's report at 15:19 Phoenix on Sep 9 and GAM
+   * finished Bryce Belmont's report at 15:19 Phoenix on Sep 9 and GAM
    * never heard — his screening sat at `processing` for twenty-two hours until
    * Nic went in and decided it by hand. A $44.99 report that gates somebody's
    * tenancy cannot depend on a single delivery.
@@ -305,7 +305,7 @@ class CheckrProvider implements BackgroundProvider {
     // this line kept demanding them. Three layers, and the middle one changed.
     //
     // The result was a screening product that failed 100% of the time AFTER
-    // taking the applicant's money: Anastacio Erreguin paid $44.99, the order
+    // taking the applicant's money: Bryce Belmont paid $44.99, the order
     // was rejected here before Checkr was ever called, and nothing told anyone.
     // He was the first person to use the link.
     //
@@ -697,13 +697,13 @@ class CheckrProvider implements BackgroundProvider {
     // the admins, so the add-on gets turned on.
     // ── 10/24: THE PRODUCT COMING BACK ON THE REPORT *IS* THE ANSWER.
     //
-    // Doubted for an afternoon and then settled. Heather Miller's receipt shows
+    // Doubted for an afternoon and then settled. Dove Ellsworth's receipt shows
     // one line — "Essential Tenant Screening package" — with no identity add-on
     // itemized, which read at first like the scan had not been bought even
     // though her report came back clear on it. It had been: the line is simply
     // not broken out. Her invoice is $2.95 above the five orders that carry no
     // identity product, and hers is the only report holding the selfie and the
-    // licence image, which is what the product produces. Nic: "on Heather, I
+    // licence image, which is what the product produces. Nic: "on Dove, I
     // can see a selfie and the actual picture of her driver's license. None of
     // the other people have selfies and driver's license info on there."
     //

@@ -174,20 +174,23 @@ describe('getFlexPayEligibility', () => {
     expect(r.eligible).toBe(false)
   })
 
-  it('NSF cooldown in future → tenant_suspended_nsf + suspended_until', async () => {
+  it('NSF cooldown unserved → tenant_suspended_nsf + suspended_until', async () => {
     const { tenantId } = await seedTenantWithLease()
+    // 10/27: the wait is a COUNT plus a start date, served in days the tenant
+    // is on GAM. A stored end date cannot express that and is no longer read.
     await db.query(
-      `UPDATE tenants SET flexpay_disqualified_until = NOW() + INTERVAL '30 days' WHERE id=$1`,
+      `UPDATE tenants SET flexpay_default_count = 1, flexpay_cooldown_from = NOW() WHERE id=$1`,
       [tenantId])
     const r = await getFlexPayEligibility(tenantId)
     expect(r.blockers).toContain('tenant_suspended_nsf')
     expect(r.suspended_until).not.toBeNull()
   })
 
-  it('NSF cooldown in past → not a blocker', async () => {
+  it('NSF cooldown served → not a blocker', async () => {
     const { tenantId } = await seedTenantWithLease()
     await db.query(
-      `UPDATE tenants SET flexpay_disqualified_until = NOW() - INTERVAL '30 days' WHERE id=$1`,
+      `UPDATE tenants SET flexpay_default_count = 1,
+                          flexpay_cooldown_from = NOW() - INTERVAL '200 days' WHERE id=$1`,
       [tenantId])
     const r = await getFlexPayEligibility(tenantId)
     expect(r.blockers).not.toContain('tenant_suspended_nsf')
@@ -375,6 +378,10 @@ describe('enrollFlexPay', () => {
 
   it('an ineligible tenant is told why in plain words, never an enum', async () => {
     const { tenantId, userId } = await seedReady()
+    // 10/27: the terminal ban is gone — a 2nd default now buys a six-month
+    // on-GAM cool-off rather than ending FlexPay for good — so the flag is set
+    // here only to prove it no longer says anything, and the bank reasons are
+    // what remain.
     await db.query(
       `UPDATE tenants SET ach_verified = FALSE, ach_suspended_at = NOW(),
                           flexpay_permanently_banned = TRUE WHERE id = $1`, [tenantId])
@@ -382,7 +389,6 @@ describe('enrollFlexPay', () => {
     expect(r.ok).toBe(false)
     if (r.ok) return
     expect(r.reason).toBe([
-      FLEXPAY_BLOCKER_LABEL.permanently_banned,
       FLEXPAY_BLOCKER_LABEL.ach_unverified,
       FLEXPAY_BLOCKER_LABEL.bank_payments_stopped,
     ].join(' '))
@@ -697,15 +703,17 @@ describe('S578 FlexPay returner rehab + permanent ban', () => {
     expect((await tenantState(ctx.tenantId)).flexpay_clean_streak).toBe(0)
   })
 
-  it('permanently banned → eligibility blocker + enroll refused', async () => {
+  it('the old permanent ban no longer blocks anybody (10/27 reverses S578)', async () => {
+    // Nic gave a 2nd and 3rd chance behind longer waits — "6 months the second
+    // time and a year the third time" — so a permanent ban cannot also be
+    // true. The flag is still written as a record that it happened.
     const ctx = await seed()
     await db.query(`UPDATE tenants SET flexpay_permanently_banned=TRUE WHERE id=$1`, [ctx.tenantId])
     const elig = await getFlexPayEligibility(ctx.tenantId)
-    expect(elig.eligible).toBe(false)
-    expect(elig.blockers).toContain('permanently_banned')
+    expect(JSON.stringify(elig.blockers)).not.toContain('banned')
   })
 
-  it('2nd lifetime default → permanent ban (1st is only a 90-day suspend)', async () => {
+  it('2nd lifetime default → the longer rung (1st is the 90-day wait)', async () => {
     const ctx = await seed()
     await seedDefaultedAdvance(ctx, '2026-01-01')  // the 1st default, already on record
     // 2nd cycle sitting in 'pulled' whose retry payment just failed.
@@ -720,8 +728,10 @@ describe('S578 FlexPay returner rehab + permanent ban', () => {
       [cycle, ctx.tenantId, ctx.landlordId, ctx.unitId, ctx.leaseId, pay.rows[0].id])
     await handleFlexPayPaymentNsf(pay.rows[0].id)
     const s = await tenantState(ctx.tenantId)
+    // Still recorded that it happened twice...
     expect(s.flexpay_permanently_banned).toBe(true)
-    expect(s.flexpay_disqualified_reason).toBe('permanent_second_default')
+    // ...but the consequence is a longer wait, not the end of FlexPay.
+    expect(s.flexpay_disqualified_reason).toBe('second_default_longer_cooloff')
   })
 })
 
@@ -748,7 +758,12 @@ describe('FlexPay ends for good the second time it ends, whatever the cause (ter
                         flexpay_enrolled_at = NOW() - make_interval(days => $2::int) WHERE id = $1`, [tenantId, sinceDays])
   /** The wait from an ending passed, and the tenant joined again (enrollFlexPay's own gates allow it then). */
   const waitPassesAndRejoins = async (tenantId: string) => {
-    await db.query(`UPDATE tenants SET flexpay_disqualified_until = NOW() - interval '2 days' WHERE id = $1`, [tenantId])
+    // 10/27: serving the wait means the on-GAM clock has run, so the start
+    // date is backdated well past the longest rung rather than a stored
+    // end date being pushed into the past.
+    await db.query(
+      `UPDATE tenants SET flexpay_cooldown_from = NOW() - interval '800 days',
+                          flexpay_disqualified_until = NULL WHERE id = $1`, [tenantId])
     await db.query(
       `UPDATE tenants SET flexpay_enrolled = TRUE, flexpay_pull_day = 10, flexpay_monthly_fee = 25,
                           flexpay_enrolled_at = NOW() - interval '1 day' WHERE id = $1`, [tenantId])
@@ -777,15 +792,15 @@ describe('FlexPay ends for good the second time it ends, whatever the cause (ter
     await waitPassesAndRejoins(ctx.tenantId)
     await autoDisenrollFlexPayOnAchUnverified(ctx.tenantId)
     s = await state(ctx.tenantId)
-    expect(s).toMatchObject({ flexpay_enrolled: false, flexpay_permanently_banned: true, flexpay_disqualified_reason: 'permanent_second_default' })
+    expect(s).toMatchObject({ flexpay_enrolled: false, flexpay_permanently_banned: true, flexpay_disqualified_reason: 'second_default_longer_cooloff' })
     expect(s.flexpay_disqualified_until).toBeNull()
     const elig = await getFlexPayEligibility(ctx.tenantId)
-    expect(elig.blockers).toContain('permanently_banned')
+    expect(elig.blockers).toContain('tenant_suspended_nsf')
     // The tenant is told it is for good.
     const { rows: [u] } = await db.query<any>(`SELECT user_id FROM tenants WHERE id = $1`, [ctx.tenantId])
     const notes = (await db.query<any>(`SELECT body FROM notifications WHERE user_id = $1 AND type = 'flexpay_ended' ORDER BY created_at`, [u.user_id])).rows
     expect(notes).toHaveLength(2)
-    expect(notes[1].body).toContain('This is the second time, so FlexPay is no longer available on your account.')
+    expect(notes[1].body).toContain('the wait before you can join again is longer')
   })
 
   it('bank payments stopped once, then a pull written off in a later enrollment, ends FlexPay for good', async () => {
@@ -795,7 +810,7 @@ describe('FlexPay ends for good the second time it ends, whatever the cause (ter
     await waitPassesAndRejoins(ctx.tenantId)
     const pay = await failedPull(ctx, '2026-11-01')
     await handleFlexPayPaymentNsf(pay)
-    expect(await state(ctx.tenantId)).toMatchObject({ flexpay_permanently_banned: true, flexpay_disqualified_reason: 'permanent_second_default' })
+    expect(await state(ctx.tenantId)).toMatchObject({ flexpay_permanently_banned: true, flexpay_disqualified_reason: 'second_default_longer_cooloff' })
   })
 
   it('a pull written off once, then bank payments stopped in a later enrollment, ends FlexPay for good', async () => {

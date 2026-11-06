@@ -301,6 +301,37 @@ describe('the migrations are expand-only and re-runnable', () => {
     // migration that states the grids absolutely, before any new environment is
     // built from this repo. Then delete this list. See the S658 handoff and
     // memory `gam-one-migration-per-agreed-state`.
+    //
+    // 10/31 — THE SAME MISTAKE WAS MADE AGAIN ON THE JOB-FINANCING PRICE CARD,
+    // AND THEN FIXED RATHER THAN NAMED HERE.
+    //
+    // Six migrations were written to job_financing_fee_schedule in one evening
+    // as the price was worked out live with Nic: seed the FlexDeposit curve,
+    // add six payments, re-price six on capital, replace every row with a flat
+    // per-month fee, then two rounding corrections. Three of them could not be
+    // re-run against the finished table — two narrowed the `payments` CHECK to
+    // values the final rows no longer satisfy, and one guarded its INSERT on a
+    // note string a later file replaced, so a second pass duplicated five
+    // brackets on ux_job_financing_fee_schedule_band. A guard keyed on free
+    // text is not a guard; the band itself is the identity.
+    //
+    // On Nic's go-ahead the six were squashed into ONE migration that states
+    // the agreed 34-bracket table absolutely — final CHECKs, final rows, and a
+    // DELETE scoped to effective_from = 2020-01-01 ahead of the INSERT so a
+    // replay lands on the same rows instead of beside them. The applied
+    // tracking rows were removed and the single file re-applied to `gam`. So
+    // 20261101004000 is covered by the loop below like any other file, and the
+    // only exclusions left are the two FlexPay drafts above.
+    //
+    // Still true, and still nothing to do with any of the above: a replay of
+    // the WHOLE chain into an empty database is not possible today. It stops at
+    // 20260822220000_str_fee_three_percent.sql, applied to `gam` back in
+    // August, which writes a platform_fee_config row whose effective window is
+    // computed from the date it runs and now trips
+    // platform_fee_config_effective_range. A new environment is therefore built
+    // from schema.sql and then caught up, which is what the FlexPay note above
+    // already assumes. That migration would have to be made date-independent
+    // before anyone plans a from-zero rebuild.
     const NOT_DOUBLE_APPLY_SAFE = new Set([
       '20261027010000_flexpay_up_one_more_and_capped.sql',
       '20261027020000_flex_price_cards_effective_from_the_start.sql',
@@ -371,7 +402,7 @@ describe('a delivered fill can name a stay or a serviced agreement, not only a l
          VALUES ($1,$2,'RV 27',589,'rv_spot',TRUE) RETURNING id`, [propertyId, landlordId])).rows[0].id
       const bookingId = (await client.query<{ id: string }>(
         `INSERT INTO unit_bookings (unit_id, landlord_id, guest_name, guest_email, check_in, check_out, lease_type)
-         VALUES ($1,$2,'Andres Razo','razo@test.dev','2026-08-01','2026-09-01','nightly') RETURNING id`,
+         VALUES ($1,$2,'Cora Castellan','castellan@test.dev','2026-08-01','2026-09-01','nightly') RETURNING id`,
         [unitId, landlordId])).rows[0].id
 
       const fill = await client.query<{ id: string; lease_id: string | null; tenant_id: string | null }>(
@@ -401,7 +432,7 @@ describe('a delivered fill can name a stay or a serviced agreement, not only a l
          VALUES ($1,$2,'RV 27',589,'rv_spot',TRUE) RETURNING id`, [propertyId, landlordId])).rows[0].id
       const bookingId = (await client.query<{ id: string }>(
         `INSERT INTO unit_bookings (unit_id, landlord_id, guest_name, check_in, check_out, lease_type)
-         VALUES ($1,$2,'Andres Razo','2026-08-01','2026-09-01','nightly') RETURNING id`,
+         VALUES ($1,$2,'Cora Castellan','2026-08-01','2026-09-01','nightly') RETURNING id`,
         [unitId, landlordId])).rows[0].id
       await client.query(
         `INSERT INTO propane_fills
@@ -424,7 +455,7 @@ describe('a delivered fill can name a stay or a serviced agreement, not only a l
       .set('Authorization', `Bearer ${auth}`)
     expect(res.status, JSON.stringify(res.body)).toBe(200)
     expect(res.body.data).toHaveLength(1)
-    expect(res.body.data[0].tenant_name).toBe('Andres Razo')
+    expect(res.body.data[0].tenant_name).toBe('Cora Castellan')
     expect(Number(res.body.data[0].balance_remaining)).toBe(0)
     expect(randomUUID()).toBeTruthy()
   })

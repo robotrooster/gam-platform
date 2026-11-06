@@ -156,7 +156,7 @@ describe('send() behavior (exercised via emailInvitation)', () => {
   // S641: a resent invitation must NOT look like the first one. Outlook and
   // Hotmail accept a duplicate at the boundary — so the provider reports it
   // delivered — and then drop it or bury it in the original conversation. That
-  // is exactly what happened to Lisa Scheeler's resent invitation: correct link,
+  // is exactly what happened to Calla Fitzhugh's resent invitation: correct link,
   // reported delivered, never visible in her mailbox, not even in spam. The
   // subject and the opening line have to differ for the message to survive.
   it('a resend does not reuse the first invitation\'s subject or body', async () => {
@@ -185,9 +185,9 @@ describe('send() behavior (exercised via emailInvitation)', () => {
 describe('background check emails', () => {
   it('emailNewBackgroundCheck: category=background_new; subject contains tenant name', async () => {
     await email.emailNewBackgroundCheck(
-      'l@mailer-test.co', 'Landlord', 'Tenant Jones', 'Sunset', 'A1', 'high')
+      'l@mailer-test.co', 'Landlord', 'Tenant Larkspur', 'Sunset', 'A1', 'high')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
-    expect(call.subject).toBe('New background check submitted — Tenant Jones')
+    expect(call.subject).toBe('New background check submitted — Tenant Larkspur')
     const log = await logRowFor('l@mailer-test.co')
     expect(log.category).toBe('background_new')
   })
@@ -429,7 +429,7 @@ describe('late payment sender', () => {
       landlordEmail: 'l@mailer-test.co', landlordName: 'L',
       items: [
         { tenantName: 'Billy Miranda', unitNumber: 'RV 34, RV 35', propertyName: 'Oak Park', daysLate: 30, amount: 902.29, tenantId: 't1' },
-        { tenantName: 'Jay Jones', unitNumber: 'RV 25', propertyName: 'Oak Park', daysLate: 30, amount: 484.33, tenantId: 't2' },
+        { tenantName: 'Kipp Larkspur', unitNumber: 'RV 25', propertyName: 'Oak Park', daysLate: 30, amount: 484.33, tenantId: 't2' },
         { tenantName: 'A B', unitNumber: 'RV 1', propertyName: 'Oak Park', daysLate: 6, amount: 0.1, tenantId: 't3' },
         { tenantName: 'C D', unitNumber: 'RV 2', propertyName: 'Oak Park', daysLate: 6, amount: 0.2, tenantId: 't4' },
       ],
@@ -521,7 +521,7 @@ describe('emailFlexsuiteEnrollment', () => {
   it('flexpay: attaches PDF with FlexPay filename; category prefix includes product', async () => {
     resendSendMock.mockResolvedValueOnce({ data: { id: 'msg_flex' }, error: null } as any)
     const id = await email.emailFlexsuiteEnrollment({
-      to: 'f@mailer-test.co', tenantName: 'Alice Jones',
+      to: 'f@mailer-test.co', tenantName: 'Alice Larkspur',
       product: 'flexpay',
       acceptedAt: new Date('2026-06-01T12:00:00Z'),
       templateVersion: '1.0.0',
@@ -860,7 +860,7 @@ describe('S655 bill, reminder and receipt emails: money and credit kept apart', 
 describe('S655 the FlexPay enrollment email carries the terms the code keeps', () => {
   it('every FLEXPAY_TERMS section is in the email, word for word', async () => {
     await email.emailFlexsuiteEnrollment({
-      to: 'fx@mailer-test.co', tenantName: 'Alice Jones', product: 'flexpay',
+      to: 'fx@mailer-test.co', tenantName: 'Alice Larkspur', product: 'flexpay',
       acceptedAt: new Date('2026-06-01T12:00:00Z'), templateVersion: '2.0.0',
       acceptanceId: '00000000-0000-0000-0000-000000000abd', pdfBuffer: Buffer.from('%PDF-1.4 fake'),
     })
@@ -899,7 +899,11 @@ describe('where replies go', () => {
       return { propertyId, landlordId }
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
   }
-  const replyOf = () => ((resendSendMock.mock.calls.at(-1) as any[])[0]).reply_to
+  // 11/1: the key the SDK ACTUALLY reads. This read `.reply_to` — GAM's own
+  // spelling — so it went green for two months against a payload the real
+  // library was throwing away. See the fetch-level guard at the end of this
+  // file, which checks the name against the library instead of against us.
+  const replyOf = () => ((resendSendMock.mock.calls.at(-1) as any[])[0]).replyTo
 
   it('mail about a property: its office email, and the log says who hears back', async () => {
     const p = await park()
@@ -925,7 +929,7 @@ describe('where replies go', () => {
 })
 
 /**
- * 10/15 (Nic): Scott Vigne asked for twelve sign-in codes over two days and
+ * 10/15 (Nic): Vance Ablewhite asked for twelve sign-in codes over two days and
  * never got in. All were delivered — and all had the same subject, so Gmail
  * collapsed them into one conversation and he kept typing a retired code. The
  * code rides in the subject now, so each email stands on its own; the

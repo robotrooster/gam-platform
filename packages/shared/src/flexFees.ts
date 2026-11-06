@@ -129,3 +129,82 @@ export function isAllowedFlexDepositPaymentCount(n: number): boolean {
   // Membership, not a range: 3 sits inside 2..4 and is not sold.
   return (FLEX_DEPOSIT_PAYMENT_CHOICES as readonly number[]).includes(n)
 }
+
+/**
+ * 10/27 (Nic) — HOW MANY SPLITS A LEASE CAN CARRY.
+ *
+ *   "I do like your idea about month to month possibly being gated to 2
+ *    payments only and fixed term being 2 or 4 payments. That, because we
+ *    can't control what lease types a landlord offers, and we don't want the
+ *    landlord to block people from using our product."
+ *
+ * WHY THE LEASE AND NOT THE PERSON. GAM covers the gap between what a resident
+ * funded and what their landlord is owed, and that bill arrives the day the
+ * tenancy ends. On a fixed term that day is on the calendar. On a month-to-
+ * month it is not: nothing enforces the notice the lease asks for
+ * (services/moveOutNotice.ts) and real notice at the counter runs three or
+ * four days, so the money can be needed with almost no warning.
+ *
+ * Four payments leaves 75% of the deposit unfunded at its worst moment and
+ * stays exposed twice as long; two leaves 50% for half the time — about a
+ * third of the exposure. So the lease with no visible end gets the shorter
+ * schedule. The published evidence points the same way: pay-in-4 style
+ * products lose under 1% of volume while longer monthly installment books
+ * charge off nearer 3.5% (CFPB 2025; Affirm FY2026).
+ *
+ * THIS IS NOT THE RISK TIERING THAT WAS REMOVED. The 10/26 rework deleted
+ * every mechanism that gave one APPLICANT fewer options than another, because
+ * under FCRA an adverse action need only rest "in part" on such information.
+ * This reads the lease, not the applicant: everyone signing a month-to-month
+ * is offered the same thing, everyone on a fixed term is offered the same
+ * thing, at the same price from the same table. Do not reintroduce a variant
+ * of this keyed to screening, history, income or risk level.
+ *
+ * `nnn_commercial` is treated as a fixed term — it is a dated commercial lease.
+ * An unknown or missing lease type gets the cautious answer, not the generous
+ * one.
+ */
+export function flexDepositPaymentChoicesForLeaseType(
+  leaseType: string | null | undefined,
+): readonly FlexDepositPaymentCount[] {
+  return leaseType === 'fixed_term' || leaseType === 'nnn_commercial'
+    ? FLEX_DEPOSIT_PAYMENT_CHOICES
+    : [FLEX_DEPOSIT_MIN_PAYMENTS as FlexDepositPaymentCount]
+}
+
+/**
+ * 10/27 — A SCHEDULE MAY NOT OUTLIVE THE TENANCY.
+ *
+ * Installment i falls on startDate + (i-1) months, so an N-payment plan
+ * finishes N-1 months after it starts. If the lease ends before that, the
+ * deposit is guaranteed to be short on the day the landlord is owed it — not
+ * a risk, an arithmetic certainty. Nothing in enrollment looked at the lease's
+ * end date before this.
+ *
+ * `leaseEnd` null means no known end (month-to-month), which cannot be
+ * violated and so is always allowed — that case is handled by the payment-count
+ * rule above instead.
+ *
+ * Dates are compared as plain YYYY-MM-DD strings in the property's own day;
+ * both sides are produced that way, and parsing them into Date objects here
+ * would reintroduce the UTC-rollover bug that makes an evening look like
+ * tomorrow.
+ */
+export function flexDepositScheduleFitsLease(
+  startDate: string,
+  payments: number,
+  leaseEnd: string | null | undefined,
+): boolean {
+  if (!leaseEnd) return true
+  const [y, m, d] = startDate.split('-').map(Number)
+  if (!y || !m || !d) return true   // unparseable start: not this rule's call
+  const months = (m - 1) + (payments - 1)
+  const lastY = y + Math.floor(months / 12)
+  const lastM = (months % 12) + 1
+  // Clamp the day to the last month's length the same way addMonths does, so
+  // a move-in on the 31st does not roll a February installment into March.
+  const dim = new Date(Date.UTC(lastY, lastM, 0)).getUTCDate()
+  const lastDay = Math.min(d, dim)
+  const last = `${lastY}-${String(lastM).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`
+  return last <= leaseEnd
+}

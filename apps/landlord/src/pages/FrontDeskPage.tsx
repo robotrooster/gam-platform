@@ -60,7 +60,7 @@ type Balance = {
   ticket?: { note: string | null; items: any[] } | null
   /**
    * 10/25 (Nic): a home/trailer payment on a contract GAM tracks but never
-   * bills — the money belongs to another account (Dominic Gonzalez's goes to
+   * bills — the money belongs to another account (Vesper Vanterpool's goes to
    * the trust). The desk COLLECTS it and marks it; it must never be rung up,
    * and there is no charge behind it for anything to ring up.
    */
@@ -556,7 +556,7 @@ export function FrontDeskPage() {
   //
   // "We wanna have a page that is accessible... somewhere near the front desk
   // type page or maybe a sub tab in the front desk page. That way my front desk
-  // help Lisa Scheeler can see that."
+  // help Calla Fitzhugh can see that."
   //
   // A sub-tab rather than its own nav entry, because it is the same job: things
   // to say to the person standing in front of you. It also means one permission
@@ -987,29 +987,68 @@ function MoveOutsPanel() {
     moveOutNoticeNote: r.moveOutNoticeNote, moveOutNoticePrevEndDate: r.moveOutNoticePrevEndDate, markedBy: r.markedBy,
   })
 
+  // 10/30 (Nic, reading this on his phone): "the text on the move-outs looks
+  // bad… It says lease runs to Saturday, October 31st, where each word's on its
+  // own line… Oh, and they're not even all uniform. Oh, it's because of the
+  // length of the email address."
+  //
+  // Both of those came from the same place. The row was four flex children
+  // carrying inline minWidths (170 for the person, 150 for the contact, plus a
+  // button that never shrinks), which on a 390px screen left the status column
+  // a few characters wide — hence one word per line — and let a long email
+  // decide how tall that row was, so no two rows matched.
+  //
+  // It is a grid now. The tracks are declared, so every row's columns line up
+  // whatever the email happens to say, and the person's column is wider than
+  // the 170 it had ("make the spots a little longer for the people"). On a
+  // phone it stacks the way he asked for: the person and the button on top,
+  // phone and email each on its own line, the leaving day on its own line, and
+  // the note underneath. The layout lives in globals.css because a media query
+  // cannot override an inline style.
   const Row = ({ r }: { r: any }) => (
-    <div style={{ display: 'flex', gap: 14, alignItems: 'center', padding: '10px 0', borderTop: '1px solid var(--border-0)' }}>
-      <div style={{ minWidth: 170 }}>
-        <div style={{ fontWeight: 600, color: 'var(--text-0)' }}>{r.names || r.email}</div>
-        <div style={{ fontSize: '.76rem', color: 'var(--text-3)' }}>{r.unitNumber} · {r.propertyName}</div>
+    <div className="desk-moveout">
+      <div className="desk-moveout-who">
+        {/* names, email and phone are all nullable here — an active lease with
+            no active lease_tenants row renders with nothing to go on, and a
+            blank line tells the desk neither who nor what is missing. */}
+        <div className="desk-moveout-name">{r.names || r.email || 'No resident on this lease'}</div>
+        <div className="desk-moveout-space">{r.unitNumber} · {r.propertyName}</div>
       </div>
-      <div style={{ minWidth: 150, fontSize: '.78rem' }}>
-        {r.phone && <div><a href={`tel:${r.phone}`} style={{ color: 'var(--text-1)', display: 'flex', alignItems: 'center', gap: 5 }}><Phone size={12} /> {r.phone}</a></div>}
-        {r.email && <div><a href={`mailto:${r.email}`} style={{ color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 5, wordBreak: 'break-all' }}><Mail size={12} /> {r.email}</a></div>}
-      </div>
-      <div style={{ flex: 1, fontSize: '.82rem', color: 'var(--text-1)' }}>
-        {r.moveOutNoticeAt ? (
-          <>
-            <span style={{ fontWeight: 800, color: 'var(--gold)' }}>Leaving {sayShort(r.endDate)}</span>
-            {r.moveOutNoticeNote && <span style={{ color: 'var(--text-3)' }}> · “{r.moveOutNoticeNote}”</span>}
-          </>
-        ) : r.endDate ? (
-          <span style={{ color: 'var(--text-3)' }}>Lease runs to {sayShort(r.endDate)}</span>
+      {/* Both lines are always present, so every card is the same shape and a
+          missing number reads as something to go and collect. */}
+      <div className="desk-moveout-contact">
+        {r.phone ? (
+          <a className="desk-moveout-reach" href={`tel:${r.phone}`}>
+            <Phone size={12} /> {r.phone}
+          </a>
         ) : (
-          <span style={{ color: 'var(--text-3)' }}>Month to month</span>
+          <span className="desk-moveout-reach desk-moveout-missing">
+            <Phone size={12} /> No phone on file
+          </span>
+        )}
+        {r.email ? (
+          <a className="desk-moveout-reach desk-moveout-mail" href={`mailto:${r.email}`}>
+            <Mail size={12} /> <span>{r.email}</span>
+          </a>
+        ) : (
+          <span className="desk-moveout-reach desk-moveout-missing">
+            <Mail size={12} /> No email on file
+          </span>
         )}
       </div>
-      <button type="button" className="btn btn-sm btn-primary" onClick={() => setPick(toLease(r))}>
+      <div className="desk-moveout-when">
+        {r.moveOutNoticeAt ? (
+          <div className="desk-moveout-day">Leaving {sayShort(r.endDate)}</div>
+        ) : r.endDate ? (
+          <div className="desk-moveout-term">Lease runs to {sayShort(r.endDate)}</div>
+        ) : (
+          <div className="desk-moveout-term">Month to month</div>
+        )}
+        {r.moveOutNoticeAt && r.moveOutNoticeNote && (
+          <div className="desk-moveout-note">“{r.moveOutNoticeNote}”</div>
+        )}
+      </div>
+      <button type="button" className="btn btn-sm btn-primary desk-moveout-act" onClick={() => setPick(toLease(r))}>
         {r.moveOutNoticeAt ? 'Change / call off' : 'Leaving on…'}
       </button>
     </div>

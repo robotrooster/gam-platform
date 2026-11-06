@@ -220,6 +220,51 @@ describe('A7 / A7b: home payments, by the owner\'s choice (Nic L11)', () => {
     expect(triples(lines)).toEqual([['suspense', 19333, 0], ['home_notes_receivable', 0, 14333], ['home_note_interest', 0, 5000]])
     expect(lines.filter(l => l.cash === 'in').map(l => l.category)).toEqual(['home_payments', 'home_payments'])
   })
+
+  // ── 11/4 (Nic): MONEY THAT WAS NEVER PAID IS NOT INCOME ───────────────────
+  //
+  //   "The money that was never paid needs to go on left still owing if the
+  //    people are gone, or still show as owing to people that are still there."
+  //
+  // settled_off_platform_at is stamped by DATE (services/homeSale: every
+  // installment before a park's first billing cycle), which is all a date can
+  // tell you — it cannot know whether the money arrived. At Country Acres three
+  // lots never paid September, their whole lot total came in as a carried
+  // balance that is STILL OWED, and GAM recognized $500 of trailer income
+  // against money nobody had handed over while the same dollars sat on the
+  // resident's balance.
+  it('an off-platform installment whose month came in as a pre-GAM balance is NOT income', async () => {
+    const co = await tenantCo({ homeSale: 'whole_sale_at_signing' })
+    const { i1 } = await contract(co)
+    await db.query(`UPDATE home_sale_installments SET settled_off_platform_at = now() WHERE id = $1`, [i1])
+    // September's whole lot total came in as a carried balance — the trailer
+    // payment is inside it, so it is pre-GAM balance money (A8), not income.
+    await bill(co, { type: 'carried_balance', amount: 566.50, due: '2026-09-01' })
+    await drain()
+    expect(await activeLines('home_installment', i1)).toEqual([])
+  })
+
+  it('and paying that balance does not turn it into income either — pre-GAM money never is', async () => {
+    const co = await tenantCo({ homeSale: 'whole_sale_at_signing' })
+    const { i1 } = await contract(co)
+    await db.query(`UPDATE home_sale_installments SET settled_off_platform_at = now() WHERE id = $1`, [i1])
+    const cb = await bill(co, { type: 'carried_balance', amount: 566.50, due: '2026-09-01' })
+    await drain()
+    await db.query(`UPDATE payments SET status = 'settled', settled_at = now() WHERE id = $1`, [cb])
+    await drain()
+    expect(await activeLines('home_installment', i1)).toEqual([])
+  })
+
+  it('a month that did NOT come in as a balance is income as before', async () => {
+    const co = await tenantCo({ homeSale: 'whole_sale_at_signing' })
+    const { i1 } = await contract(co)
+    await db.query(`UPDATE home_sale_installments SET settled_off_platform_at = now() WHERE id = $1`, [i1])
+    // The lot paid: its month is a settled rent row, not a carried balance.
+    await bill(co, { amount: 450, due: '2026-09-01', status: 'settled', settledAt: '2026-09-01T12:00:00Z', manualMethod: 'prior_arrangement' })
+    await drain()
+    expect(triples(await activeLines('home_installment', i1)))
+      .toEqual([['suspense', 19333, 0], ['home_notes_receivable', 0, 14333], ['home_note_interest', 0, 5000]])
+  })
 })
 
 describe('the receivable follows the bill', () => {

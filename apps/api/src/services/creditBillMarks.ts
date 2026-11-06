@@ -467,6 +467,10 @@ export async function judgeBills(q: Q, billKeys: readonly string[], opts: BillJu
       baseInC: cents(r?.base_in), openPastGrace: r?.open_past_grace === true,
       daysPastGraceOpen: Number(r?.dpg_open ?? 0), daysPastGracePaid: Number(r?.dpg_paid ?? 0),
       onboarding: r?.onboarding === true, lateFeeOnBill: r?.late_fee_on_bill === true,
+      // The credit history keeps its own rule: a charge brought in from another
+      // platform is never on a bill here at all (the query's own
+      // import_source IS NULL), so no bill judged here is ever one.
+      importedOnly: false,
     })
     const paidInFull = cents(r?.charged_base) > 0 && cents(r?.owed_base) <= 0
     const voided = m.voided === true

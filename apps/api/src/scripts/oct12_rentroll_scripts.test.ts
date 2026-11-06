@@ -6,7 +6,7 @@
  *   oct12_void_zero_lines     — the open $0 lines are voided; the reading stays billed
  *   oct12_rerate_late_marks   — every payment history rebuilt as one mark per bill (the late-written
  *                               bill, the 6th, the $0 line, the onboarding month, an unpaid bill)
- *   oct12_gerald_meter        — RV 48's $22.47 estimate voided, the meter repaired and
+ *   oct12_meter_estimate_repair        — RV 48's $22.47 estimate voided, the meter repaired and
  *                               confirmed working: his next flat read bills $0, not another estimate
  */
 import { randomUUID } from 'crypto'
@@ -17,7 +17,7 @@ import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seed
 import { appendEvent, verifyChain } from '../services/creditLedger'
 import { voidZeroLines, ZERO_LINE_VOID_REASON } from './oct12_void_zero_lines'
 import { planRebuild, applyRebuild, describeRebuild, formatRebuild, direction } from './oct12_rerate_late_marks'
-import { fixGeraldMeter, ESTIMATE_VOID_REASON } from './oct12_gerald_meter'
+import { fixArloMeter, ESTIMATE_VOID_REASON } from './oct12_meter_estimate_repair'
 import { generateBillsForMeter } from '../services/utilityBilling'
 
 const TZ = 'America/Phoenix'
@@ -143,7 +143,7 @@ describe('oct12_rerate_late_marks — every history rebuilt as one mark per bill
        FROM credit_events e JOIN credit_subjects s ON s.id = e.subject_id
       WHERE s.subject_ref_id = $1 AND e.event_type LIKE 'payment_%' ORDER BY e.recorded_at, e.id`, [tenantId])).rows
 
-  it('Gerald\'s September and October: their per-line marks become one mark per bill; the dry run only reads; a second run finds nothing', async () => {
+  it('Arlo\'s September and October: their per-line marks become one mark per bill; the dry run only reads; a second run finds nothing', async () => {
     const w = await world({ existingTenancy: true })
     // September (his onboarding month): due 9/1, written 9/16, paid 9/17 — "late, major" the old way; on time by the rule.
     const sepInv = await invoice(w, '2026-09-01', '2026-09-16 09:00')
@@ -196,7 +196,7 @@ describe('oct12_rerate_late_marks — every history rebuilt as one mark per bill
 
   it('an unpaid bill past grace gets its mark; an onboarding bill paid late loses its late mark; a mark with no bill is withdrawn', async () => {
     const w = await world({ existingTenancy: true })
-    // Mireya Fierro: the onboarding bill, paid 9/15, "late, major" — no late fee on it.
+    // Jarrah Mortmain: the onboarding bill, paid 9/15, "late, major" — no late fee on it.
     const sepInv = await invoice(w, '2026-09-01', '2026-09-03 09:00')
     const rent = await line(w, sepInv, { type: 'rent', amount: 495, due: '2026-09-01', writtenAt: '2026-09-03 09:00', settledAt: '2026-09-15 10:00' })
     const rentMark = await oldMark(w, rent, 'payment_received_late_major', '2026-09-01', '2026-09-15T17:00:00Z')
@@ -238,7 +238,7 @@ describe('oct12_rerate_late_marks — every history rebuilt as one mark per bill
   })
 })
 
-describe('oct12_gerald_meter', () => {
+describe('oct12_meter_estimate_repair', () => {
   async function gerald() {
     const w = await world({ unitNumber: 'RV 48', existingTenancy: true })
     const inv = await invoice(w, '2026-10-01', '2026-09-30 05:00', 'INV-T-00076')
@@ -263,13 +263,13 @@ describe('oct12_gerald_meter', () => {
 
   it('a dry run changes nothing; --apply voids the $22.47 and puts the meter back as "Works, tenant uses no power"; a second run has nothing to do', async () => {
     const g = await gerald()
-    const dry = await tx(c => fixGeraldMeter(c, who(g)), false)
+    const dry = await tx(c => fixArloMeter(c, who(g)), false)
     expect(dry).toMatchObject({ refused: null, voided: { paymentId: g.est, amount: 22.47 }, meterBackInService: { meterId: g.meterId },
       zeroUseConfirmed: { meterId: g.meterId } })
     expect((await row(g.est)).status).toBe('pending')
     expect((await db.query<any>(`SELECT out_of_service FROM utility_meters WHERE id = $1`, [g.meterId])).rows[0].out_of_service).toBe(true)
 
-    const done = await tx(c => fixGeraldMeter(c, who(g)), true)
+    const done = await tx(c => fixArloMeter(c, who(g)), true)
     expect(done.refused).toBeNull()
     expect(await row(g.est)).toMatchObject({ status: 'voided', void_reason: ESTIMATE_VOID_REASON, amount: 22.47 })
     expect((await db.query<any>(`SELECT status FROM utility_bills WHERE id = $1`, [g.reading])).rows[0].status).toBe('void')
@@ -284,14 +284,14 @@ describe('oct12_gerald_meter', () => {
     const reads = (await db.query<any>(`SELECT 1 FROM utility_meter_readings WHERE meter_id = $1 AND reason = 'meter_replaced'`, [g.meterId])).rows
     expect(reads).toEqual([])
 
-    const again = await tx(c => fixGeraldMeter(c, who(g)), true)
+    const again = await tx(c => fixArloMeter(c, who(g)), true)
     expect(again).toEqual({ voided: null, meterBackInService: null, zeroUseConfirmed: null, refused: null })
   })
 
   it('his next flat read bills $0 — not marked broken again, no estimate — while Mountain View still estimates; once it moves the confirmation is cleared', async () => {
     const g = await gerald()
     await db.query(`UPDATE properties SET estimates_stuck_meters = TRUE WHERE id = $1`, [g.w.propertyId])
-    await tx(c => fixGeraldMeter(c, who(g)), true)
+    await tx(c => fixArloMeter(c, who(g)), true)
     // The next cycle read, a month after his last one, shows the same 49083.
     const nextRead = (reason: string, days: number, value: number) => db.query<{ cycle: string }>(
       `INSERT INTO utility_meter_readings (meter_id, reading_date, reading_value, billing_cycle_month, reason, created_by_user_id)
@@ -322,7 +322,7 @@ describe('oct12_gerald_meter', () => {
     await db.query(
       `INSERT INTO ach_monitoring_log (payment_id, event_type, tenant_id, amount) VALUES ($1, 'return_received', $2, 22.47)`,
       [g.est, g.w.tenantId])
-    const r = await tx(c => fixGeraldMeter(c, who(g)), true)
+    const r = await tx(c => fixArloMeter(c, who(g)), true)
     expect(r.refused).toMatch(/a record points at/)
     expect((await row(g.est)).status).toBe('pending')
   })
@@ -330,7 +330,7 @@ describe('oct12_gerald_meter', () => {
   it('refuses, changing nothing, when the line has money on it', async () => {
     const g = await gerald()
     await db.query(`UPDATE payments SET status = 'settled', settled_at = NOW(), manual_method = 'cash' WHERE id = $1`, [g.est])
-    const r = await tx(c => fixGeraldMeter(c, who(g)), true)
+    const r = await tx(c => fixArloMeter(c, who(g)), true)
     expect(r.refused).toMatch(/settled/)
     expect(r.voided).toBeNull()
   })

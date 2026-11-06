@@ -38,7 +38,7 @@ not customers. Say the word and they are dropped; say otherwise and they come in
 Almost certainly one person entered twice. They import as two records either
 way; tell me whenever and I will merge them properly.
 
-Ray Artiaga · Nate Harveston · Rosie & Don Jorgensen · Rick Moran ·
+Quinlan Thrushwood · Nate Harveston · Rosie & Don Jorgensen · Rick Moran ·
 Tim Nicolai · AJ Rhoades · Dusty Rhoades · Sue Richards · John Stark ·
 Peter Teuber
 
@@ -56,7 +56,7 @@ These are the ones only you can call. My read on each:
 | Jeremy Ciancanelli · Jeremy J | probably one person |
 | Matthew Gomez · Richard Gomez | probably two — father and son on one phone |
 | Dalke Tucker · Phil Tucker | probably two |
-| Martin Pina · Donald Premus | two different people sharing a number |
+| Martin Pina · Wren Premus | two different people sharing a number |
 
 ## 4. Kent Nielsen · Kent & Kelly Nielsen
 
@@ -68,8 +68,8 @@ One household, two records — the RV 71 pair. Merge when you want.
 
 Both are in this file, so the import brings them in:
 
-- **Donald Hamp** — Chattaroy, WA. Propane $49.25, check **167**. The sale is
-  already recorded as cash with nobody attached; it needs Hamp and the tender
+- **Wren Westbrook** — Chattaroy, WA. Propane $49.25, check **167**. The sale is
+  already recorded as cash with nobody attached; it needs Westbrook and the tender
   corrected.
 - **Mike Prevenas** — propane $23.92, check **1006**. Not recorded yet.
 
@@ -96,7 +96,7 @@ Both are in this file, so the import brings them in:
    the stay, it kind of goes on both of their histories."* Its own piece of
    work, also the right answer for the father-and-son pairs.
 
-## Martin Pina and Donald Premus — NOT a new blacklist feature
+## Martin Pina and Wren Premus — NOT a new blacklist feature
 
 Nic, 10/24: *"that was my way of saying they left without paying. The archived
 invoices from Square that I still have to import are going to show some

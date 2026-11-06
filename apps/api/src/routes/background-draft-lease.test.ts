@@ -132,7 +132,7 @@ describe('POST /api/background/:id/draft-lease', () => {
     //
     // This used to assert MOVE_IN_PLUS_6_END and 'Fixed term' — a hard end date
     // computed from a number the applicant typed on a screening form before
-    // they had seen the place. James Fenton said "3 months" and got a binding
+    // they had seen the place. Juno Kendrew said "3 months" and got a binding
     // lease ending 2027-01-31 on RV 15, the park's busiest month, which nothing
     // disclosed and which would then have freed the space.
     //

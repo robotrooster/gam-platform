@@ -84,7 +84,11 @@ export async function loadPendingScope(client: PoolClient, landlordId: string): 
      SELECT e.source_type, e.source_id FROM ledger_source_errors e WHERE e.owner_id = $1`, [landlordId, drainable])).rows
   const sources = w.map(x => ({ type: x.t, id: x.id }))
   const everything = !start.rows[0]?.has
-    || sources.some(s => s.type === LEDGER_OUTBOX_BOOKS_START || (s.type === 'opening' && s.id === landlordId))
+    // 11/3: `companyId|propertyId` is an opening too — matching the bare id
+    // only would stop treating a queued per-property opening as "everything is
+    // moving", and the page would under-report what is waiting.
+    || sources.some(s => s.type === LEDGER_OUTBOX_BOOKS_START
+      || (s.type === 'opening' && (s.id === landlordId || s.id.startsWith(`${landlordId}|`))))
 
   const payments = new Map<string, WaitingPayment>()
   const tenantProperty = new Set<string>()

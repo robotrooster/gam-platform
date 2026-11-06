@@ -235,14 +235,14 @@ describe('open pay links are outstanding', () => {
     const prop = (await db.query<{ property_id: string }>(`SELECT property_id FROM units WHERE id = $1`, [f.unitId])).rows[0].property_id
     const mk = (kind: string, email: string | null) => db.query<{ id: string }>(
       `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items, subtotal, total, customer_name, customer_email)
-       VALUES (md5(random()::text) || md5(random()::text), $1, $2, $3, $4, 'Move-out', $5::jsonb, 670.27, 670.27, 'Andres Razo', $6) RETURNING id`,
+       VALUES (md5(random()::text) || md5(random()::text), $1, $2, $3, $4, 'Move-out', $5::jsonb, 670.27, 670.27, 'Cora Castellan', $6) RETURNING id`,
       [f.landlordId, prop, f.userId, kind, JSON.stringify([{ name: 'RV site — monthly', qty: 1, price: 589 }, { name: 'Electric (per kWh)', qty: 387, price: 0.21 }]), email])
-    const link = (await mk('one_time', 'razo@example.com')).rows[0].id
+    const link = (await mk('one_time', 'castellan@example.com')).rows[0].id
     await mk('standing', null)
     const get = () => request(buildApp()).get('/api/balances').set('Authorization', `Bearer ${tokenFor(f.userId, f.landlordId)}`)
     let rows = (await get()).body.data
     const row = rows.find((r: any) => r.pay_link_id === link)
-    expect(row).toMatchObject({ first_name: 'Andres', last_name: 'Razo', email: 'razo@example.com', balance: '670.27' })
+    expect(row).toMatchObject({ first_name: 'Cora', last_name: 'Castellan', email: 'castellan@example.com', balance: '670.27' })
     expect(rows.filter((r: any) => r.pay_link_id)).toHaveLength(1)
     // The tenant's own ledger line is untouched by it.
     expect(Number(rows.find((r: any) => r.tenant_id === f.tenantId).balance)).toBe(616.40)
@@ -553,7 +553,7 @@ describe('GAM\'s FlexPay pull never reaches a landlord screen', () => {
  * 10/25 (Nic): "Is that going to appear on the front desk person's list as like,
  * hey, collect this money?" → "Show it, collect-only, can't be rung up."
  *
- * Dominic Gonzalez's installment is the trust's money: GAM bills nothing for it
+ * Vesper Vanterpool's installment is the trust's money: GAM bills nothing for it
  * and none of it may reach the park's books, but he pays at the counter, so the
  * desk has to be told. The line carries the warning and NO way to record a
  * payment, because there is no charge behind it at all.

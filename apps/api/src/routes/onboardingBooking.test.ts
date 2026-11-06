@@ -50,7 +50,7 @@ async function seedTokenFor(opts: { expired?: boolean } = {}) {
   let landlordId = '', userId = ''
   try {
     await client.query('BEGIN')
-    const ll = await seedLandlord(client, { firstName: 'Charlie', lastName: 'Moore' })
+    const ll = await seedLandlord(client, { firstName: 'Noor', lastName: 'Netherton' })
     landlordId = ll.landlordId; userId = ll.userId
     await client.query('COMMIT')
   } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
@@ -80,7 +80,7 @@ describe('GET /api/sales/onboarding/prefill/:token', () => {
     const { token } = await seedTokenFor()
     const r = await request(app).get(`/api/sales/onboarding/prefill/${token}`).expect(200)
 
-    expect(r.body.data).toMatchObject({ firstName: 'Charlie', name: 'Charlie Moore' })
+    expect(r.body.data).toMatchObject({ firstName: 'Noor', name: 'Noor Netherton' })
     expect(r.body.data.email).toContain('@')
     // No account/portfolio state leaks to a token holder.
     expect(Object.keys(r.body.data).sort()).toEqual(['email', 'firstName', 'name', 'phone'])
@@ -114,7 +114,7 @@ describe('POST /api/sales/onboarding', () => {
     expect(slot.rows[0].kind).toBe('onboarding')
     expect(slot.rows[0].prospect_email).toBe(real.rows[0].email)
     expect(slot.rows[0].prospect_email).not.toBe('attacker@evil.test')
-    expect(slot.rows[0].prospect_name).toBe('Charlie Moore')
+    expect(slot.rows[0].prospect_name).toBe('Noor Netherton')
   })
 
   it('rejects a bad token without booking anything', async () => {

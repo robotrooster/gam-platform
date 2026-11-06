@@ -104,11 +104,11 @@ const applies = (o: Record<string, unknown> = {}) => ({
     { payment_id: 'p2', label: 'Security deposit', amount: 500, due_date: '2026-10-01', utility: false },
   ],
   total: 1500,
-  household: { tenant_names: ['Kim Harland'], unit_number: 'RV 22', property_name: 'Oak Park' },
+  household: { tenant_names: ['Yvette Bexley'], unit_number: 'RV 22', property_name: 'Oak Park' },
   ...o,
 })
 // The server-shaped answer reaches the page camelCased — this is what it reads.
-expect((camelizeKeys(applies()) as any).household.tenantNames).toEqual(['Kim Harland'])
+expect((camelizeKeys(applies()) as any).household.tenantNames).toEqual(['Yvette Bexley'])
 const PAID_WORDS = '$500.00 was already paid on this lease, so it can’t be closed as if nothing happened. ' +
   'Use Change → “They’re leaving on…” on the Leases page, then Change → Move out — the move-out settles what they paid and returns what is theirs.'
 
@@ -178,7 +178,7 @@ describe('They never moved in — end the lease', () => {
   it('reads what would be zeroed when it opens and lists it by name — who, each line, the total — with one gold button', async () => {
     await open()
     expect(server.gets).toBe(1)
-    expect(host.querySelector('[data-testid="nmi-who"]')?.textContent).toBe('Kim Harland — RV 22, Oak Park')
+    expect(host.querySelector('[data-testid="nmi-who"]')?.textContent).toBe('Yvette Bexley — RV 22, Oak Park')
     const zeroed = host.querySelector('[data-testid="nmi-zeroed"]')!.textContent!
     expect(zeroed).toContain('Rent · due Oct 1, 2026$1,000.00')
     expect(zeroed).toContain('Security deposit · due Oct 1, 2026$500.00')
@@ -651,7 +651,7 @@ describe('a space that carries unpaid space rent', () => {
     id: 'cf?', unit_id: 'u-mh09', space_name: 'MH 09', property_name: 'Oak Park',
     amount: '880.00', settled_amount: '0.00', still_owed: 880, late_fees_waived: '95.00',
     status: 'open', opened_on: '2026-10-19', oldest_due_date: '2026-09-01',
-    settled_on: null, taken_off_on: null, owed_by_name: 'Rashawn Bump',
+    settled_on: null, taken_off_on: null, owed_by_name: 'Phaedra Stanhope',
     assumed_by_name: null, assumed_lease_id: null, arrangement: null, installments: [],
     ...o,
   })
@@ -677,7 +677,7 @@ describe('a space that carries unpaid space rent', () => {
     server.spaceCarried = [claim({ id: 'cf-1', still_owed: 880 })]
     await openMhList()
     expect(text()).toContain('Space carries $880.00')
-    expect(rowOf('MH 09').querySelector('.badge-amber')?.getAttribute('title')).toContain('Rashawn Bump')
+    expect(rowOf('MH 09').querySelector('.badge-amber')?.getAttribute('title')).toContain('Phaedra Stanhope')
   })
 
   /**

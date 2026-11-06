@@ -26,7 +26,7 @@ import { afterRowsSettled } from '../services/settleHooks'
 import { activateBillingForMoneyMoved } from '../services/billingActivation'
 import type { PoolClient } from 'pg'
 import {
-  ACH_RETURN_CONFIG, CARD_DECLINE_FEE, FLEXPAY_PULL_MAX_RETRIES, FLEXPAY_PULL_RETRY_DAYS,
+  ACH_MAX_RETRIES, ACH_RETURN_CONFIG, ACH_RETURN_FEE, CARD_DECLINE_FEE, FLEXPAY_PULL_MAX_RETRIES, FLEXPAY_PULL_RETRY_DAYS,
   processingFeeFor, type PaymentReversalType,
 } from '@gam/shared'
 import { logger } from '../lib/logger'
@@ -161,7 +161,11 @@ webhooksRouter.post('/stripe', async (req, res) => {
         // failed" notice or email, no NSF event on the tenant's record.
         const { releaseFailedOnScreenConfirmation } = await import('../jobs/paymentReconcile')
         if (await releaseFailedOnScreenConfirmation(stripe, pi)) break
-        await handleFailedIntent(stripe, pi)
+        // 11/5: the EVENT's own moment, not the clock. A re-delivered event days
+        // later must stamp the fee with the day the bank actually refused the
+        // debit, which is what the resident's bill names.
+        await handleFailedIntent(stripe, pi, event.id || rawEventId,
+          event.created ? new Date(event.created * 1000) : null)
       } catch (e) {
         logger.error({ err: e, stripe_payment_intent_id: pi.id }, 'webhook payment_intent.payment_failed handler failed')
         await stampWebhookError(rawEventId, e)
@@ -554,6 +558,21 @@ webhooksRouter.post('/stripe', async (req, res) => {
           // S571 guard: a CARD setup must NOT flip ach_verified / stamp bank
           // fields. Nothing else to do for a card here.
           logger.info({ tenant_id: tenantId, customer: customerId, setup_intent: setupIntent.id }, '[webhook] tenant card saved (no ACH flip)')
+          // 10/27 (Nic): "an automatic payment when payment method is changed
+          // at all. new bank or new debit card." A card is a working method
+          // too, so a FlexDeposit schedule stuck on a dead account is re-armed
+          // for the ordinary installment cron — see
+          // rearmMissedFlexDepositInstallments for why nothing is charged here.
+          if (tenantId) {
+            try {
+              const { rearmMissedFlexDepositInstallments } = await import('../services/flexDeposit')
+              await rearmMissedFlexDepositInstallments(tenantId)
+            } catch (e) {
+              // Never fail the card save over this; the installment is still
+              // recovered from any payment they make (GAM-first routing).
+              logger.error({ err: e, tenant_id: tenantId }, '[webhook] flexdeposit re-arm after card save failed')
+            }
+          }
           break
         }
 
@@ -580,6 +599,18 @@ webhooksRouter.post('/stripe', async (req, res) => {
         } else {
           logger.info({ tenant_id: r.tenantId, setup_intent: setupIntent.id, firstTime: r.firstTime, madeDefault: r.madeDefault },
             '[webhook] ACH microdeposits verified')
+          // 10/27 (Nic): the newly verified bank restarts a FlexDeposit
+          // schedule that went 'missed' because the old account stopped
+          // working. Re-arms the row for the installment cron; charges nothing
+          // here (rearmMissedFlexDepositInstallments explains why).
+          if (r.tenantId) {
+            try {
+              const { rearmMissedFlexDepositInstallments } = await import('../services/flexDeposit')
+              await rearmMissedFlexDepositInstallments(r.tenantId)
+            } catch (e) {
+              logger.error({ err: e, tenant_id: r.tenantId }, '[webhook] flexdeposit re-arm after bank verify failed')
+            }
+          }
         }
       } catch (e) {
         logger.error({ err: e, setup_intent: setupIntent.id }, 'webhook setup_intent.succeeded handler failed')
@@ -1023,6 +1054,22 @@ interface SucceededOutcome {
 async function settleSucceededIntent(stripe: Stripe, pi: Stripe.PaymentIntent, eventId: string): Promise<void> {
   const md = (pi.metadata ?? {}) as Record<string, string>
 
+  // 11/4 (Nic): A RETURN FEE IS NOT TAKEN BACK WHEN A LATER PULL WORKS.
+  //
+  // An earlier draft of this voided the $4 here, reasoning that a resident
+  // should not hold a fee for a payment that eventually went through. That is
+  // wrong about what the $4 IS. Stripe charges GAM $4.00 for the RETURN — the
+  // moment the bank refuses the debit — and does not give it back because a
+  // later pull of the same intent clears. "GAM eats no fees": the cost was
+  // real, so the charge stands, and a retry that works is a second pull, not an
+  // unwinding of the first.
+  //
+  // Nothing double-bills it either: an ordinary return arrives as
+  // payment_intent.payment_failed and is billed there, once per Stripe event;
+  // an UNAUTHORIZED return arrives as a dispute and is billed by
+  // services/paymentReversal at Stripe's own dispute fee. A pull that bounced
+  // and was later disputed cost GAM both, so the resident owes both.
+
   // A FlexPay pull whose intent never reached its row: recorded on the row its
   // metadata names (never tenant credit, never an orphan receipt).
   if (md.gam_purpose === 'flexpay_pull') {
@@ -1179,6 +1226,25 @@ async function settleSucceededIntent(stripe: Stripe, pi: Stripe.PaymentIntent, e
           WHERE p.id = ANY($1::uuid[]) AND p.revenue_owner = 'landlord' AND p.type <> 'deposit'
             AND NOT (p.entry_description = 'DEPOSIT' AND p.lease_fee_id IS NULL)`,
         [out.settledIds])
+    }
+
+    // ── 10/27 (Nic): A LEFT-OWING INSTALLMENT THAT JUST SETTLED ─────────────
+    //
+    // The resident paid a month of what they still owed another operator. The
+    // arrangement is credited and, once it is whole, the debt is settled so it
+    // stops flagging them to every other landlord.
+    //
+    // In THIS transaction, with the settle itself: a debt that is paid and
+    // still flagging somebody is the worst failure this feature has, and it is
+    // exactly what a separate commit would allow.
+    for (const row of settledRows.filter(r => !r.reversal_id)) {
+      const owing = await client.query<{ cid: string; amount: string }>(
+        `SELECT left_owing_collection_id AS cid, amount::text
+           FROM payments WHERE id = $1 AND left_owing_collection_id IS NOT NULL`, [row.id])
+      const hit = owing.rows[0]
+      if (!hit) continue
+      const { applyCollected } = await import('../services/leftOwingCollection')
+      await applyCollected({ collectionId: hit.cid, amount: Number(hit.amount), paymentId: row.id, client })
     }
 
     for (const row of settledRows) {
@@ -1771,7 +1837,7 @@ async function failIntentRows(
       // property's calendar day three days out (the day the tenant is told).
       // A FlexPay pull retries on its own schedule (the FlexPay terms).
       const isFlexPull = live.some(r => r.entry_description === 'FLEXPAY')
-      const maxRetries = isFlexPull ? FLEXPAY_PULL_MAX_RETRIES : 2
+      const maxRetries = isFlexPull ? FLEXPAY_PULL_MAX_RETRIES : ACH_MAX_RETRIES
       const retryDays = isFlexPull ? FLEXPAY_PULL_RETRY_DAYS : 3
       out.willRetry = a.mode === 'failed' && a.decision === 'retry' && !a.isFlexDepositPull
         && Math.max(...live.map(r => Number(r.retry_count))) < maxRetries
@@ -1863,7 +1929,20 @@ async function noteGapChargeFromIntent(
 }
 
 /** payment_intent.payment_failed for a tenant charge (see failIntentRows for the guards). */
-async function handleFailedIntent(stripe: Stripe, pi: Stripe.PaymentIntent): Promise<void> {
+async function handleFailedIntent(stripe: Stripe, pi: Stripe.PaymentIntent,
+                                  eventId: string, eventAt?: Date | null): Promise<void> {
+  // 11/5 (Nic): "just separate the line items by putting the bounce date on
+  // there." The day this refusal happened, stamped on whichever fee it writes
+  // (payments.returned_on) so two $4s on one bill are told apart by the only
+  // thing that distinguishes them. Stripe's own moment when we have it; the
+  // webhook's own day otherwise, which is the same day for a live delivery.
+  //
+  // THE INSTANT, not a date — the calendar day is worked out below in the
+  // PROPERTY's own timezone. Heather's second refusal landed 11/3 at 7:11pm in
+  // Phoenix, which is 11/4 in UTC: taking .toISOString() here would have put
+  // the wrong day on her bill, and it is the evening hours when it would be
+  // wrong, which is exactly when nobody is looking.
+  const refusedAt = eventAt ? eventAt.toISOString() : null
   const md = (pi.metadata ?? {}) as Record<string, string>
   // A FlexPay pull whose intent never reached its row: GAM reads its reason on
   // the row its metadata names (flexpay.adoptFlexPayPullIntent).
@@ -1876,7 +1955,7 @@ async function handleFailedIntent(stripe: Stripe, pi: Stripe.PaymentIntent): Pro
     }
   }
 
-  const { extractReturnCode, decideRetry, pullNoticeContext, bankRefusedDebit } = await import('../services/achRetry')
+  const { extractReturnCode, decideRetry, pullNoticeContext, bankRefusedDebit, pullDebitLines } = await import('../services/achRetry')
   let returnCode = extractReturnCode(pi)
   // S654: the event usually carries latest_charge as a bare id. When the
   // intent itself names no reason, read the charge's failure_code — an
@@ -1913,6 +1992,16 @@ async function handleFailedIntent(stripe: Stripe, pi: Stripe.PaymentIntent): Pro
   // deposit-return page says so. A retry still coming says nothing yet.
   if (!willRetry) {
     const bank = (pi.payment_method_types ?? []).includes('us_bank_account')
+    // 10/30 (Nic): the bank refused and nothing more is coming, so the method
+    // autopay depends on does not work. Leaving the schedule armed means it
+    // fails again next month while the resident believes rent is handled.
+    if (bank) {
+      const { disarmAutopayAfterTerminalBankFailure } = await import('../jobs/autopayRunner')
+      await disarmAutopayAfterTerminalBankFailure(
+        moved.rows.map(r => r.id),
+        `${reasonText}${returnCode ? ` (${returnCode})` : ''}`,
+      ).catch(() => { /* a disarm failure must not block the rest of the webhook */ })
+    }
     // Leftovers fix: a card the bank declined is said as declined
     // (depositReturn.GAP_CHARGE_REASON.cardDeclined), never the generic wording.
     await noteGapChargeFromIntent(pi,
@@ -1924,22 +2013,53 @@ async function handleFailedIntent(stripe: Stripe, pi: Stripe.PaymentIntent): Pro
   // Stripe bills per AUTHORIZATION, so EVERY refused attempt costs GAM $0.28
   // with no revenue — hence this fires on every decline, not just the
   // terminal one. ACH is excluded: it carries its own $4.00 RETURNFEE.
-  // Idempotent by PaymentIntent (the deterministic note is the dedupe key).
+  //
+  // ── 11/5 (Nic), TWO HOLES CLOSED ──────────────────────────────────────────
+  //
+  //   "Every route, every path that it could happen, people need to be charged
+  //    for those, because we're not going to be out of pocket for people's lack
+  //    of preparation."
+  //
+  // THE FRONT DESK'S READER WAS FREE. A card dipped at the counter is
+  // 'card_present', not 'card' (routes/payments front_desk_reader), and both
+  // tests below asked only for 'card'. So every reader decline cost GAM its
+  // authorization fee and billed the resident nothing — the one path where
+  // somebody is standing there to be told.
+  //
+  // AND THE SECOND DECLINE ON ONE INTENT WAS FREE. The dedupe key was the
+  // PaymentIntent, which reads "one fee per intent" however many times the card
+  // is refused — while the comment above it claimed the opposite. A re-try of
+  // the same intent is a second authorization and a second cost. So the key is
+  // the EVENT, the same fix RETURNFEE already carries: a re-delivered event is
+  // still one fee, and two real declines are two.
   const pmType = (pi.last_payment_error as any)?.payment_method?.type
+  const CARD_KINDS = ['card', 'card_present']
   const isCardAttempt = pmType
-    ? pmType === 'card'
-    : (pi.payment_method_types || []).includes('card')
+    ? CARD_KINDS.includes(pmType)
+    : (pi.payment_method_types || []).some(t => CARD_KINDS.includes(t))
         && !(pi.payment_method_types || []).includes('us_bank_account')
   if (isCardAttempt) {
     try {
-      const declineNote = `Declined card attempt — ${pi.id}`
+      const declineNote = `Declined card attempt — ${pi.id} (${eventId})`
       await query(
         `INSERT INTO payments
            (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
-            entry_description, due_date, invoice_id, notes, revenue_owner)
+            entry_description, due_date, invoice_id, notes, revenue_owner, returned_on)
          -- -- S609: GAM's own fee (REVENUE_OWNERS, packages/shared) — never an owner share.
          SELECT p.unit_id, p.lease_id, p.tenant_id, p.landlord_id, 'fee', $2,
-                'pending', 'DECLINEFEE', CURRENT_DATE, p.invoice_id, $3, 'gam'
+                'pending', 'DECLINEFEE', CURRENT_DATE, p.invoice_id, $3, 'gam',
+                -- 11/5: the day the card was refused, so two declines on one
+                -- bill are two readable lines and not one repeated twice.
+                -- The PROPERTY's calendar day, never UTC's (lib/timezone says it
+                -- in words: any day that lands on a bill comes from the
+                -- property's clock). An evening refusal in Phoenix is already
+                -- tomorrow in UTC.
+                COALESCE(
+                  ($4::timestamptz AT TIME ZONE COALESCE(
+                     (SELECT pr.timezone FROM units un
+                        JOIN properties pr ON pr.id = un.property_id
+                       WHERE un.id = p.unit_id), 'America/Phoenix'))::date,
+                  CURRENT_DATE)
            FROM payments p
           WHERE p.id = $1
             AND p.tenant_id IS NOT NULL
@@ -1947,9 +2067,154 @@ async function handleFailedIntent(stripe: Stripe, pi: Stripe.PaymentIntent): Pro
               SELECT 1 FROM payments d
                WHERE d.entry_description = 'DECLINEFEE' AND d.notes = $3
             )`,
-        [updatedRow.id, CARD_DECLINE_FEE.toFixed(2), declineNote])
+        [updatedRow.id, CARD_DECLINE_FEE.toFixed(2), declineNote, refusedAt])
     } catch (e) {
       logger.error({ err: e, payment_id: updatedRow.id, pi: pi.id }, 'decline-fee insert failed')
+    }
+  }
+
+  // 11/4 (Nic): "the $4 return fee is any bounce payment... We are not eating
+  // that. GAM eats no fees." The bank refusing a debit costs GAM $4.00, and
+  // until now an ordinary pull passed on nothing: FlexPay folded its own fee
+  // into the repriced pull, and RETURNFEE was written only where a payment had
+  // SETTLED and was later clawed back (services/paymentReversal). A plain
+  // bounce — the common case — cost GAM $4 and the resident nothing.
+  //
+  // Charged on EVERY refusal, not only the terminal one, because Stripe bills
+  // GAM for every return. The attempt number is part of the dedupe key: a
+  // retry re-confirms the SAME PaymentIntent, so keying on the intent alone
+  // would let the second bounce through free.
+  //
+  // It is a charge, never a pull: a 'fee' row owned by GAM.
+  //
+  // IT RIDES THE RETRY (11/5, Nic — this SUPERSEDES the 11/4 hold):
+  //
+  //   "Every time going forward, the fee needs to ride the retry amount. And
+  //    then if it fails again, the doubled up fee, because it happened twice,
+  //    needs to ride immediately for whatever next payment method they're going
+  //    to try, whether it's going from ACH to debit card or they go in to pay
+  //    cash at the bank."
+  //
+  // So the fee is written as an ORDINARY owed charge with no invoice: the
+  // retry three days later folds it into that pull (services/achRetry
+  // foldReturnFeesIntoRetry), and if the retry bounces too it is simply money
+  // owed, payable by whatever they reach for next — a card, the front desk,
+  // cash at the bank.
+  //
+  // WHY THE HOLD IS GONE. On 11/4 this was written held_for_next_bill_at, so
+  // nothing asked for it until the next bill adopted it. That was the right
+  // answer to ONE question Nic had that day — Heather in Space 28 should not
+  // see a stray $4 sitting on Outstanding mid-cycle — and the wrong standing
+  // rule: a fee that waits a month is a fee GAM has already paid the bank for
+  // and is financing. Heather's own held row is untouched and still rides her
+  // next bill (the invoice run adopts any row still held); every fee from here
+  // is immediate.
+  //
+  // It still carries no invoice_id. The bill the bounced pull was for is the
+  // one the resident is in the middle of paying, and dropping a GAM fee onto
+  // it was the 11/4 defect this kept.
+  //
+  // ONE FEE PER STRIPE EVENT. Keyed on the event id, which is exactly the
+  // idempotency the fee needs: Stripe re-delivers an event (this webhook
+  // re-runs the handler — the raw-event insert only stores the payload), and a
+  // re-delivery must not bill a second $4, while two real returns on the same
+  // intent are two events and two real $4 costs. The earlier key was the
+  // attempt number read off the row, which a re-delivery arriving after the
+  // retry had been claimed would have read as a different attempt.
+  //
+  // FlexPay and FlexDeposit are left out — each already passes the same cost on
+  // along its own retry path, and billing here too would charge it twice.
+  if (atBank && !isFlexPayPull && !isFlexDepositPull) {
+    try {
+      const returnNote = `Returned bank payment — ${pi.id} (${eventId})`
+      await query(
+        `INSERT INTO payments
+           (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+            entry_description, due_date, notes, revenue_owner, returned_on)
+         -- S609: GAM's own fee (REVENUE_OWNERS, packages/shared) — never an owner share.
+         SELECT p.unit_id, p.lease_id, p.tenant_id, p.landlord_id, 'fee', $2,
+                'pending', 'RETURNFEE', CURRENT_DATE, $3, 'gam',
+                -- 11/5: the day the bank said no. Heather's bill carries two of
+                -- these and both read the same without it.
+                -- The PROPERTY's calendar day, never UTC's (lib/timezone says it
+                -- in words: any day that lands on a bill comes from the
+                -- property's clock). An evening refusal in Phoenix is already
+                -- tomorrow in UTC.
+                COALESCE(
+                  ($4::timestamptz AT TIME ZONE COALESCE(
+                     (SELECT pr.timezone FROM units un
+                        JOIN properties pr ON pr.id = un.property_id
+                       WHERE un.id = p.unit_id), 'America/Phoenix'))::date,
+                  CURRENT_DATE)
+           FROM payments p
+          WHERE p.id = $1
+            AND p.tenant_id IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM payments d
+               WHERE d.entry_description = 'RETURNFEE' AND d.notes = $3
+            )`,
+        [updatedRow.id, ACH_RETURN_FEE.toFixed(2), returnNote, refusedAt])
+    } catch (e) {
+      logger.error({ err: e, payment_id: updatedRow.id, pi: pi.id }, 'ach return-fee insert failed')
+    }
+  }
+
+  // ── 11/5 (Nic): A BANK THAT BOUNCED FOR GOOD COMES OFF THE ACCOUNT ────────
+  //
+  //   "If that retry bounces too, GAM needs to fully de-link their bank account
+  //    and they have to go through the micro deposits again and verify a new
+  //    bank... for people that are costing us money, I want to make it as
+  //    inconvenient as possible. That way maybe they'll just pay with a debit
+  //    card instead."
+  //
+  // TERMINAL, not "the second bounce", and the difference matters. ACH_MAX_RETRIES
+  // is 1, so a retry that bounces IS the terminal refusal — that is the case Nic
+  // described. But a FIRST bounce can also be terminal when the return code says
+  // retrying is pointless: the account is closed, or the authorization was
+  // revoked. Leaving a bank on file in those cases would keep a dead account
+  // attached and bill GAM $4 for every attempt against it, which is the same
+  // money leak by a different route. So the rule is the state, not the count.
+  //
+  // FLEXPAY AND FLEXDEPOSIT ARE LEFT ALONE. Each runs its own retry schedule
+  // and its own failure handling, and both are opt-in products with their own
+  // terms about what a failure costs; taking the bank out from under them here
+  // would break a collection they are still working.
+  //
+  // Never fails the webhook. The pull, the fee and the ledger are already
+  // recorded by this point and are the parts that must not be lost.
+  if (!willRetry && atBank && !isFlexPayPull && !isFlexDepositPull) {
+    try {
+      // A pull with no tenant on it is not a resident's bank — a landlord's own
+      // GAM debit, for one. Nothing to take off anybody, and not a fault worth
+      // logging every time one bounces. Guarded rather than returned: a bare
+      // return here would leave the whole handler and skip the credit ledger
+      // below, which is the opposite of harmless.
+      const whose = (await query<{ tenant_id: string | null }>(
+        `SELECT tenant_id FROM payments WHERE id = $1`, [updatedRow.id]))[0]
+      if (whose?.tenant_id) {
+        const { dropBankAfterRepeatReturn, intentPaymentMethodId } =
+          await import('../services/tenantBankMethods')
+        const dropped = await dropBankAfterRepeatReturn({
+          tenantId: whose.tenant_id,
+          paymentMethodId: intentPaymentMethodId(pi),
+          reason: `bank refused the debit for good (${returnCode ?? 'no return code'})`,
+        })
+        if (dropped.dropped) {
+          await createAdminNotification({
+            severity: 'info',
+            category: 'bank_dropped_after_return',
+            title:    `Bank taken off the account after a refused debit (payment ${updatedRow.id})`,
+            body:     `The bank account${dropped.last4 ? ` ending ${dropped.last4}` : ''} refused this debit with no `
+                    + `retry left (${returnCode ?? 'no return code'}), so it was removed and bank payments are `
+                    + `stopped for this resident. They re-link and verify by micro-deposit before they can pay by `
+                    + `bank again${dropped.detached ? '' : ' (Stripe would not detach the method; the next resync clears it)'}.`,
+            context:  { payment_id: updatedRow.id, stripe_payment_intent_id: pi.id, return_code: returnCode },
+          }).catch(() => {})
+        }
+      }
+    } catch (e) {
+      logger.error({ err: e, payment_id: updatedRow.id, pi: pi.id },
+        'could not take the bank off the account after a terminal return')
     }
   }
 
@@ -2101,6 +2366,51 @@ async function handleFailedIntent(stripe: Stripe, pi: Stripe.PaymentIntent): Pro
         // own charges; a GAM product's retry stays with GAM support.
         const landlordOwned = (await queryOne<{ ok: boolean }>(
           `SELECT revenue_owner = 'landlord' AS ok FROM payments WHERE id = $1`, [updatedRow.id]))?.ok === true
+        // 11/4 (Nic): the resident is told WHAT THEIR BANK WILL BE ASKED FOR,
+        // with the lines read now. The retry re-confirms this same intent, so
+        // its own amount is the debit — the charges plus the $6 ACH fee every
+        // bank payment carries, which the notice used to leave out (Heather
+        // Miller was told $100 and charged $106). Falls back to the charges
+        // total for a payload that does not name an amount.
+        //
+        // 11/5: AND the return fees that will ride it. The retry raises the
+        // pull by every unpaid return fee on this household before it confirms
+        // (services/achRetry foldReturnFeesIntoRetry), and that happens three
+        // days AFTER this notice is written. Quoting the intent's amount alone
+        // would tell Heather $106 and take $114 — the same defect as the line
+        // above, arriving from the other end. Both read returnFeesRidingPull,
+        // so there is one rule and not two.
+        let debit = typeof pi.amount === 'number' && pi.amount > 0 ? pi.amount / 100 : pullTotal
+        let lines: Array<{ label: string; amount: number }> = []
+        try {
+          lines = await pullDebitLines(pi.id, debit)
+        } catch (e) {
+          logger.error({ err: e, pi: pi.id }, 'retry-notice lines failed; the total is still named')
+        }
+        try {
+          const { returnFeesRidingPull } = await import('../services/achRetry')
+          const riding = await returnFeesRidingPull(pi.id)
+          const ridingTotal = Math.round(riding.reduce((t, f) => t + f.amount, 0) * 100) / 100
+          if (ridingTotal > 0) {
+            debit = Math.round((debit + ridingTotal) * 100) / 100
+            // Named one per bounce, so two returns read as two lines and not as
+            // one doubled number nobody can account for. 11/5: WITH THE DAY it
+            // happened — two lines of identical words and identical amounts are
+            // one doubled number again as far as the reader is concerned.
+            const { monthDay } = await import('../services/invoiceNotice')
+            for (const f of riding) {
+              lines.push({
+                label: f.returnedOn
+                  ? `Returned-payment fee — ${monthDay(f.returnedOn)}`
+                  : 'Returned-payment fee',
+                amount: f.amount,
+              })
+            }
+          }
+        } catch (e) {
+          logger.error({ err: e, pi: pi.id },
+            'could not add the riding return fees to the retry notice; the quoted debit may be low')
+        }
         await notifyAchRetryScheduled({
           propertyId:      landlordOwned ? pctx.property_id : null,
           tenantUserId:    pctx.tenant_user_id,
@@ -2111,6 +2421,8 @@ async function handleFailedIntent(stripe: Stripe, pi: Stripe.PaymentIntent): Pro
           unitNumber:      pctx.unit_number,
           propertyName:    pctx.property_name,
           amount:          pullTotal,
+          debit,
+          lines,
           reason:          reasonPlain,
           retryDate,
           retryAttempt:    (updatedRow.retry_count + 1) as 1 | 2,

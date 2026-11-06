@@ -397,6 +397,65 @@ function interiorPoint(poly) {
 // ── Building one file ────────────────────────────────────────────────────────
 
 /**
+ * The longest straight chord, in degrees, that may be left between two points
+ * of a line.
+ */
+const MAX_CHORD_DEG = 1
+
+/**
+ * PUT BACK THE POINTS THE SIMPLIFIER WAS RIGHT TO REMOVE.
+ *
+ * 10/31 (Nic, on the globe): "There's kind of an oval slit, horizontally
+ * shaped oval slit just above the boundary of the United States going into
+ * Canada."
+ *
+ * Measured in the shipped world.json.gz: Canada's 49th-parallel border had
+ * survived this build as ONE segment, longitude -123.09 to -95.18, both ends
+ * at latitude 48.9920 — a 27.91-degree span with nothing in between.
+ *
+ * That is not a bug in the simplifier. Douglas-Peucker drops a point by how
+ * far it sits from the line through its neighbours, and a point on a dead
+ * STRAIGHT run sits exactly on it — weight zero. So a straight border
+ * collapses to its two endpoints at any threshold above zero, however fine the
+ * file is cut. Lowering a coarseness number cannot fix it.
+ *
+ * It only becomes visible on a globe. d3-geo draws a segment as a GREAT
+ * CIRCLE, and the great circle between two points at the same northern
+ * latitude passes POLEWARD of the parallel they are both on: that 27.91-degree
+ * chord bowed to 49.84N, 94.4km north of the real border. The United States
+ * comes from a different, much finer file whose side of that border has 137
+ * vertices and sits true. So Canada's land fill began up to 94km north of
+ * where the United States' fill ended, and the lens between them was filled by
+ * nothing — the card's background showing through the globe, widest over
+ * Montana and Saskatchewan and tapering to nothing at each end. An oval slit.
+ *
+ * So: no segment leaves here longer than MAX_CHORD_DEG. The inserted points
+ * are a straight interpolation in longitude and latitude, which is what the
+ * border actually follows, and they bring the worst bow down from 94.4km to
+ * about 120 metres. A segment spanning more than 180 degrees is left alone —
+ * that is a line crossing the antimeridian, where interpolating would run the
+ * wrong way around the world.
+ */
+function densify(points) {
+  if (points.length < 2) return points
+  const out = [points[0]]
+  for (let i = 1; i < points.length; i++) {
+    const [lo0, la0] = points[i - 1]
+    const [lo1, la1] = points[i]
+    const dLon = lo1 - lo0, dLat = la1 - la0
+    const steps = Math.abs(dLon) > 180
+      ? 1
+      : Math.ceil(Math.max(Math.abs(dLon), Math.abs(dLat)) / MAX_CHORD_DEG)
+    for (let s = 1; s < steps; s++) {
+      const t = s / steps
+      out.push([lo0 + dLon * t, la0 + dLat * t])
+    }
+    out.push(points[i])
+  }
+  return out
+}
+
+/**
  * Areas → simplified, quantized TopoJSON. `pxDeg` is how many degrees one
  * pixel covers when the file fills the map.
  */
@@ -449,10 +508,11 @@ function buildTopology(areas, pxDeg) {
     }
   }
 
-  // topojson-simplify's simplify() with one minimum weight per line.
+  // topojson-simplify's simplify() with one minimum weight per line, then
+  // densify() — see its comment for why the second step is not optional.
   const simplified = () => ({
     type: 'Topology', bbox: pre.bbox, objects: pre.objects,
-    arcs: pre.arcs.map((arc, a) => arc.filter(p => p[2] >= arcKeep[a]).map(p => [p[0], p[1]])),
+    arcs: pre.arcs.map((arc, a) => densify(arc.filter(p => p[2] >= arcKeep[a]).map(p => [p[0], p[1]]))),
   })
 
   // An area whose simplified shape would draw inside out (d3-geo reads a ring

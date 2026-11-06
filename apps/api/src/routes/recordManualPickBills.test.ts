@@ -1,7 +1,7 @@
 /**
  * 10/14 (Nic) — each bill is paid on its own at the desk.
  *
- * "we set it up previously where somebody with two spaces, like Kevin Black,
+ * "we set it up previously where somebody with two spaces, like Wilda Yeardley,
  * could pay each invoice separately, but not partial of those invoices, but
  * was not required to pay both invoices together ... we also need to be able
  * to log each separate bill as one payment ... the only thing I wanted paid

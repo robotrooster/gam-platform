@@ -385,6 +385,13 @@ export function InviteTenantModal({ onClose }: Props) {
     // the lease; the rest are co-tenants on it.
     inviteMut.mutate({ property: null, unit: {
       ...people[0], residents: people, unitId: form.unitId,
+      // 10/28: the group this unit was picked from IS the landlord's answer.
+      // The occupied spaces sit in their own group named "Taking over an
+      // occupied spot" (10/26), so choosing one is choosing a takeover — and
+      // until today the server refused every one of them, because nothing said
+      // so. The browser never names the lease being replaced: the space and the
+      // start date decide that server-side.
+      ...((takeovers as any[]).some(u => u.id === form.unitId) ? { takeover: true } : {}),
       ...(screenMode === 'returning' ? { returningResident: true } : {}),
       ...(screenMode === 'sitting' ? { existingResident: true } : {}),
       homeSale: askSale && homeSale ? homeSalePayload(homeSale) : undefined,

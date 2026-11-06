@@ -37,10 +37,10 @@ async function seed(signerName: string | null) {
 
 describe('the name printed under the landlord signature', () => {
   it('is the on-site person when the property routes signing to them', async () => {
-    const { landlordId, propertyId } = await seed('Lisa Scheeler')
+    const { landlordId, propertyId } = await seed('Calla Fitzhugh')
     const signer = await landlordSigningContact(landlordId, { propertyId })
     // what the prefill now uses
-    expect(signer!.name).toBe('Lisa Scheeler')
+    expect(signer!.name).toBe('Calla Fitzhugh')
     // and NOT the account owner, which is what it used to print
     expect(signer!.name).not.toBe(`${signer!.firstName} ${signer!.lastName}`)
   })
@@ -52,7 +52,7 @@ describe('the name printed under the landlord signature', () => {
   })
 
   it('is never the entity — an LLC does not sign, its agent does', async () => {
-    const { landlordId, propertyId } = await seed('Lisa Scheeler')
+    const { landlordId, propertyId } = await seed('Calla Fitzhugh')
     const signer = await landlordSigningContact(landlordId, { propertyId })
     expect(signer!.name).not.toContain('LLC')
   })

@@ -69,7 +69,7 @@ type Policy = {
   initialType?: 'flat' | 'percent_of_rent'
   accrualAmount?: number | null
   accrualType?: 'flat' | 'percent_of_rent'
-  accrualPeriod?: 'daily' | 'weekly' | 'monthly'
+  accrualPeriod?: 'daily' | 'weekly'
   accrualFrom?: 'grace_end' | 'due_date' | 'due_date_inclusive'
   capAmount?: number | null
   capType?: 'flat' | 'percent_of_rent'

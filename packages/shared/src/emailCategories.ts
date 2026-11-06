@@ -16,7 +16,7 @@
  * `send()` in services/email.ts, and about fifty of its callers never touch
  * `createNotification` at all — they are senders in their own right, each
  * stamping a `category` on the log row. Those categories were invisible to the
- * catalog, the settings pages, the compiler and the completeness test. Blu Haws
+ * catalog, the settings pages, the compiler and the completeness test. Hollis Harkness
  * answered every box on his page (90 rows, 0 emailing, read out of `gam`) and
  * the 7am overdue digest, the monthly bill, the payment receipt, the signing
  * request, the three signing reminders and the monthly property report all kept
@@ -193,7 +193,9 @@ export const EMAIL_CATEGORY_RULES: Readonly<Record<string, EmailCategoryRule>> =
   invoice_ready: { label: 'Your bill is ready', gate: 'invoice_ready' },
   payment_receipt: { label: 'Receipt for a payment', gate: 'payment_receipt' },
   balance_due_reminder: { label: 'Reminder of what you owe', gate: 'balance_due_reminder' },
+  flexdeposit_offer: { label: 'Your deposit can be split into payments', gate: 'flexdeposit_offer' },
   monthly_property_report: { label: 'Monthly property report', gate: 'monthly_property_report' },
+  owner_statement: { label: 'Owner statement', gate: 'owner_statement' },
   esign_signing_request: { label: 'Something is waiting for your signature', gate: 'esign_request' },
   esign_signing_reminder: { label: 'Reminder: something is waiting for your signature', gate: 'esign_request' },
   esign_signing_completed: { label: 'A document is fully signed', gate: 'esign_completed' },

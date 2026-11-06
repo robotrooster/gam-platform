@@ -24,7 +24,7 @@
  * Four of the remaining rows are not reservations at all, and importing them as
  * stays would be wrong in a way that costs somebody money:
  *
- *   Ray Artiaga (site 9), Bill Geisman's widow (MH 26), Brandon Valdez
+ *   Quinlan Thrushwood (site 9), Bill Geisman's widow (MH 26), Ivey Ingersoll
  *   (MH 17), Rick Moran (site not yet settled) — all long-term, and three of
  *   them on work trade. A stay's money is taken up front at the counter; a
  *   resident's rent is billed every month against a lease. Imported as stays

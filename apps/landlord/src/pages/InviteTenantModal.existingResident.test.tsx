@@ -47,7 +47,7 @@ vi.mock('../lib/api', () => ({
     server.posts.push({ url, body })
     if (url === '/tenants/invite') {
       return { success: true, data: { leaseDrafted: true, draftBlocked: [], people: [
-        { email: body.email, name: 'Kay Howard', inviteSent: false, alreadyOnPlatform: false, needsOwnSignature: false },
+        { email: body.email, name: 'Verity Winthrop', inviteSent: false, alreadyOnPlatform: false, needsOwnSignature: false },
       ] } }
     }
     throw new Error(`unexpected POST ${url}`)
@@ -138,9 +138,9 @@ async function toUnitStep() {
   })
   await until(() => text().includes('Primary resident'), 'the invite form')
   const [first, last, email] = inputs()
-  await type(first, 'Kay')
-  await type(last, 'Howard')
-  await type(email, 'kay@example.test')
+  await type(first, 'Verity')
+  await type(last, 'Winthrop')
+  await type(email, 'verity@example.test')
   await press(/^Next/)
   await until(() => text().includes('A12'), 'the unit list')
   const row = [...host.querySelectorAll('div')].find(d =>

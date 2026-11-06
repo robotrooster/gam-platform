@@ -8,7 +8,7 @@
  * quietly stop matching.
  */
 import type { BackgroundProvider, BackgroundProviderWebhookUpdate } from './backgroundProvider'
-import { query, queryOne } from '../db'
+import { query, queryOne, getClient } from '../db'
 import { SCREENING_VALID_INTERVAL_SQL } from '@gam/shared'
 import { archiveProviderPayload } from './backgroundReportArchive'
 import { isPoolIntakeLandlord } from './poolIntake'
@@ -124,6 +124,34 @@ export async function applyProviderUpdate(args: {
       source: 'webhook', eventType: args.eventType ?? null,
       payload: args.rawWebhookBody,
     })
+  }
+
+  // ── 10/29 (Nic): THE LICENCE CHECKR READ GOES IN OUR SYSTEM TOO ─────────
+  //
+  //   "We need to take all the licenses that are uploaded into Checker and run
+  //    them in our system. With the identity verification on, the person has
+  //    to take a selfie of their identification."
+  //
+  // The ID scan rides every order and returns the card's number, birthday,
+  // name and issuing state — read off the document by Checkr and checked
+  // against a selfie, which is a better record than anything a desk types.
+  // It has been archived and never read. Filed here, into the same table the
+  // front-desk capture writes to, so the left-owing matcher asks ONE question
+  // of everybody however they were identified.
+  //
+  // Best-effort: a screening must never fail to post because an identification
+  // could not be filed. The catch-up script re-files anything missed.
+  try {
+    const { fileCheckrIdentity } = await import('./checkrIdentity')
+    const c = await getClient()
+    try {
+      await c.query('BEGIN')
+      await fileCheckrIdentity({ client: c, backgroundCheckId: check.id })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e } finally { c.release() }
+  } catch (e) {
+    logger.error({ err: e, background_check_id: check.id },
+      '[checkr-identity] the ID scan could not be filed')
   }
 
   // Speculative path: complete → pool (if eligible). No landlord decision step.

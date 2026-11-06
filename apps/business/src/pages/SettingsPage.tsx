@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { apiDelete, apiGet, apiPatch, apiPost } from '../lib/api'
+import { PasskeySettings } from '../../../../packages/shared-ui/Passkeys'
 import { useAuth } from '../context/AuthContext'
 import {
   BUSINESS_TYPES, BUSINESS_TYPE_LABEL, BusinessType,
@@ -147,6 +148,16 @@ export function SettingsPage() {
         </div>
       )}
 
+      {/* 10/30 (Nic): "a passkey replaces the emailed code; password + code
+          stays the fallback." ONE list for the whole platform — in production
+          every portal is a subdomain of one apex, so a device added here also
+          opens the register and GAM Books. Not gated on `biz`: this is the
+          person's own sign-in, not the business's configuration, and staff who
+          never load a business still need it. */}
+      <div style={{ maxWidth: 640, marginTop: 24 }}>
+        <PasskeySettings api={passkeyApi} />
+      </div>
+
       {biz && <StripeConnectSection biz={biz} />}
       {biz && <TaxSection biz={biz} setBiz={setBiz} />}
       {biz && <ServiceTimeSection biz={biz} setBiz={setBiz} />}
@@ -159,6 +170,14 @@ export function SettingsPage() {
       {biz && <FeaturesSection biz={biz} setBiz={setBiz} />}
     </div>
   )
+}
+
+// The shared passkey card speaks this portal's API client: apiPost hands back
+// the whole envelope and the card wants the payload.
+const passkeyApi = {
+  get:  (url: string) => apiGet(url),
+  post: (url: string, body?: any) => apiPost(url, body).then((r: any) => r.data),
+  del:  (url: string) => apiDelete(url),
 }
 
 // S536 (Nic): who pays card processing fees — the business (netted

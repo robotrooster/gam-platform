@@ -356,7 +356,7 @@ describe('a stay on a pay link', () => {
 describe('an emailed pay link on the open list', () => {
   // 10/17 (Nic): the link HOLDS ITS RESERVATION, as every link that sells a
   // stay has since the site came off the board when the link is sent. This
-  // fixture used to leave booking_id null — the Andres Razo shape, whose name
+  // fixture used to leave booking_id null — the Cora Castellan shape, whose name
   // it still carries: "somebody paid for a week, um, and it did not generate a
   // stay to occupy a site." A link in that state can no longer be made, and the
   // register now refuses to settle one (routes/pos), so a fixture built that way
@@ -370,13 +370,13 @@ describe('an emailed pay link on the open list', () => {
       `INSERT INTO unit_bookings (unit_id, landlord_id, guest_name, guest_email, lease_type,
                                   check_in, check_out, booked_check_out, nights, total_amount,
                                   status, source)
-       VALUES ($1,$2,'Andres Razo','razo@example.com','nightly',
+       VALUES ($1,$2,'Cora Castellan','castellan@example.com','nightly',
                '2027-02-01','2027-02-02','2027-02-02',1,589,'tentative','pay_link')
        RETURNING id`, [unitId, f.landlordId]))[0].id
     return (await query<{ id: string }>(
       `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items, subtotal, total, customer_name, customer_email, booking_id)
        VALUES (md5(random()::text) || md5(random()::text), $1, $2,
-               (SELECT user_id FROM landlords WHERE id = $1), 'one_time', '2 items', $3::jsonb, 649.72, 649.72, 'Andres Razo', 'razo@example.com', $4)
+               (SELECT user_id FROM landlords WHERE id = $1), 'one_time', '2 items', $3::jsonb, 649.72, 649.72, 'Cora Castellan', 'castellan@example.com', $4)
        RETURNING id`,
       [f.landlordId, f.propertyId, JSON.stringify([
         { id: f.stayItemId, cat: 'Stays', name: 'RV site — nightly', qty: 1, price: 589, tax: 0 },
@@ -393,7 +393,7 @@ describe('an emailed pay link on the open list', () => {
     const kinds = res.body.data.map((r: any) => r.kind).sort()
     expect(kinds).toEqual(['pay_link', 'ticket'])
     const row = res.body.data.find((r: any) => r.kind === 'pay_link')
-    expect(row).toMatchObject({ id: link, customerName: 'Andres Razo' })
+    expect(row).toMatchObject({ id: link, customerName: 'Cora Castellan' })
     expect(row.note).toMatch(/Emailed pay link/)
   })
 
@@ -517,9 +517,9 @@ describe('an emailed pay link on the open list', () => {
   })
 })
 
-// ── 10/2: the Scott Duffy ticket ───────────────────────────────────────────
+// ── 10/2: the Ulyssa Yoxall ticket ───────────────────────────────────────────
 //
-// Live, 10/2: Scott Duffy had two invites at Mountain View (both cancelled) and
+// Live, 10/2: Ulyssa Yoxall had two invites at Mountain View (both cancelled) and
 // no lease. A ticket for his propane could not be cleared or charged, and the
 // reader would not show it: "That resident is not at one of this company's
 // properties." The person at the register is never gated on residency.
@@ -545,27 +545,27 @@ const showOnReader = (f: any, readerId: string, body: any) =>
   request(buildApp()).post(`/api/pos/terminal/readers/${readerId}/cart`).set('Authorization', `Bearer ${f.token}`).send({ propertyId: f.propertyId, ...body })
 const openTickets = async (f: any) => query<any>(`SELECT id, items, tenant_id, pos_customer_id FROM pos_open_tickets WHERE landlord_id = $1 AND status = 'open'`, [f.landlordId])
 
-describe('10/2 a person on a ticket is never gated on residency — the Scott Duffy ticket', () => {
+describe('10/2 a person on a ticket is never gated on residency — the Ulyssa Yoxall ticket', () => {
   it('a tenant with only cancelled invites here: the ticket saves, reopens by name, shows on the reader, goes back on Clear, and charges', async () => {
     const f = await seed()
-    const scott = await tenantNamed('Scott', 'Duffy')
+    const ulyssa = await tenantNamed('Ulyssa', 'Yoxall')
     await query(`INSERT INTO pending_tenant_intents (landlord_id, tenant_id, property_id, cancelled_at) VALUES ($1,$2,$3,NOW()), ($1,$2,NULL,NOW())`,
-      [f.landlordId, scott, f.propertyId])
+      [f.landlordId, ulyssa, f.propertyId])
 
     // Saves.
-    const t = await writeTicket(f, { posCustomerId: null, tenantId: scott })
+    const t = await writeTicket(f, { posCustomerId: null, tenantId: ulyssa })
     expect(t.status, JSON.stringify(t.body)).toBe(201)
     // Reopens, fresh, with his name for the chip.
     const opened = await getTicket(f, t.body.data.id)
     expect(opened.status, JSON.stringify(opened.body)).toBe(200)
-    expect(opened.body.data).toMatchObject({ id: t.body.data.id, kind: 'ticket', tenantId: scott, customerName: 'Scott Duffy' })
+    expect(opened.body.data).toMatchObject({ id: t.body.data.id, kind: 'ticket', tenantId: ulyssa, customerName: 'Ulyssa Yoxall' })
     // Shows on the reader, by name; comes down again.
     const readerId = await readerFor(f)
-    const shown = await showOnReader(f, readerId, { items: [propane(f)], tenantId: scott })
+    const shown = await showOnReader(f, readerId, { items: [propane(f)], tenantId: ulyssa })
     expect(shown.status, JSON.stringify(shown.body)).toBe(200)
     expect(shown.body.data.shown).toBe(true)
-    expect(showCartOnReaderMock.mock.calls[0][0].who).toBe('Scott Duffy')
-    const down = await showOnReader(f, readerId, { items: [], tenantId: scott })
+    expect(showCartOnReaderMock.mock.calls[0][0].who).toBe('Ulyssa Yoxall')
+    const down = await showOnReader(f, readerId, { items: [], tenantId: ulyssa })
     expect(down.status).toBe(200)
     expect(clearCartOnReaderMock).toHaveBeenCalledTimes(1)
     // Clear puts the same ticket back — no second ticket.
@@ -574,10 +574,10 @@ describe('10/2 a person on a ticket is never gated on residency — the Scott Du
     expect((await openTickets(f)).map((r: any) => r.id)).toEqual([t.body.data.id])
     // Charges.
     const sale = await request(buildApp()).post('/api/pos/transactions').set('Authorization', `Bearer ${f.token}`)
-      .send({ items: [propane(f)], paymentMethod: 'cash', propertyId: f.propertyId, tenantId: scott, openTicketId: t.body.data.id })
+      .send({ items: [propane(f)], paymentMethod: 'cash', propertyId: f.propertyId, tenantId: ulyssa, openTicketId: t.body.data.id })
     expect(sale.status, JSON.stringify(sale.body)).toBe(201)
     const [tx] = await query<any>(`SELECT tenant_id, open_ticket_id FROM pos_transactions`)
-    expect(tx).toEqual({ tenant_id: scott, open_ticket_id: t.body.data.id })
+    expect(tx).toEqual({ tenant_id: ulyssa, open_ticket_id: t.body.data.id })
     expect(await openTickets(f)).toHaveLength(0)
   })
 

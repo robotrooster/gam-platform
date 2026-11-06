@@ -6,7 +6,7 @@
  * message id, and thrown away — no delivered event, no bounced event, nothing
  * to contradict a send log that reads like success.
  *
- * That is how thirteen emails to Rashawn Bump vanished between 2026-08-29 and
+ * That is how thirteen emails to Phaedra Stanhope vanished between 2026-08-29 and
  * 2026-09-19: invitations, reminders, and two lease signing requests, all
  * logged 'sent'. From the landlord's side a tenant was ignoring him for three
  * weeks. Nobody could have seen it from inside GAM, because GAM never asked the

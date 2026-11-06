@@ -1,7 +1,7 @@
 /**
  * S652 — Re-draft ONE installment contract with the sheet's remaining terms.
  *
- * Nic: Troy Street (MH 22) "has wrong payoff dates for the installment contract
+ * Nic: Delphine Illingworth (MH 22) "has wrong payoff dates for the installment contract
  * … if he signed it the way it reads now, his would be paid off." Blu typed the
  * ORIGINAL 2018 contract (120 × $75) over the prefilled remaining schedule; the
  * paper is the record, so the paper has to say what is left: N payments of $M

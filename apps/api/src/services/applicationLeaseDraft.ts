@@ -45,7 +45,7 @@ export async function draftLeaseFromApplication(
     // The applicant's desired_term_months is their own guess on the application
     // form. It used to be handed through as the lease term, which computed a
     // hard month-end end date and set lease_type = 'fixed_term' — the same
-    // defect that put a 2027-01-31 end date on James Fenton's RV 15 lease via
+    // defect that put a 2027-01-31 end date on Juno Kendrew's RV 15 lease via
     // the screening door (routes/background draftLeaseForApprovedCheck). Both
     // doors now draft month-to-month; the number stays on unit_applications,
     // which is where the follow-up prompt reads it from.

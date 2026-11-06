@@ -253,10 +253,14 @@ export async function withdrawSublessorCredit(args: {
     await client.query('BEGIN')
     // Lock the rows we're touching to prevent concurrent withdrawals
     // from over-drawing.
+    // `balance::text` KEPT ITS OWN NAME and ORDER BY then meant the text, so
+    // the draw-down ran in lexical order: '900.00' ahead of '1000.00' because
+    // '9' sorts after '1'. Largest-first is the point of the ORDER BY, so the
+    // cast is aliased away from the column and the sort can only mean numeric.
     const balanceRows = await client.query<{
-      id: string; balance: string;
+      id: string; bal: string;
     }>(
-      `SELECT id, balance::text
+      `SELECT id, balance::text AS bal
          FROM sublessor_credit_balances
         WHERE sublessor_tenant_id = $1 AND balance > 0
         ORDER BY balance DESC, updated_at ASC
@@ -267,7 +271,7 @@ export async function withdrawSublessorCredit(args: {
     let remaining = requested
     for (const row of balanceRows.rows) {
       if (remaining <= 0) break
-      const rowBal = Number(row.balance)
+      const rowBal = Number(row.bal)
       const take = Math.min(remaining, rowBal)
       const newBal = Math.round((rowBal - take) * 100) / 100
       await client.query(

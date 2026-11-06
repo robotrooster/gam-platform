@@ -22,6 +22,9 @@ type PaymentCsvRow = {
   resolvedLeaseId?: string
   resolvedUnitId?: string
   resolvedVia?: 'email' | 'name'
+  // 11/1: a line with no lease is matched to the SPACE instead and recorded as
+  // that space's past income — no bill, nobody charged.
+  historyOnly?: boolean
   issues: CsvIssue[]
 }
 type ValidateResponse = {
@@ -30,6 +33,19 @@ type ValidateResponse = {
 }
 type CommitResponse = {
   committed: number
+  /**
+   * 11/1 (Nic): the lines that had no lease behind them — an RV guest, a short
+   * stay — recorded as the space's own past income instead of on the rent rail.
+   * Reported separately so the screen can say plainly what went where.
+   */
+  pastIncome?: {
+    recorded: number
+    withPerson: number
+    withoutPerson: number
+    profilesCreated: number
+    refused: Array<{ row: number; why: string }>
+    batchId: string
+  } | null
   /** S296: true when this platform + import_type slot has not yet
    *  been marked verified by super admin. Triggers the review
    *  banner on the success page. Replaces S295's firstFive flag. */
@@ -83,6 +99,11 @@ export function PaymentHistoryOnboardingPage() {
   const [errorMsg, setErrorMsg] = useState<string>('')
   const [successBanner, setSuccessBanner] = useState<string>('')
   const [reviewBanner, setReviewBanner] = useState<{ platform: string } | null>(null)
+  // 11/1: lines of past income the import would not take, and why. Never a
+  // silent drop — an income import that quietly loses a line is worse than one
+  // that refuses it out loud.
+  const [pastIncomeRefused, setPastIncomeRefused] =
+    useState<Array<{ row: number; why: string }> | null>(null)
   // S297: free-text claim required on generic uploads.
   const [claimedPlatformName, setClaimedPlatformName] = useState<string>('')
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -144,8 +165,28 @@ export function PaymentHistoryOnboardingPage() {
     {
       onSuccess: (res: any) => {
         const d: CommitResponse = res.data
-        const paymentWord = d.committed === 1 ? 'payment' : 'payments'
-        setSuccessBanner(`${d.committed} historical ${paymentWord} imported.`)
+        // Two kinds of line can be in one file, so the banner says which went
+        // where rather than one number that hides half the import.
+        const parts: string[] = []
+        if (d.committed > 0) {
+          parts.push(`${d.committed} ${d.committed === 1 ? 'payment' : 'payments'} against leases`)
+        }
+        const past = d.pastIncome
+        if (past && past.recorded > 0) {
+          const named = past.withoutPerson > 0
+            ? ` (${past.withPerson} matched to a customer, ${past.withoutPerson} against the space alone)`
+            : ''
+          parts.push(`${past.recorded} recorded as past income for ${past.recorded === 1 ? 'a space' : 'their spaces'}${named}`)
+        }
+        setSuccessBanner(
+          parts.length > 0
+            ? `Imported: ${parts.join(', and ')}. Nobody was billed — this is money you already collected.`
+            : 'Nothing was imported.')
+        if (past && past.refused.length > 0) {
+          setPastIncomeRefused(past.refused)
+        } else {
+          setPastIncomeRefused(null)
+        }
         if (d.escalateToSuperAdmin) {
           const label = PLATFORM_OPTIONS.find(p => p.value === source)?.label || source
           setReviewBanner({ platform: label })
@@ -267,8 +308,35 @@ export function PaymentHistoryOnboardingPage() {
           <div style={{ flex: 1 }}>
             <strong>{successBanner}</strong>
             <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 4 }}>
-              Review them on the <a href="/payments" style={{ color: 'var(--gold)' }}>Payments page</a>.
+              Payments against leases are on the{' '}
+              <a href="/payments" style={{ color: 'var(--gold)' }}>Payments page</a>.
+              Past income shows on your <a href="/reports" style={{ color: 'var(--gold)' }}>P&amp;L</a>{' '}
+              for the month it happened in, as “Collected before GAM”.
             </div>
+          </div>
+        </div>
+      )}
+
+      {pastIncomeRefused && pastIncomeRefused.length > 0 && (
+        <div style={{
+          padding: 14, marginBottom: 16, background: 'var(--bg-2)',
+          borderLeft: '3px solid #f59e0b', borderRadius: 6,
+          fontSize: '.9rem', color: 'var(--text-0)',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+            <AlertTriangle size={18} style={{ color: '#f59e0b', flexShrink: 0 }} />
+            <strong>
+              {pastIncomeRefused.length} {pastIncomeRefused.length === 1 ? 'line was' : 'lines were'} not
+              imported
+            </strong>
+          </div>
+          <ul style={{ margin: 0, paddingLeft: 26, color: 'var(--text-2)', fontSize: '.84rem' }}>
+            {pastIncomeRefused.map(r => (
+              <li key={r.row} style={{ marginBottom: 2 }}>Line {r.row}: {r.why}</li>
+            ))}
+          </ul>
+          <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 8 }}>
+            Everything else on the file went in. Fix these and upload just them.
           </div>
         </div>
       )}

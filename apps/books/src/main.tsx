@@ -67,6 +67,7 @@ import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from 'reac
 import axios from 'axios'
 import { formatCurrency, applyCamelizeInterceptor, humanize, UNIT_STATUS_LABEL, MONEY_COLUMN_LABEL, installPrintLightTheme } from '@gam/shared'
 import { DialogHost } from './components/dialogs'
+import { PasskeySignIn } from '../../../packages/shared-ui/Passkeys'
 import {
   rentRollVariance, rentPayers, loadErrorText,
   companyChoiceState, companyName, type CompanyChoice,
@@ -92,6 +93,18 @@ api.interceptors.request.use(c=>{ let cid:string|null=null; try{ cid=localStorag
 applyCamelizeInterceptor(api)
 const get=<T,>(url:string)=>api.get<{success:boolean;data:T}>(url).then(r=>r.data.data)
 
+// 10/30 (Nic): "a passkey replaces the emailed code." The shared component
+// speaks this portal's own client; nothing in Books had needed a POST or a
+// DELETE helper. 10/31: Books names its gold button `bp`, not `btn-primary`
+// (this stylesheet predates the long names), so it has to say so or the one
+// control the feature IS paints no background at all.
+const passkeyApi = {
+  get:  (url:string) => get<any>(url),
+  post: (url:string, body?:any) => api.post(url, body).then(r=>r.data?.data ?? r.data),
+  del:  (url:string) => api.delete(url).then(r=>r.data),
+}
+const PASSKEY_CLASSES = { button:'bp btn', buttonSmall:'bp btn bsm', buttonGhost:'bg-btn btn bsm' }
+
 // S568 (Nic): NO admins in the customer Books portal — GAM's own platform
 // bookkeeping lives on the super-admin side. Books is for landlords + their
 // bookkeepers + business/POS operators.
@@ -106,6 +119,10 @@ interface AuthCtx{user:AuthUser|null;loading:boolean;activeClientId:string|null;
   loginWithTotp:(totpSession:string,code:string)=>Promise<void>
   loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>
   resendEmailOtp:(emailOtpSession:string)=>Promise<void>
+  // 10/30 (Nic): "a passkey replaces the emailed code." The server has already
+  // verified the device and minted a FULL pass, so there is no second step to
+  // pivot into — acceptPass stores it exactly as the code step's.
+  loginWithPasskey:(session:{token:string;user?:unknown})=>Promise<void>
   logout:()=>void}
 const toAuthUser=(u:any):AuthUser=>({id:u.id,email:u.email,role:u.role,firstName:u.firstName||'',lastName:u.lastName||'',landlordId:u.landlordId||undefined})
 const Ctx=createContext<AuthCtx>(null!)
@@ -215,6 +232,13 @@ function AuthProvider({children}:{children:React.ReactNode}){
   const resendEmailOtp=async(emailOtpSession:string)=>{
     await axios.post(`${API}/api/auth/email-otp/resend`,{emailOtpSession})
   }
+  // 10/30 (Nic): a passkey sign-in. routes/passkeys.ts has already checked the
+  // challenge, the origin, the relying party, the signature and the sign count,
+  // and portal 'books' refused anyone Books does not serve before any of this
+  // reached the browser. acceptPass does the rest, cache wipe included.
+  const loginWithPasskey=async(session:{token:string;user?:unknown})=>{
+    await acceptPass(session.token)
+  }
   const setActiveClient=(id:string,name:string)=>{
     try{
       localStorage.setItem(CLIENT_KEY,id)
@@ -234,116 +258,29 @@ function AuthProvider({children}:{children:React.ReactNode}){
     return()=>window.removeEventListener(CLIENT_GONE,gone)
   },[])
   const activeClientName=readStore(CLIENT_NAME_KEY)
-  return<Ctx.Provider value={{user,loading,activeClientId,activeClientName,setActiveClient,clearActiveClient,login,loginWithTotp,loginWithEmailOtp,resendEmailOtp,logout}}>{children}</Ctx.Provider>
+  return<Ctx.Provider value={{user,loading,activeClientId,activeClientName,setActiveClient,clearActiveClient,login,loginWithTotp,loginWithEmailOtp,resendEmailOtp,loginWithPasskey,logout}}>{children}</Ctx.Provider>
 }
 
 const qc=new QueryClient({defaultOptions:{queries:{retry:1,staleTime:15000}}})
 
 // ── STYLES ────────────────────────────────────────────────────────────
-const css=`
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg0:#080a0c;--bg1:#0d1014;--bg2:#121519;--bg3:#181c22;--bg4:#1e2330;
-  --b0:#1a1f28;--b1:#222a38;--b2:#2a3547;
-  --t0:#eef0f6;--t1:#b8c4d8;--t2:#7a8aaa;--t3:#475060;
-  --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;--purple:#a855f7;--teal:#14b8a6;
-  --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace
-}
-html{-webkit-font-smoothing:antialiased;height:100%}
-body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
-h1,h2,h3{font-family:var(--font-d);color:var(--t0);line-height:1.2}
-button{cursor:pointer;font-family:var(--font-b)}input,select,textarea{font-family:var(--font-b)}
-.shell{display:flex;height:100vh;overflow:hidden}
-.sidebar{width:230px;flex-shrink:0;background:var(--bg1);border-right:1px solid var(--b0);position:fixed;top:0;left:0;bottom:0;z-index:50;display:flex;flex-direction:column;overflow-y:auto}
-.main{flex:1;margin-left:230px;height:100vh;display:flex;flex-direction:column;min-width:0;overflow:hidden}
-.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40;gap:12px;flex-shrink:0}
-.page{flex:1;min-height:0;padding:28px;max-width:1600px;width:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:none}
-.logo{padding:18px;border-bottom:1px solid var(--b0)}
-.logo-n{font-family:var(--font-d);font-size:1.05rem;font-weight:800;color:var(--gold)}
-.logo-s{font-size:.65rem;color:var(--t3);margin-top:2px;text-transform:uppercase;letter-spacing:.1em}
-.nav{padding:10px;flex:1}
-.nl{font-size:.62rem;color:var(--t3);text-transform:uppercase;letter-spacing:.12em;padding:10px 8px 4px;font-weight:600}
-.ni{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:7px;color:var(--t2);font-size:.82rem;font-weight:500;transition:all .12s;width:100%;background:none;border:none;cursor:pointer;text-decoration:none}
-.ni:hover{background:var(--bg3);color:var(--t0)}
-.ni.active{background:rgba(201,162,39,.1);color:var(--gold);border:1px solid rgba(201,162,39,.2)}
-.sfooter{padding:10px;border-top:1px solid var(--b0)}
-.card{background:var(--bg2);border:1px solid var(--b1);border-radius:10px;padding:18px}
-.ct{font-size:.72rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.07em;margin-bottom:14px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
-.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-@media(max-width:1100px){.grid4{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:800px){.grid2,.grid3,.grid4{grid-template-columns:1fr}}
-.ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding-bottom:14px;border-bottom:1px solid var(--b0);flex-wrap:wrap;gap:10px}
-.pt{font-family:var(--font-d);font-size:1.4rem;font-weight:800;color:var(--t0)}
-.ps{font-size:.78rem;color:var(--t3);margin-top:2px}
-.kpi{background:var(--bg2);border:1px solid var(--b1);border-radius:10px;padding:16px;position:relative;overflow:hidden}
-.kpi::after{content:'';position:absolute;bottom:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--gold),transparent);opacity:.4}
-.kl{font-size:.65rem;color:var(--t3);text-transform:uppercase;letter-spacing:.09em;font-weight:600;margin-bottom:6px}
-.kv{font-family:var(--font-d);font-size:1.6rem;font-weight:800;color:var(--t0);line-height:1;margin-bottom:4px}
-.ks{font-size:.7rem;color:var(--t3)}
-.kv.g{color:var(--green)}.kv.r{color:var(--red)}.kv.a{color:var(--amber)}.kv.gold{color:var(--gold)}.kv.b{color:var(--blue)}.kv.t{color:var(--teal)}
-.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:7px;font-size:.78rem;font-weight:600;border:none;cursor:pointer;transition:all .12s;font-family:var(--font-b);text-decoration:none}
-.bp{background:var(--gold);color:#080a0c}.bp:hover{background:#d9af3a}
-.bg-btn{background:var(--bg4);color:var(--t1);border:1px solid var(--b2)}.bg-btn:hover{background:var(--bg3)}
-.bd{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.2)}.bd:hover{background:rgba(239,68,68,.14)}
-.bt{background:rgba(20,184,166,.08);color:var(--teal);border:1px solid rgba(20,184,166,.2)}
-.bsm{padding:4px 9px;font-size:.72rem}
-.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:20px;font-size:.65rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
-.bg2{background:rgba(34,197,94,.08);color:var(--green);border:1px solid rgba(34,197,94,.18)}
-.ba{background:rgba(245,158,11,.08);color:var(--amber);border:1px solid rgba(245,158,11,.18)}
-.br{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.18)}
-.bgold{background:rgba(201,162,39,.08);color:var(--gold);border:1px solid rgba(201,162,39,.18)}
-.bmu{background:var(--bg4);color:var(--t3);border:1px solid var(--b1)}
-.bb{background:rgba(59,130,246,.08);color:var(--blue);border:1px solid rgba(59,130,246,.18)}
-.bteal{background:rgba(20,184,166,.08);color:var(--teal);border:1px solid rgba(20,184,166,.18)}
-.tbl{width:100%;border-collapse:collapse;font-size:.78rem}
-.tbl th{background:var(--bg3);color:var(--t3);font-size:.64rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;padding:9px 12px;text-align:left;border-bottom:1px solid var(--b1)}
-.tbl td{padding:9px 12px;border-bottom:1px solid var(--b0);color:var(--t1)}
-.tbl tr:last-child td{border-bottom:none}
-.tbl tr:hover td{background:rgba(255,255,255,.012)}
-.mono{font-family:var(--font-m);font-size:.8rem}
-.alert{display:flex;align-items:flex-start;gap:10px;padding:10px 14px;border-radius:8px;font-size:.78rem;margin-bottom:14px}
-.ae{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.18);color:#fca5a5}
-.aw{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.18);color:#fcd34d}
-.ag{background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.18);color:#86efac}
-.agold{background:rgba(201,162,39,.08);border:1px solid rgba(201,162,39,.18);color:var(--gold)}
-.empty{text-align:center;padding:48px 20px;color:var(--t3)}
-.loading-pg{display:flex;align-items:center;justify-content:center;height:100vh;font-family:var(--font-d);font-size:1.1rem;color:var(--t3)}
-.spinner{width:16px;height:16px;border:2px solid var(--b2);border-top-color:var(--gold);border-radius:50%;animation:spin .6s linear infinite;flex-shrink:0}
-.dr{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--b0);font-size:.78rem}
-.dr:last-child{border-bottom:none}
-.dk{color:var(--t3)}.dv{color:var(--t0);font-weight:500}
-.tabs{display:flex;gap:2px;border-bottom:1px solid var(--b0);margin-bottom:20px}
-.tab{padding:9px 14px;background:none;border:none;color:var(--t3);font-size:.78rem;font-weight:600;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .12s;font-family:var(--font-b)}
-.tab:hover{color:var(--t1)}.tab.on{color:var(--gold);border-bottom-color:var(--gold)}
-/* Modal */
-.overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}
-.modal{background:var(--bg2);border:1px solid var(--b1);border-radius:12px;padding:24px;width:100%;max-width:520px;max-height:90vh;overflow-y:auto}
-.modal-h{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;padding-bottom:14px;border-bottom:1px solid var(--b0)}
-.modal-t{font-family:var(--font-d);font-size:1.1rem;font-weight:700;color:var(--t0)}
-.frow{margin-bottom:14px}
-.frow2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
-label{display:block;font-size:.72rem;font-weight:600;color:var(--t3);margin-bottom:5px;text-transform:uppercase;letter-spacing:.06em}
-/* 10/12: tel too — the Employees, Contractors and Vendors phone boxes were drawn unstyled. */
-input[type=text],input[type=email],input[type=tel],input[type=number],input[type=date],input[type=password],select,textarea{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:7px;color:var(--t0);padding:8px 11px;font-size:.875rem;outline:none;transition:border .12s}
-input:focus,select:focus,textarea:focus{border-color:var(--gold)}
-.factions{display:flex;gap:8px;justify-content:flex-end;margin-top:20px;padding-top:14px;border-top:1px solid var(--b0)}
-@keyframes spin{to{transform:rotate(360deg)}}
-/* S655: the "Money received" / "Money billed" switch */
-.dr-sub .dk{padding-left:14px}
-.bnote{margin-top:10px;font-size:.72rem;color:var(--t3);line-height:1.5}
-/* S655: which company's books (a landlord account with several) */
-.company-pick{max-width:560px}
-.company-pick-list{display:grid;gap:8px;margin-top:16px}
-.company-pick-list .btn{justify-content:space-between;padding:11px 14px;font-size:.84rem;text-align:left;flex-wrap:wrap}
-.company-pick-sub{font-weight:500;font-size:.72rem;opacity:.75}
-`
+// 10/31: out of a JS template literal into a real stylesheet, as admin and
+// the support console were — the phone rules in it carry backticks in their
+// comments and would have closed the literal early.
+import { installTableStacking } from '@gam/shared'
+import './styles/globals.css'
 
 // ── LAYOUT ─────────────────────────────────────────────────────────────
 function Layout(){
   const{user,logout}=useAuth()
   const navigate=useNavigate()
+  // 10/31: the phone drawer, same as every other portal.
+  const [navOpen, setNavOpen] = useState(false)
+  const navLoc = useLocation()
+  React.useEffect(() => { setNavOpen(false) }, [navLoc.pathname])
+  // Column names onto stacked cells. The ledgers opt out with [data-no-stack]
+  // (see the stylesheet) because their columns have to line up to be read.
+  React.useEffect(() => installTableStacking(document.body), [])
   const isAdmin=user?.role==='admin'||user?.role==='super_admin'
   // 10/11: the shared financial pages are about a landlord company's money —
   // its owner and its bookkeeper; business accounts keep their own Books.
@@ -373,7 +310,7 @@ function Layout(){
   },[isBookkeeper,finScope,showPropertyMoney,location.pathname,navigate])
   return(
     <div className="shell">
-      <aside className="sidebar">
+      <aside className={"sidebar" + (navOpen ? " is-open" : "")}>
         <div className="logo">
           <div className="logo-n">📒 GAM Books</div>
           <div className="logo-s">Payroll & Bookkeeping</div>
@@ -456,9 +393,13 @@ function Layout(){
           <button className="ni" onClick={()=>{logout();navigate('/login')}} style={{color:'var(--red)'}}>🚪 Sign out</button>
         </div>
       </aside>
+      {navOpen && <button className="nav-scrim" aria-label="Close menu" onClick={() => setNavOpen(false)} />}
       <div className="main">
         <header className="topbar">
-          <span style={{fontSize:'.72rem',color:'var(--t3)',fontFamily:'var(--font-m)'}}>GAM Books · Professional Accounting</span>
+          <button className="hamburger" onClick={() => setNavOpen(v => !v)}
+                  aria-label="Menu" aria-expanded={navOpen}
+                  style={{fontSize:'1.1rem',lineHeight:1}}>☰</button>
+          <span className="topbar-name" style={{fontSize:'.72rem',color:'var(--t3)',fontFamily:'var(--font-m)'}}>GAM Books · Professional Accounting</span>
           <div style={{marginLeft:'auto',display:'flex',gap:8,alignItems:'center'}}>
             <ClientSwitcher/>
             <span className="badge bgold">Beta</span>
@@ -769,7 +710,7 @@ function usePendingOtpSession(key:string):[string|null,(v:string|null)=>void]{
 
 function LoginPage(){
   React.useEffect(()=>{ localStorage.removeItem(TOKEN); delete api.defaults.headers.common['Authorization'] },[])
-  const{login,loginWithTotp,loginWithEmailOtp,resendEmailOtp}=useAuth();const navigate=useNavigate()
+  const{login,loginWithTotp,loginWithEmailOtp,resendEmailOtp,loginWithPasskey}=useAuth();const navigate=useNavigate()
   const[email,setEmail]=useState('');const[pw,setPw]=useState('');const[err,setErr]=useState('');const[loading,setLoading]=useState(false)
   const[keepSignedIn,setKeepSignedIn]=useState(()=>readKeepSignedInChoice(KEEP_SIGNED_IN_KEY))
   const[totpSession,setTotpSession]=useState<string|null>(null)
@@ -862,9 +803,15 @@ function LoginPage(){
         <div className="card" style={{padding:24}}>
           {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
           <div className="alert agold" style={{marginBottom:20,fontSize:'.75rem'}}>Sign in with your GAM Landlord or Business credentials.</div>
+          {/* 10/30 (Nic): Face ID alone signs you in. Renders nothing on a
+              device with no sensor, so the password form below is exactly what
+              it has always been for everybody else. keepSignedIn is the same
+              choice the password form offers, remembered the same way. */}
+          <PasskeySignIn api={passkeyApi} classes={PASSKEY_CLASSES} portal="books" keepSignedIn={keepSignedIn}
+            onSignedIn={async s=>{ rememberKeepSignedInChoice(KEEP_SIGNED_IN_KEY,keepSignedIn); await loginWithPasskey(s); navigate('/dashboard') }} />
           <form onSubmit={onSubmit}>
-            <div className="frow"><label>Email</label><input type="email" value={email} onChange={e=>setEmail(e.target.value)} autoFocus required/></div>
-            <div className="frow"><label>Password</label><input type="password" value={pw} onChange={e=>setPw(e.target.value)} required/></div>
+            <div className="frow"><label>Email</label><input type="email" value={email} onChange={e=>setEmail(e.target.value)} autoComplete="username webauthn" name="email" autoFocus required/></div>
+            <div className="frow"><label>Password</label><input type="password" value={pw} onChange={e=>setPw(e.target.value)} autoComplete="current-password" name="password" required/></div>
             {/* S655: off by default. Off, this sign-in ends 7 days after it
                 starts, even mid-task; on, it stays signed in while in use. */}
             <label style={{display:'flex',alignItems:'flex-start',gap:8,marginBottom:16,cursor:'pointer',fontSize:'.82rem',color:'var(--t1)',lineHeight:1.45,textTransform:'none',letterSpacing:'normal',fontWeight:400}}>
@@ -965,7 +912,6 @@ function Root(){
   return(
     <QueryClientProvider client={qc}>
       <AuthProvider>
-        <style dangerouslySetInnerHTML={{__html:css}}/>
         <BrowserRouter><App/><DialogHost/></BrowserRouter>
       </AuthProvider>
     </QueryClientProvider>

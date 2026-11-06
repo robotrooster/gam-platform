@@ -35,12 +35,19 @@
  * bills next cycle.
  */
 
-import { METER_USAGE_ALERT_THRESHOLDS, meterReadingModulus } from '@gam/shared'
+import { DateTime } from 'luxon'
+// lastBusinessDay is the TIMEZONE-AWARE one in packages/shared (it walks back
+// over weekends and the computed US federal holidays). The local
+// lastBusinessDayOfMonth below is Phoenix-only and returns a string; both are
+// correct for what they do, and a third must not be written. The month-end
+// reminder needs the property's own calendar, so it uses the shared one.
+import { METER_USAGE_ALERT_THRESHOLDS, meterReadingModulus, lastBusinessDay } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { generateBillsForProperty } from './utilityBilling'
 import { createNotification } from './notifications'
 import { US_FEDERAL_HOLIDAYS } from '../jobs/autoPayouts'
 import { logger } from '../lib/logger'
+import { barelyMovedSql } from './utilityBilling'
 
 const TZ = 'America/Phoenix'
 
@@ -247,6 +254,50 @@ async function notifyReadingRunOpened(
       emailHtml: `The ${monthLabel} meter reading run for <b>${property.name}</b> is open. ${meterCount} meter${meterCount === 1 ? '' : 's'} to read. Open the Utilities page to start.`,
     })
   }
+
+  // ── 10/28 (Nic): THE WORK-TRADE PEOPLE WHO READ METERS GET TOLD TOO ───────
+  //
+  //   "add work trade people with permission to do meter reads on the
+  //    notification list for the meter run. It doesn't need to email them. It
+  //    only needs to be in app."
+  //
+  // They could always read early — nothing gates the walk on a date — but the
+  // month's prompt reached the landlord and their staff only, so the one person
+  // actually walking the meters was never told the run had opened.
+  //
+  // The test is the SAME one the entry gate uses (traderHasFieldPermission): an
+  // ACTIVE agreement on this property carrying 'read_meters'. So the people told
+  // are exactly the people who may do it, and a PAUSED agreement is not told —
+  // nobody reads meters for a landlord while their agreement sleeps, which is
+  // the rule the tenant portal's own nav link follows.
+  const traders = await query<{ user_id: string }>(
+    `SELECT DISTINCT t.user_id
+       FROM work_trade_agreements a
+       JOIN tenants t ON t.id = a.tenant_id
+       JOIN units un ON un.id = a.unit_id
+      WHERE un.property_id = $1 AND a.status = 'active'
+        AND 'read_meters' = ANY(a.field_permissions)`,
+    [property.id])
+
+  const told = new Set(recipients.map(r => r.user_id))
+  for (const t of traders) {
+    if (told.has(t.user_id)) continue
+    await createNotification({
+      userId: t.user_id, landlordId: property.landlord_id,
+      type: 'utility_reading_run_opened',
+      title: `Meter readings open — ${property.name}`,
+      // Their own words for their own job: the walk and how much of it there
+      // is. What the readings go on to bill is the landlord's side of this and
+      // not a field worker's business (blind entry — the walk itself does not
+      // even show them the previous read).
+      body: `${monthLabel} meter reading is open: ${meterCount} meter${meterCount === 1 ? '' : 's'} to read.`,
+      data: { runId, propertyId: property.id, cycleMonth },
+      // The tenant portal's own walk, not the landlord's Utilities page.
+      actionUrl: '/meter-readings',
+      // In-app only, by his instruction. No email, no address passed.
+      sendEmail: false,
+    })
+  }
 }
 
 // ── Progress + completion ────────────────────────────────────────────
@@ -351,7 +402,16 @@ export async function countFlaggedOnRun(runId: string): Promise<number> {
        JOIN utility_meter_readings rd ON rd.meter_id = m.id
                                      AND rd.billing_cycle_month = r.billing_cycle_month
                                      AND rd.reason = 'monthly_cycle' AND rd.needs_review
-      WHERE r.id = $1`, [runId])
+       LEFT JOIN LATERAL (
+         SELECT reading_value, reading_date FROM utility_meter_readings pr
+          WHERE pr.meter_id = rd.meter_id
+            AND (pr.reading_date, pr.created_at) < (rd.reading_date, rd.created_at)
+          ORDER BY pr.reading_date DESC, pr.created_at DESC LIMIT 1) prior ON TRUE
+      WHERE r.id = $1
+        -- 10/31 (Nic): a read inside the reading margin never held a run and
+        -- must not hold one now. RV 37's one-unit drop stopped Mountain View's
+        -- whole October. Same rule the queue applies (barelyMovedSql).
+        AND NOT ${barelyMovedSql('rd')}`, [runId])
   return row?.n ?? 0
 }
 
@@ -393,6 +453,52 @@ export async function settleFlaggedOnRun(propertyId: string, cycleMonth: string,
   return done
 }
 
+/**
+ * ── 10/31 (Nic): A RUN WITH NOTHING LEFT TO REVIEW FINISHES ITSELF ──────────
+ *
+ *   "If there's nothing for a double check, why would I go back in to review
+ *    bills or choose to complete? That process should happen when there are
+ *    automatically no more to review."
+ *
+ * He is right, and until now the ONLY thing that finished a waiting run was
+ * somebody resolving the LAST flagged read (settleFlaggedOnRun). That covered
+ * the ordinary path and nothing else, so a run whose last flag went away any
+ * other way sat in `double_check` forever — telling him on the banner that
+ * every meter was read, that zero readings looked off, and to go and settle
+ * them. Mountain View's October did exactly that.
+ *
+ * It matters more now than it did: whether a read is reviewable is COMPUTED
+ * (countFlaggedOnRun applies the reading margin at read time rather than
+ * trusting the stored flag), so a read can stop being reviewable without anyone
+ * touching it — a corrected prior read is enough.
+ *
+ * What "finishes" means is unchanged and still the landlord's own setting:
+ * completeReadingRun bills and issues where the company does not review its
+ * utility bills, and where it does, it leaves the run waiting and emails that
+ * the bills are ready to approve. This only removes the dead end.
+ */
+export async function finishSettledReadingRuns(): Promise<{ finished: number; waiting: number }> {
+  const runs = await query<{ id: string; landlord_user_id: string }>(`
+    SELECT r.id, u.id AS landlord_user_id
+      FROM utility_reading_runs r
+      JOIN landlords l ON l.id = r.landlord_id
+      JOIN users u ON u.id = l.user_id
+     WHERE r.status = 'double_check'`)
+  let finished = 0
+  let waiting = 0
+  for (const r of runs) {
+    try {
+      if (await countFlaggedOnRun(r.id) > 0) { waiting++; continue }
+      const done = await completeReadingRun(r.id, r.landlord_user_id)
+      if (done?.status === 'completed') { finished++ }
+      else { await tellLandlordBillsAreReady(r.id); waiting++ }
+    } catch (e) {
+      logger.error({ err: e, runId: r.id }, '[reading-runs] finishing a settled run failed')
+    }
+  }
+  return { finished, waiting }
+}
+
 async function tellLandlordReadsNeedReview(runId: string, flagged: number) {
   const r = await queryOne<any>(
     `SELECT r.id, r.property_id, r.billing_cycle_month, p.name, p.landlord_id, u.id AS user_id, u.email
@@ -416,6 +522,140 @@ async function tellLandlordReadsNeedReview(runId: string, flagged: number) {
     emailSubject: `${flagged} meter reading${flagged === 1 ? '' : 's'} to double-check — ${r.name} (${month})`,
     emailHtml: body,
   }).catch(() => {})
+}
+
+/**
+ * ── 11/1 (Nic, DIRECTIVE) — NOBODY GETS BILLED, AND HE HAS TO BE TOLD ────────
+ *
+ *   "we need when a landlord is opted to review things before billing goes out
+ *    and they haven't done it, they need to get emailed the last business day of
+ *    the month plus any following days that are still at the end of the month...
+ *    He should have got an email both Friday and Saturday telling him to check
+ *    that."
+ *
+ * October 2026 is the worked example he gave: the 31st was a Saturday, so the
+ * last business day was Friday the 30th, and he expected a mail on the 30th AND
+ * the 31st. That is the window — last business day of the cycle month through
+ * the last day of it, every day, while a round is still waiting.
+ *
+ * WHY IT IS ITS OWN JOB AND NOT A WIDENING OF finishSettledReadingRuns.
+ * That job already nags daily, but only for a run in `double_check` whose flags
+ * have all gone — `countFlaggedOnRun > 0` takes the `waiting++; continue` branch
+ * and says NOTHING. Country Acres sat in exactly that branch for four days on
+ * one flagged read. It also never looks at a run still `open`. Both hold
+ * invoices identically, because the hold reads
+ * `status <> 'completed' AND approved_at IS NULL` (jobs/invoiceGeneration), so
+ * both have to be chased. Approval is that nullable `approved_at`, not a status
+ * — there is no `approved` status to look for.
+ *
+ * THE CYCLE MONTH IS THE MONTH THAT MATTERS, not next month. A round for
+ * October holds the invoices due November 1st, so October's end is the deadline
+ * and October's calendar is the one to measure. Measured in the PROPERTY's
+ * timezone via the shared timezone-aware helper — Country Acres is Chicago and
+ * GAM's reading crons run on Phoenix time, so the two disagree for two hours a
+ * day and the property's own calendar is the honest one.
+ *
+ * Sent once per round per day: a second run of the job the same day finds the
+ * day's row already there and says nothing again.
+ */
+export async function remindReviewLandlordsBeforeBilling(): Promise<{ reminded: number; waiting: number }> {
+  const runs = await query<{
+    id: string; property_id: string; landlord_id: string; user_id: string; email: string
+    name: string; timezone: string | null; cycle: string; status: string
+  }>(`
+    SELECT r.id, r.property_id, p.landlord_id, u.id AS user_id, u.email, p.name,
+           p.timezone, r.billing_cycle_month::text AS cycle, r.status
+      FROM utility_reading_runs r
+      JOIN properties p ON p.id = r.property_id
+      JOIN landlords l ON l.id = p.landlord_id AND l.review_utility_bills
+      JOIN users u ON u.id = l.user_id
+     WHERE r.status <> 'completed' AND r.approved_at IS NULL`)
+
+  let reminded = 0
+  let waiting = 0
+  for (const r of runs) {
+    try {
+      const tz = r.timezone || 'America/Phoenix'
+      const today = DateTime.now().setZone(tz)
+      const cycle = DateTime.fromISO(r.cycle.slice(0, 10), { zone: tz })
+      // THE WINDOW OPENS ON THE CYCLE MONTH'S LAST BUSINESS DAY AND DOES NOT
+      // CLOSE. Nic asked for "the last business day of the month plus any
+      // following days that are still at the end of the month", which stops at
+      // midnight on the 31st. That is the right place to START and the wrong
+      // place to STOP: an October round still unapproved on November 5th is
+      // still holding twelve households' November bills, and going quiet
+      // exactly when the damage becomes real is the failure we just had. So the
+      // chase continues while the round is unapproved, and the mail says
+      // something different once the month has turned (below). Told to him.
+      const deadline = lastBusinessDay(cycle.year, cycle.month, tz)
+      if (today.startOf('day') < deadline.startOf('day')) { waiting++; continue }
+
+      const alreadyToday = await queryOne<{ x: number }>(
+        `SELECT 1 AS x FROM notifications
+          WHERE user_id = $1 AND type = 'utility_review_blocks_billing'
+            AND data->>'runId' = $2
+            AND (created_at AT TIME ZONE $3)::date = $4::date
+          LIMIT 1`,
+        [r.user_id, r.id, tz, today.toISODate()])
+      if (alreadyToday) { waiting++; continue }
+
+      const flagged = await countFlaggedOnRun(r.id)
+      const month = cycle.toFormat('LLLL yyyy')
+      const last = today.hasSame(cycle.endOf('month'), 'day')
+      const monthGone = today.startOf('day') > cycle.endOf('month').startOf('day')
+      // Once the month has turned, the hold is no longer a warning — it is
+      // already costing him. Count the households actually sitting unbilled so
+      // the mail states the damage rather than the risk.
+      const stuck = monthGone ? (await queryOne<{ n: string }>(
+        `SELECT COUNT(*)::text AS n
+           FROM leases l
+           JOIN units u ON u.id = l.unit_id
+          WHERE u.property_id = $1 AND l.status = 'active'
+            AND NOT EXISTS (
+              SELECT 1 FROM invoices i
+               WHERE i.lease_id = l.id AND i.status <> 'void'
+                 AND i.due_date >= $2::date)`,
+        [r.property_id, cycle.plus({ months: 1 }).startOf('month').toISODate()]))?.n ?? '0' : '0'
+      // Two different jobs for him depending on what is actually in the way, so
+      // the mail tells him what to go and do rather than just that something is
+      // wrong.
+      const todo = flagged > 0
+        ? `${flagged} reading${flagged === 1 ? '' : 's'} still need${flagged === 1 ? 's' : ''} a second look under "Readings to double-check"`
+        + `, and then the round needs your approval`
+        : `the round is read and needs your approval`
+      const body = monthGone
+        ? `${month}'s meter reading round at ${r.name} was never approved, and it is now holding `
+          + `${stuck === '1' ? '1 household' : `${stuck} households`} with no bill at all — no rent, no water. `
+          + `Nothing goes out until you act: ${todo}. Every day this waits is a day of uncollected rent.`
+        : `${month}'s meter reading round at ${r.name} is still waiting on you: ${todo}. `
+          + `Until that is done NOBODY at ${r.name} gets billed for next month — not rent, not water, nothing.`
+          + (last
+            ? ` Today is the last day of the month.`
+            : ` The month ends in ${Math.max(1, Math.round(cycle.endOf('month').diff(today, 'days').days))} day(s).`)
+
+      await createNotification({
+        userId: r.user_id, landlordId: r.landlord_id,
+        type: 'utility_review_blocks_billing',
+        title: monthGone
+          ? `${stuck} household${stuck === '1' ? '' : 's'} unbilled — ${r.name} still needs your review`
+          : `Nobody gets billed until you review — ${r.name}`,
+        body,
+        data: { runId: r.id, propertyId: r.property_id, flagged, cycle: r.cycle.slice(0, 10), unbilled: Number(stuck) },
+        actionUrl: `/utilities?propertyId=${r.property_id}`,
+        sendEmail: true, emailTo: r.email,
+        emailSubject: monthGone
+          ? `${stuck} household${stuck === '1' ? '' : 's'} at ${r.name} have no bill — your review is holding them`
+          : `Action needed — ${month} bills at ${r.name} are on hold`,
+        emailHtml: `<p>${body}</p><p>Open the Utilities page at <b>${r.name}</b>, settle anything flagged, and approve the round.</p>`,
+      })
+      reminded++
+      logger.info({ runId: r.id, property: r.name, flagged, status: r.status },
+        '[reading-runs] told the landlord their review is holding the month\'s bills')
+    } catch (e) {
+      logger.error({ err: e, runId: r.id }, '[reading-runs] month-end review reminder failed')
+    }
+  }
+  return { reminded, waiting }
 }
 
 /** S652: every read is in — the landlord approves before anything goes out. */
@@ -487,6 +727,64 @@ export async function completeReadingRun(runId: string, userId: string, opts: { 
       RETURNING ub.id, ub.charge_amount`,
     [run.property_id, run.billing_cycle_month, run.utility_type])
 
+  // ── 10/31 (Nic): THE ARREARS TRIGGER ────────────────────────────────────
+  //
+  //   "we need the water usage for number 28 to go to the lease that's being
+  //    ended as part of the final expenses... It needs to be able to trigger at
+  //    the meter reading cycle to finalize that move out amount of money."
+  //
+  // Utilities bill in ARREARS, so the last cycle's usage is written AFTER the
+  // tenancy ended and after the handover figure was computed. Country Acres
+  // Lot 28 was frozen at $739.60 the day a replacement signed, and October's
+  // $24.75 landed the next day and never reached it. The deposit return caught
+  // it; the book that follows the resident did not, and it would be short for
+  // every resident who leaves at a cycle boundary — which is most of them.
+  //
+  // This is the moment he named: the reading cycle is the only point at which
+  // GAM knows the final figure exists. The bills for this cycle have just been
+  // written above, so recomputing now is the first time the answer is right.
+  //
+  // Narrow on purpose:
+  //   - leases on THIS property whose tenancy has ended (the ones that can have
+  //     an arrears bill nobody has billed forward);
+  //   - only a `lease` row, which is GAM's own arithmetic over GAM's own money
+  //     rows. An `import` row is a migrated historical balance and stays frozen
+  //     forever ([[gam-left-owing-amount-is-frozen]]) — it is the figure a
+  //     dishonest operator would inflate, and it is a different source_kind, so
+  //     it cannot be reached from here;
+  //   - only while unsettled and untouched by a collection arrangement, so this
+  //     never moves a number somebody is already paying against.
+  //
+  // Never fails the run. A month's bills going out is the thing that must not
+  // break; a figure that did not update is recoverable, and is logged.
+  let arrearsUpdated = 0
+  try {
+    const { whatIsStillOwedOnLease } = await import('./spotSuccession')
+    const ended = await query<{ lease_id: string; owing_id: string; amount: string }>(`
+      SELECT DISTINCT o.source_key AS lease_id, o.id AS owing_id, o.amount::text AS amount
+        FROM tenant_left_owing o
+        JOIN leases l ON l.id::text = o.source_key
+        JOIN units u ON u.id = l.unit_id
+       WHERE u.property_id = $1
+         AND o.source_kind = 'lease'
+         AND o.settled_at IS NULL
+         AND COALESCE(o.collected_amount, 0) = 0`, [run.property_id])
+    for (const row of ended) {
+      const owed = await whatIsStillOwedOnLease({ query }, row.lease_id)
+      if (Math.abs(owed.amount - Number(row.amount)) < 0.005) continue
+      await query(
+        `UPDATE tenant_left_owing SET amount = $2, updated_at = NOW()
+          WHERE id = $1 AND settled_at IS NULL AND COALESCE(collected_amount, 0) = 0`,
+        [row.owing_id, owed.amount.toFixed(2)])
+      arrearsUpdated++
+      logger.info({ owingId: row.owing_id, leaseId: row.lease_id, was: row.amount, now: owed.amount },
+        '[reading-runs] final cycle utilities folded into what the departing resident owes')
+    }
+  } catch (e) {
+    logger.error({ err: e, runId }, '[reading-runs] arrears top-up failed — the month still billed')
+  }
+  if (arrearsUpdated > 0) logger.info({ runId, arrearsUpdated }, '[reading-runs] arrears figures brought current')
+
   const billsCreated = results.reduce((s, r) => s + (r.billsCreated || 0), 0)
   const billedTotal = billed.reduce((s, b) => s + Number(b.charge_amount), 0)
 
@@ -528,7 +826,7 @@ export async function isRunFullyRead(runId: string): Promise<boolean> {
 //
 // 10/18 (Nic): "if there was a final bill and somebody moved out, the system
 // did not alert us to do a meter read. Um, speaking of that, my RV spaces 10
-// and 11, Victor Cardoza and Nemesio Rivera, they paid for a month. They both
+// and 11, Horatio Mapperley and Kestrel Norrington, they paid for a month. They both
 // left early, so I need to get those meter reads."
 //
 // This used to ask who is leaving TODAY — a lease whose end date is today, a
@@ -536,7 +834,7 @@ export async function isRunFullyRead(runId: string): Promise<boolean> {
 // early and you fall out of that question twice over: the stay is already
 // checked out, and its check-out date has moved back to the day the person
 // actually drove off. So the read was never asked for on the one day it was
-// asked for, and never asked for again. Victor and Nemesio left early, and
+// asked for, and never asked for again. Horatio and Kestrel left early, and
 // nobody at Mountain View was ever told to read RV 10 or RV 11.
 //
 // It now asks what the front desk's own reads-due list asks — which departures
@@ -994,4 +1292,62 @@ export async function unitPendingReads(unitId: string) {
               ((d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)) OR d.stay_bills) DESC,
               d.departed_on DESC`,
     [unitId])
+}
+
+/**
+ * 10/31 (Nic) — IS ANYBODY ON THIS METER'S SPACE RIGHT NOW?
+ *
+ * Asked at read entry, to decide whether a plausibility guard has anybody to
+ * protect. The suspicious-usage guard exists so a slipped digit cannot land a
+ * huge charge on a tenant's invoice; on a space with nobody in it there is no
+ * invoice and no tenant, and the flag's only effect is to stop the month for
+ * every other household on the property. Country Acres Lot 8 — never tenanted
+ * in its life — held eleven other lots' water bills for three days.
+ *
+ * It does NOT mean the read is unimportant. A vacant space is read every cycle
+ * on purpose (Nic): "if there's a slow leak somewhere under the trailer or a
+ * drip in the sink, and it sits vacant for 6 months, you don't want the new
+ * person to pay for 6 months of leak usage." The read still lands, still
+ * becomes the next arrival's starting point, and the engine still tells the
+ * landlord when an empty lot's dial moved and nobody could be billed for it
+ * (services/utilityBilling reportUsageNobodyToBill).
+ *
+ * FAILS SAFE. Anything unexpected answers TRUE — occupied, keep the guard. A
+ * wrong "occupied" costs a reading that waits for a human; a wrong "empty"
+ * could let a mistyped read through onto somebody's bill.
+ */
+export async function meterSpaceOccupied(meterId: string): Promise<boolean> {
+  try {
+    const row = await queryOne<{ occupied: boolean }>(`
+      SELECT (
+        -- The landlord's own use of a space counts as occupied: somebody is
+        -- drawing on it and the usage is real.
+        EXISTS (
+          SELECT 1 FROM utility_meter_units mu
+            JOIN units u ON u.id = mu.unit_id
+           WHERE mu.meter_id = $1 AND u.status IN ('owner_use', 'utility_service'))
+        OR EXISTS (
+          SELECT 1 FROM utility_meter_units mu
+            JOIN leases l ON l.unit_id = mu.unit_id
+           WHERE mu.meter_id = $1
+             AND (l.status = 'active'
+                  OR (l.status = 'pending' AND COALESCE(l.is_existing_tenancy, FALSE))
+                  OR (l.status IN ('expired', 'terminated')
+                      AND COALESCE(l.end_date, CURRENT_DATE) >= CURRENT_DATE)))
+        -- A guest on the space is a household too, lease or no lease.
+        OR EXISTS (
+          SELECT 1 FROM utility_meter_units mu
+            JOIN unit_bookings b ON b.unit_id = mu.unit_id
+           WHERE mu.meter_id = $1
+             AND b.status NOT IN ('cancelled', 'no_show') AND b.cancelled_at IS NULL
+             AND b.check_in <= CURRENT_DATE AND b.check_out > CURRENT_DATE)
+        -- A meter on no space at all (a master, a shop line) is not a
+        -- household's meter; treat it as occupied so nothing is skipped.
+        OR NOT EXISTS (SELECT 1 FROM utility_meter_units mu WHERE mu.meter_id = $1)
+      ) AS occupied`, [meterId])
+    return row?.occupied !== false
+  } catch (e) {
+    logger.error({ err: e, meterId }, '[utility] could not tell whether the space is occupied — treating it as occupied')
+    return true
+  }
 }

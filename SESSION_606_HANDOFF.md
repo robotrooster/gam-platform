@@ -82,7 +82,7 @@ frontends must be built locally and shipped `--prebuilt`.
 
 ## 3. ⭐ FIRST ORGANIC SIGNUP + the outreach machine
 
-**Charlie Moore** (`charlie.moore69@mx-mailsrv.com`), 2026-08-15 05:46 — 52-second
+**Noor Netherton** (`noor.moore69@mx-mailsrv.com`), 2026-08-15 05:46 — 52-second
 session, bounced off the onboarding wizard, never returned. Two emails sent from
 `support@` (both **delivered**, zero engagement, never logged in).
 

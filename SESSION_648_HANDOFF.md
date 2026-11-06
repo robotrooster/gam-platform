@@ -59,7 +59,7 @@ Nic: "money all needs to flow through the platform. Every single cent... We are 
 - **Kept on `properties`, not `property_allocation_rules`:** that table's `card_fee_payer` is the rent setting, locked to the tenant. `payments.test` guards that no other table carries a column with that name.
 
 ### Data fixes (prod)
-- **Clay Simpson** (Mountain View RV 25) → $495. Backup: `~/gam-backups/s648-clay-rv25-*`.
+- **Pell Pennington** (Mountain View RV 25) → $495. Backup: `~/gam-backups/s648-pell-rv25-*`.
 - **Unsigned page-8 drafts** (Oak Park RV27, Mountain View RV27): boxes retagged and restamped. Backup: `s648-page8-drafts-*`.
 
 ---
@@ -70,7 +70,7 @@ Nic: "money all needs to flow through the platform. Every single cent... We are 
 2. **Changing the due day on an already-signed lease:** an addendum was recommended. No answer yet.
 3. **Property settings questionnaire:** deferred ("we'll talk later"). The question list is in memory `gam-property-settings-questionnaire`.
 4. **Stripe:** confirm with the Stripe rep the assumption that GAM pays Stripe's fees on connected accounts. Order a BBPOS WisePOS E reader (it pairs to GAM's account now).
-5. **Russ Fuller's $37.60 credit:** stays.
+5. **Tamsin Wrenfield's $37.60 credit:** stays.
 
 ## 3. Still to build
 - **Register:** ringing up a night/week stay should create the booking on the schedule (quote → hold → pay link that expires with the hold → confirm). The backend pay-link side already confirms a `bookingId`.

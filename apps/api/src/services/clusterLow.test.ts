@@ -7,7 +7,7 @@ import { clusterLow } from './utilityBilling'
 
 describe('clusterLow', () => {
   it('lands where Nic put it on Mountain View\'s August electric', () => {
-    // Occupied spaces with real usage, ascending. Randall Cox (120) and David
+    // Occupied spaces with real usage, ascending. Osric Rookwood (120) and David
     // Shultz (197) are the two outliers below the group.
     const august = [120, 197, 387, 461, 592, 600, 677, 802, 891, 1079, 1259]
     expect(clusterLow(august)).toBe(387)

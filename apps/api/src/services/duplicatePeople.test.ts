@@ -409,9 +409,9 @@ describe('mergePeople', () => {
   it('TWO SIGN-INS: keeps both records, retires the folded address, moves nothing signed', async () => {
     const p = await park()
     const keeper = await account(p, {
-      first: 'Calvin', last: 'Curtis', email: 'calvin@home.net', phone: '9285551234', withLease: true })
+      first: 'Kesh', last: 'Kilbride', email: 'kesh@home.net', phone: '9285551234', withLease: true })
     const dupe = await account(p, {
-      first: 'Calvin', last: 'Curtis', email: 'calvin.curtis@usda.gov', phone: '9285551234' })
+      first: 'Kesh', last: 'Kilbride', email: 'kesh.kilbride@usda.gov', phone: '9285551234' })
 
     const open = await pairOf(p)
     const keeperSide = open.side_a_user_id === keeper.userId ? 'a' : 'b'
@@ -426,8 +426,8 @@ describe('mergePeople', () => {
     const folded = users.find(u => u.id === dupe.userId)!
     const stays = users.find(u => u.id === keeper.userId)!
     expect(folded.email).toBe(`duplicate-${dupe.userId.slice(0, 8)}@invalid`)
-    expect(folded.first_name).toBe('Calvin')                 // still findable by name
-    expect(stays.email).toBe('calvin@home.net')              // kept its own sign-in
+    expect(folded.first_name).toBe('Kesh')                 // still findable by name
+    expect(stays.email).toBe('kesh@home.net')              // kept its own sign-in
     expect(outcome.emailRetiredTo).toBe(folded.email)
 
     // The lease never moved. And NOBODY WAS SUSPENDED: tenants has no landlord
@@ -456,9 +456,9 @@ describe('mergePeople', () => {
   it('moves the sign-in address onto the survivor when the landlord asks for it', async () => {
     const p = await park()
     const keeper = await account(p, {
-      first: 'Calvin', last: 'Curtis', email: 'calvin@home.net', phone: '9285551234', withLease: true })
+      first: 'Kesh', last: 'Kilbride', email: 'kesh@home.net', phone: '9285551234', withLease: true })
     const dupe = await account(p, {
-      first: 'Calvin', last: 'Curtis', email: 'calvin.curtis@usda.gov', phone: '9285551234' })
+      first: 'Kesh', last: 'Kilbride', email: 'kesh.kilbride@usda.gov', phone: '9285551234' })
     const open = await pairOf(p)
     const keeperSide = open.side_a_user_id === keeper.userId ? 'a' : 'b'
 
@@ -466,9 +466,9 @@ describe('mergePeople', () => {
       proposalId: open.id, landlordIds: [p.landlordId], keeperSide,
       signInAddress: 'folded', byUserId: p.userId })
 
-    expect(outcome.emailMoved).toBe('calvin.curtis@usda.gov')
+    expect(outcome.emailMoved).toBe('kesh.kilbride@usda.gov')
     const stays = await query<{ email: string }>(`SELECT email FROM users WHERE id = $1`, [keeper.userId])
-    expect(stays[0].email).toBe('calvin.curtis@usda.gov')
+    expect(stays[0].email).toBe('kesh.kilbride@usda.gov')
     const gone = await query<{ email: string }>(`SELECT email FROM users WHERE id = $1`, [dupe.userId])
     expect(gone[0].email).toBe(`duplicate-${dupe.userId.slice(0, 8)}@invalid`)
   })
@@ -684,15 +684,15 @@ describe('a merge stops at the edge of the book that asked', () => {
 
     // The man who stays: a lease at Nic's park, so he has to survive.
     const keeper = await account(mine, {
-      first: 'Calvin', last: 'Curtis', email: 'calvin@home.net', phone: '9285551234', withLease: true })
+      first: 'Kesh', last: 'Kilbride', email: 'kesh@home.net', phone: '9285551234', withLease: true })
     // The second sign-in: a reservation at Nic's park, and he is MID-SIGNING a
     // lease with a landlord Nic has never heard of. Nothing Nic can see says
     // so — an unsigned signer row is 0 leases and 0 signed documents here.
     const other = await account(mine, {
-      first: 'Calvin', last: 'Curtis', email: 'calvin.curtis@usda.gov', phone: '9285551234' })
+      first: 'Kesh', last: 'Kilbride', email: 'kesh.kilbride@usda.gov', phone: '9285551234' })
     await signerAtOtherCompany({
       landlordId: theirs.landlordId, userId: other.userId,
-      email: 'calvin.curtis@usda.gov', name: 'Calvin Curtis', signed: false })
+      email: 'kesh.kilbride@usda.gov', name: 'Kesh Kilbride', signed: false })
 
     const people = await gatherPeople([mine.landlordId])
     const foldedSide = people.find(x => x.userId === other.userId)!
@@ -712,18 +712,18 @@ describe('a merge stops at the edge of the book that asked', () => {
     // reach the portal he pays his rent in.
     const u = await query<{ email: string; email_verified: boolean }>(
       `SELECT email, email_verified FROM users WHERE id = $1`, [other.userId])
-    expect(u[0].email).toBe('calvin.curtis@usda.gov')
+    expect(u[0].email).toBe('kesh.kilbride@usda.gov')
     expect(u[0].email_verified).toBe(true)
     const t = await query<{ platform_status: string }>(
       `SELECT platform_status FROM tenants WHERE id = $1`, [other.tenantId])
     expect(t[0].platform_status).toBe('active')
     // Which is to say: login still finds him by the address he uses.
     const login = await query<{ id: string }>(
-      `SELECT id FROM users WHERE LOWER(email) = 'calvin.curtis@usda.gov'`)
+      `SELECT id FROM users WHERE LOWER(email) = 'kesh.kilbride@usda.gov'`)
     expect(login.map(r => r.id)).toEqual([other.userId])
     // The survivor's own sign-in did not change either — no address moved.
     const stays = await query<{ email: string }>(`SELECT email FROM users WHERE id = $1`, [keeper.userId])
-    expect(stays[0].email).toBe('calvin@home.net')
+    expect(stays[0].email).toBe('kesh@home.net')
     expect(outcome.emailMoved).toBeNull()
     expect(outcome.emailRetiredTo).toBeNull()
     expect(outcome.signInLeftAlone).toBe(true)

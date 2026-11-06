@@ -569,7 +569,7 @@ describe('renewal hand-off and credit set aside by a payment in flight', () => {
     const heldOn = async (creditId: string) =>
       (await db.query<{ payment_id: string; amount: string }>(
         `SELECT payment_id, amount::text AS amount FROM credit_uses
-          WHERE tenant_credit_id = $1 AND status = 'held' ORDER BY amount`, [creditId])).rows
+          WHERE tenant_credit_id = $1 AND status = 'held' ORDER BY credit_uses.amount`, [creditId])).rows
     const retryOf = async (id: string) =>
       (await db.query<{ status: string; retry: boolean }>(
         `SELECT status, next_retry_at IS NOT NULL AS retry FROM payments WHERE id = $1`, [id])).rows[0]

@@ -835,19 +835,35 @@ async function writeEntityRows(
     }
   }
 
-  // Liability insurance
+  // Liability insurance — the resident's renters policy, as the signed lease
+  // states it.
+  //
+  // 11/01: this used to write `liability_insurance_policies`, a table with no
+  // reader anywhere in the codebase — no route, no job, no screen — so a policy
+  // lifted off a scanned lease went somewhere nobody ever looked. It writes the
+  // one home for insurance now (insurance_policies), which means a renters
+  // policy the parser found with an expiry date on it turns up on the LAPSE LIST
+  // like any other certificate. That is the whole point of repointing it.
+  //
+  // recorded_by_user_id stays NULL and verified stays off deliberately: the
+  // parser read a document, it did not attest to a certificate. A person marking
+  // it verified is a separate act with their name on it.
   if (out.liabilityInsurance) {
     const li = out.liabilityInsurance
     if (li.carrierName?.value || li.policyNumber?.value) {
       await client.query(
-        `INSERT INTO liability_insurance_policies (
-           lease_id, carrier_name, policy_number, expiry_date
-         ) VALUES ($1, $2, $3, $4)`,
+        `INSERT INTO insurance_policies (
+           lease_id, coverage_type, carrier_name, policy_number, expiry_date, notes
+         ) VALUES ($1, 'renters_liability', $2, $3, $4, $5)`,
         [
           leaseId,
-          li.carrierName?.value || null,
+          // carrier_name is NOT NULL: a policy number with no carrier on the
+          // page is still worth keeping, so it is recorded as unnamed rather
+          // than dropped.
+          li.carrierName?.value || 'Not stated on the lease',
           li.policyNumber?.value || null,
           li.expiryDate?.value || null,
+          'Read off the signed lease by the lease parser — nobody has checked the certificate.',
         ]
       )
     }

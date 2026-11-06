@@ -643,7 +643,7 @@ describe('S655 the portal charge', () => {
     await charge(f, 200, { use: true, expected: 200 })
     await chargeLeaseBalance({ tenantId: f.tenantId, leaseId: leaseB, amount: 0, paymentMethodType: 'ach',
       paymentMethodId: 'pm_test', source: 'portal', credit: { use: true, expected: 300 } })
-    const uses = await db.query<any>(`SELECT lease_id, amount::text AS amount, status FROM credit_uses ORDER BY amount`)
+    const uses = await db.query<any>(`SELECT lease_id, amount::text AS amount, status FROM credit_uses ORDER BY credit_uses.amount`)
     expect(uses.rows).toEqual([
       { lease_id: f.leaseId, amount: '200.00', status: 'held' },
       { lease_id: leaseB, amount: '300.00', status: 'applied' },  // covered whole: nothing charged

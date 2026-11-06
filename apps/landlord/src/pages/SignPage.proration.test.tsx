@@ -13,7 +13,7 @@
  *    of making mistakes, because eventually I'd like to be able to trust
  *    somebody else to fill out leases."
  *
- * What went wrong: Kay Howard (RV 21) and Clint Cook (RV 18) were both drafted
+ * What went wrong: Verity Winthrop (RV 21) and Quill Quarrier (RV 18) were both drafted
  * days after they arrived, both dated 10/15 — the day the forms were filled out
  * — and both charged $323.00, the 17 days from the 15th. One was about $38
  * short, the other about $19 over. The proration had stopped following the

@@ -18,6 +18,7 @@ import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import { installDatePickerAutoClose, humanize, installPrintLightTheme } from '@gam/shared'
 import React from 'react'
+import { installTableStacking } from './lib/stackTables'
 import ReactDOM from 'react-dom/client'
 import { useState } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
@@ -102,11 +103,25 @@ function POSLayout() {
   // S595: per-device light/dark toggle (initial value applied pre-paint by index.html).
   const [theme, setTheme] = useState<'dark' | 'light'>(() => document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark')
   const toggleTheme = () => { const n = theme === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', n); try { localStorage.setItem('gam_theme', n) } catch {}; setTheme(n) }
+  // 10/30 (Nic): tables become one card per row on a phone; a stacked cell
+  // needs its column's name beside the value. Same utility as the landlord
+  // portal — the register runs in both.
+  React.useEffect(() => installTableStacking(document.body), [])
   return (
-    <div style={{minHeight:'100vh',background:'var(--bg-1)'}}>
-      <header style={{background:'var(--bg-2)',borderBottom:'1px solid var(--border-1)',padding:'0 20px',height:56,display:'flex',alignItems:'center',justifyContent:'space-between',position:'sticky',top:0,zIndex:100}}>
+    /* 10/30 (Nic): THE REGISTER COULD NOT SCROLL. body is overflow:hidden (the
+       S575 "locked desktop shell"), which is only safe if something inside
+       scrolls — globals.css defines .page-content for exactly that, and this
+       app never used the class. So the shell was minHeight:100vh inside a
+       frozen document and everything below the first screenful of the register
+       — the cart, the totals, the Charge button — could not be reached on a
+       phone at all. On the one GAM product whose user is always on a phone.
+
+       100dvh, not 100vh: a phone browser's address bar makes 100vh taller than
+       what you can see, so the last rows hide behind it. */
+    <div style={{height:'var(--vh)',background:'var(--bg-1)',display:'flex',flexDirection:'column',overflow:'hidden'}}>
+      <header className="pos-topbar" style={{background:'var(--bg-2)',borderBottom:'1px solid var(--border-1)',padding:'0 20px',height:56,flexShrink:0,display:'flex',alignItems:'center',justifyContent:'space-between',zIndex:100}}>
         <div style={{fontWeight:700,fontSize:'1.1rem',color:'var(--gold)'}}>⚡ GAM POS</div>
-        <div style={{display:'flex',gap:16,alignItems:'center'}}>
+        <div className="pos-topnav" style={{display:'flex',gap:16,alignItems:'center'}}>
           <button onClick={toggleTheme} title={theme==='dark'?'Switch to light mode':'Switch to dark mode'} aria-label="Toggle light/dark theme" style={{background:'transparent',border:'none',cursor:'pointer',fontSize:'1rem',lineHeight:1,padding:'4px 6px'}}>{theme==='dark'?'☀️':'🌙'}</button>
           <a href="/pos" style={{fontSize:'.88rem',fontWeight:500}}>Register</a>
           {!isBusiness && !posLimited && <a href="/pos?tab=inventory" style={{fontSize:'.88rem',fontWeight:500}}>Inventory</a>}
@@ -130,7 +145,9 @@ function POSLayout() {
           )}
         </div>
       </header>
-      <div style={{padding:20}}>
+      {/* The scroll region the locked shell always needed. */}
+      <div style={{flex:1,minHeight:0,overflowY:'auto',overflowX:'hidden',WebkitOverflowScrolling:'touch',
+                   padding:20,paddingBottom:'calc(20px + env(safe-area-inset-bottom, 0px))'}}>
         <Routes>
           <Route path="/pos" element={isBusiness ? <BusinessRegisterPage /> : <POSPage />} />
           {/* S538: owner-only team management for standalone operators. */}

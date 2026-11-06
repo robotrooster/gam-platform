@@ -1282,7 +1282,14 @@ pmRouter.get('/companies/:id/owners/:landlordId/statement', async (req: any, res
       periodMonth: month,
       pmCompanyId: req.params.id,
     })
-    res.json({ success: true, data: statement })
+    // PM readiness 4: whether the owner has actually been sent it
+    // (jobs/ownerStatementEmail). A manager asked "did they get their
+    // statement?" has to be able to answer without ringing GAM, and the
+    // answer has to be the same one the owner sees.
+    const { ownerStatementDelivery } = await import('../services/ownerStatementDelivery')
+    res.json({ success: true, data: { ...statement, delivery: await ownerStatementDelivery({
+      landlordId: req.params.landlordId, pmCompanyId: req.params.id, periodMonth: statement.periodMonth,
+    }) } })
   } catch (e) { next(e) }
 })
 
@@ -1338,18 +1345,93 @@ pmRouter.get('/my-statements', async (req: any, res, next) => {
       [scope])
 
     const { ownerStatement } = await import('../services/ownerStatement')
+    // PM readiness 4: "sent on X" beside each statement — the record
+    // jobs/ownerStatementEmail wrote when it emailed it, or null when this
+    // month's has not gone yet.
+    const { ownerStatementDelivery } = await import('../services/ownerStatementDelivery')
     const data = []
     for (const r of rels) {
+      const statement = await ownerStatement({
+        landlordId: r.landlord_id, periodMonth: month, pmCompanyId: r.pm_company_id,
+      })
       data.push({
         pmCompanyId: r.pm_company_id,
         pmCompanyName: r.pm_name,
         entityName: r.business_name,
-        statement: await ownerStatement({
-          landlordId: r.landlord_id, periodMonth: month, pmCompanyId: r.pm_company_id,
+        statement,
+        delivery: await ownerStatementDelivery({
+          landlordId: r.landlord_id, pmCompanyId: r.pm_company_id, periodMonth: statement.periodMonth,
         }),
       })
     }
     res.json({ success: true, data })
+  } catch (e) { next(e) }
+})
+
+// GET /api/pm/my-statements/pdf?month=YYYY-MM&pmCompanyId=...
+//
+// 11/01 — THE SAME DOCUMENT THE EMAIL ATTACHES, ON DEMAND.
+//
+// The monthly email carries the PDF, and that was the only way to get one: the
+// renderer existed and nothing but jobs/ownerStatementEmail could reach it. An
+// owner who deleted the email, or who wants last March, had nowhere to go — and
+// an owner's own statement is not something they should have to ask their
+// manager for.
+//
+// Scoped exactly like /my-statements above: an entity this account actually
+// owns, and a manager who actually runs it. A stranger's month is a 403, and an
+// owner naming a manager who never ran their park gets a 404 rather than an
+// empty document that looks like a month with no money in it.
+pmRouter.get('/my-statements/pdf', async (req: any, res, next) => {
+  try {
+    const mine = landlordScopeIds(req.user!)
+    if (mine.length === 0) throw new AppError(403, 'No owned entity on this account')
+
+    const month = typeof req.query.month === 'string' ? req.query.month : todayIn(null).slice(0, 7)
+    if (!/^\d{4}-(0[1-9]|1[0-2])(-\d{2})?$/.test(month)) {
+      throw new AppError(400, 'month must be YYYY-MM')
+    }
+    const pmCompanyId = typeof req.query.pmCompanyId === 'string' ? req.query.pmCompanyId : null
+    if (!pmCompanyId) throw new AppError(400, 'Name which manager\'s statement you want.')
+
+    const wanted = typeof req.query.landlordId === 'string' ? req.query.landlordId : null
+    if (wanted && !ownsLandlord(req.user!, wanted)) throw new AppError(403, 'Not your entity')
+
+    const rel = await queryOne<{ landlord_id: string; pm_name: string; business_name: string | null }>(
+      `SELECT r.landlord_id, c.name AS pm_name, l.business_name
+         FROM pm_owner_relationships r
+         JOIN pm_companies c ON c.id = r.pm_company_id
+         JOIN landlords l    ON l.id = r.landlord_id
+        WHERE r.landlord_id = ANY($1::uuid[])
+          AND r.pm_company_id = $2
+          AND r.status = 'active'
+        LIMIT 1`,
+      [wanted ? [wanted] : mine, pmCompanyId])
+    if (!rel) {
+      throw new AppError(404,
+        'That manager does not run any of your properties, so there is no statement to draw.')
+    }
+
+    const { ownerStatement } = await import('../services/ownerStatement')
+    const { renderOwnerStatementPdf, ownerStatementFilename } = await import('../services/ownerStatementPdf')
+    const statement = await ownerStatement({
+      landlordId: rel.landlord_id, periodMonth: month, pmCompanyId,
+    })
+    const entityName = rel.business_name || 'Owner'
+    const [y, m] = statement.periodMonth.slice(0, 7).split('-')
+    const monthLabel = new Date(Number(y), Number(m) - 1, 1)
+      .toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+    const pdf = await renderOwnerStatementPdf(statement, {
+      entityName,
+      ownerName: null,
+      pmCompanyName: rel.pm_name,
+      monthLabel,
+      generatedAt: new Date().toISOString(),
+    })
+    res.type('application/pdf')
+    res.setHeader('Content-Disposition',
+      `inline; filename="${ownerStatementFilename({ entityName }, statement.periodMonth)}"`)
+    res.send(pdf)
   } catch (e) { next(e) }
 })
 

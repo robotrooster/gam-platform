@@ -427,7 +427,7 @@ describe('S639 pending pool — invite state tells the truth', () => {
     const f = await seedTOFixture()
     const email = `s639b-${randomUUID().slice(0, 6)}@test.dev`
     const intentId = await pendingIntent(f, email)
-    // Glenda Greek and Dakota Lane exactly: accepted on the intent, nothing on
+    // Birdie Calloway and Tobin Thornbury exactly: accepted on the intent, nothing on
     // the user, and the pool called them uninvited.
     await db.query(`UPDATE pending_tenant_intents SET accepted_at = NOW() WHERE id = $1`, [intentId])
     await db.query(
@@ -464,7 +464,7 @@ describe('S639 pending pool — invite state tells the truth', () => {
     await db.query(
       `INSERT INTO pending_tenant_intents (tenant_id, landlord_id, unit_id, screening_waived)
        VALUES ($1, $2, NULL, TRUE)`, [rows[0].tenant_id, rows[0].landlord_id])
-    // Illyana Gonzalez: her address was corrected, the unit invite cancelled,
+    // Greta Holloway: her address was corrected, the unit invite cancelled,
     // and the orphaned waiver row surfaced as a ghost in the pool for a week.
     await request(buildApp())
       .delete(`/api/landlords/me/pending-tenants/${intentId}`)

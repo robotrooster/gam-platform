@@ -21,7 +21,7 @@ are appended at its end and are the recent history).
   migrated to `20260929150000` (it must be migrated separately — see memory).
 - October 1 invoices generate at 7am Phoenix on 2026-10-01. Mountain View's
   September reading round is completed: 26 electric bills + the Alvarados' RV 33
-  bill (650 kWh, $136.50) + Dakota Lane's corrected RV 18 bill (481 kWh, $101.01)
+  bill (650 kWh, $136.50) + Tobin Thornbury's corrected RV 18 bill (481 kWh, $101.01)
   all `billed`, riding those invoices.
 
 ## What was decided / built this session (2026-09-29 → 09-30)
@@ -68,12 +68,12 @@ Verify each in code; file names are where to look.
     notices skip settled/void invoices.
 11. **Data corrections at Mountain View (September)**: Razo = RV 27 (pay link
     $752.17 = site $589 + Aug 387 kWh + Sept 390 kWh; he leaves after Oct 1 — add
-    the extra days + a final RV 27 read to the link, then settle Friday); Scott Duffy
+    the extra days + a final RV 27 read to the link, then settle Friday); Ulyssa Yoxall
     RV 30 = open register ticket $22.47; RV 37 read marked `billed_off_platform`;
     RV 05/16 ignored; Alvarados corrected onto RV 33 from 2026-09-16 (RV 34 vacant,
     its 2 kWh Sept bill voided); RV 43's Sept 30 read corrected 18462 → 18234 (typo;
-    meter unchanged since August). Donald Hamp: check recorded 9/29, lease active,
-    signature outstanding, now on the Front Desk. Dakota Lane is a man (he/him).
+    meter unchanged since August). Wren Westbrook: check recorded 9/29, lease active,
+    signature outstanding, now on the Front Desk. Tobin Thornbury is a man (he/him).
 12. **Email**: support@ is a Cloudflare forward to nic@golddoor.io. Replies go out as
     nic@ until Nic's partner enables "Allow per-user outbound gateways" in the
     golddoor.io Workspace admin; then Gmail "Send mail as" over Resend SMTP
@@ -232,7 +232,7 @@ And from the same conversation, earlier:
   and the LeaseFormModal edit window are GONE; `?open=` shows the read-only
   details, which carries "Confirm — looks right" for needs-review imports.
   Month-to-month drafts write `end_date='-'`. Demo/internal accounts never
-  reach `platform_revenue_ledger`. Robert Housley (RV 14, Mountain View)
+  reach `platform_revenue_ledger`. Rowena Ulverston (RV 14, Mountain View)
   signed by Nic: $589/mo MTM from 9/30, page 8 first month $539 / proration
   $0 / deposit $0 — INV-2026-00045 $539 due 9/30, Oct 1 rent skipped
   (paid at move-in), $589 from Nov 1.
@@ -270,7 +270,7 @@ And from the same conversation, earlier:
   three `expires_at` stamps (`routes/background.ts` ×2, `services/backgroundApplyUpdate.ts`)
   and the 3 AM expiry sweep. The six months was GAM's own freshness rule from
   June (commit 7c37ffb), never Checkr's or legal. Live rows already extended:
-  Anastacio Erreguin → 2027-09-10, Robert Housley → 2027-09-30.
+  Bryce Belmont → 2027-09-10, Rowena Ulverston → 2027-09-30.
 - "Not moving in for now" on an approved applicant: `background_checks.parked_at
   / parked_note` (migration `20260930240000`), `POST /background/:id/park` +
   `/unpark` (declared in actionGap), review-window buttons, Past-tab tag.
@@ -287,7 +287,7 @@ And from the same conversation, earlier:
   bill — its prior value was a placeholder). Run completed: 9 bills, $862.95
   at $0.0165/gal. Big ones to eyeball: Lot 17 19,800 gal ($326.70), Lot 21
   10,000 gal ($165.00).
-- Oct 1 dry run for the landlord: 11 invoices, 8 utility lines; Mike Boyd
+- Oct 1 dry run for the landlord: 11 invoices, 8 utility lines; Isolde Lanthorne
   (MH 15) already had INV-2026-00016 from his 9/25 signing, so his $18.15 was
   attached by hand (`attachStrandedUtilityBill`) → $468.15. All 9 water bills
   land on Oct 1.

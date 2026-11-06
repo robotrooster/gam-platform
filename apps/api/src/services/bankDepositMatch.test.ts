@@ -5,7 +5,7 @@ import {
 } from '../test/dbHelpers'
 import { candidatesForDeposit } from './bankDepositCandidates'
 import {
-  matchDeposit, memoNamesTenant, memoNameTokens, isPreselectable,
+  matchDeposit, memoNamesTenant, memoNameTokens, isPreselectable, isNearMiss,
   memoMethodHint, methodContradicts,
   type OpenCharge, type TenantDeclaredDeposit,
 } from './bankDepositMatch'
@@ -96,6 +96,82 @@ describe('matching a deposit', () => {
       expect(row.rivals).toBe(1)
       expect(row.reason).toContain('Confirm who paid')
     }
+  })
+
+  // ── 11/4 (Nic): WITHIN A THRESHOLD, ASK ──────────────────────────────────
+  //
+  //   "If there's an exact match, we know who it goes to, but if it's within a
+  //    certain threshold, we kind of hint on the bank feed, maybe, hey, does
+  //    this belong to this person."
+  //
+  // This amends S652 on purpose, so the window is tight — within 5% AND $50 of
+  // the household's WHOLE bill — and two near misses cancel each other out
+  // entirely rather than making a shortlist.
+  describe('a near miss is a question, not an identification', () => {
+    it('offers the household whose whole bill it is nearly, and says how far off', () => {
+      const m = matchDeposit({ amount: 460, postedDate: '2026-09-03', description: 'DEPOSIT' }, [
+        charge({ id: 'rent', leaseId: 'L', tenantId: 'T', amount: 450, type: 'rent' }),
+      ])
+      expect(m).toHaveLength(1)
+      expect(m[0].confidence).toBe('amount_near')
+      expect(m[0].exact).toBe(false)
+      expect(isPreselectable(m[0])).toBe(false)   // a question, never a pre-ticked answer
+      // Never a raw enum on a landlord's screen, and it names the gap.
+      expect(m[0].reason).toContain('$10.00 more than')
+      expect(m[0].reason).toContain('Does this deposit belong to them?')
+    })
+
+    it('asks about a short payment too', () => {
+      const m = matchDeposit({ amount: 440, postedDate: '2026-09-03', description: 'DEPOSIT' }, [
+        charge({ id: 'rent', leaseId: 'L', tenantId: 'T', amount: 450, type: 'rent' }),
+      ])
+      expect(m[0].confidence).toBe('amount_near')
+      expect(m[0].reason).toContain('$10.00 short of')
+    })
+
+    it('an exact tie-out is never a near miss — it keeps its stronger answer', () => {
+      const m = matchDeposit({ amount: 450, postedDate: '2026-09-03', description: 'DEPOSIT' }, [
+        charge({ id: 'rent', leaseId: 'L', tenantId: 'T', amount: 450, type: 'rent' }),
+      ])
+      expect(m[0].confidence).toBe('amount_unique')
+      expect(m[0].exact).toBe(true)
+      expect(isNearMiss(45000, 45000)).toBe(false)
+    })
+
+    it('says NOTHING when two households are equally near — no shortlist', () => {
+      const m = matchDeposit({ amount: 460, postedDate: '2026-09-03', description: 'DEPOSIT' }, [
+        charge({ id: 'a', leaseId: 'LA', tenantId: 'TA', tenantName: 'Rosa Garcia', unitNumber: 'Lot 1', amount: 450 }),
+        charge({ id: 'b', leaseId: 'LB', tenantId: 'TB', tenantName: 'Dale Whitcomb', unitNumber: 'Lot 2', amount: 455 }),
+      ])
+      expect(m.filter(x => x.confidence === 'amount_near')).toEqual([])
+    })
+
+    it('is outside the window when the gap is more than 5%', () => {
+      const m = matchDeposit({ amount: 600, postedDate: '2026-09-03', description: 'DEPOSIT' }, [
+        charge({ id: 'rent', leaseId: 'L', tenantId: 'T', amount: 450, type: 'rent' }),
+      ])
+      expect(m.filter(x => x.confidence === 'amount_near')).toEqual([])
+    })
+
+    it('is capped in cash as well as percentage, so a big bill is not a wide net', () => {
+      // 5% of $5,000 is $250, so on percentage alone a $200 gap would qualify.
+      // The $50 cash cap is what decides, and the boundary is inclusive.
+      expect(isNearMiss(520000, 500000)).toBe(false)   // $200 over — percentage would allow it
+      expect(isNearMiss(505000, 500000)).toBe(true)    // $50.00 — exactly at the cap, inside
+      expect(isNearMiss(505001, 500000)).toBe(false)   // $50.01 — one cent past it
+    })
+
+    // The case that prompted all of this: Kim Bowman's $1,175 paid ahead.
+    // No amount rule can find them — at that park a deposit that size covers
+    // six of the eight households who owe anything — which is exactly why the
+    // resident reporting it is the only mechanism that works.
+    it('a big pay-ahead is not guessed at, near or otherwise', () => {
+      const m = matchDeposit({ amount: 1175, postedDate: '2026-10-30', description: 'DEPOSIT' }, [
+        charge({ id: 'water', leaseId: 'L', tenantId: 'T', amount: 39.60, type: 'utility' }),
+        charge({ id: 'fee', leaseId: 'L', tenantId: 'T', amount: 50, type: 'late_fee' }),
+      ])
+      expect(m.filter(x => x.confidence === 'amount_near')).toEqual([])
+    })
   })
 
   it('combines charges that add up — rent plus last month’s late fee', () => {

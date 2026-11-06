@@ -1,8 +1,8 @@
 /**
  * S655 money plan P2 — the money history backfill, on a production-shaped
  * fixture: the same ids, amounts and timestamps as production for every case
- * the backfill knows by name (Kim Harland, Russ Fuller), and the same shapes
- * for the rest (Todd Niemeier's two-month check, Glenda Greek's posted check,
+ * the backfill knows by name (Yvette Bexley, Tamsin Wrenfield), and the same shapes
+ * for the rest (Caspian Hawksmoor's two-month check, Birdie Calloway's posted check,
  * RV 52, RV 33, MH 25), plus a prior arrangement and a $0 desk action.
  *
  * Production counts have moved since the plan was written (78 rows / 41
@@ -98,7 +98,7 @@ async function draw(c: PoolClient, r: { leaseId: string }, creditId: string, amo
 
 /**
  * The seeded rows are production history from before C0: credits that are
- * already part-spent (Kim's $450 Move In Special at $0 left, Todd's $460 at $0)
+ * already part-spent (Yvette's $450 Move In Special at $0 left, Caspian's $460 at $0)
  * were written by the old code, which moved amount_remaining directly. Once C0
  * is applied that is refused ("A new credit starts whole"), so the seed turns
  * on the same bypass the real backfill uses (oct3_money_history_backfill.ts
@@ -119,31 +119,31 @@ async function fixture(): Promise<Fx> {
     const mvProp = await seedProperty(c, { landlordId: mv.landlordId, ownerUserId: mv.userId, managedByUserId: mv.userId })
     const ids: Record<string, string> = {}
 
-    // ── Kim Harland, APT 04 (Oak Park): $935.45 of rows, $450 Move In Special,
+    // ── Yvette Bexley, APT 04 (Oak Park): $935.45 of rows, $450 Move In Special,
     //    money order typed $486.00 against $485.45; Nic voided the $0.55.
-    const kim = await resident(c, op.landlordId, opProp, 'APT 04')
+    const yvette = await resident(c, op.landlordId, opProp, 'APT 04')
     await c.query(
       `INSERT INTO tenant_credits (id, landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, reason, created_at)
        VALUES ($1, $2, $3, $4, 450, 0, 'other', 'Move In Special', '2026-09-05 17:17:52-07')`,
-      [KIM.tenantCredit, op.landlordId, kim.tenantId, kim.leaseId])
+      [KIM.tenantCredit, op.landlordId, yvette.tenantId, yvette.leaseId])
     const kimNote = 'Recorded as manual money_order payment (ref 55109266912)'
     const created = '2026-09-04 13:12:54.136725-07'
-    ids.kimWater = await row(c, kim, op.landlordId, { type: 'utility', amount: 10.45, due: '2026-09-01', settledAt: KIM.at, method: 'money_order', notes: `Water — Aug 2026 — ${kimNote}`, created })
-    ids.kimTrash = await row(c, kim, op.landlordId, { type: 'utility', amount: 25, due: '2026-09-01', settledAt: KIM.at, method: 'money_order', notes: `Trash — Sep 2026 — ${kimNote}`, created })
-    await row(c, kim, op.landlordId, { id: KIM.rent, amount: 900, due: '2026-09-01', settledAt: KIM.at, method: 'money_order', notes: kimNote, created })
-    await prepaid(c, kim, { id: KIM.roundUp, amount: 0.55, remaining: 0, created: KIM.at, note: 'Voided 10/3 (Nic): money order 55109266912 was entered as $486.00 against $485.45 owed; nothing was paid ahead' })
+    ids.kimWater = await row(c, yvette, op.landlordId, { type: 'utility', amount: 10.45, due: '2026-09-01', settledAt: KIM.at, method: 'money_order', notes: `Water — Aug 2026 — ${kimNote}`, created })
+    ids.kimTrash = await row(c, yvette, op.landlordId, { type: 'utility', amount: 25, due: '2026-09-01', settledAt: KIM.at, method: 'money_order', notes: `Trash — Sep 2026 — ${kimNote}`, created })
+    await row(c, yvette, op.landlordId, { id: KIM.rent, amount: 900, due: '2026-09-01', settledAt: KIM.at, method: 'money_order', notes: kimNote, created })
+    await prepaid(c, yvette, { id: KIM.roundUp, amount: 0.55, remaining: 0, created: KIM.at, note: 'Voided 10/3 (Nic): money order 55109266912 was entered as $486.00 against $485.45 owed; nothing was paid ahead' })
 
-    // ── Russ Fuller, RV 02 (Oak Park): $37.60 entered as a credit on Aug 12.
-    const russ = await resident(c, op.landlordId, opProp, 'RV 02', RUSS.lease)
+    // ── Tamsin Wrenfield, RV 02 (Oak Park): $37.60 entered as a credit on Aug 12.
+    const tamsin = await resident(c, op.landlordId, opProp, 'RV 02', RUSS.lease)
     await c.query(
       `INSERT INTO tenant_credits (id, landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, reason, created_at)
        VALUES ($1, $2, $3, $4, 37.60, 0, 'other', 'Carried-forward overpayment — paid cash ahead', '2026-08-12 12:00:00-07')`,
-      [RUSS.tenantCredit, op.landlordId, russ.tenantId, RUSS.lease])
-    await row(c, russ, op.landlordId, { id: RUSS.water, type: 'utility', amount: 5.22, due: '2026-10-01', settledAt: RUSS.billRun, notes: 'covered by account credit', created: RUSS.billRun })
-    await row(c, russ, op.landlordId, { id: RUSS.trash, type: 'utility', amount: 25, due: '2026-10-01', settledAt: RUSS.billRun, notes: 'covered by account credit', created: RUSS.billRun })
-    await row(c, russ, op.landlordId, { id: RUSS.rent, amount: 440, due: '2026-10-01', settledAt: RUSS.desk, method: 'cash', notes: 'Recorded as manual cash payment', created: RUSS.billRun })
-    ids.russElectric = await row(c, russ, op.landlordId, { type: 'utility', amount: 73.50, due: '2026-10-01', settledAt: RUSS.desk, method: 'cash', notes: 'Electric — Recorded as manual cash payment', created: RUSS.billRun })
-    ids.russRoundUp = await prepaid(c, russ, { amount: 0.88, remaining: 0.88, created: RUSS.desk })
+      [RUSS.tenantCredit, op.landlordId, tamsin.tenantId, RUSS.lease])
+    await row(c, tamsin, op.landlordId, { id: RUSS.water, type: 'utility', amount: 5.22, due: '2026-10-01', settledAt: RUSS.billRun, notes: 'covered by account credit', created: RUSS.billRun })
+    await row(c, tamsin, op.landlordId, { id: RUSS.trash, type: 'utility', amount: 25, due: '2026-10-01', settledAt: RUSS.billRun, notes: 'covered by account credit', created: RUSS.billRun })
+    await row(c, tamsin, op.landlordId, { id: RUSS.rent, amount: 440, due: '2026-10-01', settledAt: RUSS.desk, method: 'cash', notes: 'Recorded as manual cash payment', created: RUSS.billRun })
+    ids.russElectric = await row(c, tamsin, op.landlordId, { type: 'utility', amount: 73.50, due: '2026-10-01', settledAt: RUSS.desk, method: 'cash', notes: 'Electric — Recorded as manual cash payment', created: RUSS.billRun })
+    ids.russRoundUp = await prepaid(c, tamsin, { amount: 0.88, remaining: 0.88, created: RUSS.desk })
 
     // ── RV 33 (Oak Park): $600 cash for $589.71, $10.29 banked; $5.22 drawn Oct 1.
     const rv33 = await resident(c, op.landlordId, opProp, 'RV 33')
@@ -157,27 +157,27 @@ async function fixture(): Promise<Fx> {
     ids.rv33Oct = await row(c, rv33, op.landlordId, { type: 'utility', amount: 5.22, due: '2026-10-01', settledAt: rv33Draw, notes: 'covered by prepaid credit (paid ahead) (collected by the landlord, not GAM)', created: rv33Draw })
     await draw(c, rv33, ids.rv33Credit, 5.22, rv33Draw)
 
-    // ── Todd Niemeier, MH 08 (Mountain View): one $920 check for September and October.
-    const todd = await resident(c, mv.landlordId, mvProp, 'MH 08')
+    // ── Caspian Hawksmoor, MH 08 (Mountain View): one $920 check for September and October.
+    const caspian = await resident(c, mv.landlordId, mvProp, 'MH 08')
     const toddAt = '2026-09-18 13:04:41.181103-07'
-    await row(c, todd, mv.landlordId, { amount: 460, due: '2026-09-01', settledAt: toddAt, method: 'check', notes: 'Recorded as manual check payment (ref 1001)' })
-    ids.toddCredit = await prepaid(c, todd, { amount: 460, remaining: 0, created: toddAt })
+    await row(c, caspian, mv.landlordId, { amount: 460, due: '2026-09-01', settledAt: toddAt, method: 'check', notes: 'Recorded as manual check payment (ref 1001)' })
+    ids.toddCredit = await prepaid(c, caspian, { amount: 460, remaining: 0, created: toddAt })
     const toddDraw = '2026-10-01 07:00:00.870855-07'
-    ids.toddOct = await row(c, todd, mv.landlordId, { amount: 460, due: '2026-10-01', settledAt: toddDraw, notes: 'covered by prepaid credit (paid ahead) (collected by the landlord, not GAM)', created: toddDraw })
-    await draw(c, todd, ids.toddCredit, 460, toddDraw)
+    ids.toddOct = await row(c, caspian, mv.landlordId, { amount: 460, due: '2026-10-01', settledAt: toddDraw, notes: 'covered by prepaid credit (paid ahead) (collected by the landlord, not GAM)', created: toddDraw })
+    await draw(c, caspian, ids.toddCredit, 460, toddDraw)
 
-    // ── Glenda Greek, MH 04 (Mountain View): a posted $460 check, received 9/22.
-    const glenda = await resident(c, mv.landlordId, mvProp, 'MH 04')
+    // ── Birdie Calloway, MH 04 (Mountain View): a posted $460 check, received 9/22.
+    const birdie = await resident(c, mv.landlordId, mvProp, 'MH 04')
     const glendaRem = await c.query<{ id: string }>(
       `INSERT INTO tenant_remittances (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount, status,
                                        payment_method, gross_amount, processing_fee_amount, settled_at, reference, notes)
        VALUES ($1, $2, $3, 460, 0, 460, 'settled', 'check', 460, 0, '2026-09-22 12:00:00-07', '1264', 'Paid by Jason Holcomb')
-       RETURNING id`, [glenda.tenantId, glenda.leaseId, mv.landlordId])
+       RETURNING id`, [birdie.tenantId, birdie.leaseId, mv.landlordId])
     ids.glendaRem = glendaRem.rows[0].id
-    ids.glendaCredit = await prepaid(c, glenda, { amount: 460, remaining: 0, created: '2026-09-22 13:50:13.774043-07', sourceRemittanceId: ids.glendaRem })
+    ids.glendaCredit = await prepaid(c, birdie, { amount: 460, remaining: 0, created: '2026-09-22 13:50:13.774043-07', sourceRemittanceId: ids.glendaRem })
     const glendaDraw = '2026-10-01 07:00:00.775154-07'
-    ids.glendaOct = await row(c, glenda, mv.landlordId, { amount: 460, due: '2026-10-01', settledAt: glendaDraw, notes: 'covered by prepaid credit (paid ahead) (collected by the landlord, not GAM)', created: glendaDraw })
-    await draw(c, glenda, ids.glendaCredit, 460, glendaDraw)
+    ids.glendaOct = await row(c, birdie, mv.landlordId, { amount: 460, due: '2026-10-01', settledAt: glendaDraw, notes: 'covered by prepaid credit (paid ahead) (collected by the landlord, not GAM)', created: glendaDraw })
+    await draw(c, birdie, ids.glendaCredit, 460, glendaDraw)
 
     // ── RV 52 (Mountain View): a $600 check for $302.94, $297.06 banked; $14.70 drawn Oct 1.
     const rv52 = await resident(c, mv.landlordId, mvProp, 'RV 52')
@@ -217,23 +217,23 @@ const receiptOf = async (paymentId: string) => (await db.query<any>(
 beforeEach(async () => { await cleanupAllSchema() })
 
 describe('the money history backfill (P2)', () => {
-  it('reproduces Kim, Russ, Todd, Glenda, RV 52 and RV 33 exactly', async () => {
+  it('reproduces Yvette, Tamsin, Caspian, Birdie, RV 52 and RV 33 exactly', async () => {
     const f = await fixture()
     const r = await runBackfill()
 
-    // Kim: $485.45 money order, $450 Move In Special on rent, the $0.55 withdrawn.
-    const kim = await receiptOf(KIM.rent)
-    expect(kim).toMatchObject([{ amount: '485.45', applied_amount: '485.45', unapplied_amount: '0.00', payment_method: 'money_order', gross_amount: null, reference: '55109266912' }])
+    // Yvette: $485.45 money order, $450 Move In Special on rent, the $0.55 withdrawn.
+    const yvette = await receiptOf(KIM.rent)
+    expect(yvette).toMatchObject([{ amount: '485.45', applied_amount: '485.45', unapplied_amount: '0.00', payment_method: 'money_order', gross_amount: null, reference: '55109266912' }])
     const kimRent = (await db.query<any>(`SELECT issued_credit_amount::text AS i FROM payments WHERE id = $1`, [KIM.rent])).rows[0]
     expect(kimRent.i).toBe('450.00')
     const kimUse = (await db.query<any>(`SELECT amount::text, status, source, remittance_id, to_char(billing_month,'YYYY-MM-DD') AS m, applied_at FROM credit_uses WHERE tenant_credit_id = $1`, [KIM.tenantCredit])).rows
-    expect(kimUse).toMatchObject([{ amount: '450.00', status: 'applied', source: 'backfill', remittance_id: kim[0].id, m: '2026-09-01' }])
+    expect(kimUse).toMatchObject([{ amount: '450.00', status: 'applied', source: 'backfill', remittance_id: yvette[0].id, m: '2026-09-01' }])
     expect(new Date(kimUse[0].applied_at).toISOString()).toBe('2026-09-09T18:27:54.174Z')
     const kimRoundUp = (await db.query<any>(`SELECT amount_remaining::text AS r, voided_at IS NOT NULL AS voided, void_reason, source_remittance_id FROM lease_prepaid_credits WHERE id = $1`, [KIM.roundUp])).rows[0]
     expect(kimRoundUp).toMatchObject({ r: '0.55', voided: true, source_remittance_id: null })
     expect(kimRoundUp.void_reason).toMatch(/\$485\.45/)
 
-    // Russ: re-recorded as cash paid ahead on Aug 12; three spends move onto it.
+    // Tamsin: re-recorded as cash paid ahead on Aug 12; three spends move onto it.
     const russCredit = (await db.query<any>(
       `SELECT id, amount_original::text AS o, amount_remaining::text AS r, funded_by, received_at FROM lease_prepaid_credits WHERE lease_id = $1 AND note LIKE 'Paid ahead before GAM%'`, [RUSS.lease])).rows
     expect(russCredit).toHaveLength(1)
@@ -256,15 +256,15 @@ describe('the money history backfill (P2)', () => {
     const notes = (await db.query<any>(`SELECT notes FROM payments WHERE id = ANY($1::uuid[])`, [[RUSS.water, RUSS.trash]])).rows
     expect(notes.every((n: any) => /paid from money paid ahead \(Aug 12\)/.test(n.notes))).toBe(true)
 
-    // Todd: a $920 check, $460 for September and $460 paid ahead, spent on October.
-    const todd = (await db.query<any>(`SELECT r.amount::text, r.unapplied_amount::text AS u FROM tenant_remittances r JOIN lease_prepaid_credits c ON c.source_remittance_id = r.id WHERE c.id = $1`, [f.ids.toddCredit])).rows
-    expect(todd).toEqual([{ amount: '920.00', u: '460.00' }])
+    // Caspian: a $920 check, $460 for September and $460 paid ahead, spent on October.
+    const caspian = (await db.query<any>(`SELECT r.amount::text, r.unapplied_amount::text AS u FROM tenant_remittances r JOIN lease_prepaid_credits c ON c.source_remittance_id = r.id WHERE c.id = $1`, [f.ids.toddCredit])).rows
+    expect(caspian).toEqual([{ amount: '920.00', u: '460.00' }])
     const toddUse = (await db.query<any>(`SELECT payment_id, amount::text FROM credit_uses WHERE prepaid_credit_id = $1`, [f.ids.toddCredit])).rows
     expect(toddUse).toEqual([{ payment_id: f.ids.toddOct, amount: '460.00' }])
 
-    // Glenda: her posted check stays her receipt; its gross is cleared; October paid from it.
-    const glenda = (await db.query<any>(`SELECT amount::text, gross_amount FROM tenant_remittances WHERE id = $1`, [f.ids.glendaRem])).rows[0]
-    expect(glenda).toEqual({ amount: '460.00', gross_amount: null })
+    // Birdie: her posted check stays her receipt; its gross is cleared; October paid from it.
+    const birdie = (await db.query<any>(`SELECT amount::text, gross_amount FROM tenant_remittances WHERE id = $1`, [f.ids.glendaRem])).rows[0]
+    expect(birdie).toEqual({ amount: '460.00', gross_amount: null })
     const glendaCredit = (await db.query<any>(`SELECT funded_by, received_at FROM lease_prepaid_credits WHERE id = $1`, [f.ids.glendaCredit])).rows[0]
     expect(glendaCredit.funded_by).toBe('landlord')
     expect(new Date(glendaCredit.received_at).toISOString()).toBe('2026-09-22T19:00:00.000Z')   // the day the check arrived
@@ -290,14 +290,14 @@ describe('the money history backfill (P2)', () => {
   it('writes one receipt per desk action with money; prior arrangements and $0 actions get none', async () => {
     await fixture()
     const r = await runBackfill()
-    // Kim 3 rows, Russ 2, RV 33 4, Todd 1, RV 52 2, MH 25 1 = 6 receipts for 13 rows.
+    // Yvette 3 rows, Tamsin 2, RV 33 4, Caspian 1, RV 52 2, MH 25 1 = 6 receipts for 13 rows.
     expect(r.receipts).toHaveLength(6)
     expect(r.receipts.reduce((s, x) => s + x.rows, 0)).toBe(13)
     expect(r.skippedActions).toHaveLength(1)
     const prior = await db.query(
       `SELECT 1 FROM payments p JOIN remittance_applications a ON a.payment_id = p.id WHERE p.manual_method = 'prior_arrangement'`)
     expect(prior.rowCount).toBe(0)
-    expect(r.uses).toHaveLength(8)   // Kim 1, Russ 3, the four Oct 1 draws
+    expect(r.uses).toHaveLength(8)   // Yvette 1, Tamsin 3, the four Oct 1 draws
     expect(r.receipts.every(x => x.method !== 'prior_arrangement')).toBe(true)
   })
 
@@ -325,7 +325,7 @@ describe('the money history backfill (P2)', () => {
 
   // S655 review: the funding stamp (step 1) moves updated_at to the run's time
   // before the void (step 4) read it, so the $0.55 was dated by the backfill run.
-  it("Kim's withdrawn $0.55 is dated when Nic zeroed it, not when the backfill ran", async () => {
+  it("Yvette's withdrawn $0.55 is dated when Nic zeroed it, not when the backfill ran", async () => {
     await fixture()
     const zeroedAt = '2026-10-03 11:09:46.700475-07'
     await db.query(`UPDATE lease_prepaid_credits SET updated_at = $2::timestamptz WHERE id = $1`, [KIM.roundUp, zeroedAt])

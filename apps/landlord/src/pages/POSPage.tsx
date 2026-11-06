@@ -11,10 +11,13 @@ import {
 } from '../lib/terminal'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiPut, apiDel } from '../lib/api'
-import { ScreeningsWaitingPanel } from '../../../../packages/shared-ui/ScreeningsWaitingPanel'
+import { DrawerCount } from '../../../../packages/shared-ui/DrawerCount'
 
-/** The panel is shared with the landlord's own screening page — one list, both screens. */
-const screeningsApi = { get: apiGet, post: apiPost }
+/**
+ * 10/31 (Nic): counting the cash drawer down. Shared with the landlord's own
+ * register tab — one file, so the two apps cannot drift (pos-parity.test.ts).
+ */
+const drawerApi = { get: apiGet, post: apiPost, patch: apiPatch, toastError: (m: string) => toastOnce(m, { error: true }) }
 import { humanize, processingFeeFor, rvSiteFactsLabel, SUPPORTED_CARD_READER, READER_ORDER_STATUS_LABEL, STAY_TERMS, STAY_TERMS_LABEL, RETURNING_GUEST_LABEL, type StayTerms } from '@gam/shared'
 import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
 import { appConfirm, appPrompt } from '../components/dialogs'
@@ -456,7 +459,7 @@ const nonNeg = { min: 0, onKeyDown: blockNeg, onPaste: blockNegPaste }
 export function POSPage() {
   const qc = useQueryClient()
   const [payLinkOpen, setPayLinkOpen] = useState(false)
-  const [tab, setTab] = useUrlTab('tab', 'register', ['register','checkout','checks','history','customers','paylinks','items','categories','taxes','discounts','vendors','orders','inventory','readers'] as const)
+  const [tab, setTab] = useUrlTab('tab', 'register', ['register','checkout','drawer','history','customers','paylinks','items','categories','taxes','discounts','vendors','orders','inventory','readers'] as const)
 
   const [cart, setCart] = useState<CartItem[]>([])
   // S651: the site + dates + guest for a stay in the cart. Held here rather
@@ -466,7 +469,6 @@ export function POSPage() {
   const [stayModal, setStayModal] = useState(false)
   // 10/21 (Nic): a background check rung on its own — who it is for and what
   // the SERVER said it costs. Never priced here.
-  const [counterCheck, setCounterCheck] = useState<{ name: string; email: string; price: number } | null>(null)
   // The stay line in the cart, if there is one. Only ONE kind of stay can be
   // sold at a time — two different lengths on one sale have no single set of
   // dates, and the server refuses it too.
@@ -518,11 +520,21 @@ export function POSPage() {
   // when it is rung, by the same server path as every other sale.
   const [ticketsOpen, setTicketsOpen] = useState(false)
   const [openTicketId, setOpenTicketId] = useState<string | null>(null)
-  // 10/2 (the Scott Duffy ticket): what the reopened ticket held when it was
+  // 10/2 (the Ulyssa Yoxall ticket): what the reopened ticket held when it was
   // opened, read fresh from the server — so Clear can put the ORIGINAL back,
   // unchanged or updated in place, and never write a second ticket.
   const [ticketSnapshot, setTicketSnapshot] = useState<TicketSnapshot | null>(null)
   const [reopening, setReopening] = useState<string | null>(null)
+  /**
+   * 11/5 (Nic) — WHICH TAB THE DESK IS ABOUT TO CALL A WALK-AWAY.
+   *
+   * A two-step press, not a dialog: this writes a debt that follows the person
+   * to every other park on the platform, so it asks out loud first and the
+   * second press is the decision. (No native dialogs, and a modal for one
+   * sentence would be heavier than the thing it guards.)
+   */
+  const [walkAway, setWalkAway] = useState<string | null>(null)
+  const [marking, setMarking] = useState<string | null>(null)
   // S652 (Nic): an emailed pay link being settled here, in person. The link
   // is the bill; the server charges its lines and marks it paid.
   const [payLinkId, setPayLinkId] = useState<string | null>(null)
@@ -552,7 +564,7 @@ export function POSPage() {
   const [openTx,setOpenTx]=useState<string|null>(null)   // S653: history row expanded to its lines
   const [refundModal, setRefundModal] = useState<{show:boolean; tx:any}>({show:false,tx:null})
   // 10/3 (review): Void asks first, in the app — never a browser pop-up.
-  // 10/24 (Nic): "if I type Hamp, anything attached to Donald Hamp should show
+  // 10/24 (Nic): "if I type Westbrook, anything attached to Wren Westbrook should show
   // on the list, and everything else should just be hidden." A find-on-page over
   // the history already loaded — no round trip, no new query.
   const [historyFind, setHistoryFind] = useState('')
@@ -704,7 +716,7 @@ export function POSPage() {
     // bill — the power was used, so nothing is written off: it is owed the
     // ordinary way, on their invoice or as an emailed link. The read stands.
     releaseRaisedBills()
-    setCart([]); setPerson(null); setAppliedDiscount(null); setStay(null); setCashGiven(''); setCheckNumber(''); setCounterCheck(null)
+    setCart([]); setPerson(null); setAppliedDiscount(null); setStay(null); setCashGiven(''); setCheckNumber('')
     setOpenTicketId(null); setTicketSnapshot(null); setPayLinkId(null); setClosingRead(false)
   }
 
@@ -849,6 +861,39 @@ export function POSPage() {
     if ((tenantId || posCustomerId) && heldLines.length) { writeTicketMut.mutate(); return }
     resetRegister('cleared_by_cashier')
     if (billInCart) toastOnce('Cleared. The closing read stands, and its bill is owed as usual — on their invoice, or as an emailed link.')
+  }
+
+  /**
+   * 11/5 (Nic) — THEY NEVER CAME BACK FOR IT.
+   *
+   *   "If I send somebody a point of sale ticket and they never pay it, that's
+   *    a left owing money situation."
+   *
+   * The ticket is NOT closed — he was explicit that a ticket is not
+   * discardable, and it is still money owed. This only writes it into the
+   * walk-away book, where another park sees it; settling it later takes it
+   * straight back out.
+   */
+  const markNeverCameBack = async (t: any) => {
+    setMarking(t.id)
+    try {
+      // apiPost hands back the whole envelope here, so the figures are under
+      // `data` — reading them off the top level would have shown $0.00 for a
+      // debt that was recorded correctly.
+      const r: any = await apiPost(`/pos/tickets/${t.id}/never-came-back`, {})
+      setWalkAway(null)
+      const mine = Number(r?.data?.amount ?? 0)
+      const all = Number(r?.data?.owedInAll ?? 0)
+      toastOnce(`Recorded as left owing — $${fmtPlain(mine)}`
+        + (all > mine ? `, $${fmtPlain(all)} owed in all.` : '.'))
+      await tickets.refetch()
+    } catch (e: any) {
+      setWalkAway(null)
+      // The server says WHY in plain words — a reservation that has not
+      // finished, no phone to match them on, an arrangement already running.
+      // The desk needs that sentence, not a generic failure.
+      toastOnce(errorMessage(e, 'That could not be recorded.'), { error: true })
+    } finally { setMarking(null) }
   }
 
   // 10/2 (Nic, front desk foolproof): a ticket or pay link is opened from the
@@ -1215,8 +1260,11 @@ export function POSPage() {
   // to just do the background check first and see if they're going to be
   // approved." Its price is the server's (cart-quote answers with it); nothing
   // here works it out.
-  const counterCheckDue = counterCheck ? Number(counterCheck.price) || 0 : 0
-  const screeningDue = (stayLine && stayPriced(stayLine) ? Number(stayLine.screeningFee) || 0 : 0) + counterCheckDue
+  // 10/31 (Nic): the counter's pay-for-a-check flow is gone — "pos has nothing
+  // to do with screening." What remains is the stay's own fee: a stay over three
+  // weeks with no check on file carries it, the server adds it, and nobody can
+  // take it off.
+  const screeningDue = stayLine && stayPriced(stayLine) ? Number(stayLine.screeningFee) || 0 : 0
   const subtotal = cart.reduce((s,i) => s+lineAmount(i), 0) + screeningDue
   // 10/3 (review, decisions #9): a stay is charged at the schedule's price —
   // a sale with a stay (or a reservation) in it takes no discount, and the
@@ -1408,6 +1456,9 @@ export function POSPage() {
       // Always send the register's property (not just for FlexCharge) so every
       // sale is tied to a property — required for cashier property-lock scoping.
       propertyId: registerProperty || null,
+      // 10/31: the drawer this money goes into. Null where the property has no
+      // registers, which rings exactly as it always has.
+      registerShiftId: myOpenShiftId,
       subtotal:discountedSubtotal, taxAmount, surcharge, total, changeGiven:changeDue,
       discountAmount:discountAmt, discountReason:appliedDiscount?.name||null,
       // 10/23 (Nic): the check number, on a check sale only. The API refuses
@@ -1424,7 +1475,6 @@ export function POSPage() {
       stay: stayInCart ? (stay || null) : null,
       // 10/21 (Nic): a check sold on its own. The server prices it and writes
       // the line — this is only the person it is for.
-      screening: counterCheck ? { name: counterCheck.name, email: counterCheck.email } : null,
     }),
     { onSuccess: async (res:any) => {
       // 10/3 (Nic, decisions #16): the change stays on screen until the cashier
@@ -1455,7 +1505,7 @@ export function POSPage() {
         })
       }
       setClientSessionId(null)
-      abandonPendingIntent(); setCart([]); setCashGiven(''); setCheckNumber(''); setPerson(null); setAppliedDiscount(null); setStay(null); setCounterCheck(null)
+      abandonPendingIntent(); setCart([]); setCashGiven(''); setCheckNumber(''); setPerson(null); setAppliedDiscount(null); setStay(null)
       setOpenTicketId(null); setTicketSnapshot(null); setPayLinkId(null); qc.invalidateQueries('pos-tickets')
       qc.invalidateQueries('pos-transactions'); qc.invalidateQueries('pos-items')
       // 10/3 (review): a stay sold here took its site — the next picker reads what is free again.
@@ -1782,6 +1832,28 @@ export function POSPage() {
   // Staff see only tabs whose permission they hold. These keys are toggled on
   // the per-user permissions page.
   const isOwner = !!user && ['landlord', 'admin', 'super_admin'].includes(user.role)
+  // ── 10/31 (Nic): WHICH DRAWER THIS SALE GOES IN ──────────────────────────
+  //
+  //   "If you were never signed into a register, without being dedicated to a
+  //    register, you shouldn't be able to just do transactions... if you put
+  //    money in the drawer without being signed in, it would be items that were
+  //    not rung up, and under that scenario you would always have an overage."
+  //
+  // So every sale carries the shift this person has open here. The server
+  // refuses a sale with no shift once the property has registers, and refuses
+  // somebody else's drawer outright. Refetched on focus because a shift may be
+  // counted down on this very tablet between sales.
+  const { data: myDrawer } = useQuery<any>(
+    ['my-drawer', registerProperty],
+    () => apiGet(`/pos/registers?propertyId=${encodeURIComponent(registerProperty!)}`),
+    { enabled: !!registerProperty, refetchOnWindowFocus: true, staleTime: 0 },
+  )
+  const myOpenShiftId: string | null = (() => {
+    const rows: any[] = Array.isArray(myDrawer) ? myDrawer : []
+    const mine = rows.find(r => r.openShiftId && r.openShiftOpenedBy === user?.id)
+    return mine?.openShiftId ?? null
+  })()
+
   const canSeeTab = (perm: string) => isOwner || (user?.permissions as any)?.[perm] === true
   const canRefund = canSeeTab('pos.refund')
   const canVoid = canSeeTab('pos.void')
@@ -1793,12 +1865,10 @@ export function POSPage() {
     // Anyone who can ring a sale can check somebody out; its money lands on
     // the register ticket either way.
     { key:'checkout',  label:'Checkout',   perm:'pos.tab.register' },
-    // 10/21 (Nic): "nothing shows the desk it's waiting. Yeah, we need a way to
-    // resend it." The desk took the money for these checks, and the desk is who
-    // the guest rings when the link never came — so the list of who has paid and
-    // not done it belongs here, with the address editable, because a mistyped
-    // one is why the link never came AND why they cannot sign in to fix it.
-    { key:'checks',    label:'Checks',     perm:'pos.tab.register' },
+    // 10/31 (Nic): counting the drawer down is daily work at the counter, so it
+    // sits beside the register rather than behind Settings. Anyone who can ring
+    // a sale can count their own drawer.
+    { key:'drawer',    label:'Drawer',     perm:'pos.tab.register' },
     { key:'history',   label:'History',    perm:'pos.tab.history' },
     // S654 (Nic): "an overall customers tab… see my whole customer history."
     { key:'customers', label:'Customers',  perm:'pos.tab.history' },
@@ -2063,12 +2133,12 @@ export function POSPage() {
           register's ticket: "I want the determination of checking out to
           automatically know all of the things to bill for, not just targeted
           electric." */}
-      {tab==='checks' && (
-        <div style={{maxWidth:760}}>
-          <StartACheck propertyId={registerProperty}
-            onToSale={(c)=>{ setCounterCheck(c); setTab('register') }} />
-          <ScreeningsWaitingPanel propertyId={registerProperty} api={screeningsApi} />
-        </div>
+      {tab==='drawer' && (
+        !registerProperty
+          ? <div className="card" style={{ padding:14, fontSize:'.82rem', color:'var(--text-3)' }}>
+              Pick a property first — a drawer belongs to one place.
+            </div>
+          : <DrawerCount propertyId={registerProperty} api={drawerApi} canConfigure={canSeeTab('pos.manage_inventory')} />
       )}
       {tab==='checkout' && !!registerProperty && (
         <CheckoutTab propertyId={registerProperty}
@@ -2089,8 +2159,12 @@ export function POSPage() {
           }} />
       )}
 
+      {/* 10/30 (Nic): the cart was a hard 340px beside the item grid. A phone
+          has ~350px of usable width, so the grid was crushed to nothing and the
+          cart ran off the edge. pos-register-split restacks it to one column on
+          a phone — cart under the items, both full width. */}
       {tab==='register' && (
-        <div style={{display:'grid',gridTemplateColumns:'1fr 340px',gap:16,alignItems:'start'}}>
+        <div className="pos-register-split" style={{display:'grid',gridTemplateColumns:'1fr 340px',gap:16,alignItems:'start'}}>
           <div>
             {!registerProperty ? null : (<>
             {/* S263: open-tab banner — appears when there's an unclosed
@@ -2223,14 +2297,9 @@ export function POSPage() {
                     to the sale, and nobody can take it off. */}
                 {screeningDue>0 && (<div style={{display:'flex',alignItems:'center',gap:6,padding:'7px 0',borderBottom:'1px solid var(--border-1)'}}>
                   <div style={{flex:1,minWidth:0,fontSize:'.8rem',fontWeight:500}}>
-                    {counterCheck ? `Background check — ${counterCheck.name}` : (stay?.screeningLineName || 'Background check')}
+                    {stay?.screeningLineName || 'Background check'}
                   </div>
-                  {counterCheck
-                    ? <button type="button" onClick={()=>setCounterCheck(null)}
-                        style={{border:'none',background:'none',color:'var(--text-3)',fontSize:'.68rem',cursor:'pointer',textDecoration:'underline'}}>
-                        take off
-                      </button>
-                    : <div style={{fontSize:'.68rem',color:'var(--text-3)',textAlign:'right',maxWidth:110,lineHeight:1.3}}>required · cannot be taken off</div>}
+                  <div style={{fontSize:'.68rem',color:'var(--text-3)',textAlign:'right',maxWidth:110,lineHeight:1.3}}>required · cannot be taken off</div>
                   <div style={{fontSize:'.82rem',fontWeight:600,minWidth:44,textAlign:'right'}}>{fmt(screeningDue)}</div>
                 </div>)}
               </div>
@@ -3462,9 +3531,38 @@ export function POSPage() {
                     away. Settle is the only thing that closes one. */}
                 {(openTicketId===t.id||payLinkId===t.id)
                   ? <span style={{fontSize:'.72rem',color:'var(--gold)',fontWeight:700,whiteSpace:'nowrap'}}>In the cart</span>
-                  : <button className="btn btn-primary btn-sm"
-                      disabled={!!reopening || putTicketBackMut.isLoading || readerHoldsCharge || (cart.length>0 && !openTicketId && !payLinkId)}
-                      onClick={()=>void reopenTicket(t)}>{reopening===t.id ? 'Opening…' : 'Settle'}</button>}
+                  : <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap',justifyContent:'flex-end'}}>
+                      {/* 11/5 (Nic) — ALREADY ON THE WALK-AWAY BOOK. It is still
+                          owed and still on this list (a ticket is not
+                          discardable), so Settle stays; this only says another
+                          park can now be told about it. */}
+                      {t.leftOwingAmount != null
+                        ? <span style={{fontSize:'.68rem',fontWeight:700,color:'var(--gold)',whiteSpace:'nowrap'}}>
+                            Left owing · ${fmtPlain(t.leftOwingAmount)}
+                          </span>
+                        : walkAway===t.id
+                          /* The second press is the decision: this follows them
+                             to every other park on the platform. */
+                          ? <>
+                              <span style={{fontSize:'.68rem',color:'var(--text-3)',maxWidth:190,lineHeight:1.25}}>
+                                Record this? It follows them to every park on GAM.
+                              </span>
+                              <button className="btn btn-sm" style={{whiteSpace:'nowrap'}}
+                                disabled={marking===t.id}
+                                onClick={()=>setWalkAway(null)}>Cancel</button>
+                              <button className="btn btn-primary btn-sm" style={{whiteSpace:'nowrap'}}
+                                disabled={marking===t.id}
+                                onClick={()=>void markNeverCameBack(t)}>
+                                {marking===t.id ? 'Recording…' : 'Yes, they left owing'}
+                              </button>
+                            </>
+                          : <button className="btn btn-sm" style={{whiteSpace:'nowrap'}}
+                              disabled={!!reopening || marking===t.id}
+                              onClick={()=>setWalkAway(t.id)}>Never came back</button>}
+                      <button className="btn btn-primary btn-sm"
+                        disabled={!!reopening || putTicketBackMut.isLoading || readerHoldsCharge || (cart.length>0 && !openTicketId && !payLinkId)}
+                        onClick={()=>void reopenTicket(t)}>{reopening===t.id ? 'Opening…' : 'Settle'}</button>
+                    </div>}
               </div>
             ))}
           </div>
@@ -4491,73 +4589,3 @@ function GetReaderCard({ propertyId, property }: { propertyId: string; property:
  * The price is the server's either way. The email is not optional on either
  * path: the link goes to it, and it is the address they sign in with.
  */
-function StartACheck({ propertyId, onToSale }: {
-  propertyId: string | null
-  onToSale: (c: { name: string; email: string; price: number }) => void
-}) {
-  const [name, setName] = useState('')
-  const [email, setEmail] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [note, setNote] = useState<string | null>(null)
-  const [err, setErr] = useState<string | null>(null)
-  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
-  const ready = !!propertyId && !!name.trim() && emailOk && !busy
-
-  const run = async (what: 'send' | 'counter') => {
-    if (!ready) return
-    setBusy(true); setErr(null); setNote(null)
-    try {
-      if (what === 'send') {
-        const r: any = await apiPost(`/properties/${propertyId}/apply-link/send`,
-          { email: email.trim(), name: name.trim() })
-        setNote(`Sent to ${r?.data?.sentTo ?? email.trim()}. They pay for it on the page.`)
-        setName(''); setEmail('')
-      } else {
-        // The server prices it; the register never does.
-        const q: any = await apiPost('/pos/cart-quote',
-          { propertyId, items: [], paymentMethod: 'cash', screening: { name: name.trim(), email: email.trim() } })
-        const priced = q?.data?.screening
-        if (!priced) throw new Error('The register could not price that check just now — try again in a moment.')
-        onToSale({ name: priced.name, email: priced.email, price: Number(q.data.total) })
-      }
-    } catch (e: any) {
-      setErr(e?.message || 'That did not go through — try again in a moment.')
-    } finally { setBusy(false) }
-  }
-
-  return (
-    <div style={{border:'1px solid var(--border)',borderRadius:10,padding:14,marginBottom:16}}>
-      <h3 style={{margin:'0 0 4px',fontSize:'.9rem'}}>Start a background check</h3>
-      <p style={{margin:'0 0 12px',fontSize:'.76rem',color:'var(--text-3)'}}>
-        For somebody who wants to know where they stand before they book anything. They do not
-        have to take a site first.
-      </p>
-      <div style={{display:'flex',gap:8,flexWrap:'wrap',marginBottom:10}}>
-        <input value={name} onChange={e=>{setName(e.target.value);setNote(null);setErr(null)}} placeholder="Their name"
-          style={{flex:'1 1 180px',minWidth:0,padding:'7px 10px',borderRadius:8,border:'1px solid var(--border)',
-                  background:'var(--bg-2)',color:'var(--text-1)',fontSize:'.82rem'}} />
-        <input value={email} onChange={e=>{setEmail(e.target.value);setNote(null);setErr(null)}} placeholder="Their email"
-          style={{flex:'1 1 220px',minWidth:0,padding:'7px 10px',borderRadius:8,border:'1px solid var(--border)',
-                  background:'var(--bg-2)',color:'var(--text-1)',fontSize:'.82rem'}} />
-      </div>
-      <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
-        <button type="button" disabled={!ready} onClick={()=>run('send')}
-          style={{padding:'7px 14px',borderRadius:8,border:'none',background:ready?'var(--gold)':'var(--bg-3)',
-                  color:ready?'#1a1a1a':'var(--text-3)',fontWeight:700,fontSize:'.8rem',cursor:ready?'pointer':'default'}}>
-          Send them the link
-        </button>
-        <button type="button" disabled={!ready} onClick={()=>run('counter')}
-          style={{padding:'7px 14px',borderRadius:8,border:'1px solid var(--border)',background:'transparent',
-                  color:'var(--text-1)',fontWeight:600,fontSize:'.8rem',cursor:ready?'pointer':'default'}}>
-          Take it at the counter
-        </button>
-        <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>
-          They pay on their own phone, or on this ticket.
-        </span>
-      </div>
-      {!propertyId && <div style={{marginTop:8,fontSize:'.74rem',color:'var(--amber)'}}>Pick which property this register is at first.</div>}
-      {note && <div style={{marginTop:8,fontSize:'.76rem',color:'var(--green)'}}>{note}</div>}
-      {err && <div style={{marginTop:8,fontSize:'.76rem',color:'var(--red)'}}>{err}</div>}
-    </div>
-  )
-}

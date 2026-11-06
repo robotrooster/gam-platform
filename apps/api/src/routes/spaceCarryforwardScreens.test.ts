@@ -336,17 +336,29 @@ describe('what a space carries', () => {
 
     const today = await parkDay(0)
     const day = Number(today.slice(8, 10))
+    // 10/29: a cycle day is 1-28, so on the 29th-31st it clamps to 28 — which
+    // is BEFORE today, and before the arrangement starts, so the job on `today`
+    // had no cycle to ask for. The suite failed on the date, not on the code.
+    // Run it on the day the cycle actually first falls: the next occurrence of
+    // the clamped day on or after today.
+    const cycleDay = Math.min(day, 28)
+    const cycleDate = (() => {
+      const y = Number(today.slice(0, 4))
+      const m = Number(today.slice(5, 7))
+      return new Date(Date.UTC(y, m - 1 + (cycleDay >= day ? 0 : 1), cycleDay))
+        .toISOString().slice(0, 10)
+    })()
     // Nic: "even if it's $50 or $100 or whatever."
     const set = await put(`/api/leases/${p.leaseId}/space-carryforward/arrangement`, p.token,
-      { amount: 100, dayOfMonth: Math.min(day, 28), startOn: today })
+      { amount: 100, dayOfMonth: cycleDay, startOn: today })
     expect(set.status).toBe(200)
-    expect(set.body.data.arrangement).toMatchObject({ amount: 100, dayOfMonth: Math.min(day, 28) })
+    expect(set.body.data.arrangement).toMatchObject({ amount: 100, dayOfMonth: cycleDay })
 
     // The cycle runs on its day.
     const c = await db.connect()
     try {
       await c.query('BEGIN')
-      const r = await runCarryforwardArrangements(c, today)
+      const r = await runCarryforwardArrangements(c, cycleDate)
       await c.query('COMMIT')
       expect(r.asked).toBe(1)
       expect(r.lateFeesCharged).toBe(0)
@@ -354,7 +366,9 @@ describe('what a space carries', () => {
 
     const after = (await get(`/api/leases/${p.leaseId}/space-carryforward`, p.token)).body.data
     expect(after.installments).toHaveLength(1)
-    expect(after.installments[0]).toMatchObject({ amount: 100, status: 'asked', dueDate: today })
+    // Due on the cycle's own day, which is `today` for all but the last three
+    // days of a month (see cycleDate above).
+    expect(after.installments[0]).toMatchObject({ amount: 100, status: 'asked', dueDate: cycleDate })
 
     // THE PROMISE THE SCREEN MAKES: nothing is fined. Not one late_fee row
     // exists against this space any more — the 19 that did were dropped at

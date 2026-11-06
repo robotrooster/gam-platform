@@ -98,18 +98,25 @@ describe('reporting a bank deposit — the reference number', () => {
     await type(ref!, '   ')
     expect(button(/^Report this deposit$/)!.disabled).toBe(true)
     await type(ref!, '  004417 ')
+    // 11/1: a good reference is no longer enough on its own — the photo of the
+    // bank's receipt is required too.
+    expect(button(/^Report this deposit$/)!.disabled).toBe(true)
+    await pickFile(byLabel('Photo of the bank’s receipt')!,
+      new File([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])], 'receipt.jpg', { type: 'image/jpeg' }))
     expect(button(/^Report this deposit$/)!.disabled).toBe(false)
     await act(async () => { button(/^Report this deposit$/)!.click() })
     await until(() => api.posts.length === 1, 'the report')
     expect(api.posts[0]).toMatchObject({ url: '/declared-deposits', body: { leaseId: 'L1', amount: 450, method: 'cash', reference: '004417' } })
-    expect(api.uploads).toEqual([])
   })
 })
 
 describe('reporting a bank deposit — the photo of the bank’s receipt', () => {
-  it('is optional; a photo picked goes up on the report just made', async () => {
+  it('is REQUIRED (11/1, Blue via Nic): without it nothing can be sent, and the one picked goes up on the report just made', async () => {
     await openForm()
     await type(byLabel('Deposit reference number — from the bank\'s receipt')!, 'DEP-5')
+    // Everything else is filled; the photo alone holds it back. Zero of the four
+    // reports ever filed had one while this said "optional".
+    expect(button(/^Report this deposit$/)!.disabled).toBe(true)
     const pic = byLabel('Photo of the bank’s receipt')!
     expect(pic.type).toBe('file')
     expect(pic.accept).toBe('image/*')
@@ -149,5 +156,53 @@ describe('a report the bank showed on a later day', () => {
       root.render(<ReportedDeposits reports={[{ ...flagged, bankDateUsed: false }]} onWithdrawn={() => {}} />)
     })
     expect(text()).toBe('')
+  })
+})
+
+/**
+ * 11/1 (Blue, via Nic): A REPORT ALREADY FILED CAN STILL BE FINISHED.
+ *
+ * Making the photo required does nothing for the reports already on file, and
+ * every one of them was missing it. Kim Bowman filed $1,175 on 10/30 and told
+ * the office she could not find anywhere to upload the picture — there was
+ * nowhere, because the only file picker lived inside the "make a report"
+ * window and vanished when she submitted. The server always allowed it.
+ */
+describe('finishing a report that has no photo', () => {
+  const pending = {
+    id: 'r42', leaseId: 'L1', amount: 1175, declaredDate: '2026-10-30', method: 'cash',
+    reference: '11004', status: 'pending', bankFeedLinked: true,
+  }
+
+  it('offers to add the bank\u2019s receipt, says why, and sends it to that report', async () => {
+    let reloaded = 0
+    await act(async () => { root.render(<ReportedDeposits reports={[pending]} onWithdrawn={() => { reloaded++ }} />) })
+    expect(text()).toContain('This report still needs a photo of the bank\u2019s receipt.')
+    const add = button(/Add the bank\u2019s receipt/)
+    expect(add).toBeTruthy()
+
+    const pic = host.querySelector('input[type="file"]') as HTMLInputElement
+    await pickFile(pic, new File([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])], 'late.jpg', { type: 'image/jpeg' }))
+    await until(() => api.uploads.length === 1, 'the photo')
+    expect(api.uploads[0].url).toBe('/declared-deposits/r42/receipt-photo')
+    expect((api.uploads[0].form.get('photo') as File).name).toBe('late.jpg')
+    expect(reloaded).toBe(1)
+  })
+
+  it('a report that already has one offers to view it, not to add another', async () => {
+    await act(async () => {
+      root.render(<ReportedDeposits reports={[{ ...pending, receiptPhotoUrl: '/api/declared-deposits/receipt-photos/x.jpg' }]}
+        onWithdrawn={() => {}} />)
+    })
+    expect(button(/Add the bank\u2019s receipt/)).toBeUndefined()
+    expect(button(/Photo of the bank\u2019s receipt/)).toBeTruthy()
+  })
+
+  it('a file that is not a photo is refused in words and nothing is sent', async () => {
+    await act(async () => { root.render(<ReportedDeposits reports={[pending]} onWithdrawn={() => {}} />) })
+    await pickFile(host.querySelector('input[type="file"]') as HTMLInputElement,
+      new File(['%PDF'], 'receipt.pdf', { type: 'application/pdf' }))
+    expect(text()).toContain('Choose a photo (JPEG, PNG, WebP or HEIC) of the bank\'s receipt.')
+    expect(api.uploads).toEqual([])
   })
 })

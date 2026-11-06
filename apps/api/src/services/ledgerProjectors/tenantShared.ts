@@ -118,7 +118,8 @@ export async function loadCompanyBooks(client: PoolClient, landlordId: string): 
 export function requireHomeSaleMethod(co: CompanyBooks): BooksHomeSaleMethod {
   if (!co.homeSaleMethod) {
     throw new LedgerSourceError('owner_not_ready',
-      'Waiting on the owner: how home sales count (the whole sale at signing, or income as each payment comes in) is not chosen yet on the Books settings page.')
+      'Waiting on the owner: how home sales count (the whole sale at signing, or income as each payment comes in) is not chosen yet on the Books settings page.',
+      'home_sale_method')
   }
   return co.homeSaleMethod
 }
@@ -127,7 +128,8 @@ export function requireHomeSaleMethod(co: CompanyBooks): BooksHomeSaleMethod {
 export function requireWorkTradeMethod(co: CompanyBooks): BooksWorkTradeMethod {
   if (!co.workTradeMethod) {
     throw new LedgerSourceError('owner_not_ready',
-      'Waiting on the owner: how work-trade hours that cover rent count (full rent plus a labor cost, a rent discount, or left out of the books) is not chosen yet on the Books settings page.')
+      'Waiting on the owner: how work-trade hours that cover rent count (full rent plus a labor cost, a rent discount, or left out of the books) is not chosen yet on the Books settings page.',
+      'work_trade_method')
   }
   return co.workTradeMethod
 }
@@ -171,6 +173,14 @@ export interface PaymentFacts {
    * September and October income stays in September and October.
    */
   spaceCarryforwardId: string | null
+  /**
+   * 10/27 (Nic): the arrangement this installment belongs to, when the charge
+   * is a debt the resident left with ANOTHER operator and this landlord is
+   * collecting it for them. It changes the carried-balance posting
+   * (tenantCharges A8c): the money is the other operator's, so it credits a
+   * liability instead of this landlord's opening equity.
+   */
+  leftOwingCollectionId: string | null
   homeSaleInstallmentId: string | null
   invoiceId: string | null
   leaseFeeId: string | null
@@ -246,6 +256,7 @@ export async function loadPaymentFacts(client: PoolClient, ids: readonly string[
             (b.voided_at IS NOT NULL OR b.status = 'voided') AS voided,
             b.due_date::text AS due_date, ${localDaySql('b.settled_at', 'z.tz')} AS settled_day,
             b.manual_method, b.revenue_owner, b.reversal_id, b.flexpay_advance_id, b.work_trade_settlement_id, b.space_carryforward_id,
+            b.left_owing_collection_id,
             b.home_sale_installment_id, b.invoice_id, b.lease_fee_id, b.fee_type, b.deposit_collected_by,
             b.prop AS property_id, z.tz,
             ${cSql('b.amount')} AS amount_c, ${cSql('b.work_trade_credit')} AS wtc_c,
@@ -280,6 +291,7 @@ export async function loadPaymentFacts(client: PoolClient, ids: readonly string[
       type: x.type, entryDescription: x.entry_description, status: x.status, voided: !!x.voided,
       dueDate: x.due_date, settledDay: x.settled_day, manualMethod: x.manual_method, revenueOwner: x.revenue_owner,
       reversalId: x.reversal_id, flexpayAdvanceId: x.flexpay_advance_id, workTradeSettlementId: x.work_trade_settlement_id, spaceCarryforwardId: x.space_carryforward_id,
+      leftOwingCollectionId: x.left_owing_collection_id,
       homeSaleInstallmentId: x.home_sale_installment_id, invoiceId: x.invoice_id, leaseFeeId: x.lease_fee_id,
       feeType: x.fee_type, depositCollectedBy: x.deposit_collected_by, propertyId: x.property_id, tz: x.tz,
       amountCents, workTradeCents, creditCents,

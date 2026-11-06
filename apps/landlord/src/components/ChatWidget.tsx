@@ -342,8 +342,12 @@ export function ChatWidget() {
       <style>{DOT_CSS}</style>
       {open && (
         <div style={{
+          // 10/30: the panel sits with the bubble, below the dialog layer, so a
+          // dialog is never argued with. 100dvh for the height cap: 100vh is
+          // taller than a phone's visible area, which pushed the panel's own
+          // footer under the address bar.
           position: 'fixed', bottom: 88, right: 20, width: 380, maxWidth: 'calc(100vw - 40px)',
-          height: 540, maxHeight: 'calc(100vh - 120px)', zIndex: 1000,
+          height: 540, maxHeight: 'calc(var(--vh) - 120px)', zIndex: 81,
           borderRadius: 16, overflow: 'hidden', border: '1px solid var(--border-2)',
           boxShadow: '0 18px 50px rgba(0,0,0,.5)',
         }}>
@@ -355,7 +359,12 @@ export function ChatWidget() {
         aria-label={open ? 'Close support chat' : 'Open support chat'}
         style={{
           position: 'fixed', bottom: 20, right: 20, width: 56, height: 56, borderRadius: '50%',
-          background: 'var(--gold)', color: '#0a0b0e', border: 'none', cursor: 'pointer', zIndex: 1000,
+          // 10/30: at zIndex 1000 the bubble floated ABOVE dialogs (zIndex 100),
+          // and on a phone a dialog spans nearly the full width with its confirm
+          // button bottom-right — so the right edge of Confirm sat under the
+          // bubble and tapping it opened the chat instead. Below the dialog
+          // layer now; it is still above the page, which is all it needs.
+          background: 'var(--gold)', color: '#0a0b0e', border: 'none', cursor: 'pointer', zIndex: 80,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           boxShadow: '0 8px 24px rgba(0,0,0,.45)',
         }}

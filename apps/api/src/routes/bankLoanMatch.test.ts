@@ -40,8 +40,10 @@ async function company(moneyIn: 'any' | 'after_not_rent' | 'never' = 'after_not_
   const c = await db.connect()
   try {
     const { userId: ownerId, landlordId } = await seedLandlord(c)
-    await c.query(`UPDATE landlords SET books_start_date = '2026-01-01' WHERE id = $1`, [landlordId])
     const propertyId = await seedProperty(c, { landlordId, ownerUserId: ownerId, managedByUserId: ownerId })
+    // 11/3: after the property exists — the books start lives on the property
+    // and the company's is derived from it, so setting it first set nothing.
+    await c.query(`UPDATE properties SET books_start_date = '2026-01-01' WHERE landlord_id = $1`, [landlordId])
     const connectionId = (await c.query<{ id: string }>(
       `INSERT INTO bank_connections (landlord_id, provider, status, display_name) VALUES ($1, 'stripe_fc', 'active', 'Operating') RETURNING id`,
       [landlordId])).rows[0].id

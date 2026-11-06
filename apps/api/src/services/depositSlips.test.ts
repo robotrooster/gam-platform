@@ -16,11 +16,13 @@ import jwt from 'jsonwebtoken'
 import { db, getClient } from '../db'
 import {
   createSlip, voidSlip, listSlips, cashProposalFor, findCashCombination, slipLastBankDay, matchSlipByHand,
+  cashNotBanked,
 } from './depositSlips'
 import { reconcileDeposits, normalizeMerchant, namesAPayer, upsertTransactions, ignoreTransaction, undoFiling, categorizeTransaction } from './bankFeed'
 import { undoDepositMatch } from './bankDepositConfirm'
 import { bankFeedRouter } from '../routes/bankFeed'
 import { errorHandler } from '../middleware/errorHandler'
+import { todayIn } from '../lib/timezone'
 import {
   cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
@@ -693,5 +695,131 @@ describe('the routes, for front-desk staff', () => {
       landlordIds: [ctx.landlordId], permissions: {} }, SECRET, { expiresIn: '1h' })
     const listed = await request(app()).get('/api/bank-feed/deposit-slips').set('Authorization', `Bearer ${ownerTok}`)
     expect(listed.body.data.waiting.map((w: any) => w.transactionId)).toEqual([t])
+  })
+})
+
+// ── 10/31 (Nic): A DRAWER DROP GOES IN THE BAG ───────────────────────────────
+//
+// Two stages, his words (10/30): staff count the drawer down to what it started
+// with, and the money pulled out waits "because it's not worth the gas to drive
+// $100 to the bank when another $100 might come tomorrow." So one bank deposit
+// is several days of drops.
+//
+// The slip already bundled individual register cash SALES. Once a drawer has
+// been counted, the drop is the truer number — a drawer $20 short sends $20 less
+// to the bank than its sales say — and the sales inside it must stop being
+// offered, or the same cash is banked twice.
+describe('a counted drawer drops into the bag', () => {
+  // Computed, never hardcoded: a slip's day cannot be later than tomorrow, and a
+  // fixed date in a test is a deploy that fails on a day nobody chose.
+  const today = () => todayIn(null)
+
+  const drawer = async (ctx: Ctx, startingCents: number, name = 'Register 1') => {
+    const c = await getClient()
+    try {
+      return (await c.query(
+        `INSERT INTO pos_registers (landlord_id, property_id, name, starting_cash_cents,
+           starting_cash_confirmed_at, starting_cash_confirmed_by_user_id)
+         VALUES ($1,$2,$3,$4,NOW(),$5) RETURNING id`,
+        [ctx.landlordId, ctx.propertyId, name, startingCents, ctx.userId])).rows[0].id as string
+    } finally { c.release() }
+  }
+  const cashSale = async (ctx: Ctx, dollars: number, shiftId: string | null) => {
+    const c = await getClient()
+    try {
+      return (await c.query(
+        `INSERT INTO pos_transactions
+           (landlord_id, property_id, cashier_id, payment_method, subtotal, tax_amount, total,
+            refund_amount, status, register_shift_id)
+         VALUES ($1,$2,$3,'cash',$4,0,$4,0,'completed',$5) RETURNING id`,
+        [ctx.landlordId, ctx.propertyId, ctx.userId, dollars, shiftId])).rows[0].id as string
+    } finally { c.release() }
+  }
+
+  it("offers the drop and withholds the sales inside it — the same money, once", async () => {
+    const ctx = await build()
+    const { openShift, closeShift } = await import('./posDrawer')
+    const reg = await drawer(ctx, 10000)
+    const shift = await openShift({ registerId: reg, userId: ctx.userId })
+    await cashSale(ctx, 40, shift.id)
+    await cashSale(ctx, 60, shift.id)
+    // $100 of sales on a $100 drawer, counted at $195: $5 went missing.
+    const closed = await closeShift({ shiftId: shift.id, userId: ctx.userId, countedCents: 19500,
+      varianceReason: 'five short' })
+    expect(closed.dropCents).toBe(9500)
+
+    const items = await cashNotBanked(db, ctx.landlordId, {})
+    const drops = items.filter(i => i.kind === 'drawer_drop')
+    const sales = items.filter(i => i.kind === 'register_sale')
+    expect(drops).toHaveLength(1)
+    // THE DROP, not the $100 of sales — the bag really has $95 in it.
+    expect(drops[0].amountCents).toBe(9500)
+    expect(sales).toHaveLength(0)
+  })
+
+  it('still offers a sale on a shift nobody has counted yet', async () => {
+    const ctx = await build()
+    const { openShift } = await import('./posDrawer')
+    const shift = await openShift({ registerId: await drawer(ctx, 10000), userId: ctx.userId })
+    await cashSale(ctx, 40, shift.id)
+    const items = await cashNotBanked(db, ctx.landlordId, {})
+    expect(items.filter(i => i.kind === 'drawer_drop')).toHaveLength(0)
+    expect(items.filter(i => i.kind === 'register_sale').map(i => i.amountCents)).toEqual([4000])
+  })
+
+  it('leaves a sale with no drawer exactly as it was', async () => {
+    const ctx = await build()
+    await cashSale(ctx, 40, null)
+    const items = await cashNotBanked(db, ctx.landlordId, {})
+    expect(items.filter(i => i.kind === 'register_sale').map(i => i.amountCents)).toEqual([4000])
+  })
+
+  it('a drawer counted down to less than it started with has nothing to bank', async () => {
+    const ctx = await build()
+    const { openShift, closeShift } = await import('./posDrawer')
+    const shift = await openShift({ registerId: await drawer(ctx, 10000), userId: ctx.userId })
+    await closeShift({ shiftId: shift.id, userId: ctx.userId, countedCents: 9000, varianceReason: 'ten short' })
+    expect((await cashNotBanked(db, ctx.landlordId, {})).filter(i => i.kind === 'drawer_drop')).toHaveLength(0)
+  })
+
+  it('goes on a slip, counts toward its total, and cannot be in two bags at once', async () => {
+    const ctx = await build()
+    const { openShift, closeShift } = await import('./posDrawer')
+    const shift = await openShift({ registerId: await drawer(ctx, 10000), userId: ctx.userId })
+    await cashSale(ctx, 75, shift.id)
+    await closeShift({ shiftId: shift.id, userId: ctx.userId, countedCents: 17500 })
+
+    const slip = await createSlip({
+      landlordId: ctx.landlordId, depositDate: today(),
+      drawerDropIds: [shift.id], createdBy: ctx.userId, propertyIds: null,
+    })
+    expect(slip.total).toBe(75)       // dollars on the view; $75 came out of the till
+
+    // It is in a bag now, so it is not offered again.
+    expect((await cashNotBanked(db, ctx.landlordId, { includeOnSlip: false }))
+      .filter(i => i.kind === 'drawer_drop')).toHaveLength(0)
+    // And a second bag cannot have it.
+    await expect(createSlip({
+      landlordId: ctx.landlordId, depositDate: today(),
+      drawerDropIds: [shift.id], createdBy: ctx.userId, propertyIds: null,
+    })).rejects.toThrow()
+  })
+
+  it('several days of drops go in one deposit', async () => {
+    const ctx = await build()
+    const { openShift, closeShift } = await import('./posDrawer')
+    const reg = await drawer(ctx, 10000)
+    const ids: string[] = []
+    for (const take of [40, 60, 25]) {
+      const s = await openShift({ registerId: reg, userId: ctx.userId })
+      await cashSale(ctx, take, s.id)
+      await closeShift({ shiftId: s.id, userId: ctx.userId, countedCents: 10000 + take * 100 })
+      ids.push(s.id)
+    }
+    const slip = await createSlip({
+      landlordId: ctx.landlordId, depositDate: today(),
+      drawerDropIds: ids, createdBy: ctx.userId, propertyIds: null,
+    })
+    expect(slip.total).toBe(125)      // 40 + 60 + 25, one bank trip
   })
 })

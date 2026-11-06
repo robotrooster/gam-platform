@@ -38,6 +38,51 @@ const FORBIDDEN = new Set(['auth','totp','emailOtp','stripe'])
 
 /** Endpoints deliberately left unreachable, and why. METHOD + declared path. */
 const DELIBERATE = new Map(Object.entries({
+  // ── 10/31: PASSKEYS ARE THE PERSON, NOT THE ASSISTANT ─────────────────────
+  'passkeys POST /options': "an assistant never touches somebody's sign-in credential. Registering a passkey, using one, or removing one is the person proving who they are — the same rule that keeps an agent off a signature and off accepting terms. There is no version of this an assistant should do on anybody's behalf, now or later.",
+  'passkeys POST /': "an assistant never touches somebody's sign-in credential. Registering a passkey, using one, or removing one is the person proving who they are — the same rule that keeps an agent off a signature and off accepting terms. There is no version of this an assistant should do on anybody's behalf, now or later.",
+  'passkeys POST /sign-in/options': "an assistant never touches somebody's sign-in credential. Registering a passkey, using one, or removing one is the person proving who they are — the same rule that keeps an agent off a signature and off accepting terms. There is no version of this an assistant should do on anybody's behalf, now or later.",
+  'passkeys POST /sign-in': "an assistant never touches somebody's sign-in credential. Registering a passkey, using one, or removing one is the person proving who they are — the same rule that keeps an agent off a signature and off accepting terms. There is no version of this an assistant should do on anybody's behalf, now or later.",
+  'passkeys DELETE /:id': "an assistant never touches somebody's sign-in credential. Registering a passkey, using one, or removing one is the person proving who they are — the same rule that keeps an agent off a signature and off accepting terms. There is no version of this an assistant should do on anybody's behalf, now or later.",
+
+  // ── 10/31: THE CONTRACTOR MARKETPLACE — EVERY WRITE IS SOMEBODY'S DEAL ────
+  //
+  // A landlord putting work out to strangers, a contractor naming their price,
+  // and the moment one is chosen are all the same kind of act: a commitment
+  // between two parties with money on it. The customer-rep test settles each
+  // of them the same way — a rep can look things up and explain, and a rep
+  // does not commit the business. None of these become agent actions later.
+  'marketplace POST /jobs': "posting work out to outside contractors publishes an offer in the landlord's name, and the same form decides whether the job requires a bonded and insured person. An assistant choosing that wording, or that risk gate, would be committing the landlord to work and to a liability posture nobody approved. A rep can help draft it; the owner posts it.",
+  'marketplace POST /jobs/:id/award': "this is the money decision. Awarding picks which contractor gets paid, at their price, and snapshots the rate GAM will charge on it. Choosing between people's bids is the landlord's judgment about cost, trust and who they want on their property — never an assistant's.",
+  'marketplace POST /jobs/:id/complete': "settling a finished job states what the contractor is owed and books GAM's cut off it. An assistant asserting that physical work is done, and at what figure, would be writing money against a fact it cannot see.",
+  'marketplace POST /jobs/:id/cancel': "cancelling withdraws an offer that outside contractors have already priced and bid against. Taking that back is the landlord telling people the work is off.",
+  'marketplace POST /board/:id/bid': "a bid is the contractor's own price for their own labour — the single most consequential number in their business. An assistant naming it would be quoting work on somebody's behalf.",
+  'marketplace POST /my-bids/:id/withdraw': "pulling your own number back out of a landlord's decision is the contractor's call about work they no longer want.",
+  'marketplace POST /my-jobs/:id/start': "a claim that work has physically begun on somebody's property. An assistant cannot see a van arrive.",
+  'marketplace PUT /me': "a contractor's profile is their claim about what trades they work and where they will travel. An assistant filling that in would be making trade claims on their behalf, which is what a landlord reads before letting them onto a park.",
+  'marketplace POST /me/credentials': "a credential record is TRANSCRIBED off a licence somebody is holding — the number, the issuer, the dates — and a misheard digit is a false claim about qualification that a landlord then relies on. Same rule as an insurance certificate: the person with the paper types it.",
+
+  // ── 11/01: INSURANCE — A CERTIFICATE IS PAPER, AND VERIFYING IT IS A NAME ──
+  //
+  // Every write here is one of the two things an assistant stays out of. The
+  // facts on a policy are TRANSCRIBED off a document somebody is holding —
+  // carrier, policy number, coverage limit, the two dates — and a misheard
+  // expiry date is a park that believes it is covered when it is not, which is
+  // the exact failure the lapse list exists to prevent. And verifying is a
+  // person saying they have read the certificate and it is what it claims; that
+  // name is kept on the row, which is the same rule that keeps an agent off a
+  // signature. The reads are all open: an assistant can say what is on file and
+  // what lapses this month (GET /, GET /lapses, GET /:id), and those are GETs,
+  // which this count never includes.
+  'insurance POST /':
+    'records an insurance certificate — carrier, policy number, coverage limit and the two dates, transcribed off a document the person is holding, for a property, a resident\'s lease or a vendor. A misheard expiry date is a lapse list that says a park is covered when it is not, which is the one thing this subsystem exists to prevent. Typed on the policy page with the certificate in hand.',
+  'insurance POST /:id/proof':
+    'uploads the certificate itself (a PDF or a photo of the paper). A file is not something said out loud — the same reason the CSV imports and the applicant\'s proof of income are not reachable.',
+  'insurance PATCH /:id':
+    'changes what a policy says, or marks it verified. Verified means a person has read the certificate and says it is what it claims, and their name is kept on the row for good; an assistant pressing it attests to a document nobody looked at. Same rule that keeps an agent off a signature and off accepting terms.',
+  'insurance POST /:id/void':
+    'takes a certificate off the record with a reason, which drops it off the lapse list. The owner\'s own correction, pressed beside the policy with its carrier and dates on screen; the row and the reason are kept forever, because "there was a certificate on file and somebody took it off" is what a later argument turns on.',
+
   // ── 10/20: the park's task list, which is a person's list on purpose ───────
   // Blu wants a checklist the maintenance person consults and ticks off,
   // "stuff assigned by the landlord himself". Both halves of that are reasons
@@ -365,6 +410,14 @@ const DELIBERATE = new Map(Object.entries({
   'inspections POST /:id/photos': 'inspection photos are taken on site and uploaded there',
   'inspections POST /:id/videos': 'inspection video is taken on site and uploaded there',
   'esign POST /upload': 'the template PDF is a file the landlord uploads',
+  // 10/30: clearing a notice off your own screen is the person saying "I have
+  // seen this". That is the whole point of it — the row is kept with a
+  // dismissed_at precisely so it stands as evidence they were on the page and
+  // read it enough to act. An assistant clearing notices would manufacture that
+  // evidence for somebody who never looked, and quietly empty the one list
+  // telling them their rent failed.
+  'notifications DELETE /:id':
+    'clears a notice off the resident\'s own list. The dismissal is kept as evidence they saw it (Nic 10/30: "can be assumed to have read it enough to go through with deleting it"), so an assistant doing it would fake a receipt nobody gave.',
   'tenants POST /avatar': 'a profile photo is a file the tenant chooses',
   // 10/5 (Nic): photos of a bank's deposit receipt are files taken of paper.
   'payments POST /remittances/:id/deposit-photo': 'a photo of the bank\'s receipt is a file the landlord takes and uploads',
@@ -396,6 +449,9 @@ const DELIBERATE = new Map(Object.entries({
   // one tap on the screen they are already looking at.
   'tenants POST /me/fixed-income':
     'the resident\'s own yes or no to "are you on a fixed income?", and a yes sends them to the FlexPay explainer. Only they can know the answer, so an assistant recording it manufactures a fact about somebody\'s income (the same reason a staff-side agent cannot confirm an emergency contact), and there is no correcting it after — the first answer is kept. One tap in their own portal.',
+
+  'tenants POST /me/flexpay-money-arrives':
+    'the day the resident says their own money lands, which sets both the day GAM would draw and the price they would pay. Only they can know it, so an assistant recording it manufactures a fact about somebody\'s income — the same reason it stays off the fixed-income answer above — and this one has a price attached to being wrong. One pick in their own portal.',
 
   // A SIGNATURE IS THE PERSON'S. The agent never signs, never declines a
   // signature, and never accepts terms on somebody's behalf — an acceptance
@@ -556,7 +612,7 @@ const DELIBERATE = new Map(Object.entries({
   // charges a late fee, and whether its bills take a card. Both are the
   // landlord's own money decisions on a document somebody signed: turning fees
   // on starts charging a resident money, and the card flag exists because
-  // Dominic Gonzalez's installment is the trust's and a chargeback on it would
+  // Vesper Vanterpool's installment is the trust's and a chargeback on it would
   // have to be unwound across two sets of books. An assistant changing either
   // would be changing the terms of an agreement, which is the same rule that
   // keeps an agent off signatures ([[gam-agent-never-signs-or-accepts-terms]]).
@@ -592,6 +648,20 @@ const DELIBERATE = new Map(Object.entries({
   'landlords POST /me/tenant-roster/confirm': 'confirms a whole property\'s roster at once and drafts a lease per household; it is pressed on the review screen where every unit and its problems are listed',
   'landlords POST /me/onboard-payment-history-csv/validate': 'a CSV is a file the landlord uploads and reviews',
   'landlords POST /me/onboard-payment-history-csv/commit': 'commits imported payment history the landlord reviewed on screen',
+  // ── 11/1 (Nic): typing old money in by hand ───────────────────────────────
+  //
+  //   "People switching to gam may not use software so lots of stuff may go in
+  //    manual."
+  //
+  // Not an agent action, on purpose. Every figure here comes off a piece of
+  // paper only the operator is holding — an agent has no way to read it and no
+  // way to be right about it, and these rows land in the landlord's books as
+  // income. The one thing an assistant could plausibly do (offer to key a
+  // column it was told out loud) is the thing most likely to put a wrong
+  // number in somebody's P&L with nobody having seen the ledger.
+  'landlords GET /me/payment-history/spaces': 'the picker behind the by-hand entry screen; the operator reads their own sheet',
+  'landlords POST /me/payment-history/manual': 'the operator types each figure off their own paper ledger — an agent cannot see the paper, and these rows are income on the landlord\'s books',
+  'landlords POST /me/payment-history/undo': 'takes back a line the operator just typed, while the sheet is still in front of them',
   'tenants POST /flexpay/inquiry/proof': 'proof of income is a file the tenant uploads',
 
   // THE AGENT'S OWN PLUMBING. Sending a message to an agent is not a portal

@@ -25,6 +25,7 @@ import { query, queryOne } from '../db'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { APPOINTMENT_STATUSES } from '@gam/shared'
+import { apiUrl } from '../lib/portalUrls'
 
 export const appointmentsRouter = Router()
 
@@ -198,7 +199,7 @@ appointmentsRouter.get('/', requireAuth, async (req, res, next) => {
 // ═══════════════════════════════════════════════════════════════
 
 function feedUrls(token: string): { url: string; webcalUrl: string } {
-  const base = (process.env.API_PUBLIC_URL || 'http://localhost:4000').replace(/\/$/, '')
+  const base = apiUrl()
   const url = `${base}/api/public/business-calendar/${token}.ics`
   // webcal:// makes calendar apps add it as a live subscription on click.
   const webcalUrl = url.replace(/^https?:\/\//, 'webcal://')

@@ -9,7 +9,7 @@ import fs from 'fs'
 import crypto from 'crypto'
 import multer from 'multer'
 import { streamStoredFile } from '../lib/fileServe'
-import { meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, MASTER_TOTAL_JUMP_FACTOR, METER_READ_REASONS, RUBS_ALLOCATION_METHODS, RUBS_BASES, RUBS_SUBMETER_RATES, RUBS_EXCLUSION_MODES, meterWorksNoUseLabel } from '@gam/shared'
+import { METER_USAGE_BANDS, meterReadingModulus, METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS, MASTER_TOTAL_JUMP_FACTOR, METER_READ_REASONS, RUBS_ALLOCATION_METHODS, RUBS_BASES, RUBS_SUBMETER_RATES, RUBS_EXCLUSION_MODES, meterWorksNoUseLabel } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope, getScopedPropertyIds, userHasPerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
@@ -18,7 +18,7 @@ import { releaseSuspendedChargesForLease } from '../services/utilityBilling'
 // ONE place a departure's money kept and power absorbed are put beside each
 // other; the report reads it rather than re-deriving either half.
 import { washPairing } from '../services/earlyDepartureWash'
-import { markMeterRepaired, markMeterWorksNoUse, flaggedPeriodEstimates, flaggedPeriodStart, voidFlaggedPeriodEstimates, ZERO_USE_CLEARED_SET } from '../services/meterRepair'
+import { markMeterRepaired, markMeterWorksNoUse, markMeterReadsStand, flaggedPeriodEstimates, flaggedPeriodStart, voidFlaggedPeriodEstimates, ZERO_USE_CLEARED_SET } from '../services/meterRepair'
 import { logger } from '../lib/logger'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 // 10/20: who may be shown a meter reading figure, and a bill with the odometer
@@ -54,6 +54,7 @@ import {
   generateBillsForLandlord,
   billMoveOutRead,
   usageNeedsDoubleCheck,
+  barelyMovedSql,
 } from '../services/utilityBilling'
 import {
   openReadingRun,
@@ -64,6 +65,7 @@ import {
   settleFlaggedOnRun,
   countFlaggedOnRun,
   getReadsDue,
+  meterSpaceOccupied,
 } from '../services/utilityReadingRuns'
 
 export const utilityRouter = Router()
@@ -554,7 +556,7 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
       // as the starting point for the next billing cycle."
       repairedStartingReading: z.number().nonnegative().optional(),
       // 10/12 (Nic), M1: "ADD 'Works, tenant uses no power' choice next to
-      // 'Repaired' (Gerald specifically is gone, not plugged in, paying for
+      // 'Repaired' (Arlo specifically is gone, not plugged in, paying for
       // occupancy)." The meter works and the household on it uses nothing:
       // back in service with no new reading (nothing was replaced), and a flat
       // read bills $0 instead of being flagged until the meter moves
@@ -564,6 +566,22 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
       // parameter it was given, so a "mark it repaired" call carrying
       // zeroUseConfirmed: false was refused outright. Only true is the choice;
       // false (or leaving it out) means not this choice.
+      // 10/31 (Nic): what this space normally uses, and where in the park it
+      // sits — both reached for ONLY while the meter is broken and the property
+      // estimates. A meter that reads always bills its own reads.
+      //   "I'd like a way to flag high usage people as billing kind of not the
+      //    highest in the park, but on the upper end of the spectrum."
+      // null clears the stated figure and falls back to the band.
+      expectedMonthlyUsage: z.number().positive().nullable().optional(),
+      expectedUsageNote: z.string().max(500).nullable().optional(),
+      usageBand: z.enum(METER_USAGE_BANDS as unknown as [string, ...string[]]).optional(),
+      // 10/31 (Nic): "on meter 22, mark it working again and make that bill use
+      // the used water reading." The THIRD way back into service, and the only
+      // one that keeps the gallons: nothing was replaced and nobody claims zero
+      // use, so the reads the meter already has are good and the cycle bills the
+      // difference (services/meterRepair -> markMeterReadsStand). Only true
+      // acts; false or absent means not this choice.
+      readsStand: z.boolean().optional(),
       zeroUseConfirmed: z.boolean().optional(),
       // 10/12 (Nic, review): take "Works, tenant uses no power" back. On a
       // master or a flat-rate meter nothing else could: "Mark broken" (which
@@ -601,6 +619,20 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
       throw new AppError(400, 'A meter cannot be marked broken and confirmed working at the same time.')
     }
     const withdrawingNoUse = body.zeroUseWithdrawn === true
+    // 10/31 (Nic): the meter was turning all along — its own reads bill.
+    const readsStand = body.readsStand === true
+    if (readsStand && body.outOfService === true) {
+      throw new AppError(400, 'A meter cannot be marked broken and billed off its own reads at the same time.')
+    }
+    if (readsStand && body.repairedStartingReading != null) {
+      throw new AppError(400,
+        'Pick one: either the meter was replaced and bills from a fresh starting read, or it was reading fine all along '
+        + 'and bills off the reads it already has. A replacement read would throw away this cycle\'s usage.')
+    }
+    if (readsStand && confirmingNoUse) {
+      throw new AppError(400,
+        'Pick one: either nobody is using it (bills $0), or it was reading fine and bills the usage its reads show.')
+    }
     if (withdrawingNoUse && confirmingNoUse) {
       throw new AppError(400, '"Works, tenant uses no power" cannot be chosen and taken back at the same time.')
     }
@@ -680,9 +712,10 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
     // test it quiets runs on submeters only).
     // "Works, tenant uses no power" needs no reading: the meter was never
     // broken, so the reads it already has stand and the next is measured from them.
-    if (repairing && body.repairedStartingReading == null && !confirmingNoUse) {
+    if (repairing && body.repairedStartingReading == null && !confirmingNoUse && !readsStand) {
       throw new AppError(400,
-        'Enter what the repaired or replaced meter reads right now (0 for a brand-new meter). Its next bill is measured from that number.')
+        'Say which this is: the meter was replaced or repaired and needs what it reads right now (0 for a brand-new meter), '
+        + 'or it was reading fine all along and bills off the reads it already has, or it works and nobody is using it.')
     }
     if (repairing && meter.digits != null && body.repairedStartingReading != null
         && body.repairedStartingReading >= meterReadingModulus(Number(meter.digits))) {
@@ -793,6 +826,17 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
             WHEN $10::boolean IS TRUE  THEN COALESCE(out_of_service_since, CURRENT_DATE)
             WHEN $10::boolean IS FALSE THEN NULL
             ELSE out_of_service_since END,
+          -- 10/31: the landlord's own figure for the space, and where in the
+          -- park it sits. Both only consulted on the broken-meter path.
+          expected_monthly_usage = CASE WHEN $21::text = '__keep__' THEN expected_monthly_usage
+                                        ELSE $22::numeric END,
+          expected_usage_set_at = CASE WHEN $21::text = '__keep__' THEN expected_usage_set_at
+                                       WHEN $22::numeric IS NULL THEN NULL ELSE NOW() END,
+          expected_usage_set_by_user_id = CASE WHEN $21::text = '__keep__' THEN expected_usage_set_by_user_id
+                                               WHEN $22::numeric IS NULL THEN NULL ELSE $23::uuid END,
+          expected_usage_note = CASE WHEN $24::text = '__keep__' THEN expected_usage_note
+                                     ELSE $25::text END,
+          usage_band = COALESCE($26, usage_band),
           updated_at = NOW()
         WHERE id = $9 RETURNING *`,
         [
@@ -817,6 +861,15 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
           nextUtility,
           nextMethod,
           body.readingMultiplier ?? null,
+          // 10/31: $21-$26 — appended, because $16-$20 were already taken by the
+          // utility/method/multiplier rules above. Inserting mid-array silently
+          // repointed every one of them.
+          body.expectedMonthlyUsage === undefined ? '__keep__' : 'set',
+          body.expectedMonthlyUsage === undefined ? null : body.expectedMonthlyUsage,
+          req.user!.userId,
+          body.expectedUsageNote === undefined ? '__keep__' : 'set',
+          body.expectedUsageNote === undefined ? null : body.expectedUsageNote,
+          body.usageBand ?? null,
         ])).rows[0]
       // 10/12 (Nic): somebody marking the meter broken by hand overrides an
       // earlier "it works, the household uses nothing" (utility_meters.
@@ -835,7 +888,7 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
         // The fresh starting point, dated today at the property. Recorded as a
         // replacement read: it starts the next measurement and bills nothing.
         // 10/12: the one repair path (services/meterRepair), shared with the
-        // one-time repair of Gerald Logue's meter — confirmed working with
+        // one-time repair of Arlo Braddock's meter — confirmed working with
         // nobody using it too, when that is said with it.
         await markMeterRepaired(tx, {
           meterId: req.params.id, startingReading: body.repairedStartingReading, userId: req.user!.userId,
@@ -845,6 +898,11 @@ utilityRouter.patch('/meters/:id', requirePerm('properties.edit'), async (req, r
       } else if (confirmingNoUse) {
         // 10/12 (Nic), M1: "Works, tenant uses no power".
         await markMeterWorksNoUse(tx, { meterId: req.params.id, userId: req.user!.userId, stopFlatCharge: body.stopFlatCharge === true })
+        updated = (await tx.query(`SELECT * FROM utility_meters WHERE id = $1`, [req.params.id])).rows[0]
+      } else if (readsStand && repairing) {
+        // 10/31 (Nic), meter 22: back in service with its reads intact, so this
+        // cycle bills the difference instead of being estimated or given away.
+        await markMeterReadsStand(tx, { meterId: req.params.id, userId: req.user!.userId })
         updated = (await tx.query(`SELECT * FROM utility_meters WHERE id = $1`, [req.params.id])).rows[0]
       }
       await tx.query('COMMIT')
@@ -1342,7 +1400,7 @@ utilityRouter.get('/recovery', requirePerm('properties.edit', 'units.view_status
       --
       -- S652 (Nic): "It needs to count the 387 kilowatts for $81.27 as still
       -- outstanding. It's billed back and not paid." A tenant with no lease is
-      -- billed his meter on a PAY LINK — Andres Razo, leaving, got a link
+      -- billed his meter on a PAY LINK — Cora Castellan, leaving, got a link
       -- instead of a lease. That is utility billed back exactly like a bill
       -- on an invoice, so it is counted the same: an open link is still owed,
       -- and a utility line rung up and paid (a paid link is a register sale)
@@ -2169,30 +2227,76 @@ utilityRouter.post('/reading-runs/:id/meters/:meterId/reading', requireMeterRead
     // range), and invoiceGeneration's flagHold then held the WHOLE invoice,
     // rent included, for every unit that master feeds until a human cleared
     // it. Seasonal drops are normal; they must not hold the park's rent.
+    // ── 10/31 (Nic): THE FAT-FINGER FLAG IS GONE ───────────────────────────
+    //
+    //   "Turn off the readings to double check feature for now... as far as the
+    //    random blind check for fat fingering."
+    //
+    // A plausible wrap still bills as a rollover, exactly as before. What is
+    // gone is the FLAG on an implausible one: it used to stop the read, which
+    // stopped the run, which stopped every other lot's water bill for the
+    // month. Country Acres sat at that for three days over Lot 8 — a dial on a
+    // lot that has never had a tenant, where no charge could ever be produced
+    // for anybody.
+    //
+    // Nothing is now billed off a dial that went backwards. The read is simply
+    // not flagged, and the billing engine takes it from here: a negative delta
+    // that is not a wrap makes the METER broken (services/utilityBilling —
+    // `rolledBack`), which bills the low end of what comparable spaces used
+    // where the property allows estimating and nothing where it does not, tells
+    // the landlord either way, and leaves this read as the new starting point.
+    // Nic: "Rollback is more likely" than a wrap of the whole dial.
+    //
+    // The meter being marked broken is the signal, and it is the right one — a
+    // dial that drops is a meter to go and look at (10/24). It just no longer
+    // holds eleven other households' bills while somebody does.
     if (!meter.out_of_service && meter.billing_method === 'submeter'
         && prior && body.readingValue < Number(prior.reading_value)) {
       const wrap = (modulus - Number(prior.reading_value)) + body.readingValue
       if (wrap < modulus / 2) isRollover = true
-      else {
-        needsReview = true
-        reviewNote = 'Reading is below the previous reading — double-check the meter'
-      }
     }
     // Suspicious-usage flag (Nic, S533) — individual submeters only.
     // Wrap-aware usage over the utility type's threshold is silently
     // flagged and held from billing until the landlord double-checks —
     // a misread that slipped past the rollover guard would otherwise
     // land a huge charge on the tenant's next invoice.
-    if (!meter.out_of_service && !needsReview && meter.billing_method === 'submeter' && prior) {
+    // ── 10/31 (Nic): A KNOWN HEAVY USER, AND AN EMPTY SPACE ────────────────
+    //
+    //   "we need a system to mark when people are just generally high users.
+    //    That way it doesn't flag the system every month."
+    //
+    // The threshold is ONE flat number per utility type (10,000 gallons of
+    // water) and is never compared against the household's own history, so a
+    // home that genuinely runs heavy trips it every month forever. Country
+    // Acres Lot 17 billed 19,800 gallons in September, paid and settled, then
+    // was held in October for 12,700 — 7,100 gallons LESS than the month that
+    // went through. `high_use_confirmed_at` is the landlord saying they have
+    // looked and the usage is real for that household; the guard then leaves
+    // that meter alone. It changes nothing about what the meter bills.
+    //
+    // And an UNOCCUPIED space is skipped, because the guard exists to stop a
+    // slipped digit landing a huge charge on a tenant's invoice — with nobody
+    // on the space there is no invoice and no tenant. The landlord still hears
+    // about movement on an empty lot: the engine reports it with the gallons
+    // and the dollars nobody could be billed (reportUsageNobodyToBill), which
+    // is how a drip under an empty trailer gets found instead of waiting to
+    // land on whoever moves in next.
+    if (!meter.out_of_service && !needsReview && meter.billing_method === 'submeter' && prior
+        && !meter.high_use_confirmed_at && await meterSpaceOccupied(meter.id)) {
       // 10/20: compared in BILLING UNITS — the quantity the bill actually
       // charges for — not in face turns. A face that counts per hundred gallons
       // (S613's multiplier) reads 4130 → 6130 for 200,000 gallons; as turns
       // that is 2,000 and the threshold never saw it. The rule itself is one
       // function now (usageNeedsDoubleCheck), shared with the move-out path,
       // which is how that path went without an upward check at all.
+      // 10/31 (Nic): the MAGNITUDE of the movement, because a dial that ran
+      // backwards bills that movement as usage (services/utilityBilling
+      // cycleUsageFromReadings). Unsigned here was the hole that let a replaced
+      // head through: a negative figure can never exceed a positive threshold,
+      // so the one guard that stops a swap-sized charge never saw it.
       const faceTurns = isRollover
         ? (modulus - Number(prior.reading_value)) + body.readingValue
-        : body.readingValue - Number(prior.reading_value)
+        : Math.abs(body.readingValue - Number(prior.reading_value))
       const mult = Number(meter.reading_multiplier)
       const usage = faceTurns * (mult > 0 ? mult : 1)
       if (usageNeedsDoubleCheck(meter.utility_type, usage)) {
@@ -2441,6 +2545,31 @@ utilityRouter.get('/readings/flagged', requirePerm('properties.edit'), async (re
                  ORDER BY p.reading_date DESC, p.created_at DESC LIMIT 1
               ) prior ON TRUE
         WHERE m.property_id = $1 AND r.needs_review
+          -- ── 10/31 (Nic): LAST MONTH'S FLAGS MUST NOT BE SITTING HERE ──────
+          --
+          --   "we need a way to clear them after the month is over because,
+          --    yeah, the ones from last month need to not be there anymore."
+          --
+          -- A read whose reason is 'billed_off_platform' belongs to a cycle the
+          -- landlord billed themselves before the park came onto GAM. There is
+          -- nothing here to settle and settling it would bill nobody, so the
+          -- window could never empty: Country Acres carried three of these from
+          -- August (Lots 21, 22 and 24) into every month afterwards, which is
+          -- why the card said six while the banner above it said three. The
+          -- banner was right — it counts the cycle's own monthly reads
+          -- (countFlaggedOnRun) — and this is the card agreeing with it.
+          --
+          -- Everything that CAN be settled still shows, including a held
+          -- move-out read from an earlier cycle, which is not on a run and has
+          -- no other window.
+          AND r.reason <> 'billed_off_platform'
+          -- 10/31 (Nic): "I should not need to double check a read that's off by
+          -- one. RV 37 should not be showing up on this list." A read inside the
+          -- reading margin is not reviewable, whatever an older row's flag says
+          -- — the entry rule that set those is gone (services/utilityBilling
+          -- barelyMovedSql). Handled automatically instead: no usage billed, and
+          -- on an occupied space the meter is marked as not reading.
+          AND NOT ${barelyMovedSql('r')}
         ORDER BY r.billing_cycle_month DESC, m.label`,
       [propertyId])
     res.json({ success: true, data: rows })

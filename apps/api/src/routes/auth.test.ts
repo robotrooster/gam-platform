@@ -1141,7 +1141,7 @@ describe('S639 login is case- and whitespace-insensitive on the address', () => 
 })
 
 // ─── S650: A COMPLETED PASSWORD RESET PROVES THE ADDRESS ────────────────────
-// Ellen Gregory (Oak Park MH 02) reset her password from the link in her inbox
+// Zeph Ashcombe (Oak Park MH 02) reset her password from the link in her inbox
 // and then could not sign in: her account was never email-verified, so login
 // answered "verify your email first" on a password she had just set.
 describe('S650 resetting the password verifies the email', () => {
@@ -1149,7 +1149,7 @@ describe('S650 resetting the password verifies the email', () => {
     const email = `s650-reset-${randomUUID().slice(0, 8)}@test.dev`
     const { rows: [u] } = await db.query<{ id: string }>(
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified, reset_token, reset_token_expires)
-       VALUES ($1, 'x', 'tenant', 'Ellen', 'Gregory', FALSE, 'tok-s650', NOW() + interval '1 hour') RETURNING id`, [email])
+       VALUES ($1, 'x', 'tenant', 'Zeph', 'Ashcombe', FALSE, 'tok-s650', NOW() + interval '1 hour') RETURNING id`, [email])
     await db.query(`INSERT INTO tenants (user_id) VALUES ($1)`, [u.id])
 
     const reset = await request(buildApp()).post('/api/auth/reset-password')
@@ -1269,7 +1269,7 @@ describe('S639 password reset link is routed by role when there is no Origin', (
 
 // ─── S639 SECURITY: PER-USER RESPONSES ARE NEVER CACHEABLE ──────────────────
 //
-// Nick Platt accepted his invite on a browser where another household member was
+// Maren Pemberton accepted his invite on a browser where another household member was
 // already signed in and landed in THEIR profile. The client query cache was the
 // main culprit and is fixed in every portal, but the API log showed the other
 // half: /api/tenants/me and /api/auth/me answering 304, which means a browser

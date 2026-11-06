@@ -3,8 +3,8 @@
  *
  * Nic: "we wanna have a page that is accessible... near the front desk type
  * page or maybe a sub tab in the front desk page. That way my front desk help
- * Lisa Scheeler can see that, and have permission to edit and update fields
- * that are blank... when people come in to pay rent in person, Lisa can just
+ * Calla Fitzhugh can see that, and have permission to edit and update fields
+ * that are blank... when people come in to pay rent in person, Calla can just
  * say, hey, just in case we ever need emergency contact information, who would
  * you like us to contact."
  *

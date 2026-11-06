@@ -160,6 +160,13 @@ export interface OutstandingSpace {
   months: OwedMonth[]
   daysLate: number
   clearing: number
+  /**
+   * 10/28 (Nic): money clearing here is shown WITHOUT an amount — a FlexDeposit
+   * deposit charge on its way in. "Just have it not show an amount. Just have
+   * it stay still clearing." The deposit reads in full on their bill; the part
+   * of it arriving this week is not a figure that means anything on its own.
+   */
+  clearingUnpriced?: boolean
 }
 
 export interface RecordAnchor { landlordId: string; paymentId: string }
@@ -181,6 +188,8 @@ export interface OutstandingRow {
   months?: OwedMonth[]
   daysLate?: number
   clearing?: number
+  /** Money clearing shown without an amount (a FlexDeposit deposit charge). */
+  clearingUnpriced?: boolean
   workTrade?: boolean
   status?: 'owes' | 'clearing'
   statusLabel?: string
@@ -203,6 +212,8 @@ export interface OutstandingSlice {
   months: OwedMonth[]
   daysLate: number
   clearing: number
+  /** Money clearing shown without an amount (a FlexDeposit deposit charge). */
+  clearingUnpriced: boolean
   workTrade: boolean
   status: 'owes' | 'clearing'
   /** Where Record payment opens for this slice (one per company they owe here). */
@@ -242,6 +253,7 @@ export function sliceByProperty(rows: readonly OutstandingRow[]): OutstandingSli
         months: r.months ?? [],
         daysLate: Number(r.daysLate ?? 0),
         clearing: Number(r.clearing ?? 0),
+        clearingUnpriced: r.clearingUnpriced === true,
         status: r.status ?? (toCents(r.balance) > 0 ? 'owes' : 'clearing'),
         anchors: r.recordWith ?? [],
       })
@@ -265,6 +277,7 @@ export function sliceByProperty(rows: readonly OutstandingRow[]): OutstandingSli
         months: [...months.entries()].sort(([a], [z]) => a.localeCompare(z)).map(([month, c]) => ({ month, amount: toDollars(c) })),
         daysLate: Math.max(0, ...here.filter(s => toCents(s.balance) > 0).map(s => Number(s.daysLate ?? 0))),
         clearing: toDollars(here.reduce((t, s) => t + toCents(s.clearing), 0)),
+        clearingUnpriced: here.some(s => s.clearingUnpriced === true),
         status: balanceC > 0 ? 'owes' : 'clearing',
         anchors: anchors.length ? anchors : (balanceC > 0 ? (r.recordWith ?? []) : []),
       })

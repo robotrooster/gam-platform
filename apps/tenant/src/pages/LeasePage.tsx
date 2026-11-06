@@ -1664,6 +1664,10 @@ function FlexDepositPayAheadBanner() {
   const qc = useQueryClient()
   const [error, setError] = useState<string | null>(null)
   const [started, setStarted] = useState(false)
+  // 10/30 (Nic): the gold button used to fire a live ACH debit on a single tap.
+  // It now only opens the confirmation below; nothing reaches the bank until
+  // the resident confirms the amount.
+  const [confirming, setConfirming] = useState(false)
 
   const { data } = useQuery<any>(
     'tenant-flexdeposit',
@@ -1680,6 +1684,7 @@ function FlexDepositPayAheadBanner() {
         if (r?.success === false) { setError(r?.error || 'Could not start the payment'); return }
         setError(null)
         setStarted(true)
+        setConfirming(false)
         qc.invalidateQueries('tenant-flexdeposit')
       },
       onError: (e: any) => setError(e?.message || 'Could not start the payment'),
@@ -1700,19 +1705,59 @@ function FlexDepositPayAheadBanner() {
           </div>
         </div>
         <button
-          onClick={() => payAhead.mutate()}
-          disabled={payAhead.isLoading || started}
+          onClick={() => { setError(null); setConfirming(true) }}
+          disabled={payAhead.isLoading || started || confirming}
           style={{
             padding:'10px 20px', borderRadius:8, border:'none',
-            background: started ? 'var(--bg-2)' : 'var(--gold, #c9a227)',
-            color: started ? 'var(--text-3)' : '#060809',
-            fontWeight:700, cursor: started ? 'default' : 'pointer',
+            background: (started || confirming) ? 'var(--bg-2)' : 'var(--gold, #c9a227)',
+            color: (started || confirming) ? 'var(--text-3)' : '#060809',
+            fontWeight:700, cursor: (started || confirming) ? 'default' : 'pointer',
             whiteSpace:'nowrap' as const,
           }}
         >
           {payAhead.isLoading ? 'Starting…' : started ? 'Payment initiated' : 'Fund remaining deposit now'}
         </button>
       </div>
+      {confirming && !started && (
+        <div style={{ marginTop:14, padding:'14px 16px', background:'var(--bg-2)', border:'1px solid rgba(245,158,11,.35)', borderRadius:10 }}>
+          <div style={{ fontSize:'.82rem', fontWeight:700, marginBottom:6 }}>
+            Debit ${unfunded.toFixed(2)} from your bank account?
+          </div>
+          <div style={{ fontSize:'.76rem', color:'var(--text-2)', lineHeight:1.5, marginBottom:12 }}>
+            This funds the rest of your deposit in one payment instead of over your
+            remaining monthly installments. It is taken straight from the bank account
+            on file and <strong>cannot be reversed once it starts</strong>, so only
+            continue if the full ${unfunded.toFixed(2)} is available now.
+            <br />
+            You do not have to do this — leaving it alone keeps your installments exactly as they are.
+          </div>
+          <div style={{ display:'flex', gap:10, flexWrap:'wrap' as const }}>
+            <button
+              onClick={() => payAhead.mutate()}
+              disabled={payAhead.isLoading}
+              style={{
+                padding:'10px 18px', borderRadius:8, border:'none',
+                background:'var(--gold, #c9a227)', color:'#060809',
+                fontWeight:700, cursor: payAhead.isLoading ? 'default' : 'pointer',
+              }}
+            >
+              {payAhead.isLoading ? 'Starting…' : `Yes, debit $${unfunded.toFixed(2)}`}
+            </button>
+            <button
+              onClick={() => setConfirming(false)}
+              disabled={payAhead.isLoading}
+              style={{
+                padding:'10px 18px', borderRadius:8,
+                border:'1px solid var(--border, rgba(255,255,255,.14))',
+                background:'transparent', color:'var(--text-2)',
+                fontWeight:600, cursor:'pointer',
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
       {error && (
         <div style={{ marginTop:10, fontSize:'.74rem', color:'var(--red)', background:'rgba(239,68,68,.06)', padding:'8px 12px', borderRadius:6 }}>
           {error}

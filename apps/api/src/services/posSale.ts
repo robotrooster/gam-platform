@@ -14,6 +14,13 @@ import { query } from '../db'
 import { logger } from '../lib/logger'
 
 export interface PosSaleInput {
+  /**
+   * 10/31: the open shift whose drawer this sale goes into. The register app
+   * sends it; the server checks it is open and belongs to this property before
+   * it gets here. Absent for a property with no registers, and for a pay link
+   * paid online, which never touched a drawer.
+   */
+  registerShiftId?: string | null
   landlordId: string
   propertyId: string | null
   cashierId: string
@@ -98,14 +105,20 @@ export async function insertPosSale(client: PoolClient, s: PosSaleInput): Promis
   /** GAM's card fee on the sale, booked once the sale commits (resolves then; nothing to wait on for callers). */
   cardFeeBooked: Promise<CommittedBookingOutcome | 'no_fee'>
 }> {
+  // 10/31 (Nic): the shift this sale was rung into, so the drawer it went into
+  // can be counted down. The shift implies the register, which also removes the
+  // boundary question — a sale rung while a cashier is mid-count would otherwise
+  // land in whichever shift a timestamp comparison happened to pick. NULL for a
+  // property with no registers and for anything paid online; the property's day
+  // settlement still covers everything either way.
   const txRes = await client.query(`INSERT INTO pos_transactions
-    (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id,discount_amount,discount_reason,tax_breakdown,paid_online,payment_reference)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18) RETURNING *`,
+    (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id,discount_amount,discount_reason,tax_breakdown,paid_online,payment_reference,register_shift_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19) RETURNING *`,
     [s.landlordId, s.tenantId || null, s.posCustomerId || null, s.cashierId,
      s.paymentMethod, s.subtotal, s.taxAmount, s.surcharge, s.total, s.changeGiven || 0, s.platformFee || 0,
      s.stripePaymentIntentId || null, s.propertyId || null, s.discountAmount || 0, s.discountReason || null,
      s.taxBreakdown && s.taxBreakdown.length ? JSON.stringify(s.taxBreakdown) : null,
-     s.paidOnline === true, s.paymentReference || null])
+     s.paidOnline === true, s.paymentReference || null, s.registerShiftId || null])
   const tx = txRes.rows[0]
   // 10/5 (Nic): "money movement is the end of onboarding" — a register sale or
   // a pay link paid, cash or card, ends the landlord's free onboarding window.

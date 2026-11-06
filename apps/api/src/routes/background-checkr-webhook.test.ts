@@ -261,7 +261,7 @@ describe('POST /api/background/webhook/checkr — rejections', () => {
  *
  * There was nothing to apply even if it had parsed: the check is already
  * `processing` and a single product finishing does not change that. Meanwhile
- * Anastacio Erreguin's screening sat unfinished for twenty-two hours.
+ * Bryce Belmont's screening sat unfinished for twenty-two hours.
  *
  * A webhook endpoint should acknowledge what it can safely ignore. A 500 is a
  * request to be told again.

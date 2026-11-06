@@ -150,7 +150,9 @@ export function JournalEntriesPage(){
                 </div>
                 <span className={`badge ${STATUS[entryDetail.status]||'bmu'}`}>{humanize(entryDetail.status)}</span>
               </div>
-              <div style={{overflowX:'auto'}}>
+              {/* The entry's own lines: Debit and Credit have to sit under
+                  each other or there is no telling whether it balances. */}
+              <div style={{overflowX:'auto'}} data-no-stack>
                 <table className="tbl" style={{marginBottom:12,minWidth:420}}>
                   <thead><tr><th>Account</th><th>Property</th><th style={{textAlign:'right'}}>Debit</th><th style={{textAlign:'right'}}>Credit</th></tr></thead>
                   <tbody>
@@ -206,7 +208,9 @@ export function JournalEntriesPage(){
                 <label style={{marginBottom:0}}>Lines</label>
                 <button type="button" className="btn bp bsm" onClick={addLine}>+ Add Line</button>
               </div>
-              <div style={{overflowX:'auto'}}>
+              {/* The line EDITOR. Same reason as above, and stacking a row of
+                  inputs into a card scatters one line's fields down a screen. */}
+              <div style={{overflowX:'auto'}} data-no-stack>
                 <table style={{width:'100%',minWidth:560,borderCollapse:'collapse',fontSize:'.75rem'}}>
                   <thead><tr>
                     <th style={{textAlign:'left',padding:'4px 6px',color:'var(--t3)',fontWeight:600,fontSize:'.65rem',textTransform:'uppercase'}}>Account</th>

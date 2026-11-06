@@ -555,7 +555,7 @@ export function extractAdditionalOccupants(
     coerce:        coerceText,
   })
   if (!hit) return []
-  // "Marci Neeld" only -- excludes the primary tenant
+  // "Eben Hartright" only -- excludes the primary tenant
   const names = hit.value.split(/[,\n;]/).map(s => s.trim()).filter(Boolean)
   const primaryNorm = primaryTenantFullName.toLowerCase().replace(/\s+/g, ' ').trim()
   const occupants: ParserExtractedOccupant[] = []

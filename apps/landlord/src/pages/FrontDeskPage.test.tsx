@@ -382,30 +382,30 @@ describe('every Front Desk tab a staffer sees works for them', () => {
     await open({ portal: true })
     await until(() => text().includes('Nobody here'), 'the empty list')
     const before = state.asked.filter(u => u === '/balances').length
-    state.balances = [{ tenantId: 't1', firstName: 'Kim', lastName: 'Harland', email: 'kim@t.dev', phone: null,
+    state.balances = [{ tenantId: 't1', firstName: 'Yvette', lastName: 'Bexley', email: 'yvette@t.dev', phone: null,
       unitNumber: 'APT 04', propertyId: 'p1', propertyName: 'Mountain View', balance: '460.00',
       creditAvailable: 0, creditOnAccount: 0, oldestDueDate: '2020-01-01', openInvoices: 1 }]
     await act(async () => { button(/^Emergency contacts$/)!.click() })
     await until(() => text().includes('Nobody is on a space right now.'), 'the roster')
     await act(async () => { button(/^Call list/)!.click() })
-    await until(() => text().includes('Kim Harland'), 'Kim on the call list')
+    await until(() => text().includes('Yvette Bexley'), 'Yvette on the call list')
     expect(state.asked.filter(u => u === '/balances').length).toBeGreaterThan(before)
   })
 
   it('the call list is read again when the desk comes back to the page (a payment taken elsewhere meanwhile)', async () => {
     state.perms = { 'front_desk.view': true, 'balances.view': true }
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 300000, refetchOnWindowFocus: false, refetchOnMount: false } } })
-    state.balances = [{ tenantId: 't1', firstName: 'Kim', lastName: 'Harland', email: 'kim@t.dev', phone: null,
+    state.balances = [{ tenantId: 't1', firstName: 'Yvette', lastName: 'Bexley', email: 'yvette@t.dev', phone: null,
       unitNumber: 'APT 04', propertyId: 'p1', propertyName: 'Mountain View', balance: '460.00',
       creditAvailable: 0, creditOnAccount: 0, oldestDueDate: '2020-01-01', openInvoices: 1 }]
     await act(async () => { root.render(<QueryClientProvider client={qc}><FrontDeskPage /></QueryClientProvider>) })
-    await until(() => text().includes('Kim Harland'), 'Kim on the call list')
-    // Off to another page (Kim pays there), then back to the Front Desk.
+    await until(() => text().includes('Yvette Bexley'), 'Yvette on the call list')
+    // Off to another page (Yvette pays there), then back to the Front Desk.
     await act(async () => { root.render(<QueryClientProvider client={qc}><div>Outstanding Balances</div></QueryClientProvider>) })
     state.balances = []
     const before = state.asked.filter(u => u === '/balances').length
     await act(async () => { root.render(<QueryClientProvider client={qc}><FrontDeskPage /></QueryClientProvider>) })
-    await until(() => text().includes('Nobody here'), 'Kim gone from the call list')
+    await until(() => text().includes('Nobody here'), 'Yvette gone from the call list')
     expect(state.asked.filter(u => u === '/balances').length).toBeGreaterThan(before)
   })
 
@@ -462,7 +462,7 @@ describe('every Front Desk tab a staffer sees works for them', () => {
     state.perms = { 'front_desk.view': true, 'balances.view': true }
     let release!: () => void
     state.balancesGate = new Promise<void>(r => { release = r })
-    state.balances = [{ tenantId: 't1', firstName: 'Kim', lastName: 'Harland', email: 'kim@t.dev', phone: null,
+    state.balances = [{ tenantId: 't1', firstName: 'Yvette', lastName: 'Bexley', email: 'yvette@t.dev', phone: null,
       unitNumber: 'APT 04', propertyId: 'p1', propertyName: 'Mountain View', balance: '460.00',
       creditAvailable: 0, creditOnAccount: 0, oldestDueDate: '2020-01-01', openInvoices: 1 }]
     await open()
@@ -473,7 +473,7 @@ describe('every Front Desk tab a staffer sees works for them', () => {
     expect(text()).not.toMatch(/\b0 people need contacting/)
     expect(button(/^Everyone/)!.textContent).toBe('Everyone')
     await act(async () => { release() })
-    await until(() => text().includes('Kim Harland'), 'Kim on the call list')
+    await until(() => text().includes('Yvette Bexley'), 'Yvette on the call list')
     expect(text()).toContain('1 person needs contacting')
     expect(button(/^Everyone/)!.textContent).toBe('Everyone (1)')
   })
@@ -680,7 +680,7 @@ describe('call-list sentences fit who is looking', () => {
     phone: null, heldUnitNumber: 'RV 11', propertyName: 'Mountain View', inviteState: 'invited',
     inviteExpiresAt: null, leaseDocStatus: null, leaseWaitingOnRole: null, leaseWaitingOnName: null,
     householdPendingNames: null, ...o })
-  const payLink = () => ({ tenantId: null, payLinkId: 'pl1', firstName: 'Russ', lastName: 'Fuller', email: 'russ@t.dev',
+  const payLink = () => ({ tenantId: null, payLinkId: 'pl1', firstName: 'Tamsin', lastName: 'Wrenfield', email: 'tamsin@t.dev',
     phone: null, unitNumber: null, propertyId: 'p1', propertyName: 'Mountain View', balance: '37.60',
     creditAvailable: 0, creditOnAccount: 0, oldestDueDate: '2020-01-01', openInvoices: 1,
     payLink: { label: 'Propane', items: [] } })
@@ -730,21 +730,21 @@ describe('call-list sentences fit who is looking', () => {
     state.perms = { 'front_desk.view': true, 'balances.view': true }
     state.balances = [payLink()]
     await open()
-    await until(() => text().includes('Russ Fuller'), 'Russ')
+    await until(() => text().includes('Tamsin Wrenfield'), 'Tamsin')
     expect(text()).toContain('They can pay the link, or ask the owner or a manager to settle it at the register.')
     expect(text()).not.toContain('Register →')
     act(() => root.unmount())
     root = createRoot(host)
     state.perms = { 'front_desk.view': true, 'balances.view': true, 'pos.tab.register': true }
     await open()
-    await until(() => text().includes('Russ Fuller'), 'Russ for a register staffer')
+    await until(() => text().includes('Tamsin Wrenfield'), 'Tamsin for a register staffer')
     expect(text()).toContain('settle it here: Register → open tickets & pay links.')
   })
 
   it('reads the server\'s snake_case rows as they arrive on the wire (balances and the call list)', async () => {
     state.perms = { 'front_desk.view': true, 'balances.view': true }
     state.wire = (x: any) => camelCaseKeys(x)
-    state.balances = [{ tenant_id: null, pay_link_id: 'pl1', first_name: 'Russ', last_name: 'Fuller', email: 'russ@t.dev',
+    state.balances = [{ tenant_id: null, pay_link_id: 'pl1', first_name: 'Tamsin', last_name: 'Wrenfield', email: 'tamsin@t.dev',
       phone: null, unit_number: null, property_id: 'p1', property_name: 'Mountain View', balance: '37.60',
       credit_available: 0, credit_on_account: 0, oldest_due_date: '2020-01-01', open_invoices: 1,
       pay_link: { label: 'Propane', items: [] } }]
@@ -753,8 +753,8 @@ describe('call-list sentences fit who is looking', () => {
       invite_expires_at: '2020-01-01T00:00:00Z', lease_doc_status: null, lease_waiting_on_role: null,
       lease_waiting_on_name: null, household_pending_names: null }]
     await open()
-    await until(() => text().includes('Russ Fuller') && text().includes('Dana Ortiz'), 'both rows')
-    expect(text()).toContain('Russ owes $37.60 on an emailed pay link')
+    await until(() => text().includes('Tamsin Wrenfield') && text().includes('Dana Ortiz'), 'both rows')
+    expect(text()).toContain('Tamsin owes $37.60 on an emailed pay link')
     expect(text()).toContain("Dana's invite has expired. Press Re-send invite, then ask them to accept.")
     expect(button(/^Re-send invite$/)).toBeTruthy()
   })

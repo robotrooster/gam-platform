@@ -18,13 +18,14 @@ import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import React, { useContext, useState, useEffect } from 'react'
 import ReactDOM from 'react-dom/client'
-import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useSearchParams, Link } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useSearchParams, useLocation, Link } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import {
   LayoutDashboard, Rocket, Building2, Users, Zap, ClipboardList, DoorOpen,
   CreditCard, ArrowDownToLine, Plug, Activity, Map as MapIcon, FileText,
   Scale, SlidersHorizontal, Lightbulb, Landmark, Mail, Send,
-  Target, TrendingUp, Bot, Lock, LogOut, Sun, Moon, ShieldCheck, Trophy, UserSearch,
+  Target, TrendingUp, Bot, Lock, LogOut, Sun, Moon, ShieldCheck, Trophy, UserSearch, ScanLine,
+  Menu,
 } from 'lucide-react'
 import axios from 'axios'
 import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
@@ -67,7 +68,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('gam_admin_token'))
   const [loading, setLoading] = useState(true)
 
-  // S639 SECURITY: a change of identity empties the client cache. Nick Platt
+  // S639 SECURITY: a change of identity empties the client cache. Maren Pemberton
   // accepted his invite on a browser where another household member was signed
   // in and landed in THEIR profile — the token swapped correctly and react-query
   // kept serving the previous person's cached responses under the same keys.
@@ -210,149 +211,43 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
 const qc=new QueryClient({defaultOptions:{queries:{retry:1,staleTime:30000,refetchOnWindowFocus:false}}})
 
 // ── STYLES ────────────────────────────────────────────────────
-const css=`
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{--bg0:#080a0c;--bg1:#0d1014;--bg2:#121519;--bg3:#181c22;--bg4:#1e2330;
-  --b0:#1a1f28;--b1:#222a38;--b2:#2a3547;
-  --t0:#eef0f6;--t1:#b8c4d8;--t2:#7a8aaa;--t3:#475060;
-  --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;--purple:#a855f7;--teal:#14b8a6;
-  --s1:var(--bg3);--s2:var(--bg4);
-  --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace}
-html{-webkit-font-smoothing:antialiased;height:100%}
-body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
-h1,h2,h3,h4{font-family:var(--font-d);color:var(--t0);line-height:1.2}
-h1{font-size:1.8rem;font-weight:800}h2{font-size:1.3rem;font-weight:700}h3{font-size:1rem;font-weight:700}
-button{cursor:pointer;font-family:var(--font-b)}input,select{font-family:var(--font-b)}
-a{color:var(--gold);text-decoration:none}
-.shell{display:flex;height:100vh;overflow:hidden}
-.sidebar{width:220px;flex-shrink:0;background:var(--bg1);border-right:1px solid var(--b0);position:fixed;top:0;left:0;bottom:0;z-index:50;display:flex;flex-direction:column;overflow-y:auto}
-.main{flex:1;margin-left:220px;height:100vh;display:flex;flex-direction:column;min-width:0;overflow:hidden}
-.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40;gap:12px;flex-shrink:0}
-.page{flex:1;min-height:0;padding:28px;max-width:1600px;width:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:none}
-.logo{padding:18px;border-bottom:1px solid var(--b0)}
-.logo-n{font-family:var(--font-d);font-size:1rem;font-weight:800;color:var(--red)}
-.logo-s{font-size:.65rem;color:var(--t3);margin-top:2px;text-transform:uppercase;letter-spacing:.1em}
-.nav{padding:10px;flex:1}
-.nl{font-size:.62rem;color:var(--t3);text-transform:uppercase;letter-spacing:.12em;padding:10px 8px 4px;font-weight:600}
-.ni{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:7px;color:var(--t2);font-size:.82rem;font-weight:500;transition:all .12s;width:100%;background:none;border:none;cursor:pointer;text-decoration:none}
-.ni:hover{background:var(--bg3);color:var(--t0)}
-.ni.active{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.15)}
-.sfooter{padding:10px;border-top:1px solid var(--b0)}
-.card{background:var(--bg2);border:1px solid var(--b1);border-radius:10px;padding:18px}
-.ct{font-size:.72rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.07em;margin-bottom:14px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
-.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-@media(max-width:1200px){.grid4{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:900px){.grid2,.grid3,.grid4{grid-template-columns:1fr}}
-.ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding-bottom:14px;border-bottom:1px solid var(--b0)}
-.pt{font-family:var(--font-d);font-size:1.4rem;font-weight:800;color:var(--t0)}
-.ps{font-size:.78rem;color:var(--t3);margin-top:2px}
-.kpi{background:var(--bg2);border:1px solid var(--b1);border-radius:10px;padding:16px;position:relative;overflow:hidden}
-.kpi::after{content:'';position:absolute;bottom:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--gold),transparent);opacity:0.4}
-.kl,.kpi-l{font-size:.65rem;color:var(--t3);text-transform:uppercase;letter-spacing:.09em;font-weight:600;margin-bottom:6px}
-.kv,.kpi-v{font-family:var(--font-d);font-size:1.6rem;font-weight:800;color:var(--t0);line-height:1;margin-bottom:4px}
-.ks,.kpi-s{font-size:.7rem;color:var(--t3)}
-.kv.g{color:var(--green)}.kv.r{color:var(--red)}.kv.a{color:var(--amber)}.kv.gold{color:var(--gold)}.kv.b{color:var(--blue)}
-.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:7px;font-size:.78rem;font-weight:600;border:none;cursor:pointer;transition:all .12s;font-family:var(--font-b);text-decoration:none}
-.bp,.btn-p,.btn-primary{background:var(--gold);color:#080a0c}
-.bg-btn{background:var(--red);color:#fff}
-.bg-btn:hover{filter:brightness(1.08)}.bp:hover,.btn-p:hover,.btn-primary:hover{background:#d9af3a}
-.bg,.btn-g,.btn-ghost{background:var(--bg4);color:var(--t1);border:1px solid var(--b2)}.bg:hover,.btn-g:hover,.btn-ghost:hover{background:var(--bg3)}
-.bd{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.2)}.bd:hover{background:rgba(239,68,68,.14)}
-.bsm{padding:4px 9px;font-size:.72rem}
-.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:20px;font-size:.65rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
-.bg2,.b-green{background:rgba(34,197,94,.08);color:var(--green);border:1px solid rgba(34,197,94,.18)}
-.ba,.b-amber{background:rgba(245,158,11,.08);color:var(--amber);border:1px solid rgba(245,158,11,.18)}
-.br,.b-red{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.18)}
-.bgold,.b-gold{background:rgba(201,162,39,.08);color:var(--gold);border:1px solid rgba(201,162,39,.18)}
-.bmu,.b-muted{background:var(--bg4);color:var(--t3);border:1px solid var(--b1)}
-.bb{background:rgba(59,130,246,.08);color:var(--blue);border:1px solid rgba(59,130,246,.18)}
-.tbl{width:100%;border-collapse:collapse;font-size:.78rem}
-.tbl th{background:var(--bg3);color:var(--t3);font-size:.64rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;padding:9px 12px;text-align:left;border-bottom:1px solid var(--b1)}
-.tbl td{padding:9px 12px;border-bottom:1px solid var(--b0);color:var(--t1)}
-.tbl tr:last-child td{border-bottom:none}
-.tbl tr:hover td{background:rgba(255,255,255,.012)}
-.mono{font-family:var(--font-m);font-size:.8rem}
-.alert{display:flex;align-items:flex-start;gap:10px;padding:10px 14px;border-radius:8px;font-size:.78rem;margin-bottom:14px}
-.ae{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.18);color:#fca5a5}
-.aw{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.18);color:#fcd34d}
-.ag{background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.18);color:#86efac}
-.agold{background:rgba(201,162,39,.08);border:1px solid rgba(201,162,39,.18);color:var(--gold)}
-.empty{text-align:center;padding:48px 20px;color:var(--t3)}
-.loading{display:flex;align-items:center;justify-content:center;height:100vh;font-family:var(--font-d);font-size:1.1rem;color:var(--t3)}
-.spinner{width:16px;height:16px;border:2px solid var(--b2);border-top-color:var(--gold);border-radius:50%;animation:spin .6s linear infinite}
-.dr{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--b0);font-size:.78rem}
-.dr:last-child{border-bottom:none}
-.dk{color:var(--t3)}.dv{color:var(--t0);font-weight:500}
-.tabs{display:flex;gap:2px;border-bottom:1px solid var(--b0);margin-bottom:20px}
-.tab{padding:9px 14px;background:none;border:none;color:var(--t3);font-size:.78rem;font-weight:600;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .12s;font-family:var(--font-b)}
-.tab:hover{color:var(--t1)}
-.tab.on{color:var(--gold);border-bottom-color:var(--gold)}
-.nacha-flag{background:rgba(239,68,68,.05);border:1px solid rgba(239,68,68,.2);border-radius:8px;padding:14px;margin-bottom:14px}
-@keyframes spin{to{transform:rotate(360deg)}}
-/* S562: classes referenced by newer admin surfaces (FlexPay review modal,
-   shared dialogs, form fields) that were never defined in this block — they
-   rendered unstyled (the FlexPay modal had no overlay). Small-button + modal +
-   input + form-group defs, matching the tenant vocabulary. */
-.btn-sm{padding:5px 10px;font-size:.72rem}
-.modal-ov,.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;backdrop-filter:blur(4px)}
-.modal{background:var(--bg2);border:1px solid var(--b2);border-radius:14px;padding:24px;width:100%;max-width:520px;max-height:90vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.5)}
-.modal-t,.modal-title{font-family:var(--font-d);font-size:1.1rem;font-weight:800;color:var(--t0);margin-bottom:18px}
-.modal-f{display:flex;justify-content:flex-end;gap:10px;margin-top:20px;padding-top:16px;border-top:1px solid var(--b0)}
-.fg{margin-bottom:16px}
-.fl{display:block;font-size:.72rem;font-weight:600;color:var(--t2);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
-.inp,.input,.form-input{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:10px 12px;font-size:.88rem;color-scheme:dark}
-.inp:focus,.input:focus,.form-input:focus{outline:none;border-color:var(--gold)}
-textarea.inp{resize:vertical}
-/* S595: className="input" fields were never aliased (same drift .inp had) —
-   they fell back to white browser boxes. Alias + uniform +6% type lift +
-   readable disabled state. */
-html{font-size:17px}
-.inp:disabled,.input:disabled,.form-input:disabled,input:disabled,select:disabled,textarea:disabled,input[readonly],textarea[readonly]{background:var(--bg2);border-color:var(--b0);color:var(--t1);-webkit-text-fill-color:var(--t1);opacity:1;cursor:not-allowed}
-/* S595 LIGHT THEME (short token names). Admin's accent is red — darkened for light. */
-:root[data-theme="light"]{color-scheme:light;--bg0:#f4f5f7;--bg1:#ffffff;--bg2:#ffffff;--bg3:#eef0f4;--bg4:#e5e8ee;--b0:#e7e9ef;--b1:#dde0e8;--b2:#ccd2de;--t0:#12151c;--t1:#333b49;--t2:#5b6474;--t3:#8a93a5;--gold-ink:#7a5f0f;--red:#c0201f}
-:root[data-theme="light"] .inp,:root[data-theme="light"] .input,:root[data-theme="light"] .form-input{color-scheme:light}
-:root[data-theme="light"] a{color:var(--gold-ink)}
-:root[data-theme="light"] .ni.active{background:rgba(239,68,68,.10);border-color:rgba(239,68,68,.28)}
-/* 10/12 (Nic): the Metrics page. Tiles wrap to whatever width there is. */
-.mx-hero{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
-.mx-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
-.mx-big{font-family:var(--font-d);font-size:clamp(1.45rem,2.3vw,2.1rem);font-weight:800;color:var(--gold);line-height:1.1;margin-bottom:6px;overflow-wrap:break-word}
-.mx-v{font-size:clamp(1.1rem,1.6vw,1.35rem);overflow-wrap:break-word}
-.mx-section{margin:6px 0 10px}
-/* 10/12: at phone width the fixed 220px sidebar left the page about 150px to
-   draw in. Below 760px the sidebar becomes a top bar whose links scroll
-   sideways, and the page scrolls as one column. Desktop is untouched. */
-@media(max-width:760px){
-  body{overflow:auto;height:auto}
-  .shell{flex-direction:column;height:auto;overflow:visible}
-  .sidebar{position:static;width:100%;flex-direction:column;overflow:visible;border-right:none;border-bottom:1px solid var(--b0)}
-  .logo{padding:10px 16px}
-  .nav{display:flex;flex-wrap:nowrap;gap:4px;overflow-x:auto;padding:6px 10px;-webkit-overflow-scrolling:touch}
-  .nav .nl{display:none}
-  .nav .ni{width:auto;flex-shrink:0;white-space:nowrap}
-  .sfooter{display:flex;align-items:center;justify-content:space-between;padding:6px 10px}
-  .sfooter .ni{width:auto}
-  .main{margin-left:0;height:auto;overflow:visible}
-  .topbar{padding:0 16px}
-  .page{padding:16px;overflow:visible}
-  .ph{flex-wrap:wrap;gap:8px}
-  .mx-big{font-size:1.6rem}
-}
-`
+// 10/30: this was 142 lines of CSS inside a JS template literal, injected
+// with <style dangerouslySetInnerHTML>. It is a real stylesheet now, for a
+// concrete reason: the phone rules being ported here from the landlord
+// portal carry 18 backticks in their comments, and every one of them would
+// have closed that literal early. Working around it by stripping the
+// comments would have thrown away the reasoning that makes those rules
+// readable. Vite already handles the font imports above, so this costs
+// nothing and the admin portal gets a stylesheet it can be edited in.
+import { installTableStacking } from '@gam/shared'
+import './styles/globals.css'
 
 // ── LAYOUT ────────────────────────────────────────────────────
 function Layout(){
   const{user,logout,loading}=useAuth();const navigate=useNavigate()
   const isSuperAdmin=user?.role==='super_admin'
+  // 10/30 (Nic): "even though we're only planning a few native apps, every
+  // portal should be mobile compatible… I may occasionally want to see some
+  // stats from browsing on my phone."
+  //
+  // The 10/12 attempt turned the 220px sidebar into a full-width band whose
+  // links scrolled sideways with their section headings switched off, which
+  // put 28 undifferentiated nav chips in one strip about three at a time. A
+  // drawer shows all of them, still grouped, in one vertical scroll.
+  const [navOpen, setNavOpen] = useState(false)
+  const navLoc = useLocation()
+  useEffect(() => { setNavOpen(false) }, [navLoc.pathname])
+  // Tables become cards below 820px; this copies each column's name onto its
+  // cells so a stacked cell is not a bare number. document.body, so a dialog
+  // rendered through a portal is covered too.
+  useEffect(() => installTableStacking(document.body), [])
   // S595: per-device light/dark toggle (initial value applied pre-paint by index.html).
   const [theme, setTheme] = useState<'dark' | 'light'>(() => document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark')
   const toggleTheme = () => { const n = theme === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', n); try { localStorage.setItem('gam_theme', n) } catch {}; setTheme(n) }
   if(loading||!user)return<div className="loading">Loading…</div>
   return(
     <div className="shell">
-      <aside className="sidebar">
+      <aside className={"sidebar" + (navOpen ? " is-open" : "")}>
         <div className="logo">
           <div className="logo-n">⚠ GAM ADMIN</div>
           <div className="logo-s">Internal Operations</div>
@@ -372,6 +267,7 @@ function Layout(){
               admin to kind of do some research on." Nobody is flagged while a
               row sits here, so an empty list is the normal state. */}
           {isSuperAdmin&&<NavLink to="/left-owing-reviews" className={({isActive})=>`ni${isActive?' active':''}`}><UserSearch size={15}/> Left-Owing Matches<LeftOwingReviewBadge/></NavLink>}
+          {isSuperAdmin&&<NavLink to="/id-front-reviews" className={({isActive})=>`ni${isActive?' active':''}`}><ScanLine size={15}/> Licences to Confirm<IdFrontReviewBadge/></NavLink>}
           {isSuperAdmin&&<NavLink to="/feature-requests" className={({isActive})=>`ni${isActive?' active':''}`}><Lightbulb size={15}/> Feature Requests</NavLink>}
           <NavLink to="/units" className={({isActive})=>`ni${isActive?' active':''}`}><DoorOpen size={15}/> Units</NavLink>
           <div className="nl" style={{marginTop:8}}>Finance</div>
@@ -420,9 +316,16 @@ function Layout(){
           <button className="ni" onClick={()=>{logout();navigate('/login')}} style={{color:'var(--red)'}}><LogOut size={15}/> Sign out</button>
         </div>
       </aside>
+      {navOpen && <button className="nav-scrim" aria-label="Close menu" onClick={() => setNavOpen(false)} />}
       <div className="main">
         <header className="topbar">
-          <span style={{fontSize:'.72rem',color:'var(--t3)',fontFamily:'var(--font-m)'}}>Gold Asset Management — Admin Console</span>
+          {/* The only way in and out of the drawer on a phone. Hidden above
+              820px, where the sidebar is always open. */}
+          <button className="hamburger" onClick={() => setNavOpen(v => !v)}
+                  aria-label="Menu" aria-expanded={navOpen}>
+            <Menu size={20} />
+          </button>
+          <span className="topbar-name" style={{fontSize:'.72rem',color:'var(--t3)',fontFamily:'var(--font-m)'}}>Gold Asset Management — Admin Console</span>
           <button onClick={toggleTheme} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} aria-label="Toggle light/dark theme" style={{ marginLeft: 'auto', background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--t2)', padding: 6, display: 'inline-flex', alignItems: 'center', borderRadius: 6 }}>
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
           </button>
@@ -445,6 +348,30 @@ function AdminOnboardingOverview(){
   // Onboarding = the PM's OWN deals to onboard (closer or CS = them), NOT the
   // self-closed claim pool that /landlords also returns; super sees everyone.
   const landlords=React.useMemo(()=>user?.role==='super_admin'?(allLandlords as any[]):(allLandlords as any[]).filter((l:any)=>l.portfolioManagerId===user?.id||l.serviceManagerId===user?.id),[allLandlords,user])
+  // 10/29 (Nic): the list is of PEOPLE; the companies sit under them. Grouped
+  // here rather than in the API because each company row still has to be the
+  // real entity — it is what owns a Stripe account and opens its own detail.
+  const [expandedPeople,setExpandedPeople]=React.useState<Record<string,boolean>>({})
+  const landlordsByPerson=React.useMemo(()=>{
+    const by=new Map<string,any>()
+    for(const l of landlords as any[]){
+      const key=l.userId||l.id
+      const p=by.get(key)??{
+        userId:key,firstName:l.firstName,lastName:l.lastName,email:l.email,
+        companies:[],propertyCount:0,unitCount:0,allBanksReady:true,allOnboarded:true,
+      }
+      p.companies.push(l)
+      p.propertyCount+=Number(l.propertyCount||0)
+      p.unitCount+=Number(l.unitCount||0)
+      // Worst case wins: one company nobody can pay is still a company nobody
+      // can pay, however healthy the other one is.
+      if(!l.bankAccountReady)p.allBanksReady=false
+      if(!l.onboardingComplete)p.allOnboarded=false
+      by.set(key,p)
+    }
+    return [...by.values()].sort((a,b)=>
+      `${a.lastName||''} ${a.firstName||''}`.trim().localeCompare(`${b.lastName||''} ${b.firstName||''}`.trim()))
+  },[landlords])
   const[selectedLandlord,setSelectedLandlord]=React.useState<any>(null)
   const[selectedTenant,setSelectedTenant]=React.useState<any>(null)
   const{data:landlordDetail}=useQuery(['landlord-detail',selectedLandlord?.id],()=>get<any>('/admin/onboarding/landlord/'+selectedLandlord.id),{enabled:!!selectedLandlord?.id,staleTime:15000})
@@ -548,19 +475,63 @@ function AdminOnboardingOverview(){
       <div className="grid2" style={{gap:16}}>
         {/* LEFT — list */}
         <div className="card" style={{padding:0,overflowX:'auto'}}>
+          {/* ── 10/29 (Nic): ONE ROW PER PERSON, COMPANIES UNDERNEATH ─────────
+              "I also don't need to be a landlord twice in the list because of
+               2 properties."
+
+              He was not: he is one person who owns two LLCs, each with its own
+              Stripe account — which is correct and must not be merged
+              (Connect is per entity). What was wrong is that this listed the
+              ENTITIES and labelled each with the person, so he read as two
+              landlords. S650 already fixed exactly this for the landlord COUNT
+              on the overview; the list was missed.
+
+              So: a row per person, their companies' properties and units added
+              up, expanding to the companies themselves — each of which still
+              opens its own detail, because that is the thing with a Stripe
+              account, an onboarding state and a bank. */}
           {tab==='landlords'&&(lLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
               <table className="tbl" style={{minWidth:540}}>
                 <thead><tr><th>Landlord</th><th>Properties</th><th>Units</th><th>Bank</th><th>Onboarded</th></tr></thead>
                 <tbody>
-                  {(landlords as any[]).map((l:any)=>(
-                    <tr key={l.id} style={{cursor:'pointer',background:selectedLandlord?.id===l.id?'rgba(201,162,39,.05)':''}} onClick={()=>{setSelectedLandlord(l);setSelectedTenant(null)}}>
-                      <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{l.firstName} {l.lastName}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{l.email}</div></td>
-                      <td className="mono">{l.propertyCount}</td>
-                      <td className="mono">{l.unitCount}</td>
-                      <td><span className={`badge ${l.bankAccountReady?'bg2':'br'}`}>{l.bankAccountReady?'✓':'Missing'}</span></td>
-                      <td><span className={`badge ${l.onboardingComplete?'bg2':'ba'}`}>{l.onboardingComplete?'Done':'Pending'}</span></td>
-                    </tr>
-                  ))}
+                  {landlordsByPerson.map((p:any)=>[
+                    <tr key={p.userId} style={{cursor:'pointer'}}
+                        onClick={()=>setExpandedPeople(x=>({...x,[p.userId]:!x[p.userId]}))}>
+                      <td>
+                        <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>
+                          <span style={{display:'inline-block',width:12,color:'var(--t3)'}}>
+                            {p.companies.length>1?(expandedPeople[p.userId]?'▾':'▸'):''}
+                          </span>
+                          {p.firstName} {p.lastName}
+                        </div>
+                        <div style={{fontSize:'.65rem',color:'var(--t3)',marginLeft:12}}>
+                          {p.email}
+                          {p.companies.length>1&&` · ${p.companies.length} companies`}
+                        </div>
+                      </td>
+                      <td className="mono">{p.propertyCount}</td>
+                      <td className="mono">{p.unitCount}</td>
+                      {/* One company that cannot be paid is a problem even when
+                          another can, so the badge reads the worst case. */}
+                      <td><span className={`badge ${p.allBanksReady?'bg2':'br'}`}>{p.allBanksReady?'✓':'Missing'}</span></td>
+                      <td><span className={`badge ${p.allOnboarded?'bg2':'ba'}`}>{p.allOnboarded?'Done':'Pending'}</span></td>
+                    </tr>,
+                    ...((p.companies.length>1&&expandedPeople[p.userId])||p.companies.length===1
+                      ? p.companies.map((l:any)=>(
+                        <tr key={l.id} style={{cursor:'pointer',background:selectedLandlord?.id===l.id?'rgba(201,162,39,.05)':''}}
+                            onClick={()=>{setSelectedLandlord(l);setSelectedTenant(null)}}>
+                          <td style={{paddingLeft:p.companies.length>1?28:12}}>
+                            <div style={{fontSize:'.72rem',color:'var(--t1)'}}>
+                              {l.businessName||<span style={{color:'var(--t3)'}}>No company name</span>}
+                            </div>
+                          </td>
+                          <td className="mono" style={{fontSize:'.72rem'}}>{l.propertyCount}</td>
+                          <td className="mono" style={{fontSize:'.72rem'}}>{l.unitCount}</td>
+                          <td><span className={`badge ${l.bankAccountReady?'bg2':'br'}`}>{l.bankAccountReady?'✓':'Missing'}</span></td>
+                          <td><span className={`badge ${l.onboardingComplete?'bg2':'ba'}`}>{l.onboardingComplete?'Done':'Pending'}</span></td>
+                        </tr>))
+                      : []),
+                  ])}
                 </tbody>
               </table>
             ))}
@@ -3153,6 +3124,82 @@ function Bool({ v }: { v: boolean }) {
 // Worth designing at hiring time, not before.
 
 
+// 10/27 (Nic) — THE FLEXDEPOSIT CASH BOARD.
+//
+// His flowchart: are there move-outs this month, do we hold their deposit,
+// what is owed versus what we funded, and the difference is the cash we need.
+// It stops at the first empty step, so with no plans every figure is a true $0
+// rather than an estimate of one.
+//
+// The reserve here is NOT the FlexPay reserve beside it: it is FlexDeposit fees
+// banked less shortfalls paid, summed off GAM's revenue book. The FlexPay card
+// reads reserve_fund_state, which no production code has ever written.
+function FlexDepositExposure(){
+  const{user}=useAuth()
+  const{data,isLoading}=useQuery<any>('admin-flexdeposit-exposure',
+    ()=>get<any>('/admin/flexdeposit/exposure'),{enabled:!!user})
+  if(isLoading)return <div className="card"><div className="ct">FlexDeposit Exposure</div><div style={{color:'var(--t3)',fontSize:'.8rem'}}>Loading…</div></div>
+  // The API response is camelized client-side (S312), so these are the wire
+  // contract — not a guess with a snake_case fallback behind it.
+  const plans=data?.custodyPlans??0
+  const reserve=data?.reserve??0
+  const required=data?.cashRequired??0
+  const headroom=data?.headroom??0
+  const months:any[]=data?.months??[]
+  const allowance=data?.unexpectedAllowance??0
+  const unscheduled=data?.unscheduledPlans??0
+  const unscheduledOwed=data?.unscheduledUnfunded??0
+  return(
+    <div className="card" style={{marginBottom:16}}>
+      <div className="ct">FlexDeposit Exposure</div>
+      {plans===0?(
+        <div style={{color:'var(--t3)',fontSize:'.82rem',lineHeight:1.6}}>
+          No deposits in custody, so there is nothing GAM could be asked to cover.
+          This fills in from the first FlexDeposit plan — and the money it shows is
+          never due before that resident's tenancy ends.
+        </div>
+      ):(
+        <>
+          <div className="dr"><span className="dk">Deposits in custody</span><span className="dv mono">{plans}</span></div>
+          <div className="dr"><span className="dk">Cash to have standing by</span><span className="dv mono">{formatCurrency(required)}</span></div>
+          <div className="dr"><span className="dk">Reserve (fees banked less paid out)</span><span className="dv mono">{formatCurrency(reserve)}</span></div>
+          <div className="dr"><span className="dk">Headroom</span>
+            <span className={`badge ${headroom>=0?'bg2':'br'}`}>{formatCurrency(headroom)}</span></div>
+          {months.length===0?(
+            <div style={{marginTop:14,fontSize:'.78rem',color:'var(--t3)',lineHeight:1.5}}>
+              Nobody with a deposit in custody is scheduled to leave, so no month needs cash yet.
+              {unscheduled>0&&` ${unscheduled} plan${unscheduled===1?'':'s'} on a lease with no end date — ${formatCurrency(unscheduledOwed)} unfunded, which can come due on a few days' notice.`}
+            </div>
+          ):(
+            <div style={{marginTop:12,overflowX:'auto'}}>
+              <table className="tbl"><thead><tr>
+                <th>Month</th><th>Leaving</th><th>Landlord owed</th><th>We funded</th><th>Cash needed</th>
+              </tr></thead><tbody>
+                {months.map((m:any)=>(
+                  <tr key={m.month}>
+                    <td>{m.month}</td>
+                    <td>{(m.departures??[]).length}</td>
+                    <td className="mono">{formatCurrency(m.owed??0)}</td>
+                    <td className="mono">{formatCurrency(m.funded??0)}</td>
+                    <td className="mono" style={{color:(m.cashNeeded??0)>0?'var(--amber)':'var(--t3)'}}>
+                      {formatCurrency(m.cashNeeded??0)}</td>
+                  </tr>
+                ))}
+              </tbody></table>
+            </div>
+          )}
+          <div style={{marginTop:14,fontSize:'.78rem',color:'var(--t3)',lineHeight:1.5}}>
+            Each month assumes the landlord keeps the whole deposit, which is the worst case
+            and the one to hold cash against. What the landlord actually keeps is settled at
+            move-out, and anything the earmark did not need comes straight back.
+            Plus {formatCurrency(allowance)} for one departure nobody saw coming.
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 function Reserve(){
   const{user}=useAuth()
   const{data:stats}=useQuery('admin-overview',()=>get<any>('/admin/overview'),{enabled:!!user})
@@ -3168,15 +3215,21 @@ function Reserve(){
   const pct=target>0?Math.min(((stats?.reserveBalance||0)/target)*100,100):0
   return(
     <div>
-      <div className="ph"><div><h1 className="pt">Reserve &amp; Float</h1><p className="ps">Scales with FlexPay enrollment — $0 until the first income-verified enrollment</p></div></div>
+      <div className="ph"><div><h1 className="pt">Reserve &amp; Float</h1><p className="ps">What each Flex product could be asked to cover, and what is standing behind it</p></div></div>
+      <FlexDepositExposure/>
       <div className="grid2" style={{marginBottom:16}}>
         <div className="card">
-          <div className="ct">Default Reserve Fund</div>
+          {/* 10/27: this card is FlexPay's, and its balance reads a table no
+              production code has ever written (reserve_fund_state — zero, its
+              only rows a seed from the shelved On-Time Pay model). Said so on
+              the card rather than left looking like a measured figure. The
+              FlexDeposit board above is computed from real revenue rows. */}
+          <div className="ct">FlexPay Default Reserve</div>
           <div className="dr"><span className="dk">Balance</span><span className="dv mono" style={{color:pct>=100?'var(--green)':pct>=50?'var(--amber)':'var(--red)'}}>{formatCurrency(stats?.reserveBalance||0)}</span></div>
           <div className="dr"><span className="dk">Target (10% of FlexPay float)</span><span className="dv mono">{formatCurrency(target)}</span></div>
           <div className="dr"><span className="dk">Coverage</span><span className={`badge ${pct>=100?'bg2':pct>=50?'ba':'br'}`}>{pct.toFixed(0)}%</span></div>
           <div style={{marginTop:14,fontSize:'.78rem',color:'var(--t3)',lineHeight:1.5}}>
-            Reserve absorbs FlexPay defaults — sized at 10% of the FlexPay float (money at risk), not total rent. It only grows as income-verified tenants enroll, so it stays $0 during the demand-test phase.
+            Reserve absorbs FlexPay defaults — sized at 10% of the FlexPay float (money at risk), not total rent. It only grows as income-verified tenants enroll, so it stays $0 during the demand-test phase. Nothing funds this balance yet: FlexPay enrolment is closed, and no code writes it.
           </div>
         </div>
         <div className="card">
@@ -4087,6 +4140,37 @@ function VerifyEmailPage(){
 // S655: remembered per browser so the box starts the way it was last left.
 const KEEP_SIGNED_IN_KEY='gam_admin_keep_signed_in'
 
+// ── THE CODE STEP MUST SURVIVE LEAVING THE PAGE (S639/S654, ported 10/30) ────
+//
+// Nic: "they go back out to get the two-factor authentication code, [and] it
+// boots them out." Nothing was ever signed in — the pending OTP session lived
+// in React state, so switching to the mail app let the phone browser discard
+// and reload the page, and it came back as the email/password form with the
+// code they are now holding useless. Every login hits this, because email 2FA
+// is on for every account.
+//
+// localStorage, not sessionStorage: sessionStorage is PER TAB, and somebody who
+// reads the code in their mail app and returns through a link lands in a NEW
+// tab with no pending session. The stored token is PRE-auth, useless without
+// the emailed code, and expires in 15 minutes — the same trust level as the
+// page holding it in memory. Cleared the moment the code is accepted.
+//
+// The tenant portal has the canonical copy of this (usePendingOtpSession in
+// apps/tenant/src/main.tsx); POS, business, admin and admin-ops never got it.
+function usePendingOtpSession(key: string): [string | null, (v: string | null) => void] {
+  const [v, setV] = useState<string | null>(() => {
+    try { return localStorage.getItem(key) ?? sessionStorage.getItem(key) } catch { return null }
+  })
+  const set = (next: string | null) => {
+    setV(next)
+    try {
+      if (next) localStorage.setItem(key, next)
+      else { localStorage.removeItem(key); sessionStorage.removeItem(key) }
+    } catch { /* private mode — behaves exactly as before */ }
+  }
+  return [v, set]
+}
+
 function LoginPage(){
   const{login,loginWithTotp,loginWithEmailOtp,resendEmailOtp}=useAuth()
   const[keepSignedIn,setKeepSignedIn]=useState(()=>readKeepSignedInChoice(KEEP_SIGNED_IN_KEY))
@@ -4096,7 +4180,7 @@ function LoginPage(){
   },[])
   const[email,setEmail]=useState('');const[pw,setPw]=useState('');const[err,setErr]=useState('');const[loading,setLoading]=useState(false)
   const[totpSession,setTotpSession]=useState<string|null>(null)
-  const[emailOtpSession,setEmailOtpSession]=useState<string|null>(null)
+  const[emailOtpSession,setEmailOtpSession]=usePendingOtpSession('gam.otp.admin.login')
   const[resentMsg,setResentMsg]=useState('')
   const[code,setCode]=useState('')
 
@@ -4913,6 +4997,7 @@ function App(){
           <Route path="flexpay-requests" element={<SuperAdminGuard><FlexPayRequests/></SuperAdminGuard>}/>
           <Route path="property-reviews" element={<SuperAdminGuard><PropertyReviews/></SuperAdminGuard>}/>
           <Route path="left-owing-reviews" element={<SuperAdminGuard><LeftOwingReviews/></SuperAdminGuard>}/>
+          <Route path="id-front-reviews" element={<SuperAdminGuard><IdFrontReviews/></SuperAdminGuard>}/>
           <Route path="feature-requests" element={<SuperAdminGuard><FeatureRequests/></SuperAdminGuard>}/>
           <Route path="team"          element={<SuperAdminGuard><Team/></SuperAdminGuard>}/>
           <Route path="units"         element={<Units/>}/>
@@ -5740,7 +5825,7 @@ interface LeftOwingReviewRow {
   id: string; owingId: string
   debtName: string | null; personName: string | null
   personEmail: string | null; personPhone: string | null
-  matchedOn: 'email' | 'phone' | 'account'
+  matchedOn: 'email' | 'phone' | 'account' | 'licence'
   nameAgreement: 'same' | 'unsure' | 'different'
   why: string; amount: number; owedTo: string | null
   leftOn: string | null; where: string | null; source: string; raisedAt: string
@@ -5768,7 +5853,12 @@ function LeftOwingReviews() {
   )
 
   const money = (n: number) => '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-  const WHICH: Record<string, string> = { email: 'Same email address', phone: 'Same phone number', account: 'Same account' }
+  const WHICH: Record<string, string> = {
+    email: 'Same email address', phone: 'Same phone number', account: 'Same account',
+    // 10/29: a licence number identifies on its own, so one of these only
+    // reaches this page when the NAME disagrees — most likely a mistyped digit.
+    licence: 'Same licence number',
+  }
   const CLOSE: Record<string, string> = {
     unsure: 'The names are close', different: 'The names do not match', same: 'The names match',
   }
@@ -5823,6 +5913,225 @@ function LeftOwingReviews() {
           </div>
         </div>
       ))}
+    </div>
+  )
+}
+
+/**
+ * ── READING A LICENCE BY HAND (Nic, 10/29) ─────────────────────────────────
+ *
+ *   "Maybe we can have it where gam to-do list for gam admin people is
+ *    verifying the front photo and typing it in by hand, or like letting the
+ *    parser try to read the license and matching it up, and then we can flag a
+ *    percentage of accuracy of, hey, we're getting 99% accuracy in this state,
+ *    and this state is only 30%, and so these ones need to be always verified
+ *    by a real person."
+ *
+ * Only what the OCR could not settle reaches this screen: the front and the
+ * barcode disagreeing, or a state GAM has not read enough cards from to trust
+ * a front on its own. Everything else files itself and is never seen here.
+ *
+ * It is a GAM desk and not a landlord one on purpose — an identification
+ * decides which human being a left-owing debt belongs to, so the landlord who
+ * stands to collect never gets to decide whose licence it is.
+ */
+interface FrontReviewRow {
+  identificationId: string
+  tenantId: string | null; bookingId: string | null; who: string | null
+  idType: string; idNumber: string
+  issuingState: string | null; dateOfBirth: string | null
+  capturedHow: string; reviewReason: string | null
+  frontUrl: string | null; backUrl: string | null
+  readIdNumber: string | null; readDateOfBirth: string | null; readConfidence: number | null
+  truthIdNumber: string | null; truthDateOfBirth: string | null
+  stateAccuracyPct: number | null; stateAccuracySample: number | null
+  waitingSince: string
+}
+interface StateAccuracyRow {
+  issuingState: string; checked: number; correctPct: number; trusted: boolean; note: string
+}
+interface FrontReviewPayload { waiting: FrontReviewRow[]; byState: StateAccuracyRow[] }
+
+function IdFrontReviewBadge() {
+  const { data } = useQuery<FrontReviewPayload>(
+    'id-front-reviews', () => get<FrontReviewPayload>('/admin/id-front-reviews'))
+  const n = data?.waiting?.length ?? 0
+  if (!n) return null
+  return <span className="badge b-amber" style={{ marginLeft: 'auto' }}>{n}</span>
+}
+
+/** The stored photo, fetched with the admin's own token — never a public URL. */
+function LicencePhoto({ url, label }: { url: string | null; label: string }) {
+  const [src, setSrc] = React.useState<string | null>(null)
+  const [failed, setFailed] = React.useState(false)
+  React.useEffect(() => {
+    if (!url) return
+    let dead = false
+    let objectUrl: string | null = null
+    // The file route is auth-gated (S535: nothing under uploads/ is public), so
+    // the image cannot be an <img src> — it is fetched with the token and held
+    // as a blob for as long as the card is on screen.
+    const name = url.split('/').pop()
+    api.get(`/guest-licence-files/${name}`, { responseType: 'blob' })
+      .then(res => {
+        if (dead) return
+        objectUrl = URL.createObjectURL(res.data as Blob)
+        setSrc(objectUrl)
+      })
+      .catch(() => { if (!dead) setFailed(true) })
+    return () => { dead = true; if (objectUrl) URL.revokeObjectURL(objectUrl) }
+  }, [url])
+  if (!url) return <div className="kpi-s">No {label.toLowerCase()} on file</div>
+  return (
+    <div style={{ flex: 1, minWidth: 220 }}>
+      <div className="kpi-l">{label}</div>
+      {failed ? <div className="kpi-s">That picture could not be loaded.</div>
+        : !src ? <div className="kpi-s">Loading…</div>
+        : <a href={src} target="_blank" rel="noreferrer">
+            <img src={src} alt={label} style={{ width: '100%', borderRadius: 10, border: '1px solid var(--line)' }}/>
+          </a>}
+    </div>
+  )
+}
+
+function IdFrontReviews() {
+  const qc = useQueryClient()
+  const [edit, setEdit] = React.useState<Record<string, { idNumber: string; dateOfBirth: string; note: string }>>({})
+  const [err, setErr] = React.useState<string | null>(null)
+  const { data, isLoading } = useQuery<FrontReviewPayload>(
+    'id-front-reviews', () => get<FrontReviewPayload>('/admin/id-front-reviews'))
+  const rows = data?.waiting ?? []
+  const byState = data?.byState ?? []
+
+  const decide = useMutation(
+    (p: { id: string; idNumber?: string; dateOfBirth?: string; note?: string }) =>
+      post(`/admin/id-front-reviews/${p.id}/decide`, {
+        idNumber: p.idNumber || undefined,
+        dateOfBirth: p.dateOfBirth || undefined,
+        note: p.note || undefined,
+      }),
+    { onSuccess: () => { qc.invalidateQueries('id-front-reviews'); setErr(null) },
+      onError: (e: any) => setErr(e?.response?.data?.error || 'That did not save — try again') },
+  )
+
+  const HOW: Record<string, string> = { scanned: 'Read off the barcode', typed: 'Typed by the guest' }
+  const TYPE: Record<string, string> = {
+    drivers_license: "Driver's licence", state_id: 'State ID', passport: 'Passport',
+    military_id: 'Military ID', tribal_id: 'Tribal ID',
+    permanent_resident_card: 'Permanent resident card', other: 'Other',
+  }
+  const field = (id: string) => edit[id] ?? { idNumber: '', dateOfBirth: '', note: '' }
+  const setField = (id: string, patch: Partial<{ idNumber: string; dateOfBirth: string; note: string }>) =>
+    setEdit({ ...edit, [id]: { ...field(id), ...patch } })
+
+  return (
+    <div>
+      <div className="ph">
+        <div>
+          <h1 className="pt">Licences to Confirm</h1>
+          <p className="ps">
+            {rows.length === 0
+              ? 'Nothing waiting. A licence only needs a person when the front and the barcode disagree, or the state reads badly.'
+              : `${rows.length} waiting — the front could not be settled on its own`}
+          </p>
+        </div>
+      </div>
+      {err && <div className="alert a-red" style={{ marginBottom: 12 }}>{err}</div>}
+      {isLoading && <div className="muted">Loading…</div>}
+
+      {rows.map(r => (
+        <div key={r.identificationId} className="card" style={{ marginBottom: 12 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 20, alignItems: 'flex-start' }}>
+            <LicencePhoto url={r.frontUrl} label="Front"/>
+            <LicencePhoto url={r.backUrl} label="Back"/>
+            <div style={{ flex: 1, minWidth: 280 }}>
+              <div className="kpi-l">On file now</div>
+              <div style={{ fontSize: '1.05rem', fontWeight: 600 }}>{r.who || '— no name —'}</div>
+              <div className="kpi-s">
+                {TYPE[r.idType] ?? r.idType} · {r.idNumber || '— no number —'}
+                {r.issuingState ? ` · ${r.issuingState}` : ''}
+                {r.dateOfBirth ? ` · born ${r.dateOfBirth}` : ''}
+              </div>
+              <div className="kpi-s">{HOW[r.capturedHow] ?? r.capturedHow}</div>
+
+              <div className="kpi-l" style={{ marginTop: 12 }}>What the reader made of the front</div>
+              <div className="kpi-s">
+                {r.readIdNumber || '— nothing —'}
+                {r.readDateOfBirth ? ` · born ${r.readDateOfBirth}` : ''}
+                {r.readConfidence != null ? ` · ${Math.round(r.readConfidence)}% sure of itself` : ''}
+              </div>
+              {r.truthIdNumber && (
+                <>
+                  <div className="kpi-l" style={{ marginTop: 12 }}>What the barcode said</div>
+                  <div className="kpi-s">
+                    {r.truthIdNumber}{r.truthDateOfBirth ? ` · born ${r.truthDateOfBirth}` : ''}
+                  </div>
+                </>
+              )}
+              {r.stateAccuracyPct != null && (
+                <div className="kpi-s" style={{ marginTop: 10 }}>
+                  <span className={`badge ${r.stateAccuracyPct >= 90 ? 'b-green' : 'b-amber'}`}>
+                    {r.issuingState} reads right {r.stateAccuracyPct}% of {r.stateAccuracySample}
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {r.reviewReason && <p className="ps" style={{ marginTop: 10 }}>{r.reviewReason}</p>}
+
+          <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+            <input className="in" style={{ flex: 1, minWidth: 180 }}
+              placeholder={`Licence number (leave blank to keep ${r.idNumber || 'what is on file'})`}
+              value={field(r.identificationId).idNumber}
+              onChange={e => setField(r.identificationId, { idNumber: e.target.value })}/>
+            <input className="in" type="date" style={{ minWidth: 150 }}
+              value={field(r.identificationId).dateOfBirth}
+              onChange={e => setField(r.identificationId, { dateOfBirth: e.target.value })}/>
+          </div>
+          <input className="in" style={{ marginTop: 8 }}
+            placeholder="What you read on the card (optional, kept with the record)"
+            value={field(r.identificationId).note}
+            onChange={e => setField(r.identificationId, { note: e.target.value })}/>
+          <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+            <button className="btn btn-primary btn-sm" disabled={decide.isLoading}
+              onClick={() => decide.mutate({ id: r.identificationId, ...field(r.identificationId) })}>
+              {field(r.identificationId).idNumber
+                ? 'Save what I read off the card'
+                : 'What is on file is right'}
+            </button>
+          </div>
+        </div>
+      ))}
+
+      {byState.length > 0 && (
+        <div className="card" style={{ marginTop: 20 }}>
+          <h3 style={{ margin: '0 0 4px' }}>How the reader is doing, by state</h3>
+          <p className="ps" style={{ marginTop: 0 }}>
+            Graded against the barcode on the back wherever a guest sent both sides, and
+            against what somebody typed here when they did not. A state under 90%, or
+            with fewer than 20 cards read, is confirmed by hand.
+          </p>
+          <table className="tbl">
+            <thead><tr><th>State</th><th>Read</th><th>Correct</th><th></th></tr></thead>
+            <tbody>
+              {byState.map(st => (
+                <tr key={st.issuingState}>
+                  <td>{st.issuingState}</td>
+                  <td>{st.checked}</td>
+                  <td>{st.correctPct}%</td>
+                  <td>
+                    <span className={`badge ${st.trusted ? 'b-green' : 'b-amber'}`}>
+                      {st.trusted ? 'Trusted on its own' : 'A person looks'}
+                    </span>
+                    <div className="kpi-s">{st.note}</div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   )
 }
@@ -6851,7 +7160,6 @@ function Root(){
   return(
     <QueryClientProvider client={qc}>
       <AuthProvider>
-        <style dangerouslySetInnerHTML={{__html:css}}/>
         <App/>
       </AuthProvider>
     </QueryClientProvider>

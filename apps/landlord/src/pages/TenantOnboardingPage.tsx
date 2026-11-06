@@ -5,7 +5,7 @@ import { EntityPicker, useCompanyMissing } from '../components/EntityPicker'
 import { WorkTradeTermsFields, defaultWorkTradeTerms, workTradeTermsPayload, type WorkTradeTerms } from '../components/WorkTradeTermsFields'
 import { toast, appConfirm } from '../components/dialogs'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
-import { canInviteToUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
+import { canInviteToUnit, canTakeOverUnit, hiddenUnitReasons } from '../lib/inviteEligibility'
 import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, Inbox } from 'lucide-react'
 import { api, apiPost, apiGet, apiPut, apiPatch, apiDelete } from '../lib/api'
 import { UNIT_TYPE_LABEL, humanize, dueDayLabel,
@@ -518,6 +518,12 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
 
   const inProperty = (allUnits as any[]).filter(u => u.propertyId === propertyId)
   const selectable = inProperty.filter(canInviteToUnit)
+  // 10/28: an occupied space can be taken over from this door as well. Kept in
+  // its OWN list and named, never mixed into the vacancies — choosing one is
+  // choosing a takeover, which is the same shape the invite modal and the
+  // screening page use (lib/inviteEligibility).
+  const takeoverUnits = inProperty.filter(canTakeOverUnit)
+  const isTakeover = (id: string) => takeoverUnits.some((u: any) => u.id === id)
   const hiddenReasons = hiddenUnitReasons(inProperty)
 
   // 10/19 (Nic, "Fix invite flag overridden in first 28 days"): the page reads
@@ -598,6 +604,8 @@ function NewLeaseInviteMode({ onBack, initialUnitId = '', initialPropertyId = ''
       try {
         const r: any = await apiPost<any>('/landlords/me/onboard-new-lease-tenant', {
           unitId: u.id, people,
+          // The list this space was chosen from is the landlord's answer.
+          ...(isTakeover(u.id) ? { takeover: true } : {}),
           // 10/19: only what the landlord was actually SHOWN and left ticked.
           // This read `attest[u.id] !== false`, which is true when the box was
           // never rendered at all — so a unit whose property could not offer

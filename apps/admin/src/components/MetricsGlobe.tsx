@@ -46,7 +46,7 @@
  * there, on a diverging red/blue scale, with GAM's own number as the gold
  * marker on top of it. Gold on this globe always means GAM.
  */
-import React, { useCallback, useEffect, useRef } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef } from 'react'
 import { geoGraticule10, geoPath } from 'd3-geo'
 import type { MultiLineString } from 'geojson'
 import {
@@ -109,6 +109,52 @@ interface Props {
 const graticule = geoGraticule10()
 const sphere = { type: 'Sphere' } as const
 
+/** One point in this many is kept for the lines drawn WHILE the globe moves. */
+const DRAG_KEEP_EVERY = 12
+
+/**
+ * A thinned copy of a boundary mesh, for drag frames only.
+ *
+ * 10/31 (Nic): "I wish that you would keep all the boundaries, the highlighted
+ * kind of bluish gray color around each boundary… those would stay on when
+ * dragging the map so you can see like where you want to stop."
+ *
+ * The gate below used to draw NO boundary during a drag, for a measured
+ * reason: at full detail the provinces and the lines between countries cost
+ * about 79ms of path building a frame on top of the 27ms the fills, grid and
+ * rim already cost — six to eight frames a second.
+ *
+ * MEASURED AGAIN on 10/31, against the real files at 975x610, before choosing:
+ *   full detail, both heavy meshes      79.2ms
+ *   projection precision 0.6 -> 3       NO saving at all
+ *   one point in 4                      26.2ms
+ *   one point in 12                     12.0ms
+ *   one point in 24                      8.2ms
+ * Coarsening the projection's precision — the obvious lever — buys nothing
+ * here, because these meshes are already denser than the adaptive resampler
+ * would ever subdivide to. Thinning the geometry is what pays.
+ *
+ * One in twelve puts the whole frame around 46ms (about 22fps) against 37fps
+ * with no lines at all, and the curve is flat past that point: the 27ms of
+ * fills dominates, so one in twenty-four would buy one more frame a second and
+ * lose half the shape. Full detail is still what gets drawn the moment the
+ * globe stops, so what a thinned line costs is a slightly straighter border
+ * while it is actually turning — which is when he is looking at where to stop,
+ * not at the shape of Saskatchewan.
+ *
+ * The first and last point of every line are always kept, so nothing shortens.
+ */
+export function thinMesh(geo: MultiLineString | null | undefined, every: number): MultiLineString | null {
+  if (!geo || geo.type !== 'MultiLineString') return null
+  return {
+    type: 'MultiLineString',
+    coordinates: geo.coordinates.map(line => (
+      line.length <= 3 ? line
+        : [line[0], ...line.slice(1, -1).filter((_, i) => i % every === 0), line[line.length - 1]]
+    )),
+  }
+}
+
 /** A CSS color (any form the theme writes) → [r, g, b], read back from a 1×1 canvas. */
 function makeColorReader() {
   const cache = new Map<string, [number, number, number]>()
@@ -146,9 +192,17 @@ export function MetricsGlobe({
   const colorOf = useRef(makeColorReader()).current
   /** The markers drawn last frame (places too small to see), for hover and tap. */
   const dots = useRef<Array<{ id: string; x: number; y: number }>>([])
+  // Thinned once per mesh, not per frame — these are the lines a drag draws.
+  const dragBorders = useMemo(() => thinMesh(borders, DRAG_KEEP_EVERY), [borders])
+  const dragProvinces = useMemo(() => thinMesh(provinces?.borders, DRAG_KEEP_EVERY), [provinces])
+  const dragCountries = useMemo(() => thinMesh(countries?.borders, DRAG_KEEP_EVERY), [countries])
+  const dragWorld = useMemo(() => thinMesh(world?.borders, DRAG_KEEP_EVERY), [world])
+
   // The latest props, for the drawing loop and the pointer handlers.
-  const props = useRef({ areas, borders, shade, lean, focus, stateLines, onHover, onPick, onView })
-  props.current = { areas, borders, shade, lean, focus, stateLines, onHover, onPick, onView }
+  const props = useRef({ areas, borders, shade, lean, focus, stateLines, onHover, onPick, onView,
+                         dragBorders, dragProvinces, dragCountries, dragWorld })
+  props.current = { areas, borders, shade, lean, focus, stateLines, onHover, onPick, onView,
+                    dragBorders, dragProvinces, dragCountries, dragWorld }
 
   const paint = useCallback(() => {
     frame.current = null
@@ -235,15 +289,23 @@ export function MetricsGlobe({
      * edges only, so no coastline is in it either way — a coast is where the
      * land fill stops), and the provinces inside them.
      */
-    if (!fast) {
-      if (p.borders) stroke(p.borders, line, 0.5, 0.7)
+    // 10/31 (Nic): every boundary stays up through a drag now — thinned while
+    // the globe is turning (thinMesh, one point in twelve) and at full detail
+    // the moment it stops. The United States' own two layers are 2ms together,
+    // so they are never thinned.
+    {
+      const b = fast ? p.dragBorders : p.borders
+      if (b) stroke(b, line, 0.5, 0.7)
       // A province is the same kind of thing as a state, so it is drawn
       // exactly like one — same color, same weight. That is the whole point of
       // Nic's decision: "Alaska and Hawaii stop looking like a different kind
       // of thing from Arizona."
-      if (provinces) stroke(provinces.borders, line, 0.7)
-      if (countries) stroke(countries.borders, line, 1)
-      else if (world) stroke(world.borders, line, 1)
+      const prov = fast ? p.dragProvinces : provinces?.borders
+      if (prov) stroke(prov, line, 0.7)
+      const ctry = fast ? p.dragCountries : countries?.borders
+      const wrld = fast ? p.dragWorld : world?.borders
+      if (ctry) stroke(ctry, line, 1)
+      else if (wrld) stroke(wrld, line, 1)
       if (p.stateLines) stroke(us.stateBorders, line, 0.7)
       stroke(us.nation, line, 1)
     }

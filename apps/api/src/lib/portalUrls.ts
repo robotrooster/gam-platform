@@ -76,3 +76,40 @@ export function portalLink(portal: Portal, path: string): string {
   const base = portalUrl(portal)
   return `${base}/${String(path).replace(/^\/+/, '')}`
 }
+
+/**
+ * ── THE API'S OWN PUBLIC ADDRESS ────────────────────────────────────────────
+ *
+ * Some pages are served by the API itself rather than by a portal: a pay link,
+ * a calendar feed, a guest's licence-capture page. Those links go to people
+ * outside the company, so they are the same hazard the rest of this file
+ * exists for, and they get the same treatment — ONE name, resolved here.
+ *
+ * Found by the guard in portalUrls.test.ts: a new route invented `API_BASE_URL`
+ * (nothing sets it) when the real variable is `API_PUBLIC_URL`, so every guest
+ * sent a capture link would have been sent to localhost. That is exactly the
+ * shape of the bug this file was written after, one variable name later.
+ */
+const API_ENV_VAR = 'API_PUBLIC_URL'
+const API_PRODUCTION_HOST = 'https://api.goldassetmanagement.com'
+const API_DEV_HOST = 'http://localhost:4000'
+
+/** The API's own public base URL, with no trailing slash. */
+export function apiUrl(): string {
+  const raw = process.env[API_ENV_VAR]
+  if (raw && raw.trim()) return raw.trim().replace(/\/+$/, '')
+
+  if (process.env.NODE_ENV === 'production') {
+    logger.error(
+      { expected: API_ENV_VAR },
+      '[portal-url] API_PUBLIC_URL missing in production — using the known host. Set it.',
+    )
+    return API_PRODUCTION_HOST
+  }
+  return API_DEV_HOST
+}
+
+/** A link to a page the API serves itself. `path` may start with or without a slash. */
+export function apiLink(path: string): string {
+  return `${apiUrl()}/${String(path).replace(/^\/+/, '')}`
+}

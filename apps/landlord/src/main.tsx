@@ -14,7 +14,6 @@ import '@fontsource/jetbrains-mono/400.css'
 import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import { installDatePickerAutoClose, startVersionWatch, unlockScrollIfStandalone, installPrintLightTheme } from '@gam/shared'
-import { AccountLockScreen } from './components/AccountLockScreen'
 import React, { useEffect, useState } from 'react'
 import { apiPost } from './lib/api'
 import ReactDOM from 'react-dom/client'
@@ -83,6 +82,9 @@ import { PendingTenantsPage } from './pages/PendingTenantsPage'
 import { PaymentsPage }    from './pages/PaymentsPage'
 import { RentRollPage }    from './pages/RentRollPage'
 import { UtilityMetersPage } from './pages/UtilityMetersPage'
+import { MarketplacePage } from './pages/MarketplacePage'
+import { InsurancePage } from './pages/InsurancePage'
+import { MyStatementsPage } from './pages/MyStatementsPage'
 import { DisbursementsPage } from './pages/DisbursementsPage'
 import { LotRentPage } from './pages/LotRentPage'
 // 10/11 (Nic): the shared financial pages — the same files in GAM Books
@@ -106,6 +108,7 @@ import { OnboardingPage }  from './pages/OnboardingPage'
 import { TenantOnboardingPage } from './pages/TenantOnboardingPage'
 import { PropertyOnboardingPage } from './pages/PropertyOnboardingPage'
 import { PaymentHistoryOnboardingPage } from './pages/PaymentHistoryOnboardingPage'
+import { TypeInPastPaymentsPage } from './pages/TypeInPastPaymentsPage'
 import { ReportsPage } from './financials/ReportsPage'
 import { ESignPage } from './pages/ESignPage'
 import { BackgroundChecksPage } from './pages/BackgroundChecksPage'
@@ -281,7 +284,6 @@ function App() {
           <VersionWatch />
           <ScrollUnlock />
           {/* S652: draws itself only when the API says the account is on hold. */}
-          <AccountLockScreen />
           <Routes>
             <Route path="/login"    element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
@@ -319,6 +321,9 @@ function App() {
               <Route path="properties/:id"  element={<PropertyDetailPage />} />
               <Route path="property-onboarding" element={<PropertyOnboardingPage />} />
               <Route path="payment-history-onboarding" element={<PaymentHistoryOnboardingPage />} />
+              {/* 11/1 (Nic): "People switching to gam may not use software so
+                  lots of stuff may go in manual." The no-file way in. */}
+              <Route path="type-in-past-payments" element={<TypeInPastPaymentsPage />} />
               <Route path="pm-invitations"  element={LAUNCH_HIDDEN.has('/pm-invitations') ? <Navigate to="/dashboard" replace /> : <PmInvitationsPage />} />
               {/* 10/23: the management company's own side of the business, now
                   that the PM portal folded in here (PM_FOLD_PLAN.md). */}
@@ -352,6 +357,9 @@ function App() {
               <Route path="maint-portal"    element={<MaintenancePortalPage />} />
               <Route path="sign/:token"    element={<SignPage />} />
               <Route path="utilities"      element={<UtilityMetersPage />} />
+              <Route path="marketplace"    element={<MarketplacePage />} />
+              <Route path="insurance"      element={<InsurancePage />} />
+              <Route path="my-statements"  element={<MyStatementsPage />} />
               <Route path="maintenance"    element={<MaintenancePage />} />
               {/* S575: Financials hub. Flat child paths are UNCHANGED so every
                   existing deep link/redirect keeps working — the pathless layout

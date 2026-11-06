@@ -394,7 +394,7 @@ describe('finding who to send a link to', () => {
          VALUES ($1,'x','tenant',$2,$3,TRUE) RETURNING id`, [email, first, last])
       return (await db.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.rows[0].id])).rows[0].id
     }
-    const mine = await mkTenant('Andres', 'Razo', 'razo@example.com')
+    const mine = await mkTenant('Cora', 'Castellan', 'castellan@example.com')
     await db.query(`INSERT INTO pending_tenant_intents (landlord_id, tenant_id, property_id) VALUES ($1, $2, $3)`, [f.landlordId, mine, f.propertyId])
     await mkTenant('Stella', 'Stranger', 'stella@elsewhere.com')
     const find = async (q: string) => (await request(buildApp()).get(`/api/pos/pay-links/people?propertyId=${f.propertyId}&q=${encodeURIComponent(q)}`)
@@ -402,9 +402,15 @@ describe('finding who to send a link to', () => {
     // 10/2 (review): an invite alone is a loose tie — they are listed by name;
     // the email and phone on their own GAM account wait until they take a
     // place on one of this company's leases.
-    expect(await find('raz')).toEqual([['Andres Razo', null, 'invited']])
+    // 10/27: the query is a FRAGMENT of the resident's surname, so it had to
+    // move with the name. A sweep that rewrites names cannot see 'raz' inside
+    // a search string — only this assertion could, and it did.
+    expect(await find('castell')).toEqual([['Cora Castellan', null, 'invited']])
     // Not yours: found by part of a name, shown with a masked hint, never their address.
-    expect(await find('stel')).toEqual([['Stella Stranger', null, 's•••@elsewhere.com']])
+    // 'stel' would now also match Ca-stell-an, so the fragment has to be one
+    // only the stranger has — otherwise this stops testing "not yours" and
+    // starts testing that two people match.
+    expect(await find('strang')).toEqual([['Stella Stranger', null, 's•••@elsewhere.com']])
     expect(await find('stella@elsewhere.com')).toEqual([['Stella Stranger', null, 's•••@elsewhere.com']])
   })
 })

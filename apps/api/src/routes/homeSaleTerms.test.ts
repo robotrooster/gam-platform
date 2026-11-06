@@ -349,8 +349,8 @@ describe('a trailer charge still carries the buyer\'s lease', () => {
 })
 
 /**
- * 10/25 — THE COUNTER READER. Dominic Gonzalez pays at the counter but never by
- * card ("Dominic can pay at the counter. He cannot pay by card"), because his
+ * 10/25 — THE COUNTER READER. Vesper Vanterpool pays at the counter but never by
+ * card ("Vesper can pay at the counter. He cannot pay by card"), because his
  * installment is the trust's money and a chargeback would have to be unwound
  * across two sets of books. The reader must therefore scope to the CONTRACT,
  * not to the lease the charge also carries — otherwise it takes the resident's
@@ -441,7 +441,7 @@ describe('a tracked contract that the landlord later starts billing', () => {
 })
 
 /**
- * 10/25 (Nic): "Lisa is not going to get permission to edit leases. That is a
+ * 10/25 (Nic): "Calla is not going to get permission to edit leases. That is a
  * non-starter right there. Marking that somebody logged a payment for a
  * contract that's being kept off the books has nothing to do with leases. You
  * need to take a different route."
@@ -467,7 +467,7 @@ describe('who may mark an off-the-books payment', () => {
         landlordId, permissions: perms },
       process.env.JWT_SECRET!, { expiresIn: '1h' })
   }
-  // Lisa Scheeler's live keys, trimmed to what matters here: take_payment yes,
+  // Calla Fitzhugh's live keys, trimmed to what matters here: take_payment yes,
   // leases.edit no.
   const LISA = { 'take_payment': true, 'balances.view': true, 'front_desk.view': true,
                  'guests.check_in': true, 'guests.check_out': true, 'pos.ring_sale': true }

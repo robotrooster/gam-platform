@@ -171,3 +171,41 @@ describe('S622 money on a signed document', () => {
     expect(parse({ rent_amount: '$1,250.00' }).rent_amount).toBe('1250')
   })
 })
+
+/**
+ * 10/28 (Nic) — THE DATE DECIDES THE TERM, BOTH WAYS.
+ *
+ *   "If a tenant sets a month-to-month lease by having no end date, the system
+ *    needs to know it's month-to-month. And if they put any sort of date on
+ *    there, it needs to know to change it to a fixed term."
+ *
+ * The first half was already held. The second was reachable the day a landlord
+ * put a three-year term on a lease drafted from his month-to-month template:
+ * the term box still said "Month-to-month", so the RECORD came out
+ * month-to-month with an end date on it — the same incoherence this spec exists
+ * to prevent, pointing the other way.
+ */
+describe('the end date decides the lease type', () => {
+  const typeFor = (v: Record<string, string>) =>
+    (WRITABLE_LEASE_COLUMN_SPECS.lease_type.parse(v as any) as any).lease_type
+
+  it('a dash is month-to-month however the term box reads', () => {
+    expect(typeFor({ end_date: '-', lease_type: '36' })).toBe('month_to_month')
+    expect(typeFor({ end_date: '', lease_type: 'FIXED TERM' })).toBe('month_to_month')
+  })
+
+  it('a real date is a fixed term even when the term box still says month-to-month', () => {
+    expect(typeFor({ end_date: '2029-10-31', lease_type: 'Month-to-month' })).toBe('fixed_term')
+    expect(typeFor({ end_date: '2029-10-31', lease_type: 'MONTH-TO-MONTH TERM' })).toBe('fixed_term')
+    expect(typeFor({ end_date: '2029-10-31', lease_type: 'm2m' })).toBe('fixed_term')
+  })
+
+  it('a named commercial term survives a date — nnn is a kind of fixed term', () => {
+    expect(typeFor({ end_date: '2029-10-31', lease_type: 'Triple Net' })).toBe('nnn_commercial')
+  })
+
+  it('and the ordinary cases are unchanged', () => {
+    expect(typeFor({ end_date: '2029-10-31', lease_type: 'FIXED TERM' })).toBe('fixed_term')
+    expect(typeFor({ end_date: '2029-10-31', lease_type: '' })).toBe('fixed_term')
+  })
+})

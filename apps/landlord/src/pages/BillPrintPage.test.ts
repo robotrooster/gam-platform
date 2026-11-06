@@ -15,8 +15,8 @@
 import { describe, it, expect } from 'vitest'
 import { itemizeSheet } from './BillPrintPage'
 
-const line = (label: string, amount: number, dueDate: string, opts: { detail?: string | null; type?: string } = {}) =>
-  ({ id: `${label}-${dueDate}-${amount}`, label, amount, dueDate, detail: opts.detail ?? null, type: opts.type, open: true }) as any
+const line = (label: string, amount: number, dueDate: string, opts: { detail?: string | null; type?: string; gam?: boolean } = {}) =>
+  ({ id: `${label}-${dueDate}-${amount}`, label, amount, dueDate, detail: opts.detail ?? null, type: opts.type, open: true, gam: opts.gam }) as any
 const bill = (id: string, dueDate: string, lines: any[]) =>
   ({ id, invoiceNumber: id, dueDate, lines, amountPaid: 0, creditApplied: 0, balance: 0, totalAmount: 0, unitNumber: null, propertyName: null }) as any
 
@@ -45,7 +45,7 @@ describe('a printed statement', () => {
     expect(lateFees[0]).toMatchObject({ qty: 2, unit: 15, amount: 30 })
   })
 
-  it("Josh Roby's 54 daily late fees are one line, not a page and a half", () => {
+  it("Soren Tremaine's 54 daily late fees are one line, not a page and a half", () => {
     const days = Array.from({ length: 54 }, (_, i) =>
       line('Late fee', 5, `2026-09-${String((i % 28) + 1).padStart(2, '0')}`, { type: 'late_fee' }))
     const { lateFees } = itemizeSheet([bill('x', '2026-09-01', days)])
@@ -85,5 +85,35 @@ describe('a printed statement', () => {
 
   it('nothing owed itemises to nothing', () => {
     expect(itemizeSheet([])).toEqual({ charges: [], lateFees: [] })
+  })
+})
+
+/**
+ * 10/28 (Nic): a charge of GAM's rides the bill but is not one of the
+ * landlord's priced lines — "not counted in the landlord's books". It is stated
+ * once under their totals ("Tenant owes GAM"), so it must stay out of the itemized
+ * rows, which sum to the landlord's own subtotal.
+ */
+describe("GAM's own charge on a printed statement", () => {
+  it('is not one of the itemized charges', () => {
+    const bills = [bill('a', '2026-10-01', [
+      line('Rent', 440, '2026-10-01'),
+      line('Security deposit', 2000, '2026-10-01', { type: 'deposit' }),
+      line('Tenant owes GAM', 124, '2026-10-01', { type: 'fee', gam: true }),
+    ])]
+    const { charges, lateFees } = itemizeSheet(bills)
+    expect(charges.map(c => c.label)).toEqual(['Rent', 'Security deposit'])
+    expect(lateFees).toHaveLength(0)
+    // The rows sum to the landlord's own money and nothing else.
+    expect(charges.reduce((t, c) => t + c.amount, 0)).toBe(2440)
+  })
+
+  it('keeps the deposit whole, as the landlord is shown it', () => {
+    const bills = [bill('a', '2026-10-01', [
+      line('Security deposit', 2000, '2026-10-01', { type: 'deposit' }),
+    ])]
+    const { charges } = itemizeSheet(bills)
+    expect(charges).toHaveLength(1)
+    expect(charges[0]).toMatchObject({ label: 'Security deposit', qty: 1, amount: 2000, detail: null })
   })
 })

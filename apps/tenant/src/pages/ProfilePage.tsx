@@ -4,6 +4,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { User, Check, AlertCircle } from 'lucide-react'
 import { PASSWORD_MIN_LEN } from '@gam/shared'
 import { NotificationPreferences } from '../../../../packages/shared-ui/NotificationPreferences'
+import { PasskeySettings } from '../../../../packages/shared-ui/Passkeys'
 
 import axios from 'axios'
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -12,6 +13,15 @@ api.interceptors.request.use(c => { const t = localStorage.getItem('gam_tenant_t
 function get<T>(path: string): Promise<T> { return api.get(path).then(r => r.data?.data ?? r.data) }
 function patchReq(path: string, body: any) { return api.patch(path, body).then(r => r.data) }
 function putReq(path: string, body: any) { return api.put(path, body).then(r => r.data?.data ?? r.data) }
+
+// 10/30 (Nic): "a passkey replaces the emailed code; password + code stays the
+// fallback." The shared device list speaks this page's own client — nothing
+// here had ever needed a POST or a DELETE.
+const passkeyApi = {
+  get:  (url: string) => get<any>(url),
+  post: (url: string, body?: any) => api.post(url, body).then(r => r.data?.data ?? r.data),
+  del:  (url: string) => api.delete(url).then(r => r.data),
+}
 
 // The server's sentences for a 401 that means the session itself has ended:
 // no pass ("No token provided"), a bad or expired one ("Invalid or expired
@@ -306,6 +316,15 @@ export function ProfilePage() {
             <div style={{ fontSize:'.8rem', color:'var(--text-2)', lineHeight:1.6 }}>
               To protect your lease and payment details, every sign-in requires a 6-digit code we email to <strong style={{ color:'var(--text-1)' }}>{twoFa?.email || 'your login email'}</strong>. The code always goes to your login email, so if you change your email below, it moves with it.
             </div>
+          </div>
+
+          {/* 10/30 (Nic): "a passkey replaces the emailed code." ONE list for
+              the whole platform — in production every portal is a subdomain of
+              one apex, so a device added here also opens the register and GAM
+              Books. Above the password form because it is the way IN; the
+              password below it is the fallback. */}
+          <div style={{ marginBottom:24 }}>
+            <PasskeySettings api={passkeyApi} />
           </div>
 
           {[

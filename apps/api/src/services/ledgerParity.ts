@@ -118,18 +118,61 @@ function measure(key: ParityMeasureKey, records: number, ledger: number, reasons
 async function stayTiming(landlordId: string, start: string, end: string): Promise<number> {
   const r = await query<{ earned: string; held: string }>(
     `SELECT COALESCE(SUM(l.credit - l.debit) FILTER (WHERE l.account_role = 'stay_income' AND ps.source_type = 'booking' AND ps.posting_kind = 'charge'), 0)::text AS earned,
-            COALESCE(SUM(l.credit - l.debit) FILTER (WHERE l.account_role = 'guest_deposits' AND l.cash_effect = 'in'), 0)::text AS held
+            COALESCE(SUM(l.credit - l.debit) FILTER (WHERE l.account_role = 'guest_deposits' AND l.cash_effect = 'in'
+              -- 11/2: the held sum subtracts a dollar on the understanding that
+              -- money records billed that same dollar in this same month. For a
+              -- ONE-TIME PAY LINK they did not: the records bill a link the day
+              -- it was SENT (incomeBasis, 'Open one-time pay links: billed,
+              -- still owed (by the day they were sent)'), which can be any
+              -- earlier month. Mountain View's October subtracted $589.00 on a
+              -- link sent 9/18 and paid 10/06 and so reported $554.05 of
+              -- difference that was never there. That dollar's records-side
+              -- billing belongs to the pay-link reason, not to this one.
+              AND NOT EXISTS (
+                SELECT 1 FROM pos_pay_links lk
+                  LEFT JOIN properties lp ON lp.id = lk.property_id
+                 WHERE ps.source_type = 'pos_sale' AND lk.pos_transaction_id::text = ps.source_id::text
+                   AND lk.kind = 'one_time'
+                   AND (lk.created_at AT TIME ZONE COALESCE(lp.timezone, 'America/Phoenix'))::date
+                         NOT BETWEEN $2::date AND $3::date)), 0)::text AS held
        FROM ledger_posting_lines l JOIN ledger_postings ps ON ps.id = l.posting_id
-      WHERE l.landlord_id = $1 AND l.accounting_date BETWEEN $2::date AND $3::date`, [landlordId, start, end])
+      WHERE l.landlord_id = $1 AND ps.role = 'post' AND ps.superseded_at IS NULL
+        AND l.accounting_date BETWEEN $2::date AND $3::date`, [landlordId, start, end])
   return round2(Number(r[0]?.earned ?? 0) - Number(r[0]?.held ?? 0))
 }
 
-/** Ledger lines of the company in the month: credits on a role from bill postings (Cr − Dr). */
-async function chargeCredits(landlordId: string, role: string, start: string, end: string): Promise<number> {
+/**
+ * Ledger lines of the company in the month: credits on a role from bill
+ * postings (Cr − Dr).
+ *
+ * 11/2 — `includeOpening` exists because the opening balance is NOT a bill.
+ * It is posted once as `posting_kind = 'main'` with `source_type = 'opening'`,
+ * so the `'charge'` filter hid it, and the reason written for it below ("An old
+ * balance carried from before GAM is opening equity, not this company's
+ * income") returned 0.00 for every company since it was written. Mountain View
+ * carried $589.00 of pre-books rent that way — rent for an RV 27 stay that
+ * ended the day before its books begin — and it read as unexplained in both
+ * directions: −589 in September and +589 in October.
+ *
+ * Scoped to `source_type = 'opening'` rather than dropping the filter: the
+ * opening posting touches only guest_deposits and opening_balance_equity today,
+ * but a future opening leg on a role this helper is also called with (a home
+ * note, utility tax) would otherwise silently start over-explaining a month the
+ * records never billed.
+ */
+async function chargeCredits(
+  landlordId: string, role: string, start: string, end: string,
+  opts: { includeOpening?: boolean } = {},
+): Promise<number> {
   const r = await query<{ n: string }>(
     `SELECT COALESCE(SUM(l.credit - l.debit), 0)::text AS n
        FROM ledger_posting_lines l JOIN ledger_postings ps ON ps.id = l.posting_id
-      WHERE l.landlord_id = $1 AND l.account_role = $2 AND ps.posting_kind = 'charge'
+      WHERE l.landlord_id = $1 AND l.account_role = $2
+        AND (ps.posting_kind = 'charge'${opts.includeOpening ? " OR ps.source_type = 'opening'" : ''})
+        -- The reader these are measured against counts only live postings
+        -- (ledgerReports), so a reversed or superseded leg must not land in a
+        -- reason either, or the reason outlives the posting it explains.
+        AND ps.role = 'post' AND ps.superseded_at IS NULL
         AND l.accounting_date BETWEEN $3::date AND $4::date`, [landlordId, role, start, end])
   return round2(Number(r[0]?.n ?? 0))
 }
@@ -164,12 +207,15 @@ async function gamHeldPaidAheadTiming(landlordId: string, start: string, end: st
  * company's Money charged differed by them and nothing named them, so no
  * company could ever switch on its own):
  *
- *   workTradeHeld   a bill on hold for work trade (payments.work_trade_suspended_at)
- *                   is charged on its due day, like any bill — the 1100 check
- *                   counts it owed (design §8); the records leave it out of
- *                   Money billed until the work-trade month settles. The part
- *                   of a month's Charged difference: the bills on hold that
- *                   came due in the month, from the money records (10/12).
+ *   workTradeHeld   RETIRED 11/4. It used to explain a real difference: the
+ *                   books charged a bill held for work trade on its due day
+ *                   while the records left it out until the work-trade month
+ *                   settled. Nic's 11/3 directive took that money out of every
+ *                   month figure, so ledgerReports leaves the held bill out of
+ *                   Charged as well (NOT_WORK_TRADE_HELD) and the two sides now
+ *                   agree with no reason needed. See the note at the reason
+ *                   list below for why removing it was mandatory and not
+ *                   housekeeping.
  *   workTradeLabor  work-trade hours that covered rent, when the owner counts
  *                   them as "full rent plus a labor cost" (Nic L12): the books
  *                   charge the full rent and book the hours as labor; the
@@ -179,20 +225,6 @@ async function gamHeldPaidAheadTiming(landlordId: string, start: string, end: st
  *                   link was sent (incomeBasis sharedBranches); the books count
  *                   it the day it is paid (register sales post when made).
  */
-/**
- * 10/12 (Nic, review): worked out from the MONEY RECORDS — every bill on hold
- * for work trade that came due in the month (its whole amount; the tax on it
- * is the utility-tax reason's) — never from what the books charged on those
- * bills, which would "explain" any mistake the books made on them.
- */
-async function workTradeHeldCharged(landlordId: string, start: string, end: string): Promise<number> {
-  const r = await query<{ n: string }>(
-    `SELECT COALESCE(SUM(amount), 0)::text AS n FROM payments
-      WHERE landlord_id = $1 AND work_trade_suspended_at IS NOT NULL AND status <> 'voided'
-        AND type NOT IN ('deposit', 'float_fee', 'platform_fee')
-        AND due_date BETWEEN $2::date AND $3::date`, [landlordId, start, end])
-  return round2(Number(r[0]?.n ?? 0))
-}
 
 async function workTradeLaborCharged(landlordId: string, start: string, end: string): Promise<number> {
   const r = await query<{ n: string }>(
@@ -200,6 +232,59 @@ async function workTradeLaborCharged(landlordId: string, start: string, end: str
        FROM ledger_posting_lines l JOIN ledger_postings ps ON ps.id = l.posting_id
       WHERE l.landlord_id = $1 AND l.account_role = 'work_trade_labor' AND ps.posting_kind = 'work_trade'
         AND l.accounting_date BETWEEN $2::date AND $3::date`, [landlordId, start, end])
+  return round2(Number(r[0]?.n ?? 0))
+}
+
+/**
+ * 11/2 (Nic: "leave it in September") — MONEY THAT PAID AN OLDER MONTH'S BILL.
+ *
+ * Cash can arrive in one month and pay off a bill recorded as settled in
+ * another. The books count the cash the day it actually arrived; the money
+ * records count it against the month of the bill it cleared. Both are right and
+ * they differ by that amount.
+ *
+ * It happens whenever an older balance is settled by hand on the day it belongs
+ * to rather than the day the money turned up — which is the whole shape of a
+ * balance carried in from before GAM. MH 29 at Country Acres paid $500 toward
+ * September: $100 early in September and $400 that reached the bank on 10/05.
+ * September is where that income belongs (dating it to arrival would put
+ * pre-GAM rent in October and charge GAM's fee on it), so the September bill is
+ * settled 09/01 while the books hold the cash on 10/05 — $400 the records place
+ * in September and the books in October.
+ *
+ * Both directions, because the same pair of dates reads the other way round
+ * from the earlier month's side:
+ *   + cash the books counted INSIDE this window against a bill settled outside
+ *   − cash the books counted outside the window against a bill settled inside
+ *
+ * Derived from the MECHANISM — the two dates on one piece of money — and never
+ * from the size of the gap. A reason computed as "whatever is left over"
+ * explains everything and would hide the next real defect.
+ */
+async function olderMonthSettlementTiming(landlordId: string, start: string, end: string): Promise<number> {
+  const r = await query<{ n: string }>(
+    `WITH money AS (
+       SELECT ra.amount_applied AS amount,
+              -- What the BOOKS used: the day the remittance's cash posted.
+              ps.accounting_date AS cash_day,
+              -- What the RECORDS used: the day the bill it cleared was settled,
+              -- in the property's own calendar (incomeBasis' convention).
+              (p.settled_at AT TIME ZONE COALESCE(pr.timezone, 'America/Phoenix'))::date AS bill_day
+         FROM remittance_applications ra
+         JOIN tenant_remittances tr ON tr.id = ra.remittance_id AND tr.undone_at IS NULL
+         JOIN payments p ON p.id = ra.payment_id AND p.settled_at IS NOT NULL
+         JOIN ledger_postings ps ON ps.source_type = 'remittance' AND ps.source_id = tr.id::text
+                                AND ps.role = 'post' AND ps.superseded_at IS NULL
+         LEFT JOIN units u ON u.id = p.unit_id
+         LEFT JOIN properties pr ON pr.id = u.property_id
+        WHERE tr.landlord_id = $1)
+     SELECT (COALESCE(SUM(amount) FILTER (
+               WHERE cash_day BETWEEN $2::date AND $3::date
+                 AND bill_day NOT BETWEEN $2::date AND $3::date), 0)
+           - COALESCE(SUM(amount) FILTER (
+               WHERE bill_day BETWEEN $2::date AND $3::date
+                 AND cash_day NOT BETWEEN $2::date AND $3::date), 0))::text AS n
+       FROM money`, [landlordId, start, end])
   return round2(Number(r[0]?.n ?? 0))
 }
 
@@ -215,6 +300,7 @@ async function payLinkTiming(landlordId: string, start: string, end: string): Pr
        SELECT s.link_day, l.accounting_date AS day, SUM(l.credit - l.debit) AS amount
          FROM sale s
          JOIN ledger_postings ps ON ps.source_type = 'pos_sale' AND ps.source_id = s.id
+                               AND ps.role = 'post' AND ps.superseded_at IS NULL
          JOIN ledger_posting_lines l ON l.posting_id = ps.id AND l.landlord_id = $1
          JOIN books_accounts a ON a.id = l.account_id AND a.type = 'income'
         GROUP BY 1, 2)
@@ -235,6 +321,23 @@ export async function parityForMonth(landlordId: string, start: string, end: str
   ])
   const rr = summarize(rRec, 'received'), rl = summarize(rLed, 'received')
   const br = summarize(bRec, 'billed'), bl = summarize(bLed, 'billed')
+  /**
+   * 11/2 — a one-time pay link NOBODY HAS PAID. The records bill it the day it
+   * was sent and carry it as still owed; the books have nothing until money
+   * arrives, which is right. Nothing named that, so two unpaid reservation
+   * links sent 10/24 ($24.50 and $10.45) sat in Mountain View's October as
+   * $34.95 of unexplained difference.
+   *
+   * Taken off the records reader's own events rather than re-queried here. The
+   * records side carries real conditions — one link per booking, never one past
+   * its expiry, nothing for a link that is only a background check — and a
+   * second hand-written copy of them in this file is exactly how the stay
+   * reason above came to subtract a dollar the records had billed in another
+   * month. There is one definition, and this reads it.
+   */
+  const openLinksOwed = round2(bRec
+    .filter(e => e.part === 'stillOwed' && e.category === 'stays_and_pay_links')
+    .reduce((t, e) => t + e.amount, 0))
   const [procRec, procLed, cardRec, cardLed, expRec, expLedDays, homePrincipal, openingCarried, gamTiming, stays, utilityTax] = await Promise.all([
     processingFeesFromRecords([landlordId], start, end),
     ledgerRoleByProperty({ landlordIds: [landlordId] }, 'processing_fees', start, end),
@@ -243,18 +346,19 @@ export async function parityForMonth(landlordId: string, start: string, end: str
     landlordExpensesTotal(landlordId, start, end),
     ledgerEnteredExpensesByDay({ landlordIds: [landlordId] }, start, end),
     chargeCredits(landlordId, 'home_notes_receivable', start, end),
-    chargeCredits(landlordId, 'opening_balance_equity', start, end),
+    chargeCredits(landlordId, 'opening_balance_equity', start, end, { includeOpening: true }),
     gamHeldPaidAheadTiming(landlordId, start, end),
     stayTiming(landlordId, start, end),
     chargeCredits(landlordId, 'utility_tax_payable', start, end),
   ])
-  const [workTradeHeld, workTradeLabor, payLinks] = await Promise.all([
-    workTradeHeldCharged(landlordId, start, end),
+  const [workTradeLabor, payLinks, olderMonth] = await Promise.all([
     workTradeLaborCharged(landlordId, start, end),
     payLinkTiming(landlordId, start, end),
+    olderMonthSettlementTiming(landlordId, start, end),
   ])
   const received = measure('received', rr.total, rl.total, [
     { reason: 'Paid-ahead money GAM holds counts when it pays a bill, not when it arrives (Nic L13)', amount: gamTiming },
+    { reason: 'Money that paid an older month\'s bill counts on the books the day it arrived; the records count it in the month of the bill it cleared', amount: olderMonth },
   ])
   received.byLine = byLine(rRec, rLed)
   const charged = measure('charged', br.total, bl.total, [
@@ -262,9 +366,25 @@ export async function parityForMonth(landlordId: string, start: string, end: str
     { reason: 'An old balance carried from before GAM is opening equity, not this company\'s income', amount: -openingCarried },
     { reason: 'A stay counts when the guest arrives, held as a guest deposit until then (Nic L10)', amount: stays },
     { reason: 'Utility tax on a bill is owed to the government, not income', amount: -utilityTax },
-    { reason: 'A bill on hold for work trade is charged when it is due; the records leave it out until the work-trade month settles', amount: workTradeHeld },
+    // 11/4: THIS REASON IS RETIRED, and retiring it is not optional.
+    //
+    // It explained a REAL difference: the books charged a bill held for work
+    // trade on its due day while the money records left it out until the
+    // work-trade month settled. Nic's 11/3 directive took that money out of
+    // every month figure, so ledgerReports now leaves the held bill out of
+    // Charged too (NOT_WORK_TRADE_HELD) and the two sides agree on their own.
+    //
+    // Leaving the reason in place would have been far worse than a stale
+    // comment. `measure` subtracts every reason from the raw difference to get
+    // `unexplained`; with the difference now zero and the reason still
+    // claiming it, unexplained would go non-zero by exactly the held amount,
+    // PARITY_PASSED_SQL would stop matching, ledgerLiveCompanyIds would drop
+    // the company, and EVERY report for Mountain View and Oak Park would
+    // silently fall back off the books onto the money records. The reports
+    // would still render. They would just quietly be answering a different
+    // question than the day before.
     { reason: 'Work-trade hours that covered rent count as full rent plus a labor cost (Nic L12); the records show the bill less the hours', amount: workTradeLabor },
-    { reason: 'A one-time pay link counts the day it is paid; the records bill it the day the link was sent', amount: payLinks },
+    { reason: 'A one-time pay link counts the day it is paid; the records bill it the day the link was sent', amount: round2(payLinks - openLinksOwed) },
   ])
   charged.byLine = byLine(bRec, bLed.filter(e => !e.ledger || e.ledger === 'line'))
   // 10/12 (Nic, review): a month cut at the books' start date compares no

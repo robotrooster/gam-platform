@@ -116,7 +116,10 @@ export function NotificationBell() {
 
       {/* Dropdown */}
       {open && (
-        <div style={{ position:'absolute', top:'calc(100% + 8px)', right:0, width:380, background:'var(--bg-1)', border:'1px solid var(--border-0)', borderRadius:12, boxShadow:'0 8px 40px rgba(0,0,0,.5)', zIndex:500, overflow:'hidden' }}>
+        /* 10/30: 380px pinned to the bell's right edge hung ~100px off the LEFT
+           of a phone, and the shell hides its overflow, so the start of every
+           notification title was simply gone. */
+        <div style={{ position:'absolute', top:'calc(100% + 8px)', right:0, width:'min(380px, calc(100vw - 24px))', maxHeight:'calc(var(--vh) - 90px)', overflowY:'auto', background:'var(--bg-1)', border:'1px solid var(--border-0)', borderRadius:12, boxShadow:'0 8px 40px rgba(0,0,0,.5)', zIndex:500, overflow:'hidden' }}>
 
           {/* Header */}
           <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'12px 16px', borderBottom:'1px solid var(--border-0)' }}>

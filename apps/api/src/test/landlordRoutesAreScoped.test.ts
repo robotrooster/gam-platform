@@ -43,9 +43,16 @@ const OTHER_PORTALS = new Set([
   'businessBookableServices', 'recurringSchedules', 'routes', 'depots', 'dumpLocations', 'vehicles',
   // Public and webhook surfaces: no signed-in caller to scope.
   'publicPropertyBooking', 'publicBooking', 'publicCustomerPortal', 'publicCardUpdate',
+  // The guest's own licence page: reached by the capture token on their booking,
+  // which IS the scope. Its one signed-in route serves a photograph and is
+  // requireAuth + requireAdmin with a per-row owner lookup.
+  'publicGuestId',
   'propertyBookingAdmin', 'stripeWebhook', 'webhooks', 'telemetry', 'appointments',
-  // Sign-in itself, and the shelved ones.
-  'auth', 'totp', 'emailOtp', 'stripe', 'subleases', 'subleaseInvitations', 'lotRent',
+  // Sign-in itself, and the shelved ones. 10/31: passkeys joins this group for
+  // the same reason as totp and emailOtp — a credential belongs to a PERSON, not
+  // to a property or a company, so there is no property to scope it to. Its own
+  // gate is the signed-in user plus the WebAuthn challenge it issued.
+  'auth', 'totp', 'emailOtp', 'passkeys', 'stripe', 'subleases', 'subleaseInvitations', 'lotRent',
 ])
 
 /**

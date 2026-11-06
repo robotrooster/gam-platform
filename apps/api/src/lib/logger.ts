@@ -132,6 +132,14 @@ export const logger: LooseLogger = pinoLogger as unknown as LooseLogger
  */
 const SECRET_IN_PATH: RegExp[] = [
   /^(\/api\/invitations\/)[^/?#]+/i,
+  // 10/29 (review): every PUBLIC route that carries a capability in its path
+  // belongs here, for the same reason as the invitation above — and these two
+  // are worse in one respect: neither token expires, so a logged one stays
+  // usable for the life of the booking or the link, and the guest-id token is a
+  // WRITE capability over an identification an admin may already have
+  // confirmed. The log files are never deleted.
+  /^(\/api\/public\/id\/)[^/?#]+/i,
+  /^(\/api\/public\/pay\/)[^/?#]+/i,
 ]
 
 /** A request path as it may be written to the log: secrets in the path replaced. */

@@ -1,5 +1,5 @@
 /**
- * 10/14 (Nic) — Andres Razo's month at RV 27, booked for when he was there:
+ * 10/14 (Nic) — Cora Castellan's month at RV 27, booked for when he was there:
  * the dry run reads and writes nothing; --apply books the stay on the money
  * already paid (no new charge), marks the sale for GAM Books, and the Rent Roll
  * shows the month in its own month; run again, nothing left to do. On fixtures
@@ -38,7 +38,7 @@ async function world(): Promise<{ t: Rv27Target; unitId: string; saleId: string;
     await c.query(`UPDATE properties SET timezone = 'America/Phoenix' WHERE id = $1`, [propertyId])
     const unitId = await seedUnit(c, { propertyId, landlordId: ll.landlordId, rentAmount: 589 })
     await c.query(`UPDATE units SET unit_number = 'RV 27' WHERE id = $1`, [unitId])
-    const tenantId = await seedTenant(c, { email: 'razoandres60@t.dev' })
+    const tenantId = await seedTenant(c, { email: 'castellancora60@t.dev' })
     const cat = (await c.query<{ id: string }>(
       `INSERT INTO pos_categories (landlord_id, name, sort_order, is_active) VALUES ($1,'Stays',1,TRUE) RETURNING id`, [ll.landlordId])).rows[0].id
     const monthly = (await c.query<{ id: string }>(
@@ -48,7 +48,7 @@ async function world(): Promise<{ t: Rv27Target; unitId: string; saleId: string;
     const link = (await c.query<{ id: string }>(
       `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items, subtotal, total, customer_email,
                                   customer_name, status, paid_at)
-       VALUES ($1,$2,$3,$4,'one_time','3 items','[]'::jsonb,752.17,752.17,'RazoAndres60@t.dev','Andres Razo','paid',$5::timestamptz) RETURNING id`,
+       VALUES ($1,$2,$3,$4,'one_time','3 items','[]'::jsonb,752.17,752.17,'CastellanCora60@t.dev','Cora Castellan','paid',$5::timestamptz) RETURNING id`,
       [randomUUID(), ll.landlordId, propertyId, ll.userId, at])).rows[0].id
     const saleId = (await c.query<{ id: string }>(
       `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, surcharge, total, platform_fee, property_id,
@@ -62,7 +62,7 @@ async function world(): Promise<{ t: Rv27Target; unitId: string; saleId: string;
          ($1,NULL,'Electric (per kWh)','Utilities',387,0.21,81.27),
          ($1,NULL,'Electric (per kWh) — September, RV 27','Utilities',390,0.21,81.90)`, [saleId, monthly])
     return {
-      t: { landlordId: ll.landlordId, propertyId, unitNumber: 'RV 27', payer: 'Andres Razo', checkIn: `${SEPT}-01` },
+      t: { landlordId: ll.landlordId, propertyId, unitNumber: 'RV 27', payer: 'Cora Castellan', checkIn: `${SEPT}-01` },
       unitId, saleId, tenantId, userId: ll.userId,
     }
   } finally { c.release() }
@@ -74,7 +74,7 @@ describe('oct14_book_rv27_september', () => {
     const dry = await tx(c => planRv27September(c, w.t), false)
     expect(dry.refused).toBeNull()
     expect(dry.booking).toMatchObject({
-      unitId: w.unitId, guestName: 'Andres Razo', guestEmail: 'RazoAndres60@t.dev', tenantId: w.tenantId,
+      unitId: w.unitId, guestName: 'Cora Castellan', guestEmail: 'CastellanCora60@t.dev', tenantId: w.tenantId,
       checkIn: `${SEPT}-01`, checkOut: `${addMonths(SEPT, 1)}-01`, total: 589,
     })
     // The card fee's share of the $589 (of $752.17 charged before the fee on top).

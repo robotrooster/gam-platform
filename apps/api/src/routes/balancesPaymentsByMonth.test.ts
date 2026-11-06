@@ -281,9 +281,9 @@ describe('one line per payment, its charges nested', () => {
     expect(pay.lines[1].detail).toMatch(/100 → 140/)
   })
 
-  it('money and account credit apart: Kim\'s $486 money order against $935.45 with a $450 credit', async () => {
+  it('money and account credit apart: Yvette\'s $486 money order against $935.45 with a $450 credit', async () => {
     const p = await park()
-    const t = await resident('Kim Harland')
+    const t = await resident('Yvette Bexley')
     const s = await space(p, 'RV 22')
     const [rent, fee] = await bill(p, t, s, '2026-09-01', [['rent', 900], ['fee', 35.45, 'Move-in fee']])
     const credit = (await db.query<{ id: string }>(
@@ -855,7 +855,7 @@ describe('a dispute takes back only what it disputed', () => {
 
         // Owed again: the card's $300 and the credit's $200, each once.
         const reopened = await db.query<{ amount: string }>(
-          `SELECT amount::text FROM payments WHERE reversal_id IS NOT NULL AND status = 'pending' AND type = 'utility' ORDER BY amount`)
+          `SELECT amount::text FROM payments WHERE reversal_id IS NOT NULL AND status = 'pending' AND type = 'utility' ORDER BY payments.amount`)
         expect(reopened.rows.map(x => Number(x.amount))).toEqual([200, 300])
         const [outstanding] = await listOpenTenantBalances({ landlordIds: [p.landlordId] })
         const fees = await db.query<{ s: string }>(

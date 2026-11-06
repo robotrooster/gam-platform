@@ -238,7 +238,16 @@ describe('POST /api/landlords/me/onboard-payment-history-csv/validate', () => {
     expect(issues.some((i: any) => i.field === 'payment_type' && i.severity === 'block')).toBe(true)
   })
 
-  it('tenant_email not in portfolio → blocker "No active lease"', async () => {
+  // ── 11/1 (Nic): a line with no lease is no longer refused outright ─────────
+  //
+  //   "it needs to be this unit brought this much money, attributed to this
+  //    person's contact information."
+  //
+  // An RV guest or a short stay never had a lease, and the money is still the
+  // space's income. So the refusal moved: what is required now is a SPACE, not
+  // a lease. With neither, there is nothing to attribute the money to and it
+  // still refuses — which is what this now holds.
+  it('a payer with no lease AND no space → blocker that asks for the space', async () => {
     const f = await seedPFixture()
     const csv = CANONICAL_HEADERS + '\n' + rowFor({ tenant_email: 'ghost@nowhere.test' })
     const res = await request(buildApp())
@@ -247,7 +256,27 @@ describe('POST /api/landlords/me/onboard-payment-history-csv/validate', () => {
       .send({ csv, source: 'generic' })
     expect(res.status).toBe(200)
     const issues = res.body.data.rows[0].issues
-    expect(issues.some((i: any) => i.field === 'tenant_email' && i.severity === 'block' && /No active lease/.test(i.message))).toBe(true)
+    expect(issues.some((i: any) =>
+      i.field === 'unit_number' && i.severity === 'block' && /Add the space number/.test(i.message))).toBe(true)
+    expect(res.body.data.rows[0].historyOnly).toBeFalsy()
+  })
+
+  it('a payer with no lease but a space → recorded as that space\'s past income', async () => {
+    const f = await seedPFixture()
+    // The fixture's own space (seedPFixture sets unit_number='101'); no
+    // property_name needed, the number is unique inside the company.
+    const csv = CANONICAL_HEADERS + '\n' + rowFor({
+      tenant_name: 'Dale Okafor', unit_number: '101',
+    })
+    const res = await request(buildApp())
+      .post('/api/landlords/me/onboard-payment-history-csv/validate')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ csv, source: 'generic' })
+    expect(res.status).toBe(200)
+    const row = res.body.data.rows[0]
+    expect(row.issues.filter((i: any) => i.severity === 'block')).toHaveLength(0)
+    expect(row.historyOnly).toBe(true)
+    expect(JSON.stringify(row.issues)).toMatch(/Nobody is billed/)
   })
 
   it('name fallback resolves via tenant_name when email missing', async () => {

@@ -42,7 +42,7 @@ vi.mock('../services/adminNotifications', () => ({
 
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
-import { processAutoPayouts, shouldRunToday } from './autoPayouts'
+import { processAutoPayouts, shouldRunToday, isMonthEndSweepDay } from './autoPayouts'
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -50,14 +50,32 @@ beforeEach(async () => {
   balanceMock.mockClear()
 })
 
-/** The next date the engine would actually run, so tests never fight the clock. */
+/**
+ * The next ORDINARY run date, so these tests never fight the clock.
+ *
+ * 10/28: deliberately not a month-end day. That one is exempt from the $100
+ * floor and the two-day minimum gap on purpose — it exists to leave nothing
+ * behind — so when the next run day happened to be the month's last business
+ * day (as it was on 10/28, Friday the 30th), the floor and the gap tests fired
+ * a payout and read like regressions. The exemption has its own test below.
+ */
 function nextRunDate(): Date {
   const d = new Date()
-  for (let i = 0; i < 21; i++) {
-    if (shouldRunToday(d)) return d
+  for (let i = 0; i < 28; i++) {
+    if (shouldRunToday(d) && !isMonthEndSweepDay(d)) return d
     d.setDate(d.getDate() + 1)
   }
-  throw new Error('no run day found in three weeks')
+  throw new Error('no ordinary run day found in four weeks')
+}
+
+/** The next month-end run date — the last business day of a month. */
+function nextMonthEndDate(): Date {
+  const d = new Date()
+  for (let i = 0; i < 70; i++) {
+    if (isMonthEndSweepDay(d)) return d
+    d.setDate(d.getDate() + 1)
+  }
+  throw new Error('no month-end run day found in ten weeks')
 }
 
 /** A Connect-ready landlord with no rent roll and no prior payout. */
@@ -91,6 +109,17 @@ describe('S640 weekly payout cadence', () => {
   })
 
   // The floor: $0.25 is 0.6% of a $40 payout and 0.03% of an $800 one.
+  // 10/28: and the month-end day pays it anyway, because its whole job is to
+  // leave nothing behind — "we want to always hit the last business day of the
+  // month". Exempt from the floor AND from the two-day gap.
+  it('the month-end run pays a small balance even days after the last payout', async () => {
+    await seedPayable({ lastPayoutDaysAgo: 1 })
+    balanceMock.mockResolvedValue(40 as any)
+    const res = await processAutoPayouts(nextMonthEndDate())
+    expect(res.payoutsFired).toBe(1)
+    expect(firePayoutMock).toHaveBeenCalledTimes(1)
+  })
+
   it('holds back a balance under $100', async () => {
     await seedPayable({ lastPayoutDaysAgo: 7 })
     balanceMock.mockResolvedValue(40 as any)

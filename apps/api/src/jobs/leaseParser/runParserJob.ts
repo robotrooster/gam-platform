@@ -129,7 +129,7 @@ export async function runParserJob(intentId: string): Promise<void> {
   }
 
   // 5. Identity comparison. If landlord typed John Smith but PDF says
-  //    Marci Neeld, flag it block-severity. Each mismatched field is
+  //    Eben Hartright, flag it block-severity. Each mismatched field is
   //    its own flag so the landlord sees field-level diffs in the UI.
   const identityFlags = typed
     ? buildIdentityMismatchFlags(typed, parseResult.output)

@@ -70,15 +70,17 @@
  */
 import {
   INCOME_CATEGORIES, INCOME_CATEGORY_LABEL, LEDGER_ACCOUNT_ROLE_BY_NAME, LEDGER_SOURCE_TYPE_LABEL, ledgerIncomeDetailOf,
-  type IncomeCategory, type IncomeBasis, type LedgerAccountRole, type LedgerSourceType,
+  type IncomeCategory, type IncomeBasis, type LedgerAccountRole, type LedgerSourceType, type BilledPart,
 } from '@gam/shared'
 import { query } from '../db'
+import { logger } from '../lib/logger'
 import { cutoffsParam, withinCutoffsSql, pastCutoff, type PropertyCutoff } from '../lib/bookkeeperScope'
 import type {
   IncomeEvent, IncomeQuery, ReportLine, AsideLine, LedgerProofTerm, MoneyView, IncomeDetailPiece,
 } from './incomeBasis'
 import { STAY_FACTS_SQL, stayOf, stayParts } from './ledgerProjectors/incomeLines'
 import { moneyViewFrom } from './incomeBasis'
+import { workTradeOpenRowSql } from './openBalances'
 
 const round2 = (n: number) => Math.round(n * 100) / 100
 const ymd = (d: string) => String(d).slice(0, 10)
@@ -189,7 +191,7 @@ const CATEGORY_OF_ROLE: Partial<Record<LedgerAccountRole, IncomeCategory>> = {
 const isIncomeCategory = (c: string | null): c is IncomeCategory =>
   !!c && (INCOME_CATEGORIES as readonly string[]).includes(c)
 
-interface LineRow {
+export interface LineRow {
   landlord_id: string; property_id: string | null; unit_id: string | null; lease_id: string | null
   payment_id: string | null; due_date: string | null; day: string; report_category: string | null
   account_role: string | null; account_type: string; amount: string
@@ -278,6 +280,55 @@ const LINE_COLS = `l.landlord_id::text AS landlord_id, l.property_id::text AS pr
        l.lease_id::text AS lease_id, l.payment_id::text AS payment_id, pay.due_date::text AS due_date,
        l.accounting_date::text AS day, l.report_category, l.account_role, a.type AS account_type`
 
+
+/**
+ * 11/4 — THE VALUE WORK TRADE COVERED, REPORTED BESIDE THE COLUMNS.
+ *
+ * It is in no column by Nic's 11/3 directive (never that month's money), but it
+ * is absolutely something a landlord is owed a figure for: nine households at
+ * Mountain View pay their space with labor. The monthly property report has a
+ * "Covered by work trade (never money)" line for exactly this, in the portal
+ * and in the PDF it emails on the 2nd — and it has printed **$0.00** for every
+ * company on the books since the ledger shipped, because `beside` is filled
+ * only from the received array and a work-trade posting moves no cash, so it
+ * could never reach it.
+ *
+ * ONE READ OF ONE POPULATION (11/4 Nic: "everything needs to come from the
+ * original source"), covering both states a work-trade value lives in without
+ * asking two questions:
+ *
+ *   settled month — projectWorkTrade has run, so its posting CREDITS ar_tenants
+ *                   for the covered cents. Take credit − debit.
+ *   open month    — nothing has run yet; the held bill's own charge DEBITS
+ *                   ar_tenants for the full amount. Take debit − credit.
+ *
+ * A payment is in exactly one of those states, so the two can never
+ * double-count the same cents. Verified against production: Mountain View
+ * returns $3,615.76 for October (settled — matching the proof strip's own
+ * work-trade term to the cent, which is the cross-check that this reads the
+ * same money) and $3,647.68 for November (open).
+ */
+async function workTradeAside(s: LedgerScope, start: string, end: string): Promise<IncomeEvent[]> {
+  const params: unknown[] = [start, end]
+  const rows = await query<{ landlord_id: string; property_id: string | null; unit_id: string | null; amount: string }>(
+    `SELECT l.landlord_id::text AS landlord_id, l.property_id::text AS property_id, l.unit_id::text AS unit_id,
+            ROUND(SUM(CASE WHEN ps.posting_kind = 'work_trade' THEN l.credit - l.debit
+                           ELSE l.debit - l.credit END), 2)::text AS amount
+       FROM ledger_posting_lines l
+       JOIN ledger_postings ps ON ps.id = l.posting_id
+      WHERE l.account_role = 'ar_tenants'
+        AND l.accounting_date BETWEEN $1::date AND $2::date AND ${scopeSql(s, params)}
+        AND (ps.posting_kind = 'work_trade' OR NOT ${NOT_WORK_TRADE_HELD})
+      GROUP BY 1, 2, 3
+     HAVING ROUND(SUM(CASE WHEN ps.posting_kind = 'work_trade' THEN l.credit - l.debit
+                           ELSE l.debit - l.credit END), 2) <> 0`, params)
+  return rows.map(r => ({
+    landlordId: r.landlord_id, propertyId: r.property_id, unitId: r.unit_id, leaseId: null, paymentId: null,
+    dueDate: null, day: end, line: 'workTrade' as const, category: null, part: null,
+    amount: Number(r.amount), inTotal: false, moveOutId: null, ledger: 'line' as const,
+  }))
+}
+
 async function receivedEvents(s: LedgerScope, start: string, end: string): Promise<IncomeEvent[]> {
   const params: unknown[] = [start, end]
   const rows = await query<DetailRow>(
@@ -290,9 +341,349 @@ async function receivedEvents(s: LedgerScope, start: string, end: string): Promi
       WHERE l.cash_effect = 'in' AND l.accounting_date BETWEEN $1::date AND $2::date AND ${scopeSql(s, params)}
       GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
      HAVING SUM(l.credit - l.debit) <> 0`, params)
-  return (await itemized(rows)).map(({ row: r, amount, detail }) => ({
-    ...baseEvent(r), ...receivedLineOf(r.report_category, r.account_role, r.account_type), amount, ...(detail.length ? { detail } : {}),
-  }))
+  const [facts, workTrade] = await Promise.all([itemized(rows), workTradeAside(s, start, end)])
+  return [
+    ...facts.map(({ row: r, amount, detail }) => ({
+      ...baseEvent(r), ...receivedLineOf(r.report_category, r.account_role, r.account_type), amount, ...(detail.length ? { detail } : {}),
+    })),
+    // In no column (inTotal false) — moneyViewFrom routes it to `beside`, which
+    // it fills from THIS array only. That is why a billed-side figure is handed
+    // out here rather than with the charged facts.
+    ...workTrade,
+  ]
+}
+
+
+// ─── 11/3 (Nic, DIRECTIVE): A BILL ON HOLD FOR WORK TRADE IS NOT THIS MONTH'S
+//     MONEY — NOT CHARGED, NOT OWED, NOT IN ANY MONTH FIGURE ────────────────
+//
+//   "If a work trade person is short hours and it becomes an invoice to that
+//    person, that's when it becomes money owed. It would always be the month
+//    after, at bare minimum... it should never show as November's money in the
+//    first place."
+//
+// The books keep their two-step on purpose — he was explicit that this is not a
+// request to re-architect them ("no matter how we're keeping track of it on the
+// back end"). The invoice issues in full, sits open while the tenant works, and
+// is credited at month close from that month's approved hours; without that the
+// first month of every tenancy would post uncovered, which is the bug the
+// two-step was built to fix. So the directive binds THE REPORTING LAYER, here.
+//
+// WHY A SETTLED MONTH NEEDS NOTHING AND AN OPEN ONE DOES. Once the month
+// settles, projectWorkTrade debits the very income sub-lines the charge
+// credited (method 'left_out' — the only method any live company uses) and
+// credits ar_tenants for the same cents, so the pair nets to zero and
+// the pair nets to zero inside the Charged column (and where both land on the
+// same day, chargedEvents' own `HAVING SUM(credit - debit) <> 0` drops the two
+// rows outright).
+// Verified against production before writing this: Mountain View October reads
+// $18,502.00 of rent both before and after this predicate — already net of
+// $3,478.00 of work trade. November, still open, had no offsetting posting at
+// all and carried $3,647.68 of covered charges in Charged with nothing to net
+// them. So the predicate is provably a no-op on every settled month and
+// removes exactly the open month's held bills.
+//
+// DO NOT ALSO SUBTRACT THE PROOF STRIP'S WORK-TRADE FIGURE. That figure is the
+// settled month's AR credit, which is already netted out above; taking it off
+// as well removes the same money twice.
+//
+// ONE PREDICATE, FOUR FIGURES, so they cannot drift apart (11/4 Nic: "all the
+// numbers are derived from their original source. We don't want things
+// drifting in the future."): the income it charges (chargedEvents), the income
+// listed by account on the books P&L (ledgerPl's incomeAccounts — which must
+// still add up to Charged), the receivable it leaves open (owedSnapshots), and
+// the `billed` term of the proof strip (receivableFlows, or the strip stops
+// tying by exactly this amount and says so to the landlord).
+//
+// The value is not lost: workTradeAside reports it BESIDE the columns, which is
+// also what repairs the "Covered by work trade $0.00" that the monthly property
+// report and its emailed PDF have printed for every company on the books since
+// the ledger shipped.
+const NOT_WORK_TRADE_HELD = `NOT EXISTS (
+    SELECT 1 FROM payments wt WHERE wt.id = l.payment_id AND ${workTradeOpenRowSql('wt')})`
+
+// ─── 11/4 (Nic, DIRECTIVE): WHAT BECAME OF WHAT WAS CHARGED ────────────────
+//
+//   "Rent is showing $15,000 received, almost $16,000, but over $18,500
+//    charged, and owed is only $955. And that's almost a $3,000 discrepancy
+//    when it says we only are only owed $955... every line is actually wrong."
+//
+// He is reading three columns with nothing joining them. The columns were
+// right; the report simply never said what the difference WAS. Mountain View's
+// October rent, from the books themselves:
+//
+//    charged $18,502.00 = collected $16,958.00 + still owed $955.00
+//                       + $589.00 neither (a resident paid in Square, so the
+//                         bill was closed with an account credit, not money)
+//
+// His own "nothing maths out exactly right except for the home and trailer
+// payments, $333 received, $333 charged, $0 owed" is the proof of the shape:
+// that is the one line with nothing in the third bucket.
+//
+// moneyViewFrom has carried the four buckets since the records path was built
+// (MoneyTie.charged) and the LEDGER path never filled them, so every report a
+// company on the books can open has returned collected $0 + clearing $0 +
+// owed $0 + other <the whole total> — a total with every part empty, which
+// explains nothing. These facts fill them.
+//
+// ONE POPULATION (11/4 Nic: "all the numbers are derived from their original
+// source"). The parts are not a second count of the money: they are the SAME
+// income facts that make the Charged column, each bill's own total split by
+// what its own receivable did. Per bill and category:
+//
+//   collected  the receivable's credits that were money or stood in for it
+//              (a receipt, money paid ahead, a deposit kept)
+//   clearing   its open balance while its bill is still processing
+//   owed       its open balance otherwise
+//   other      the rest OF THE SAME income total — credits given, labor,
+//              written-off balances. A residual on purpose, so the four can
+//              never fail to add back to Charged.
+//
+// AS OF THE PERIOD'S END, not today (11/3 Nic: a card headed with a month must
+// not carry a figure from outside it). October's card says what October looked
+// like on October 31 and never moves again. The records path reads each bill's
+// status TODAY; that is the one place the two paths answer different questions,
+// and the period-end reading is the correct one for a month's card.
+//
+// THIS IS NOT THE OWED COLUMN AND MUST NEVER FEED IT. The Owed column is the
+// whole receivables balance (1100) at the period's end, which is what the
+// books owe and what the proof strip ties to — it includes balances carried in
+// from earlier months. These parts cover THIS period's charges only. At
+// Mountain View the two coincide ($1,265.00, nothing carried in), which is
+// exactly why a fix validated only there would look right and ship broken: at
+// Oak Park the October column is $8,694.17 and this period's share is
+// $4,187.30, and at TruBlu $4,413.50 against $2,734.30.
+//
+// VERIFIED, both ways, against production. `other` is computed twice from
+// independent sources — as the residual of the income total, and explicitly as
+// the receivable's non-money credits plus the income lines that are not
+// charges — and the two agree TO THE CENT on all three companies on the books
+// for September, October and November 2026 (nine company-months, every
+// category). The `drift` chargedPartFacts returns is that same comparison, kept on in
+// production so the day they stop agreeing says so instead of quietly
+// reshaping a landlord's report.
+
+/** What one bill's receivable had done by the end of one day (cents). */
+export interface BillFate {
+  received: number
+  paidAhead: number
+  deposits: number
+  /** Its open balance: clearing while the bill is still processing, else owed. */
+  open: number
+  /**
+   * Whether the bill is processing NOW. The books hold nothing for money in
+   * flight — a receipt posts only once it settles (tenantReceipts: `status
+   * !== 'settled'` returns no lines) — so this is the one figure here read
+   * from the money record rather than the ledger, and it is deliberately
+   * current rather than as-of-a-past-day. The effect is that a closed month
+   * calls money that was in flight on its last day "still owed", which is
+   * exactly what the books said that day and what the Owed column shows; only
+   * the OPEN month can report anything as clearing. Do not "fix" the asymmetry
+   * by freezing it: there is no record of what was processing on a past day,
+   * and inventing one would be a second population.
+   */
+  processing: boolean
+  /** Its non-money credits (credits given, labor, written off, openings, corrections). */
+  otherTerms: number
+}
+
+/** The key a fate is held under: one bill, one report category, one day. */
+export const fateKey = (paymentId: string, category: string | null, day: string): string =>
+  `${paymentId}\u0000${category ?? ''}\u0000${day}`
+
+/**
+ * What became of each bill charged in the period, by category, at the end of
+ * each of `days`.
+ *
+ * ONE FATE PER DAY, not one for the whole read, because a report read over
+ * several months is sliced back into months afterwards (routes/reports
+ * monthView, the landlord dashboard's trend) and each month's card must say
+ * what that month looked like on ITS last day — the same reason owedSnapshots
+ * reads every month's end and not only the period's. One fate for the whole
+ * window would make a June card answer with December's collections.
+ *
+ * The receivable is read over its whole life up to each day (a bill charged in
+ * October and paid in October needs both), capped there, so a closed month's
+ * answer never changes.
+ */
+async function billFates(s: LedgerScope, start: string, end: string, days: readonly string[]): Promise<Map<string, BillFate>> {
+  const params: unknown[] = [start, end, [...days]]
+  const scope = scopeSql(s, params)
+  const rows = await query<{
+    day: string; payment_id: string; report_category: string | null; processing: boolean
+    received: string; paid_ahead: string; deposits: string; open_bal: string; other_terms: string
+  }>(
+    // `bills` names them from the same read the Charged column makes, so a
+    // bill the column leaves out (a work-trade bill still on hold) has no fate
+    // either and cannot reach these facts.
+    //
+    // DELIBERATELY NO `HAVING SUM(...) <> 0` here, unlike the income read. A
+    // bill charged in one month and reversed in another nets to zero over a
+    // long period while each MONTH is non-zero, and the parts are built per
+    // month: with the HAVING that bill had no fate at all, so the month it was
+    // charged in would have called it "settled without money" when it was
+    // owed. A bill whose months all net to zero emits nothing anyway (every
+    // part is zero), so carrying it here costs a row and no figure.
+    `WITH bills AS (
+       SELECT DISTINCT l.payment_id, l.report_category
+         FROM ledger_posting_lines l
+         JOIN books_accounts a ON a.id = l.account_id
+        WHERE a.type = 'income' AND l.payment_id IS NOT NULL
+          AND l.accounting_date BETWEEN $1::date AND $2::date AND ${scope}
+          AND ${NOT_WORK_TRADE_HELD}
+     ),
+     ar AS (
+       SELECT d.day, l.payment_id, l.report_category, ${RECEIVABLE_TERM_SQL} AS term,
+              SUM(l.debit - l.credit) AS net
+         FROM unnest($3::date[]) AS d(day)
+         JOIN ledger_posting_lines l ON l.accounting_date <= d.day
+         JOIN ledger_postings ps ON ps.id = l.posting_id
+         ${POSTING_FLAGS_SQL}
+        WHERE l.account_role = 'ar_tenants' AND ${scope}
+          AND EXISTS (SELECT 1 FROM bills b WHERE b.payment_id = l.payment_id
+                        AND b.report_category IS NOT DISTINCT FROM l.report_category)
+        GROUP BY 1, 2, 3, 4
+     )
+     SELECT d.day::text AS day, b.payment_id::text AS payment_id, b.report_category,
+            COALESCE(pay.status, '') = 'processing' AS processing,
+            ROUND(COALESCE(-SUM(CASE WHEN ar.term = 'received' THEN ar.net END), 0), 2)::text AS received,
+            ROUND(COALESCE(-SUM(CASE WHEN ar.term = 'paidAhead' THEN ar.net END), 0), 2)::text AS paid_ahead,
+            ROUND(COALESCE(-SUM(CASE WHEN ar.term = 'deposits' THEN ar.net END), 0), 2)::text AS deposits,
+            ROUND(COALESCE(SUM(ar.net), 0), 2)::text AS open_bal,
+            ROUND(COALESCE(-SUM(CASE WHEN ar.term NOT IN ('received', 'paidAhead', 'deposits', 'billed')
+                                     THEN ar.net END), 0), 2)::text AS other_terms
+       FROM bills b
+       CROSS JOIN unnest($3::date[]) AS d(day)
+       LEFT JOIN ar ON ar.day = d.day AND ar.payment_id = b.payment_id
+                   AND ar.report_category IS NOT DISTINCT FROM b.report_category
+       LEFT JOIN payments pay ON pay.id = b.payment_id
+      GROUP BY 1, 2, 3, 4`, params)
+  const out = new Map<string, BillFate>()
+  for (const r of rows) {
+    out.set(fateKey(r.payment_id, r.report_category, r.day), {
+      received: cents(r.received), paidAhead: cents(r.paid_ahead), deposits: cents(r.deposits),
+      open: cents(r.open_bal), processing: r.processing, otherTerms: cents(r.other_terms),
+    })
+  }
+  return out
+}
+
+/**
+ * The income each bill took in the period that was NOT a charge — the mirror
+ * of a non-money credit: the work-trade debit that cancels a covered bill, the
+ * minus line of a credit given. Keyed per bill, category and MONTH, because
+ * that is the grain the parts are built at.
+ *
+ * Read on its own, deliberately: this is the independent half of the drift
+ * check. The buckets come from the receivable; this comes from the income
+ * postings. Two reads of the same money that must agree.
+ */
+async function chargedOffsets(s: LedgerScope, start: string, end: string): Promise<Map<string, number>> {
+  const params: unknown[] = [start, end]
+  const rows = await query<{ payment_id: string; report_category: string | null; ym: string; n: string }>(
+    `SELECT l.payment_id::text AS payment_id, l.report_category,
+            to_char(l.accounting_date, 'YYYY-MM') AS ym,
+            ROUND(SUM(l.credit - l.debit), 2)::text AS n
+       FROM ledger_posting_lines l
+       JOIN books_accounts a ON a.id = l.account_id
+       JOIN ledger_postings ps ON ps.id = l.posting_id
+      WHERE a.type = 'income' AND l.payment_id IS NOT NULL AND ps.posting_kind <> 'charge'
+        AND l.accounting_date BETWEEN $1::date AND $2::date AND ${scopeSql(s, params)}
+        AND ${NOT_WORK_TRADE_HELD}
+      GROUP BY 1, 2, 3`, params)
+  const out = new Map<string, number>()
+  for (const r of rows) {
+    const k = `${r.payment_id}\u0000${r.report_category ?? ''}\u0000${r.ym}`
+    out.set(k, (out.get(k) ?? 0) + cents(r.n))
+  }
+  return out
+}
+
+/**
+ * The part facts of the period's charges: the same income facts, each bill's
+ * total split by what its receivable did. In no column (inTotal false) — they
+ * are the Charged column's own explanation, not more of it.
+ *
+ * GROUPED BY MONTH as well as by bill, and that matters. A bill's charge and a
+ * later credit against it are two facts of the same bill and share one fate;
+ * but a twelve-month report is cut back into months afterwards
+ * (routes/reports monthView), so a group spanning two months would land its
+ * whole explanation in one of them. Keying the month in means the charge's
+ * month carries the fate and a later month carries only its own minus line —
+ * which is what that line IS: money settled without money.
+ *
+ * Money charged with no bill behind it (a register sale, a stay, other income)
+ * gets a fact of its OWN, on its own day, never pooled: nothing in the books
+ * raises a receivable without a bill, so it is collected by construction and
+ * there is no fate to share. Pooling them was a real bug, and one a one-month
+ * check could not see — in a twelve-month read every register sale, stay and
+ * other-income line collapsed into a single fact dated in the first month with
+ * books, moving $1,100.96 into September 2026 and taking $949.49 out of
+ * October.
+ */
+export function chargedPartFacts(
+  rows: ReadonlyArray<{ row: LineRow; amount: number }>, fates: Map<string, BillFate>,
+  offsets: Map<string, number>, fateDayOf: (day: string) => string,
+): { facts: IncomeEvent[]; drift: number } {
+  interface Group { r: LineRow; day: string; cents: number; pick: number }
+  const groups = new Map<string, Group>()
+  const out: IncomeEvent[] = []
+  const emit = (r: LineRow, day: string, part: BilledPart | null, c: number) => {
+    if (!c) return
+    out.push({
+      landlordId: r.landlord_id, propertyId: r.property_id, unitId: r.unit_id, leaseId: r.lease_id,
+      paymentId: r.payment_id, dueDate: null, day, ...chargedLineOf(r.report_category, r.account_role),
+      part, amount: c / 100, inTotal: false, moveOutId: null, ledger: 'part',
+    })
+  }
+  for (const { row: r, amount } of rows) {
+    const c = Math.round(amount * 100)
+    if (!c) continue
+    // No bill, no receivable, nothing to pool: its own fact, its own day.
+    if (!r.payment_id) { emit(r, r.day, 'paid', c); continue }
+    // Keyed on the line's OWN report_category, never on the IncomeCategory
+    // chargedLineOf derives from it: 'credits_given' and 'work_trade' derive a
+    // null category, so keying on the derived one loses their fate and reports
+    // the whole minus line as collected.
+    const k = [r.landlord_id, r.property_id, r.unit_id, r.lease_id, r.payment_id, r.report_category, r.day.slice(0, 7)].join('\u0000')
+    const g = groups.get(k)
+    if (!g) { groups.set(k, { r, day: r.day, cents: c, pick: Math.abs(c) }); continue }
+    g.cents += c
+    // Dated on the day the charge itself landed (its group's first), never on
+    // the day a later offset did: these say what became of that charge. The
+    // line is read off the group's biggest row, so a stray correction cannot
+    // move the whole group onto another report line.
+    if (r.day < g.day) g.day = r.day
+    if (Math.abs(c) > g.pick) { g.r = r; g.pick = Math.abs(c) }
+  }
+  // A bill's fate belongs to the month its charge landed in; a later month's
+  // facts for the same bill are its minus lines and carry no part at all.
+  const claimed = new Set<string>()
+  let drift = 0
+  for (const g of [...groups.values()].sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0))) {
+    const bill = [g.r.payment_id, g.r.report_category].join('\u0000')
+    const f = claimed.has(bill) ? null : fates.get(fateKey(g.r.payment_id!, g.r.report_category, fateDayOf(g.day))) ?? null
+    if (f) claimed.add(bill)
+    const collected = f ? f.received + f.paidAhead + f.deposits : 0
+    const clearing = f && f.processing ? f.open : 0
+    const owed = f && !f.processing ? f.open : 0
+    const other = g.cents - collected - clearing - owed
+    emit(g.r, g.day, 'paid', f ? f.received : 0)
+    emit(g.r, g.day, 'coveredByPaidAhead', f ? f.paidAhead : 0)
+    emit(g.r, g.day, 'keptFromDeposit', f ? f.deposits : 0)
+    emit(g.r, g.day, 'clearing', clearing)
+    emit(g.r, g.day, 'stillOwed', owed)
+    // The residual, so the four buckets always add back to Charged exactly.
+    emit(g.r, g.day, null, other)
+    // THE CHECK, per group, where the identity actually holds: the residual is
+    // the bill's own non-money credits on the receivable plus this group's own
+    // income that was not a charge. Those come from two different reads, so
+    // them agreeing is worth something; the four buckets adding to Charged is
+    // true by construction and is worth nothing.
+    const key = `${g.r.payment_id}\u0000${g.r.report_category ?? ''}\u0000${g.day.slice(0, 7)}`
+    drift += other - ((f ? f.otherTerms : 0) + (offsets.get(key) ?? 0))
+  }
+  return { facts: out, drift: round2(drift / 100) }
 }
 
 async function chargedEvents(s: LedgerScope, start: string, end: string): Promise<IncomeEvent[]> {
@@ -303,17 +694,41 @@ async function chargedEvents(s: LedgerScope, start: string, end: string): Promis
        JOIN books_accounts a ON a.id = l.account_id
        LEFT JOIN payments pay ON pay.id = l.payment_id
       WHERE a.type = 'income' AND l.accounting_date BETWEEN $1::date AND $2::date AND ${scopeSql(s, params)}
+        AND ${NOT_WORK_TRADE_HELD}
       GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
      HAVING SUM(l.credit - l.debit) <> 0`, params).then(itemized)
   // 10/12 (Nic, review): every snapshot day travels with each 'owed' fact, so
   // a day on which nothing was owed still counts as the day Owed is read
   // (Owed $0), and the day before the start gives the proof strip a real
   // owed-at-start to tie out against.
-  const [rows, owed, flows] = await Promise.all([income, owedSnapshots(s, [addDays(start, -1), ...snapshotDays(start, end)], end), receivableFlows(s, start, end)])
+  // The month-ends the parts are read at — the same list owedSnapshots reads
+  // the receivables at, so a month's buckets and its Owed column are as of the
+  // same day.
+  const fateDays = snapshotDays(start, end)
+  const dayOfMonth = new Map(fateDays.map(d => [d.slice(0, 7), d]))
+  const fateDayOf = (day: string) => dayOfMonth.get(day.slice(0, 7)) ?? fateDays[fateDays.length - 1]
+  const [rows, owed, flows, fates, offsets] = await Promise.all([
+    income,
+    owedSnapshots(s, [addDays(start, -1), ...fateDays], end),
+    receivableFlows(s, start, end),
+    billFates(s, start, end, fateDays),
+    chargedOffsets(s, start, end),
+  ])
+  const charged: IncomeEvent[] = rows.map(({ row: r, amount, detail }) => ({
+    ...baseEvent(r), ...chargedLineOf(r.report_category, r.account_role), inTotal: true, amount, ...(detail.length ? { detail } : {}),
+  }))
+  const parts = chargedPartFacts(rows, fates, offsets, fateDayOf)
+  const drift = parts.drift
+  if (drift !== 0) {
+    logger.error({ landlordIds: [...s.landlordIds], start, end, drift },
+      '[CHARGED PARTS DRIFT] the Charged column\'s parts no longer explain it from the receivable: ' +
+      'the residual and the receivable\'s own non-money credits disagree by this much')
+  }
   return [
-    ...rows.map(({ row: r, amount, detail }) => ({
-      ...baseEvent(r), ...chargedLineOf(r.report_category, r.account_role), inTotal: true, amount, ...(detail.length ? { detail } : {}),
-    })),
+    ...charged,
+    // The same facts, split by what each bill's receivable did — the column's
+    // explanation, in no column of its own (inTotal false).
+    ...parts.facts,
     ...owed,
     ...flows,
   ]
@@ -480,6 +895,7 @@ async function owedSnapshots(s: LedgerScope, days: string[], lastDay: string): P
        FROM unnest($1::date[]) AS d(day)
        JOIN ledger_posting_lines l ON l.accounting_date <= d.day
       WHERE l.account_role = 'ar_tenants' AND ${scopeSql(s, params)}
+        AND ${NOT_WORK_TRADE_HELD}
       GROUP BY 1, 2, 3, 4, 5, 6, 7
      HAVING SUM(l.debit - l.credit) <> 0`, params)
   // 10/14 (Nic I1): what is still owed on a bill, itemized as the bill was
@@ -558,6 +974,7 @@ async function receivableFlows(s: LedgerScope, start: string, end: string): Prom
        JOIN ledger_postings ps ON ps.id = l.posting_id
        ${POSTING_FLAGS_SQL}
       WHERE l.account_role = 'ar_tenants' AND l.accounting_date BETWEEN $1::date AND $2::date AND ${scopeSql(s, params)}
+        AND ${NOT_WORK_TRADE_HELD}
       GROUP BY 1, 2, 3, 4, 5, 6, 7
      HAVING SUM(l.debit - l.credit) <> 0`, params)
   return rows.map(r => ({
@@ -1605,6 +2022,7 @@ export async function ledgerProfitAndLoss(s: LedgerScope, start: string, end: st
       `SELECT a.id::text AS account_id, a.code, a.name, SUM(l.credit - l.debit)::text AS n
          FROM ledger_posting_lines l JOIN books_accounts a ON a.id = l.account_id
         WHERE a.type = 'income' AND l.accounting_date BETWEEN $1::date AND $2::date AND ${scopeSql(s, params)}
+          AND ${NOT_WORK_TRADE_HELD}
         GROUP BY 1, 2, 3 HAVING SUM(l.credit - l.debit) <> 0 ORDER BY a.code, a.name`, params),
   ])
   const view = moneyViewFrom(charged, received, { start: ymd(start), end: ymd(end), label }, paidAhead)

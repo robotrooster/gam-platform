@@ -28,7 +28,7 @@
 // confirmation and the list of reports — says which of the two it is
 // (./reportBankDepositCopy.ts).
 
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { useQuery } from 'react-query'
 import {
   DEPOSITABLE_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS, formatCurrency,
@@ -41,7 +41,7 @@ import { apiGet, apiPost, apiDelete, apiUpload } from '../lib/api'
 import { AuthedImg } from './AuthedMedia'
 import {
   ONLY_AFTER_YOU_PAID, alreadyReportedMessage, bankWatch, pendingReportStatus, reportDepositCopy,
-  reportStandsNow, PHOTO_NOT_SENT,
+  reportStandsNow, PHOTO_NOT_SENT, ADD_RECEIPT_PROMPT, ADD_RECEIPT_WHY,
 } from './reportBankDepositCopy'
 
 interface Props {
@@ -64,7 +64,11 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
   const [reference, setReference] = useState('')
   // 10/6 (Nic): about what time they were at the bank — required. '' until picked.
   const [hour, setHour] = useState('')
-  // 10/5 (Nic): an optional photo of the bank's receipt, sent once the report is made.
+  // 10/5 (Nic): a photo of the bank's receipt, sent once the report is made.
+  // 11/1 (Blue, via Nic): REQUIRED. Zero of the four reports ever filed had one,
+  // because it said "(optional)" and people skip optional. Without the picture a
+  // deposit cannot be matched by hand when the bank feed misses it, which is the
+  // whole reason the field exists.
   const [photo, setPhoto] = useState<File | null>(null)
   const [confirmed, setConfirmed] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -87,7 +91,9 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
   const amount = Number(amountText)
   // 10/5 (Nic): the reference number from the bank's receipt is required.
   // 10/6 (Nic): and about what time they were at the bank.
-  const canSubmit = confirmed && amount > 0 && !!declaredDate && !!reference.trim() && !!hour && !submitting && copy.canReport
+  // 11/1: and the photo of the receipt — see the note on `photo` above.
+  const canSubmit = confirmed && amount > 0 && !!declaredDate && !!reference.trim()
+    && !!hour && !!photo && !submitting && copy.canReport
 
   async function submit() {
     setError(null); setSubmitting(true)
@@ -230,7 +236,7 @@ export function ReportBankDepositModal({ leaseId, outstanding, onReported, onClo
 
             <label htmlFor="report-deposit-photo"
               style={{ display: 'block', marginTop: 12, fontSize: '.75rem', color: 'var(--t3)' }}>
-              Photo of the bank’s receipt <span style={{ color: 'var(--t3)' }}>(optional)</span>
+              Photo of the bank’s receipt <span style={{ color: 'var(--gold)' }}>(required)</span>
             </label>
             <input id="report-deposit-photo" type="file" accept="image/*" style={{ ...inputStyle, padding: '7px 9px' }}
               onChange={(e) => {
@@ -356,7 +362,9 @@ export function ReportedDeposits({ reports, onWithdrawn, refusal, onRefusal, sta
                   ? bankDateUsedText(r.declaredDate, r.bankPostedDate)
                   : (r.resolutionNote || 'We could not find a matching deposit.')}
             </div>
-            {r.receiptPhotoUrl && <ReceiptPhotoButton url={r.receiptPhotoUrl} />}
+            {r.receiptPhotoUrl
+              ? <ReceiptPhotoButton url={r.receiptPhotoUrl} />
+              : <AddReceiptPhoto reportId={r.id} onAdded={onWithdrawn} />}
           </span>
           {r.status === 'pending' && (
             <button className="btn-ghost" disabled={busy === r.id}
@@ -375,6 +383,65 @@ export function ReportedDeposits({ reports, onWithdrawn, refusal, onRefusal, sta
             onClick={() => setWithdrawError(null)}>
             OK
           </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * 11/1 (Blue, via Nic): FINISH A REPORT THAT HAS NO PICTURE.
+ *
+ * The photo is required to file a report now, but that does nothing for the
+ * ones already filed - and there were four, every one of them without a
+ * picture. Kim Bowman filed $1,175 on 10/30 and told the office she could not
+ * find anywhere to upload it; there was nowhere, because the only file picker
+ * in the app lived inside the "make a report" window and vanished on submit.
+ *
+ * The server already allowed this all along (declaredDeposits POST
+ * /:id/receipt-photo takes any report the tenant owns that is not withdrawn),
+ * so nothing new is permitted here - it is simply reachable now. It also
+ * covers a report filed by the tenant agent, which cannot upload files at all.
+ */
+function AddReceiptPhoto({ reportId, onAdded }: { reportId: string; onAdded: () => void }) {
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [problem, setProblem] = useState<string | null>(null)
+
+  async function pick(file: File | null) {
+    setProblem(null)
+    if (!file) return
+    const bad = bankReceiptPhotoProblem(file)
+    if (bad) { setProblem(bad); return }
+    setBusy(true)
+    try {
+      const fd = new FormData()
+      fd.append('photo', file)
+      await apiUpload(`/declared-deposits/${reportId}/receipt-photo`, fd)
+      onAdded()
+    } catch (e: any) {
+      // Said here and retryable, never swallowed: a photo that silently failed
+      // to send is how every one of these reports ended up without one.
+      setProblem(e?.message || 'That did not upload. Try again.')
+    } finally {
+      setBusy(false)
+      if (inputRef.current) inputRef.current.value = ''
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 4 }}>
+      <div style={{ color: 'var(--t3)', fontSize: '.72rem', marginBottom: 4 }}>{ADD_RECEIPT_WHY}</div>
+      <button type="button" className="btn-primary" disabled={busy}
+        style={{ fontSize: '.7rem', padding: '3px 10px' }}
+        onClick={() => inputRef.current?.click()}>
+        {busy ? 'Sending...' : ADD_RECEIPT_PROMPT}
+      </button>
+      <input ref={inputRef} type="file" accept="image/*" style={{ display: 'none' }}
+        onChange={(e) => pick(e.target.files?.[0] ?? null)} />
+      {problem && (
+        <div role="status" style={{ color: 'var(--danger, #d66)', fontSize: '.72rem', marginTop: 4 }}>
+          {problem}
         </div>
       )}
     </div>

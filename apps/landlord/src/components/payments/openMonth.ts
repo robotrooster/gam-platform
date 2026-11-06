@@ -28,7 +28,7 @@ export function openProperties(properties: readonly RentRollProperty[] | undefin
   return (properties ?? []).filter(p => p.owned).sort((a, b) => a.name.localeCompare(b.name))
 }
 
-/** "Glenda Moss & Russ Fuller" — the lease's residents, primary first (the server's order). */
+/** "Glenda Moss & Tamsin Wrenfield" — the lease's residents, primary first (the server's order). */
 export function householdName(row: Pick<OpenMonthRow, 'residents'>): string {
   return row.residents.map(r => r.name).filter(Boolean).join(' & ') || 'No tenant on file'
 }
@@ -74,7 +74,7 @@ export function spaceOnlyWords(row: Pick<OpenMonthRow, 'status' | 'statusLabel'>
 
 /**
  * A register sale or pay link opens to its breakdown (10/13, Nic: "When
- * Andres Razo paid by card online for his stay ... it looks like that charge
+ * Cora Castellan paid by card online for his stay ... it looks like that charge
  * is just for electric ... not clickable to show an expanded breakdown") —
  * each part with its own amount and what it is. A refund has none.
  */

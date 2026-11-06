@@ -247,7 +247,7 @@ homeSaleRouter.get('/unit/:unitId', async (req: any, res, next) => {
  *    to backtrack bookkeeping and stuff."
  *
  * Settable on an existing contract, not only at creation: a landlord who takes
- * one of these on later (Dominic Gonzalez's, whose money goes to the trust)
+ * one of these on later (Vesper Vanterpool's, whose money goes to the trust)
  * must be able to say so without re-papering the sale. Omitted fields are left
  * exactly as they are.
  *
@@ -261,7 +261,7 @@ const termsSchema = z.object({
   lateFeeInitialAmount: z.number().min(0).nullable().optional(),
   lateFeeAccrualType:   z.enum(['flat', 'percent']).nullable().optional(),
   lateFeeAccrualAmount: z.number().min(0).nullable().optional(),
-  lateFeeAccrualPeriod: z.enum(['daily', 'weekly', 'monthly']).nullable().optional(),
+  lateFeeAccrualPeriod: z.enum(['daily', 'weekly']).nullable().optional(),
   lateFeeAccrualFrom:   z.enum(['grace_end', 'due_date']).nullable().optional(),
   lateFeeCapType:       z.enum(['flat', 'percent']).nullable().optional(),
   lateFeeCapAmount:     z.number().min(0).nullable().optional(),

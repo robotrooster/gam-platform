@@ -62,6 +62,10 @@ interface AuthCtx {
   loginWithTotp: (totpSession: string, code: string) => Promise<void>
   loginWithEmailOtp: (emailOtpSession: string, code: string) => Promise<void>
   resendEmailOtp: (emailOtpSession: string) => Promise<void>
+  // 10/30 (Nic): "a passkey replaces the emailed code." The server has already
+  // verified the device and minted a FULL session, so there is no second step
+  // to pivot into — this just stores what came back.
+  loginWithPasskey: (session: { token: string; user?: unknown }) => Promise<void>
   logout: () => void
   refresh: () => Promise<void>
   // S574 — terminal lock screen (standalone register).
@@ -90,7 +94,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true)
   const posLimited = readPosLimited(token)
 
-  // S639 SECURITY: a change of identity empties the client cache. Nick Platt
+  // S639 SECURITY: a change of identity empties the client cache. Maren Pemberton
   // accepted his invite on a browser where another household member was signed
   // in and landed in THEIR profile — the token swapped correctly and react-query
   // kept serving the previous person's cached responses under the same keys.
@@ -191,6 +195,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await apiPost('/auth/email-otp/resend', { emailOtpSession })
   }
 
+  // 10/30 (Nic): a passkey sign-in. routes/passkeys.ts has already checked the
+  // challenge, the origin, the relying party, the signature and the sign count
+  // and minted a full session, so there is no code step after this. Stored
+  // exactly as the code step stores its token, cache wipe included (S639: a
+  // change of identity empties the client cache).
+  const loginWithPasskey = async (session: { token: string; user?: unknown }): Promise<void> => {
+    wipeCache(); localStorage.setItem('gam_token', session.token)
+    setToken(session.token)
+    await refresh()
+  }
+
   // ── S574: terminal lock screen (standalone register) ───────────
   // Bind this device to the current (full) session's business register.
   const activateTerminal = async (): Promise<void> => {
@@ -239,7 +254,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }
 
   return <Ctx.Provider value={{
-    user, token, loading, login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, logout, refresh,
+    user, token, loading, login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, loginWithPasskey, logout, refresh,
     terminalToken, posLimited, activateTerminal, lockRegister, unlockWithPasscode, deactivateTerminal,
   }}>{children}</Ctx.Provider>
 }

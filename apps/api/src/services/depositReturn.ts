@@ -6,13 +6,13 @@ import { appendEvent } from './creditLedger'
 import { ensureBillsForUnit } from './utilityBilling'
 import { getStripe } from '../lib/stripe'
 import { logger } from '../lib/logger'
-import { todayIn } from '../lib/timezone'
 import { AppError } from '../middleware/errorHandler'
 import { lockHousehold, payableRowSql, depositOrMoveOutRowSql } from './moneyPredicates'
 import { disputeClaimOnCredit, supersedeScheduledRetry, cancelSupersededIntents } from './creditUse'
 import { computePlatformCut } from './stripeConnect'
 import { depositCollectedBySql } from './leaseFeesSync'
 import { EARLY_CHECKOUT_CHOICE_LABEL, LEASE_COLUMN_LABEL, PAYMENT_ENTRY_DESCRIPTION_LABELS, isUsFederalHoliday } from '@gam/shared'
+import { todayIn } from '../lib/timezone'
 
 // ============================================================
 // Deposit-return service.
@@ -147,7 +147,7 @@ export interface UnpaidBalanceLine {
  * their unpaid bills were swept against the new household's deposit (and marked
  * paid from it at finalize). Same gate as invoiceGeneration.isRenewalSuccessor.
  */
-const LEASE_CHAIN = `(WITH RECURSIVE chain(id) AS (
+export const LEASE_CHAIN = `(WITH RECURSIVE chain(id) AS (
       SELECT $1::uuid
       UNION
       SELECT cl.supersedes_lease_id FROM leases cl JOIN chain c ON cl.id = c.id
@@ -531,10 +531,36 @@ export const FIGURES_CHANGED_MESSAGE = 'The figures changed since you opened thi
  */
 export function moveOutMath(o: {
   carriedForward: boolean; security: number; boxes: number; interest: number; paidAhead: number; deductions: number
+  /**
+   * 10/27 (Nic) — THE PART OF A FLEXDEPOSIT THE RESIDENT NEVER FUNDED.
+   *
+   *   "Any deposits we hold are absolutely going to the landlord. That is our
+   *    risk to take, and that is why we are making the money on the flex
+   *    deposit... The landlord gets what they're owed, full stop."
+   *
+   * `total_amount - collected_amount` on the deposit record, and 0 (or absent)
+   * for every deposit that was simply paid in full — which is almost all of
+   * them. Passing it in turns on `gamCovers` below.
+   */
+  unfundedDeposit?: number
 }): {
   deposit: number; refund: number; gap: number; carried: number; paidAheadUsed: number; paidAheadLeft: number
   /** Carried forward only: the pet, key and cleaning deposits the deductions took (0 otherwise — they are in the refund). */
   boxesUsed: number
+  /**
+   * 10/27: cash GAM pays the landlord because the resident never funded this
+   * much of their deposit, and which is therefore NOT billed to the resident.
+   *
+   * It is `min(what the deductions reached past the money actually held, the
+   * part never funded)` — so it is zero in the two cases people expect it not
+   * to be. If the landlord keeps no more than was funded, the resident's own
+   * refund absorbs the gap (a refund is computed against what is held, § 8(ii)),
+   * and GAM pays nothing. If the deductions run past the WHOLE deposit, GAM
+   * covers only up to the face amount and the excess stays the resident's bill
+   * exactly as it would be for a resident who paid their deposit in full —
+   * GAM carries its own risk, not the landlord's damage claim.
+   */
+  gamCovers: number
 } {
   const ded = Math.max(0, toCents(o.deductions))
   const paidAhead = Math.max(0, toCents(o.paidAhead))
@@ -546,21 +572,76 @@ export function moveOutMath(o: {
     return {
       deposit: toDollars(security), refund: 0, gap: toDollars(ded - taken - fromBoxes - used), carried: toDollars(security - taken),
       paidAheadUsed: toDollars(used), paidAheadLeft: toDollars(paidAhead - used), boxesUsed: toDollars(fromBoxes),
+      // A carried-forward deposit is not returned and nothing is settled with
+      // this landlord beyond what the carried balance paid. GAM's exposure
+      // travels to the new tenancy with the custody balance, so there is
+      // nothing for GAM to make good HERE — it falls due at the lease that
+      // actually ends. Paying it now would pay it twice.
+      gamCovers: 0,
     }
   }
   const depositSide = toCents(o.security) + toCents(o.boxes) + toCents(o.interest)
   const fromDeposit = Math.min(ded, Math.max(0, depositSide))
   const beyondDeposit = ded - fromDeposit
   const used = Math.min(paidAhead, beyondDeposit)
+  // What the deductions reached past every dollar actually available, and then
+  // only as far as the unfunded part of the deposit goes.
+  const gapBefore = Math.max(0, beyondDeposit - used)
+  const gamCovers = Math.min(gapBefore, Math.max(0, toCents(o.unfundedDeposit ?? 0)))
   return {
     deposit: toDollars(toCents(o.security) + toCents(o.boxes)),
     refund: toDollars(Math.max(0, depositSide - fromDeposit)),
-    gap: toDollars(beyondDeposit - used),
+    // GAM's part comes off the resident's bill. It is never chased: no
+    // collections, no reporting, no setoff against a later refund — which is
+    // what makes covering it GAM carrying a risk rather than lending.
+    gap: toDollars(gapBefore - gamCovers),
     carried: 0,
     paidAheadUsed: toDollars(used),
     paidAheadLeft: toDollars(paidAhead - used),
     boxesUsed: 0,
+    gamCovers: toDollars(gamCovers),
   }
+}
+
+/**
+ * 10/27 — THE UNFUNDED PART OF A FLEXDEPOSIT ON THIS LEASE, OR ZERO.
+ *
+ * One read, used by the landlord's move-out preview, the draft recalculation
+ * and finalize, so all three compute the same `gamCovers` and the confirm
+ * check cannot 409 on a figure only one of them knows about.
+ *
+ * Zero for every ordinary deposit, so the behaviour of every non-FlexDeposit
+ * move-out on the platform is untouched by this.
+ *
+ * `collected_amount` is clamped to the total before subtracting: GAM-first
+ * routing raises it without the LEAST() clamp its three sibling writers have
+ * (services/supersedence.ts), so it can exceed the total and a bare
+ * subtraction would make the unfunded figure negative.
+ */
+async function unfundedFlexDeposit(
+  exec: (sql: string, params: unknown[]) => Promise<Array<{ unfunded: string }>>,
+  leaseId: string,
+): Promise<number> {
+  const rows = await exec(
+    `SELECT GREATEST(total_amount - LEAST(COALESCE(collected_amount, 0), total_amount), 0)::text
+              AS unfunded
+       FROM security_deposits
+      WHERE lease_id = $1
+        AND flex_deposit_enabled = TRUE
+        AND status <> 'voided'
+        AND voided_at IS NULL
+        -- MUST match the branch that actually pays it. GAM covers a shortfall
+        -- only out of the escrow settlement, which exists only for a deposit
+        -- GAM holds. Without this, a flex row whose held_by was somehow
+        -- 'landlord' would take the shortfall off the resident's bill and then
+        -- pay nobody and book nothing — money quietly lost between two
+        -- branches. Enrollment forces gam_escrow, so this should always be
+        -- true; it is here because the cost of it not being is silent.
+        AND held_by = 'gam_escrow'
+      LIMIT 1`,
+    [leaseId],
+  )
+  return rows.length === 0 ? 0 : round2(Number(rows[0].unfunded))
 }
 
 /** One deposit payment and who refunds it at move-out. */
@@ -604,9 +685,25 @@ export interface DepositPart { id: string; kind: 'box' | 'security'; amount: num
  * part no money moves at all); then the part GAM holds, which GAM releases to
  * the landlord. GAM refunds what is left of what it holds; the landlord
  * refunds what is left of theirs. This order is the one place it is decided
- * (DEDUCTIONS_FROM_LANDLORD_HELD_FIRST). PROVISIONAL: decisions.md does not
- * settle it and Nic has not ruled on it — put to him before deploy (reported).
- * Flipping the constant is the whole change (false: GAM-held money first).
+ * (DEDUCTIONS_FROM_LANDLORD_HELD_FIRST).
+ *
+ * DECIDED 10/29 (Nic) — the fewest money movements wins:
+ *
+ *   "Deposit deductions would come from any portion the landlord holds first.
+ *    It makes sense. It's the least amount of money movement. If we have to
+ *    top up a little bit because we have the portion that the landlord is
+ *    trying to dip into, that's one thing, but it doesn't make sense for us to
+ *    collect it and then give it to the landlord, and then the landlord's
+ *    portion gets debited from their Connect account later on. Like, it's just
+ *    a bunch of money crossing. Extra movement costs extra money. We want
+ *    least money movements as possible without making people be delayed for
+ *    too long."
+ *
+ * So `true` is the ruling, not a placeholder: a deduction taken out of the
+ * landlord's own held money moves nothing at all, and only the shortfall above
+ * it reaches for what GAM holds. Flipping the constant (false: GAM-held money
+ * first) would route every claim through GAM and back, which is the crossing
+ * he is ruling out. Do not re-raise this as open.
  */
 export const DEDUCTIONS_FROM_LANDLORD_HELD_FIRST = true
 
@@ -1189,9 +1286,14 @@ export async function calculateDepositReturn(
   // #46.2): the deductions come out of it first; the tenant's paid-ahead money
   // pays only what it cannot, and what is left of that money is NOT refunded
   // (moveOutMath). A carried-forward deposit refunds nothing.
-  const { deposit, refund, gap, paidAheadUsed, paidAheadLeft } = moveOutMath({
+  // 10/27: the part of a FlexDeposit never funded, which GAM covers for the
+  // landlord instead of billing to the resident (moveOutMath.gamCovers).
+  const unfundedDeposit = await unfundedFlexDeposit(
+    async (sql, params) => (await db.query(sql, params as any[])).rows as any, leaseId)
+  const { deposit, refund, gap, paidAheadUsed, paidAheadLeft, gamCovers } = moveOutMath({
     carriedForward: !!portable, security: pool.security, boxes: pool.boxes,
     interest: round2(interestAccrued + interestCredited), paidAhead: prepaidCreditRemaining, deductions: totalDeductions,
+    unfundedDeposit,
   })
   // 10/4 (decisions #46.3): who refunds which part — the same split finalize
   // records (refundSplit). A carried-forward deposit refunds nothing.
@@ -1362,6 +1464,10 @@ export async function applyDeductionsToDraft(
   const { deposit, refund, gap } = moveOutMath({
     carriedForward: !!portable, security: pool.security, boxes: pool.boxes,
     interest: round2(interestAccrued + interestCredited), paidAhead: prepaidPool, deductions: totalDeductions,
+    // 10/27: same figure the preview and finalize use, so the saved draft's
+    // gap_amount already has GAM's part taken off it.
+    unfundedDeposit: await unfundedFlexDeposit(
+      async (sql, params) => (await db.query(sql, params as any[])).rows as any, current.lease_id),
   })
 
   const updated = await queryOne<DepositReturnRow>(
@@ -1629,10 +1735,13 @@ export async function finalizeDepositReturn(
     // carried-forward deposit leaves it where it is (GAM is told, below).
     const interestCredits = carriedForward ? [] : await unspentInterestCredits(client, row.lease_id, true)
     const liveInterestCredited = sumCredits(interestCredits)
+    const liveUnfunded = await unfundedFlexDeposit(
+      async (sql, params) => (await client.query(sql, params as any[])).rows as any, row.lease_id)
     const math = moveOutMath({
       carriedForward, security: depositPool.security, boxes: depositPool.boxes,
       interest: round2(liveInterestAccrued + liveInterestCredited), paidAhead: livePrepaidCredit,
       deductions: liveTotalDeductions,
+      unfundedDeposit: liveUnfunded,
     })
     const totalDeposit = math.deposit
     const liveRefund = math.refund
@@ -1885,11 +1994,16 @@ export async function finalizeDepositReturn(
     const gap    = liveGap
 
     // Pull lease unit context for credit-event evidence + payments row.
-    const ctx = await client.query<{ unit_id: string }>(
-      `SELECT l.unit_id FROM leases l WHERE l.id = $1`,
+    const ctx = await client.query<{ unit_id: string; property_id: string | null }>(
+      // 10/27: the property comes along too — a revenue-book row is scoped to
+      // the property it was earned or spent at (platform_revenue_ledger).
+      `SELECT l.unit_id, u.property_id
+         FROM leases l LEFT JOIN units u ON u.id = l.unit_id
+        WHERE l.id = $1`,
       [row.lease_id],
     )
     const unitId = ctx.rows[0]?.unit_id
+    const ctxPropertyId = ctx.rows[0]?.property_id ?? null
 
     let nextStatus: 'sent_refund' | 'sent_gap' | 'sent_zero' | 'sent_carried_forward'
     let refundPaymentId: string | null = null
@@ -2074,9 +2188,45 @@ export async function finalizeDepositReturn(
           `Move-out at ${space}: ${p.kind === 'security' ? 'security deposit' : p.label} the tenant paid through GAM, released to you`)) releasedPayments.push(p.id)
       }
       if (sdRec?.held_by === 'gam_escrow') {
+        // ── 10/27 (Nic): GAM MAKES UP WHAT THE RESIDENT NEVER FUNDED ────────
+        //
+        //   "Any deposits we hold are absolutely going to the landlord. That
+        //    is our risk to take, and that is why we are making the money on
+        //    the flex deposit... The landlord gets what they're owed, full
+        //    stop."
+        //
+        // So GAM's part rides the SAME Connect transfer the custody money goes
+        // out on (fireLandlordDisbursementTransfer, post-commit). The landlord
+        // is whole on the day the deposit return finalizes, and they are never
+        // told which part of it was the resident's and which was GAM's — it is
+        // simply their deposit money.
+        //
+        // The resident's bill already has this taken off it (moveOutMath.gap),
+        // and nothing ever chases them for it: no collections, no reporting, no
+        // setoff against a later refund. That is the difference between GAM
+        // carrying a risk and GAM lending.
         escrowSettlement = await settleEscrow(
-          toCents(split.keptFromGam) + toCents(gamHeldPaidAhead) - toCents(gamLinesTotal),
+          toCents(split.keptFromGam) + toCents(gamHeldPaidAhead) - toCents(gamLinesTotal)
+            + toCents(math.gamCovers),
           `${gamLinesText}, $${gamLinesTotal.toFixed(2)}, were paid from deposit money paid to you directly, and they are GAM's`)
+        if (math.gamCovers > 0) {
+          // NEGATIVE on GAM's one revenue book: this is fee income being spent,
+          // and the FlexDeposit reserve is the sum of those two lines
+          // (services/flexDepositExposure.flexDepositReserve). Booked under
+          // finalize's locks, in the same transaction that commits the
+          // settlement, so the book cannot say GAM paid when it did not.
+          const { recordPlatformRevenue } = await import('./platformRevenue')
+          await recordPlatformRevenue({
+            type:          'flexdeposit_shortfall',
+            amount:        -math.gamCovers,
+            referenceId:   draftId,
+            referenceType: 'deposit_return',
+            propertyId:    ctxPropertyId,
+            notes:         `FlexDeposit shortfall covered for the landlord — the resident funded $${
+              round2(sdRec.collected_amount ? Number(sdRec.collected_amount) : 0).toFixed(2)
+            } of their deposit`,
+          }, client)
+        }
       } else {
         const uses = await client.query<{ id: string; amount: string }>(
           `SELECT v.id, v.amount::text AS amount FROM v_credit_uses v
@@ -2260,6 +2410,79 @@ export async function finalizeDepositReturn(
         },
         client,
       )
+
+    }
+
+
+    // 10/27: OUTSIDE the gap branch on purpose. A resident can leave owing
+    // this landlord nothing of their own while still part-way through
+    // collecting an EARLIER landlord's debt here — and that debt still has to
+    // follow them. Inside the branch it would silently vanish for exactly the
+    // residents who were paying it down.
+    // ── 10/27 (Nic): LEFT OWING IS REAL TIME, AND IT FOLLOWS THEM ───────────
+    //
+    //   "if they have an outstanding bill and they are trying to onboard with
+    //    another landlord on GAM, like, that landlord needs to see that they
+    //    already owe. that's a real-time situation."
+    //
+    // So it is recorded HERE, the moment a tenancy is finalised, and not by a
+    // sweep that waits a while first. The earlier open question about how long
+    // after a move-out somebody counts as left-owing is closed: an open
+    // balance counts from the day it is open.
+    //
+    // One call does both jobs, because they are the same job. If this resident
+    // was part-way through collecting an EARLIER landlord's debt here, that
+    // landlord is made whole and the remainder is folded into this gap, so
+    // what follows the resident is ONE debt rather than a pile — "the second
+    // landlord's owed amount will be calculated based on that first landlord's
+    // balance that was passed on, plus any outstanding from what was accrued
+    // with that second landlord". With no arrangement in play it simply
+    // records the gap, which is the ordinary case.
+    //
+    // The amount is the gap AFTER everything that could pay it already has:
+    // the deposit, the resident's paid-ahead money, and anything GAM covered
+    // for a FlexDeposit shortfall (GAM's own loss, never theirs).
+    //
+    // Inside finalize's transaction, so a debt cannot exist for a move-out
+    // that rolled back.
+    //
+    // NOT on a carried-forward deposit. Portability means the resident is
+    // moving to another space ON the platform, not leaving — settling their
+    // arrangement and raising a fresh debt in the landlord's name would say
+    // they walked away from a tenancy they are still in.
+    if (!portabilityAuthorized) try {
+      const { carryForwardOnDeparture } = await import('./leftOwingCollection')
+      await carryForwardOnDeparture({
+        tenantId: row.tenant_id, landlordId: row.landlord_id,
+        // 11/5: the gap is the LEASE's unpaid money, so it rides the lease's
+        // own part of the resident's one walk-away debt — the same part
+        // services/leftOwingFreeze writes. Passing the lease is what keeps the
+        // two from counting this money twice.
+        ownBalance: gap, leaseId: row.lease_id, propertyId: ctxPropertyId, client,
+      })
+    } catch (e) {
+      // The move-out is the thing that must not fail: a rolled-back finalize is
+      // a resident who never moved out.
+      //
+      // 10/27: this call now MOVES MONEY as well as raising the flag — the
+      // remainder comes off the departing landlord's disbursement and goes to
+      // the landlord who was owed. So a swallowed failure is no longer only a
+      // gap in what another landlord can see; it is a landlord not being made
+      // whole. It stays swallowed, and it stops being quiet: a critical
+      // notice is written outside this transaction (createAdminNotification
+      // runs on the pool), so it survives the rollback that hid it before.
+      logger.error({ err: e, ctx: draftId }, '[deposit-return][left-owing] not recorded')
+      const { createAdminNotification } = await import('./adminNotifications')
+      await createAdminNotification({
+        severity: 'critical',
+        category: 'left_owing_carry_forward_failed',
+        title:    `A left-owing balance was not carried forward at move-out (${draftId})`,
+        body:     'The resident moved out with a debt being collected for another operator. '
+                + 'The remainder was NOT taken off the departing landlord\'s disbursement and the '
+                + 'landlord owed was NOT paid. Settle it by hand.\n\n'
+                + (e instanceof Error ? e.message : String(e)),
+        context:  { deposit_return_id: draftId, tenant_id: row.tenant_id, landlord_id: row.landlord_id },
+      }).catch(err => logger.error({ err }, '[deposit-return][left-owing] could not raise the notice either'))
     }
 
     // S193: distinct credit-ledger event for statutory deposit interest
@@ -2518,6 +2741,26 @@ export async function finalizeDepositReturn(
     } catch (e) {
       logger.error({ err: e, ctx: draftId }, '[deposit-return][landlord-disbursement]')
     }
+  }
+
+  // ── 11/5: THE LEFT-OWING FIGURE IS EXACT ONLY NOW ────────────────────────
+  //
+  // The tenancy's ending booked what they left owing with the deposit the
+  // return was GOING to spend taken off (services/leftOwingFreeze). This is the
+  // moment that stops being an estimate: the swept rows are marked paid from
+  // the deposit and whatever is beyond it has just been raised as the gap
+  // invoice, so re-reading the rows gives the real number. A figure somebody is
+  // already collecting against is left alone, and paying everything off settles
+  // the row instead of leaving it flagged.
+  //
+  // Post-commit and best-effort. Finalize has already paid out; it must never
+  // fail because a book could not be re-read, and the nightly sweep retries.
+  try {
+    const { bookWhatTheyLeftOwing } = await import('./leftOwingFreeze')
+    const { query: poolQ } = await import('../db')
+    await bookWhatTheyLeftOwing({ query: poolQ as any }, { leaseId: row.lease_id })
+  } catch (e) {
+    logger.error({ err: e, ctx: draftId }, '[deposit-return][left-owing-recompute]')
   }
 
   return row

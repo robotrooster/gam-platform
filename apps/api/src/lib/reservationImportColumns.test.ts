@@ -89,7 +89,7 @@ describe('column names', () => {
   })
 
   it('a month stay read off "Last Night" stays a month — one night short would change what kind of stay it is', () => {
-    const [row] = applyReservationMapping([{ Guest: 'Victor Cardoza', Site: '11',
+    const [row] = applyReservationMapping([{ Guest: 'Horatio Mapperley', Site: '11',
       'First Night': '10/4/2026', 'Last Night': '11/3/2026' }])
     expect(row.check_out).toBe('2026-11-04')
   })

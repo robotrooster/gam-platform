@@ -74,6 +74,8 @@ const dash = (qs = '') => request(buildApp())
   .get(`/api/landlords/me/dashboard${qs}`).set('Authorization', `Bearer ${token}`)
 const balances = () => request(buildApp())
   .get('/api/balances').set('Authorization', `Bearer ${token}`)
+const todos = (qs = '') => request(buildApp())
+  .get(`/api/landlords/me/todos${qs}`).set('Authorization', `Bearer ${token}`)
 
 describe('GET /landlords/me/dashboard?propertyId=', () => {
   it('blends every property when nothing is chosen', async () => {
@@ -111,6 +113,65 @@ describe('GET /landlords/me/dashboard?propertyId=', () => {
     const res = await dash(`?propertyId=${propB}`)
     expect(res.body.data.total_units).toBe(1)
     expect(Number(res.body.data.monthly_rent_volume)).toBe(300)
+  })
+
+  /**
+   * 10/29 (Nic): "the platform fee still shows combined portfolio... the KPI
+   * cards don't filter with the property filter."
+   *
+   * Occupancy, occupied units, outstanding balance and property health all
+   * took the filter from S637 onward; the platform-fee card listed EVERY
+   * property on the account and summed them whatever the filter said, so an
+   * owner of two parks had no way to read one park's fee. The breakdown modal
+   * reads the same list, so it narrows with the card.
+   */
+  it('narrows the platform fee and its breakdown to the chosen property', async () => {
+    const blended = await dash('')
+    expect(blended.body.data.platformFeeByProperty).toHaveLength(2)
+
+    const a = await dash(`?propertyId=${propA}`)
+    expect(a.body.data.platformFeeByProperty).toHaveLength(1)
+    expect(a.body.data.platformFeeByProperty[0].propertyId).toBe(propA)
+    // The card's figure is the sum of its own breakdown, both narrowed.
+    expect(Number(a.body.data.platformFee)).toBe(
+      Number(a.body.data.platformFeeByProperty[0].fee))
+
+    const b = await dash(`?propertyId=${propB}`)
+    expect(b.body.data.platformFeeByProperty).toHaveLength(1)
+    expect(b.body.data.platformFeeByProperty[0].propertyId).toBe(propB)
+
+    // And the two parts still add up to the blended total they came from.
+    expect(Number(a.body.data.platformFee) + Number(b.body.data.platformFee))
+      .toBeCloseTo(Number(blended.body.data.platformFee), 2)
+  })
+
+  /**
+   * 10/29 (Nic): "the to-do list does not filter by property... people that own
+   * both don't have any way to make the entire dashboard accurate to one
+   * property."
+   *
+   * Every section narrows EXCEPT the company-level one. The Stripe-payouts
+   * task belongs to the company, not a park, and a landlord reading one park
+   * still needs to know they cannot be paid at all — so it survives the
+   * filter deliberately, and that is asserted rather than left to chance.
+   */
+  it('narrows the to-do list to the chosen property', async () => {
+    const blended = await todos()
+    expect(blended.status).toBe(200)
+
+    const a = await todos(`?propertyId=${propA}`)
+    expect(a.status).toBe(200)
+    // A task carrying a property can never belong to the park not chosen.
+    expect(a.body.data.counts.maintenance).toBeLessThanOrEqual(blended.body.data.counts.maintenance)
+    expect(a.body.data.counts.leases).toBeLessThanOrEqual(blended.body.data.counts.leases)
+    expect(a.body.data.counts.onboarding).toBeLessThanOrEqual(blended.body.data.counts.onboarding)
+    // The company's own task is not a property's, so it is untouched.
+    expect(a.body.data.counts.ach).toBe(blended.body.data.counts.ach)
+  })
+
+  it("REFUSES another landlord's property id for the to-do list too", async () => {
+    const res = await todos(`?propertyId=${otherProp}`)
+    expect(res.status).toBe(404)
   })
 
   it("REFUSES another landlord's property id", async () => {
@@ -173,6 +234,68 @@ describe('S654 outstanding vs delinquent vs accruing', () => {
       await c.query('COMMIT')
     } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
   }
+
+  // ── 11/4: THE CARD ANSWERS WITH THE SAME RULE AS OUTSTANDING ─────────────
+  //
+  // These two cards had their own spelling of "is money owed on this row" and
+  // it had drifted three ways from the shared rule (openBalanceSql →
+  // payableRowSql). Each case below is a charge the card counted and the
+  // Outstanding page did not, which is the S639 complaint over again.
+  /** A unit whose ONLY open charge is one $4 fee, long past grace. */
+  async function unitWithOneFee(o: { held?: boolean; entry?: string; inFlight?: boolean } = {}) {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { rows: [{ landlord_id }] } = await c.query(`SELECT landlord_id FROM properties WHERE id=$1`, [propA])
+      const unitId = await seedUnit(c, { propertyId: propA, landlordId: landlord_id })
+      await c.query(`UPDATE units SET status='active' WHERE id=$1`, [unitId])
+      const { rows: [lease] } = await c.query<{ id: string }>(
+        `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, late_fee_grace_days)
+         VALUES ($1,$2,500,'month_to_month','active', CURRENT_DATE - 60, 5) RETURNING id`, [unitId, landlord_id])
+      await c.query(
+        // created_at matters as much as due_date: a charge GAM wrote TODAY is not
+        // late yet whatever its due date (10/12, Nic), so a fixture that leaves
+        // it at now() can never be past grace.
+        `INSERT INTO payments (unit_id, lease_id, landlord_id, type, amount, status, due_date,
+                               entry_description, revenue_owner, held_for_next_bill_at, stripe_payment_intent_id,
+                               created_at)
+         VALUES ($1,$2,$3,'fee',4.00,'pending', CURRENT_DATE - 30, $4, $5, $6, $7, NOW() - INTERVAL '33 days')`,
+        [unitId, lease.id, landlord_id, o.entry ?? 'RETURNFEE',
+         o.entry === 'FLEXPAY' ? 'gam' : 'landlord',
+         o.held ? new Date() : null,
+         o.inFlight ? `pi_${randomUUID().slice(0, 8)}` : null])
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('a charge held for the next bill makes a unit neither owing nor delinquent', async () => {
+    await unitWithOneFee({ held: true })
+    const res = await dash()
+    expect(res.status).toBe(200)
+    expect(res.body.data.units_owing).toBe(0)
+    expect(res.body.data.units_past_grace).toBe(0)
+  })
+
+  it('the same charge NOT held does count — so it is the hold doing the work', async () => {
+    await unitWithOneFee({ held: false })
+    const res = await dash()
+    expect(res.body.data.units_owing).toBe(1)
+    expect(res.body.data.units_past_grace).toBe(1)
+  })
+
+  it('a charge whose money is already clearing is not a unit that owes', async () => {
+    await unitWithOneFee({ inFlight: true })
+    const res = await dash()
+    expect(res.body.data.units_owing).toBe(0)
+    expect(res.body.data.units_past_grace).toBe(0)
+  })
+
+  it('GAM\'s FlexPay pull never shows on a landlord\'s card (CLAUDE.md)', async () => {
+    await unitWithOneFee({ entry: 'FLEXPAY' })
+    const res = await dash()
+    expect(res.body.data.units_owing).toBe(0)
+    expect(res.body.data.units_past_grace).toBe(0)
+  })
 
   it('counts owing, past-grace, and fee-will-be-charged separately', async () => {
     await unitOwing({ daysPastDue: 0,  graceDays: 5, fee: 50 })              // due today: outstanding only
@@ -530,8 +653,8 @@ describe('10/18 Outstanding counts every open charge, and ties to the balances p
     await db.query(
       `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items,
                                   subtotal, total, customer_name, customer_email, status)
-       VALUES ($1,$2,$3,$4,'one_time','Move-out bill', $5::jsonb, $6, $6, 'Andres Razo',
-               'andres@example.test','open')`,
+       VALUES ($1,$2,$3,$4,'one_time','Move-out bill', $5::jsonb, $6, $6, 'Cora Castellan',
+               'cora@example.test','open')`,
       [`tok_${randomUUID().slice(0, 12)}`, landlord_id, propertyId, meUserId,
        JSON.stringify([{ name: 'Move-out bill', qty: 1, price: total, tax: 0 }]), total])
   }

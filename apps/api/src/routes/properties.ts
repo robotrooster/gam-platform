@@ -1124,7 +1124,7 @@ propertiesRouter.put('/:id/late-fee-overrides', requirePerm('properties.edit'), 
         // policy is $25 initial + $5/day). All-or-nothing per group.
         accrualAmount: z.number().min(0).nullish(),
         accrualType:   z.enum(['flat', 'percent_of_rent']).nullish(),
-        accrualPeriod: z.enum(['daily', 'weekly', 'monthly']).nullish(),
+        accrualPeriod: z.enum(['daily', 'weekly']).nullish(),
         // S577: where the accrual counts from once grace is crossed. Default
         // due_date_inclusive (fits the first cohort; landlord-configurable,
         // neutral copy). grace_end = accrual starts after grace (prior behavior).
@@ -1709,8 +1709,8 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     if (lateFeeAccrualType !== undefined && lateFeeAccrualType !== null && lateFeeAccrualType !== 'flat' && lateFeeAccrualType !== 'percent_of_rent') {
       throw new AppError(400, 'late_fee_accrual_type must be flat, percent_of_rent, or null')
     }
-    if (lateFeeAccrualPeriod !== undefined && lateFeeAccrualPeriod !== null && !['daily', 'weekly', 'monthly'].includes(lateFeeAccrualPeriod)) {
-      throw new AppError(400, 'late_fee_accrual_period must be daily, weekly, monthly, or null')
+    if (lateFeeAccrualPeriod !== undefined && lateFeeAccrualPeriod !== null && !['daily', 'weekly'].includes(lateFeeAccrualPeriod)) {
+      throw new AppError(400, 'late_fee_accrual_period must be daily, weekly, or null')
     }
     if (lateFeeCapType !== undefined && lateFeeCapType !== null && lateFeeCapType !== 'flat' && lateFeeCapType !== 'percent_of_rent') {
       throw new AppError(400, 'late_fee_cap_type must be flat, percent_of_rent, or null')

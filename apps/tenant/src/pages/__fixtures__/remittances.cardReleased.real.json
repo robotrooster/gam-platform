@@ -20,7 +20,13 @@
           "type": "rent",
           "dueDate": "2026-10-04",
           "entryDescription": "RENT",
-          "paymentStatus": "pending"
+          "paymentStatus": "pending",
+          "utilityType": null,
+          "feeType": null,
+          "feeDescription": null,
+          "returnedOn": null,
+          "label": "Rent",
+          "detail": null
         }
       ]
     },
@@ -44,7 +50,13 @@
           "type": "rent",
           "dueDate": "2026-10-04",
           "entryDescription": "RENT",
-          "paymentStatus": "pending"
+          "paymentStatus": "pending",
+          "utilityType": null,
+          "feeType": null,
+          "feeDescription": null,
+          "returnedOn": null,
+          "label": "Rent",
+          "detail": null
         }
       ]
     },

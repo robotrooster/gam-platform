@@ -175,7 +175,7 @@ describe('moving a resident to another space', () => {
 // the first part of the month for that first site and for the later half of the
 // month start and end for the later site, and show them as line items."
 describe('billing a month with a move in it', () => {
-  // S652 (Nic): "make sure that Dakota Lane was billed properly." The closing
+  // S652 (Nic): "make sure that Tobin Thornbury was billed properly." The closing
   // read was recorded and never billed; her old space billed 0 kWh for the
   // month and the 481 kWh she used there went nowhere.
   it('bills the resident for the old space up to the closing read, on the move month', async () => {

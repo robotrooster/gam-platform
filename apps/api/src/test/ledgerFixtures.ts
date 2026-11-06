@@ -41,19 +41,39 @@ export interface LedgerCompany {
   owner: LedgerOwner
 }
 
-/** A landlord company with books starting `booksStart` (null = none picked), two properties and a unit. */
-export async function ledgerCompany(o: { booksStart?: string | null } = {}): Promise<LedgerCompany> {
+/**
+ * A landlord company with two properties and a unit.
+ *
+ * `booksStart` is the date BOTH properties get (null = none picked), and the
+ * company's own `landlords.books_start_date` is then derived from them by
+ * properties_derive_company_books_start() — 11/3, when the date moved onto the
+ * property because a property bought later has its own books start. Writing
+ * the landlord row directly here would be a lie the next property save erased,
+ * so this sets the properties and reads the company's back.
+ *
+ * `booksStart2` gives the SECOND property a different date, which is the shape
+ * every per-property test needs: money at property 1 posts while the same
+ * month at property 2 is still before its books begin.
+ */
+export async function ledgerCompany(
+  o: { booksStart?: string | null; booksStart2?: string | null } = {},
+): Promise<LedgerCompany> {
   return inTx(async (c) => {
     const { userId: ownerUserId, landlordId } = await seedLandlord(c)
     const propertyId = await seedProperty(c, { landlordId, ownerUserId, managedByUserId: ownerUserId })
     const propertyId2 = await seedProperty(c, { landlordId, ownerUserId, managedByUserId: ownerUserId })
     const unitId = await seedUnit(c, { propertyId, landlordId })
     const start = o.booksStart === undefined ? '2026-01-01' : o.booksStart
-    await c.query(`UPDATE landlords SET books_start_date = $2 WHERE id = $1`, [landlordId, start])
+    const start2 = o.booksStart2 === undefined ? start : o.booksStart2
+    await c.query(`UPDATE properties SET books_start_date = $2 WHERE id = $1`, [propertyId, start])
+    await c.query(`UPDATE properties SET books_start_date = $2 WHERE id = $1`, [propertyId2, start2])
     // Set up before the test starts: nothing of its own is waiting (picking the
-    // start date marked the company's opening posting, which no test projector
-    // posts in this phase).
-    await c.query(`DELETE FROM ledger_outbox WHERE source_type = 'opening' AND source_id = $1`, [landlordId])
+    // start date marked the opening posting, which no test projector posts in
+    // this phase). The LIKE covers the composite `landlordId|propertyId` the
+    // opening's source_id takes once there is one opening per property.
+    await c.query(
+      `DELETE FROM ledger_outbox
+        WHERE source_type = 'opening' AND (source_id = $1 OR source_id LIKE $1 || '|%')`, [landlordId])
     return { landlordId, ownerUserId, propertyId, propertyId2, unitId, owner: { landlordId } }
   })
 }

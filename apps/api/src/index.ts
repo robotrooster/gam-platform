@@ -26,6 +26,7 @@ import { recordLatency } from './lib/apiMetrics'
 import { authRouter }         from './routes/auth'
 import { totpRouter }         from './routes/totp'
 import { emailOtpRouter }     from './routes/emailOtp'
+import { passkeysRouter }     from './routes/passkeys'
 import { landlordsRouter }    from './routes/landlords'
 import { landlordAgentActivityRouter } from './routes/landlordAgentActivity'
 import { pmAgentActivityRouter } from './routes/pmAgentActivity'
@@ -86,7 +87,11 @@ import { balancesRouter }     from './routes/balances'
 import { disbursementsRouter } from './routes/disbursements'
 import { maintenanceRouter }  from './routes/maintenance'
 import { documentsRouter }    from './routes/documents'
+// 11/01: one home for insurance — a property's building policy, a resident's
+// renters liability, a vendor's general liability and bond, and the lapse list.
+import { insuranceRouter }    from './routes/insurance'
 import { utilityRouter }      from './routes/utility'
+import { marketplaceRouter }  from './routes/marketplace'
 import { utilityServiceAgreementsRouter } from './routes/utilityServiceAgreements'
 import { oneOffChargesRouter } from './routes/oneOffCharges'
 import { propaneRouter }      from './routes/propane'
@@ -99,6 +104,7 @@ import { workTradeRouter }    from './routes/workTrade'
 import { declaredDepositsRouter } from './routes/declaredDeposits'
 import { posRouter }          from './routes/pos'
 import { posPayLinksRouter, publicPayRouter } from './routes/posPayLinks'
+import { publicGuestIdRouter, guestIdFilesRouter } from './routes/publicGuestId'
 import { reportsRouter }      from './routes/reports'
 import { maintenancePortalRouter } from './routes/maintenance-portal'
 import { esignRouter }        from './routes/esign'
@@ -283,7 +289,7 @@ app.set('trust proxy', 1)
 
 // ── S639 SECURITY: NEVER LET A BROWSER CACHE ONE PERSON'S DATA FOR ANOTHER ───
 //
-// Nick Platt accepted his invite on a browser where another household member was
+// Maren Pemberton accepted his invite on a browser where another household member was
 // already signed in and saw THEIR profile. The main culprit was the client-side
 // query cache (fixed in every portal), but the API log showed the other half of
 // the same hazard: `GET /api/tenants/me` and `/api/auth/me` answering 304, which
@@ -363,6 +369,10 @@ app.get('/health', async (_req, res) => {
 app.use('/api/auth',          authRouter)
 app.use('/api/auth/totp',     totpRouter)
 app.use('/api/auth/email-otp', emailOtpRouter)
+// 10/30 (Nic): "a passkey replaces the emailed code; password + code stays the
+// fallback." The sign-in pair under here is unauthenticated by design — a
+// discoverable key means nothing is typed first (routes/passkeys.ts).
+app.use('/api/auth/passkey',  passkeysRouter)
 app.use('/api/landlords',     landlordsRouter)
 app.use('/api/landlord/agent-activity', landlordAgentActivityRouter)
 app.use('/api/businesses',    businessesRouter)
@@ -383,6 +393,13 @@ app.use('/api/business-bookable-services', businessBookableServicesRouter)
 app.use('/api/public', publicBookingRouter)
 app.use('/api/public', publicPropertyBookingRouter)
 app.use('/api/public', publicPayRouter)
+// 10/29: the guest's own ID-capture page. No sign-in on purpose — the
+// token in their reservation email is the key, and it opens exactly one
+// thing: attaching an identification to that one booking.
+app.use('/api/public', publicGuestIdRouter)
+// The pictures back out, GAM-admin only, with per-row auth. NOT a static
+// mount: see the S535 note above, which this obeys.
+app.use('/api', guestIdFilesRouter)
 app.use('/api/business-attachments', businessAttachmentsRouter)
 app.use('/api/business-search', businessSearchRouter)
 app.use('/api/public', publicCardUpdateRouter)
@@ -432,6 +449,7 @@ app.use('/api/balances',      balancesRouter)
 app.use('/api/disbursements', disbursementsRouter)
 app.use('/api/maintenance',   maintenanceRouter)
 app.use('/api/documents',     documentsRouter)
+app.use('/api/insurance',     insuranceRouter)
 // S615: mounted BEFORE the utility router so '/service-agreements' is matched
 // here rather than falling into utilityRouter's own route table.
 app.use('/api/utility/service-agreements', utilityServiceAgreementsRouter)
@@ -448,9 +466,19 @@ app.use('/api/stripe',        stripeRouter)
 app.use('/api/pos/pay-links', posPayLinksRouter)
 app.use('/api/pos',           posRouter)
 app.use('/api/reports',       reportsRouter)
-// Allow PDF embedding for file routes
+// Allow PDF embedding for file routes.
+//
+// 10/30: the forced `Content-Type: application/pdf` came out of here, because
+// it applied to EVERY response on this path including the refusals. Express's
+// res.json() only sets a content type when one is not already set, so a 403
+// "Not authorized to view this file", a 404, and the new 410 for a document
+// that is fully signed all went out labelled as a PDF carrying JSON bytes —
+// the caller got an unparseable body instead of the sentence explaining what
+// happened. The header was redundant anyway: res.sendFile types the response
+// from the file's extension, and all 271 documents on this route end in .pdf.
+// The framing headers stay; they are what lets the signing page embed the PDF
+// it is asking the reader to sign.
 app.use('/api/esign/files', (req, res, next) => {
-  res.setHeader('Content-Type', 'application/pdf')
   res.setHeader('X-Frame-Options', 'ALLOWALL')
   res.setHeader('Content-Security-Policy', "frame-ancestors *")
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
@@ -501,6 +529,7 @@ app.use('/api/sales',          salesAgentRouter)
 app.use('/api/guest',          guestAgentRouter)
 app.use('/api/property',       propertyAgentRouter)
 app.use('/api/entry-requests', entryRequestsRouter)
+app.use('/api/marketplace',   marketplaceRouter)
 app.use('/webhooks',          webhooksRouter)
 
 // Sentry's express error handler must come AFTER all routes and

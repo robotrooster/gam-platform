@@ -158,6 +158,23 @@ export async function projectCharge(client: PoolClient, f: PaymentFacts, co: Com
     L.dr('ar_tenants', gross, { ...d, reportCategory: 'space_rent' })
     for (const p of incomePartsFor({ ...f, category: 'space_rent' }, gross)) L.cr(p.role, p.cents, { ...d, reportCategory: 'space_rent', sub: p.sub })
     memo = 'Work-trade hours not completed, billed as rent'
+  } else if (f.type === 'carried_balance' && f.leftOwingCollectionId !== null) {
+    // A8c — 10/27 (Nic): a debt the resident left with ANOTHER operator, which
+    // this landlord collects for them. "They can pay you and we'll collect the
+    // money from you."
+    //
+    // It is billed on this landlord's invoice because that is the invoice the
+    // resident gets, and it is NOT this landlord's money at any point. So the
+    // resident owes it (receivable) and this landlord owes it onward
+    // (liability), and the two cancel when the weekly payout takes it off them
+    // and pays the operator owed (held item 'left_owing_netted', posted in
+    // payoutHeldItem). No income, and no equity: A8 below would have credited
+    // OPENING BALANCE EQUITY, which would say this landlord got richer by
+    // somebody else's debt.
+    L.dr('ar_tenants', gross, { ...d, reportCategory: 'balances_collected' })
+    L.cr('collected_for_another_operator', gross,
+         { ...d, reportCategory: 'balances_collected', memo: 'Collected for another operator' })
+    memo = 'Balance owed from a previous tenancy on the platform'
   } else if (f.type === 'carried_balance' && f.spaceCarryforwardId === null) {
     // A8 — a balance from before GAM: owed to the company, never income here.
     L.dr('ar_tenants', gross, { ...d, reportCategory: 'balances_collected' })
@@ -254,6 +271,54 @@ export const homeInstallmentProjector: LedgerProjector = {
          FROM home_sale_installments i JOIN home_sale_contracts c ON c.id = i.contract_id
         WHERE i.id = $1`, [sourceId])).rows[0]
     if (!r || !r.off || r.payment_id) return []
+    // ── 11/4 (Nic): MONEY THAT WAS NEVER PAID IS NOT INCOME ─────────────────
+    //
+    //   "The money that was never paid needs to go on left still owing if the
+    //    people are gone, or still show as owing to people that are still
+    //    there."
+    //
+    // settled_off_platform_at does three jobs at once: the installment never
+    // bills, it counts as paid when the balance is worked out, and — here — it
+    // is recognized as income. The first two are right for every installment
+    // before a park's first billing cycle (services/homeSale stamps them by
+    // date, which is all a date can tell you). The third is only right when the
+    // money actually arrived.
+    //
+    // At Country Acres it had not. Eight September trailer installments were
+    // stamped on 9/27 and 10/12; three of those lots never paid September, and
+    // their whole lot total — the trailer payment inside it — came in as a
+    // carried balance that is still owed, or followed the resident out onto the
+    // left-owing book. GAM recognized $500 of trailer income against money
+    // nobody had handed over, while the same dollars sat on the resident's
+    // balance. One dollar, two places.
+    //
+    // THE RULE, and why it is not "is it still owed". A8 above already settles
+    // what pre-GAM money is: a carried balance posts ar_tenants against
+    // opening_balance_equity — "owed to the company, never income here" —
+    // whether it is ever paid or not. So when a month arrived as a carried
+    // balance, the trailer payment inside it is pre-GAM balance money, and
+    // pre-GAM balance money is never income. Paying it later moves cash
+    // against the receivable; it does not become income then either.
+    //
+    // That also keeps this projector honest: a rule written as "still owed"
+    // would make this installment's income depend on ANOTHER row's live
+    // status, and nothing re-projects an installment when a payment settles —
+    // so the income would silently fail to come back. This condition depends
+    // only on facts that do not move.
+    //
+    // The five lots at Country Acres that DID pay September are untouched by
+    // this: their month came in as a settled rent row, not a carried balance,
+    // and their trailer payment is now its own linked charge row, which is
+    // where their income comes from.
+    const preGam = (await client.query<{ carried: boolean }>(
+      `SELECT EXISTS (
+                SELECT 1 FROM payments cb
+                 WHERE cb.unit_id = $1 AND cb.type = 'carried_balance'
+                   AND cb.space_carryforward_id IS NULL
+                   AND date_trunc('month', cb.due_date) = date_trunc('month', $2::date)
+                   AND cb.voided_at IS NULL) AS carried`,
+      [r.unit_id, r.day])).rows[0]
+    if (preGam?.carried) return []
     const co = await loadCompanyBooks(client, r.landlord_id)
     const method = requireHomeSaleMethod(co)
     const d = { propertyId: r.property_id, unitId: r.unit_id, leaseId: r.lease_id, tenantId: r.tenant_id }

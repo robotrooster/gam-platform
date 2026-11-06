@@ -868,6 +868,112 @@ export async function resyncTenantBankSummary(tenantId: string): Promise<{ metho
   }
 }
 
+/**
+ * 11/5 (Nic) — A BANK THAT BOUNCED TWICE IS TAKEN OFF THE ACCOUNT.
+ *
+ *   "If that retry bounces too, GAM needs to fully de-link their bank account
+ *    and they have to go through the micro deposits again and verify a new
+ *    bank. For people that are costing us money, I want to make it as
+ *    inconvenient as possible. That way maybe they'll just pay with a debit
+ *    card instead."
+ *
+ * Every refused bank debit costs GAM $4 that Stripe does not give back. A
+ * resident whose account bounces, bounces again on the retry, and then keeps
+ * the same account on file is a standing $8-a-month bill to GAM for nothing.
+ * Taking the account off means the next attempt cannot be made from it at all:
+ * they re-link and wait out micro-deposits, or they reach for a card.
+ *
+ * ── WHY NOT removeTenantPaymentMethod ──────────────────────────────────────
+ *
+ * That one is the RESIDENT removing their own method, and its guards are built
+ * for that: it refuses while a pull is in flight, and it refuses to strip
+ * somebody of their only verified bank. Both are right for a person clicking
+ * Remove and both are wrong here — this runs BECAUSE a pull just failed, and
+ * taking the only bank away is the entire point. So it is its own path rather
+ * than a flag that would quietly weaken the resident's guards too.
+ *
+ * ── WHAT IT LEAVES THEM WITH ───────────────────────────────────────────────
+ *
+ * The same state as somebody who never linked a bank: not verified, no bank on
+ * file, nothing pinned in autopay, and bank payments stopped
+ * (`ach_suspended_at`, which chargeLeaseBalance and the autopay runner both
+ * refuse on). Re-linking starts the ordinary micro-deposit flow, which is the
+ * inconvenience, and it is not a punishment the system has to remember: once a
+ * new account verifies, recordVerifiedTenantBank lifts the stop.
+ *
+ * ── IT NEVER FAILS THE THING THAT CALLED IT ────────────────────────────────
+ *
+ * The webhook that calls this has already recorded the failed pull and the
+ * fee, which is the part that must not be lost. Stripe refusing the detach, or
+ * being unreachable, must not roll that back — so Stripe is best-effort and the
+ * row is cleared regardless. A payment method left attached at Stripe but gone
+ * from the account is harmless: nothing can pull from a method the account no
+ * longer names, and the next resync reconciles it.
+ */
+export async function dropBankAfterRepeatReturn(opts: {
+  tenantId: string
+  /** The method the refused pull was made from, when the intent named one. */
+  paymentMethodId?: string | null
+  /** Plain words for the log and the resident's notice. */
+  reason: string
+}): Promise<{ dropped: boolean; detached: boolean; last4: string | null }> {
+  const client = await getClient()
+  let detached = false
+  try {
+    await client.query('BEGIN')
+    await lockTenantBanks(client, opts.tenantId)
+    const t = (await client.query<{ stripe_customer_id: string | null } & BankSummaryRow>(
+      `SELECT stripe_customer_id, ach_verified, bank_last4, bank_routing_last4, bank_pending_since
+         FROM tenants WHERE id = $1 FOR UPDATE`, [opts.tenantId])).rows[0]
+    if (!t) { await client.query('ROLLBACK'); return { dropped: false, detached: false, last4: null } }
+    const last4 = t.bank_last4 ?? null
+
+    // Nothing on file and already stopped: this has run before (a second
+    // webhook delivery, or both lines of one pull). Say so rather than
+    // re-notifying somebody who has already been told.
+    const nothingToDo = !t.ach_verified && !t.bank_last4 && !t.bank_routing_last4
+    if (nothingToDo) { await client.query('ROLLBACK'); return { dropped: false, detached: false, last4 } }
+
+    await client.query(
+      `UPDATE tenants
+          SET ach_verified = FALSE,
+              bank_last4 = NULL,
+              bank_routing_last4 = NULL,
+              bank_pending_since = NULL,
+              ach_suspended_at = COALESCE(ach_suspended_at, NOW()),
+              updated_at = NOW()
+        WHERE id = $1`, [opts.tenantId])
+
+    // Autopay must not keep pointing at a method that is gone — it would fail
+    // every cycle and bill GAM $4 each time, which is the thing this prevents.
+    await client.query(
+      `UPDATE tenant_autopay SET payment_method_id = NULL, updated_at = NOW()
+        WHERE tenant_id = $1 AND payment_method_id IS NOT NULL`, [opts.tenantId])
+
+    await client.query('COMMIT')
+
+    // Best-effort, after the commit: the account state is already right, and
+    // Stripe being down must not undo it.
+    if (opts.paymentMethodId) {
+      try {
+        await getStripe().paymentMethods.detach(opts.paymentMethodId)
+        detached = true
+      } catch (e) {
+        logger.warn({ err: e, tenantId: opts.tenantId, paymentMethodId: opts.paymentMethodId },
+          '[tenant-banks] bank dropped from the account, but Stripe would not detach it')
+      }
+    }
+    logger.info({ tenantId: opts.tenantId, last4, detached, reason: opts.reason },
+      '[tenant-banks] bank taken off the account after a repeat return')
+    return { dropped: true, detached, last4 }
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
 // ─── Remove a saved method ──────────────────────────────────────────────────
 
 export interface RemoveResult {

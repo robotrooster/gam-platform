@@ -62,16 +62,99 @@ FRONTENDS=(
   # silently keeps serving last month's code.
   "admin-ops:ops.goldassetmanagement.com"
   "books:books.goldassetmanagement.com"
+  # 10/31: the business portal had NEVER shipped — no Vercel project at all,
+  # not merely stale like the two above. That made the contractor marketplace
+  # half a product: landlords could post a job and no contractor had anywhere
+  # to go. business. is the primary and contractors. is the second door on the
+  # same deployment (Nic picked both), so a plumber sent a link reads the name
+  # of what they came for.
+  "business:business.goldassetmanagement.com"
 )
 
 GREEN=$'\033[32m'; RED=$'\033[31m'; YEL=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
-ok(){ echo "${GREEN}✓${OFF} $*"; }
-warn(){ echo "${YEL}•${OFF} $*"; }
-bad(){ echo "${RED}✗${OFF} $*"; }
+
+# ── EVERY DEPLOY EMAILS NIC (10/30) ─────────────────────────────────────────
+# Nic: "I would also like emails at each deploy going forward."
+#
+# This lives IN THE SCRIPT and not in anybody's memory, because the three
+# earlier times he asked to be told without having to watch, it was done by
+# hand and then forgotten by the next round.
+#
+# It does NOT tee this script's stdout into a log. That was the obvious
+# implementation and it would have hung the deploy: `wait` at the end of the
+# parallel stage waits on every child, and a `tee` reading a pipe that is still
+# open never exits. So the four printing helpers each append one plain line to
+# a report file instead, which costs nothing and reads better in mail than a
+# screenful of color codes would.
+REPORT="/tmp/gam-deploy-report-$(date '+%Y%m%d-%H%M%S').txt"
+: > "$REPORT"
+sect(){ echo; echo "── $* ──"; printf '\n[%s]\n' "$*" >> "$REPORT"; }
+ok(){ echo "${GREEN}✓${OFF} $*"; echo "  ok   $*" >> "$REPORT"; }
+warn(){ echo "${YEL}•${OFF} $*"; echo "  note $*" >> "$REPORT"; }
+bad(){ echo "${RED}✗${OFF} $*"; echo "  FAIL $*" >> "$REPORT"; }
 FAILED=0
 # 10/12 review: set when the API did not build, load or answer. Every frontend
 # step below is skipped then — see "API first" after the API step.
 API_FAILED=0
+
+# Hung off EXIT so the two early aborts below — the shared build and the test
+# gate — mail as well. Those are the ones actually worth hearing about, since
+# they mean nothing shipped. A mail failure never changes the deploy's result:
+# the trap returns the status it was handed, and the real outcome has already
+# been printed above it.
+#
+# 11/1: THE SUBJECT MUST NOT SAY "nothing shipped" WHEN THINGS SHIPPED.
+# Every failure used to mail the same subject. On 11/1 the API, the demo,
+# marketing and six portals all deployed and verified, ONE portal failed on a
+# DNS record that does not exist, and the email said "FAILED — nothing shipped".
+# Nic reads the subject and reasonably concludes production is untouched, which
+# is the opposite of true and the worst thing this email can get wrong — he
+# either re-runs a deploy he does not need or holds off work that is already
+# live. The report file already holds one line per step, so the subject is
+# counted from it rather than guessed: nothing ticked means nothing shipped;
+# anything ticked plus a failure is PARTLY LIVE, and the body names which.
+mail_result(){
+  local rc=$?
+  $CHECK_ONLY && return "$rc"
+  local subject state shipped failed_n
+  # grep -c prints 0 and exits 1 when there is no match; capture it plainly
+  # rather than with `|| echo 0`, which would make the value "0\n0".
+  #
+  # 11/1, SECOND PASS: count only the lines that mean something is LIVE IN
+  # PRODUCTION. The first version counted every '  ok   ' line, which includes
+  # "built", "API suite green" and every passing portal suite — so when the API
+  # BUILD failed and all ten surfaces were skipped, it counted five green test
+  # suites as things that shipped and mailed "PARTLY LIVE". Nothing had
+  # shipped. A subject that overstates is the same failure as the one this
+  # replaced, pointing the other way.
+  shipped=$(grep -cE '^  ok   (deployed and verified|restarted and answering|demo API restarted)' "$REPORT" 2>/dev/null)
+  shipped=${shipped:-0}
+  failed_n=$(grep -c '^  FAIL ' "$REPORT" 2>/dev/null); failed_n=${failed_n:-0}
+  if [ "$rc" -eq 0 ] && [ "$FAILED" -eq 0 ]; then
+    state="LIVE"
+  elif [ "$shipped" -eq 0 ]; then
+    state="FAILED — nothing shipped"
+  else
+    state="PARTLY LIVE — $failed_n step(s) failed, the rest shipped"
+  fi
+  subject="GAM deploy $state — $(date '+%b %-d, %-I:%M %p')"
+  {
+    echo "$subject"
+    echo
+    echo "Took $((SECONDS / 60))m $((SECONDS % 60))s."
+    $SKIP_TESTS && echo "TESTS WERE SKIPPED (--skip-tests) — nothing verified this code."
+    cat "$REPORT"
+    echo
+    echo "Full logs on the Mac: /tmp/gam-deploy-*.log"
+  } > "$REPORT.mail"
+  if (cd apps/api && npm run -s notify:nic -- "$subject" "$REPORT.mail") >/dev/null 2>&1; then
+    echo "${DIM}emailed: $subject${OFF}"
+  else
+    echo "${YEL}•${OFF} the result email did not send — the deploy result above stands"
+  fi
+  return "$rc"
+}
+trap mail_result EXIT
 
 echo "═══ GAM deploy $(date '+%Y-%m-%d %H:%M:%S') ═══"
 $CHECK_ONLY && echo "${DIM}check-only — nothing will be changed${OFF}"
@@ -82,7 +165,7 @@ $CHECK_ONLY && echo "${DIM}check-only — nothing will be changed${OFF}"
 # compiles against that dist, the API suite included (apps/api imports
 # @gam/shared through it). Building it once, here, is what lets the suite and
 # every surface build run side by side without one rewriting the other's input.
-echo; echo "── @gam/shared ──"
+sect "@gam/shared"
 if (cd packages/shared && npm run build >/tmp/gam-deploy-shared.log 2>&1); then
   ok "built"
 else
@@ -132,14 +215,16 @@ gate_suite(){
   fi
   bad "$2 FAILED — nothing has been deployed."
   echo
-  grep -E "FAIL|✕|Tests +[0-9]+ failed" "$3" | head -20
+  # Into the mail as well as the terminal: "a suite failed" without the name of
+  # the test that failed is not something anyone can act on from a phone.
+  grep -E "FAIL|✕|Tests +[0-9]+ failed" "$3" | head -20 | tee -a "$REPORT"
   echo
   echo "Full output: $3"
   echo "To ship anyway (and you should have a reason): bash deploy.sh --skip-tests"
   exit 1
 }
 
-echo; echo "── tests + builds (in parallel) ──"
+sect "tests + builds (in parallel)"
 if $CHECK_ONLY; then
   warn "would run the API, tenant, landlord, register and PM company suites (skipped in --check)"
 elif $SKIP_TESTS; then
@@ -164,6 +249,13 @@ else
   # long and both are green, and in this stage they cost no wall clock at all.
   stage_run pos-tests /tmp/gam-deploy-tests-pos.log \
     "cd apps/pos && npx vitest run --reporter=dot"
+  # 10/31: apps/business had NO tests at all — zero files — until the contractor
+  # marketplace gave it a surface that decides money. A contractor reads what
+  # they keep and what GAM's cut is on that screen, and places a price no other
+  # contractor may ever see, so the anonymity of the board and the privacy of a
+  # bid are asserted there and not only on the server.
+  stage_run business-tests /tmp/gam-deploy-tests-business.log \
+    "cd apps/business && npx vitest run --reporter=dot"
   # 10/23: apps/pm-company is a one-page door to the landlord portal now (the
   # management portal folded in — PM_FOLD_PLAN.md). Nothing to test: no login,
   # no data, no API call. The surface still BUILDS and deploys below, so the
@@ -219,11 +311,12 @@ if ! $CHECK_ONLY && ! $SKIP_TESTS; then
   gate_suite tenant-tests   "tenant portal suite green"   /tmp/gam-deploy-tests-tenant.log
   gate_suite landlord-tests "landlord portal suite green" /tmp/gam-deploy-tests-landlord.log
   gate_suite pos-tests        "register suite green"      /tmp/gam-deploy-tests-pos.log
+  gate_suite business-tests   "business portal suite green" /tmp/gam-deploy-tests-business.log
 
 fi
 
 # ── API ──────────────────────────────────────────────────────────────────
-echo; echo "── API (launchd com.gam.api) ──"
+sect "API (launchd com.gam.api)"
 if [ "$(stage_rc api-build)" = "0" ]; then
   ok "built"
   if ! $CHECK_ONLY; then
@@ -287,6 +380,97 @@ if [ "$API_FAILED" -ne 0 ]; then
   echo; bad "API did not go live — marketing, every frontend and the storefront are SKIPPED (production keeps their current builds)"
 fi
 
+# ── demo / sales environment (launchd com.gam.api.demo) ──────────────────
+# 10/28 (Nic): "the demo environment should always match what is currently
+# deployed. Anytime we make a new deploy, we need to update that demo
+# environment. That needs to be a rule... I don't even want it to be an hour
+# behind."
+#
+# WHY IT DRIFTED FOR 13 DAYS. com.gam.api.demo runs the SAME compiled file as
+# com.gam.api — apps/api/dist/index.js — pointed at .env.demo (gam_demo, port
+# 4100, no live credentials). The API step above rebuilds that file and
+# restarts the LIVE service only, so the demo service kept October-14 code
+# resident in memory while the file underneath it was rebuilt a dozen times.
+# Nothing was misconfigured; the demo was simply never a step in this script.
+# A prospect on a sales call was shown a build two weeks old.
+#
+# Two things have to move for the demo to match, and one of them is the
+# database: gam_demo is a separate database with its own schema_migrations, so
+# new code lands in front of old columns unless it is migrated too.
+if [ "$API_FAILED" -eq 0 ]; then
+  sect "demo (launchd com.gam.api.demo)"
+  if $CHECK_ONLY; then
+    warn "would migrate gam_demo and restart the demo API"
+  else
+    # gam_demo first — the restarted process must not meet a schema older than
+    # the code it is about to run. migrate.ts regenerates schema.sql afterwards
+    # via dump-schema.sh, which reads the PRODUCTION database by default, so
+    # the snapshot in the repo keeps describing gam and not the demo. The
+    # explicit re-dump below is belt-and-braces for that, since a demo-shaped
+    # schema.sql would rebuild gam_test wrong and break the next suite.
+    if GAM_ENV_FILE="$PWD/apps/api/.env.demo" npm run migrate --workspace=apps/api >/tmp/gam-deploy-demo-migrate.log 2>&1; then
+      # grep -c prints 0 AND exits 1 when nothing matches, so `|| echo 0`
+      # would append a second zero — same family as the pipefail/grep -q trap.
+      applied=$(grep -cE "^ *(✓|applied)" /tmp/gam-deploy-demo-migrate.log 2>/dev/null || true)
+      ok "gam_demo migrated (${applied:-0} migration lines)"
+    else
+      bad "gam_demo migration FAILED — see /tmp/gam-deploy-demo-migrate.log"; FAILED=1
+    fi
+    bash apps/api/scripts/dump-schema.sh >/dev/null 2>&1 || warn "schema.sql re-dump from production failed"
+
+    # 10/30 (Nic): "the demo data needs to always run what's live in production.
+    # They need to be fully in sync." Code and migrations already move together;
+    # this carries the CATALOG data that is loaded by hand-run scripts instead
+    # of by a migration. The disclosure library is why: production had 20
+    # documents and demo had zero, so every demo resident was told their state's
+    # landlord-tenant act was missing. Non-fatal — a reference-data gap is a
+    # worse demo, not a broken deploy.
+    if bash apps/api/scripts/sync-demo-reference.sh >/tmp/gam-deploy-demo-ref.log 2>&1; then
+      ok "demo reference data in sync ($(grep -c '\->' /tmp/gam-deploy-demo-ref.log 2>/dev/null || echo 0) tables)"
+    else
+      warn "demo reference sync had problems — see /tmp/gam-deploy-demo-ref.log"
+    fi
+
+    # Same bootout + bootstrap shape as the live service: a kickstart would
+    # restart the process without re-reading the plist.
+    launchctl bootout "gui/$(id -u)/com.gam.api.demo" >/dev/null 2>&1
+    for i in $(seq 1 20); do lsof -nP -iTCP:4100 -sTCP:LISTEN >/dev/null 2>&1 || break; sleep 1; done
+    for i in $(seq 1 60); do
+      launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.gam.api.demo.plist" >/dev/null 2>&1
+      launchctl print "gui/$(id -u)/com.gam.api.demo" >/dev/null 2>&1 && break
+      sleep 2
+    done
+    dcode=
+    for i in $(seq 1 60); do
+      dcode=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:4100/health 2>/dev/null)
+      [ "$dcode" = "200" ] && break
+      sleep 1
+    done
+    if [ "${dcode:-}" = "200" ]; then ok "demo API restarted and answering on :4100"
+    else bad "demo API restarted but NOT answering on :4100 (last code: ${dcode:-none})"; FAILED=1; fi
+  fi
+fi
+
+# ── both API services must be running code newer than the build ──────────
+# The check that would have caught the 13-day drift the day it started, and
+# the only one that actually proves "the demo matches what is deployed": a
+# service whose process started BEFORE dist/index.js was written is serving
+# code that no longer exists on disk. Cheap, and it needs no version endpoint.
+if ! $CHECK_ONLY && [ "$API_FAILED" -eq 0 ]; then
+  dist_mtime=$(stat -f %m apps/api/dist/index.js 2>/dev/null || echo 0)
+  for lbl in com.gam.api com.gam.api.demo; do
+    spid=$(launchctl print "gui/$(id -u)/$lbl" 2>/dev/null | awk '/pid = /{print $3; exit}')
+    if [ -z "${spid:-}" ]; then bad "$lbl is not running"; FAILED=1; continue; fi
+    # ps gives the start time in seconds since the epoch via lstart -> date.
+    started=$(date -j -f "%a %b %d %T %Y" "$(ps -o lstart= -p "$spid" | sed 's/  */ /g;s/^ //;s/ *$//')" +%s 2>/dev/null || echo 0)
+    if [ "$started" -ge "$dist_mtime" ] 2>/dev/null; then
+      ok "$lbl is running the current build"
+    else
+      bad "$lbl started BEFORE the build it is supposed to serve — it is serving stale code"; FAILED=1
+    fi
+  done
+fi
+
 # ── marketing ────────────────────────────────────────────────────────────
 # S617: THE PUBLIC SITE IS ON VERCEL NOW, not this Mac. goldassetmanagement.com
 # and www both point at cname.vercel-dns.com (project gam-marketing), matching
@@ -308,7 +492,7 @@ fi
 # as "all surfaces in sync" while the public page stayed two days stale. The 200
 # was true and meaningless. Build and publish to Vercel here, and verify by
 # fetching CONTENT, not a status code.
-echo; echo "── marketing (Vercel: goldassetmanagement.com) ──"
+sect "marketing (Vercel: goldassetmanagement.com)"
 if [ "$API_FAILED" -ne 0 ]; then
   warn "skipped: the API did not go live"
 elif $CHECK_ONLY; then
@@ -348,7 +532,7 @@ fi
 # ── Vercel frontends ─────────────────────────────────────────────────────
 for entry in "${FRONTENDS[@]}"; do
   app="${entry%%:*}"; domain="${entry##*:}"
-  echo; echo "── $app ($domain) ──"
+  sect "$app ($domain)"
   if [ "$API_FAILED" -ne 0 ]; then warn "skipped: the API did not go live"; continue; fi
   [ -d "apps/$app" ] || { warn "no such app, skipping"; continue; }
   [ -f "apps/$app/.vercel/project.json" ] || { warn "not Vercel-linked, skipping"; continue; }
@@ -396,7 +580,7 @@ done
 # storefront change silently never shipped. Found the hard way: the new
 # /apply page built clean, deploy.sh reported "all surfaces in sync", and
 # the page was not live.
-echo; echo "── storefront (self-hosted: *.gam.biz) ──"
+sect "storefront (self-hosted: *.gam.biz)"
 STOREFRONT_PROBE="${STOREFRONT_PROBE_URL:-https://mountain-view-rv-ranch-2843.gam.biz/}"
 if [ "$API_FAILED" -ne 0 ]; then
   warn "skipped: the API did not go live"
@@ -424,6 +608,25 @@ else
     done
     if [ "$sf_local" = "$sf_prod" ]; then ok "deployed and verified ($sf_local)"
     else bad "restarted but the site still serves ${sf_prod:-none}"; FAILED=1; fi
+  fi
+fi
+
+# ── 11/5: IS THE TUNNEL STALE? ──────────────────────────────────────────────
+#
+# Every public GAM address rides one cloudflared process, and it runs with
+# --no-autoupdate, so nothing moves it but us. On 11/5 that left it four months
+# behind through a Cloudflare security advisory and nobody knew. A nightly job
+# (deploy/cloudflared-guard.sh via com.gam.cloudflared-guard) now keeps it
+# current; this is the second pair of eyes, on the day somebody is already
+# watching a deploy.
+#
+# REPORT ONLY, and it never fails the deploy: a stale tunnel is working fine,
+# it is just overdue, and nothing that shipped above depends on it.
+if [ -x deploy/cloudflared-guard.sh ]; then
+  if ! tunnel_state="$(./deploy/cloudflared-guard.sh --check 2>&1)"; then
+    warn "${tunnel_state} — the nightly guard updates it at 4:10am, or run: ./deploy/cloudflared-guard.sh"
+  else
+    echo "${DIM}${tunnel_state}${OFF}"
   fi
 fi
 

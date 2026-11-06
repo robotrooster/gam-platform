@@ -147,7 +147,19 @@ Pass-through fees are **not** GAM service fees and are **not** a finance charge 
 
 **A collection taken back.** A debit that settled and is later taken back by Subscriber's bank — for example, one the account holder reports as unauthorized, which can happen up to sixty (60) days after it settled — is treated the same way: FlexPay ends, and the amount taken back becomes Subscriber's GAM-side balance together with any return or dispute fee Stripe charges GAM, passed through at cost under Section 4.2.
 
-**Waiting period.** After FlexPay ends under any paragraph above or under "Bank payments stopped" below, Subscriber may not enroll again for **ninety (90) days**. If it happens a **second time**, FlexPay ends for good and Subscriber may not enroll again.
+**Waiting period.** After FlexPay ends under any paragraph above or under "Bank payments stopped" below, Subscriber may not enroll again until **both** of the following are true: Subscriber has paid GAM everything owed from the ended subscription, and the waiting period below has been served.
+
+The waiting period grows each time FlexPay ends:
+
+| Time FlexPay has ended | Waiting period |
+|---|---|
+| First | 90 days |
+| Second | 6 months |
+| Third and after | 1 year |
+
+**The waiting period counts only days Subscriber holds a lease served by the Platform.** It pauses if Subscriber leaves the Platform and resumes when Subscriber returns, so time away does not shorten it. Changing landlords does not shorten it either: a Subscriber three months into a one-year period who moves to another Platform landlord still has nine months to serve.
+
+**Price on returning.** On returning after FlexPay has ended **once**, the Monthly Fee is the ordinary price for Subscriber's service tier. On returning after it has ended **twice or more**, every price in the fee schedule is **five dollars ($5.00) higher** for Subscriber. The return or dispute fees in Section 4.2 are passed through at cost in addition, as always, and GAM charges no late fee of its own at any time.
 
 **Bank payments stopped.** If bank payments are stopped on Subscriber's account after a returned payment, or Subscriber has no verified bank account on file, the collection is treated as the last try failing: FlexPay ends, the waiting period above applies, and the amount FlexPay paid with the Monthly Fee becomes Subscriber's GAM-side balance. If that happens before a Cover Day, FlexPay ends and does not pay that Monthly Bill, which remains Subscriber's to pay.
 

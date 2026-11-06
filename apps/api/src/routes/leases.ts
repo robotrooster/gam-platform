@@ -785,7 +785,7 @@ leasesRouter.patch('/:id', requirePerm('leases.edit'), async (req, res, next) =>
       // Toggling off in the UI sends null for the whole group.
       lateFeeAccrualAmount: z.number().min(0).nullable().optional(),
       lateFeeAccrualType: z.enum(['flat', 'percent_of_rent']).nullable().optional(),
-      lateFeeAccrualPeriod: z.enum(['daily', 'weekly', 'monthly']).nullable().optional(),
+      lateFeeAccrualPeriod: z.enum(['daily', 'weekly']).nullable().optional(),
       lateFeeCapAmount: z.number().min(0).nullable().optional(),
       lateFeeCapType: z.enum(['flat', 'percent_of_rent']).nullable().optional(),
       terminationReason: z.string().optional(),

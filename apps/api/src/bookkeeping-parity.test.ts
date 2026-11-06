@@ -49,6 +49,14 @@ const ENTRY_POINTS = [
   'bookkeeping/FixedAssetsPage.tsx',
   // 10/12 (Nic, ledger P9): closing a month.
   'bookkeeping/CloseMonthPage.tsx',
+  // 10/31: these two were byte-identical in both apps and guarded by NOTHING —
+  // only each app's own main.tsx imports them, and main.tsx is not an entry
+  // point here. A one-sided edit to either drifted in silence, which is exactly
+  // what the phone work was about to do to them (the trial balance and the
+  // general ledger are grids that are PICTURES, so both copies need the
+  // stacking opt-out or one portal keeps a broken one).
+  'bookkeeping/TrialBalancePage.tsx',
+  'bookkeeping/GeneralLedgerPage.tsx',
 ]
 const ADAPTER = 'bookkeeping/adapter.ts'
 

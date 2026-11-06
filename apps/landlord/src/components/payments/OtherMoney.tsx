@@ -45,7 +45,7 @@ export function OtherMoneyFolder({ lines, month, totals }: {
 
 /**
  * The lines themselves: day, what it was for, who paid and how, the amount (a
- * refund as −). 10/13 (Nic): "When Andres Razo paid by card online for his
+ * refund as −). 10/13 (Nic): "When Cora Castellan paid by card online for his
  * stay ... it looks like that charge is just for electric. It's not ... not
  * clickable to show an expanded breakdown" — a sale opens (its caret) to its
  * breakdown (SaleParts), one sale at a time or several; a refund has none, its

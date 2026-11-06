@@ -7,7 +7,7 @@ if you touch Mattoon.
 16 commits, deployed and verified — **all surfaces in sync**, suite green at
 7,619 tests.
 Mattoon is loaded into production. **No tenant anywhere was emailed** except
-Rashawn Bump at Oak Park, which Nic authorised in the moment.
+Phaedra Stanhope at Oak Park, which Nic authorised in the moment.
 
 ---
 
@@ -84,8 +84,7 @@ no symptom anyone would see. Retried nightly now, and backfilled.
 - Bounces were captured but only ever alerted GAM admins. The landlord — the one
   person who can ask a tenant how their address is spelled — saw nothing.
 - A SUPPRESSION fires no event at all. Once Resend gives up on an address, every
-  send is accepted, given a message id, and discarded. Thirteen emails to Rashawn
-  Bump vanished that way over three weeks, every one logged 'sent'.
+  send is accepted, given a message id, and discarded. Thirteen emails to Phaedra Stanhope vanished that way over three weeks, every one logged 'sent'.
 - GAM now mirrors the provider's suppression list nightly, refuses to send to a
   dead address, and records it 'undeliverable' instead of 'sent'.
 
@@ -102,7 +101,7 @@ both shipped by nobody. admin-ops had been stale since its S650 login change.
 
 ## Country Acres (Mattoon) — loaded
 
-Blu Haws (TruBlu Management LLC) is the sole owner; "Jeff" on the Park Info
+Hollis Harkness (TruHollis Management LLC) is the sole owner; "Jeff" on the Park Info
 sheet is the seller from before closing. Source is sheet 1 of
 `Illinois Trip.xlsx`. Scripts and a fuller note live in
 `apps/api/src/scripts/mattoon/`.
@@ -112,7 +111,7 @@ sheet is the seller from before closing. Source is sheet 1 of
 | Lots live / retired | 31 / 16 |
 | Occupied | 13 |
 | Tenant accounts created | 13 (no invite token, no email) |
-| Lease documents | 13, **sent to Blu and delivered** |
+| Lease documents | 13, **sent to Hollis and delivered** |
 | Installment contracts | 11 drafted, then **voided** — see below |
 | Water meters / readings | 13 / 26 |
 | Readings flagged for a read | 3 |
@@ -175,7 +174,7 @@ $3.10–$7.60 per 100 cubic feet (748 gallons) — about $4–$10 per 1,000 gall
 plus a monthly base charge. City sewer is $7.54 per 100 cf, but Park Info says
 the park is on **private septic**, so it likely pays no city sewer. That makes
 $16.50 per 1,000 gallons plausibly **above** what the park pays for water.
-Blu should put his actual water bill next to it before the first invoice.
+Hollis should put his actual water bill next to it before the first invoice.
 
 Sources: [Mattoon water rates 2026](https://mattoon.illinois.gov/wp-content/uploads/UPDATED-CITY-OF-MATTOON-WATER-RATES-2026.pdf) ·
 [Mattoon sewer rates](https://mattoon.illinois.gov/government/finance-department/sewer-rates/) ·
@@ -189,7 +188,7 @@ Sources: [Mattoon water rates 2026](https://mattoon.illinois.gov/wp-content/uplo
 **Ask before choosing a method, not just an outcome.** Twice a "yes" to a
 result was treated as a "yes" to whatever route seemed reasonable:
 - Sending the 13 leases: Nic authorised the send. To do it I minted a
-  15-minute token for Blu Haws' account and drove his own endpoint with it —
+  15-minute token for Hollis Harkness' account and drove his own endpoint with it —
   effectively logging in as another person. Never discussed.
 - Six adults with no email were left off their leases entirely. The reasoning
   (an account needs a real address, GAM never invents one) was right; the
@@ -221,15 +220,15 @@ things travel together for convenience, they are not bound in the back end.
 - **The reservation form** (#11) is the one item where Nic has already given the
   whole flow, in his own words, and it is still not built.
 
-### Needs Nic or Blu, not code
-1. **Curtis Clabough's work-trade hours** (Country Acres Lot 6). Agreement is
+### Needs Nic or Hollis, not code
+1. **Sage Stillwell's work-trade hours** (Country Acres Lot 6). Agreement is
    live from 1 Oct, hours tracked monthly, 3-month carry-forward, covers rent.
    The **20 hrs/mo target is a placeholder** the schema forced. Editable any
    time — it is not tied to the lease or to signing.
 2. **Money fields on Mattoon's installment contracts.** The sheet records what
    is LEFT ($11,000 over 55 months), never the original price or down payment.
-   Nic is checking with Blu.
-3. **Lisa Scheeler's permissions** — Nic to eyeball them logged in as her.
+   Nic is checking with Hollis.
+3. **Calla Fitzhugh's permissions** — Nic to eyeball them logged in as her.
    Open since S649.
 4. **Stripe rep question and the card reader order.** Open since S649.
 5. **Oak Park has no register Stays items**, so it cannot sell a stay until
@@ -242,9 +241,9 @@ things travel together for convenience, they are not bound in the back end.
 7. **The 11 installment contracts.** Deliberately NOT drafted yet. They are
    created through the home-sale flow (`POST /api/home-sales`), which now works
    **without a lease** — but for these households the lease is the natural
-   anchor and it does not exist until Blu signs. Do this after signing.
+   anchor and it does not exist until Hollis signs. Do this after signing.
 8. **Six adults are occupants, not signers.** Named on the lease, no account.
-   If any should be liable co-tenants, Blu collects their own email addresses
+   If any should be liable co-tenants, Hollis collects their own email addresses
    and they go on by addendum.
 
 ### Built but never exercised
@@ -301,7 +300,7 @@ things travel together for convenience, they are not bound in the back end.
   two landlord onboarding emails. Profile removed, role corrected to tenant,
   her email history kept. Lot 1 is loaded — she is the account holder, John is
   the occupant.
-- **Curtis Clabough** stays off a work-trade agreement by decision; Blu applies
+- **Sage Stillwell** stays off a work-trade agreement by decision; Hollis applies
   a credit as needed until he settles what he wants.
 - **The 5-day late-fee grace** was never a problem — the statutory minimum is 5
   and the property is set to 5. I listed a pass among things needing attention.

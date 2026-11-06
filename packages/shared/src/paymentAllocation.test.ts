@@ -122,7 +122,7 @@ describe('carried-forward balance is paid last', () => {
 
 // ── S655 (money plan §1.4): the ONE allocation order ─────────────────
 //
-// Kim Harland's rent, water and trash were due the same day and created in the
+// Robin Nithsdale's rent, water and trash were due the same day and created in the
 // same second. Her $450 move-in special belongs on the rent; before the type
 // tie-break, which line took the money depended on the order a query happened
 // to return them in.
@@ -197,7 +197,7 @@ describe('S655 the one allocation order', () => {
     }
   })
 
-  it('a credit the size of the rent lands on the rent (Kim Harland)', () => {
+  it('a credit the size of the rent lands on the rent (Robin Nithsdale)', () => {
     const res = allocateOldestFirst(
       [row('trash', 'utility'), row('water', 'utility'), { ...row('rent', 'rent'), amount: 450 }], 450)
     expect(res.lines).toEqual([{ payment_id: 'rent', amount_applied: 450 }])

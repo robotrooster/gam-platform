@@ -1,5 +1,5 @@
 /**
- * 10/12 (Nic, Curtis Clabough) — CHANGING WHAT A WORK TRADE COVERS REACHES THE
+ * 10/12 (Nic, Sage Stillwell) — CHANGING WHAT A WORK TRADE COVERS REACHES THE
  * BILLS ALREADY OUT, NOT ONLY THE NEXT ONE.
  *
  *   "for some reason you're billing him water or it's set up to bill him water.
@@ -9,7 +9,7 @@
  * bill, a stay's utility bill): a covered charge goes on the bill suspended —
  * worked off, not owed — and the month close settles it from the hours. So a
  * landlord who ticked Water on the 12th changed November's bill and nothing
- * else: October's water sat on Curtis's balance as money owed.
+ * else: October's water sat on Sage's balance as money owed.
  *
  * ADDING a type: every still-open charge of that type (pending, not on its way
  * to being paid, amount > 0, never a late fee or a fee GAM keeps) on this

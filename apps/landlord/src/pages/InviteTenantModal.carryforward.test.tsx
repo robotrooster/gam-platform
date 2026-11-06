@@ -91,12 +91,12 @@ const apt = {
   bedrooms: 1, bathrooms: 1, rentAmount: 900, unitType: 'apartment', dwellingOwnership: 'landlord',
   tenantId: null, status: 'vacant', pendingInviteCount: 0,
 }
-/** The $880 Rashawn left on MH 09, as the server hands it over. */
+/** The $880 Phaedra left on MH 09, as the server hands it over. */
 const carried = (over: any = {}) => ({
   id: 'cf-1', unitId: 'u-mh09', spaceName: 'MH 09', propertyName: 'Oak Park',
   amount: 880, settledAmount: 0, stillOwed: 880, lateFeesWaived: 95, status: 'open',
   openedOn: '2026-10-19', oldestDueDate: '2026-09-01', settledOn: null, takenOffOn: null,
-  owedByName: 'Rashawn Bump', assumedByName: null, assumedLeaseId: null,
+  owedByName: 'Phaedra Stanhope', assumedByName: null, assumedLeaseId: null,
   chargeLabel: 'Unpaid space rent left on this space by the previous owner of the home',
   arrangement: null, installments: [], followsToNextLease: true,
   ...over,
@@ -185,7 +185,7 @@ describe('inviting someone to a space that carries a balance', () => {
     await until(() => radios().length === 2, 'the question')
     // The figure, the space, and the man who left it.
     expect(text()).toContain('MH 09 carries $880.00 of unpaid space rent')
-    expect(text()).toContain('Rashawn Bump')
+    expect(text()).toContain('Phaedra Stanhope')
     expect(text()).toContain('Is the new resident taking this balance on?')
     // The two promises the resident will ask about.
     expect(text()).toMatch(/never gets a late fee/)

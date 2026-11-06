@@ -10,7 +10,7 @@
  * Restamps a document's computed page 8 boxes from its own values:
  *   - move_in_security_deposit ← page 2 deposit (new tenant) / $0 (onboarding)
  *   - onboarding only: first month ← the monthly rent, proration ← $0, and
- *     every move-in fee box ← $0 (Clay Simpson and Martin Alvarado were billed
+ *     every move-in fee box ← $0 (Pell Pennington and Faye Inglewood were billed
  *     page 2's rent while page 8 said something else; for an existing
  *     resident the two cannot differ)
  *   - move_in_total_due ← the sum of everything the move-in invoice bills

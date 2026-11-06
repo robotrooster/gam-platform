@@ -127,7 +127,29 @@ function addDays(date: Date, n: number): Date {
 // the 1st–10th. A run day that is a federal holiday moves to the next business
 // day (no backward compensation), exactly as before. Supersedes S640's
 // Thursday. Evaluated per Stripe Connect account (the candidates below).
-const EARLY_MONTH_LAST_DAY = 10
+// ── 10/28 (Nic): TUESDAY AND FRIDAY ALL MONTH, AND ALWAYS THE LAST DAY ────
+//
+//   "Let's do Tuesdays and Fridays indefinitely when there's money, even
+//    towards the end of the month... We want to always hit the last business
+//    day of the month... I would skip Tuesday if the last business day was
+//    Wednesday, I would skip Friday if the last business day was Thursday...
+//    Obviously no payout if there's no money to be paid out."
+//
+// The 1st–10th limit on Fridays is gone: initiating a payout is cheap enough
+// ($0.25) that a landlord should never wait a week for money that is sitting
+// there. It also fixes the thing that prompted this — under the old shape
+// October's last Friday was the 9th, so the 29th and 30th had no payout day at
+// all and rolled into November, which is exactly what the month-end push was
+// supposed to prevent and wasn't.
+//
+// And the month boundary is now ONE payout, not a weekly plus a sweep beside
+// it: the last business day of the month is always a payout day, and a
+// scheduled Tuesday or Friday sitting the calendar day either side of it yields
+// to it. Both of his cases come out of that one rule — a Wednesday month-end
+// skips the Tuesday before it, and a Thursday month-end skips the Friday after
+// it (which is the 1st), so the balance builds over the weekend instead of
+// paying out twice in two days. "Not everybody is going to pay right on the
+// first."
 const TUESDAY = 2
 const FRIDAY = 5
 
@@ -136,17 +158,27 @@ function addDaysIso(iso: string, n: number): string {
   d.setUTCDate(d.getUTCDate() + n)
   return d.toISOString().slice(0, 10)
 }
-/** A scheduled landing day before any holiday shift. */
+/** A scheduled landing day before any holiday shift, and before month-end wins. */
 function isScheduledLandingDate(iso: string): boolean {
   const d = new Date(iso + 'T12:00:00Z')
   const dow = d.getUTCDay()
-  return dow === TUESDAY || (dow === FRIDAY && d.getUTCDate() <= EARLY_MONTH_LAST_DAY)
+  return dow === TUESDAY || dow === FRIDAY
 }
-/** The first business day on or after `iso`. */
-function onOrAfterHoliday(iso: string): string {
-  let d = iso
-  while (!isBusinessDayUtc(d)) d = addDaysIso(d, 1)
-  return d
+
+/**
+ * A scheduled day that gives way to the month's last business day, because that
+ * day is a payout day too and paying twice within a day of it is pointless.
+ *
+ * Either side: the day BEFORE (the last-day run is about to take everything) or
+ * the day AFTER (let the weekend and the start of the month build a balance).
+ */
+function yieldsToLastBusinessDay(iso: string): boolean {
+  for (const step of [-1, 1]) {
+    const neighbour = addDaysIso(iso, step)
+    const n = new Date(neighbour + 'T12:00:00Z')
+    if (neighbour === lastBusinessDayOfMonthUtc(n.getUTCFullYear(), n.getUTCMonth())) return true
+  }
+  return false
 }
 
 /**
@@ -202,17 +234,22 @@ export function lastBusinessDayOfMonthUtc(year: number, month0: number): string 
   return isoUtc(year, month0, lastDay)
 }
 
-/** How many business days ahead of arrival the sweep has to fire. */
-const SWEEP_LEAD_BUSINESS_DAYS = 2
-
-/** The day the month-end sweep fires, so the money has ARRIVED by month end. */
+/**
+ * The day the month-end payout fires: THE LAST BUSINESS DAY ITSELF.
+ *
+ * 10/28 (Nic): "the month-end sweep shouldn't happen the two business days
+ * before. We need the last possible sweep that hits in the month to be right on
+ * the last day."
+ *
+ * It used to fire two business days early so the money had ARRIVED by month end
+ * — a hedge from when payouts took days to land. They do not: this account's
+ * standard payouts arrive on the UTC day they are created (Sep 11, 21 and 22
+ * all did), so the run day IS the landing day and the lead time only bought a
+ * gap. October paid out on the 28th and left the 29th and 30th to roll into
+ * November, the precise outcome the push exists to prevent.
+ */
 export function monthEndSweepDateUtc(year: number, month0: number): string {
-  let cursor = new Date(lastBusinessDayOfMonthUtc(year, month0) + 'T12:00:00Z')
-  for (let stepped = 0; stepped < SWEEP_LEAD_BUSINESS_DAYS; ) {
-    cursor = new Date(cursor.getTime() - 86400000)
-    if (isBusinessDayUtc(cursor.toISOString().slice(0, 10))) stepped++
-  }
-  return cursor.toISOString().slice(0, 10)
+  return lastBusinessDayOfMonthUtc(year, month0)
 }
 
 /**
@@ -257,13 +294,23 @@ export function nextPayoutDateUtc(from: Date = new Date()): string {
 export function shouldRunToday(now: Date = new Date(), tz: string = TZ): boolean {
   const today = localDateString(now, tz)
   if (!isBusinessDayUtc(today)) return false
-  // Today runs if it is a scheduled landing day, or a scheduled day from the
-  // last week that a holiday pushed onto today.
-  for (let back = 0; back <= 6; back++) {
-    const d = addDaysIso(today, -back)
-    if (isScheduledLandingDate(d) && onOrAfterHoliday(d) === today) return true
-  }
-  return false
+  // 10/28 (Nic): A HOLIDAY DOES NOT MOVE THE SCHEDULE.
+  //
+  //   "If there's ever a calendar holiday that interferes with it, then just
+  //    keep the original Tuesday and Friday."
+  //
+  // It used to push a scheduled day onto the next open day, which quietly
+  // manufactured the thing this whole change set started from: Christmas
+  // (Friday) pushed onto Monday 12-28 while Tuesday 12-29 was already a payout
+  // day, so two payouts landed a day apart — and New Year's did the same on
+  // 01-04 and 01-05. Nothing is lost by dropping the push: the banks are shut
+  // that day anyway, the money stays in the balance, and the next scheduled day
+  // — never more than three days off — pays it out.
+  if (!isScheduledLandingDate(today)) return false
+  // The month's last business day is its own payout day; a scheduled day beside
+  // it stands down rather than paying twice within a day of it.
+  if (yieldsToLastBusinessDay(today)) return false
+  return true
 }
 
 // ============================================================================
@@ -670,7 +717,11 @@ async function processOneCandidate(
         gam_entity_id:  cand.entity_id,
         gam_run_date:   today,
       },
-      description: 'GAM weekly payout',
+      // 10/28: say which run this is. The sweep lands within a day or two of
+      // a Tuesday every month, and this string is what the owner reads on the
+      // Stripe dashboard AND on his bank statement memo — so calling it the
+      // weekly payout made two legitimate payouts indistinguishable.
+      description: monthEndSweep ? 'GAM month-end sweep' : 'GAM weekly payout',
     })
     stripePayoutId = payout.id
   } catch (e: any) {
@@ -692,7 +743,12 @@ async function processOneCandidate(
   // 4. Audit row. Only for user-side payouts — PM payouts audit via the
   //    webhook-fed connect_payouts table (no pm_company_id on disbursements).
   if (cand.kind === 'user') {
-    const triggerType = catchUpRun ? 'catch_up' : 'auto_friday'
+    // 10/28: the audit row gets the real reason too. disbursements.trigger_type
+  // is what the books, the payouts page and the dashboard key off, so filing a
+  // month-end sweep as the weekly run left no way to answer "which of these was
+  // the sweep?" afterwards — the trigger was already computed for Stripe's
+  // metadata a few lines up and then dropped on the floor.
+  const triggerType = catchUpRun ? 'catch_up' : (monthEndSweep ? 'month_end_sweep' : 'auto_friday')
     // S655: the Connect webhook files every payout it hears about (as
     // 'stripe_dashboard' when no row exists yet). If it beat this insert —
     // even by a moment, mid-statement — that row is this payout: claim it

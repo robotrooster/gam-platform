@@ -224,7 +224,11 @@ export async function previewRows(q: Q, docIds: string[], leaseId: string | null
   await add('leases', 'deleted', `SELECT id FROM leases WHERE id = $1`, L)
   for (const t of ['lease_fees', 'lease_notices', 'lease_occupants', 'lease_pets', 'lease_renewal_requests',
     'lease_rent_components', 'lease_tenants', 'lease_unit_history', 'lease_utility_assignments',
-    'lease_utility_responsibilities', 'lease_vehicles', 'liability_insurance_policies', 'scheduled_lease_changes',
+    'lease_utility_responsibilities', 'lease_vehicles', 'liability_insurance_policies',
+    // 11/01: the renters policy lives in insurance_policies now (the one home
+    // for insurance), and it cascades off the lease exactly as the old table
+    // did — so the proof this script prints has to name it.
+    'insurance_policies', 'scheduled_lease_changes',
     'seasonal_tenancies', 'security_deposit_interest_accruals', 'tenant_autopay', 'tenant_declared_deposits']) {
     // Two tables are keyed by the lease and a second column: that column names the row.
     const key = t === 'lease_utility_assignments' ? `'meter ' || meter_id`

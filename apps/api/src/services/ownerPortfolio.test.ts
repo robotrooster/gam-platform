@@ -22,6 +22,12 @@ import {
 // after 5 pm), or a charge could land outside the window it was written for.
 let dbToday = ''
 const daysAgo = (n: number) => addDaysTo(dbToday, -n)
+/** The 1st of the month `n` months before the database's today. */
+const firstOfMonthsAgo = (n: number) => {
+  const [y, m] = dbToday.split('-').map(Number)
+  const t = (y * 12 + (m - 1)) - n
+  return `${String(Math.floor(t / 12)).padStart(4, '0')}-${String((t % 12) + 1).padStart(2, '0')}-01`
+}
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -54,13 +60,25 @@ async function leasedUnit(client: any, propertyId: string, landlordId: string) {
 }
 
 /** A rent charge that came due, and either settled on time or late. */
+/**
+ * One rent bill. `dueMonthsAgo` puts it on the 1st of that month; `dueDaysAgo`
+ * counts back in days.
+ *
+ * 10/30: timeliness is judged ONE STAMP PER HOUSEHOLD PER BILL MONTH, so a
+ * fixture that wants N judged months has to land in N DIFFERENT months. Counting
+ * back 90/60/30 days does not: run it on the 30th of a month and those are the
+ * 1st, the 31st and the 30th — two of them in one month, which collapses three
+ * bills into two stamps and makes the arithmetic wrong on that date only. Name
+ * the month when the test is about month stamps.
+ */
 async function rentDue(client: any, unitId: string, landlordId: string, opts: {
-  dueDaysAgo: number; lateDays?: number | null
+  dueDaysAgo?: number; dueMonthsAgo?: number; lateDays?: number | null
 }) {
-  const due = daysAgo(opts.dueDaysAgo)
-  const settled = opts.lateDays == null
-    ? null
-    : daysAgo(opts.dueDaysAgo - opts.lateDays)
+  if ((opts.dueDaysAgo == null) === (opts.dueMonthsAgo == null)) {
+    throw new Error('rentDue: pass exactly one of dueDaysAgo / dueMonthsAgo')
+  }
+  const due = opts.dueMonthsAgo != null ? firstOfMonthsAgo(opts.dueMonthsAgo) : daysAgo(opts.dueDaysAgo!)
+  const settled = opts.lateDays == null ? null : addDaysTo(due, opts.lateDays)
   const hh = householdOf.get(unitId)
   await client.query(
     `INSERT INTO payments (unit_id, landlord_id, lease_id, tenant_id, type, amount, status, due_date,
@@ -140,14 +158,14 @@ describe('collecting on time', () => {
       const o = { userId, landlordId }
 
       const gUnit = await leasedUnit(client, await park(client, o, good), landlordId)
-      await rentDue(client, gUnit, landlordId, { dueDaysAgo: 90, lateDays: 0 })
-      await rentDue(client, gUnit, landlordId, { dueDaysAgo: 60, lateDays: 0 })
-      await rentDue(client, gUnit, landlordId, { dueDaysAgo: 30, lateDays: 0 })
+      await rentDue(client, gUnit, landlordId, { dueMonthsAgo: 3, lateDays: 0 })
+      await rentDue(client, gUnit, landlordId, { dueMonthsAgo: 2, lateDays: 0 })
+      await rentDue(client, gUnit, landlordId, { dueMonthsAgo: 1, lateDays: 0 })
 
       const sUnit = await leasedUnit(client, await park(client, o, slow), landlordId)
-      await rentDue(client, sUnit, landlordId, { dueDaysAgo: 90, lateDays: 0 })
-      await rentDue(client, sUnit, landlordId, { dueDaysAgo: 60, lateDays: 10 })
-      await rentDue(client, sUnit, landlordId, { dueDaysAgo: 30, lateDays: 20 })
+      await rentDue(client, sUnit, landlordId, { dueMonthsAgo: 3, lateDays: 0 })
+      await rentDue(client, sUnit, landlordId, { dueMonthsAgo: 2, lateDays: 10 })
+      await rentDue(client, sUnit, landlordId, { dueMonthsAgo: 1, lateDays: 20 })
 
       const p = await ownerPortfolio({ landlordIds: [landlordId] })
       const g = p.managers.find(m => m.pmCompanyName === 'Good Co')!

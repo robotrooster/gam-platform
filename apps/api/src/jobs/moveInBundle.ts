@@ -382,7 +382,7 @@ export async function generateMoveInInvoice(
   // An existing resident's first bill belongs to the first billing cycle, and
   // it is made by the nightly job WHEN that cycle arrives — with the month's
   // meter reads on it. Making it at signing, weeks early, put an empty October
-  // statement in Curtis Clabough's inbox on September 23rd.
+  // statement in Sage Stillwell's inbox on September 23rd.
   if (leaseMeta?.is_existing_tenancy && !renewal) {
     const tzRow = await client.query<{ tz: string }>(
       `SELECT COALESCE(p.timezone, 'America/Phoenix') AS tz FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
@@ -489,11 +489,18 @@ export async function generateMoveInInvoice(
     let flexDepositActive = false
     let flexDepositSecurityDepositId: string | null = null
     let flexDepositServiceFee = 0
+    // How many payments the plan runs to — 2 or 4 — so the invoice line can say
+    // "installment 1 of 4" the way a home-purchase installment does.
+    let flexDepositInstallmentCount = 0
     let flexDepositPayUpFront = 0
     if (depositFee && inputs.tenant_id) {
-      const fdRow = await client.query<{ id: string; flex_deposit_enabled: boolean; first_amount: string | null; portability_status: string; service_fee: string | null; pay_up_front: string }>(
+      const fdRow = await client.query<{ id: string; flex_deposit_enabled: boolean; first_amount: string | null; portability_status: string; service_fee: string | null; pay_up_front: string; installment_count: number | null }>(
         `SELECT sd.id, sd.flex_deposit_enabled, sd.portability_status,
                 sd.flex_deposit_service_fee::text AS service_fee,
+                -- 10/28: "two or four payments", and the line says which of how
+                -- many — the same shape as a home-purchase installment.
+                (SELECT installment_count FROM flex_deposit_installments
+                  WHERE security_deposit_id = sd.id AND installment_number = 1) AS installment_count,
                 (SELECT amount::text FROM flex_deposit_installments
                   WHERE security_deposit_id = sd.id AND installment_number = 1) AS first_amount,
                 -- 10/27 (Nic): the part of the deposit ABOVE the top of the
@@ -522,8 +529,35 @@ export async function generateMoveInInvoice(
         flexDepositServiceFee = Math.round(Number(fdRow.rows[0].service_fee ?? 0) * 100) / 100
         flexDepositPayUpFront = Math.round(Number(fdRow.rows[0].pay_up_front ?? 0) * 100) / 100
         firstInstallmentAmount = Number(fdRow.rows[0].first_amount)
-        // Invoice deposit line disappears; landlord doesn't see
-        // anything deposit-related on this invoice.
+        flexDepositInstallmentCount = Number(fdRow.rows[0].installment_count ?? 0) || 0
+        // ── 10/28 (Nic): THE LANDLORD SEES THE WHOLE INVOICE ───────────────
+        //
+        //   "The landlord sees the full move-in fees, first month's rent, last
+        //    month's rent, security deposits, all that stuff. When the tenant
+        //    pays it, the tenant is paying that full thing, but just the first
+        //    installment of the security deposit. They're still paying the full
+        //    rent, the full other move-in fees."
+        //
+        // The deposit line used to VANISH here, so a FlexDeposit move-in showed
+        // the landlord nothing deposit-related at all — and with enrolment now
+        // possible while a bank verifies, a plan that never funded would have
+        // left no deposit charge anywhere and nothing claiming it.
+        //
+        // The invoice is the sum of what the tenant is about to PAY, and the
+        // installment is a LINE ITEM on it — the same shape as a home-purchase
+        // installment sitting beside rent and utilities. So there is no
+        // full-deposit charge here: the deposit's only line on this bill IS
+        // installment 1, with the whole table fee riding it, written below.
+        //
+        // What the LANDLORD reads is not another row — it is a RENDERING of
+        // these same rows (services/openBills.ts): installment 1 is shown at
+        // the whole deposit, so their bill carries the deposit in full and
+        // reads PAID IN FULL the moment that first charge settles, while GAM's
+        // side and the tenant's still show the remaining installments owed.
+        // Three views, one deposit, no extra rows to keep in step. An earlier
+        // pass on 10/28 did this with a full-deposit charge and a deferral
+        // credit under it; two rows that had to net to the cent on every
+        // surface, which is a worse way to say the same thing.
         depositAmountForInvoice = 0
       }
     }
@@ -535,6 +569,16 @@ export async function generateMoveInInvoice(
     // tenant should see what the month was worth) but it is suspended and stays
     // out of the amount due. Month close leaves either 0 or the prorated lapse.
     const rentSuspended = wtCovers('rent') && rentForMoveIn > 0
+    // 10/28: under FlexDeposit the deposit's contribution to this total is
+    // exactly installment 1 (depositAmountForInvoice is 0 above), so the total
+    // is what the tenant OWES TODAY: full rent, full fees, and the first
+    // installment. Rent and fees are untouched by the plan.
+    //
+    // The landlord's own view of this bill is bigger than this figure, and
+    // deliberately so: openBills renders installment 1 at the whole deposit, so
+    // their bill totals the full move-in. This stored total is the tenant's
+    // amount due, not theirs — nothing reads it as the landlord's receivable
+    // (their balance is built from the charges, openBalances).
     const totalAmount = (rentSuspended ? 0 : rentForMoveIn)
       + feesTotal + depositAmountForInvoice + firstInstallmentAmount
 
@@ -718,26 +762,45 @@ export async function generateMoveInInvoice(
       depositInserted = true
     }
 
-    // S246: FlexDeposit installment 1 payment row. Tagged
-    // entry_description='DEPOSIT' so allocation + audit treats it
-    // consistently with the regular deposit. The payments row carries
-    // the installment-1 amount (the tenant's first portion of their
-    // own deposit — there is no GAM-fronted gap under custody);
-    // landlord doesn't see this row tied to their dashboard because
-    // it's NOT linked to the invoice (invoice_id=NULL) — its
-    // visibility is tenant-side only.
+    // ── 10/28 (Nic): THE INSTALLMENT IS A LINE ITEM ON THE INVOICE ──────────
+    //
+    //   "The invoice is the sum of all the charges that they are about to pay.
+    //    People on installment contracts, they have the payment for the home
+    //    sale plus their rent and utilities. For flex deposit, that installment
+    //    is another line item on the bill. It's on the invoice."
+    //
+    //   "It should have the same shape as an installment contract for a home
+    //    purchase. Something that ends over a fixed time. Two or four payments.
+    //    The first payment has the entirety of the table fee based on what fee
+    //    they fall under. And it says security deposit installment one of four."
+    //
+    // So this row carries invoice_id and says what it is. It used to be written
+    // with invoice_id=NULL to keep it off the landlord's dashboard, which made
+    // the tenant's own bill disagree with the invoice it belonged to — and left
+    // the desk and the register, which read the invoice, charging something
+    // different from the portal.
+    //
+    // The landlord's side is handled by RENDERING, not by hiding rows: their
+    // view of this invoice shows the deposit in full and reads paid in full
+    // from the FIRST payment. One invoice, two renderings.
+    //
+    // S246: tagged entry_description='DEPOSIT' so allocation and audit treat it
+    // consistently with an ordinary deposit; the amount is the tenant's own
+    // first portion (no GAM-fronted gap exists under custody).
     let flexDepositInstallment1PaymentId: string | null = null
     if (flexDepositActive && firstInstallmentAmount > 0) {
       const inst1 = await client.query<{ id: string }>(
         `INSERT INTO payments (
-           unit_id, lease_id, tenant_id, landlord_id,
-           type, amount, status, due_date, entry_description, notes
-         ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', $6, 'DEPOSIT', $7)
+           invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+           type, amount, status, due_date, entry_description, notes,
+           flex_deposit_security_deposit_id
+         ) VALUES ($1, $2, $3, $4, $5, 'deposit', $6, 'pending', $7, 'DEPOSIT', $8, $9)
          RETURNING id`,
         [
-          inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
+          invoiceId, inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
           firstInstallmentAmount.toFixed(2), invoiceDueDate,
-          `FlexDeposit installment 1 (deposit ${flexDepositSecurityDepositId})`,
+          `Security deposit — installment 1 of ${flexDepositInstallmentCount}`,
+          flexDepositSecurityDepositId,
         ]
       )
       flexDepositInstallment1PaymentId = inst1.rows[0].id
@@ -756,8 +819,14 @@ export async function generateMoveInInvoice(
     // 'gam', entry 'FLEXDEP'), so it must never land in collected_amount or be
     // returned. One row each is what keeps the deposit return honest.
     //
-    // invoice_id stays NULL, like installment 1: the landlord's move-in invoice
-    // excludes the whole FlexDeposit arrangement, and this is tenant-side only.
+    // invoice_id stays NULL — UNLIKE installment 1, which carries it. This is
+    // GAM's own charge, so it is not a line of the landlord's invoice; what the
+    // landlord sees is a generically worded "Tenant owes GAM" figure beside their
+    // balance, never inside it (openBills.OWED_TO_GAM / gam_owed).
+    //
+    // It names its deposit (flex_deposit_security_deposit_id) so that rendering
+    // can tell GAM's collection apart from a deposit charge that is genuinely
+    // the landlord's, without reading the English in `notes`.
     //
     // Guarded on > 0 so a plan written before the fee existed charges nothing
     // rather than a zero-amount row.
@@ -765,12 +834,14 @@ export async function generateMoveInInvoice(
       await client.query(
         `INSERT INTO payments (
            unit_id, lease_id, tenant_id, landlord_id,
-           type, amount, status, due_date, entry_description, revenue_owner, notes
-         ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', $6, 'FLEXDEP', 'gam', $7)`,
+           type, amount, status, due_date, entry_description, revenue_owner, notes,
+           flex_deposit_security_deposit_id
+         ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', $6, 'FLEXDEP', 'gam', $7, $8)`,
         [
           inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
           flexDepositServiceFee.toFixed(2), invoiceDueDate,
           `FlexDeposit service fee (deposit ${flexDepositSecurityDepositId})`,
+          flexDepositSecurityDepositId,
         ]
       )
     }
@@ -786,20 +857,25 @@ export async function generateMoveInInvoice(
     // installment 1 and the whole fee.
     //
     // Its OWN row, type 'deposit', beside installment 1 rather than folded into
-    // it: it is the resident's own custody principal (so it belongs in
-    // collected_amount and comes back at move-out, unlike GAM's fee), but it is
-    // not an installment and must not read as one on a ledger or a receipt.
+    // it: it funds the DEPOSIT itself — money owed to the landlord from day one
+    // and held in GAM's custody, suspended until move-out, where their
+    // lease-entitled claim settles first and the remainder goes back to the
+    // resident. So it belongs in collected_amount, unlike GAM's fee, which is
+    // revenue and never part of what the deposit return runs against. It is not
+    // an installment and must not read as one on a ledger or a receipt.
     // Zero for everybody under $3,000, which is almost everybody.
     if (flexDepositActive && flexDepositPayUpFront > 0) {
       await client.query(
         `INSERT INTO payments (
            unit_id, lease_id, tenant_id, landlord_id,
-           type, amount, status, due_date, entry_description, notes
-         ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', $6, 'DEPOSIT', $7)`,
+           type, amount, status, due_date, entry_description, notes,
+           flex_deposit_security_deposit_id
+         ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', $6, 'DEPOSIT', $7, $8)`,
         [
           inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
           flexDepositPayUpFront.toFixed(2), invoiceDueDate,
           `Deposit above the FlexDeposit plan, paid in full (deposit ${flexDepositSecurityDepositId})`,
+          flexDepositSecurityDepositId,
         ]
       )
     }
@@ -942,17 +1018,18 @@ export async function generateMoveInInvoice(
 
     if (ownsTx) await client.query('COMMIT')
 
-    // S246/S527: post-commit FlexDeposit settlement. Flips installment
-    // 1 to settled and updates the custody counters. NO Connect
-    // Transfer fires — the deposit stays in gam_escrow for the life of
-    // the lease (settleFlexDepositMoveIn returns stripeTransferId:
-    // null); GAM advances nothing, so there is no gap to cover.
-    // Best-effort: on failure an admin notification is recorded and
-    // the cron retry path picks it up.
+    // 10/28 (Nic): post-commit, LINK installment 1 to the payment that will
+    // fund it — and settle nothing. The deposit is recorded as paid when the
+    // money actually lands ("we would only record the deposit as paid in full
+    // when they make their first installment on it"), by whatever settles that
+    // payment: the ACH pull, a card, or cash at the front desk. No Connect
+    // Transfer fires either way — the deposit stays in gam_escrow for the life
+    // of the lease. Best-effort: on failure the landlord is told and the row is
+    // still there to link on the retry.
     if (flexDepositActive && flexDepositSecurityDepositId && flexDepositInstallment1PaymentId && inputs.tenant_id) {
       try {
-        const { settleFlexDepositMoveIn } = await import('../services/flexDeposit')
-        await settleFlexDepositMoveIn({
+        const { linkFlexDepositMoveInPayment } = await import('../services/flexDeposit')
+        await linkFlexDepositMoveInPayment({
           tenantId:           inputs.tenant_id,
           securityDepositId:  flexDepositSecurityDepositId,
           movInPaymentId:     flexDepositInstallment1PaymentId,

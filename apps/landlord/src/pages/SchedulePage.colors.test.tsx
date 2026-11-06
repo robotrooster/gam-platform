@@ -46,7 +46,6 @@ vi.mock('../lib/api', async () => {
     apiDel: async () => ({}),
     apiDelete: async () => ({}),
     openPdfInNewTab: async () => {},
-    ACCOUNT_LOCKED_EVENT: 'gam:account-locked',
   }
 })
 vi.mock('../components/dialogs', () => ({
@@ -58,6 +57,7 @@ vi.mock('../components/dialogs', () => ({
 vi.mock('../lib/permissions', () => ({ usePerms: () => ({ can: () => true, isOwner: true }) }))
 
 import { SchedulePage, scheduleBarKind, isScheduleBarLocked, SCHEDULE_BAR_COLOR, SCHEDULE_BAR_TEXT, SCHEDULE_BAR_THEME_CSS } from './SchedulePage'
+import { localToday } from '../lib/creditDesk'
 
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
 // The floating-name overlay measures its rows with a ResizeObserver; jsdom has none.
@@ -66,7 +66,9 @@ import { SchedulePage, scheduleBarKind, isScheduleBarLocked, SCHEDULE_BAR_COLOR,
 }
 
 /** The same day the page calls today, and plain day math on top of it. */
-const TODAY = new Date().toISOString().split('T')[0]
+// The same day the PAGE calls today — its own calendar day, not UTC's,
+// which is tomorrow from 5pm Phoenix (testsAreDeterministic).
+const TODAY = localToday()
 const day = (n: number) => {
   const d = new Date(TODAY + 'T12:00:00Z')
   d.setUTCDate(d.getUTCDate() + n)
@@ -109,7 +111,7 @@ const SCHEDULE = () => ({
            check_in: day(-10), check_out: day(-8) }),
   ],
   leases: [{
-    id: 'l1', unit_id: 'u5', first_name: 'Dakota', last_name: 'Lane', status: 'active',
+    id: 'l1', unit_id: 'u5', first_name: 'Tobin', last_name: 'Thornbury', status: 'active',
     start_date: stamp(day(-5)), end_date: stamp(day(40)), rent_amount: 650,
     unit_number: 'RV 5', unit_type: 'rv_spot', property_name: PROPERTY.name,
   }],
@@ -224,6 +226,50 @@ describe('the yellow box around every square is gone', () => {
   })
 })
 
+/**
+ * 11/3 — WHY FIREFOX COULD NOT DRAG A SINGLE BAR.
+ *
+ * Nic, on the Mountain View desk computer: "I cannot click and drag and drop
+ * reservations or lengthen or shorten them… I can do that on this Mac, no
+ * problem. But there's something wrong with the rendering where it doesn't want
+ * to let me click and drag it on that other computer." The API log says that
+ * machine loads the master schedule on Windows Firefox while his Mac is Safari.
+ *
+ * It was not rendering. In Gecko the drag gesture runs through the selection
+ * machinery, so an element carrying `user-select: none` cannot start a native
+ * HTML5 drag at all; WebKit and Blink decoupled the two years ago. The bar had
+ * `userSelect: 'none'` left over from when it still painted the guest's name
+ * inside itself — by S575 the name moved to the floating overlay, so the
+ * declaration bought nothing and cost every Firefox user the whole feature.
+ */
+describe('a movable bar is actually movable in every browser', () => {
+  it('no draggable bar carries user-select: none — Gecko will not drag unselectable content', async () => {
+    await openTimeline()
+    const everyBar = [...host.querySelectorAll('[data-bar-id]')] as HTMLElement[]
+    expect(everyBar.length).toBeGreaterThan(0)
+    const offenders = everyBar
+      .filter(b => b.draggable)
+      .filter(b => /user-select\s*:\s*none/i.test(b.getAttribute('style') ?? '') || b.style.userSelect === 'none')
+      .map(b => b.getAttribute('data-bar-id'))
+    expect(offenders, `these bars are draggable but unselectable, so Firefox cannot drag them: ${offenders.join(', ')}`).toEqual([])
+  })
+
+  it('an editable stay is draggable and shows the grab hand', async () => {
+    await openTimeline()
+    for (const c of cells('b_reserved')) {
+      expect(c.draggable).toBe(true)
+      expect(c.style.cursor).toBe('grab')
+    }
+  })
+
+  it('the edge grips never take the pointer — the bar reads the grab position itself', async () => {
+    await openTimeline()
+    for (const g of grips('b_reserved')) {
+      expect((g as HTMLElement).style.pointerEvents).toBe('none')
+    }
+  })
+})
+
 describe('history is locked on the calendar', () => {
   it('a checked-out stay cannot be dragged and has no edge grips', async () => {
     await openTimeline()
@@ -246,7 +292,7 @@ describe('history is locked on the calendar', () => {
     await openTimeline()
     expect(cells('l1').every(c => c.draggable === false)).toBe(true)
     expect(grips('l1')).toHaveLength(0)
-    expect(name('l1')?.textContent).toBe('🔒 Dakota Lane')
+    expect(name('l1')?.textContent).toBe('🔒 Tobin Thornbury')
   })
 
   it('a stay still to come is draggable, with a grip on each end', async () => {

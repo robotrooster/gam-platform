@@ -29,9 +29,10 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { db } from '../db'
 import {
   getFlexDepositEligibility, FLEX_DEPOSIT_MIN_LANDLORD_DAYS, FLEX_DEPOSIT_SIGNING_WINDOW_DAYS,
+  flexDepositOffer, flexDepositSignPrompt,
 } from './flexDeposit'
 import {
-  withRollback, cleanupAllSchema,
+  withRollback, cleanupAllSchema, seedDepositCustodyRule,
   seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
 import type { PoolClient } from 'pg'
@@ -225,7 +226,13 @@ async function emitOnTimePayment(
   )
 }
 
-beforeEach(cleanupAllSchema)
+beforeEach(async () => {
+  await cleanupAllSchema()
+  // 10/29: FlexDeposit is a custody product and now refuses a state whose
+  // rules do not permit GAM's vehicle. cleanupAllSchema truncates the rules
+  // table and the gate fails closed, so every suite has to say where it is.
+  await seedDepositCustodyRule(db)
+})
 
 // withRollback is unused here — eligibility reads through the singleton
 // pool, so seeds must commit before getFlexDepositEligibility runs.
@@ -240,7 +247,10 @@ describe('getFlexDepositEligibility — pre-existing blockers', () => {
   })
 
 
-  it('blocks ach_unverified when tenants.ach_verified=FALSE', async () => {
+  // 10/28 (Nic): an unverified bank no longer refuses enrolment — only a bank
+  // nobody has STARTED does. Verification is microdeposits and takes days, and
+  // "they should be able to be like, hey, I'm interested in signing up."
+  it('blocks somebody who has not started a bank link at all', async () => {
     const client = await db.connect()
     let tenantId: string
     try {
@@ -254,7 +264,7 @@ describe('getFlexDepositEligibility — pre-existing blockers', () => {
     } finally { client.release() }
     const r = await getFlexDepositEligibility(tenantId)
     expect(r.eligible).toBe(false)
-    expect(r.blockers).toContain('ach_unverified')
+    expect(r.blockers).toContain('no_bank_started')
   })
 
   it('blocks bg_not_approved when default not_started status (no BG check yet)', async () => {
@@ -311,7 +321,18 @@ describe('getFlexDepositEligibility — pre-existing blockers', () => {
     expect(r.blockers).toContain('risk_level_missing')
   })
 
-  it('blocks not_ssi_ssdi when tenant is not an SSDI/SSI recipient (S514)', async () => {
+  /**
+   * 10/29 (Nic): "FlexPay is for fixed income people. FlexDeposit is for
+   * anybody. Two different requirements for two different products."
+   *
+   * This test asserted the opposite until today — FlexDeposit refused anyone
+   * who was not an SSDI/SSI recipient, which is FlexPay's rule and only
+   * FlexPay's. FlexPay fronts the landlord's rent and is gated on verified
+   * fixed income; FlexDeposit floats nothing, so there is no exposure for an
+   * income test to tier. Kept as an explicit assertion, not deleted, so the
+   * gate cannot quietly come back.
+   */
+  it('is open to a tenant who is NOT an SSDI/SSI recipient', async () => {
     const client = await db.connect()
     let tenantId: string
     try {
@@ -325,8 +346,200 @@ describe('getFlexDepositEligibility — pre-existing blockers', () => {
       await client.query('COMMIT')
     } finally { client.release() }
     const r = await getFlexDepositEligibility(tenantId)
-    expect(r.eligible).toBe(false)
-    expect(r.blockers).toContain('not_ssi_ssdi')
+    expect(r.blockers).not.toContain('not_ssi_ssdi')
+    expect(r.eligible).toBe(true)
+  })
+
+  /**
+   * 10/29 (Nic): "no we are not blocking by state. let her use flex deposit"
+   *
+   * A state gate was added here earlier the same day and taken straight back
+   * out on his instruction. FlexDeposit does not consult the S604 custody
+   * rules: a resident in a state recorded `blocked` enrolls like anyone else,
+   * and enrollment still takes GAM custody. Asserted rather than deleted so a
+   * later session cannot quietly put the gate back and call it a fix.
+   */
+  it('does NOT refuse a state whose custody rules are blocked', async () => {
+    const client = await db.connect()
+    let tenantId: string
+    try {
+      await client.query('BEGIN')
+      const stack = await buildEligibilityStack(client, {
+        achVerified: true, bgStatus: 'approved', riskLevel: 'low',
+        tenantCreatedAt: '2020-01-01T00:00:00Z',
+      })
+      // Illinois, recorded blocked — MH 28 at Country Acres - Mattoon.
+      await client.query(
+        `INSERT INTO state_deposit_custody_rules
+           (state_code, custody_status, allows_treasury_bills, statute_citation)
+         VALUES ('IL', 'blocked', FALSE, '765 ILCS 745/18')
+         ON CONFLICT (state_code) DO UPDATE
+            SET custody_status = 'blocked', allows_treasury_bills = FALSE`)
+      await client.query(
+        `UPDATE properties SET state = 'IL'
+          WHERE id = (SELECT un.property_id FROM security_deposits sd
+                        JOIN units un ON un.id = sd.unit_id
+                       WHERE sd.tenant_id = $1 LIMIT 1)`, [stack.tenantId])
+      tenantId = stack.tenantId
+      await client.query('COMMIT')
+    } finally { client.release() }
+    const r = await getFlexDepositEligibility(tenantId)
+    expect(r.blockers).toEqual([])
+    expect(r.eligible).toBe(true)
+  })
+
+  /**
+   * 10/29 (Nic): "it needs to be there until the deposit is handled one way or
+   * another." The offer is what every surface reads — the portal prompt, the
+   * signing prompt and the one-time email — so it is asserted on the FACTS
+   * that end it, never on anything a resident clicked.
+   */
+  describe('the standing deposit offer', () => {
+    // The offer checks visibility, so these switch the product on the way
+    // production has it.
+    beforeEach(async () => {
+      await db.query(
+        `INSERT INTO system_features (key, enabled, description)
+         VALUES ('flexdeposit_rollout_visible', TRUE, '10/29 offer test')
+         ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
+    })
+
+    const offerFor = async (opts: Parameters<typeof buildEligibilityStack>[1] = {}) => {
+      const client = await db.connect()
+      let tenantId: string
+      try {
+        await client.query('BEGIN')
+        const stack = await buildEligibilityStack(client, {
+          achVerified: true, bgStatus: 'approved', riskLevel: 'low',
+          tenantCreatedAt: '2020-01-01T00:00:00Z', ...opts,
+        })
+        tenantId = stack.tenantId
+        await client.query('COMMIT')
+      } finally { client.release() }
+      return { tenantId, offer: await flexDepositOffer({ tenantId }) }
+    }
+
+    it('stands while the deposit is unpaid, with the figures the screens show', async () => {
+      const { offer } = await offerFor({ depositAmount: 500 })
+      expect(offer).not.toBeNull()
+      expect(offer!.depositAmount).toBe(500)
+      expect(offer!.collected).toBe(0)
+      expect(offer!.choices.map(c => c.payments)).toEqual([2, 4])
+      // The point of the prompt: less than the whole deposit, today.
+      expect(offer!.lowestFirstPull).toBeLessThan(500)
+      expect(offer!.lowestFirstPull)
+        .toBe(Math.min(...offer!.choices.map(c => c.firstPull)))
+    })
+
+    it('still stands on a part-paid deposit', async () => {
+      const { tenantId } = await offerFor({ depositAmount: 500 })
+      await db.query(
+        `UPDATE security_deposits SET collected_amount = 100, status = 'partial'
+          WHERE tenant_id = $1`, [tenantId])
+      const offer = await flexDepositOffer({ tenantId })
+      expect(offer).not.toBeNull()
+      expect(offer!.collected).toBe(100)
+    })
+
+    /**
+     * 10/29 (Nic, reading the demo preview): "That's only showing the total of
+     * payments what they'll pay. It's not showing what's due at move-in. It
+     * needs to generate whatever their first month is."
+     *
+     * The plan's figures describe the DEPOSIT alone, so a resident reading
+     * "$273.00 at move-in" against a $900 move-in bill was reading a number
+     * they were never going to pay. The rest of that bill rides on the offer.
+     */
+    it('carries the rest of the move-in bill, so due-at-move-in is the real figure', async () => {
+      const { tenantId, offer } = await offerFor({ depositAmount: 500 })
+      // Nothing else billed yet: the deposit figures stand alone.
+      expect(offer!.otherDueNow).toBe(0)
+
+      const ctx = await db.query<{ unit_id: string; lease_id: string; landlord_id: string }>(
+        `SELECT sd.unit_id, sd.lease_id, un.landlord_id FROM security_deposits sd
+           JOIN units un ON un.id = sd.unit_id WHERE sd.tenant_id = $1`, [tenantId])
+      const { unit_id, lease_id, landlord_id } = ctx.rows[0]
+      // Their first month's rent, unpaid, on the same lease.
+      await db.query(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+                               entry_description, due_date, revenue_owner)
+         VALUES ($1,$2,$3,$4,'rent',900,'pending','RENT',CURRENT_DATE,'landlord')`,
+        [unit_id, lease_id, tenantId, landlord_id])
+
+      const after = await flexDepositOffer({ tenantId })
+      expect(after!.otherDueNow).toBe(900)
+      // Which is what the screen adds to the first pull.
+      const two = after!.choices.find(c => c.payments === 2)!
+      expect(after!.otherDueNow + two.firstPull).toBeGreaterThan(900)
+      expect(after!.otherDueNow + two.firstPull).toBeLessThan(900 + 500)
+    })
+
+    /**
+     * The security deposit is the one charge the plan REPLACES, so counting it
+     * here would bill it twice on the same screen. A pet or key deposit is a
+     * separate charge they still owe in full, and stays in.
+     */
+    it('leaves the security deposit out of it, but not a pet deposit', async () => {
+      const { tenantId } = await offerFor({ depositAmount: 500 })
+      const ctx = await db.query<{ unit_id: string; lease_id: string; landlord_id: string }>(
+        `SELECT sd.unit_id, sd.lease_id, un.landlord_id FROM security_deposits sd
+           JOIN units un ON un.id = sd.unit_id WHERE sd.tenant_id = $1`, [tenantId])
+      const { unit_id, lease_id, landlord_id } = ctx.rows[0]
+      // The security deposit as the move-in bundle bills it: no lease_fee_id.
+      await db.query(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+                               entry_description, due_date, revenue_owner)
+         VALUES ($1,$2,$3,$4,'deposit',500,'pending','DEPOSIT',CURRENT_DATE,'landlord')`,
+        [unit_id, lease_id, tenantId, landlord_id])
+      expect((await flexDepositOffer({ tenantId }))!.otherDueNow).toBe(0)
+
+      // A pet deposit carries its own lease_fees row.
+      const fee = await db.query<{ id: string }>(
+        `INSERT INTO lease_fees (lease_id, fee_type, due_timing, amount, description, is_refundable)
+         VALUES ($1,'pet_deposit','move_in',200,'Pet deposit',TRUE) RETURNING id`, [lease_id])
+      await db.query(
+        `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+                               entry_description, due_date, revenue_owner, lease_fee_id)
+         VALUES ($1,$2,$3,$4,'deposit',200,'pending','DEPOSIT',CURRENT_DATE,'landlord',$5)`,
+        [unit_id, lease_id, tenantId, landlord_id, fee.rows[0].id])
+      expect((await flexDepositOffer({ tenantId }))!.otherDueNow).toBe(200)
+    })
+
+    it('ends when the deposit is funded', async () => {
+      const { tenantId } = await offerFor({ depositAmount: 500 })
+      await db.query(
+        `UPDATE security_deposits SET collected_amount = 500, status = 'funded'
+          WHERE tenant_id = $1`, [tenantId])
+      expect(await flexDepositOffer({ tenantId })).toBeNull()
+    })
+
+    it('ends when a plan is already running', async () => {
+      const { tenantId } = await offerFor({ depositAmount: 500 })
+      await db.query(
+        `UPDATE security_deposits SET flex_deposit_enabled = TRUE,
+                flex_deposit_plan_status = 'active' WHERE tenant_id = $1`, [tenantId])
+      expect(await flexDepositOffer({ tenantId })).toBeNull()
+    })
+
+    it('says nothing while the product is switched off', async () => {
+      const { tenantId } = await offerFor({ depositAmount: 500 })
+      await db.query(`UPDATE system_features SET enabled = FALSE WHERE key = 'flexdeposit_rollout_visible'`)
+      expect(await flexDepositOffer({ tenantId })).toBeNull()
+    })
+
+    /**
+     * The signing prompt used to fire ONLY for somebody whose bank was neither
+     * verified nor begun — which skipped exactly the people ready to enrol.
+     * It now reads this same offer, so a resident with a verified bank is
+     * prompted rather than passed over.
+     */
+    it('is what the signing prompt reads, verified bank included', async () => {
+      const { tenantId } = await offerFor({ depositAmount: 500 })
+      const u = await db.query<{ user_id: string }>(
+        `SELECT user_id FROM tenants WHERE id = $1`, [tenantId])
+      const prompt = await flexDepositSignPrompt(u.rows[0].user_id)
+      expect(prompt).toEqual({ depositAmount: 500 })
+    })
   })
 
   it('blocks no_deposit_row when no security_deposits row for tenant', async () => {
@@ -637,7 +850,11 @@ describe('getFlexDepositEligibility — the window after signing', () => {
 
   it('signed today, bank link begun today, microdeposits still in flight: offered', async () => {
     const r = await sign({ achVerified: false, signedDaysAgo: 0, bankStartedDaysAgo: 0 })
-    expect(r.blockers).toEqual(['ach_unverified'])   // the only thing left is the wait
+    // 10/28: this test's TITLE always said "offered" while its assertion said
+    // blocked — the intent was written down and never built. Now it is: a link
+    // in flight is enough to enrol and read your own terms, and nothing is
+    // recorded as paid until an installment actually lands.
+    expect(r.blockers).toEqual([])
     expect(r.blockers).not.toContain('bank_link_not_started_on_signing_day')
     expect(r.blockers).not.toContain('signing_window_closed')
   })
@@ -687,6 +904,19 @@ describe('getFlexDepositEligibility — the window after signing', () => {
 // The first version of this read a tenant_id off the SIGNER row. That column
 // does not exist, so the lookup never ran and the prompt silently never
 // appeared — the kind of nothing that looks exactly like a working feature.
+//
+// ── 10/29 (Nic): AND IT IS NOT A BANK NUDGE ANY MORE ───────────────────────
+//
+//   "We need the prompt to pop up for any tenants when the deposit has not
+//    been paid yet... It needs to be there until the deposit is handled one
+//    way or another."
+//
+// It used to fire ONLY for somebody whose bank was neither verified nor begun,
+// which skipped exactly the people ready to enrol — the resident at MH 28
+// verified her bank the morning after signing and would never have been shown
+// it. It now reads the standing offer, so a verified bank is a reason to
+// prompt, not a reason to stay quiet. The three cases below that asserted the
+// old silence are kept, flipped, so the narrowing cannot come back by accident.
 describe('flexDepositSignPrompt — what the signer is told before signing', () => {
   // There is no point nudging somebody about a product that is switched off,
   // so the prompt checks visibility — which means these tests have to switch
@@ -723,14 +953,14 @@ describe('flexDepositSignPrompt — what the signer is told before signing', () 
     expect(prompt).toEqual({ depositAmount: 900 })
   })
 
-  it('says nothing once the bank is verified — they have already done it', async () => {
+  it('STILL prompts once the bank is verified — they are the readiest of all', async () => {
     const { prompt } = await promptFor({ achVerified: true, depositAmount: 900 })
-    expect(prompt).toBeNull()
+    expect(prompt).toEqual({ depositAmount: 900 })
   })
 
-  it('says nothing while microdeposits are already in flight', async () => {
+  it('STILL prompts while microdeposits are in flight', async () => {
     const { prompt } = await promptFor({ achVerified: false, depositAmount: 900, bankStartedDaysAgo: 0 })
-    expect(prompt).toBeNull()
+    expect(prompt).toEqual({ depositAmount: 900 })
   })
 
   it('says nothing when the landlord is charging no deposit', async () => {

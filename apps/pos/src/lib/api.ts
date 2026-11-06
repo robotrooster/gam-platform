@@ -37,13 +37,8 @@ api.interceptors.request.use((config) => {
 // inline. Only a 401 on a NORMAL authed request means a dead session worth
 // bouncing. The tenant portal already had this carve-out (S537).
 //
-// S652: a 402 ACCOUNT_LOCKED is NOT a dead session and must never bounce anyone
-// to /login. The landlord is signed in perfectly well; GAM has suspended the
-// account because it cannot collect what it is owed. Throwing them at the login
-// page would leave them typing a correct password into a form that keeps
-// working, with no idea why nothing loads. The flag is broadcast instead, and
-// the app draws the lock screen over the top.
-export const ACCOUNT_LOCKED_EVENT = 'gam:account-locked'
+// 11/2 (Nic): the 402 ACCOUNT_LOCKED path is gone with the portal lock. The
+// server no longer sends it and nothing draws a lock screen.
 
 api.interceptors.response.use(
   (res) => res,
@@ -59,11 +54,6 @@ api.interceptors.response.use(
     if (err.response?.status === 401 && !url.includes('/auth/')) {
       localStorage.removeItem('gam_token')
       window.location.href = '/login'
-    }
-    if (err.response?.status === 402 && err.response?.data?.code === 'ACCOUNT_LOCKED') {
-      window.dispatchEvent(new CustomEvent(ACCOUNT_LOCKED_EVENT, {
-        detail: { reason: err.response?.data?.lockedReason ?? null },
-      }))
     }
     return Promise.reject(err)
   }

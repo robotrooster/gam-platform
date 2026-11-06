@@ -661,7 +661,7 @@ describe('chain restart (10/13)', () => {
   })
 
   // 10/13 review: production's forks split up to seven ways at one entry, and
-  // one chain (Jonathan Covey's) at two entries. The seal, the report and the
+  // one chain (Rilla Satterlee's) at two entries. The seal, the report and the
   // hashed note have to carry every split, not the first the walk meets.
   it('a chain split three ways, and again further on: the restart seals and reports every split', async () => {
     const refId = newRefId()

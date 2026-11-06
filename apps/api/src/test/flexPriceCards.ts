@@ -88,6 +88,71 @@ export const FLEXPAY_SEED_ROWS = 15
 export const FLEXDEPOSIT_SEED_ROWS = 10
 
 /**
+ * 10/31 — GAM's cut of a finished contractor-marketplace job.
+ *
+ * Here for the same reason the grids are: services/marketplace.ts treats a
+ * missing card as an ERROR and never as a zero, so a test file that borrowed
+ * the table would hand every later file that refusal in place of a rate. The
+ * marketplace suite deliberately empties it to prove the refusal, which is
+ * exactly the case this guards.
+ */
+/**
+ * 10/31 — what financing a job costs. The FlexDeposit curve, continued.
+ *
+ * Here for the same reason the grids are: a missing bracket is an ERROR in
+ * services/jobFinancing, never a free plan, so a file that emptied this table
+ * would hand every later file that refusal in place of a fee. The financing
+ * suite deliberately prices above the top bracket to prove the refusal, which
+ * is exactly the case this guards.
+ */
+const JOB_FINANCING_SQL = `
+  INSERT INTO job_financing_fee_schedule (job_min, job_max, payments, fee, effective_from, note)
+  SELECT v.job_min, v.job_max, v.payments, v.fee, DATE '2020-01-01', 'test seed'
+    FROM (VALUES
+      (0,1000,2,25),(0,1000,4,70),(1000,1500,2,35),(1000,1500,4,105),
+      (1500,2000,2,45),(1500,2000,4,140),(2000,2500,2,60),(2000,2500,4,175),
+      (2500,3000,2,70),(2500,3000,4,210),(3000,4000,2,95),(3000,4000,4,280),
+      (4000,5000,2,120),(4000,5000,4,355),
+      (5000,7500,2,175),(5000,7500,4,530),(5000,7500,6,880),(5000,7500,12,1940),
+      (7500,10000,2,235),(7500,10000,4,705),(7500,10000,6,1175),(7500,10000,12,2585),
+      (10000,12500,2,295),(10000,12500,4,880),(10000,12500,6,1470),(10000,12500,12,3230),
+      (12500,15000,2,355),(12500,15000,4,1060),(12500,15000,6,1765),(12500,15000,12,3880),
+      (15000,20000,2,470),(15000,20000,4,1410),(15000,20000,6,2350),(15000,20000,12,5170)
+    ) AS v(job_min, job_max, payments, fee)
+   WHERE NOT EXISTS (SELECT 1 FROM job_financing_fee_schedule)`
+
+/**
+ * 10/31 — where the top spot is sold and what it costs there.
+ *
+ * Two tiny stand-ins rather than the 439 published areas: a file that needs a
+ * real metro reads the live table, and what this guards is only that
+ * `requirePlacementRate` finds a band at all, since a missing band is an ERROR
+ * by design and would otherwise leak into every later file in the run.
+ */
+const MARKETPLACE_AREA_SQL = `
+  INSERT INTO marketplace_areas (area_kind, area_key, name, states, cost_index, index_source, index_year)
+  SELECT v.k, v.key, v.name, v.states, v.idx, 'BEA Regional Price Parities, all items', 2024
+    FROM (VALUES
+      ('metro','99901','Testville-Fixture, AZ',ARRAY['AZ']::text[],100.000),
+      ('state_rural','AZ','Arizona, outside the metro areas',ARRAY['AZ']::text[],100.700)
+    ) AS v(k, key, name, states, idx)
+   WHERE NOT EXISTS (SELECT 1 FROM marketplace_areas)`
+
+const MARKETPLACE_PLACEMENT_SQL = `
+  INSERT INTO marketplace_placement_rates (index_min, index_max, monthly_price, effective_from, note)
+  SELECT v.lo, v.hi, v.price, DATE '2020-01-01', 'test seed'
+    FROM (VALUES
+      (0,86,20),(86,90,25),(90,94,35),(94,98,45),(98,102,55),
+      (102,106,70),(106,110,85),(110,112,105),(112,999,120)
+    ) AS v(lo, hi, price)
+   WHERE NOT EXISTS (SELECT 1 FROM marketplace_placement_rates)`
+
+const MARKETPLACE_CUT_SQL = `
+  INSERT INTO marketplace_cut_rates (percent, effective_from, note)
+  SELECT 3.000, DATE '2020-01-01', 'test seed'
+  WHERE NOT EXISTS (SELECT 1 FROM marketplace_cut_rates)`
+
+/**
  * Put both grids in place, if they are not already there. Safe to call again:
  * each insert is guarded on its own table being empty, so restoring after a
  * file that wiped them does the right thing and a second call does nothing.
@@ -101,6 +166,10 @@ export async function seedFlexPriceCards(exec: SqlExec): Promise<void> {
   await exec(FLEXPAY_SQL)
   await exec(FLEXDEPOSIT_SQL)
   await exec(MOVE_FEES_SQL)
+  await exec(MARKETPLACE_CUT_SQL)
+  await exec(JOB_FINANCING_SQL)
+  await exec(MARKETPLACE_AREA_SQL)
+  await exec(MARKETPLACE_PLACEMENT_SQL)
   // The two callers hand back different shapes — a pg Client returns
   // `{ rows }`, the db module's `query` returns the rows themselves — so the
   // count is read out of either rather than assuming one of them.

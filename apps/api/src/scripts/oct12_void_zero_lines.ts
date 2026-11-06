@@ -6,7 +6,7 @@
  * The monthly invoice run used to write a charge line for a utility reading
  * that billed nothing (jobs/invoiceGeneration now marks such a reading billed
  * and writes no line). Four of those lines were still open in production on
- * 10/12 — Gerald Logue's August electric (RV 48, 49083 → 49083) among them.
+ * 10/12 — Arlo Braddock's August electric (RV 48, 49083 → 49083) among them.
  * An open $0 line read like an unpaid bill: it counted against payment health,
  * looked like rent on the tenant profile, and kept late fees running.
  *

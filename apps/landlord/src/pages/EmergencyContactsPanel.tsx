@@ -11,9 +11,9 @@ import { FRESH_LIST, loadFailedSentence, actionFailedSentence } from './deskErro
  * S640 — the emergency contact list, as a Front Desk sub-tab.
  *
  * Nic: "we wanna have a page that is accessible... maybe a sub tab in the front
- * desk page. That way my front desk help Lisa Scheeler can see that, and have
+ * desk page. That way my front desk help Calla Fitzhugh can see that, and have
  * permission to edit and update fields that are blank... when people come in to
- * pay rent in person, Lisa can just say, hey, just in case we ever need
+ * pay rent in person, Calla can just say, hey, just in case we ever need
  * emergency contact information, who would you like us to contact."
  *
  * So it is built for a person standing at a counter with somebody in front of

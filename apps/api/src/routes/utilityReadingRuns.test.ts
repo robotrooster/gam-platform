@@ -21,7 +21,7 @@ import {
   seedLease, seedLeaseTenant, seedUtilityMeter,
 } from '../test/dbHelpers'
 import { utilityRouter } from './utility'
-import { openReadingRun, getRunMeters, isRunFullyRead } from '../services/utilityReadingRuns'
+import { countFlaggedOnRun, openReadingRun, getRunMeters, isRunFullyRead } from '../services/utilityReadingRuns'
 import { errorHandler } from '../middleware/errorHandler'
 import { lastBusinessDayOfMonth } from '../services/utilityReadingRuns'
 import { generateInvoices } from '../jobs/invoiceGeneration'
@@ -216,17 +216,67 @@ describe('blind entry', () => {
     }
   })
 
-  it('a below-prior entry gets an indistinguishable 201 and a silent flag', async () => {
+  // ── 10/31 (Nic): THE FAT-FINGER FLAG IS GONE ───────────────────────────
+  //
+  //   "Turn off the readings to double check feature for now... as far as the
+  //    random blind check for fat fingering."
+  //
+  // The entry stays indistinguishable — that part never changed, and it is why
+  // the walk is blind. What is gone is the FLAG, which used to stop the read and
+  // with it every other lot's bill for the month. A dial that went backwards is
+  // handled at billing instead, as a broken meter (services/utilityBilling
+  // `rolledBack`), so nothing is billed off it and the landlord is told.
+  it('a below-prior entry gets an indistinguishable 201 and NO flag', async () => {
     const app = buildApp()
     const f = await seed()
     const run = await openRun(app, f)
-    const res = await enterReading(app, f, run.id, f.meterLeased, 900) // wrap ≥ half range → suspect
+    const res = await enterReading(app, f, run.id, f.meterLeased, 900) // wrap ≥ half range
     expect(res.status).toBe(201)
     expect(JSON.stringify(res.body)).not.toMatch(/needs_review|review_note|reading_value/)
     const row = await db.query(
-      `SELECT needs_review FROM utility_meter_readings WHERE meter_id = $1 AND billing_cycle_month = $2`,
-      [f.meterLeased, CYCLE])
-    expect(row.rows[0].needs_review).toBe(true)
+      `SELECT needs_review, is_rollover FROM utility_meter_readings
+        WHERE meter_id = $1 AND billing_cycle_month = $2`, [f.meterLeased, CYCLE])
+    expect(row.rows[0].needs_review).toBe(false)
+    expect(row.rows[0].is_rollover).toBe(false)   // not billed as a wrap either
+  })
+
+  // The guard that remains protects a TENANT's invoice from a slipped digit. On
+  // a space with nobody on it there is no invoice and no tenant, and the flag's
+  // only effect was to stop the month for everybody else — Country Acres Lot 8,
+  // never tenanted in its life, held eleven other lots for three days.
+  it('a high read on a space with nobody on it is not flagged; the same read on an occupied one is', async () => {
+    const app = buildApp()
+    const f = await seed()
+    const run = await openRun(app, f)
+    const done = await mainWalk(app, f, run, 7000, 7000) // both far over the 5,000 kWh line
+    expect(done.flagged).toBe(1)
+    const rows = await db.query(
+      `SELECT meter_id, needs_review FROM utility_meter_readings
+        WHERE billing_cycle_month = $1 AND meter_id = ANY($2::uuid[])`,
+      [CYCLE, [f.meterLeased, f.meterVacant]])
+    const byMeter = Object.fromEntries(rows.rows.map((r: any) => [r.meter_id, r.needs_review]))
+    expect(byMeter[f.meterLeased]).toBe(true)
+    expect(byMeter[f.meterVacant]).toBe(false)
+  })
+
+  // "we need a system to mark when people are just generally high users. That
+  // way it doesn't flag the system every month." Country Acres Lot 17 billed
+  // 19,800 gallons in September, paid and settled, then was held in October for
+  // 12,700 — LESS than the month that went through.
+  it('a meter marked a known heavy user is not flagged however high the read', async () => {
+    const app = buildApp()
+    const f = await seed()
+    await db.query(
+      `UPDATE utility_meters SET high_use_confirmed_at = NOW(), high_use_confirmed_by_user_id = $2
+        WHERE id = $1`, [f.meterLeased, f.landlordAUserId])
+    const run = await openRun(app, f)
+    const done = await mainWalk(app, f, run, 90000, 560)
+    expect(done.flagged).toBe(0)
+    expect(done.run.status).not.toBe('double_check')
+    const row = await db.query(
+      `SELECT needs_review FROM utility_meter_readings
+        WHERE meter_id = $1 AND billing_cycle_month = $2`, [f.meterLeased, CYCLE])
+    expect(row.rows[0].needs_review).toBe(false)
   })
 })
 
@@ -303,12 +353,182 @@ describe('flagged reads — one window', () => {
     expect(Number(bills.rows[0].usage_amount)).toBe(700)   // 1700 − 1000
   })
 
+  // ── 10/31 (Nic): A ONE-UNIT DROP IS NOT A REVIEWABLE READ ─────────────────
+  //
+  //   "I should not need to double check a read that's off by one. RV 37 should
+  //    not be showing up on this list."
+  //
+  // Dropping the entry flag stopped new ones and did nothing about rows already
+  // carrying needs_review from the old rule. Mountain View RV 37 sat in his
+  // queue holding the whole park's October for a one-unit drop, and I told him
+  // to settle it — which was the wrong answer twice over. The queue and the
+  // held-count now apply the margin at READ time rather than trusting the
+  // stored boolean, so a leftover flag cannot hold anything.
+  it('a stored flag on a barely-moved read neither shows in the queue nor holds the run', async () => {
+    const app = buildApp()
+    const f = await seed()
+    const run = await openRun(app, f)
+    const done = await mainWalk(app, f, run, 1250, 560)
+    expect(done.run.status).toBe('completed')          // nothing flagged at entry
+
+    // Force the old rule's leftover: one unit below the prior, flagged by hand.
+    await db.query(
+      `UPDATE utility_meter_readings SET reading_value = 999, needs_review = TRUE,
+              review_note = 'Reading is below the previous reading — double-check the meter'
+        WHERE meter_id = $1 AND billing_cycle_month = $2 AND reason = 'monthly_cycle'`,
+      [f.meterLeased, CYCLE])
+
+    const flagged = await flaggedList(app, f)
+    expect(flagged.body.data).toHaveLength(0)           // not his problem
+    expect(await countFlaggedOnRun(run.id)).toBe(0)     // and it holds nothing
+
+    // Three units down IS a real drop and still comes to him.
+    await db.query(
+      `UPDATE utility_meter_readings SET reading_value = 997
+        WHERE meter_id = $1 AND billing_cycle_month = $2 AND reason = 'monthly_cycle'`,
+      [f.meterLeased, CYCLE])
+    expect((await flaggedList(app, f)).body.data).toHaveLength(1)
+    expect(await countFlaggedOnRun(run.id)).toBe(1)
+  })
+
+  // ── 10/31 (Nic): A WAITING RUN WITH NOTHING LEFT FINISHES ITSELF ──────────
+  //
+  //   "If there's nothing for a double check, why would I go back in to review
+  //    bills or choose to complete? That process should happen when there are
+  //    automatically no more to review."
+  //
+  // The only trigger was resolving the LAST flagged read. A run whose last flag
+  // went away any other way — and now a read can stop being reviewable without
+  // anyone touching it, because countFlaggedOnRun applies the reading margin at
+  // read time — sat in double_check telling him zero readings looked off and to
+  // go and settle them.
+  it('finishes a waiting run once nothing is left to review', async () => {
+    const { finishSettledReadingRuns } = await import('../services/utilityReadingRuns')
+    const app = buildApp()
+    const f = await seed()
+    await db.query(
+      `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+       VALUES ($1, 'electric', TRUE) ON CONFLICT DO NOTHING`, [f.leaseAId])
+    const run = await openRun(app, f)
+    const done = await mainWalk(app, f, run, 7000, 560)   // leased meter flagged
+    expect(done.run.status).toBe('double_check')
+
+    // Nothing has changed, so it stays waiting — this must not bill early.
+    expect(await finishSettledReadingRuns()).toMatchObject({ finished: 0, waiting: 1 })
+    expect((await db.query(`SELECT status FROM utility_reading_runs WHERE id = $1`, [run.id]))
+      .rows[0].status).toBe('double_check')
+
+    // The flag goes away WITHOUT resolve-review — the case that had no trigger.
+    await db.query(
+      `UPDATE utility_meter_readings SET needs_review = FALSE
+        WHERE meter_id = $1 AND billing_cycle_month = $2`, [f.meterLeased, CYCLE])
+
+    expect(await finishSettledReadingRuns()).toMatchObject({ finished: 1 })
+    const after = (await db.query(`SELECT status, bills_created FROM utility_reading_runs WHERE id = $1`,
+      [run.id])).rows[0]
+    expect(after.status).toBe('completed')
+    expect(Number(after.bills_created)).toBeGreaterThan(0)
+  })
+
+  it('leaves a run waiting for a company that reviews its bills, and says so', async () => {
+    const { finishSettledReadingRuns } = await import('../services/utilityReadingRuns')
+    const app = buildApp()
+    const f = await seed()
+    await db.query(`UPDATE landlords SET review_utility_bills = TRUE WHERE id = $1`, [f.landlordAId])
+    const run = await openRun(app, f)
+    await mainWalk(app, f, run, 7000, 560)
+    await db.query(
+      `UPDATE utility_meter_readings SET needs_review = FALSE
+        WHERE meter_id = $1 AND billing_cycle_month = $2`, [f.meterLeased, CYCLE])
+
+    // Nothing to review, but this landlord approves first — so it waits, and
+    // they are told the bills are ready rather than left to find out.
+    expect(await finishSettledReadingRuns()).toMatchObject({ finished: 0, waiting: 1 })
+    expect((await db.query(`SELECT status FROM utility_reading_runs WHERE id = $1`, [run.id]))
+      .rows[0].status).toBe('double_check')
+    const n = await db.query(
+      `SELECT COUNT(*)::int AS n FROM notifications
+        WHERE landlord_id = $1 AND type = 'utility_bills_ready_to_review'`, [f.landlordAId])
+    expect(n.rows[0].n).toBeGreaterThan(0)
+  })
+
+  // ── 10/31 (Nic): THE ARREARS TRIGGER ──────────────────────────────────────
+  //
+  //   "we need the water usage for number 28 to go to the lease that's being
+  //    ended as part of the final expenses... It needs to be able to trigger at
+  //    the meter reading cycle to finalize that move out amount of money."
+  //
+  // Utilities bill in arrears, so the last cycle's usage is written after the
+  // tenancy ended and after the handover figure was frozen. Country Acres Lot 28
+  // froze at $739.60 the day a replacement signed; October's $24.75 landed the
+  // next day and never reached it. The reading cycle is the first moment the
+  // right answer exists, which is the moment he named.
+  it("folds the final cycle's utilities into what the departing resident owes", async () => {
+    const app = buildApp()
+    const f = await seed()
+    await db.query(
+      `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+       VALUES ($1, 'electric', TRUE) ON CONFLICT DO NOTHING`, [f.leaseAId])
+    // She left owing rent, recorded before the month's meter was read.
+    await db.query(
+      `INSERT INTO payments (lease_id, tenant_id, landlord_id, amount, type, status, due_date, entry_description)
+       VALUES ($1,$2,$3,450,'rent','pending',$4,'RENT')`,
+      [f.leaseAId, f.tenantAId, f.landlordAId, CYCLE])
+    const owing = (await db.query<any>(
+      `INSERT INTO tenant_left_owing (landlord_id, property_id, user_id, who, amount, source_kind, source_key, left_on)
+       VALUES ($1,$2,NULL,'A Departing Resident',450,'lease',$3,CURRENT_DATE) RETURNING id`,
+      [f.landlordAId, f.propertyAId, f.leaseAId])).rows[0].id
+
+    // The month is read and closed: 1250 against a 1000 baseline = 250 × $0.14.
+    const run = await openRun(app, f)
+    const done = await mainWalk(app, f, run, 1250, 560)
+    expect(done.run.status).toBe('completed')
+
+    const after = (await db.query<any>(
+      `SELECT amount::float AS amount FROM tenant_left_owing WHERE id = $1`, [owing])).rows[0]
+    expect(after.amount).toBe(485)        // 450 rent + $35.00 of electric
+  })
+
+  it('never moves an imported balance, and never one being collected against', async () => {
+    const app = buildApp()
+    const f = await seed()
+    await db.query(
+      `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+       VALUES ($1, 'electric', TRUE) ON CONFLICT DO NOTHING`, [f.leaseAId])
+    // An IMPORTED historical balance keyed to the same lease. Frozen forever:
+    // it is the figure a dishonest operator would inflate.
+    const imported = (await db.query<any>(
+      `INSERT INTO tenant_left_owing (landlord_id, property_id, user_id, who, amount, source_kind, source_key, left_on)
+       VALUES ($1,$2,NULL,'From The Old Park',900,'import',$3,CURRENT_DATE) RETURNING id`,
+      [f.landlordAId, f.propertyAId, f.leaseAId])).rows[0].id
+    // And a GAM-accrued row somebody has already paid against.
+    const collecting = (await db.query<any>(
+      `INSERT INTO tenant_left_owing (landlord_id, property_id, user_id, who, amount, collected_amount,
+                                      source_kind, source_key, left_on)
+       VALUES ($1,$2,NULL,'Part Paid',300,50,'lease',$3,CURRENT_DATE) RETURNING id`,
+      [f.landlordAId, f.propertyAId, f.unitAId])).rows[0].id
+
+    const run = await openRun(app, f)
+    await mainWalk(app, f, run, 1250, 560)
+
+    expect(Number((await db.query<any>(`SELECT amount FROM tenant_left_owing WHERE id = $1`, [imported]))
+      .rows[0].amount)).toBe(900)
+    expect(Number((await db.query<any>(`SELECT amount FROM tenant_left_owing WHERE id = $1`, [collecting]))
+      .rows[0].amount)).toBe(300)
+  })
+
   it('two flagged reads: the run waits until the LAST one is settled', async () => {
     const app = buildApp()
     const f = await seed()
     await db.query(
       `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
        VALUES ($1, 'electric', TRUE) ON CONFLICT DO NOTHING`, [f.leaseAId])
+    // 10/31: BOTH spaces have to be occupied for both reads to flag — the
+    // suspicious-usage guard skips a space with nobody on it, because there is
+    // no invoice there to protect.
+    const c = await db.connect()
+    try { await seedLease(c, { unitId: f.unit2Id, landlordId: f.landlordAId, status: 'active' }) }
+    finally { c.release() }
     const run = await openRun(app, f)
     const done = await mainWalk(app, f, run, 7000, 7000) // both over the threshold
     expect(done.run.status).toBe('double_check')
@@ -336,23 +556,33 @@ describe('flagged reads — one window', () => {
     expect(Number(bills.rows[0].charge_amount)).toBeCloseTo(44.24, 2)
   })
 
-  it('an implausible low value is flagged for the landlord (rollover vs swap); confirmed, nothing bills', async () => {
+  // ── 10/31: A SWAP-SIZED DROP IS STILL CAUGHT, BY THE PLAUSIBILITY GUARD ───
+  //
+  // A dial that ran backwards now bills its movement (Nic: "go by what's on the
+  // meter"), which raises the obvious question: what stops a REPLACED head from
+  // billing a fortune? A new meter reading 50 where the old one ended at 500000
+  // would be 499,950 units of fiction. The answer is the guard that was already
+  // there for a slipped digit — the usage blows past the utility type's
+  // threshold and is held for the landlord's one window, where "that was a
+  // meter swap" zeroes it. The fat-finger flag is gone; this is not it.
+  it('a swap-sized drop is held by the usage threshold, and nothing bills', async () => {
     const app = buildApp()
     const f = await seed()
     await db.query(
       `UPDATE utility_meter_readings SET reading_value = 500000
         WHERE meter_id = $1 AND billing_cycle_month = '2026-06-01'`, [f.meterLeased])
     const run = await openRun(app, f)
-    const done = await mainWalk(app, f, run, 50, 560) // wrap 500050 ≥ half range → flagged
+    const done = await mainWalk(app, f, run, 50, 560)
     expect(done.run.status).toBe('double_check')
+    expect(done.flagged).toBe(1)
     const flagged = await flaggedList(app, f)
     expect(flagged.body.data).toHaveLength(1)
-    expect(flagged.body.data[0].review_note).toMatch(/below the previous reading/)
-    // Landlord: the meter was swapped → confirm; nothing bills this cycle.
-    const resolved = await resolveFlagged(app, f, flagged.body.data[0].id, {})
-    expect(resolved.status).toBe(200)
-    expect(resolved.body.data.run.status).toBe('completed')
-    expect(resolved.body.data.run.bills_created).toBe(0)
+    // The HIGH-usage sentence, because that is the guard that caught it.
+    expect(flagged.body.data[0].review_note).toMatch(/Unusually high usage/)
+    const bills = await db.query(
+      `SELECT COUNT(*)::int AS n FROM utility_bills
+        WHERE meter_id = $1 AND billing_cycle_month = $2`, [f.meterLeased, CYCLE])
+    expect(bills.rows[0].n).toBe(0)
   })
 
   it('per-meter digits drive the wrap: a 4-digit meter rolls 9822 → 0138 = 316', async () => {
@@ -378,8 +608,22 @@ describe('flagged reads — one window', () => {
     await db.query(
       `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
        VALUES ($1, 'electric', TRUE) ON CONFLICT DO NOTHING`, [f.leaseAId])
+    // 10/31: the flag has to be on the OCCUPIED meter now — a high read on an
+    // empty space is no longer flagged, so flagging the vacant one would leave
+    // the run with nothing waiting and it would complete on its own. unit2 gets
+    // a lease so the OTHER meter is genuinely billable, which is what "bills the
+    // clean meters" has to mean for this test to prove anything.
+    const c2 = await db.connect()
+    try {
+      const l2 = await seedLease(c2, { unitId: f.unit2Id, landlordId: f.landlordAId, status: 'active' })
+      const t2 = await seedTenant(c2)
+      await seedLeaseTenant(c2, { leaseId: l2, tenantId: t2 })
+      await c2.query(
+        `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+         VALUES ($1, 'electric', TRUE) ON CONFLICT DO NOTHING`, [l2])
+    } finally { c2.release() }
     const run = await openRun(app, f)
-    await mainWalk(app, f, run, 1250, 7000) // vacant meter flagged; leased clean
+    await mainWalk(app, f, run, 7000, 560) // leased meter flagged; unit2's clean and billable
     const done = await request(app)
       .post(`/api/utility/reading-runs/${run.id}/complete`)
       .set('Authorization', `Bearer ${f.tokenA}`)
@@ -1944,5 +2188,72 @@ describe('GET /api/utility/reading-history', () => {
     const other = await request(app).get(`/api/utility/reading-history?propertyId=${f.propertyAId}`)
       .set('Authorization', `Bearer ${f.tokenB}`)
     expect(other.status).toBe(403)
+  })
+})
+
+/**
+ * ── 10/28 (Nic): THE PERSON WALKING THE METERS GETS THE PROMPT ──────────────
+ *
+ *   "add work trade people with permission to do meter reads on the
+ *    notification list for the meter run. It doesn't need to email them. It
+ *    only needs to be in app."
+ *
+ * They could already start whenever they liked — nothing gates the walk on a
+ * date — but the month's prompt went to the landlord and their staff only, so
+ * the one person actually doing it was never told the run had opened.
+ */
+describe('who is told a reading run opened', () => {
+  async function agreement(f: Fixture, perms: string[], status = 'active') {
+    await db.query(
+      `INSERT INTO work_trade_agreements (unit_id, tenant_id, landlord_id, start_date, status, field_permissions)
+       VALUES ($1,$2,$3,'2026-01-01',$4,$5)`, [f.unitAId, f.tenantAId, f.landlordAId, status, perms])
+    return (await db.query(`SELECT user_id FROM tenants WHERE id=$1`, [f.tenantAId])).rows[0].user_id
+  }
+  const noticesFor = (userId: string) => db.query(
+    `SELECT title, body, action_url, email_sent FROM notifications
+      WHERE user_id = $1 AND type = 'utility_reading_run_opened'`, [userId])
+
+  it('tells a work trader who may read meters, in the app and not by email', async () => {
+    const f = await seed()
+    const uid = await agreement(f, ['read_meters'])
+    await openReadingRun(f.propertyAId, '2026-07-01')
+
+    const { rows } = await noticesFor(uid)
+    expect(rows).toHaveLength(1)
+    // Their own page, not the landlord's Utilities screen.
+    expect(rows[0].action_url).toBe('/meter-readings')
+    // In-app only, by his instruction.
+    expect(rows[0].email_sent).not.toBe(true)
+    // The walk and its size — not what the readings go on to bill, which is
+    // the landlord's side of this and not a field worker's business.
+    expect(rows[0].body).not.toMatch(/invoice|bill/i)
+  })
+
+  it('does not tell a work trader whose agreement carries no meter reading', async () => {
+    // field_permissions is CHECKed subset-of ['read_meters'] — reading meters is
+    // the only field permission there is today — so "not allowed" is an
+    // agreement with none, which is what most work trade is.
+    const f = await seed()
+    const uid = await agreement(f, [])
+    await openReadingRun(f.propertyAId, '2026-07-01')
+    expect((await noticesFor(uid)).rows).toHaveLength(0)
+  })
+
+  it('does not tell a work trader whose agreement is paused', async () => {
+    // Nobody reads meters for a landlord while their agreement sleeps — the
+    // same rule the tenant portal's own nav link follows.
+    const f = await seed()
+    const uid = await agreement(f, ['read_meters'], 'paused')
+    await openReadingRun(f.propertyAId, '2026-07-01')
+    expect((await noticesFor(uid)).rows).toHaveLength(0)
+  })
+
+  it('still tells the landlord, by email as before', async () => {
+    const f = await seed()
+    await agreement(f, ['read_meters'])
+    await openReadingRun(f.propertyAId, '2026-07-01')
+    const { rows } = await noticesFor(f.landlordAUserId)
+    expect(rows).toHaveLength(1)
+    expect(rows[0].action_url).toContain('/utilities')
   })
 })

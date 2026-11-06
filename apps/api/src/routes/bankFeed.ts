@@ -762,6 +762,8 @@ bankFeedRouter.post('/deposit-slips', requirePerm('take_payment'), async (req: a
       depositDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
       receiptIds: z.array(z.string().uuid()).max(200).default([]),
       registerSaleIds: z.array(z.string().uuid()).max(200).default([]),
+      // 10/31: counted drawers whose drop went in the bag.
+      drawerDropIds: z.array(z.string().uuid()).max(200).default([]),
       otherAmount: z.number().min(0).max(1_000_000).default(0),
       otherNote: z.string().max(300).nullish(),
       otherIsNotRent: z.boolean().optional(),
@@ -782,6 +784,7 @@ bankFeedRouter.post('/deposit-slips', requirePerm('take_payment'), async (req: a
     const slip = await createSlip({
       landlordId, depositDate: body.depositDate,
       receiptIds: body.receiptIds, registerSaleIds: body.registerSaleIds,
+      drawerDropIds: body.drawerDropIds,
       otherAmount: body.otherAmount, otherNote: body.otherNote ?? null, otherIsNotRent: body.otherIsNotRent,
       expectedTotal: body.expectedTotal ?? null, bankTransactionId: body.bankTransactionId ?? null,
       createdBy: req.user.userId, propertyIds,

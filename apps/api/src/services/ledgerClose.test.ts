@@ -83,7 +83,10 @@ describe('who may close and reopen (the owner decides)', () => {
     await setLedgerSettings({ landlordId: co.landlordId, actorUserId: co.ownerUserId, reopenBy: 'owner_or_bookkeeper' })
     expect(await reopenMonth({ owner: co.owner, month: '2026-09-15', actorUserId: rw, reason: 'missed a bill' }))
       .toMatchObject({ closedThrough: '2026-08-31' })
-    const hist = await db.query(`SELECT action, closed_through::text AS t, reason FROM books_period_closes WHERE landlord_id = $1 ORDER BY id`, [co.landlordId])
+    // 11/3: primary rows only — each action also writes one sibling row per
+    // property, so the per-line close guard can ask about the line's own.
+    const hist = await db.query(`SELECT action, closed_through::text AS t, reason FROM books_period_closes
+                                  WHERE landlord_id = $1 AND property_id IS NULL ORDER BY id`, [co.landlordId])
     expect(hist.rows).toEqual([
       { action: 'close', t: '2026-09-30', reason: null },
       { action: 'reopen', t: '2026-08-31', reason: 'missed a bill' },
@@ -126,6 +129,64 @@ describe('a co-owner is an owner', () => {
       { user_id: co.ownerUserId, title: 'A month was closed in your books' },
       { user_id: co.ownerUserId, title: 'A closed month was reopened in your books' },
     ])
+  })
+})
+
+// 11/3 — THE CLOSE IS PER-PROPERTY (Nic picked this over refusing a new
+// property's start inside a closed month). The guard on every ledger line asks
+// what THE LINE'S OWN property is closed through, so a close that wrote only
+// the company's row — the one whose property_id is NULL, covering the lines
+// that name no property — would protect a bank balance and leave the rent wide
+// open. That is the only thing anyone closes a month for, and it would have
+// failed in total silence: no error, no finding, just a month that says closed
+// and accepts postings.
+describe('a close covers every property (11/3)', () => {
+  it('writes one row per property beside the company\'s, and the state reads per property', async () => {
+    const co = await ledgerCompany({ booksStart: '2026-01-01' })
+    expect(await closeMonth({ owner: co.owner, through: '2026-09-30', actorUserId: co.ownerUserId }))
+      .toMatchObject({ closedThrough: '2026-09-30' })
+
+    const rows = (await db.query<{ p: string | null; t: string }>(
+      `SELECT property_id::text AS p, closed_through::text AS t
+         FROM books_period_closes WHERE landlord_id = $1 AND action = 'close'`, [co.landlordId])).rows
+    expect(rows.map(r => r.p).sort()).toEqual([co.propertyId, co.propertyId2, null].sort())
+    expect([...new Set(rows.map(r => r.t))]).toEqual(['2026-09-30'])
+
+    // And the state read answers per property, which is what the line guard asks.
+    const asked = (await db.query<{ one: string | null; two: string | null; company: string | null }>(
+      `SELECT ledger_closed_through($1, NULL, $2)::text AS one,
+              ledger_closed_through($1, NULL, $3)::text AS two,
+              ledger_closed_through($1, NULL)::text      AS company`,
+      [co.landlordId, co.propertyId, co.propertyId2])).rows[0]
+    expect(asked).toEqual({ one: '2026-09-30', two: '2026-09-30', company: '2026-09-30' })
+  })
+
+  it('can hold one property closed while another stays open', async () => {
+    const co = await ledgerCompany({ booksStart: '2026-01-01' })
+    // Written by hand: closing a single property is what the per-property shape
+    // makes POSSIBLE, and the engine has to honour it before any screen offers
+    // it. This is the row that screen will write.
+    await db.query(
+      `INSERT INTO books_period_closes (landlord_id, property_id, action, closed_through, acted_by)
+       VALUES ($1, $2, 'close', '2026-09-30', $3)`, [co.landlordId, co.propertyId2, co.ownerUserId])
+    const asked = (await db.query<{ open: string | null; shut: string | null; company: string | null }>(
+      `SELECT ledger_closed_through($1, NULL, $2)::text AS open,
+              ledger_closed_through($1, NULL, $3)::text AS shut,
+              ledger_closed_through($1, NULL)::text      AS company`,
+      [co.landlordId, co.propertyId, co.propertyId2])).rows[0]
+    expect(asked).toEqual({ open: null, shut: '2026-09-30', company: null })
+  })
+
+  it('a reopen lifts every property, not only the company\'s slice', async () => {
+    const co = await ledgerCompany({ booksStart: '2026-01-01' })
+    await closeMonth({ owner: co.owner, through: '2026-09-30', actorUserId: co.ownerUserId })
+    await reopenMonth({ owner: co.owner, month: '2026-09-01', reason: 'missed a bill', actorUserId: co.ownerUserId })
+    const asked = (await db.query<{ one: string | null; company: string | null }>(
+      `SELECT ledger_closed_through($1, NULL, $2)::text AS one,
+              ledger_closed_through($1, NULL)::text      AS company`, [co.landlordId, co.propertyId])).rows[0]
+    // Left closed on a property, the month would read open and refuse every
+    // line in it — the exact opposite failure to the one above.
+    expect(asked.one).toEqual(asked.company)
   })
 })
 

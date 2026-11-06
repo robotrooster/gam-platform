@@ -1,7 +1,7 @@
 /**
  * S655 (money plan, Step 11) — a receipt lists money and credit separately.
  *
- * Kim Harland's 9/9 receipt said $936 for a $486 money order: every line at its
+ * Yvette Bexley's 9/9 receipt said $936 for a $486 money order: every line at its
  * full amount, summed and called "Total paid", though $450 of it was the
  * landlord's move-in special. The receipt now shows each charge by name, the
  * account credit as its own line, anything kept on the account, and a total
@@ -31,8 +31,8 @@ afterEach(() => { delete process.env.EMAIL_SEND_LIVE })
 
 const lastSend = () => (resendSendMock.mock.calls.at(-1) as any[])![0]
 
-/** Kim's September: rent, water, trash on one lease, all still open. */
-async function seedKim() {
+/** Yvette's September: rent, water, trash on one lease, all still open. */
+async function seedYvette() {
   const c = await db.connect()
   try {
     await c.query('BEGIN')
@@ -42,8 +42,8 @@ async function seedKim() {
     const unitId = await seedUnit(c, { propertyId, landlordId: ll.landlordId })
     await c.query(`UPDATE units SET unit_number = 'RV 22' WHERE id = $1`, [unitId])
     const leaseId = await seedLease(c, { unitId, landlordId: ll.landlordId, rentAmount: 900 })
-    const tenantId = await seedTenant(c, { email: `kim-${randomUUID()}@mailer-test.co` })
-    await c.query(`UPDATE users SET first_name = 'Kim' WHERE id = (SELECT user_id FROM tenants WHERE id = $1)`, [tenantId])
+    const tenantId = await seedTenant(c, { email: `yvette-${randomUUID()}@mailer-test.co` })
+    await c.query(`UPDATE users SET first_name = 'Yvette' WHERE id = (SELECT user_id FROM tenants WHERE id = $1)`, [tenantId])
     await seedLeaseTenant(c, { leaseId, tenantId })
     const inv = await c.query<{ id: string }>(
       `INSERT INTO invoices (landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date, total_amount, status)
@@ -66,7 +66,7 @@ async function seedKim() {
 }
 
 /** A landlord-issued credit spent on these rows (applied), then the rows settled. */
-async function payWithCredit(k: Awaited<ReturnType<typeof seedKim>>, uses: Array<[string, number]>) {
+async function payWithCredit(k: Awaited<ReturnType<typeof seedYvette>>, uses: Array<[string, number]>) {
   const total = uses.reduce((s, [, a]) => s + a, 0)
   const credit = await db.query<{ id: string }>(
     `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, reason, status)
@@ -82,7 +82,7 @@ const settle = (ids: string[], method: string | null) => db.query(
   [ids, method])
 
 describe('receiptFigures', () => {
-  it('Kim: $935.45 of lines, $450 of credit, $0.55 kept — the money is $486.00', () => {
+  it('Yvette: $935.45 of lines, $450 of credit, $0.55 kept — the money is $486.00', () => {
     const f = receiptFigures([
       { type: 'rent', amount: 900, notes: null, due_date: 'Oct 1, 2026', due_month_label: 'October', credit_used: 450 },
       { type: 'utility', amount: 10.45, notes: null, utility_type: 'water', due_date: 'Oct 1, 2026', due_month_label: 'October', credit_used: 0 },
@@ -105,7 +105,7 @@ describe('receiptFigures', () => {
 
 describe('sendPaymentReceipt', () => {
   it('a receipt lists money and credit separately', async () => {
-    const k = await seedKim()
+    const k = await seedYvette()
     await payWithCredit(k, [[k.rent, 450]])
     await settle(k.ids, 'money_order')
     await sendPaymentReceipt({ paymentIds: k.ids, method: 'money order', reference: '55187081609', creditBanked: 0.55 })
@@ -129,7 +129,7 @@ describe('sendPaymentReceipt', () => {
   })
 
   it('a bill paid entirely with account credit: "paid with your account credit", nothing charged', async () => {
-    const k = await seedKim()
+    const k = await seedYvette()
     await payWithCredit(k, [[k.rent, 900], [k.water, 10.45], [k.trash, 25]])
     await settle(k.ids, null)
     await sendPaymentReceipt({ paymentIds: k.ids, method: 'your account credit' })
@@ -141,7 +141,7 @@ describe('sendPaymentReceipt', () => {
   })
 
   it('no credit: the money paid is the lines, exactly as before', async () => {
-    const k = await seedKim()
+    const k = await seedYvette()
     await settle(k.ids, 'cash')
     await sendPaymentReceipt({ paymentIds: k.ids, method: 'cash' })
     const mail = lastSend()
@@ -150,7 +150,7 @@ describe('sendPaymentReceipt', () => {
   })
 
   it('a card payment still clearing counts the credit it set aside', async () => {
-    const k = await seedKim()
+    const k = await seedYvette()
     const credit = await db.query<{ id: string }>(
       `INSERT INTO tenant_credits (landlord_id, tenant_id, lease_id, amount_original, amount_remaining, category, reason, status)
        VALUES ($1,$2,$3,100,100,'goodwill','test','active') RETURNING id`, [k.landlordId, k.tenantId, k.leaseId])
@@ -171,7 +171,7 @@ describe('sendPaymentReceipt', () => {
 // S637: "the person who paid gets a receipt". Lease charges carry the primary
 // resident's tenant_id, so the receipt used to go to the primary whoever paid.
 describe('the receipt goes to the person who paid', () => {
-  async function coTenant(k: Awaited<ReturnType<typeof seedKim>>) {
+  async function coTenant(k: Awaited<ReturnType<typeof seedYvette>>) {
     const c = await db.connect()
     try {
       const email = `ray-${randomUUID()}@mailer-test.co`
@@ -185,9 +185,9 @@ describe('the receipt goes to the person who paid', () => {
     `SELECT u.email FROM tenants t JOIN users u ON u.id = t.user_id WHERE t.id = $1`, [tenantId])).rows[0].email
 
   it('a co-tenant\'s card payment of the lease\'s rent emails the co-tenant, not the primary', async () => {
-    const k = await seedKim()
+    const k = await seedYvette()
     const ray = await coTenant(k)
-    // Ray pays the lease's whole bill by card; every row is billed to Kim.
+    // Ray pays the lease's whole bill by card; every row is billed to Yvette.
     const rem = await db.query<{ id: string }>(
       `INSERT INTO tenant_remittances (tenant_id, landlord_id, lease_id, amount, applied_amount, payment_method, status, stripe_payment_intent_id, settled_at)
        VALUES ($1,$2,$3,935.45,935.45,'card','settled','pi_receipt_ray',NOW()) RETURNING id`, [ray.co, k.landlordId, k.leaseId])
@@ -206,9 +206,9 @@ describe('the receipt goes to the person who paid', () => {
   })
 
   it('an earlier attempt that failed does not decide who paid', async () => {
-    const k = await seedKim()
+    const k = await seedYvette()
     const ray = await coTenant(k)
-    // Kim's bank payment failed; Ray then paid.
+    // Yvette's bank payment failed; Ray then paid.
     const failed = await db.query<{ id: string }>(
       `INSERT INTO tenant_remittances (tenant_id, landlord_id, lease_id, amount, applied_amount, payment_method, status, created_at)
        VALUES ($1,$2,$3,900,900,'ach','failed',NOW() + interval '1 minute') RETURNING id`, [k.tenantId, k.landlordId, k.leaseId])
@@ -224,7 +224,7 @@ describe('the receipt goes to the person who paid', () => {
   })
 
   it('a bill a co-tenant paid with credit emails the payer the caller names', async () => {
-    const k = await seedKim()
+    const k = await seedYvette()
     const ray = await coTenant(k)
     await payWithCredit(k, [[k.rent, 900], [k.water, 10.45], [k.trash, 25]])
     await settle(k.ids, null)
@@ -233,7 +233,7 @@ describe('the receipt goes to the person who paid', () => {
   })
 
   it('with no remittance and no payer named, the person the bill is in the name of gets it', async () => {
-    const k = await seedKim()
+    const k = await seedYvette()
     await coTenant(k)
     await settle(k.ids, 'cash')
     await sendPaymentReceipt({ paymentIds: k.ids, method: 'cash' })

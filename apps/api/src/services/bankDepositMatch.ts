@@ -158,6 +158,12 @@ export type MatchConfidence =
   | 'amount_ambiguous'
   /** Short of any full charge; only offerable against a carried balance. */
   | 'carried_paydown'
+  /**
+   * 11/4 (Nic): "if it's within a certain threshold, we kind of hint on the
+   * bank feed, maybe, hey, does this belong to this person". Within
+   * NEAR_MISS of exactly ONE household's whole bill, and nobody else near it.
+   */
+  | 'amount_near'
 
 export interface DepositMatch {
   chargeIds: string[]
@@ -216,6 +222,15 @@ export function isPreselectable(m: DepositMatch): boolean {
     || (m.confidence === 'amount_unique' && m.rivals === 0)
 }
 
+// 11/4: a near miss is deliberately NOT preselectable. It reaches the landlord
+// as an offered candidate carrying its own plain sentence ("$460.00 is $10.00
+// more than Pat Rivera's whole bill on Lot 1 ($450.00). Does this deposit
+// belong to them?"), which is the hint Nic asked for — a question, not a
+// pre-ticked answer, because one click on a guess is how the wrong resident's
+// bill gets paid. isPreselectable keeps requiring an exact tie-out, a report or
+// a name on the memo, and isAutoSettleable keeps requiring an exact tie-out, so
+// nothing settles a near miss by itself.
+
 /**
  * S655 (money plan §3, "Bank-deposit auto-settle by amount"; Step 12; Nic 10/2:
  * "auto-settle a tenant's own bank deposit that equals exactly one tenant's
@@ -240,6 +255,38 @@ export function isPreselectable(m: DepositMatch): boolean {
  * be undone (bankDepositConfirm.undoDepositMatch) and both sides are told.
  */
 export const AUTO_SETTLE_SAME_AMOUNT_DAYS = 4
+
+/**
+ * ── 11/4 (Nic): HOW NEAR IS NEAR ENOUGH TO ASK ──────────────────────────────
+ *
+ *   "If there's an exact match, we know who it goes to, but if it's within a
+ *    certain threshold, we kind of hint on the bank feed, maybe, hey, does this
+ *    belong to this person."
+ *
+ * This deliberately amends S652 ("a candidate is an exact amount match, a
+ * tenant's own report, or their name on the memo — nothing weaker"), which was
+ * written when the feed was offering Mobile Home 2's rent for every line. So
+ * the window is tight on purpose, and it is BOTH tests, not either: within 5%
+ * AND within $50 of the household's whole bill. At Country Acres a $1,175
+ * deposit covers the whole bill of six of the eight households who owe
+ * anything — coverage alone identifies nobody — while 5% catches none of them.
+ * That is the difference between a hint and a list.
+ *
+ * A near miss is never settled by itself (isAutoSettleable still requires an
+ * exact tie-out) and never produces a shortlist: two households inside the
+ * window means GAM says nothing at all, because a confident wrong answer is
+ * the failure this file exists to prevent.
+ */
+export const NEAR_MISS_FRACTION = 0.05
+export const NEAR_MISS_MAX_CENTS = 5000
+
+/** Is `depositCents` near enough to a whole bill of `owedCents` to ask about? */
+export function isNearMiss(depositCents: number, owedCents: number): boolean {
+  if (owedCents <= 0 || depositCents <= 0) return false
+  const off = Math.abs(depositCents - owedCents)
+  if (off === 0) return false  // an exact tie-out is its own, stronger answer
+  return off <= Math.round(owedCents * NEAR_MISS_FRACTION) && off <= NEAR_MISS_MAX_CENTS
+}
 
 export interface AutoSettleContext {
   /** What this household owes the company in bank-payable money now, every lease. */
@@ -733,10 +780,37 @@ export function matchDeposit(
       continue
     }
 
+    // 11/4 (Nic): NEAR ENOUGH TO ASK ABOUT. Not an exact tie-out, not reported,
+    // not named — but within 5% and $50 of this household's WHOLE bill, which
+    // is a resident who forgot a late fee or rounded their rent up. Offered as
+    // a question, never settled by itself, and dropped entirely below if any
+    // other household is as near (isNearMiss / NEAR_MISS_FRACTION).
+    if (isNearMiss(depositCents, owedCents)) {
+      const fit = oldestLinesWithin(charges, deposit.amount)
+      const off = depositCents - owedCents
+      cands.push({
+        rank: 3,
+        m: {
+          chargeIds: (fit.length > 0 ? fit : charges).map(c => c.id),
+          leaseId, tenantId: head.tenantId,
+          tenantName: head.tenantName, unitNumber: head.unitNumber,
+          total: (fit.length > 0 ? fit : charges).reduce((t, c) => t + cents(c.amount), 0) / 100,
+          owed: owedCents / 100, exact: false,
+          confidence: 'amount_near',
+          rivals: 0,
+          reason: `$${deposit.amount.toFixed(2)} is $${Math.abs(off / 100).toFixed(2)} `
+            + `${off > 0 ? 'more than' : 'short of'} ${head.tenantName}'s whole bill on `
+            + `${head.unitNumber} ($${(owedCents / 100).toFixed(2)}). Does this deposit belong to them?`,
+        },
+      })
+      continue
+    }
+
     // Nothing else is a candidate. S652 (Nic): "it's thinking every single
     // transaction is going to be Mobile Home 2's rent — none of them even are
     // a dollar amount match." A candidate is an exact amount match, a tenant's
-    // own report, or their name on the memo — nothing weaker.
+    // own report, or their name on the memo — or (11/4) near enough to ONE
+    // household's whole bill to ask. Nothing weaker.
   }
 
   // Two tenants declaring the same figure in the same window is possible in a
@@ -789,6 +863,15 @@ export function matchDeposit(
   // Ambiguity is a property of the WHOLE result, not of any one row: if four
   // tenants all owe $250, none of them is a unique match, and saying so is the
   // difference between a useful shortlist and a confident wrong answer.
+  // 11/4: a near miss identifies nobody once two of them are in the window, and
+  // a shortlist of near misses is the "every line is MH 2's rent" failure in a
+  // new coat. So they are REMOVED, not demoted — GAM says nothing rather than
+  // something unhelpful, and the line goes to review as it did before.
+  const nearHits = cands.filter(c => c.m.confidence === 'amount_near')
+  if (nearHits.length > 1) {
+    for (const c of nearHits) cands.splice(cands.indexOf(c), 1)
+  }
+
   const exactHits = cands.filter(c => c.m.confidence === 'amount_unique')
   if (exactHits.length > 1) {
     for (const c of exactHits) {

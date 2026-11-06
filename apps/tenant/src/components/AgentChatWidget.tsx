@@ -339,7 +339,7 @@ export function AgentChatWidget() {
       <style>{DOT_CSS}</style>
       {open && (
         <div style={{
-          position: 'fixed', bottom: 88, right: 20, width: 380, maxWidth: 'calc(100vw - 40px)',
+          position: 'fixed', bottom: 'calc(88px + var(--tabbar-h, 0px))', right: 20, width: 380, maxWidth: 'calc(100vw - 40px)',
           height: 540, maxHeight: 'calc(100vh - 120px)', zIndex: 1000,
           borderRadius: 16, overflow: 'hidden', border: '1px solid var(--b2)',
           boxShadow: '0 18px 50px rgba(0,0,0,.5)',
@@ -351,7 +351,7 @@ export function AgentChatWidget() {
         onClick={() => setOpen((o) => !o)}
         aria-label={open ? 'Close support chat' : 'Open support chat'}
         style={{
-          position: 'fixed', bottom: 20, right: 20, width: 56, height: 56, borderRadius: '50%',
+          position: 'fixed', bottom: 'calc(20px + var(--tabbar-h, 0px))', right: 20, width: 56, height: 56, borderRadius: '50%',
           background: 'var(--gold)', color: '#0a0b0e', border: 'none', cursor: 'pointer', zIndex: 1000,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           boxShadow: '0 8px 24px rgba(0,0,0,.45)',

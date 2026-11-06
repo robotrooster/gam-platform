@@ -1,8 +1,8 @@
 /**
  * S640 — the emergency contact list the front desk works from.
  *
- * Nic: "one lady, Carine Covarrubius, has her daughter, Irma, as an emergency
- * contact. She didn't put the phone number down. Irma is also a tenant... what
+ * Nic: "one lady, Carine Covarrubius, has her daughter, Hale, as an emergency
+ * contact. She didn't put the phone number down. Hale is also a tenant... what
  * if two or three other people have the same person as an emergency contact?"
  *
  * Both cases are real at Mountain View. These test the two things that make the
@@ -38,7 +38,7 @@ interface Fx {
   coreenTenantId: string; irmaUserId: string
 }
 
-/** Coreen in MH 13 with "Irma Fuentes" and no number; Irma reachable elsewhere. */
+/** Coreen in MH 13 with "Hale Ivorson" and no number; Hale reachable elsewhere. */
 async function seed(): Promise<Fx> {
   const c = await getClient()
   try {
@@ -66,19 +66,19 @@ async function seed(): Promise<Fx> {
     }
 
     const coreen = await mkTenant('Coreen', 'Covarrubias', null)
-    const irma   = await mkTenant('Irma', 'Fuentes', '5202043181')
+    const hale   = await mkTenant('Hale', 'Ivorson', '5202043181')
     const bret   = await mkTenant('Bret', 'Robinson', null)
     await house(coreen.tenantId, 460)
     await house(bret.tenantId, 460)
-    // Irma is in the system but holds no current lease — which is why the match
+    // Hale is in the system but holds no current lease — which is why the match
     // has to search users rather than active tenants.
 
-    // Coreen's lease said "Irma Fuentes". Bret's said so too, so one person is
+    // Coreen's lease said "Hale Ivorson". Bret's said so too, so one person is
     // the emergency contact for two households.
     for (const t of [coreen.tenantId, bret.tenantId]) {
       await c.query(
         `INSERT INTO emergency_contacts (tenant_id, name, raw_text, source, sort_order)
-         VALUES ($1, 'Irma Fuentes', 'Irma Fuentes', 'lease', 0)`, [t])
+         VALUES ($1, 'Hale Ivorson', 'Hale Ivorson', 'lease', 0)`, [t])
     }
     // The desk person is a real onsite_manager with a real scope row — that is
     // what getScopedPropertyIds reads, and a token alone would have shown them
@@ -114,7 +114,7 @@ async function seed(): Promise<Fx> {
       deskToken:  sign(desk.rows[0].id, { 'front_desk.view': true }, 'onsite_manager', { landlordId }),
       strangerToken: stranger,
       landlordId, propertyId,
-      coreenTenantId: coreen.tenantId, irmaUserId: irma.userId,
+      coreenTenantId: coreen.tenantId, irmaUserId: hale.userId,
     }
   } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
 }
@@ -126,14 +126,14 @@ const roster = (token: string) => request(buildApp())
   .get('/api/emergency-contacts').set('Authorization', `Bearer ${token}`)
 
 describe('S640 emergency contact roster', () => {
-  it('offers Irma’s number for the contact who named her and left it blank', async () => {
+  it('offers Hale’s number for the contact who named her and left it blank', async () => {
     const f = await seed()
     const res = await roster(f.ownerToken)
     expect(res.status).toBe(200)
     const coreen = res.body.data.find((r: any) => r.tenant_first === 'Coreen')
-    expect(coreen.contact_name).toBe('Irma Fuentes')
+    expect(coreen.contact_name).toBe('Hale Ivorson')
     expect(coreen.contact_phone).toBeNull()
-    expect(coreen.suggestion).toMatchObject({ phone: '5202043181', fromName: 'Irma Fuentes' })
+    expect(coreen.suggestion).toMatchObject({ phone: '5202043181', fromName: 'Hale Ivorson' })
   })
 
   // Nic asked this one directly. One person being the call for several
@@ -163,8 +163,8 @@ describe('S640 emergency contact roster', () => {
 describe('S640 importing without trampling what staff typed', () => {
   it('claims the row a person already entered instead of adding a second', async () => {
     const f = await seed()
-    // What actually happened in production: David Shultz had "Henry Sauer" from
-    // his lease and again from the counter, and the roster then reported Henry
+    // What actually happened in production: Ursa Underhill had "Esme Fenwick" from
+    // his lease and again from the counter, and the roster then reported Esme
     // as the emergency contact for two households.
     await db.query(
       `UPDATE emergency_contacts SET source = 'staff', source_field_id = NULL, phone = '5205551234'
@@ -186,7 +186,7 @@ describe('S640 importing without trampling what staff typed', () => {
     // A second row for the SAME resident must not read as a second household.
     await db.query(
       `INSERT INTO emergency_contacts (tenant_id, name, phone, source, sort_order)
-       VALUES ($1, 'Irma Fuentes', '5205559999', 'staff', 1)`, [f.coreenTenantId])
+       VALUES ($1, 'Hale Ivorson', '5205559999', 'staff', 1)`, [f.coreenTenantId])
     const res = await roster(f.ownerToken)
     const coreen = res.body.data.find((r: any) => r.tenant_first === 'Coreen')
     expect(coreen.shared_with_count).toBe(2)   // Coreen + Bret, not three rows
@@ -200,7 +200,7 @@ describe('S640 recording one at the counter', () => {
   it('fills in the blank number and marks it confirmed', async () => {
     const f = await seed()
     const res = await put(f.deskToken, {
-      tenantId: f.coreenTenantId, name: 'Irma Fuentes', phone: '(520) 204-3181', relationship: 'Daughter',
+      tenantId: f.coreenTenantId, name: 'Hale Ivorson', phone: '(520) 204-3181', relationship: 'Daughter',
     })
     expect(res.status).toBe(200)
     const { rows } = await db.query<any>(
@@ -214,7 +214,7 @@ describe('S640 recording one at the counter', () => {
 
   it('refuses a number that is not ten digits rather than storing a stub', async () => {
     const f = await seed()
-    const res = await put(f.deskToken, { tenantId: f.coreenTenantId, name: 'Irma', phone: '520-204' })
+    const res = await put(f.deskToken, { tenantId: f.coreenTenantId, name: 'Hale', phone: '520-204' })
     expect(res.status).toBe(400)
   })
 
@@ -241,7 +241,7 @@ describe('S640 recording one at the counter', () => {
     const { rows } = await db.query<any>(
       `SELECT confirmed_at, name FROM emergency_contacts WHERE tenant_id=$1`, [f.coreenTenantId])
     expect(rows[0].confirmed_at).not.toBeNull()
-    expect(rows[0].name).toBe('Irma Fuentes')   // untouched
+    expect(rows[0].name).toBe('Hale Ivorson')   // untouched
   })
 })
 

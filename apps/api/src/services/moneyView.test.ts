@@ -12,7 +12,10 @@
 import { describe, it, expect } from 'vitest'
 import { MONTHLY_REPORT_RECIPIENT_KINDS, MONTHLY_REPORT_SEND_STATUSES } from '@gam/shared'
 import { db } from '../db'
-import { moneyViewFrom, moneyTieText, sayDollars, monthWords, type IncomeEvent } from './incomeBasis'
+import {
+  moneyViewFrom, moneyTieText, sayDollars, monthWords, chargedBucketOf,
+  REPORT_LINES, ASIDE_LINES, type IncomeEvent,
+} from './incomeBasis'
 import { dailyLines } from '../routes/reports'
 
 const ev = (o: Partial<IncomeEvent> & Pick<IncomeEvent, 'line' | 'amount' | 'day'>): IncomeEvent => ({
@@ -143,5 +146,41 @@ describe('the new tables\' CHECKs are the shared lists (one definition)', () => 
   })
   it('monthly_report_sends.status', async () => {
     expect((await values('monthly_report_sends_status_check')).sort()).toEqual([...MONTHLY_REPORT_SEND_STATUSES].sort())
+  })
+})
+
+
+/**
+ * 11/4 — THE TWO LINE SETS MUST STAY DISJOINT.
+ *
+ * summarize() puts a fact in a column when `inTotal` is true and otherwise
+ * puts it in `beside` IF its line is an ASIDE_LINES value (incomeBasis.ts,
+ * the else-if). Every out-of-column ledger fact — the receivables snapshots,
+ * the proof strip, and since 11/4 the Charged buckets — carries a REPORT_LINES
+ * value instead, and is dropped there on exactly that grounds.
+ *
+ * So the day a name appears in both lists, those facts start landing in a
+ * `beside` figure: the owner statement's and the P&L's figures beside the
+ * total would silently absorb part of Charged, with nothing failing. The
+ * near-misses are real — 'creditsGiven' (a report line) beside
+ * 'creditsYouGave' (an aside), and 'workTradeDiscount' beside 'workTrade'.
+ * This is the guard that would have to fail first.
+ */
+describe('the report lines and the figures beside them are different names', () => {
+  it('no name is in both lists', () => {
+    const both = REPORT_LINES.filter(l => (ASIDE_LINES as readonly string[]).includes(l))
+    expect(both).toEqual([])
+  })
+
+  it('every BILLED_PARTS value, and null, lands in exactly one Charged bucket', () => {
+    expect(chargedBucketOf('paid')).toBe('collected')
+    expect(chargedBucketOf('coveredByPaidAhead')).toBe('collected')
+    expect(chargedBucketOf('coveredByDepositInterest')).toBe('collected')
+    expect(chargedBucketOf('keptFromDeposit')).toBe('collected')
+    expect(chargedBucketOf('clearing')).toBe('clearing')
+    expect(chargedBucketOf('stillOwed')).toBe('owed')
+    // The residual the books path uses for credits given, work trade and
+    // written-off balances.
+    expect(chargedBucketOf(null)).toBe('other')
   })
 })

@@ -55,7 +55,12 @@ export function TrialBalancePage() {
               <span>Accounts</span>
               {data && <span className={`badge ${data.balances ? 'bg2' : 'br'}`}>{data.balances ? '✓ Balanced' : '⚠ Out of balance'}</span>}
             </div>
-            <div style={{ overflowX: 'auto' }}>
+            {/* 10/31: NOT a card list. A trial balance is the proof that the
+                books balance — you read At the start / Debits / Credits / At the
+                end DOWN their columns. Broken into one card per account those
+                five figures cannot be scanned or totalled, so this grid keeps
+                its shape and scrolls sideways instead. */}
+            <div style={{ overflowX: 'auto' }} data-no-stack>
               <table className="tbl" style={{ minWidth: 560 }}>
                 <thead><tr>
                   <th>Account</th><th style={{ textAlign: 'right' }}>At the start</th><th style={{ textAlign: 'right' }}>Debits</th>

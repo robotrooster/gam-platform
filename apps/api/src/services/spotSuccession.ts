@@ -1,7 +1,7 @@
 /**
  * 10/24 (Nic + Blue) — A REPLACEMENT TAKES OVER A SPOT.
  *
- * Country Acres, MH 28. Susie McCoy is walking away from the mobile home and
+ * Country Acres, MH 28. Amias Fotheringay is walking away from the mobile home and
  * owes rent; the Bowmans' daughter is taking over the home on a new installment
  * contract and wants the spot from November 1. Blue's problem, in Nic's words:
  *
@@ -29,7 +29,7 @@
  *   2. It fires on the LANDLORD's signature, because for a renewal the same
  *      household owes the new rent whether they sign or not (Nic, 10/2: "they
  *      always get charged the new rent, whether or not they sign it"). Here that
- *      is backwards. Blue signing alone would release Susie before the
+ *      is backwards. Blue signing alone would release Amias before the
  *      replacement has committed, which is the exact thing he is protecting
  *      against. Nic: "The replacement person needs to sign before it fires,
  *      right? That's the thing that it's gated on... landlord always signs
@@ -89,7 +89,7 @@
  * ── WHAT IS REFUSED ────────────────────────────────────────────────────────
  *
  * One SITTING lease plus one INCOMING lease is the normal case and is exactly
- * what this is for — Susie's runs years out and the replacement's starts
+ * what this is for — Amias's runs years out and the replacement's starts
  * November 1, so they overlap on paper and that is not an error. What cannot be
  * resolved by any rule is TWO REPLACEMENTS of the same sitting lease: two
  * people both signed to take one space. The database refuses the second
@@ -122,7 +122,11 @@
  */
 import type { PoolClient } from 'pg'
 import { query as poolQuery } from '../db'
-import { payableRowSql, requiredRowSql } from './moneyPredicates'
+import { bookWhatTheyLeftOwing, whatIsStillOwedOnLease } from './leftOwingFreeze'
+import { BUYER_OWING_MONTH } from './homeSale'
+
+/** Who owes the handover month on a contract — the one rule, from homeSale. */
+const BUYER_OWING_MONTH_SQL = BUYER_OWING_MONTH('c.id', '$2::date', 'c.tenant_id')
 import { logger } from '../lib/logger'
 
 type Q = { query: PoolClient['query'] } | { query: typeof poolQuery }
@@ -284,16 +288,43 @@ export const HANDOVER_REACHES_A_BILLED_MONTH = (dueDate: string): string =>
   + 'would end their lease behind a bill that is already out. Start this lease after that month, or settle that '
   + 'invoice first.'
 
-/** What the departing resident still owes on the lease being ended. */
-export async function whatIsStillOwedOnLease(
-  q: Q, leaseId: string,
-): Promise<{ amount: number; rows: number }> {
-  const rows = await run<{ amount: string; rows: string }>(q, `
-    SELECT COALESCE(SUM(p.amount), 0)::text AS amount, COUNT(*)::text AS rows
-      FROM payments p
-     WHERE ${requiredRowSql('p', '$1')} AND ${payableRowSql('p')}`, [leaseId])
-  return { amount: Number(rows[0]?.amount ?? 0), rows: Number(rows[0]?.rows ?? 0) }
-}
+/**
+ * What the departing resident still owes on the lease being ended.
+ *
+ * ── 10/31 (Nic): THE FINAL CYCLE'S UTILITIES COUNT ───────────────────────────
+ *
+ *   "we need the water usage for number 28 to go to the lease that's being
+ *    ended as part of the final expenses... Fix the number 28 gap where it'll
+ *    add that money to her bill if she ever gets around to paying it."
+ *
+ * This used to sum PAYMENTS rows only — lines that had already made it onto an
+ * invoice. Utilities bill in ARREARS, so the last cycle's usage is written as a
+ * utility bill with no payment row yet and arrives AFTER the handover is
+ * computed. Country Acres Lot 28: her figure was frozen at $739.60 on 10/28
+ * when the replacement signed, and October's water ($24.75) was written on
+ * 10/29. The deposit return caught it (its deductions came to $764.35) but the
+ * left-owing book never did, so the money that follows her was $24.75 short —
+ * and would be short for every resident who leaves at a cycle boundary, which
+ * is most of them.
+ *
+ * So the same predicate the deposit return already uses is added here: utility
+ * bills on this lease chain with no payment row, still 'unbilled' or 'billed'.
+ * Nothing is double-counted — a utility line that HAS a payment row is already
+ * in the payments sum and is excluded here by `payment_id IS NULL`.
+ *
+ * This is GAM's own arithmetic over GAM's own money rows. It is not the
+ * imported-balance freeze ([[gam-left-owing-amount-is-frozen]]): that rule is
+ * about a historical figure a landlord migrates in at onboarding, which can
+ * never move because a dishonest operator would inflate it. source_kind
+ * 'import' is untouched by any of this.
+ */
+// 11/5: the arithmetic and the book-writing both moved to
+// services/leftOwingFreeze, because a REPLACEMENT SIGNING was only one of six
+// ways a tenancy ends and it was the only one wired. Re-exported so every
+// existing caller and test keeps its import. The figure also changed there:
+// it had borrowed the PAY-NOW predicate, which leaves a carried-forward
+// balance out on purpose — right for a Pay Now button, wrong for a walk-away.
+export { whatIsStillOwedOnLease }
 
 /**
  * THE TWO REFUSALS, ASKED BEFORE A DOCUMENT IS EVER SENT.
@@ -429,6 +460,37 @@ export interface HandoverResult {
  * checked again before the document is ever sent, so reaching them here means
  * the world changed while it was out for signature.
  */
+/**
+ * 10/28 (Nic): "I want any of the three paths to invite a tenant for a lease
+ * takeover to work... I don't want a quick fix. I want each flow to work
+ * correctly how it needs to work every time."
+ *
+ * The doors differ in what the landlord is looking at; none of them should ask
+ * him WHICH lease is being replaced, because the space answers that. Given a
+ * unit and the day the new lease starts, this names the tenancy being taken
+ * over and refuses the cases that cannot hand over — the same refusals
+ * GoldSign gets, so a takeover means one thing platform-wide.
+ *
+ * Returns a reason rather than throwing: this layer has no HTTP status to give
+ * and the callers all have one (AppError 409).
+ */
+export async function resolveTakeoverForSpace(
+  q: Q, opts: { unitId: string; startIso: string; exceptLeaseId?: string | null },
+): Promise<{ replacesLeaseId: string; refused?: undefined } | { refused: string; replacesLeaseId?: undefined }> {
+  const sitting = await sittingLeaseOnSpace(q, { unitId: opts.unitId, startIso: opts.startIso })
+  if (!sitting) return { refused: NOTHING_TO_TAKE_OVER }
+  const why = await whySpotCannotBeTakenOver(q, {
+    unitId: opts.unitId, startIso: opts.startIso,
+    replacesLeaseId: sitting.id, exceptLeaseId: opts.exceptLeaseId ?? null,
+  })
+  if (why) return { refused: why }
+  return { replacesLeaseId: sitting.id }
+}
+
+export const NOTHING_TO_TAKE_OVER =
+  'Nobody is on that space for those dates, so there is no tenancy to take over. '
+  + 'Invite them to it as an ordinary new lease instead.'
+
 export async function replacementTookOverSpot(
   q: Q, newLeaseId: string,
 ): Promise<HandoverResult | null> {
@@ -470,33 +532,36 @@ export async function replacementTookOverSpot(
        SET end_date = $2::date, updated_at = NOW()
      WHERE id = $1`, [sitting.id, sitting.endsOn])
 
-  let leftOwingId: string | null = null
-  if (owed.amount > 0) {
-    // Frozen at this figure against the person by name — the same book the
-    // import writes. One row per lease (tenant_left_owing_source_uniq), so a
-    // second pass cannot double it or move it.
-    const who = await run<any>(q, `
-      SELECT t.id AS tenant_id, u.id AS user_id, u.email, u.phone,
-             u.first_name || ' ' || u.last_name AS who
-        FROM lease_tenants lt
-        JOIN tenants t ON t.id = lt.tenant_id
-        JOIN users u ON u.id = t.user_id
-       WHERE lt.lease_id = $1 AND lt.status IN ('active','pending_add')
-       ORDER BY (lt.role = 'primary') DESC
-       LIMIT 1`, [sitting.id])
-    const p = who[0]
-    if (p) {
-      const ins = await run<{ id: string }>(q, `
-        INSERT INTO tenant_left_owing
-          (landlord_id, property_id, user_id, email, phone, who, amount, source_kind, source_key, left_on)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'lease', $8, $9::date)
-        ON CONFLICT (landlord_id, source_kind, source_key) DO NOTHING
-        RETURNING id`,
-        [sitting.landlordId, sitting.propertyId, p.user_id, p.email, p.phone, p.who,
-         owed.amount, sitting.id, sitting.endsOn])
-      leftOwingId = ins[0]?.id ?? null
-    }
-  }
+  // ── THE TRAILER DOES NOT MOVE ON THIS SIGNATURE ──────────────────────────
+  //
+  // 10/28 (Nic): "when somebody's taking over and making the payments, they
+  // become the new owner. So they need to sign that as well. The original buyer
+  // is not on the contract at that point. They are replacing the person on the
+  // contract. Why would a person make the payments if they're not on the
+  // contract?"
+  //
+  // An earlier cut of this recorded the home-sale handover right here, off the
+  // REPLACEMENT LEASE's signature — which moved the payments onto somebody who
+  // had signed for the space and nothing else. That is the thing he refused:
+  // being billed for a trailer you never signed for.
+  //
+  // So the contract hands over on ITS OWN paper, the same way the space does:
+  // the landlord's installment-sale form, naming the contract it takes over
+  // (lease_documents.supersedes_home_sale_contract_id), signed by the new buyer.
+  // Until that is signed the person on the contract stays on it and keeps being
+  // billed — the recoverable direction, and the one the money can be undone from.
+  //
+  // Deliberately nothing here. The space and the home are two signatures.
+
+  // What is still owed is frozen against the person by name — the same book
+  // the import writes, one row per lease, re-computed only while nobody has
+  // begun collecting against it. 11/5: the writer is shared with every other
+  // way a tenancy ends (services/leftOwingFreeze). The amount is passed
+  // because it had to be read BEFORE the lease was ended, a few lines up —
+  // reading it now would read a lease that no longer bills.
+  const froze = await bookWhatTheyLeftOwing(q, {
+    leaseId: sitting.id, leftOn: sitting.endsOn, amount: owed.amount })
+  const leftOwingId = froze?.id ?? null
 
   logger.info({ sittingLeaseId: sitting.id, newLeaseId, endsOn: sitting.endsOn,
                 owed: owed.amount, leftOwingId },

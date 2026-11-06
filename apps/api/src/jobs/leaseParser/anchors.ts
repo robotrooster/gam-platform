@@ -6,7 +6,7 @@
 // Algorithm (tuned against real lease PDFs, generalizes across vendors):
 //
 // 1. Same-line search FIRST. The label "TENANT(S):" is at y=586.8 x=43.2
-//    and the value "Marci Neeld" is at y=587.5 x=151.9. Same baseline
+//    and the value "Eben Hartright" is at y=587.5 x=151.9. Same baseline
 //    (within Y tolerance), value is right of label. Match wins.
 //
 // 2. If no same-line match, look UP one line. Some forms put the label

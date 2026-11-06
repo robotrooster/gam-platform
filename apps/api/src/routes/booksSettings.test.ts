@@ -270,7 +270,7 @@ describe('Books settings — the owner\'s choices', () => {
     expect(r.body.data).toMatchObject({ booksStartDate: '2026-08-01', historyStart: 'since_joining', joinedOn: '2026-08-28', joinMonthStart: '2026-08-01' })
     expect(await landlordRow(w.canyon)).toMatchObject({ books_start_date: '2026-08-01', books_history_start: 'since_joining' })
     // Moved on the Bank page afterwards: a date the owner picked.
-    await db.query(`UPDATE landlords SET books_start_date = '2026-09-01' WHERE id = $1`, [w.canyon])
+    await db.query(`UPDATE properties SET books_start_date = '2026-09-01' WHERE landlord_id = $1`, [w.canyon])
     const after = await request(app).get('/api/books/setup/settings').set(asOwner(w))
     expect(after.body.data).toMatchObject({ booksStartDate: '2026-09-01', historyStart: 'start_date' })
   })

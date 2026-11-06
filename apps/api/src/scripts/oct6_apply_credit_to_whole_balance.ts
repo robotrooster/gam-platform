@@ -8,7 +8,7 @@
  *    outstanding balance is really only $17.64." And: "he's not going to get
  *    any late fees so we need to remove that $30."
  *
- * Marc Renspurger (Mountain View RV 52): a $600 check in September paid
+ * Darrow Galbraith (Mountain View RV 52): a $600 check in September paid
  * September and left $297.06 paid ahead. On Oct 1 the old per-line draw paid
  * the $14.70 electric in full and skipped the $300 rent because the $282.36
  * left could not cover that whole line; the rent stayed open and six $5 late
@@ -29,8 +29,8 @@
  *            bill first. The fee was charged only because the money was left
  *            beside the bill; or
  *        (b) the bill is marked late-fee exempt AND its household is one Nic
- *            named (`zeroExemptFor`; the command line names Marc's) — no late
- *            fee should have been charged on it at all (Marc's October bill:
+ *            named (`zeroExemptFor`; the command line names Darrow's) — no late
+ *            fee should have been charged on it at all (Darrow's October bill:
  *            "we need to remove that $30"). On any other household a fee on
  *            an exempt bill is LISTED: the exemption may have been stamped for
  *            a reason that has nothing to do with the credit (work trade).
@@ -52,7 +52,7 @@
  *   cd apps/api && npx ts-node -T src/scripts/oct6_apply_credit_to_whole_balance.ts
  *   cd apps/api && npx ts-node -T src/scripts/oct6_apply_credit_to_whole_balance.ts --apply
  *   --zero-exempt-for=<tenant id>[,<tenant id>…] replaces the households
- *   rule (b) applies to (default: Marc Renspurger, the one Nic named).
+ *   rule (b) applies to (default: Darrow Galbraith, the one Nic named).
  */
 import type { PoolClient } from 'pg'
 import { lockHousehold, payableRowSql, creditEligibleRowSql } from '../services/moneyPredicates'
@@ -60,7 +60,7 @@ import { householdQuote, settleWholeBillIfCovered, paidAheadDrawnByMonth, type H
 
 /**
  * The households Nic named whose late-fee-exempt bill's fees come off (rule
- * b): Marc Renspurger, Mountain View RV 52 — "we need to remove that $30".
+ * b): Darrow Galbraith, Mountain View RV 52 — "we need to remove that $30".
  */
 export const NIC_NAMED_EXEMPT_BILL_TENANTS: readonly string[] = ['c7a6ebe8-cfc9-4c99-9921-b219bd82829a']
 

@@ -233,23 +233,28 @@ describe('a loan and the asset it paid for sit on the same side of the books sta
     expect((await patch(w.tok, `/loans/${deere}`, { startDate: '2026-02-12' })).status).toBe(200)
     const across = await patch(w.tok, `/loans/${deere}`, { startDate: '2025-12-20', openingBalance: 5800 })
     expect(across.status).toBe(409)
-    expect(across.body.error).toBe('This loan paid for the fixed asset "Riding mower", bought on 2026-02-15. Your books start on 2026-01-01, and the loan\'s day ' +
+    expect(across.body.error).toBe('This loan paid for the fixed asset "Riding mower", bought on 2026-02-15. Those books start on 2026-01-01, and the loan\'s day ' +
       'cannot be on the other side of that day from the asset\'s (the asset\'s cost would count twice, or not at all). Change the asset\'s day on the Fixed assets page first.')
     expect((await db.query(`SELECT start_date::text AS d FROM books_loans WHERE id = $1`, [deere])).rows[0].d).toBe('2026-02-12')
     // The books start: before both, or after both, is fine; between them is refused, on Books settings and in the database.
     const between = await patch(w.tok, '/setup/settings', { historyStart: 'start_date', startDate: '2026-02-14' })
     expect(between.status).toBe(409)
-    expect(between.body.error).toBe('Your books cannot start on 2026-02-14: the fixed asset "Riding mower" (bought on 2026-02-15) and the loan "Deere loan" ' +
+    expect(between.body.error).toBe('This property\'s books cannot start on 2026-02-14: the fixed asset "Riding mower" (bought on 2026-02-15) and the loan "Deere loan" ' +
       'that paid for it (made on 2026-02-12) would be on different sides of that day, so the asset\'s cost would count twice, or not at all. ' +
       'Change the asset\'s day or the loan\'s first.')
-    await expect(db.query(`UPDATE landlords SET books_start_date = '2026-02-13' WHERE id = $1`, [w.co.landlordId]))
-      .rejects.toThrow(/Your books cannot start on 2026-02-13/)
+    await expect(db.query(`UPDATE properties SET books_start_date = '2026-02-13' WHERE landlord_id = $1`, [w.co.landlordId]))
+      .rejects.toThrow(/This property's books cannot start on 2026-02-13/)
     expect((await db.query(`SELECT books_start_date::text AS d FROM landlords WHERE id = $1`, [w.co.landlordId])).rows[0].d).toBe('2026-01-01')
     const earlier = await patch(w.tok, '/setup/settings', { historyStart: 'start_date', startDate: '2025-12-01' })
     expect(earlier.status, JSON.stringify(earlier.body)).toBe(200)
     // Once voided, the asset holds nothing.
     expect((await post(w.tok, `/fixed-assets/${a.body.data.id}/void`, { reason: 'typed twice' })).status).toBe(200)
-    expect((await db.query(`UPDATE landlords SET books_start_date = '2026-02-14' WHERE id = $1 RETURNING id`, [w.co.landlordId])).rowCount).toBe(1)
+    // 11/3: the date lives on each PROPERTY and this company has more than one,
+    // so a row count says nothing useful. What matters is that the guard no
+    // longer refuses the day the asset used to block, and that the company's
+    // derived date followed its properties there.
+    await db.query(`UPDATE properties SET books_start_date = '2026-02-14' WHERE landlord_id = $1`, [w.co.landlordId])
+    expect((await db.query(`SELECT books_start_date::text AS d FROM landlords WHERE id = $1`, [w.co.landlordId])).rows[0].d).toBe('2026-02-14')
   })
 })
 

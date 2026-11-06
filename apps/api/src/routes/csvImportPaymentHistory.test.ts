@@ -156,7 +156,21 @@ describe('POST /api/landlords/me/onboard-payment-history-csv/validate', () => {
     expect(res.body.data.rows[0].resolvedLeaseId).toBe(leaseId)
   })
 
-  it('blocks when no active lease found for the email', async () => {
+  // ── 11/1 (Nic): NO LEASE IS NO LONGER A REFUSAL ────────────────────────────
+  //
+  //   "We also need to have it not gated on leases, because income that
+  //    happened for a property may not attach to a lease. If it's an RV park or
+  //    a short-term stay situation, it needs to be this unit brought this much
+  //    money, attributed to this person's contact information."
+  //
+  // This test used to assert the old refusal ("No active lease ... Onboard the
+  // tenant first"), which was right for a resident's mistyped email and wrong
+  // for the whole RV and short-stay side of a park: those people never had a
+  // lease, and the money is still income the space earned. Rewritten rather
+  // than deleted, because what it now holds is the replacement rule — with no
+  // SPACE there is still nothing to attribute the money to, so it still
+  // refuses, and the message says what to add.
+  it('with no lease AND no space, it still refuses — and says to add the space', async () => {
     const { token } = await seedLandlordWithActiveLease()
     const csv = [
       'tenant_email,payment_date,amount,payment_type',
@@ -169,10 +183,33 @@ describe('POST /api/landlords/me/onboard-payment-history-csv/validate', () => {
       .send({ csv, source: 'generic' })
 
     expect(res.status).toBe(200)
-    const issues = res.body.data.rows[0].issues
-      .filter((i: any) => i.field === 'tenant_email' && i.severity === 'block')
-    expect(issues.length).toBe(1)
-    expect(issues[0].message).toMatch(/No active lease/i)
+    const blocks = res.body.data.rows[0].issues.filter((i: any) => i.severity === 'block')
+    expect(blocks.length).toBe(1)
+    expect(blocks[0].field).toBe('unit_number')
+    expect(blocks[0].message).toMatch(/Add the space number/i)
+    // And it is NOT quietly treated as a space's income without one.
+    expect(res.body.data.rows[0].historyOnly).toBeFalsy()
+  })
+
+  it('with no lease but a space, it records as that space\'s past income instead', async () => {
+    // The seed's own property and space names.
+    const { token } = await seedLandlordWithActiveLease()
+    const csv = [
+      'tenant_email,tenant_name,payment_date,amount,payment_type,property_name,unit_number',
+      ',Dale Okafor,2025-06-01,1850,rent,Sunset Apartments,4B',
+    ].join('\n')
+
+    const res = await request(buildApp())
+      .post('/api/landlords/me/onboard-payment-history-csv/validate')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ csv, source: 'generic' })
+
+    expect(res.status).toBe(200)
+    const row = res.body.data.rows[0]
+    expect(row.issues.filter((i: any) => i.severity === 'block')).toHaveLength(0)
+    expect(row.historyOnly).toBe(true)
+    expect(row.resolvedUnitId).toBeTruthy()
+    expect(JSON.stringify(row.issues)).toMatch(/Nobody is billed/)
   })
 
   it('blocks negative amount (refunds out of scope)', async () => {
@@ -307,15 +344,15 @@ describe('POST /api/landlords/me/onboard-payment-history-csv/validate', () => {
     expect(res.body.data.rows[0].resolvedVia).toBe('name')
   })
 
-  it('resolves combined-name strings on the first matching tenant ("Kim & Zach")', async () => {
+  it('resolves combined-name strings on the first matching tenant ("Yvette & Zach")', async () => {
     const { leaseId, token } = await seedLandlordWithActiveLease({
-      tenantFirstName: 'Kim',
-      tenantLastName:  'Harland',
+      tenantFirstName: 'Yvette',
+      tenantLastName:  'Bexley',
     })
     // DoorLoop's Lease column bundles co-tenants with " & ".
     const csv = [
       'Date,Lease,Amount',
-      `2026-05-10,Kim Harland & Zach Harland,1850`,
+      `2026-05-10,Yvette Bexley & Zach Bexley,1850`,
     ].join('\n')
 
     const res = await request(buildApp())

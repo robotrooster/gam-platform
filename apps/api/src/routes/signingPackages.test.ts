@@ -247,7 +247,7 @@ describe('drafting a package as one bundle', () => {
     expect(siblings[0].isSelf).toBe(true)
   })
 
-  // S652 (Blu): the lease's done screen has to lead to the next document that
+  // S652 (Hollis): the lease's done screen has to lead to the next document that
   // still needs THIS signer — otherwise a nine-document packet ends after one.
   it('siblings carry the signer\'s own status and token so the page can walk them', async () => {
     const f = await seedSignableUnit()
@@ -433,7 +433,7 @@ describe('drafting a package as one bundle', () => {
 /**
  * S652 — the tenant fields that never reached thirteen leases.
  *
- * Blu Haws read the Country Acres leases and reported it from the far end:
+ * Hollis Harkness read the Country Acres leases and reported it from the far end:
  * "Tenant name(s) on page 1 didn't auto populate... page 5 didn't auto
  * populate... page 7 didn't auto populate... Area for a date on page 7 didn't
  * auto-populate or give the option to manually enter anything."
@@ -482,7 +482,7 @@ describe('S652: a household lease uses the roles its template binds to', () => {
     const { rows: fields } = await db.query<any>(
       `SELECT lease_column FROM lease_document_fields
         WHERE document_id = $1 AND lease_column = 'tenant_name'`, [res.documentId])
-    expect(fields.length).toBeGreaterThan(0)   // the field Blu could not see
+    expect(fields.length).toBeGreaterThan(0)   // the field Hollis could not see
   })
 
   it('refuses outright to build a document for a role no template knows', async () => {
@@ -522,7 +522,7 @@ describe('S652: a household lease uses the roles its template binds to', () => {
  * paint disclosure. The whole reason we built the packages process was for this
  * property."
  *
- * Blu uploaded two — "Mattoon LBP - Lease" and "Mattoon LBP - Sale" — because
+ * Hollis uploaded two — "Mattoon LBP - Lease" and "Mattoon LBP - Sale" — because
  * the federal disclosure differs between selling a home and renting one. What
  * decides which is the TRANSACTION, and the database already knows it: a live
  * home-sale contract means a sale, a tenant-owned dwelling means the landlord is
@@ -583,7 +583,7 @@ describe('S652: the packet picks the disclosure that matches the transaction', (
   })
 })
 
-describe('an account that runs two companies (Blu: Country Acres in IL, Oak Park in AZ)', () => {
+describe('an account that runs two companies (Hollis: Country Acres in IL, Oak Park in AZ)', () => {
   async function twoCompanies() {
     const f = await seed()
     await db.query(`UPDATE properties SET state='IL' WHERE landlord_id=$1`, [f.a.landlordId])
@@ -596,7 +596,7 @@ describe('an account that runs two companies (Blu: Country Acres in IL, Oak Park
       `INSERT INTO lease_templates (landlord_id, name, purpose, library_document_id) VALUES ($1,'Federal: Lead — Sales','state_disclosure',$2) RETURNING id`,
       [f.b.landlordId, doc])).rows[0].id
     const both = jwt.sign(
-      { userId: f.a.userId, role: 'landlord', email: 'blu@t.dev', profileId: f.a.landlordId, landlordIds: [f.a.landlordId, f.b.landlordId], permissions: {} },
+      { userId: f.a.userId, role: 'landlord', email: 'hollis@t.dev', profileId: f.a.landlordId, landlordIds: [f.a.landlordId, f.b.landlordId], permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' })
     return { ...f, doc, azCopy, both }
   }

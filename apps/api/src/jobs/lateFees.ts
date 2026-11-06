@@ -630,17 +630,12 @@ async function processInvoice(
   const period: LateFeeAccrualPeriod = inv.late_fee_accrual_period
 
   const accrualDay = accrualCalendar(inv, accrualFrom, period, firstCharged)
-  // 10/12 (Nic): a monthly fee charges once a month. A month that already has
-  // a fee on this bill (live, deleted or bounced) is never charged again, on
-  // whatever day of it the calendar now falls.
-  const monthsCharged = new Set([...existingDates].map(d => d.slice(0, 7)))
   for (let occ = 1; occ <= MAX_OCCURRENCES; occ++) {
     const tickDate = accrualDay(occ)
     if (tickDate > today) break
     // Never back-fill before the bill's first fee (see firstCharged above).
     if (firstCharged && tickDate < firstCharged) continue
     if (existingDates.has(tickDate)) continue
-    if (period === 'monthly' && monthsCharged.has(tickDate.slice(0, 7))) continue
 
     const rawTick = computeLateFeeAmount(accrualKind, accrualAmt, rentAmount)
     if (rawTick <= 0) break
@@ -657,7 +652,6 @@ async function processInvoice(
     result.rowsWritten += 1
     existingSum += tickAmt
     existingDates.add(tickDate)
-    monthsCharged.add(tickDate.slice(0, 7))
     remaining = capRemaining(capKind, capAmt, rentAmount, existingSum)
 
     if (capHit) {

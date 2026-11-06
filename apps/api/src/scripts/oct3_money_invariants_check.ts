@@ -137,13 +137,26 @@ const CHECKS: Record<InvariantId, string> = {
       FROM h
      WHERE owner_shares > GREATEST(0, held_at_settle - never_theirs) + 0.005
      ORDER BY payment_id`,
+  // 11/4: kept in step with the DATABASE's own rule, credit_uses_apply()
+  // (migration 20261026090000_own_overpayment_may_pay_a_trailer_payment). That
+  // rule widened on 10/26 — a resident's OWN overpayment may pay their trailer
+  // payment — and this clause did not follow it, so from 10/26 until now the
+  // checker reported Kim Bowman's $10.40 as a violation when the trigger had
+  // deliberately allowed it. A checker a month behind the thing it checks is
+  // worse than no checker: it sends somebody hunting a bug that was a decision.
+  //
+  // Paid-ahead credit only (prepaid_credit_id). Credit the landlord ISSUED and
+  // work-trade credit stay barred from a trailer payment, and FLEXPAY stays
+  // barred to every kind — it is GAM's own collection, not a landlord charge.
   I6: `
     SELECT u.id AS use_id, u.payment_id, u.status, p.type, p.revenue_owner, p.entry_description
       FROM credit_uses u JOIN payments p ON p.id = u.payment_id
      WHERE u.status IN ('held','applied')
        AND NOT (p.revenue_owner = 'landlord'
-                AND p.type IN ('rent','utility','late_fee','fee')
-                AND p.entry_description NOT IN ('FLEXPAY','HOMEPMT')
+                AND (p.type IN ('rent','utility','late_fee','fee')
+                     OR (p.type = 'home_payment' AND u.prepaid_credit_id IS NOT NULL))
+                AND p.entry_description <> 'FLEXPAY'
+                AND NOT (p.entry_description = 'HOMEPMT' AND u.prepaid_credit_id IS NULL)
                 AND NOT (p.entry_description = 'DEPOSIT' AND p.lease_fee_id IS NULL)
                 AND p.work_trade_suspended_at IS NULL
                 AND p.reversal_id IS NULL

@@ -8,10 +8,10 @@
  * Thirty-one of these are sitting in signed leases at Mountain View and Oak
  * Park, in a single free-text box, in every shape a person writes one:
  *
- *   Leigh Fisher 520-903-8134      name then number
- *   502 330 3810 Joe Martínez      number then name
- *   Irma Fuentes                   name only — the case Nic described
- *   5208414602                     number only, nobody to ask for
+ *   Dana Whitfield 520-555-0134      name then number
+ *   502 555 0381 José Navarro      number then name
+ *   Marta Delgado                   name only — the case Nic described
+ *   5205550462                     number only, nobody to ask for
  *   Wife                           a relationship and nothing else
  *   NA / Na / 911                  not a contact at all
  *
@@ -168,8 +168,8 @@ export function typingPhone(raw: string): string {
 
 /**
  * Are these two names plausibly the same person? Used to offer a phone number
- * from somebody already in the system — Coreen Covarrubias wrote "Irma Fuentes"
- * and Irma is a tenant here with a number on file.
+ * from somebody already in the system — Paula Illingworth wrote "Marta Delgado"
+ * and Marta is a tenant here with a number on file.
  *
  * Deliberately strict: first AND last must both match, case and accents
  * normalized. A suggestion is shown to staff for confirmation and never

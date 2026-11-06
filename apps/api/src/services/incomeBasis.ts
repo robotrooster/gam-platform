@@ -2245,7 +2245,15 @@ export interface IncomeEvent {
    *            the start of a period beginning that day; never the Owed
    *            column, never in a total
    */
-  ledger?: 'line' | 'owed' | 'owedStart' | 'proof'
+  /**
+   *   'part'   11/4 (Nic): what became of one of the period's charges — the
+   *            Charged column's own explanation, split by what the bill's
+   *            receivable did (services/ledgerReports chargedPartFacts).
+   *            `part` says which bucket; never in a total (inTotal false),
+   *            and NEVER the Owed column, which is the whole receivables
+   *            balance including what was carried in from earlier months.
+   */
+  ledger?: 'line' | 'owed' | 'owedStart' | 'proof' | 'part'
   proofTerm?: LedgerProofTerm
   /**
    * 10/14 (Nic I1): the fact itemized for the Detailed view (facts read from
@@ -2415,6 +2423,19 @@ export interface IncomeSummary {
 }
 
 const COLLECTED_PARTS: readonly BilledPart[] = ['paid', 'coveredByPaidAhead', 'coveredByDepositInterest', 'keptFromDeposit']
+
+/**
+ * Which of the Charged tie's four buckets a BILLED_PARTS value belongs to —
+ * null is the residual, `other`. ONE definition (11/4 Nic: "all the numbers
+ * are derived from their original source"): moneyViewFrom's tie, the per-line
+ * buckets and the dashboard's income card all read the same `ledger: 'part'`
+ * facts, and a second copy of this rule is how two of them start disagreeing.
+ */
+export function chargedBucketOf(p: BilledPart | null | undefined): 'collected' | 'clearing' | 'owed' | 'other' {
+  if (p === 'stillOwed') return 'owed'
+  if (p === 'clearing') return 'clearing'
+  return p && COLLECTED_PARTS.includes(p) ? 'collected' : 'other'
+}
 
 function zeroLines(): Record<ReportLine, number> {
   return Object.fromEntries(REPORT_LINES.map(l => [l, 0])) as Record<ReportLine, number>
@@ -2728,8 +2749,15 @@ export interface MoneyViewDetail extends MoneyColumns {
   subtypes: Array<MoneyColumns & { name: string }>
 }
 
-export interface MoneyViewLine extends MoneyColumns { line: ReportLine; label: string }
-export interface MoneyViewCategory extends MoneyColumns { category: IncomeCategory; label: string }
+/**
+ * 11/4 (Nic): of this line's Charged, what became of it. The same four buckets
+ * as MoneyTie.charged and they add back to `charged` to the cent. Present only
+ * on the books path; the records path carries the figures in `tie` alone.
+ */
+export interface ChargedParts { collected: number; clearing: number; owed: number; other: number }
+
+export interface MoneyViewLine extends MoneyColumns { line: ReportLine; label: string; parts?: ChargedParts }
+export interface MoneyViewCategory extends MoneyColumns { category: IncomeCategory; label: string; parts?: ChargedParts }
 
 /**
  * How the columns tie. Every figure is a split of a column's own total, so
@@ -2738,8 +2766,17 @@ export interface MoneyViewCategory extends MoneyColumns { category: IncomeCatego
  *     collected  paid, covered by money paid ahead or deposit interest, kept
  *                from a deposit (BILLED_PARTS' collected parts)
  *     clearing   paid with money still on its way
- *     owed       still owed today
- *     other      Charged money with no outcome on it (0 in practice)
+ *     owed       still owed — as of the period's END on the books path (a
+ *                month's card never moves again), as of TODAY on the records
+ *                path (each bill's status now)
+ *     other      charged money that was never going to be money: a credit
+ *                given, rent covered by labor, a balance written off. It is
+ *                NOT 0 in practice and the old comment here said it was —
+ *                Mountain View's October rent carries $589.00 of it, which is
+ *                the whole of what Nic could not reconcile on 11/4. Per line
+ *                it is usually the answer to "why doesn't this add up"; over
+ *                a whole report it tends back toward 0, because a credit's
+ *                own minus line sits on the Credits given row.
  *   received = forPeriodBills + forEarlierBills + paidAhead + noBill
  *     forPeriodBills   for bills due in the period
  *     forEarlierBills  for bills due before it (a late payment)
@@ -2767,6 +2804,16 @@ export interface MoneyView extends MoneyColumns {
   tie: MoneyTie
   /** The tie in plain words — one short line per column (screens, the PDF and the email print it as is). */
   tieText: string[]
+  /**
+   * 11/4: the same sentences with every one that names what is still owed
+   * taken out, for a viewer who may not see Owed (decisions #25 — on-site
+   * staff). routes/reports viewForViewer sends this instead of tieText.
+   * It used to drop sentence index 1 by position, which was only ever right
+   * because the books path happened to put its proof strip there; adding the
+   * charged sentence back to that path would have leaked the owed figure
+   * straight past the filter.
+   */
+  tieTextNoOwed?: string[]
   /**
    * Figures in no column: covered by work trade (never money), deposits
    * received (held for the tenant), owner contributions and sale proceeds
@@ -2817,12 +2864,20 @@ function joinWords(parts: string[]): string {
  * money received was for. `periodLabel` names the period ("September 2026",
  * "2026"). Zero parts are left out (the first part of each line always shows).
  */
-export function moneyTieText(v: Pick<MoneyView, 'charged' | 'received'> & { tie: MoneyTie }, periodLabel: string): string[] {
+export function moneyTieText(
+  v: Pick<MoneyView, 'charged' | 'received'> & { tie: MoneyTie }, periodLabel: string, asOfDay?: string,
+): string[] {
   const c = v.tie.charged, r = v.tie.received
   const chargedParts = [`${sayDollars(c.collected)} is collected`]
   if (c.clearing) chargedParts.push(`${sayDollars(c.clearing)} is still clearing`)
-  chargedParts.push(`${sayDollars(c.owed)} is still owed`)
-  if (c.other) chargedParts.push(`${sayDollars(c.other)} has no outcome yet`)
+  // 11/4 (Nic): on the books path these are as of the period's END, so say so
+  // — a month's card must not read as a figure from today.
+  chargedParts.push(asOfDay ? `${sayDollars(c.owed)} was still owed on ${dayWords(asOfDay)}` : `${sayDollars(c.owed)} is still owed`)
+  // 11/4 (Nic): "has no outcome yet" was simply untrue — this is money that was
+  // never going to BE money. Mountain View's October rent carries $589.00 of
+  // it (a resident paid in Square, so the bill closed with an account credit),
+  // and that figure is most of what he could not reconcile.
+  if (c.other) chargedParts.push(`${sayDollars(c.other)} was settled without money (a credit you gave, work trade, or a balance written off)`)
   const receivedParts = [`${sayDollars(r.forPeriodBills)} was for bills due in ${periodLabel}`]
   if (r.forEarlierBills) receivedParts.push(`${sayDollars(r.forEarlierBills)} for bills due earlier`)
   if (r.paidAhead) receivedParts.push(`${sayDollars(r.paidAhead)} was paid ahead for later bills`)
@@ -2854,6 +2909,16 @@ export function moneyViewFrom(
   const byLine = new Map<ReportLine, MoneyColumns>()
   const byCat = new Map<IncomeCategory, MoneyColumns>()
   const noCat = new Map<ReportLine, MoneyColumns>()
+  // 11/4 (Nic): the same four buckets per line and per category, so a row that
+  // does not look like it adds up can say why on its own row.
+  const partsByLine = new Map<ReportLine, ChargedParts>()
+  const partsByCat = new Map<IncomeCategory, ChargedParts>()
+  const partsNoCat = new Map<ReportLine, ChargedParts>()
+  const pcell = <K>(m: Map<K, ChargedParts>, k: K): ChargedParts => {
+    let x = m.get(k)
+    if (!x) { x = { collected: 0, clearing: 0, owed: 0, other: 0 }; m.set(k, x) }
+    return x
+  }
   const cell = <K>(m: Map<K, MoneyColumns>, k: K): MoneyColumns => {
     let x = m.get(k)
     if (!x) { x = { charged: 0, received: 0, owed: 0 }; m.set(k, x) }
@@ -2930,6 +2995,17 @@ export function moneyViewFrom(
       if (e.proofTerm && e.day >= start && e.day <= end) flow[e.proofTerm] += e.amount
       continue
     }
+    // 11/4 (Nic): what became of the period's charges. In no column — these
+    // only split Charged into the four buckets that explain it.
+    if (e.ledger === 'part') {
+      const b = chargedBucketOf(e.part)
+      tie.charged[b] += e.amount
+      const pl = isLine(e.line) ? e.line : null
+      if (pl) pcell(partsByLine, pl)[b] += e.amount
+      if (e.category) pcell(partsByCat, e.category)[b] += e.amount
+      else if (pl) pcell(partsNoCat, pl)[b] += e.amount
+      continue
+    }
     if (!e.inTotal) continue
     const isOwed = e.part === 'stillOwed'
     const line = isLine(e.line) ? e.line : null
@@ -2939,14 +3015,22 @@ export function moneyViewFrom(
     if (g) g.charged += e.amount
     if (g) addDetail(e, 'charged')
     if (isOwed) {
-      owed += e.amount
-      if (line) cell(byLine, line).owed += e.amount
-      if (g) g.owed += e.amount
-      if (g) addDetail(e, 'owed')
-      tie.charged.owed += e.amount
-    } else if (e.part === 'clearing') tie.charged.clearing += e.amount
-    else if (e.part && COLLECTED_PARTS.includes(e.part)) tie.charged.collected += e.amount
-    else tie.charged.other += e.amount
+      // The records path has no other source for the Owed column: it IS the
+      // sum of what each of the period's bills still owes. The books path
+      // reads 1100 itself ('owed' facts above) and fills the tie from its own
+      // 'part' facts, so letting a part through here would count it twice.
+      if (!fromLedger) {
+        owed += e.amount
+        if (line) cell(byLine, line).owed += e.amount
+        if (g) g.owed += e.amount
+        if (g) addDetail(e, 'owed')
+        tie.charged.owed += e.amount
+      }
+    } else if (!fromLedger) {
+      if (e.part === 'clearing') tie.charged.clearing += e.amount
+      else if (e.part && COLLECTED_PARTS.includes(e.part)) tie.charged.collected += e.amount
+      else tie.charged.other += e.amount
+    }
   }
   const beside = new Map<string, number>()
   for (const e of received) {
@@ -2973,17 +3057,22 @@ export function moneyViewFrom(
   }
   const tidy = (x: MoneyColumns): MoneyColumns => ({ charged: round2(x.charged), received: round2(x.received), owed: round2(x.owed) })
   const nonZero = (x: MoneyColumns) => x.charged !== 0 || x.received !== 0 || x.owed !== 0
+  const tidyParts = (x: ChargedParts | undefined): { parts?: ChargedParts } => {
+    if (!x) return {}
+    const p = { collected: round2(x.collected), clearing: round2(x.clearing), owed: round2(x.owed), other: round2(x.other) }
+    return p.collected || p.clearing || p.owed || p.other ? { parts: p } : {}
+  }
   const lines = REPORT_LINES
     .filter(l => byLine.has(l))
-    .map(l => ({ line: l, label: REPORT_LINE_LABEL[l], ...tidy(byLine.get(l)!) }))
+    .map(l => ({ line: l, label: REPORT_LINE_LABEL[l], ...tidy(byLine.get(l)!), ...tidyParts(partsByLine.get(l)) }))
     .filter(nonZero)
   const categories = INCOME_CATEGORIES
     .filter(c => byCat.has(c))
-    .map(c => ({ category: c, label: INCOME_CATEGORY_LABEL[c], ...tidy(byCat.get(c)!) }))
+    .map(c => ({ category: c, label: INCOME_CATEGORY_LABEL[c], ...tidy(byCat.get(c)!), ...tidyParts(partsByCat.get(c)) }))
     .filter(nonZero)
   const uncategorized = REPORT_LINES
     .filter(l => noCat.has(l))
-    .map(l => ({ line: l, label: REPORT_LINE_LABEL[l], ...tidy(noCat.get(l)!) }))
+    .map(l => ({ line: l, label: REPORT_LINE_LABEL[l], ...tidy(noCat.get(l)!), ...tidyParts(partsNoCat.get(l)) }))
     .filter(nonZero)
   for (const k of ['collected', 'clearing', 'owed', 'other'] as const) tie.charged[k] = round2(tie.charged[k])
   for (const k of ['forPeriodBills', 'forEarlierBills', 'paidAhead', 'noBill'] as const) tie.received[k] = round2(tie.received[k])
@@ -3007,7 +3096,19 @@ export function moneyViewFrom(
       ...VIEW_BESIDE_KEYS
         .map(k => ({ key: k as string, label: ASIDE_LINE_LABEL[k], amount: round2(beside.get(k) ?? 0) }))
         .filter(b => b.amount !== 0),
-      ...(paidAheadUnused ? [{ key: 'paidAheadUnused', label: ASIDE_LINE_LABEL.paidAheadUnused, amount: round2(paidAheadUnused) }] : []),
+      // 11/4 (Nic): "It's showing paid ahead, not used yet... $971.82. That
+      // does not seem accurate." It was accurate — two residents paid
+      // November's rent on October 30 — and the figure is a BALANCE on the
+      // period's last day, where every other figure beside it is a flow
+      // through the period. Undated it reads as today's money, and today it
+      // is $71.00. The tax route has dated this figure since it was built
+      // (routes/reports paidAheadNextYearLabel, "…at Dec 31"); this says it
+      // everywhere else too.
+      ...(paidAheadUnused ? [{
+        key: 'paidAheadUnused',
+        label: `${ASIDE_LINE_LABEL.paidAheadUnused} on ${dayWords(end)}`,
+        amount: round2(paidAheadUnused),
+      }] : []),
     ],
   }
   if (fromLedger) {
@@ -3030,10 +3131,19 @@ export function moneyViewFrom(
     }
     view.source = 'ledger'
     view.proof = proof
-    view.tieText = [moneyTieText(view, period.label)[0], ledgerProofText(proof)]
+    // 11/4 (Nic): the charged sentence is BACK on the books path. It was left
+    // out because the books path never filled MoneyTie.charged, so it read
+    // "$0.00 is collected, $0.00 is still owed" with the whole total in a
+    // bucket called other — worse than silence. Now it is the sentence that
+    // answers "why doesn't this line add up".
+    const t = moneyTieText(view, period.label, end)
+    view.tieText = [t[0], t[1], ledgerProofText(proof), ...t.slice(2)]
+    view.tieTextNoOwed = [t[0], ...t.slice(2)]
     return view
   }
-  view.tieText = moneyTieText(view, period.label)
+  const t = moneyTieText(view, period.label)
+  view.tieText = t
+  view.tieTextNoOwed = [t[0], ...t.slice(2)]
   return view
 }
 

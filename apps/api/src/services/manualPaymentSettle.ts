@@ -37,7 +37,7 @@
 //     money order has no change (S648): its extra goes to the old balance, then
 //     becomes paid-ahead money, and the desk must first confirm the amount
 //     written on it ("You typed $486.00 against $485.45 owed — is the money
-//     order really $486.00?" — Kim Harland's $0.55, Fuller's $0.88 were typed
+//     order really $486.00?" — Yvette Bexley's $0.55, Fuller's $0.88 were typed
 //     round-ups). Paid-ahead money from the desk is the landlord's
 //     (funded_by 'landlord', received_at = when it was taken, linked to the
 //     receipt).
@@ -929,6 +929,55 @@ async function bookGamHeldOwnerShare(client: PoolClient, settledIds: readonly st
  * canceled in afterCommit(), which the caller runs after its COMMIT. The
  * caller holds the household lock (lockHousehold) before locking the row.
  */
+export const FLEX_DEPOSIT_NOT_PAYABLE_OFF_PLATFORM =
+  'That charge is a FlexDeposit deposit. The plan is paid from the resident’s verified bank account, '
+  + 'so it cannot be taken as cash, a check, a money order or a bank deposit — not an installment, and '
+  + 'not the whole deposit. Nothing was recorded. Leave it to their scheduled bank payments.'
+
+/**
+ * ── 10/29 (Nic): NO FLEXDEPOSIT MONEY IS EVER TAKEN OFF-PLATFORM ────────────
+ *
+ *   "I was pretty sure we already decided that the counter cannot take the flex
+ *    deposit payments. I thought we opted out of that for a variety of reasons."
+ *
+ * He is right, and the tree had half-opted-out. The WINDOW never offered these
+ * rows (bankPayableRowSql refuses them, notFlexDepositRowSql), but this settle
+ * path does not gate on that — it settles anything payable — and the guard that
+ * stood here only caught a payment SHORT of what was left of the deposit. On the
+ * LAST installment those two figures are equal, so the final installment of a
+ * plan was collectable in cash at the counter: the plan ended, the landlord kept
+ * the money, and the clawback that would move it into GAM's custody was
+ * deliberately never built (it was specified 10/28 and withdrawn the same day).
+ *
+ * So the rule is now the whole rule, with no arithmetic in it: a FlexDeposit
+ * installment is never settled by cash, check, money order or a bank deposit, at
+ * any amount. The refusal THROWS, which rolls the settle back — the clerk is
+ * told rather than the money being booked somewhere it cannot be reconciled.
+ *
+ * This covers all three doors at once, because the front desk
+ * (POST /payments/:id/record-manual), a posted payment (services/postPayment)
+ * and the agent's cash tool (agents/tools/recordCashPayment) all settle through
+ * settleManualRentPayment. The resident's real collection is untouched: an ACH
+ * installment settles from the Stripe webhook, which calls
+ * reconcileSettledFlexDepositPayment directly and never comes through here.
+ */
+async function refuseFlexDepositSettledOffPlatform(
+  client: PoolClient, paymentIds: string[], method: string,
+): Promise<void> {
+  if (!paymentIds.length) return
+  const installments = await client.query<{ payment_id: string }>(
+    `SELECT f.payment_id
+       FROM flex_deposit_installments f
+      WHERE f.payment_id = ANY($1::uuid[])`,
+    [paymentIds])
+  if (!installments.rows.length) return
+  // Said out loud as well as refused: somebody reached a row the window does
+  // not offer, and that is worth seeing in the log either way.
+  logger.warn({ paymentIds: installments.rows.map(r => r.payment_id), method },
+    '[flexdeposit] an off-platform payment was attempted against a deposit plan and was refused')
+  throw new AppError(409, FLEX_DEPOSIT_NOT_PAYABLE_OFF_PLATFORM)
+}
+
 async function settleOneRow(client: PoolClient, input: ManualSettleInput): Promise<ManualSettleResult> {
   const { payment, method } = input
   const refNote = input.reference ? ` (ref ${input.reference})` : ''
@@ -948,6 +997,19 @@ async function settleOneRow(client: PoolClient, input: ManualSettleInput): Promi
   }
   const ids = settled.rows.map(r => r.id)
   await resolveReopenedPaidAgain(client, ids)
+  // ── 10/28 (Nic): A FLEXDEPOSIT INSTALLMENT PAID IN THE LANDLORD'S HANDS ──
+  //
+  //   "If any tenant pays installment in cash to the landlord or by as part of
+  //    a check, applied to an invoice, that installment would need to get
+  //    debited out of the landlord's payout to be put into our books."
+  //
+  // Crediting an installment used to be wired to the Stripe webhook alone, so
+  // cash or a check at the desk settled the charge and credited the plan
+  // NOTHING — the resident had paid and their deposit still read unfunded. And
+  // the money is physically the landlord's, while the deposit is GAM's to hold,
+  // so it also has to come back: the clawback rides the ordinary payout batch
+  // as a negative held item, the same mechanism the left-owing hand-over uses.
+  await refuseFlexDepositSettledOffPlatform(client, ids, method)
   await bookGamHeldOwnerShare(client, ids, 'Let GAM support know.')
   const depositRecords = await recordDepositsCollected(client, ids)
   await afterRowsSettled(client, ids, {
@@ -1577,7 +1639,7 @@ async function settleHousehold(client: PoolClient, input: ManualSettleInput): Pr
   if (kept > 0) {
     // The receipt says what was handed over and what became of any extra —
     // the old balance it paid, change, or credit: the desk's own answer, never
-    // a default (S637; harland-credits 10/3).
+    // a default (S637; bexley-credits 10/3).
     const oldPart = towardOld > 0 ? `; ${money(towardOld)} went to the old balance` : ''
     const handedOver = isCash
       ? `Handed over ${money(tendered)}`

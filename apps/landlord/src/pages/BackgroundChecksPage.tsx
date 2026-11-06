@@ -5,7 +5,11 @@ import { humanize } from '@gam/shared'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
 import { EntityPicker, useEntities } from '../components/EntityPicker'
 import { toast } from '../components/dialogs'
+// 10/28: the SAME rule the Tenants-page invite modal uses, so "which occupied
+// spaces may be taken over" has one answer platform-wide.
+import { canTakeOverUnit } from '../lib/inviteEligibility'
 import { ScreeningsWaitingPanel } from '../../../../packages/shared-ui/ScreeningsWaitingPanel'
+import { ApplyLinkCard } from '../components/ApplyLinkCard'
 
 /** Shared with the front desk's own Checks tab in the POS — one list, both screens. */
 const screeningsApi = { get: apiGet, post: apiPost }
@@ -116,6 +120,11 @@ export function BackgroundChecksPage() {
           not in either list below, and until now they were in no list at all.
           The address is editable because a mistyped one is both why the link
           never arrived and why they cannot sign in to sort it out themselves. */}
+      {/* 10/30 (Nic): the emailed link and the QR live here now, where the
+          dashboard's Applications card lands — not on the register. A property
+          carried in that query string pre-selects itself; see ApplyLinkCard. */}
+      <ApplyLinkCard companyId={companyId}
+        initialPropertyId={new URLSearchParams(window.location.search).get('propertyId') || ''} />
       <ScreeningsWaitingPanel propertyId={propertyId || null} api={screeningsApi} />
       <div className="filter-bar" style={{display:'flex',gap:6,alignItems:'center',marginBottom:12,flexWrap:'wrap'}}>
         <button type="button" className={`btn btn-sm ${tab === 'attention' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab('attention')}>
@@ -139,7 +148,7 @@ export function BackgroundChecksPage() {
                 column said "Risk" as though it were. riskLevel is GAM's own
                 INTAKE score, computed from what the applicant typed on the form
                 (stated income, employment, how fast they filled it in) before
-                Checkr is contacted at all. Anastacio read "low" here while
+                Checkr is contacted at all. Bryce read "low" here while
                 Checkr's verdict on him was CONSIDER. Two different questions,
                 and the screening answer is the one a tenancy turns on, so it
                 gets the column and the intake score is named for what it is. */}
@@ -422,6 +431,19 @@ function ReviewModal({ check, onClose, onDecided }: {
     { enabled: !!(needsUnit && check.propertyId) },
   )
   const choosable = (vacants as any[]).filter(u => u.status === 'vacant')
+  // 10/28 (Nic): "I want him to do the flow from the background check — the
+  // screened applicant that's already in the list — invite them to a unit
+  // that's already occupied."
+  //
+  // An occupied space is offered here the way it is on the invite modal: in its
+  // OWN group, named a takeover, never mixed in with the vacancies, so an
+  // ordinary draft cannot land on somebody's home by a mis-click. A space whose
+  // replacement is already promised to an incoming lease is not offered at all
+  // (canTakeOverUnit), or two people get told the same space is theirs.
+  const takeovers = (vacants as any[]).filter(canTakeOverUnit)
+  const occupantOf = (id: string) => (takeovers as any[]).find(u => u.id === id)
+  const takingOver = !!pickedUnit && !!occupantOf(pickedUnit)
+  const [replaceConfirmed, setReplaceConfirmed] = useState(false)
 
   // S653 (Nic): the draft IS the signing packet. Land on it to sign — never on
   // an edit window. No default template for the unit type → GoldSign, where
@@ -443,7 +465,7 @@ function ReviewModal({ check, onClose, onDecided }: {
     setDrafting(true)
     try {
       const res: any = await apiPost(`/background/${check.id}/draft-lease`,
-        pickedUnit ? { unitId: pickedUnit } : {})
+        pickedUnit ? { unitId: pickedUnit, takeover: takingOver } : {})
       const d = res?.data ?? res
       onClose()
       landOnDraft(d)
@@ -558,8 +580,7 @@ function ReviewModal({ check, onClose, onDecided }: {
               They could not see it. This block looped the summary's TOP level,
               so it printed order_id, provider and report_id — identifiers of no
               use to anybody — while the findings themselves sat one level down
-              inside `products` and rendered as nothing at all. Anastacio
-              Erreguin's report came back CONSIDER on the credit file and clear
+              inside `products` and rendered as nothing at all. Bryce Belmont's report came back CONSIDER on the credit file and clear
               on everything else, and none of that reached the screen.
 
               Per-product, plainly, with the overall verdict first. */}
@@ -738,8 +759,7 @@ function ReviewModal({ check, onClose, onDecided }: {
               used to populate the lease with their name and stuff?"
               Because this was the one control in the approved block that did not
               ask whether they are already housed — the "Not moving in for now"
-              control directly above has always asked. Robert Housley and James
-              Fenton are both on leases here and were being offered a second one;
+              control directly above has always asked. Rowena Ulverston and Juno Kendrew are both on leases here and were being offered a second one;
               Victor and Nemesio are matched to their old stays (by guest email),
               which skips this whole block, which is why only those two looked
               right. `housed` is true for a pending or active lease OR a live
@@ -753,17 +773,44 @@ function ReviewModal({ check, onClose, onDecided }: {
           {isApproved && !forStay && !check.housed && (
             <>
               {needsUnit && (
-                <select className="input" style={{maxWidth:220}} value={pickedUnit} onChange={e => setPickedUnit(e.target.value)}>
+                <select className="input" style={{maxWidth:260}} value={pickedUnit}
+                        onChange={e => { setPickedUnit(e.target.value); setReplaceConfirmed(false) }}>
                   <option value="">Which space?</option>
                   {choosable.map(u => (
                     <option key={u.id} value={u.id}>
                       {u.unitNumber}{u.rentAmount ? ` · $${Number(u.rentAmount).toLocaleString()}/mo` : ''}
                     </option>
                   ))}
+                  {takeovers.length > 0 && (
+                    <optgroup label="Taking over an occupied spot">
+                      {takeovers.map(u => (
+                        <option key={u.id} value={u.id}>
+                          {u.unitNumber} · occupied{u.tenantFirst ? ` by ${u.tenantFirst}` : ''}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
                 </select>
               )}
-              <button className="btn btn-primary" onClick={draftLease} disabled={drafting || (needsUnit && !pickedUnit)}>
-                {drafting ? 'Drafting…' : 'Draft lease'}
+              {/* Ending somebody's tenancy is not a thing to do by mis-click, so
+                  it is ticked by name — the same confirmation GoldSign asks for. */}
+              {takingOver && (
+                <label style={{display:'flex',alignItems:'flex-start',gap:8,maxWidth:420,
+                               fontSize:'.76rem',color:'var(--text-2)',lineHeight:1.5}}>
+                  <input type="checkbox" checked={replaceConfirmed}
+                         onChange={e => setReplaceConfirmed(e.target.checked)} />
+                  <span>
+                    <strong style={{color:'var(--amber,#d97706)'}}>
+                      Yes — this lease replaces {occupantOf(pickedUnit)?.tenantFirst || 'the resident living there'}.
+                    </strong>{' '}
+                    They keep being billed until this new lease is signed. Nothing moves until
+                    then, and the two leases are never linked on paperwork.
+                  </span>
+                </label>
+              )}
+              <button className="btn btn-primary" onClick={draftLease}
+                      disabled={drafting || (needsUnit && !pickedUnit) || (takingOver && !replaceConfirmed)}>
+                {drafting ? 'Drafting…' : takingOver ? 'Draft takeover lease' : 'Draft lease'}
               </button>
             </>
           )}

@@ -921,7 +921,7 @@ export const PORTAL_ACTIONS: readonly PortalAction[] = [
       initialType: { type: 'string', description: 'flat or percent_of_rent.' },
       accrualAmount: { type: 'number', description: 'The recurring amount that follows the first fee.' },
       accrualType: { type: 'string', description: 'flat or percent_of_rent.' },
-      accrualPeriod: { type: 'string', description: 'daily, weekly or monthly.' },
+      accrualPeriod: { type: 'string', description: 'daily or weekly.' },
       accrualFrom: { type: 'string', description: 'Where the daily count starts: due_date_inclusive (default), due_date, or grace_end.' },
       capAmount: { type: 'number', description: 'The most the late fees can add up to.' },
       capType: { type: 'string', description: 'flat or percent_of_rent.' },

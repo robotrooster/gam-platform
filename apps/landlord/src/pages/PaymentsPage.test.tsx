@@ -107,10 +107,10 @@ vi.mock('../components/RecordPaymentWindow', async () => {
   return {
     RecordPaymentWindow: (p: any) => h('div', { className: 'stub-desk' },
       `DESK anchor=${p.anchorPaymentId} tenant=${p.tenantId} name=${p.name}`,
-      h('button', { onClick: () => { p.onRecorded('Recorded $260.00 from Russ Fuller.'); p.onClose() } }, 'stub record and close')),
+      h('button', { onClick: () => { p.onRecorded('Recorded $260.00 from Tamsin Wrenfield.'); p.onClose() } }, 'stub record and close')),
     PostPaymentForm: (p: any) => h('div', { className: 'stub-post' },
       `POST tenant=${p.tenantId} name=${p.name}`,
-      h('button', { onClick: () => p.onPosted('Posted $50.00 from Dakota Lane — $50.00 kept as paid ahead.') }, 'stub post')),
+      h('button', { onClick: () => p.onPosted('Posted $50.00 from Tobin Thornbury — $50.00 kept as paid ahead.') }, 'stub post')),
     sendDepositPhoto: async () => null,
   }
 })
@@ -152,11 +152,11 @@ const roll = (rows: OpenMonthRow[], over: Partial<OpenMonthRoll> = {}): OpenMont
 })
 
 // A month as the server orders it: still owing first, then space order.
-const russ = row({
-  key: 'lease:L7', unitId: 'u7', space: 'MH 07', leaseId: 'L7', householdId: 't-russ',
-  residents: [{ tenantId: 't-russ', name: 'Russ Fuller', primary: true }, { tenantId: 't-ann', name: 'Ann Fuller', primary: false }],
+const tamsin = row({
+  key: 'lease:L7', unitId: 'u7', space: 'MH 07', leaseId: 'L7', householdId: 't-tamsin',
+  residents: [{ tenantId: 't-tamsin', name: 'Tamsin Wrenfield', primary: true }, { tenantId: 't-ann', name: 'Ann Wrenfield', primary: false }],
   invoiced: 460, paid: 200, owed: 260, methods: ['Cash'], status: 'owes', statusLabel: 'Owes +3', statusColor: 'red',
-  daysPastGrace: 3, recordWith: 'chg-russ', payments: [payment({ paymentId: 'rcpt7', amount: 200 })],
+  daysPastGrace: 3, recordWith: 'chg-tamsin', payments: [payment({ paymentId: 'rcpt7', amount: 200 })],
   charges: [charge({ chargeId: 'c7', paid: 200, owed: 260, paidOn: null })],
 })
 const nora = row({
@@ -166,14 +166,14 @@ const nora = row({
   recordWith: 'chg-nora', payments: [], charges: [charge({ chargeId: 'c12', invoiced: 500, paid: 0, owed: 500, paidOn: null, howPaid: null })],
 })
 const glenda = row({ key: 'lease:L2', unitId: 'u2', space: 'MH 02', leaseId: 'L2' })
-const dakota = row({
-  key: 'lease:L10', unitId: 'u10', space: 'MH 10', leaseId: 'L10', householdId: 't-dakota',
-  residents: [{ tenantId: 't-dakota', name: 'Dakota Lane', primary: true }],
+const tobin = row({
+  key: 'lease:L10', unitId: 'u10', space: 'MH 10', leaseId: 'L10', householdId: 't-tobin',
+  residents: [{ tenantId: 't-tobin', name: 'Tobin Thornbury', primary: true }],
   status: 'paid_late', statusLabel: 'Paid late +5', statusColor: 'orange', daysPastGrace: 5,
   methods: ['Cash', 'Card · online'],
   payments: [payment({ paymentId: 'rcpt10a', amount: 200 }), payment({ paymentId: 'rcpt10b', paidOn: '2026-10-11', amount: 260, methodLabel: 'Card · online' })],
 })
-const month = () => roll([russ, nora, glenda, vacant('MH 03', 'u3'), dakota])
+const month = () => roll([tamsin, nora, glenda, vacant('MH 03', 'u3'), tobin])
 
 let host: HTMLDivElement
 let root: Root
@@ -320,7 +320,7 @@ describe('one row per household, in the server’s order, every space', () => {
     await loaded()
     const c = cells('lease:L7')
     expect(c[0]).toBe('▸MH 07')
-    expect(c[1]).toBe('Russ Fuller & Ann Fuller')
+    expect(c[1]).toBe('Tamsin Wrenfield & Ann Wrenfield')
     expect(c.slice(2, 7)).toEqual(['$460.00', '$200.00', '$260.00', 'Cash', 'Owes +3'])
   })
 
@@ -447,7 +447,7 @@ describe('eviction mode blocks payments, and the row says so', () => {
     server.rolls['p-oak'] = roll([row({
       key: 'lease:L5', space: 'MH 05', evictionMode: true, owed: 460, paid: 0, status: 'owes', statusLabel: 'Owes +12',
       statusColor: 'red', recordWith: null, methods: [], payments: [],
-    }), russ])
+    }), tamsin])
     await render()
     await loaded()
     expect(rowOf('lease:L5')!.querySelector('.pay-tag.evict')!.textContent).toBe('Eviction mode — payments blocked')
@@ -485,7 +485,7 @@ describe('click the row for its payments and charges; click the name for the rep
 
   it('a partial’s charge shows what is still owed on it, and a payment logged after the late fee says it counts late', async () => {
     server.rolls['p-oak'] = roll([row({
-      ...russ, charges: [charge({ chargeId: 'c7', paid: 200, owed: 260, loggedAfterLateFee: true })],
+      ...tamsin, charges: [charge({ chargeId: 'c7', paid: 200, owed: 260, loggedAfterLateFee: true })],
     })])
     await render()
     await loaded()
@@ -522,7 +522,7 @@ describe('click the row for its payments and charges; click the name for the rep
     await loaded()
     await click(rowOf('lease:L7')!.querySelector('button.pay-name'))
     await until(() => !!host.querySelector('.report-probe'), 'the report')
-    expect(host.querySelector('.report-probe')!.textContent).toBe('REPORT /tenants/t-russ/report?leaseId=L7')
+    expect(host.querySelector('.report-probe')!.textContent).toBe('REPORT /tenants/t-tamsin/report?leaseId=L7')
   })
 })
 
@@ -538,19 +538,19 @@ describe('logging a payment right here (the desk window — the one way)', () =>
     const before = openMonthReads().length
     await click(rowOf('lease:L7')!.querySelector('button.btn'))
     expect(host.querySelector('tr.pay-detail')).toBeNull()
-    expect(host.querySelector('.stub-desk')!.textContent).toContain('DESK anchor=chg-russ tenant=t-russ name=Russ Fuller & Ann Fuller')
+    expect(host.querySelector('.stub-desk')!.textContent).toContain('DESK anchor=chg-tamsin tenant=t-tamsin name=Tamsin Wrenfield & Ann Wrenfield')
     await click(btn(/stub record and close/))
     expect(host.querySelector('.stub-desk')).toBeNull()
-    expect(host.querySelector('.cd-notice')!.textContent).toContain('Recorded $260.00 from Russ Fuller.')
+    expect(host.querySelector('.cd-notice')!.textContent).toContain('Recorded $260.00 from Tamsin Wrenfield.')
     await until(() => openMonthReads().length > before, 'the month read again')
   })
 
   it('Record payment at the top lists this property’s households: one who owes opens the desk window, one paid up posts ahead, eviction mode is said with nothing to press', async () => {
     server.rolls['p-oak'] = roll([
-      russ,
+      tamsin,
       row({ key: 'lease:L5', space: 'MH 05', householdId: 't-ed', residents: [{ tenantId: 't-ed', name: 'Ed Price', primary: true }],
         evictionMode: true, owed: 460, paid: 0, status: 'owes', statusLabel: 'Owes +12', statusColor: 'red', recordWith: null }),
-      row({ ...dakota, owedEarlier: 0 }),
+      row({ ...tobin, owedEarlier: 0 }),
       vacant('MH 03', 'u3'),
     ])
     await render()
@@ -560,21 +560,21 @@ describe('logging a payment right here (the desk window — the one way)', () =>
     expect(picker().textContent).toContain('Who is paying?')
     const items = [...picker().querySelectorAll('.cd-picker-item')].map(i => i.textContent)
     expect(items).toEqual([
-      'Russ Fuller & Ann FullerMH 07owes $260.00',
+      'Tamsin Wrenfield & Ann WrenfieldMH 07owes $260.00',
       'Ed PriceMH 05Eviction mode — payments blocked',
-      'Dakota LaneMH 10nothing owed — paying ahead',
+      'Tobin ThornburyMH 10nothing owed — paying ahead',
     ])
     expect(picker().querySelector('div.cd-picker-info')!.textContent).toContain('Ed Price')
     await setValue(picker().querySelector('input') as HTMLInputElement, 'mh 10')
-    expect([...picker().querySelectorAll('.cd-picker-item')].map(i => i.textContent)).toEqual(['Dakota LaneMH 10nothing owed — paying ahead'])
-    await click(inWindow(/^Dakota Lane/))
-    expect(host.querySelector('.stub-post')!.textContent).toContain('POST tenant=t-dakota name=Dakota Lane')
+    expect([...picker().querySelectorAll('.cd-picker-item')].map(i => i.textContent)).toEqual(['Tobin ThornburyMH 10nothing owed — paying ahead'])
+    await click(inWindow(/^Tobin Thornbury/))
+    expect(host.querySelector('.stub-post')!.textContent).toContain('POST tenant=t-tobin name=Tobin Thornbury')
     await click(btn(/stub post/))
-    expect(host.querySelector('.cd-notice')!.textContent).toContain('Posted $50.00 from Dakota Lane')
+    expect(host.querySelector('.cd-notice')!.textContent).toContain('Posted $50.00 from Tobin Thornbury')
 
     await click(btn(/^Record payment$/))
-    await click(inWindow(/^Russ Fuller/))
-    expect(host.querySelector('.stub-desk')!.textContent).toContain('DESK anchor=chg-russ tenant=t-russ')
+    await click(inWindow(/^Tamsin Wrenfield/))
+    expect(host.querySelector('.stub-desk')!.textContent).toContain('DESK anchor=chg-tamsin tenant=t-tamsin')
   })
 
   it('the whole balance here is what the list says is owed, earlier months included', async () => {
@@ -588,7 +588,7 @@ describe('logging a payment right here (the desk window — the one way)', () =>
   // 10/13 (Nic): "outstanding balances are always at the top of this list ...
   // once it's paid, it drops down" — a balance from an earlier month too.
   it('paid this month but owing an earlier one: the row says how much from earlier months, and takes the payment', async () => {
-    server.rolls['p-oak'] = roll([row({ owedEarlier: 120, recordWith: 'chg-sept' }), row({ ...russ, owedEarlier: 50 })])
+    server.rolls['p-oak'] = roll([row({ owedEarlier: 120, recordWith: 'chg-sept' }), row({ ...tamsin, owedEarlier: 50 })])
     await render()
     await loaded()
     expect(cells('lease:L4').slice(2, 7)).toEqual(['$460.00', '$460.00', '—$120.00 from earlier months', 'Cash', 'Paid'])
@@ -609,13 +609,13 @@ describe('logging a payment right here (the desk window — the one way)', () =>
 
 describe('the month total (decisions #25)', () => {
   it('shows only when the server sent it', async () => {
-    server.rolls['p-oak'] = roll([russ], { totals: { invoiced: 960, lateFees: 0, paid: 700, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 0, staysRefunded: 0 } })
+    server.rolls['p-oak'] = roll([tamsin], { totals: { invoiced: 960, lateFees: 0, paid: 700, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 0, staysRefunded: 0 } })
     await render()
     await loaded()
     expect(host.querySelector('.cd-totals')!.textContent).toBe('Invoiced $960.00Paid $700.00Owed $260.00')
   })
   it('adds work trade and what is owed from earlier months when there is some — as the Rent Roll does', async () => {
-    server.rolls['p-oak'] = roll([russ], { totals: { invoiced: 1460, lateFees: 0, paid: 700, credit: 0, workTrade: 500, owed: 260, owedEarlier: 120, stays: 0, staysRefunded: 0 } })
+    server.rolls['p-oak'] = roll([tamsin], { totals: { invoiced: 1460, lateFees: 0, paid: 700, credit: 0, workTrade: 500, owed: 260, owedEarlier: 120, stays: 0, staysRefunded: 0 } })
     await render()
     await loaded()
     expect(host.querySelector('.cd-totals')!.textContent)
@@ -631,7 +631,7 @@ describe('the month total (decisions #25)', () => {
 // ─── What the ledger said on a payment, kept ─────────────────────────────────
 
 const ledgerPayment = (over: any = {}) => ({
-  id: 'rcpt7', kind: 'receipt', name: 'Russ Fuller', unitNumber: 'MH 07', propertyName: 'Oak Park',
+  id: 'rcpt7', kind: 'receipt', name: 'Tamsin Wrenfield', unitNumber: 'MH 07', propertyName: 'Oak Park',
   paidOn: '2026-10-03', arrivedOn: '2026-10-05', applied: 200, amount: 200, creditApplied: 0, returned: 0, creditReturned: 0,
   method: 'ach', methodLabel: 'Bank', status: 'settled', statusLabel: 'Paid', paidFor: 'October rent',
   daysLate: 0, timingLabel: 'On time', receiptId: 'rm7', reference: null,
@@ -639,7 +639,7 @@ const ledgerPayment = (over: any = {}) => ({
   ...over,
 })
 const returnedMonth = () => roll([row({
-  ...russ, payments: [payment({ paymentId: 'rcpt7', amount: 200, methodLabel: 'Bank', status: 'returned', statusLabel: 'Returned' })],
+  ...tamsin, payments: [payment({ paymentId: 'rcpt7', amount: 200, methodLabel: 'Bank', status: 'returned', statusLabel: 'Returned' })],
 })])
 
 describe('a payment that came back says why', () => {
@@ -690,7 +690,7 @@ describe('a payment that came back says why', () => {
   })
 
   it('credit a dispute took back says so on the payment, and why', async () => {
-    server.rolls['p-oak'] = roll([row({ ...russ, payments: [payment({ paymentId: 'rcpt7', amount: 10, credit: 10, methodLabel: 'Paid from credit' })] })])
+    server.rolls['p-oak'] = roll([row({ ...tamsin, payments: [payment({ paymentId: 'rcpt7', amount: 10, credit: 10, methodLabel: 'Paid from credit' })] })])
     server.ledger = { ...server.ledger, payments: [ledgerPayment({ kind: 'credit', amount: 0, creditApplied: 10, creditReturned: 10, method: null, methodLabel: 'Paid from credit', receiptId: null })] }
     await render()
     await loaded()
@@ -707,7 +707,7 @@ describe('a payment that came back says why', () => {
 // deposit the bank showed on a later day says so, plainly, on its line.
 describe('a payment from a bank deposit the tenant dated earlier than the bank', () => {
   it('shows the flag with both dates, and the tenant’s photo of the bank receipt', async () => {
-    server.rolls['p-oak'] = roll([row({ ...russ, payments: [payment({ paymentId: 'rcpt7', amount: 200, methodLabel: 'Bank deposit' })] })])
+    server.rolls['p-oak'] = roll([row({ ...tamsin, payments: [payment({ paymentId: 'rcpt7', amount: 200, methodLabel: 'Bank deposit' })] })])
     server.ledger = { ...server.ledger, payments: [ledgerPayment({
       method: 'bank_deposit', methodLabel: 'Bank deposit', depositPhotoUrl: '/api/payments/remittances/rm7/deposit-photo',
       depositDateFlag: { said: '2026-10-01', bank: '2026-10-06' },
@@ -723,7 +723,7 @@ describe('a payment from a bank deposit the tenant dated earlier than the bank',
   })
 
   it('a bank deposit with no photo can have one added by someone who takes payments', async () => {
-    server.rolls['p-oak'] = roll([row({ ...russ, payments: [payment({ paymentId: 'rcpt7', amount: 200, methodLabel: 'Bank deposit' })] })])
+    server.rolls['p-oak'] = roll([row({ ...tamsin, payments: [payment({ paymentId: 'rcpt7', amount: 200, methodLabel: 'Bank deposit' })] })])
     server.ledger = { ...server.ledger, payments: [ledgerPayment({ method: 'bank_deposit', methodLabel: 'Bank deposit', depositPhotoUrl: null })] }
     await render()
     await loaded()
@@ -735,17 +735,17 @@ describe('a payment from a bank deposit the tenant dated earlier than the bank',
 
 // ─── Who may see it ──────────────────────────────────────────────────────────
 
-// 10/14 (Nic), about Lisa Scheeler (Mountain View's on-site manager: "View who
+// 10/14 (Nic), about Calla Fitzhugh (Mountain View's on-site manager: "View who
 // owes" and "Take payments", not "View all payments"): "they should see at
 // least the payments tab ... kind of the same way that I see it, but not with
 // that top view ... not show all the totals, the work trade, all these things
 // at the top in the header. Just have it show the record payment like it does
 // and down the list, everybody else who's paid or paid late or whatever."
 describe('10/14 (Nic): the front desk sees the Payments page, without the top view', () => {
-  const lisa = { role: 'onsite_manager', permissions: { 'payments.view': true, 'balances.view': true, take_payment: true } }
+  const calla = { role: 'onsite_manager', permissions: { 'payments.view': true, 'balances.view': true, take_payment: true } }
 
   it('the month for their property: its header, Record payment, every row — no totals, no report from a name, nothing more read', async () => {
-    server.user = lisa
+    server.user = calla
     // The server sends the desk no sums (routes/balances); the page shows what it was sent.
     await render()
     await loaded()
@@ -765,7 +765,7 @@ describe('10/14 (Nic): the front desk sees the Payments page, without the top vi
     expect(btn(/Import payment history/)).toBeUndefined()
     // The name is just the name: the tenant report is "View all payments".
     expect(host.querySelector('.pay-name')).toBeNull()
-    expect(cells('lease:L7')[1]).toContain('Russ Fuller & Ann Fuller')
+    expect(cells('lease:L7')[1]).toContain('Tamsin Wrenfield & Ann Wrenfield')
     // A row opens to its payments and charges from the row itself — the Payments ledger is never asked.
     await click(rowOf('lease:L7'))
     expect(host.querySelectorAll('tr[data-line="payment"]')).toHaveLength(1)
@@ -774,19 +774,19 @@ describe('10/14 (Nic): the front desk sees the Payments page, without the top vi
   })
 
   it('logs a payment right here: the desk window on the row\'s charge, the month read again when it closes', async () => {
-    server.user = lisa
+    server.user = calla
     await render()
     await loaded()
     await click(rowOf('lease:L7')!.querySelector('.pay-record button'))
-    expect(host.querySelector('.stub-desk')!.textContent).toContain('DESK anchor=chg-russ tenant=t-russ name=Russ Fuller & Ann Fuller')
+    expect(host.querySelector('.stub-desk')!.textContent).toContain('DESK anchor=chg-tamsin tenant=t-tamsin name=Tamsin Wrenfield & Ann Wrenfield')
     const before = openMonthReads().length
     await click(btn(/stub record and close/))
-    await until(() => text().includes('Recorded $260.00 from Russ Fuller.'), 'the result')
+    await until(() => text().includes('Recorded $260.00 from Tamsin Wrenfield.'), 'the result')
     await until(() => openMonthReads().length > before, 'the month read again')
   })
 
   it('more than one property in their scope: Which property?, then Change property', async () => {
-    server.user = lisa
+    server.user = calla
     server.properties = [property(), property({ propertyId: 'p-mv', name: 'Mountain View RV', spaces: 61 })]
     server.rolls['p-mv'] = roll([row({ key: 'lease:M1', space: 'RV 1', residents: [{ tenantId: 't-m', name: 'Mo Reyes', primary: true }] })],
       { propertyId: 'p-mv', propertyName: 'Mountain View RV' })
@@ -950,7 +950,7 @@ describe('10/13 (Nic): a bookkeeper sees the Payments page read-only', () => {
     expect(btn(/Import payment history/)).toBeUndefined()
     // The name is just the name: the tenant report is not theirs.
     expect(host.querySelector('.pay-name')).toBeNull()
-    expect(cells('lease:L7')[1]).toContain('Russ Fuller & Ann Fuller')
+    expect(cells('lease:L7')[1]).toContain('Tamsin Wrenfield & Ann Wrenfield')
     // A row still opens to its payments and charges — from the row itself, nothing more is read.
     await click(rowOf('lease:L7'))
     expect(host.querySelectorAll('tr[data-line="payment"]')).toHaveLength(1)
@@ -972,7 +972,7 @@ describe('a stay guest\'s money: on their row, with its details', () => {
   })
 
   it('the row: the guest, what was paid this month and how — no Invoiced, nothing owed, no Record payment', async () => {
-    server.rolls['p-oak'] = roll([russ, stayRow()], {
+    server.rolls['p-oak'] = roll([tamsin, stayRow()], {
       totals: { invoiced: 460, lateFees: 0, paid: 200, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 589, staysRefunded: 0 },
     })
     await render()
@@ -1026,7 +1026,7 @@ describe('the register\'s and pay links\' money that is no bill and no stay', ()
   const lines = [
     line(),
     line({ id: 'sale2', saleId: 'sale2', day: '2026-10-06', amount: 752.17, methodLabel: 'Card · online',
-      forLabel: 'Electric (per kWh), RV site — monthly · pay link', who: 'Andres Razo' }),
+      forLabel: 'Electric (per kWh), RV site — monthly · pay link', who: 'Cora Castellan' }),
     line({ id: 'ref1', saleId: 'sale1', kind: 'refund', day: '2026-10-07', amount: 5, forLabel: 'Refund at the register · Propane' }),
   ]
   const totals = (over: Partial<OpenMonthTotals> = {}): OpenMonthTotals => ({
@@ -1035,7 +1035,7 @@ describe('the register\'s and pay links\' money that is no bill and no stay', ()
   })
 
   it('a folder under the month, closed until opened, its count and sums on its head; each line its day, what for, who, how and the amount', async () => {
-    server.rolls['p-oak'] = roll([russ], { otherMoney: lines, totals: totals() })
+    server.rolls['p-oak'] = roll([tamsin], { otherMoney: lines, totals: totals() })
     await render()
     await loaded()
     // Its own sum beside the bills', apart from them.
@@ -1050,7 +1050,7 @@ describe('the register\'s and pay links\' money that is no bill and no stay', ()
     const shown = [...folder.querySelectorAll('li.pay-other-line')]
     expect(shown.map(li => [li.getAttribute('data-line'), ...lineCells(li)])).toEqual([
       ['sale', 'Oct 1', 'Propane · at the registerNo name given · Cash', '$23.92'],
-      ['sale', 'Oct 6', 'Electric (per kWh), RV site — monthly · pay linkAndres Razo · Card · online', '$752.17'],
+      ['sale', 'Oct 6', 'Electric (per kWh), RV site — monthly · pay linkCora Castellan · Card · online', '$752.17'],
       ['refund', 'Oct 7', 'Refund at the register · PropaneNo name given · Cash', '−$5.00'],
     ])
     // Money already in: nothing to press on it (these lines carry no breakdown), and nothing more is read.
@@ -1061,13 +1061,13 @@ describe('the register\'s and pay links\' money that is no bill and no stay', ()
   })
 
   it('without the sums (decisions #25) the folder says only how many; with nothing of the kind there is no folder', async () => {
-    server.rolls['p-oak'] = roll([russ], { otherMoney: lines })
+    server.rolls['p-oak'] = roll([tamsin], { otherMoney: lines })
     await render()
     await loaded()
     expect(host.querySelector('button.pay-other-head')!.textContent).toBe('▸Register sales and pay links2 sales · 1 refund')
     act(() => root.unmount())
     root = createRoot(host)
-    server.rolls['p-oak'] = roll([russ])
+    server.rolls['p-oak'] = roll([tamsin])
     await render()
     await loaded()
     expect(host.querySelector('[data-section="other-money"]')).toBeNull()
@@ -1076,7 +1076,7 @@ describe('the register\'s and pay links\' money that is no bill and no stay', ()
   it('on a phone it sits under the cards, one line each — never a table that scrolls sideways', async () => {
     ;(window as any).matchMedia = (q: string) => ({ matches: true, media: q, addEventListener: () => {}, removeEventListener: () => {} })
     try {
-      server.rolls['p-oak'] = roll([russ], { otherMoney: lines })
+      server.rolls['p-oak'] = roll([tamsin], { otherMoney: lines })
       await render()
       await until(() => !!host.querySelector('.pay-cards'), 'the cards')
       const folder = host.querySelector('[data-section="other-money"]')!
@@ -1110,7 +1110,7 @@ describe('10/21 (Nic): the stays under the sites', () => {
   }
 
   it('a card under the sites and above the register sales and pay links: a line per kind, how many stays, opening to its notes per site', async () => {
-    server.rolls['p-oak'] = roll([russ, vacant('RV 10', 'u10')], { stays: [nights, weeks], otherMoney: [otherLine] })
+    server.rolls['p-oak'] = roll([tamsin, vacant('RV 10', 'u10')], { stays: [nights, weeks], otherMoney: [otherLine] })
     await render()
     await loaded()
     // Under the sites, above the register's money — in that order on the page.
@@ -1136,7 +1136,7 @@ describe('10/21 (Nic): the stays under the sites', () => {
   })
 
   it('a line that does carry money (the Rent Roll page\'s, one card for both) shows it beside the label', async () => {
-    server.rolls['p-oak'] = roll([russ], { stays: [{ ...nights, paid: 1540 }] })
+    server.rolls['p-oak'] = roll([tamsin], { stays: [{ ...nights, paid: 1540 }] })
     await render()
     await loaded()
     const card = host.querySelector('[data-section="stays"]')!
@@ -1145,7 +1145,7 @@ describe('10/21 (Nic): the stays under the sites', () => {
   })
 
   it('no stays this month, no card', async () => {
-    server.rolls['p-oak'] = roll([russ], { stays: [] })
+    server.rolls['p-oak'] = roll([tamsin], { stays: [] })
     await render()
     await loaded()
     expect(host.querySelector('[data-section="stays"]')).toBeNull()
@@ -1154,13 +1154,13 @@ describe('10/21 (Nic): the stays under the sites', () => {
 
 describe('10/13 (Nic): "a \'Delinquent\' tag beside the name"', () => {
   it('a small red tag on the name\'s line, only on a delinquent household', async () => {
-    server.rolls['p-oak'] = roll([{ ...russ, delinquent: true }, glenda])
+    server.rolls['p-oak'] = roll([{ ...tamsin, delinquent: true }, glenda])
     await render()
     await loaded()
     const tag = rowOf('lease:L7')!.querySelector('.pay-tag.delinquent')!
     expect(tag.textContent).toBe('Delinquent')
     expect(tag.parentElement!.tagName).toBe('TD')
-    expect(tag.previousElementSibling!.textContent).toBe('Russ Fuller & Ann Fuller')
+    expect(tag.previousElementSibling!.textContent).toBe('Tamsin Wrenfield & Ann Wrenfield')
     expect(rowOf('lease:L2')!.querySelector('.pay-tag.delinquent')).toBeNull()
   })
 })
@@ -1219,7 +1219,7 @@ describe('10/13 (Nic), round 3: "Stay rows SHOW what\'s still owed"', () => {
   })
 
   it('the row\'s Owed is what is owed on the stay now, the day its pay link went out under it; its sum beside the stays\'', async () => {
-    server.rolls['p-oak'] = roll([owing(), russ], {
+    server.rolls['p-oak'] = roll([owing(), tamsin], {
       totals: { invoiced: 460, lateFees: 0, paid: 200, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 0, staysRefunded: 0,
                 staysOwed: 360, otherIn: 0, otherRefunded: 0, folderIn: 0, folderRefunded: 0 },
     })
@@ -1266,13 +1266,13 @@ describe('10/13 (Nic), round 3: "Stay rows SHOW what\'s still owed"', () => {
 })
 
 describe('10/13 (Nic), round 3: "Pay links / register sales that name a space go ON that space\'s row"', () => {
-  const andres = (over: Partial<OpenMonthOtherMoney> = {}): OpenMonthOtherMoney => ({
+  const cora = (over: Partial<OpenMonthOtherMoney> = {}): OpenMonthOtherMoney => ({
     id: 'sale27', saleId: 'sale27', kind: 'sale', day: '2026-10-06', amount: 752.17, methodLabel: 'Card · online',
-    forLabel: 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly · pay link', who: 'Andres Razo', ...over,
+    forLabel: 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly · pay link', who: 'Cora Castellan', ...over,
   })
   const rv27 = (): OpenMonthRow => ({
     ...vacant('RV 27', 'u27'),
-    otherMoney: [andres(), andres({ id: 'ref27', kind: 'refund', day: '2026-10-07', amount: 10, methodLabel: 'Cash', forLabel: 'Refund at the register · Electric' })],
+    otherMoney: [cora(), cora({ id: 'ref27', kind: 'refund', day: '2026-10-07', amount: 10, methodLabel: 'Cash', forLabel: 'Refund at the register · Electric' })],
     otherIn: 752.17, otherRefunded: 10,
   })
   const walkIn: OpenMonthOtherMoney = {
@@ -1281,7 +1281,7 @@ describe('10/13 (Nic), round 3: "Pay links / register sales that name a space go
   }
 
   it('an empty space a sale names says the money under Paid and how it came, and opens to its lines; the folder keeps the rest', async () => {
-    server.rolls['p-oak'] = roll([russ, rv27(), { ...glenda, otherMoney: [andres({ id: 'sale2', saleId: 'sale2', amount: 20, methodLabel: 'Cash', who: null, forLabel: 'Propane — rv02 · at the register' })], otherIn: 20 }], {
+    server.rolls['p-oak'] = roll([tamsin, rv27(), { ...glenda, otherMoney: [cora({ id: 'sale2', saleId: 'sale2', amount: 20, methodLabel: 'Cash', who: null, forLabel: 'Propane — rv02 · at the register' })], otherIn: 20 }], {
       otherMoney: [walkIn],
       totals: { invoiced: 920, lateFees: 0, paid: 660, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 0, staysRefunded: 0,
                 staysOwed: 0, otherIn: 796.09, otherRefunded: 10, folderIn: 23.92, folderRefunded: 0 },
@@ -1302,8 +1302,8 @@ describe('10/13 (Nic), round 3: "Pay links / register sales that name a space go
     // Still said to be Vacant, nothing billed — its money is no bill.
     expect(host.querySelector('tr.pay-detail [data-block="space-only"]')!.textContent).toBe('Vacant — nothing billed this month.')
     expect([...block.querySelectorAll('li.pay-other-line')].map(li => [li.getAttribute('data-line'), ...lineCells(li)])).toEqual([
-      ['sale', 'Oct 6', 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly · pay linkAndres Razo · Card · online', '$752.17'],
-      ['refund', 'Oct 7', 'Refund at the register · ElectricAndres Razo · Cash', '−$10.00'],
+      ['sale', 'Oct 6', 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly · pay linkCora Castellan · Card · online', '$752.17'],
+      ['refund', 'Oct 7', 'Refund at the register · ElectricCora Castellan · Cash', '−$10.00'],
     ])
     // Money already in: nothing to press, and nothing more is read.
     expect(block.querySelectorAll('button')).toHaveLength(0)
@@ -1311,8 +1311,8 @@ describe('10/13 (Nic), round 3: "Pay links / register sales that name a space go
   })
 
   it('a space whose only register money this month is a refund (its sale an earlier month\'s) says the refund, never "$0.00"', async () => {
-    const back = andres({ id: 'ref27', kind: 'refund', day: '2026-10-07', amount: 10, methodLabel: 'Cash', forLabel: 'Refund at the register · Electric' })
-    server.rolls['p-oak'] = roll([russ, { ...vacant('RV 27', 'u27'), otherMoney: [back], otherIn: 0, otherRefunded: 10 }])
+    const back = cora({ id: 'ref27', kind: 'refund', day: '2026-10-07', amount: 10, methodLabel: 'Cash', forLabel: 'Refund at the register · Electric' })
+    server.rolls['p-oak'] = roll([tamsin, { ...vacant('RV 27', 'u27'), otherMoney: [back], otherIn: 0, otherRefunded: 10 }])
     await render()
     await loaded()
     expect(cells('vacant:u27').slice(2, 7)).toEqual(['', '—$10.00 refunded', '', '—', 'Vacant'])
@@ -1330,7 +1330,7 @@ describe('10/13 (Nic), round 3: "Pay links / register sales that name a space go
   })
 })
 
-// 10/13 (Nic): "When Andres Razo paid by card online for his stay ... it looks
+// 10/13 (Nic): "When Cora Castellan paid by card online for his stay ... it looks
 // like that charge is just for electric. It's not. ... It's not clickable to
 // show an expanded breakdown. It shows electric per kilowatt hour, electric per
 // kilowatt hour, September, RV 27, RV site monthly pay link. It's not got a
@@ -1341,9 +1341,9 @@ describe('10/13 (Nic): a register sale or pay link opens to its breakdown', () =
   const part = (over: Partial<OpenMonthSalePart>): OpenMonthSalePart => ({
     kind: 'item', label: '', what: null, qty: null, unitPrice: null, unit: null, amount: 0, ...over,
   })
-  const andres: OpenMonthOtherMoney = {
+  const cora: OpenMonthOtherMoney = {
     id: 'ff58520a', saleId: 'ff58520a', kind: 'sale', day: '2026-10-06', amount: 752.17, methodLabel: 'Card · online',
-    forLabel: 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly · pay link', who: 'Andres Razo',
+    forLabel: 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly · pay link', who: 'Cora Castellan',
     parts: [
       part({ label: 'Electric (per kWh)', what: 'Electric bill-back', qty: 387, unitPrice: 0.21, unit: 'kWh', amount: 81.27 }),
       part({ label: 'Electric (per kWh) — September, RV 27', what: 'Electric bill-back', qty: 390, unitPrice: 0.21, unit: 'kWh', amount: 81.9 }),
@@ -1363,7 +1363,7 @@ describe('10/13 (Nic): a register sale or pay link opens to its breakdown', () =
     .map(tr => [tr.getAttribute('data-part'), ...[...tr.querySelectorAll('td')].map(td => td.textContent)])
 
   it('on its space\'s row: each part, what it is — the electric bill-backs apart from the site rent — and its own amount', async () => {
-    server.rolls['p-oak'] = roll([russ, { ...vacant('RV 27', 'u27'), otherMoney: [andres], otherIn: 752.17 }])
+    server.rolls['p-oak'] = roll([tamsin, { ...vacant('RV 27', 'u27'), otherMoney: [cora], otherIn: 752.17 }])
     await render()
     await loaded()
     await click(rowOf('vacant:u27'))
@@ -1371,7 +1371,7 @@ describe('10/13 (Nic): a register sale or pay link opens to its breakdown', () =
     const open = li.querySelector('button.pay-other-row')!
     expect(open.getAttribute('aria-expanded')).toBe('false')
     expect(lineCells(li)).toEqual([
-      'Oct 6', 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly · pay linkAndres Razo · Card · online', '$752.17',
+      'Oct 6', 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly · pay linkCora Castellan · Card · online', '$752.17',
     ])
     expect(li.querySelector('[data-block="sale-parts"]')).toBeNull()
     await click(open)
@@ -1395,7 +1395,7 @@ describe('10/13 (Nic): a register sale or pay link opens to its breakdown', () =
       id: 'ref1', saleId: '37fe8a03', kind: 'refund', day: '2026-10-07', amount: 5, methodLabel: 'Cash',
       forLabel: 'Refund at the register · Propane', who: null, parts: [], cardFee: 0,
     }
-    server.rolls['p-oak'] = roll([russ], { otherMoney: [propane, back] })
+    server.rolls['p-oak'] = roll([tamsin], { otherMoney: [propane, back] })
     await render()
     await loaded()
     const folder = host.querySelector('[data-section="other-money"]')!
@@ -1416,7 +1416,7 @@ describe('10/13 (Nic): a register sale or pay link opens to its breakdown', () =
   it('on a phone the breakdown opens inside the card', async () => {
     ;(window as any).matchMedia = (q: string) => ({ matches: true, media: q, addEventListener: () => {}, removeEventListener: () => {} })
     try {
-      server.rolls['p-oak'] = roll([{ ...vacant('RV 27', 'u27'), otherMoney: [andres], otherIn: 752.17 }])
+      server.rolls['p-oak'] = roll([{ ...vacant('RV 27', 'u27'), otherMoney: [cora], otherIn: 752.17 }])
       await render()
       await until(() => !!host.querySelector('.pay-cards'), 'the cards')
       const card = host.querySelector('.pay-card')!
@@ -1441,7 +1441,7 @@ describe('10/14 (Nic): "Moved out, still owes" under the month', () => {
   }
 
   it('a closed folder with who is in it and, with the sums, what they owe; opened, each space, who, when they left and what is owed', async () => {
-    server.rolls['p-oak'] = roll([russ], {
+    server.rolls['p-oak'] = roll([tamsin], {
       movedOutOwing: [moe, olaf],
       totals: { invoiced: 460, lateFees: 0, paid: 200, credit: 0, workTrade: 0, owed: 260, owedEarlier: 0, stays: 0, staysRefunded: 0,
                 staysOwed: 0, otherIn: 0, otherRefunded: 0, folderIn: 0, folderRefunded: 0, movedOutOwed: 855 },
@@ -1462,11 +1462,11 @@ describe('10/14 (Nic): "Moved out, still owes" under the month', () => {
   })
 
   it('without the sums, the folder still says who; nobody in it, no folder', async () => {
-    server.rolls['p-oak'] = roll([russ], { movedOutOwing: [olaf] })
+    server.rolls['p-oak'] = roll([tamsin], { movedOutOwing: [olaf] })
     await render()
     await loaded()
     expect(host.querySelector('[data-section="moved-out"] button.pay-other-head')!.textContent).toBe('▸Moved out, still owes1 stay guest')
-    server.rolls['p-oak'] = roll([russ])
+    server.rolls['p-oak'] = roll([tamsin])
     act(() => root.unmount())
     root = createRoot(host)
     await render()

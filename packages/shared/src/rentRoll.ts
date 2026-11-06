@@ -42,7 +42,7 @@
 // Late fees never decide it (10/12: "Late fees are never a bill and never
 // decide a month's color"); they are in Invoiced and Owed.
 // 10/25 (Nic): 'covered' — a month the WORK TRADE settled, not money. Lisa
-// Scheeler came in to make a trailer payment, read the green "Paid" against her
+// Brandt came in to make a trailer payment, read the green "Paid" against her
 // name on the financials page, and took it to mean her trailer payment was
 // already paid. It meant her RENT was covered by her hours. Nic: "I would just
 // make it say covered or something instead of paid." Still green — nothing is
@@ -220,7 +220,7 @@ export interface RentRollPayment {
   reference: string | null
   /**
    * 10/15 (Nic): a payment somebody typed in says who typed it and on what
-   * device — "Lisa Scheeler · Chrome on Windows (70.112.4.9)". Both null when
+   * device — "Carol Brandt · Chrome on Windows (70.112.4.9)". Both null when
    * GAM recorded it itself (a card, a bank payment, a bank match).
    */
   recordedBy?: string | null
@@ -411,7 +411,7 @@ export interface OpenMonthRow {
   stay: OpenMonthStay | null
   /**
    * 10/13 (Nic): "Pay links / register sales that name a space go ON that
-   * space's row" (Andres Razo's $752.17 electric pay link for RV 27 is RV 27's).
+   * space's row" (Diego Salas's $752.17 electric pay link for RV 27 is RV 27's).
    * Every register sale and pay link this month whose items or label name this
    * row's space — and what went back on one at the register this month — oldest
    * first, in the same lines the folder uses (OpenMonthRoll.otherMoney keeps
@@ -537,7 +537,7 @@ export interface OpenMonthOtherMoney {
   /** Who paid: the resident's or the customer's name; null — nobody named (a walk-in). */
   who: string | null
   /**
-   * 10/13 (Nic): "When Andres Razo paid by card online for his stay ... it
+   * 10/13 (Nic): "When Diego Salas paid by card online for his stay ... it
    * looks like that charge is just for electric ... It's not got a good
    * breakdown between what's a billback on the electricity and what is not."
    * A sale's breakdown, from its own line items: each part with its own amount

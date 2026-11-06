@@ -74,14 +74,14 @@ import {
   LEDGER_ACCOUNT_ROLE_BY_NAME, LEDGER_POSTING_KINDS, LEDGER_REPORT_CATEGORIES, LEDGER_CASH_EFFECTS,
   LEDGER_SOURCE_TYPES, LEDGER_OUTBOX_BOOKS_START, ledgerCentsToNumeric,
   type LedgerAccountRole, type LedgerSourceType, type LedgerPostingKind, type LedgerReportCategory,
-  type LedgerCashEffect, type LedgerMapKind, type LedgerSourceErrorReason,
+  type LedgerCashEffect, type LedgerMapKind, type LedgerSourceErrorReason, type LedgerWaitingOnCause,
 } from '@gam/shared'
 import { ledgerConnect, ledgerQuery } from '../db/ledgerPool'
 import { logger } from '../lib/logger'
 import { createAdminNotification } from './adminNotifications'
 import {
   type LedgerOwner, type LedgerOwnerContext, ownerIdOf, ownerColOf, ownerKeyOf, ownerFromRow, ownerLockText,
-  loadOwnerContext, maxIso, sameOwner, ISO_DAY, pinBooksTimezone, addDaysIso,
+  loadOwnerContext, maxIso, sameOwner, ISO_DAY, pinBooksTimezone, addDaysIso, booksStartFor,
 } from './ledgerOwner'
 import {
   ensureChart, readChart, resolveAccount, accountTakingOver, LedgerOwnerNotReadyError,
@@ -182,14 +182,33 @@ const ISO_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
 export class LedgerSourceError extends Error {
-  constructor(readonly reasonCode: LedgerSourceErrorReason, message: string) {
+  /**
+   * `waitingOn` (11/1) names WHICH unanswered question is holding this posting,
+   * when the reason is one of LEDGER_WAITING_ON_OWNER_REASONS. The reason code
+   * is two values covering six questions and the message interpolates loan
+   * names and dates, so this is the only thing a notice can group by.
+   */
+  constructor(
+    readonly reasonCode: LedgerSourceErrorReason,
+    message: string,
+    readonly waitingOn: LedgerWaitingOnCause | null = null,
+    /**
+     * 11/3 — WHICH property's unanswered question this is, when the question
+     * is per-property. The company's date is now the earliest of its
+     * properties', so it goes non-null the moment ANY property picks one:
+     * without this the drain's immediate retry would spin on a source whose
+     * own property still has no date. NULL means the question belongs to the
+     * company (a line that names no property), which is what it always meant.
+     */
+    readonly propertyId: string | null = null,
+  ) {
     super(message)
   }
 }
 
 function asSourceError(e: unknown, fallback: LedgerSourceErrorReason): LedgerSourceError {
   if (e instanceof LedgerSourceError) return e
-  if (e instanceof LedgerOwnerNotReadyError) return new LedgerSourceError('owner_not_ready', e.message)
+  if (e instanceof LedgerOwnerNotReadyError) return new LedgerSourceError('owner_not_ready', e.message, 'business_phase')
   const msg = e instanceof Error ? e.message : String(e)
   return new LedgerSourceError(fallback, msg)
 }
@@ -575,17 +594,60 @@ export async function postSource(sourceType: string, sourceId: string, opts: Pos
       let want = g.want
       if (want) {
         if (!ctx.exists) throw new LedgerSourceError('projector_error', `${sourceType} ${sourceId} names a company that does not exist`)
-        if (g.owner.businessId) throw new LedgerSourceError('owner_not_ready', 'A business\'s books post in a later phase.')
-        if (!ctx.booksStartDate) {
-          throw new LedgerSourceError('no_books_start', 'The company has no books start date yet; nothing posts until it picks one.')
+        if (g.owner.businessId) throw new LedgerSourceError('owner_not_ready', 'A business\'s books post in a later phase.', 'business_phase')
+        // ── 11/3: THE GATE IS PER LINE, NOT PER POSTING ─────────────────
+        // Nic, 11/2: "my books for that property are going to start from when
+        // I bought that property. Whether or not it's the same LLC is
+        // irrelevant. It's a completely separate business revenue stream."
+        //
+        // A posting carries ONE date; what differs per line is the day its
+        // property's books begin. Dropping one property's lines cannot
+        // unbalance what is left, because ledger_postings_balanced() groups by
+        // property_id with HAVING sum(debit) <> sum(credit) — every property's
+        // slice of a posting, and the no-property slice, already balances on
+        // its own. Checked against the live data before this was written: of
+        // 2,660 postings not one names two properties, and no per-property
+        // group is unbalanced or smaller than two lines.
+        const kept: DesiredLine[] = []
+        const heldBy = new Set<string>()
+        for (const l of want.lines) {
+          const start = booksStartFor(ctx, l.propertyId)
+          if (!start) {
+            throw new LedgerSourceError('no_books_start',
+              l.propertyId
+                ? 'This property has no books start date yet; nothing of its posts until one is picked.'
+                : 'The company has no books start date yet; nothing posts until it picks one.',
+              'books_start', l.propertyId ?? null)
+          }
+          if (want.intendedDate < start) heldBy.add(l.propertyId ?? '')
+          else kept.push(l)
         }
-        // Before the books start, the opening posting carries it (design J1).
-        if (want.intendedDate < ctx.booksStartDate) {
+        // Before a property's books start, that property's opening posting
+        // carries it (design J1). The opening's source_id is
+        // `landlordId|propertyId`, or the bare landlordId for lines that name
+        // no property — which is the company-level opening this file has
+        // always written.
+        const holdKeys = (): string[] =>
+          g.owner.landlordId
+            ? [...heldBy].map(pid => (pid === '' ? g.owner.landlordId! : `${g.owner.landlordId}|${pid}`))
+            : []
+        if (heldBy.size === 0) {
+          if (want.lines.length === 0) want = undefined
+        } else if (kept.length < 2) {
+          // Nothing started, or too little left to BE a posting: a posting has
+          // at least two lines, so a one-line remainder would be refused by
+          // the balance trigger. The whole thing goes to the opening instead
+          // of being written as a stub.
           want = undefined
           result.suppressed++
-          if (g.owner.landlordId) markOpening.add(g.owner.landlordId)
+          for (const k of holdKeys()) markOpening.add(k)
+        } else {
+          // Part of this posting is before one property's start and part is
+          // after. `suppressed` is deliberately NOT counted here: it means a
+          // whole posting the opening took over, and this posting still posts.
+          want = { ...want, lines: kept }
+          for (const k of holdKeys()) markOpening.add(k)
         }
-        else if (want.lines.length === 0) want = undefined
       }
       let lines: ResolvedLine[] | null = null
       let fingerprint: string | null = null
@@ -674,12 +736,21 @@ export async function postSource(sourceType: string, sourceId: string, opts: Pos
       if (wantsNothing && opts.outboxIds?.length && ownerHint && ISO_UUID.test(ownerHint)) {
         const has = await client.query<{ ok: boolean }>(
           `SELECT books_start_date IS NOT NULL AS ok FROM landlords WHERE id = $1`, [ownerHint])
+        // 11/3: the source wants nothing and never posted, so there is no line
+        // left to say which property's opening may still carry its old ones.
+        // The bare company key is enough — the drain fans it out to one key per
+        // property before it reads the queue, which is the single place that
+        // knows how to do that.
         if (has.rows[0]?.ok) markOpening.add(ownerHint)
       }
       if (markOpening.size) {
         await client.query(
+          // 11/3: split_part, not x::uuid — the source_id is now
+          // `landlordId|propertyId` for a property's own opening, and casting
+          // the whole string to uuid would throw on every one of them.
           `INSERT INTO ledger_outbox (source_type, source_id, owner_id)
-           SELECT 'opening', x, x::uuid FROM unnest($1::text[]) AS x`, [[...markOpening].sort()])
+           SELECT 'opening', x, split_part(x, '|', 1)::uuid FROM unnest($1::text[]) AS x`,
+          [[...markOpening].sort()])
       }
     }
 
@@ -736,17 +807,31 @@ async function recordSourceError(sourceType: string, sourceId: string, err: Ledg
       `SELECT attempts FROM ledger_source_errors WHERE source_type = $1 AND source_id = $2`, [sourceType, sourceId])
     const attempts = (prior[0]?.attempts ?? 0) + 1
     const rows = await ledgerQuery<{ attempts: number; noticed_at: string | null }>(
-      `INSERT INTO ledger_source_errors (source_type, source_id, owner_id, reason_code, attempts, last_error, next_try_at)
-       VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(mins => $7))
+      `INSERT INTO ledger_source_errors (source_type, source_id, owner_id, reason_code, attempts, last_error, next_try_at, waiting_on, property_id)
+       VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(mins => $7), $8, $9)
        ON CONFLICT (source_type, source_id) DO UPDATE
           SET owner_id = COALESCE(EXCLUDED.owner_id, ledger_source_errors.owner_id),
               reason_code = EXCLUDED.reason_code,
+              -- 11/3: taken from the new failure, not merged — a source that
+              -- cleared one property's question and hit another's must ask
+              -- about the one it is actually waiting on now.
+              property_id = EXCLUDED.property_id,
               attempts = ledger_source_errors.attempts + 1,
               last_error = EXCLUDED.last_error,
               last_failed_at = now(),
-              next_try_at = EXCLUDED.next_try_at
+              next_try_at = EXCLUDED.next_try_at,
+              -- 11/1: a source that starts failing for a DIFFERENT reason gets
+              -- the new cause, and its notice is owed again — the owner answered
+              -- one question and walked into the next, which is exactly what
+              -- happened at Country Acres (no books start, then the home-sale
+              -- method). Clearing noticed_at is what lets the next notice fire.
+              waiting_on = EXCLUDED.waiting_on,
+              noticed_at = CASE
+                WHEN ledger_source_errors.waiting_on IS DISTINCT FROM EXCLUDED.waiting_on THEN NULL
+                ELSE ledger_source_errors.noticed_at END
        RETURNING attempts, noticed_at`,
-      [sourceType, sourceId, ownerId, err.reasonCode, attempts, err.message.slice(0, 2000), backoffMinutes(attempts, err.reasonCode)])
+      [sourceType, sourceId, ownerId, err.reasonCode, attempts, err.message.slice(0, 2000),
+       backoffMinutes(attempts, err.reasonCode), err.waitingOn, err.propertyId])
     const row = rows[0]
     // Design §3: an admin hears about a source after its 3rd failed try. A
     // company with no books start date (or, P4, a method not chosen yet) is
@@ -813,8 +898,21 @@ export async function diffSource(client: PoolClient, sourceType: string, sourceI
     if (a) matched.add(a.id)
     const base = { sourceType, sourceId, ownerId: ownerIdOf(d.owner), postingKind: d.postingKind as string, activeFingerprint: a?.fingerprint ?? null }
     const ctx = await ctxOf(d.owner)
-    if (!ctx.booksStartDate) { out.push({ ...base, status: 'no_books_start' }); continue }
-    if (d.intendedDate < ctx.booksStartDate || d.lines.length === 0) {
+    // 11/3 — MIRRORS THE PER-LINE GATE ABOVE EXACTLY. If these two ever
+    // disagree the nightly parity check reports drift against postings the
+    // engine folded on purpose, which reads as missing money and is not.
+    const diffKept = d.lines.filter(l => {
+      const start = booksStartFor(ctx, l.propertyId)
+      return start !== null && d.intendedDate >= start
+    })
+    // Only a LINE whose property has not picked a day is "no books start",
+    // exactly as the gate decides it. A posting that wants no lines at all is
+    // not waiting on anybody — the gate produces nothing for it and says
+    // nothing, so saying `no_books_start` here would be the two disagreeing,
+    // which ledgerCheck turns into a nightly re-post and a notice each run.
+    const diffUnstarted = d.lines.some(l => booksStartFor(ctx, l.propertyId) === null)
+    if (diffUnstarted) { out.push({ ...base, status: 'no_books_start' }); continue }
+    if (diffKept.length < 2 || d.lines.length === 0) {
       out.push({ ...base, status: a ? 'stale' : 'equal', desiredFingerprint: null }); continue
     }
     let lines: ResolvedLine[] | null = null
@@ -822,7 +920,7 @@ export async function diffSource(client: PoolClient, sourceType: string, sourceI
     try {
       chart = charts.get(ownerKeyOf(d.owner))
       if (!chart) { chart = await readChart(client, d.owner); charts.set(ownerKeyOf(d.owner), chart) }
-      lines = await resolveLines(client, chart, d, true)
+      lines = await resolveLines(client, chart, { ...d, lines: diffKept }, true)
     } catch (e) {
       out.push({ ...base, status: 'error', message: e instanceof Error ? e.message : String(e) }); continue
     }
@@ -897,6 +995,32 @@ export async function drainLedgerOutbox(opts: {
     const started = Date.now()
     const maxMs = opts.maxMs ?? 50_000
     const limit = opts.limit ?? 500
+
+    // ── 11/3: FAN A COMPANY'S OPENING OUT TO ITS PROPERTIES ───────────────
+    // There is one opening posting per property now, plus the company's own,
+    // and TEN trigger functions plus a route queue an opening by the bare
+    // company id. Teaching each of them which property to name would be ten
+    // places to get right today and one more for every projector that later
+    // feeds the opening — and getting it wrong is silent: the row would name a
+    // key the projector does not answer to, nothing would fail, and the change
+    // would sit on the balance sheet unapplied.
+    //
+    // So it is done once, here, where the queue is read. An opening that has
+    // not changed posts nothing, so fanning out wider than strictly needed
+    // costs a no-op key per property and can never produce a wrong answer. The
+    // NOT EXISTS keeps a busy company from piling duplicates up within a pass.
+    await ledgerQuery(
+      `INSERT INTO ledger_outbox (source_type, source_id, owner_id)
+       SELECT DISTINCT 'opening', o.source_id || '|' || p.id::text, o.owner_id
+         FROM ledger_outbox o
+         JOIN properties p ON p.landlord_id = o.owner_id AND p.books_start_date IS NOT NULL
+        WHERE o.source_type = 'opening' AND o.source_id NOT LIKE '%|%'
+          AND ($1::uuid IS NULL OR o.owner_id = $1::uuid)
+          AND NOT EXISTS (
+                SELECT 1 FROM ledger_outbox q
+                 WHERE q.source_type = 'opening'
+                   AND q.source_id = o.source_id || '|' || p.id::text)`,
+      [opts.ownerId ?? null])
     const attempted = new Set<string>()
     for (;;) {
       if (Date.now() - started > maxMs) break
@@ -911,9 +1035,20 @@ export async function drainLedgerOutbox(opts: {
                   SELECT 1 FROM ledger_source_errors e
                    WHERE e.source_type = o.source_type AND e.source_id = o.source_id
                      AND e.next_try_at > now()
-                     -- a company that has since picked its books start date is retried at once
+                     -- Whoever has since picked their books start date is retried at
+                     -- once. 11/3: the PROPERTY named on the error, because the
+                     -- company's date is the earliest of its properties' and goes
+                     -- non-null as soon as any one property picks — asking the
+                     -- company would spin this source on every drain while its own
+                     -- property still has no date. An error that names no property
+                     -- asks the company, as it always did.
                      AND NOT (e.reason_code = 'no_books_start'
-                              AND EXISTS (SELECT 1 FROM landlords l WHERE l.id = e.owner_id AND l.books_start_date IS NOT NULL))))
+                              AND (CASE WHEN e.property_id IS NOT NULL
+                                        THEN EXISTS (SELECT 1 FROM properties p
+                                                      WHERE p.id = e.property_id AND p.books_start_date IS NOT NULL)
+                                        ELSE EXISTS (SELECT 1 FROM landlords l
+                                                      WHERE l.id = e.owner_id AND l.books_start_date IS NOT NULL)
+                                   END))))
           ORDER BY o.id
           LIMIT $5`,
         [types, opts.ownerId ?? null, opts.xid ?? null, !!opts.ignoreBackoff, limit, [...attempted]])
@@ -1042,7 +1177,16 @@ async function noticeStaleOutbox(types: string[]): Promise<void> {
         AND NOT EXISTS (SELECT 1 FROM ledger_source_errors e
                          WHERE e.source_type = o.source_type AND e.source_id = o.source_id
                            AND e.reason_code = ANY($2::text[]))
-        AND NOT EXISTS (SELECT 1 FROM landlords l WHERE l.id = o.owner_id AND l.books_start_date IS NULL)`,
+        -- Quiet while the owner still owes an answer: a company that has picked
+        -- no date at all, and (11/3) one that has picked for some properties but
+        -- not others, whose sources sit waiting rather than broken. This
+        -- deliberately over-suppresses — an outbox row does not say which
+        -- property it belongs to — because the alternative is an hourly false
+        -- alarm for as long as a new property's date goes unanswered, and an
+        -- alert people learn to ignore is worse than no alert. The owner-facing
+        -- signal is the 11/1 waiting-on notice, which names the question.
+        AND NOT EXISTS (SELECT 1 FROM landlords l WHERE l.id = o.owner_id AND l.books_start_date IS NULL)
+        AND NOT EXISTS (SELECT 1 FROM properties p WHERE p.landlord_id = o.owner_id AND p.books_start_date IS NULL)`,
     [types, LEDGER_WAITING_ON_OWNER_REASONS])
   const n = Number(r[0]?.n ?? 0)
   if (n === 0) return

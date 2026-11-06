@@ -11,7 +11,7 @@
  *   "they would be pro rated at the monthly divided by days of the month not
  *    the daily rate. just for rvs."
  *
- * The real case this was built for: Tyler Schroeder on RV 20 and Donavan Denny
+ * The real case this was built for: Evander Jolyon on RV 20 and Yarrow Yarborough
  * on RV 41, both month-to-month at $589 with rent due the 1st.
  */
 import { describe, it, expect } from 'vitest'
@@ -45,7 +45,7 @@ describe('the month they are actually in', () => {
 describe('what would have gone back', () => {
   const period = rentPeriodAround('2026-10-20', 1)
 
-  it('Donavan and Tyler: $589 in a 31-day month is $19.00 a night', () => {
+  it('Yarrow and Evander: $589 in a 31-day month is $19.00 a night', () => {
     const out = proratedUnusedRent({ monthlyRent: RENT, period, leftOn: '2026-10-20' })
     expect(out.daysInPeriod).toBe(31)
     expect(out.perDay).toBe(19)

@@ -334,7 +334,7 @@ function isAssignableRole(s: string): s is LandlordAssignableRole {
  * every permission change and every scope listing on the Team page inserted a
  * NULL landlord_id and died on the not-null constraint, surfacing as a raw
  * Postgres string rather than anything a person could act on. Found trying to
- * add Lisa Scheeler to the front desk: the whole Team page was dead.
+ * add Calla Fitzhugh to the front desk: the whole Team page was dead.
  *
  * Same fix as the eleven sites in background.ts, plus the S633 preference for
  * DERIVING over asking: a team member is scoped to a property, and the property
@@ -390,7 +390,7 @@ async function getLandlordIdFromReq(req: any): Promise<string> {
  *
  * Nic: "I don't see anywhere that shows my existing team." His account owns
  * Oak Park AND Mountain View; the roll-up resolved ONE company (the one the
- * account founded) and Lisa, on Mountain View's front desk, was under the
+ * account founded) and Calla, on Mountain View's front desk, was under the
  * other. A team member belongs to a property, the property to a company, and
  * the account to all of its companies — so the roster spans them all, and a
  * member is looked up by user id across them rather than under a guess.
@@ -493,7 +493,7 @@ async function getInviterName(landlordId: string): Promise<string> {
  *
  * This read LANDLORD_PORTAL_URL, which has never existed in any environment —
  * the variable is LANDLORD_APP_URL — so every team invitation ever sent pointed
- * at http://localhost:3001. Lisa Scheeler's did. Nic: "you keep sending links to
+ * at http://localhost:3001. Calla Fitzhugh's did. Nic: "you keep sending links to
  * localhost when that's not what we're doing."
  *
  * Resolved centrally now (lib/portalUrls), where a production boot with the

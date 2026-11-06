@@ -35,6 +35,7 @@ import type { PoolClient } from 'pg'
 import { AppError } from '../middleware/errorHandler'
 import { PM_PAYOUT_USER_SQL, noPmRecipientMessage } from './pmPayoutRecipient'
 import { logger } from '../lib/logger'
+import { todayIn } from '../lib/timezone'
 
 export type PaymentMethod = 'ach' | 'card'
 
@@ -739,7 +740,7 @@ async function billManagersUnpaidCut(client: PoolClient, landlordId: string, pro
     const { createMoneyOutExpense } = await import('./landlordExpenses')
     await createMoneyOutExpense(client, {
       landlordId, categoryKey: 'management', amount: owedCents / 100,
-      expenseDate: p?.day ?? new Date().toISOString().slice(0, 10), dueDate: null,
+      expenseDate: p?.day ?? todayIn(null), dueDate: null,
       description: `Management fee GAM held too little to pay${p?.name ? `: ${p.name}` : ''}`,
       vendor: p?.pm ?? null, propertyId, allocationSplitId: splitId,
     })

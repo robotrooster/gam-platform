@@ -86,7 +86,7 @@ const item = (id: string, amount: number, payerName: string, unitNumber: string,
 let host: HTMLDivElement
 let root: Root
 beforeEach(() => {
-  server.notOnSlip = [item('r1', 460, 'Kim Harland', 'APT 04'), item('r2', 37.6, 'Russ Fuller', 'RV 02'),
+  server.notOnSlip = [item('r1', 460, 'Yvette Bexley', 'APT 04'), item('r2', 37.6, 'Tamsin Wrenfield', 'RV 02'),
     item('s1', 12.5, '', '', 'register_sale')]
   server.onSlip = []; server.slips = []; server.waiting = []; server.gets = []; server.posts = []; server.fail = null
   server.slipsFail = false; server.hold = null; server.wire = null; server.toasts = []
@@ -144,13 +144,13 @@ async function type(el: HTMLInputElement | null, value: string) {
 describe('Make a bank deposit', () => {
   it('each payment in the bag is shown by name with an × that takes it out; Start over sends nothing', async () => {
     await open()
-    await tick('Kim Harland')
-    await tick('Russ Fuller')
+    await tick('Yvette Bexley')
+    await tick('Tamsin Wrenfield')
     await until(() => text().includes('$497.60'), 'the bag total')
-    const x = host.querySelector('button[aria-label="Take Russ Fuller · RV 02 out of the bag"]')
+    const x = host.querySelector('button[aria-label="Take Tamsin Wrenfield · RV 02 out of the bag"]')
     expect(x).toBeTruthy()
     await click(x!)
-    await until(() => text().includes('$460.00') && !text().includes('$497.60'), 'Russ out of the bag')
+    await until(() => text().includes('$460.00') && !text().includes('$497.60'), 'Tamsin out of the bag')
     await click(button(/^Start over$/))
     expect(host.querySelectorAll('.bankrec-bag-row')).toHaveLength(0)
     expect(server.posts).toHaveLength(0)
@@ -179,7 +179,7 @@ describe('Make a bank deposit', () => {
 
   it('the slip is sent with the payments ticked and the total the screen showed', async () => {
     await open()
-    await tick('Kim Harland')
+    await tick('Yvette Bexley')
     await tick('Register sale')
     await click(button(/Make the deposit slip/))
     await until(() => server.posts.length === 1, 'the slip sent')
@@ -189,17 +189,17 @@ describe('Make a bank deposit', () => {
 
   it('a 409 shows the server’s sentence once and the lists are fetched again in place', async () => {
     await open()
-    await tick('Kim Harland')
+    await tick('Yvette Bexley')
     const before = server.gets.length
     server.fail = {
       status: 409,
-      error: 'Kim Harland’s $460.00 is already on the 2026-10-02 deposit slip. Take it off that slip (void it) or leave it out of this one.',
+      error: 'Yvette Bexley’s $460.00 is already on the 2026-10-02 deposit slip. Take it off that slip (void it) or leave it out of this one.',
       then: () => { server.notOnSlip = server.notOnSlip.filter(i => i.id !== 'r1') },
     }
     await click(button(/Make the deposit slip/))
     await until(() => text().includes('already on the 2026-10-02 deposit slip'), 'the server’s sentence')
     expect(host.querySelectorAll('[role="alert"]')).toHaveLength(1)
-    const listed = () => [...host.querySelectorAll('label')].some(l => (l.textContent ?? '').includes('Kim Harland'))
+    const listed = () => [...host.querySelectorAll('label')].some(l => (l.textContent ?? '').includes('Yvette Bexley'))
     await until(() => server.gets.length > before && !listed(), 'the fresh list')
     expect(server.posts).toHaveLength(1)
     expect(text()).not.toMatch(/reload/i)
@@ -216,7 +216,7 @@ describe('Make a bank deposit', () => {
       status: 504, error: 'The server took too long to answer',
       then: () => {
         server.slips = [{ id: 'slipL', status: 'open', source: 'manual', depositDate: day, total: 40,
-          otherAmount: 40, otherNote: 'Laundry quarters', createdByName: 'Lisa', bankPostedDate: null,
+          otherAmount: 40, otherNote: 'Laundry quarters', createdByName: 'Calla', bankPostedDate: null,
           lastBankDay: null, overdue: false, flag: null, items: [] }]
       },
     }
@@ -232,7 +232,7 @@ describe('Make a bank deposit', () => {
 
   it('a slip that failed with nothing made keeps the form and says the reason once', async () => {
     await open()
-    await tick('Kim Harland')
+    await tick('Yvette Bexley')
     server.fail = { status: 504, error: 'The server took too long to answer' }
     await click(button(/Make the deposit slip/))
     await until(() => text().includes('The server took too long to answer.'), 'the reason')
@@ -245,7 +245,7 @@ describe('Make a bank deposit', () => {
   // without bank matching (the bank's own deposits stay the owner's).
   describe('on the Front Desk, without bank matching', () => {
     const waitingDeposit = { transactionId: 't1', amount: 497.6, postedDate: '2026-10-03', description: 'BRANCH DEPOSIT',
-      fittingSlipIds: [], proposal: { kind: 'one', note: 'Kim and Russ', total: 497.6, items: [] } }
+      fittingSlipIds: [], proposal: { kind: 'one', note: 'Yvette and Tamsin', total: 497.6, items: [] } }
 
     it('a staffer ticks what went in the bag and makes the slip; no bank deposit is ever shown or matched', async () => {
       server.waiting = [waitingDeposit]
@@ -253,7 +253,7 @@ describe('Make a bank deposit', () => {
       expect(text()).not.toContain("Bank deposits that may be the office's cash")
       expect(text()).not.toContain('BRANCH DEPOSIT')
       expect(server.gets).toEqual(['/bank-feed/deposits/undeposited', '/bank-feed/deposit-slips'])
-      await tick('Kim Harland')
+      await tick('Yvette Bexley')
       await click(button(/Make the deposit slip/))
       await until(() => server.posts.length === 1, 'the slip sent')
       expect(server.posts[0].url).toBe('/bank-feed/deposit-slips')
@@ -271,14 +271,14 @@ describe('Make a bank deposit', () => {
 
   it('a slip cannot be voided while another is being made, and nothing else starts while a void is in flight', async () => {
     server.slips = [{ id: 'slipA', status: 'open', source: 'manual', depositDate: '2026-10-01', total: 37.6,
-      otherAmount: 0, otherNote: null, createdByName: 'Lisa', bankPostedDate: null, lastBankDay: '2026-10-08',
+      otherAmount: 0, otherNote: null, createdByName: 'Calla', bankPostedDate: null, lastBankDay: '2026-10-08',
       overdue: false, flag: null, items: [] }]
     await open()
     await until(() => !!button(/^Void this slip$/), 'the open slip')
     expect(button(/^Void this slip$/)!.disabled).toBe(false)
     let release!: () => void
     server.hold = new Promise<void>(r => { release = r })
-    await tick('Kim Harland')
+    await tick('Yvette Bexley')
     await click(button(/Make the deposit slip/))
     await until(() => text().includes('Making the slip…'), 'the slip in flight')
     expect(button(/^Void this slip$/)!.disabled).toBe(true)
@@ -288,7 +288,7 @@ describe('Make a bank deposit', () => {
 
     // Now the void is the thing in flight: it locks itself and the slip maker.
     server.hold = new Promise<void>(r => { release = r })
-    await tick('Russ Fuller')
+    await tick('Tamsin Wrenfield')
     await click(button(/^Void this slip$/))
     await until(() => server.posts.some(p => p.url.includes('/slipA/void')), 'the void sent')
     expect(button(/^Void this slip$/)!.disabled).toBe(true)
@@ -304,13 +304,13 @@ describe('Make a bank deposit', () => {
       kind, id, amount, collected_on: '2026-10-02', method: 'money_order', payer_name: payer, unit_number: unit,
       property_name: 'Mountain View RV Ranch', slip_id: null, slip_deposit_date: null,
     })
-    server.notOnSlip = [row('r1', 460, 'Kim Harland', 'APT 04')]
+    server.notOnSlip = [row('r1', 460, 'Yvette Bexley', 'APT 04')]
     server.onSlip = []
     server.slips = [
       { id: 'slipA', status: 'open', source: 'manual', deposit_date: '2026-10-01', total: 37.6,
-        other_amount: 5, other_note: 'laundry quarters', created_by_name: 'Lisa Scheeler',
+        other_amount: 5, other_note: 'laundry quarters', created_by_name: 'Calla Fitzhugh',
         bank_posted_date: null, last_bank_day: '2026-10-08', overdue: false, flag: null,
-        items: [{ id: 'r2', kind: 'receipt', amount: 32.6, payer_name: 'Russ Fuller', unit_number: 'RV 02',
+        items: [{ id: 'r2', kind: 'receipt', amount: 32.6, payer_name: 'Tamsin Wrenfield', unit_number: 'RV 02',
           method: 'cash', collected_on: '2026-10-01' }] },
       { id: 'slipB', status: 'matched', source: 'inferred', deposit_date: '2026-09-28', total: 100,
         other_amount: 0, other_note: null, created_by_name: null, bank_posted_date: '2026-09-30',
@@ -320,11 +320,11 @@ describe('Make a bank deposit', () => {
       fitting_slip_ids: ['slipA'], proposal: null }]
     server.wire = (x: any) => camelCaseKeys(x)
     await open({ entityId: 'co1', canMatchBank: true })
-    await until(() => text().includes('Kim Harland · APT 04'), 'the cash list')
+    await until(() => text().includes('Yvette Bexley · APT 04'), 'the cash list')
     expect(text()).toContain('Money order · taken 2026-10-02')
-    expect(text()).toContain('made by Lisa Scheeler')
+    expect(text()).toContain('made by Calla Fitzhugh')
     expect(text()).toContain('the bank should show it by 2026-10-08')
-    expect(text()).toContain('Russ Fuller · RV 02 $32.60')
+    expect(text()).toContain('Tamsin Wrenfield · RV 02 $32.60')
     expect(text()).toContain('Other — laundry quarters $5.00')
     expect(text()).toContain('(bank 2026-09-30)')
     expect(text()).toContain('The 2026-10-01 slip ($37.60) fits this deposit.')
@@ -340,7 +340,7 @@ describe('Make a bank deposit', () => {
     expect(text().split('The slips already made could not be loaded').length - 1).toBe(1)
     // The server's reason, then the next step.
     expect(text()).toContain('The slips already made could not be loaded: The slip list query timed out. Refresh the page; if it keeps happening, tell GAM support.')
-    expect(text()).toContain('Kim Harland')
+    expect(text()).toContain('Yvette Bexley')
     expect(button(/Make the deposit slip/)).toBeTruthy()
   })
 
@@ -385,7 +385,7 @@ describe('Make a bank deposit', () => {
   it('a refused slip (403) says to sign in again, once, and the lists are read again', async () => {
     server.perms = { takePayment: true }
     await open({ canMatchBank: false })
-    await tick('Kim Harland')
+    await tick('Yvette Bexley')
     server.fail = { status: 403, error: 'Insufficient permissions' }
     await click(button(/Make the deposit slip/))
     await until(() => text().includes('Making a bank deposit is not open to you right now.'), 'the refusal')
@@ -396,8 +396,8 @@ describe('Make a bank deposit', () => {
   it('a slip refused for its own reason (403, a payment taken at a property they are not assigned to) says that reason, not the switch', async () => {
     server.perms = { takePayment: true }
     await open({ canMatchBank: false })
-    await tick('Kim Harland')
-    const said = 'Kim Harland\u2019s $460.00 was taken at a property you are not assigned to.'
+    await tick('Yvette Bexley')
+    const said = 'Yvette Bexley\u2019s $460.00 was taken at a property you are not assigned to.'
     server.fail = { status: 403, error: said }
     await click(button(/Make the deposit slip/))
     await until(() => text().includes(said), 'the server\u2019s reason')
@@ -419,7 +419,7 @@ describe('Make a bank deposit', () => {
   it('the cash list is read again when the panel is opened again: a payment recorded meanwhile is there to tick', async () => {
     const qc = portalClient()
     await open({ entityId: 'co1' }, qc)
-    await until(() => text().includes('Kim Harland'), 'the cash list')
+    await until(() => text().includes('Yvette Bexley'), 'the cash list')
     // Off to a resident's page to record a cash payment, then back.
     await act(async () => { root.render(<QueryClientProvider client={qc}><div>Resident</div></QueryClientProvider>) })
     server.notOnSlip = [...server.notOnSlip, item('r9', 120, 'Dana Ortiz', 'RV 11')]

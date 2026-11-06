@@ -7,7 +7,7 @@
  *   A month work trade covers in full is green. The 6th is late for rent due
  *   the 1st with 5 grace days. The onboarding month is good news only.
  *
- * Gerald Logue (Mountain View RV 48) is the case that started it: 25% on the
+ * Arlo Braddock (Mountain View RV 48) is the case that started it: 25% on the
  * Tenants list, 6% on his profile, 0% on his own screen. Under the one
  * definition he is 1 of 2 months, 50%.
  */
@@ -109,7 +109,8 @@ const monthOf = (ms: HouseholdMonth[], m: string) => ms.find(x => x.month === m)
 
 describe('judgeMonth (the stamp rule)', () => {
   const base = { chargedBaseC: 50000, workTradeBaseC: 0, owedBaseC: 0, baseInC: 50000, openPastGrace: false,
-    daysPastGraceOpen: 0, daysPastGracePaid: 0, onboarding: false, lateFeeOnBill: false }
+    daysPastGraceOpen: 0, daysPastGracePaid: 0, onboarding: false, lateFeeOnBill: false,
+    importedOnly: false }
   it('paid in full within grace is green and counted on time', () => {
     expect(judgeMonth(base)).toMatchObject({ stamp: 'paid_on_time', counted: true, onTime: true })
   })
@@ -176,7 +177,7 @@ describe('householdMonths — the onboarding month left out, and said', () => {
   })
 })
 
-describe('householdMonths — Gerald Logue (Mountain View RV 48)', () => {
+describe('householdMonths — Arlo Braddock (Mountain View RV 48)', () => {
   it('September (written 9/16, paid 9/17) is on time; October is outstanding; the $0 electric is ignored; 1 of 2 = 50%', async () => {
     const w = await world({ existingTenancy: true })
     // September: due 9/1, written 9/16, paid online 9/17 at 10:13.
@@ -254,6 +255,94 @@ describe('householdMonths — partial payments', () => {
   })
 })
 
+// ── 11/4 (Nic): THE REST OF A BILL SORTS AFTER THE SLICE IT CAME FROM ───────
+//
+//   "GAM shows Nathan September rent as 50 dollars. Something about the layout
+//    is off even if final number reconciled."
+//
+// A charge paid in part becomes two rows: the paid slice keeps the row and the
+// rest gets its own, written later. The lines came back created_at DESC, so the
+// REST led — MH 29's $450 rent read "Rent $50 / Rent $400" under the month, and
+// the first line is the one anybody reads as the rent.
+// ── 11/4 (Nic): A PRE-GAM ARREARS BALANCE IS MONEY, NOT JUST HISTORY ────────
+//
+// A charge brought in from another platform stays out of payment health —
+// "health starts with the first bill GAM wrote" (10/12) — but taking it out of
+// this query took it out of the MONEY too: MH 29's September arrears, $169.80
+// the landlord really is collecting, showed on his statement, on Outstanding
+// and at the desk and was invisible on the Rent Roll and the Payments page.
+describe('householdMonths — imported history that is still owed', () => {
+  it('shows a still-owed imported balance as money, and never counts its month', async () => {
+    const w = await world()
+    const [owed] = await bill(w, '2026-09-01', '2026-08-30 05:00', [
+      { type: 'rent', amount: 400, status: 'settled', method: 'cash', paidAt: '2026-09-02 10:00' },
+    ])
+    // The arrears row: a carried balance for a month before GAM, brought in.
+    const arrears = (await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date,
+                             entry_description, notes, import_source, imported_at)
+       VALUES ($1,$2,$3,$4,'carried_balance',169.80,'pending','2026-09-01','BALANCE',
+               'September 2026 — billed before this park was on GAM, never paid.','manual',NOW())
+       RETURNING id`, [w.unitId, w.leaseId, w.tenantId, w.landlordId])).rows[0].id
+
+    const [sep] = await months(w, '2026-09', '2026-09')
+    // The money is there: the imported balance is owed.
+    expect(sep.owed).toBe(169.8)
+    expect(sep.charged).toBe(569.8)
+    // and it is a line, so the Rent Roll and the Payments page show it
+    const lines = await householdLines({ landlordIds: [w.landlordId], from: '2026-09', through: '2026-09', asOf: AS_OF })
+    expect(lines.map(l => `${l.label} ${l.owed}`).sort()).toEqual(['Earlier balance 169.8', 'Rent 0'])
+
+    // A carried balance is not a base charge, so it moves no stamp: September
+    // is still judged on its $400 rent, paid on time, and counted.
+    expect(sep).toMatchObject({ stamp: 'paid_on_time', counted: true, on_time: true })
+
+    // A month whose every BASE charge is imported is never counted, good news
+    // or bad: there is no bill GAM wrote in it to judge.
+    await db.query(`UPDATE payments SET import_source = 'manual', imported_at = NOW() WHERE id = $1`, [owed])
+    await db.query(`UPDATE payments SET status = 'pending', settled_at = NULL, manual_method = NULL WHERE id = $1`, [owed])
+    const [sepImported] = await months(w, '2026-09', '2026-09')
+    expect(sepImported.counted).toBe(false)
+    expect(sepImported.owed).toBe(569.8)
+    expect(arrears).toBeTruthy()
+  })
+
+  it('a settled imported row stays history and is never a line (one dollar, one place)', async () => {
+    const w = await world()
+    await bill(w, '2026-09-01', '2026-08-30 05:00', [
+      { type: 'rent', amount: 400, status: 'settled', method: 'cash', paidAt: '2026-09-02 10:00' },
+    ])
+    await db.query(
+      `UPDATE payments SET import_source = 'buildium', imported_at = NOW() WHERE lease_id = $1`, [w.leaseId])
+    const lines = await householdLines({ landlordIds: [w.landlordId], from: '2026-09', through: '2026-09', asOf: AS_OF })
+    expect(lines).toEqual([])
+    expect(await months(w, '2026-09', '2026-09')).toEqual([])
+  })
+})
+
+describe('householdLines — a bill paid in part reads whole', () => {
+  it('lists the slice that was paid before the rest that is still owed', async () => {
+    const w = await world()
+    const [paid, rest] = await bill(w, '2026-09-01', '2026-08-30 05:00', [
+      { type: 'rent', amount: 400, status: 'settled', method: 'cash', paidAt: '2026-09-03 10:00',
+        notes: 'paid in part; $50.00 still owed' },
+      { type: 'rent', amount: 50, remainder: true, notes: 'What is left of this bill after a part payment' },
+    ])
+    // The rest is written when the part payment lands, days after the bill.
+    await db.query(
+      `UPDATE payments SET created_at = ('2026-09-03 10:00'::timestamp AT TIME ZONE $2) WHERE id = $1`, [rest, TZ])
+
+    const lines = await householdLines({ landlordIds: [w.landlordId], from: '2026-09', through: '2026-09', asOf: AS_OF })
+    const rents = lines.filter(l => l.type === 'rent')
+    expect(rents.map(l => l.payment_id)).toEqual([paid, rest])
+    expect(rents.map(l => `${l.label} ${l.charged} ${l.owed}`))
+      .toEqual(['Rent 400 0', 'Rent 50 50'])
+    // and the rest says what it is, with no pull paperwork after it
+    expect(rents[1].detail).toBe('What is left of this bill after a part payment')
+    expect(rents[0].detail).toBeNull()
+  })
+})
+
 describe('householdMonths — work trade', () => {
   it('a month work trade covers in full is green and counted on time; it is its own bucket, never paid or owed', async () => {
     const w = await world()
@@ -296,7 +385,7 @@ describe('householdMonths — work trade', () => {
     expect(oct).toMatchObject({ stamp: 'paid_on_time', days_past_grace: 0, paid: 125, owed: 0, work_trade: 335 })
   })
 
-  it('a charge work trade does not cover is judged normally (Curtis Clabough\'s water)', async () => {
+  it('a charge work trade does not cover is judged normally (Sage Stillwell\'s water)', async () => {
     const w = await world()
     await bill(w, '2026-10-01', '2026-09-30 05:00', [
       { type: 'rent', amount: 495, wtSuspended: true },

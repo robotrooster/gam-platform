@@ -92,7 +92,7 @@ async function rowsFor(propertyId: string) {
 async function chargesFor(landlordId: string) {
   return (await db.query<{ amount: string; source_type: string; notes: string | null }>(
     `SELECT amount::text, source_type, notes FROM landlord_gam_charges
-      WHERE landlord_id = $1 ORDER BY created_at, amount`, [landlordId])).rows
+      WHERE landlord_id = $1 ORDER BY created_at, landlord_gam_charges.amount`, [landlordId])).rows
 }
 
 const sum = (xs: { amount: string }[]) => Math.round(xs.reduce((n, x) => n + parseFloat(x.amount), 0) * 100) / 100

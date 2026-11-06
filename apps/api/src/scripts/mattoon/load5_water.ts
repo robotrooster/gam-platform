@@ -1,7 +1,7 @@
 /**
- * S651 — Mattoon load, stage 5: the water submeters and Blu's two reads.
+ * S651 — Mattoon load, stage 5: the water submeters and Hollis's two reads.
  *
- * Blu's sheet bills water as (current − prior) × $16.50, exactly, on every row
+ * Hollis's sheet bills water as (current − prior) × $16.50, exactly, on every row
  * that has usage — $572.55 across the park for the 7/28→8/26 cycle. Verified
  * to the cent on all ten rows that moved.
  *
@@ -109,7 +109,7 @@ async function main() {
            stuck && date === CYCLE_DATE
              ? 'No movement between 7/28 and 8/26 on an occupied home — meter not read, or stuck. Needs a walk-out read before this bills.'
              : null,
-           'Loaded from Blu Haws’ lot inspection sheet, 2026-09-20'])
+           'Loaded from Hollis Harkness’ lot inspection sheet, 2026-09-20'])
         reads++
       }
     }

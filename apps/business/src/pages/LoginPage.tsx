@@ -1,16 +1,58 @@
 import { useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { PasskeySignIn } from '../../../../packages/shared-ui/Passkeys'
+import { apiGet, apiPost, apiDelete } from '../lib/api'
+
+// ── THE CODE STEP MUST SURVIVE LEAVING THE PAGE (S639/S654, ported 10/30) ────
+//
+// Nic: "they go back out to get the two-factor authentication code, [and] it
+// boots them out." Nothing was ever signed in — the pending OTP session lived
+// in React state, so switching to the mail app let the phone browser discard
+// and reload the page, and it came back as the email/password form with the
+// code they are now holding useless. Every login hits this, because email 2FA
+// is on for every account.
+//
+// localStorage, not sessionStorage: sessionStorage is PER TAB, and somebody who
+// reads the code in their mail app and returns through a link lands in a NEW
+// tab with no pending session. The stored token is PRE-auth, useless without
+// the emailed code, and expires in 15 minutes — the same trust level as the
+// page holding it in memory. Cleared the moment the code is accepted.
+//
+// The tenant portal has the canonical copy of this (usePendingOtpSession in
+// apps/tenant/src/main.tsx); POS, business, admin and admin-ops never got it.
+function usePendingOtpSession(key: string): [string | null, (v: string | null) => void] {
+  const [v, setV] = useState<string | null>(() => {
+    try { return localStorage.getItem(key) ?? sessionStorage.getItem(key) } catch { return null }
+  })
+  const set = (next: string | null) => {
+    setV(next)
+    try {
+      if (next) localStorage.setItem(key, next)
+      else { localStorage.removeItem(key); sessionStorage.removeItem(key) }
+    } catch { /* private mode — behaves exactly as before */ }
+  }
+  return [v, set]
+}
+
+// 10/30 (Nic): "a passkey replaces the emailed code." The shared component
+// speaks this portal's own client — apiPost hands back the whole envelope and
+// the component wants the payload.
+const passkeyApi = {
+  get:  (url: string) => apiGet(url),
+  post: (url: string, body?: any) => apiPost(url, body).then((r: any) => r.data),
+  del:  (url: string) => apiDelete(url),
+}
 
 export function LoginPage() {
-  const { login, loginWithEmailOtp, resendEmailOtp } = useAuth()
+  const { login, loginWithEmailOtp, resendEmailOtp, loginWithPasskey } = useAuth()
   const navigate = useNavigate()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [err, setErr] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
   // S578: mandatory email-2FA (business_owner) — the emailed-code second step.
-  const [emailOtpSession, setEmailOtpSession] = useState<string | null>(null)
+  const [emailOtpSession, setEmailOtpSession] = usePendingOtpSession('gam.otp.business.login')
   const [code, setCode] = useState('')
   const [resent, setResent] = useState(false)
 
@@ -87,10 +129,16 @@ export function LoginPage() {
           marginTop: 2, marginBottom: 24,
         }}>for Businesses</div>
 
+        {/* 10/30 (Nic): Face ID alone signs you in. Renders nothing on a device
+            with no sensor, so the password form below is exactly what it has
+            always been for everybody else. */}
+        <PasskeySignIn api={passkeyApi} onSignedIn={async s => { await loginWithPasskey(s); navigate('/dashboard') }} />
+
         <label style={labelStyle}>Email</label>
         <input
           value={email} onChange={e => setEmail(e.target.value)}
           type="email" required
+          autoComplete="username webauthn" name="email"
           style={inputStyle}
         />
 

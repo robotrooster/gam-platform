@@ -1,0 +1,33 @@
+-- 10/27 — UNDOING A DUPLICATE I SHOULD NOT HAVE BUILT.
+--
+-- 20261028070000 added `reference_documents` + `reference_document_properties`
+-- for the "Documents tab has no upload button" item in LAUNCH.md § 2c, raised
+-- in S624. That note is STALE: the feature was built in S641 and the whole of
+-- what Nic asked for on 10/27 already works.
+--
+-- What already exists, and what I nearly shipped a second copy of:
+--   * `documents.is_reference` — paper nobody signs, which is the distinction
+--     the S624 note said was missing.
+--   * `documents.property_id` + the `document_properties` join table — a
+--     document shown at several properties.
+--   * routes/documents.ts, whose list already resolves exactly the rule he
+--     restated on 10/27: the named property, OR any property in
+--     document_properties, OR nothing named at all, which means the whole
+--     company and shows everywhere.
+--   * DocumentsPage.tsx, with an "Upload Document" button behind the
+--     `documents.upload` permission.
+--
+-- So two filing cabinets would have existed, each holding half the landlord's
+-- notices, and the Documents tab would have shown one of them.
+--
+-- CLAUDE.md's recon-first rule says this out loud — "The handoff describes
+-- intent; the code describes reality. When they disagree, the code wins" — and
+-- I read the backlog note instead of the code. The lesson is cheap here only
+-- because both tables are empty.
+--
+-- SAFE: neither table ever held a row (created and dropped the same night, with
+-- no production code path between), and nothing references them — the router
+-- and its tests are deleted in the same change.
+
+DROP TABLE IF EXISTS public.reference_document_properties;
+DROP TABLE IF EXISTS public.reference_documents;

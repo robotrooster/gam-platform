@@ -271,7 +271,7 @@ describe('GET /api/home-sales/unit/:unitId — tenant scoping', () => {
  * 10/25: AN INSTALLMENT BILLS WHEN ITS OWN DATE ARRIVES.
  *
  * The biller compared each installment's date against the FIRST of the month,
- * which quietly assumed every schedule falls on the 1st. Lisa Scheeler's falls
+ * which quietly assumed every schedule falls on the 1st. Calla Fitzhugh's falls
  * on the 10th ("it's monthly on the 10th of the month"), so 2026-10-10 was not
  * <= 2026-10-01 and her October payment would not have billed until November —
  * and November's not until December, for the whole 34-payment contract.
@@ -463,7 +463,7 @@ describe('purchase agreement gates the billing', () => {
 })
 
 /**
- * S654 (Nic, Shane Rueff at Country Acres MH 11): "if he signs today and the
+ * S654 (Nic, Xenia Cholmondeley at Country Acres MH 11): "if he signs today and the
  * bill was generated yesterday, that $150 needs to go on this month's bill as
  * well after he signs." Signing after the month's bill went out puts the
  * installment already due onto that open bill — not two at once next month.

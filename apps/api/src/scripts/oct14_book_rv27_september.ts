@@ -1,8 +1,8 @@
 /**
- * 10/14 (Nic) — Andres Razo's month at Mountain View RV 27 goes on the
+ * 10/14 (Nic) — Cora Castellan's month at Mountain View RV 27 goes on the
  * schedule for September, when he was there.
  *
- *   "RV 27 / Andres Razo's month of site rent by pay link: book the stay for
+ *   "RV 27 / Cora Castellan's month of site rent by pay link: book the stay for
  *    when he was actually there, September ('make sure its when we was
  *    actually here not when he finally paid. he was here september')."
  *
@@ -14,7 +14,7 @@
  * stay item buys one month: Sep 1 → Oct 1, 30 nights; --check-in=YYYY-MM-DD
  * moves the arrival) — and ties that money to it:
  *
- *   1. unit_bookings: RV 27, Andres Razo (his pay link's email; his resident
+ *   1. unit_bookings: RV 27, Cora Castellan (his pay link's email; his resident
  *      record when exactly one has that email), checked out, a month stay
  *      ('month_to_month', no lease — stay_terms 'stay'), its price the $589.00
  *      the line charged, paid in full the moment his pay link was paid
@@ -71,7 +71,7 @@ export const RV27 = {
   landlordId: '96ec7df3-362d-4777-b54c-e9604313820f',
   propertyId: 'dcccb7b8-7ac9-4ec2-b3ff-40bde536df01',
   unitNumber: 'RV 27',
-  payer: 'Andres Razo',
+  payer: 'Cora Castellan',
   checkIn: '2026-09-01',
 } as const
 export type Rv27Target = { landlordId: string; propertyId: string; unitNumber: string; payer: string; checkIn: string }

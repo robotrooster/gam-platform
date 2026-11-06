@@ -119,7 +119,7 @@ describe('draftLeaseFromApplication', () => {
   // and every drafted lease starts month to month with no end date." The number
   // an applicant types on the form is their guess before they have seen the
   // place; it is kept on the application and asked about later, never turned
-  // into a binding end date the landlord never chose. (James Fenton said "3
+  // into a binding end date the landlord never chose. (Juno Kendrew said "3
   // months" through the screening door and got a lease ending 2027-01-31 on RV
   // 15 — the park's busiest month — which nothing on the lease screen said.)
   it('drafts month-to-month even when a term was named, and keeps the move-in they asked for', async () => {

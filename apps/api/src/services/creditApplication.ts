@@ -16,7 +16,7 @@
  *
  * This file used to spend credit itself: it settled whatever open charges a
  * credit could fully cover, oldest first, and lowered amount_remaining by hand.
- * That is how Kim Harland's $450 Move In Special was chopped into a water row,
+ * That is how Yvette Bexley's $450 Move In Special was chopped into a water row,
  * a trash row and five late fees, and how a landlord's write-off showed as
  * collected rent. Every spend now goes through the credit ledger
  * (services/creditUse), and the only automatic spend is the whole-bill rule.

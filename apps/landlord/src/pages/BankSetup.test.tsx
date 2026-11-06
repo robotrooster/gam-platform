@@ -8,7 +8,7 @@
  * fucking signups. It should all be in one flow." Then: "Merge it all so it's
  * one flow for any other landlords that onboard."
  *
- * Blu Haws went to the Disbursement Account page on 10/5 — one of two nav
+ * Hollis Harkness went to the Disbursement Account page on 10/5 — one of two nav
  * entries three letters apart — found the old pre-Stripe "Add Bank Account"
  * form, typed in his First Mid routing and account number, and waited for
  * microdeposits that could never come. His company had no Stripe account at
@@ -20,7 +20,7 @@
  *   - Step 2 names the bank from step 1 instead of asking for it again.
  *   - Step 2 is offered even when step 1 is not done — no gate, nobody stranded.
  *   - The old /banking address still resolves there, with its ?entity= intact.
- *   - A landlord whose property onboarding window expired weeks ago (Blu's
+ *   - A landlord whose property onboarding window expired weeks ago (Hollis's
  *     exact state) still reaches both steps, neither hidden nor disabled.
  *
  * 10/12 (Nic): "Remove the old form." Kept from the previous pass: the pages
@@ -40,7 +40,7 @@ const server = vi.hoisted(() => ({
   gets: [] as string[],
   posts: [] as string[],
   user: { id: 'u1', role: 'landlord', profileId: 'L1', permissions: {} } as any,
-  entities: [{ id: 'L1', businessName: 'TruBlu Management LLC', isOwner: true, connectPayoutsEnabled: false, propertyCount: 1 }] as any[],
+  entities: [{ id: 'L1', businessName: 'TruHollis Management LLC', isOwner: true, connectPayoutsEnabled: false, propertyCount: 1 }] as any[],
   status: { connectAccountId: null, exists: false } as any,
   // 10/12: per-company Stripe status, keyed by entityId (falls back to `status`).
   statusByEntity: null as Record<string, any> | null,
@@ -73,7 +73,7 @@ vi.mock('../lib/api', () => ({
     // page WOULD show it — the assertions below catch the request itself.
     if (url === '/bank-accounts') {
       return [{ id: 'ba1', nickname: 'TBM First Mid', accountType: 'checking',
-                accountHolderType: 'business', accountHolderName: 'TruBlu',
+                accountHolderType: 'business', accountHolderName: 'TruHollis',
                 accountNumberLast4: '8944', status: 'active' }]
     }
     return []
@@ -117,7 +117,7 @@ beforeEach(() => {
   server.gets = []
   server.posts = []
   server.user = { id: 'u1', role: 'landlord', profileId: 'L1', permissions: {} }
-  server.entities = [{ id: 'L1', businessName: 'TruBlu Management LLC', isOwner: true, connectPayoutsEnabled: false, propertyCount: 1 }]
+  server.entities = [{ id: 'L1', businessName: 'TruHollis Management LLC', isOwner: true, connectPayoutsEnabled: false, propertyCount: 1 }]
   server.status = { connectAccountId: null, exists: false }
   server.statusByEntity = null
   server.feed = []
@@ -155,7 +155,7 @@ const btn = (re: RegExp) =>
 // ── the merged destination ──────────────────────────────────────────────────
 
 const OAK_PARK = { id: 'OP', businessName: 'Oak Park Motel and RV LLC', isOwner: true, connectPayoutsEnabled: true, propertyCount: 1 }
-const TRUBLU   = { id: 'TB', businessName: 'TruBlu Management LLC', isOwner: true, connectPayoutsEnabled: false, propertyCount: 1 }
+const TRUBLU   = { id: 'TB', businessName: 'TruHollis Management LLC', isOwner: true, connectPayoutsEnabled: false, propertyCount: 1 }
 const LIVE     = { connectAccountId: 'acct_1', exists: true, payoutsEnabled: true, detailsSubmitted: true,
                    payoutBank: { bankName: 'First Mid Bank', last4: '8944' } }
 // A hand-linked bank as the API really answers for one: debit_ready is a field
@@ -234,11 +234,11 @@ describe('Bank setup — one destination, two steps', () => {
     expect(btn(/Connect account for payouts/)).toBeUndefined()
   })
 
-  // 10/19: Blu's exact state. TruBlu Management LLC owns Country Acres -
+  // 10/19: Hollis's exact state. TruHollis Management LLC owns Country Acres -
   // Mattoon, whose onboarding window closed 9/11; he also owns Oak Park, which
   // is paid. He came back on 10/5, weeks after the window.
-  it("an expired onboarding window hides and disables nothing — Blu's state", async () => {
-    server.user = { id: 'blu', role: 'landlord', profileId: 'OP', permissions: {} }
+  it("an expired onboarding window hides and disables nothing — Hollis's state", async () => {
+    server.user = { id: 'hollis', role: 'landlord', profileId: 'OP', permissions: {} }
     server.entities = [OAK_PARK, TRUBLU]
     server.statusByEntity = { OP: LIVE, TB: { connectAccountId: null, exists: false } }
     await render(<BankPage />, '/bank')
@@ -265,7 +265,7 @@ describe('Bank setup — one destination, two steps', () => {
   // feed until payouts existed so nobody linked the read-only feed believing
   // they had set up payouts; the order and the labels do that job now, and
   // hiding it would strand somebody who came back weeks later — which is
-  // exactly what happened to Blu.
+  // exactly what happened to Hollis.
   it('offers step 2 even with step 1 untouched', async () => {
     await render(<BankPage />, '/bank?tab=setup')
     const feed = btn(/Connect feed/)
@@ -280,7 +280,7 @@ describe('Bank setup — one destination, two steps', () => {
   // told the Country Acres owner "you're all set" about Oak Park.
   it('with no single company to land on, chooses none and claims nothing', async () => {
     const SECOND = { id: 'MV', businessName: 'Mountain View LLC', isOwner: true, connectPayoutsEnabled: false, propertyCount: 2 }
-    server.user = { id: 'blu', role: 'landlord', profileId: 'OP', permissions: {} }
+    server.user = { id: 'hollis', role: 'landlord', profileId: 'OP', permissions: {} }
     server.entities = [OAK_PARK, TRUBLU, SECOND]
     server.statusByEntity = { OP: LIVE, TB: { connectAccountId: null, exists: false }, MV: { connectAccountId: null, exists: false } }
     await render(<BankPage />, '/bank?tab=setup')
@@ -288,7 +288,7 @@ describe('Bank setup — one destination, two steps', () => {
     expect(text()).toContain('Choose the company above')
     expect(text()).not.toContain("You're all set")
     expect(text()).not.toContain('Bank setup is complete.')
-    expect(text()).toContain("TruBlu Management LLC, Mountain View LLC can't be paid yet.")
+    expect(text()).toContain("TruHollis Management LLC, Mountain View LLC can't be paid yet.")
     // No half-pressable step either: with no company named there is nothing for
     // a button to act on, so neither is offered (S637 — "the adding a bank
     // button does nothing right now").
@@ -299,14 +299,14 @@ describe('Bank setup — one destination, two steps', () => {
 
   it('a to-do link opens the company it names', async () => {
     const SECOND = { id: 'MV', businessName: 'Mountain View LLC', isOwner: true, connectPayoutsEnabled: false, propertyCount: 2 }
-    server.user = { id: 'blu', role: 'landlord', profileId: 'OP', permissions: {} }
+    server.user = { id: 'hollis', role: 'landlord', profileId: 'OP', permissions: {} }
     server.entities = [OAK_PARK, TRUBLU, SECOND]
     server.statusByEntity = { OP: LIVE, TB: { connectAccountId: null, exists: false }, MV: { connectAccountId: null, exists: false } }
     await render(<BankPage />, '/bank?tab=setup&entity=MV')
     expect(server.gets).toContain('/stripe/connect/status?entity=landlord&entityId=MV')
     expect(stepDone(1)).toBe(false)
     // The other unpaid company is still named while this one is on screen.
-    expect(text()).toContain("TruBlu Management LLC can't be paid yet.")
+    expect(text()).toContain("TruHollis Management LLC can't be paid yet.")
   })
 
   it('a finished landlord still lands on the bank feed, their daily page', async () => {
@@ -428,7 +428,7 @@ describe('one bank link — onboarded from today on', () => {
 })
 
 describe('one bank link — onboarded before the switch', () => {
-  // Blu Haws finished step one at 18:24 on 10/19, before the switch. His link
+  // Hollis Harkness finished step one at 18:24 on 10/19, before the switch. His link
   // carries payment_method only — verified against live Stripe on 10/20
   // (fca_1USLR9…, permissions ["payment_method"]) — and Stripe fixes
   // permissions at link time, so it can never be read for transactions. He
@@ -477,7 +477,7 @@ describe('one bank link — onboarded before the switch', () => {
 })
 
 // 10/19: /banking was the Disbursement Account page. A landlord may have it
-// bookmarked — Blu does — and the owner to-do list links it with ?entity=.
+// bookmarked — Hollis does — and the owner to-do list links it with ?entity=.
 describe('the old /banking address', () => {
   function Probe() {
     const loc = useLocation()
@@ -570,17 +570,17 @@ describe('a GAM admin looking in', () => {
   })
 })
 
-// 10/19 (review): Blu one step from now. He finishes step 1 for TruBlu today;
+// 10/19 (review): Hollis one step from now. He finishes step 1 for TruHollis today;
 // tomorrow both his companies are paid, so the payouts rule picks no company,
 // so nothing was "known", so no banner rendered on any tab and the page opened
-// on the feed — with TruBlu's read-only feed still missing and no screen saying
+// on the feed — with TruHollis's read-only feed still missing and no screen saying
 // so. The exact silence that cost him 10/5, one step later.
 describe('two companies, payouts live on both, one feed missing', () => {
   const OP_PAID = { ...OAK_PARK, connectPayoutsEnabled: true }
   const TB_PAID = { ...TRUBLU, connectPayoutsEnabled: true }
 
   it('lands on Bank setup and names the company that still needs it', async () => {
-    server.user = { id: 'blu', role: 'landlord', profileId: 'OP', permissions: {} }
+    server.user = { id: 'hollis', role: 'landlord', profileId: 'OP', permissions: {} }
     server.entities = [OP_PAID, TB_PAID]
     server.statusByEntity = { OP: LIVE, TB: { ...LIVE, payoutBank: null } }
     server.feedByEntity = { OP: LINKED, TB: [] }
@@ -595,7 +595,7 @@ describe('two companies, payouts live on both, one feed missing', () => {
   })
 
   it('says so on the other tabs too, and names the company', async () => {
-    server.user = { id: 'blu', role: 'landlord', profileId: 'OP', permissions: {} }
+    server.user = { id: 'hollis', role: 'landlord', profileId: 'OP', permissions: {} }
     // Three companies, two unfinished: no single company to land on, which is
     // the case that used to render nothing at all.
     server.entities = [OP_PAID, TB_PAID, { id: 'MV', businessName: 'Mountain View LLC', isOwner: true, connectPayoutsEnabled: true, propertyCount: 2 }]
@@ -603,7 +603,7 @@ describe('two companies, payouts live on both, one feed missing', () => {
     server.feedByEntity = { OP: LINKED, TB: [], MV: [] }
     await render(<BankPage />, '/bank?tab=feed')
     expect(text()).toContain("Your bank setup isn't finished.")
-    expect(text()).toContain('TruBlu Management LLC, Mountain View LLC still need it.')
+    expect(text()).toContain('TruHollis Management LLC, Mountain View LLC still need it.')
     expect(btn(/Finish bank setup/)).toBeTruthy()
   })
 
@@ -650,7 +650,7 @@ describe('waiting on Stripe', () => {
 // company", about a question that tab never asked. S637's complaint verbatim.
 describe('the Bank feed tab with no company chosen', () => {
   it('offers no Connect feed, and says to choose one', async () => {
-    server.user = { id: 'blu', role: 'landlord', profileId: 'OP', permissions: {} }
+    server.user = { id: 'hollis', role: 'landlord', profileId: 'OP', permissions: {} }
     server.entities = [OAK_PARK, TRUBLU]
     server.statusByEntity = { OP: LIVE, TB: { connectAccountId: null, exists: false } }
     await render(<BankPage />, '/bank?tab=feed')
@@ -675,7 +675,7 @@ describe('the chosen tab survives a refresh', () => {
   })
 })
 
-// 10/12 (Nic): "Remove the old form." The form Blu typed his First Mid routing
+// 10/12 (Nic): "Remove the old form." The form Hollis typed his First Mid routing
 // and account number into on 10/5. It reached nothing, and nothing like it may
 // come back anywhere in the portal.
 describe('no routing-number entry form, anywhere in the landlord app', () => {
@@ -777,7 +777,7 @@ describe('onboarding', () => {
   // two or more — it returns 400. So the list came back empty forever: the
   // landlord pressed Connect feed, signed in at their bank, the link was really
   // created, and the wizard still said Not done with Continue greyed out and
-  // Sign Agreement locked. Blu has owned two companies since 8/31.
+  // Sign Agreement locked. Hollis has owned two companies since 8/31.
   it('asks for the bank feed BY COMPANY, never with the company left off', async () => {
     await render(<OnboardingPage />)
     expect(server.gets).toContain('/bank-feed/connections?entityId=L1')
@@ -790,17 +790,17 @@ describe('onboarding', () => {
   // screen with an instruction that could not be followed and no way off it.
   describe('step 4 with several companies and none chosen', () => {
     const drive = async () => {
-      server.user = { id: 'blu', role: 'landlord', profileId: null, permissions: {} }
+      server.user = { id: 'hollis', role: 'landlord', profileId: null, permissions: {} }
       // Both paid, so step 3's Continue opens without choosing a company —
       // which is exactly how somebody reached step 4 with no company named.
       server.entities = [
         { id: 'OP', businessName: 'Oak Park Motel and RV LLC', isOwner: true, connectPayoutsEnabled: true, propertyCount: 1 },
-        { id: 'TB', businessName: 'TruBlu Management LLC', isOwner: true, connectPayoutsEnabled: true, propertyCount: 1 },
+        { id: 'TB', businessName: 'TruHollis Management LLC', isOwner: true, connectPayoutsEnabled: true, propertyCount: 1 },
       ]
       server.properties = [{ id: 'p1', name: 'Country Acres - Mattoon' }]
       server.units = [{ id: 'u1', unitNumber: '1' }]
       await render(<OnboardingPage />)
-      await fill([['Smith Properties LLC', 'TruBlu Management LLC'], ['(555) 000-0000', '2175551234']])
+      await fill([['Smith Properties LLC', 'TruHollis Management LLC'], ['(555) 000-0000', '2175551234']])
       await next()                                   // → First Property
       await fill([
         ['Oak Street Apartments', 'Country Acres - Mattoon'],
@@ -818,7 +818,7 @@ describe('onboarding', () => {
       await drive()
       expect(text()).toContain('Choose the company above to link its bank read-only.')
       const picker = [...host.querySelectorAll('select')]
-        .find(s => [...s.options].some(o => o.textContent?.includes('TruBlu Management LLC')))
+        .find(s => [...s.options].some(o => o.textContent?.includes('TruHollis Management LLC')))
       expect(picker, 'a company picker is on the step').toBeTruthy()
       expect(text()).toContain('Bank setup for')
     })
@@ -842,21 +842,21 @@ describe('onboarding', () => {
 // hid it from the owner of Country Acres, whose company has no Stripe account.
 describe('Properties banner', () => {
   it('names the company with a property that can\'t be paid, even when another is paid', async () => {
-    server.user = { id: 'blu', role: 'landlord', profileId: 'OP', permissions: {} }
+    server.user = { id: 'hollis', role: 'landlord', profileId: 'OP', permissions: {} }
     server.entities = [
       { id: 'OP', businessName: 'Oak Park Motel and RV LLC', isOwner: false, connectPayoutsEnabled: true, propertyCount: 1 },
-      { id: 'TB', businessName: 'TruBlu Management LLC', isOwner: true, connectPayoutsEnabled: false, propertyCount: 1 },
+      { id: 'TB', businessName: 'TruHollis Management LLC', isOwner: true, connectPayoutsEnabled: false, propertyCount: 1 },
     ]
     server.status = { connectAccountId: 'acct_op', exists: true, payoutsEnabled: true, detailsSubmitted: true }
     await render(<PropertiesPage />)
-    expect(text()).toContain('Payouts not set up for TruBlu Management LLC')
+    expect(text()).toContain('Payouts not set up for TruHollis Management LLC')
     expect(text()).not.toContain('Oak Park Motel and RV LLC can')
     // It never asks Stripe about the account's oldest company to decide.
     expect(server.gets).not.toContain('/stripe/connect/status?entity=landlord&entityId=OP')
   })
 
   it('stays hidden when every company with a property can be paid', async () => {
-    server.entities = [{ id: 'L1', businessName: 'TruBlu Management LLC', isOwner: true, connectPayoutsEnabled: true, propertyCount: 1 }]
+    server.entities = [{ id: 'L1', businessName: 'TruHollis Management LLC', isOwner: true, connectPayoutsEnabled: true, propertyCount: 1 }]
     await render(<PropertiesPage />)
     expect(text()).not.toContain('Payouts not set up')
   })

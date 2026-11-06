@@ -12,7 +12,7 @@
  * not find a stay that had finished: 'checked_out' was off the status list, and
  * a walk-up check naming no site had to be OLDER than the booking, which is the
  * opposite of how the counter works (screen first, write the stay minutes
- * later). Measured on Victor Cardoza (RV 10) and Nemesio Rivera (RV 11) at
+ * later). Measured on Horatio Mapperley (RV 10) and Kestrel Norrington (RV 11) at
  * Mountain View: both checked out on 10-18 after 14 nights, both approved
  * checks still demanding a space for them.
  *
@@ -76,7 +76,7 @@ async function world(): Promise<World> {
     const guestEmail = `walkup-${randomUUID().slice(0, 8)}@test.dev`
     const u = await c.query<{ id: string }>(
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
-       VALUES ($1,'x','tenant','Victor','Cardoza',TRUE) RETURNING id`, [guestEmail])
+       VALUES ($1,'x','tenant','Horatio','Mapperley',TRUE) RETURNING id`, [guestEmail])
     const t = await c.query<{ id: string }>(`INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [u.rows[0].id])
     await c.query('COMMIT')
     return {
@@ -97,7 +97,7 @@ async function approvedWalkUpCheck(w: World, o: { unitId?: string | null; proper
   const { rows: [r] } = await db.query<{ id: string }>(
     `INSERT INTO background_checks
        (landlord_id, user_id, tenant_id, unit_id, property_id, status, first_name, last_name, decided_at, created_at)
-     VALUES ($1, $2, $3, $4, $5, 'approved', 'Victor', 'Cardoza', NOW(), NOW() - ($6 || ' days')::interval)
+     VALUES ($1, $2, $3, $4, $5, 'approved', 'Horatio', 'Mapperley', NOW(), NOW() - ($6 || ' days')::interval)
      RETURNING id`,
     [w.landlordId, w.guestUserId, w.guestTenantId,
      o.unitId === undefined ? null : o.unitId,
@@ -122,7 +122,7 @@ async function stay(w: World, o: {
     `INSERT INTO unit_bookings
        (unit_id, landlord_id, tenant_id, guest_name, guest_email, check_in, check_out, status,
         lease_type, total_amount, stay_terms, screening_required, created_at)
-     VALUES ($1, $2, $3, 'Victor Cardoza', $4, ${day(o.checkInDays ?? -14)}, ${day(o.checkOutDays ?? -1)}, $5,
+     VALUES ($1, $2, $3, 'Horatio Mapperley', $4, ${day(o.checkInDays ?? -14)}, ${day(o.checkOutDays ?? -1)}, $5,
              'month_to_month', 900, 'stay', $6, NOW() - ($7 || ' days')::interval)
      RETURNING id`,
     [o.unitId ?? w.rv10, o.landlordId ?? w.landlordId, o.tenantId ?? null,
@@ -336,7 +336,7 @@ describe('the day they screened against the days of the stay', () => {
   })
 
   it('a month on a site does not swallow a screening taken to get a lease', async () => {
-    // Anastacio Erreguin: approved 09-04 at Mountain View, no space yet, still
+    // Bryce Belmont: approved 09-04 at Mountain View, no space yet, still
     // on the attention list. Put him on a site for a month while the lease
     // paperwork runs and his screening must not file itself as done — that is
     // the one lease button he has.

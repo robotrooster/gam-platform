@@ -1,7 +1,7 @@
 /**
- * 10/25 (Nic), on Dominic Gonzalez's contract:
+ * 10/25 (Nic), on Vesper Vanterpool's contract:
  *
- *   "For now, with Dominic, we are going to send reminders about that contract
+ *   "For now, with Vesper, we are going to send reminders about that contract
  *    payment being due. But it is not going to go billed through the property.
  *    It's not going to get invoiced through the property. It's just going to be
  *    a ledger that keeps track and when that payment comes in, we will mark
@@ -141,7 +141,7 @@ describe('a contract GAM tracks but does not bill', () => {
  * 10/25 (Nic): "Is that going to appear on the front desk person's list as
  * like, hey, collect this money?" → yes — "collect-only, can't be rung up."
  *
- * Dominic pays at the counter, so a desk that is never told cannot collect. But
+ * Vesper pays at the counter, so a desk that is never told cannot collect. But
  * the money is the trust's, so nothing of it may become a GAM payment. Both
  * halves are tested here: the line is on the list, AND there is nothing behind
  * it for the register, the reader or Record payment to act on.

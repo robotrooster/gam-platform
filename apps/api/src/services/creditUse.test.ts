@@ -245,7 +245,7 @@ describe('which bills credit may pay', () => {
   })
 
   /**
-   * 10/26 (Nic): "let their own overpayment pay a trailer payment." Kim Bowman
+   * 10/26 (Nic): "let their own overpayment pay a trailer payment." Xander Allerton
    * paid $550 against $639.60; it settled rent, water and the late fee exactly,
    * and the $10.40 left over became paid-ahead credit that could never reach
    * the $100 home payment he still owed. His own money, against his own bill.
@@ -275,7 +275,7 @@ describe('which bills credit may pay', () => {
   })
 
   it("a home payment takes the tenant's own money even when it only covers part", async () => {
-    // Bowman's actual shape: $10.40 of change against a $100 line.
+    // Allerton's actual shape: $10.40 of change against a $100 line.
     const h = await house()
     await paidAhead(h, 10.40)
     const home = await charge(h, { amount: 100, type: 'home_payment', entry: 'HOMEPMT' })
@@ -595,7 +595,7 @@ describe('spend order', () => {
     expect(q.plan.find(l => l.creditId === interest)!.creditKind).toBe('deposit_interest')
   })
 
-  it('on one due date the credit goes on rent before water and trash (Kim Harland)', async () => {
+  it('on one due date the credit goes on rent before water and trash (Yvette Bexley)', async () => {
     const h = await house()
     await issued(h, 450)
     // Same due date, same creation instant: only the type order decides.

@@ -31,9 +31,9 @@ describe('which property the page shows', () => {
 
 describe('a household on a row', () => {
   it('is named by its primary resident; everyone on hover; nobody named says so', () => {
-    const rs = [{ tenantId: 'g2', name: 'Gina Logue', primary: false }, { tenantId: 'g1', name: 'Gerald Logue', primary: true }]
-    expect(householdName(rs)).toBe('Gerald Logue')
-    expect(householdNames(rs)).toBe('Gina Logue, Gerald Logue')
+    const rs = [{ tenantId: 'g2', name: 'Gina Braddock', primary: false }, { tenantId: 'g1', name: 'Arlo Braddock', primary: true }]
+    expect(householdName(rs)).toBe('Arlo Braddock')
+    expect(householdNames(rs)).toBe('Gina Braddock, Arlo Braddock')
     expect(householdName([])).toBe('No resident named')
   })
   it('opens its report for its lease; a charge on no lease opens the person’s', () => {

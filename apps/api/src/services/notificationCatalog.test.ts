@@ -28,7 +28,7 @@
  * fifty-odd senders in services/email.ts that call send() directly and write no
  * notification row at all — the 7am overdue digest, the monthly bill, the
  * payment receipt, the signing request and its reminders, the monthly property
- * report. Every one of them still reached Blu Haws after he answered all 90 of
+ * report. Every one of them still reached Hollis Harkness after he answered all 90 of
  * his rows, because the compiler and this file only ever looked at the first
  * road.
  *
@@ -298,7 +298,7 @@ describe('every notification GAM can send is in the catalog', () => {
     // read as orphans here otherwise — the morning overdue digest, the monthly
     // bill, the payment receipt, the background-check result, the two e-sign
     // notices, the two renter-pool notices and the monthly property report —
-    // every one of which Blu Haws was still receiving with 90 boxes unchecked.
+    // every one of which Hollis Harkness was still receiving with 90 boxes unchecked.
     // Read from the declaration rather than re-listed here, so a new gated
     // category counts the moment somebody declares it. That is the only version
     // of this test that cannot go stale the way the settings pages did.
@@ -321,7 +321,7 @@ describe('every notification GAM can send is in the catalog', () => {
    * existed for a type — never whether any of them emailed. Thirty-two catalog
    * types had no emailing call site at all, and twenty-five of those sat on the
    * landlord's page with a tickable Email box. Unticking one did nothing,
-   * because nothing has ever emailed it; two of them were boxes Blu actually
+   * because nothing has ever emailed it; two of them were boxes Hollis actually
    * bothered to uncheck. By the rule that retired 'Rent failed' and
    * 'Disbursement sent' — "a box for mail that cannot arrive is noise" — those
    * thirty rows were the same defect, measured by the same test that was
@@ -445,13 +445,29 @@ describe('every catalog entry is fit to put in front of a person', () => {
   })
 })
 
-// ─── The five Nic named ─────────────────────────────────────────────────────
+// ─── The ones Nic named ─────────────────────────────────────────────────────
 
-describe('the five GAM always sends', () => {
-  it('is exactly the five Nic named — adding or dropping one is his call', () => {
+describe('the notices GAM always sends', () => {
+  it('is exactly the list Nic named — adding or dropping one is his call', () => {
+    // 10/30: autopay_disarmed joined on his word — "If autopay turns off, it
+    // needs to inform them." The rule that this list is HIS to change is
+    // unchanged, which is why the assertion is spelled out rather than derived.
+    //
+    // 11/4: autopay_disarmed_info joined — the operator's copy of the autopay
+    // notice. Nic: "We also need to know when auto pay went off." Until then the
+    // notice was tenant-audience only, so the operator saw the badge disappear
+    // and nothing else.
+    //
+    // 11/1: utility_review_blocks_billing joined, and it is the first LANDLORD
+    // notice on the list that is landlord-only. Nic, after Country Acres' twelve
+    // households got no November bill because one flagged meter read left the
+    // reading round unapproved: "they need to get emailed the last business day
+    // of the month plus any following days... otherwise nobody's going to get
+    // billed." He had declined every utility email there is (96 preference
+    // rows, none emailing), so nothing else could have reached him.
     expect([...CRITICAL_NOTIFICATION_TYPES].sort()).toEqual([
-      'autopay_failed', 'flexpay_bill_covered', 'flexpay_ended', 'flexpay_pull_retry',
-      'payment_failed',
+      'autopay_disarmed', 'autopay_disarmed_info', 'autopay_failed', 'flexpay_bill_covered', 'flexpay_ended',
+      'flexpay_pull_retry', 'payment_failed', 'utility_review_blocks_billing',
     ])
   })
 

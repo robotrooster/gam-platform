@@ -41,6 +41,7 @@ import { db } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { companyTzSql, cSql } from './ledgerProjectors/tenantShared'
 import { assetSchedule } from './ledgerProjectors/loansAssets'
+import { booksStartSql } from './ledgerOwner'
 
 /** A client or the pool: anything with query(). */
 type Q = Pick<PoolClient, 'query'>
@@ -328,7 +329,7 @@ export async function loanFigures(q: Q, loans: readonly LoanBase[], asOf?: strin
        JOIN books_loans l ON l.id = p.loan_id
       WHERE p.loan_id = ANY($1::uuid[]) AND p.voided_at IS NULL
         AND p.paid_on >= GREATEST(l.start_date,
-              COALESCE((SELECT x.books_start_date FROM landlords x WHERE x.id = l.landlord_id), l.start_date))
+              COALESCE(${booksStartSql('l.property_id', 'l.landlord_id')}, l.start_date))
         AND ($2::date IS NULL OR p.paid_on <= $2::date)
       GROUP BY p.loan_id`, [loans.map(l => l.id), asOf ?? null])
   const by = new Map(sums.rows.map(s => [s.loan_id, s]))
@@ -362,7 +363,7 @@ export const LOAN_COLUMNS = `
   l.funded_to, l.funded_bank_connection_id, l.funded_bank_transaction_id,
   l.opening_balance::text AS opening_balance, l.opening_escrow::text AS opening_escrow, l.notes,
   l.created_at, l.updated_at, l.voided_at::text AS voided_at, l.void_reason,
-  (SELECT x.books_start_date::text FROM landlords x WHERE x.id = l.landlord_id) AS books_start,
+  ${booksStartSql('l.property_id', 'l.landlord_id')}::text AS books_start,
   (SELECT p.name FROM properties p WHERE p.id = l.property_id) AS property_name,
   (SELECT v.name FROM books_vendors v WHERE v.id = l.vendor_id) AS vendor_name,
   -- 10/13 (Nic): where each payment's interest goes, picked when the loan was logged.
@@ -492,7 +493,7 @@ export async function findLoanMatchesForBankLine(
           -- 10/12 review: a loan made before the books start opens at what was
           -- still owed (its posting carries no bank money), so its money
           -- arriving is no line of these books to match.
-          AND l.start_date >= COALESCE((SELECT x.books_start_date FROM landlords x WHERE x.id = l.landlord_id), l.start_date)
+          AND l.start_date >= COALESCE(${booksStartSql('l.property_id', 'l.landlord_id')}, l.start_date)
           AND (l.funded_bank_connection_id IS NULL OR l.funded_bank_connection_id = $3)
           AND ($6::uuid IS NULL OR l.id = $6::uuid)
         ORDER BY abs(l.start_date - $4::date), l.id`,
@@ -620,7 +621,7 @@ export const ASSET_COLUMNS = `
   a.salvage_value::text AS salvage_value, a.acquired_on::text AS acquired_on, a.in_service_date::text AS in_service_date,
   a.life_years::text AS life_years, a.method, a.prior_depreciation::text AS prior_depreciation, a.source_expense_id,
   a.notes, a.created_at, a.updated_at, a.voided_at::text AS voided_at, a.void_reason,
-  (SELECT x.books_start_date::text FROM landlords x WHERE x.id = a.landlord_id) AS books_start,
+  ${booksStartSql('a.property_id', 'a.landlord_id')}::text AS books_start,
   (SELECT p.name FROM properties p WHERE p.id = a.property_id) AS property_name,
   (SELECT e.description FROM landlord_expenses e WHERE e.id = a.source_expense_id) AS source_expense_description,
   a.funded_by, a.funded_loan_id, (SELECT l.name FROM books_loans l WHERE l.id = a.funded_loan_id) AS funded_loan_name,
@@ -832,12 +833,11 @@ export async function markDepreciationMonthsDue(q: Q = db): Promise<number> {
             ${cSql('a.salvage_value')} AS salvage_c, a.acquired_on::text AS acquired_on, a.in_service_date::text AS in_service_date,
             a.life_years::text AS life_years,
             CASE WHEN a.prior_depreciation IS NULL THEN NULL ELSE ${cSql('a.prior_depreciation')} END AS prior_c,
-            a.source_expense_id, l.books_start_date::text AS books_start,
+            a.source_expense_id, ${booksStartSql('a.property_id', 'a.landlord_id')}::text AS books_start,
             (now() AT TIME ZONE ${companyTzSql('a.landlord_id')})::date::text AS today
        FROM books_fixed_assets a
-       JOIN landlords l ON l.id = a.landlord_id
       WHERE a.voided_at IS NULL AND a.life_years IS NOT NULL AND a.asset_class <> 'land' AND a.cost > a.salvage_value
-        AND l.books_start_date IS NOT NULL
+        AND ${booksStartSql('a.property_id', 'a.landlord_id')} IS NOT NULL
         AND (a.source_expense_id IS NULL
              OR EXISTS (SELECT 1 FROM landlord_expenses e WHERE e.id = a.source_expense_id AND e.status = 'active' AND e.voided_at IS NULL))`)).rows
   const due: { key: string; owner: string }[] = []

@@ -224,7 +224,7 @@ describe('a report only expires once the bank was actually looked at', () => {
 
   it('a deposit from before the company’s books start is never written off', async () => {
     const d = await declare(DECLARATION_EXPIRY_DAYS + 2)
-    await db.query(`UPDATE landlords SET books_start_date = CURRENT_DATE - 3 WHERE id = $1`, [d.landlordId])
+    await db.query(`UPDATE properties SET books_start_date = CURRENT_DATE - 3 WHERE landlord_id = $1`, [d.landlordId])
     expect((await sweepExpiredDeclarations()).expired).toBe(0)
     expect((await statusOf(d.id)).status).toBe('pending')
   })

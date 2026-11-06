@@ -207,7 +207,7 @@ describe('S609 prepaid release', () => {
     expect(await ownerShare(paymentId)).toBeCloseTo(0, 2)
   })
 
-  // S654 (Nic): "Glenda Greek and Todd Niemeyer also paid by check… Mark
+  // S654 (Nic): "Birdie Calloway and Todd Niemeyer also paid by check… Mark
   // Rensberger… he's not paid with card ever. Why is that saying that that's
   // going to be dispersed to our account? That's a huge problem."
   it('a check the landlord already deposited settles the month but releases nothing', async () => {

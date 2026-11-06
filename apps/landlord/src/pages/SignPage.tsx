@@ -113,7 +113,7 @@ function SignatureChooser({ name, type, onSelect, onClose }: { name:string; type
        makes vh taller than what you can actually see, which is how a button ends
        up permanently just below the fold. */
     <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20, overflowY:'auto', WebkitOverflowScrolling:'touch' }}>
-      <div style={{ background:'white', borderRadius:20, width:'100%', maxWidth:460, maxHeight:'calc(100dvh - 40px)', overflowY:'auto', margin:'auto', boxShadow:'0 24px 80px rgba(0,0,0,.4)' }}>
+      <div style={{ background:'white', borderRadius:20, width:'100%', maxWidth:460, maxHeight:'calc(var(--vh) - 40px)', overflowY:'auto', margin:'auto', boxShadow:'0 24px 80px rgba(0,0,0,.4)' }}>
         <div style={{ padding:'20px 24px 0' }}>
           <div style={{ fontWeight:800, fontSize:'1.05rem', color:'#1a1a1a', marginBottom:4 }}>{type==='signature'?'Create Your Signature':'Create Your Initials'}</div>
           <p style={{ fontSize:'.8rem', color:'#999', margin:'0 0 14px' }}>{type==='initials'?'Initials are locked to your name on file.':'Applied to all signature fields.'}</p>
@@ -464,7 +464,12 @@ export function SignPage() {
   const scaleRef     = useRef(1)
 
   const { data, isLoading, error } = useQuery(['sign', token],
-    () => authFetch('/esign/sign/'+token).then(r=>r.json()).then(r=>{ if(!r.success)throw new Error(r.error); return r.data }),
+    () => authFetch('/esign/sign/'+token).then(r=>r.json()).then(r=>{
+      // 10/30: keep the server's code, not only its sentence. A link closed
+      // because everyone has signed is finished, not invalid, and the heading
+      // below says so instead of accusing the reader's link of being broken.
+      if(!r.success){ const e:any = new Error(r.error); e.code = r.code; throw e }
+      return r.data }),
     { retry:false }
   )
   // S535: surface API sign failures — pre-fix a {success:false} response
@@ -621,7 +626,7 @@ export function SignPage() {
       // It used to stop following the start date the moment anything was typed
       // over it (S648 kept it editable for a move-in special). One keystroke
       // froze the figure, and every later change of the start date left it
-      // where it was — silently. Kay Howard (RV 21) and Clint Cook (RV 18) both
+      // where it was — silently. Verity Winthrop (RV 21) and Quill Quarrier (RV 18) both
       // signed $323.00, which is the 17 days from 10/15, the day the forms were
       // filled out — not from the day either of them actually arrived. One was
       // about $38 short and the other about $19 over.
@@ -702,8 +707,15 @@ export function SignPage() {
   if (isLoading) return <div style={{ display:'flex', alignItems:'center', justifyContent:'center', minHeight:'60vh', color:'var(--text-3)' }}>Loading document...</div>
   if (error||!data) return (
     <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:'60vh', gap:16, textAlign:'center', padding:32 }}>
-      <AlertCircle size={40} style={{ color:'var(--red)' }}/>
-      <h2 style={{ color:'var(--text-0)' }}>Invalid Signing Link</h2>
+      {/* 10/30: a link that closed because everybody signed is not a failure,
+          and a red alert icon over the words "Already Signed" reads like one.
+          Green check for that case, red alert for a link that really is bad. */}
+      {(error as any)?.code === 'document_completed'
+        ? <Check size={40} style={{ color:'var(--green)' }}/>
+        : <AlertCircle size={40} style={{ color:'var(--red)' }}/>}
+      <h2 style={{ color:'var(--text-0)' }}>
+        {(error as any)?.code === 'document_completed' ? 'Already Signed' : 'Invalid Signing Link'}
+      </h2>
       <p style={{ color:'var(--text-3)', maxWidth:380 }}>{(error as any)?.message || 'This link may be invalid or not associated with your account.'}</p>
       <button className="btn btn-ghost" onClick={()=>navigate('/')}>Back to Portal</button>
     </div>
@@ -766,6 +778,38 @@ export function SignPage() {
   // every field returned was already this signer's — treat it as true.
   const isMine = (f:any) => f.mine !== false
   // S652: a choice box marked X/check shows the glyph, not the option text it stores.
+  /**
+   * 10/28: the term box follows the end date, so the two can never say
+   * different things (S629). The dash means month-to-month; a real date means a
+   * fixed term, written as the number of whole months from the start date —
+   * which is what every valued lease_type field on the platform already holds
+   * ("Month-to-month", or a month count).
+   */
+  const termFieldValue = (endIso: string): Record<string, string> => {
+    const termField = (allFields as any[]).find((f:any) => f.leaseColumn === 'lease_type')
+    if (!termField) return {}
+    if (!endIso || endIso === '-') return { [termField.id]: 'Month-to-month' }
+    const startIso = (allFields as any[]).find((f:any) => f.leaseColumn === 'start_date')
+    const startRaw = startIso ? (fieldValues[startIso.id] ?? startIso.value ?? '') : ''
+    const start = startRaw ? documentDateToIso(String(startRaw)) : ''
+    if (!start) return {}
+    const [sy, sm, sd] = String(start).split('-').map(Number)
+    const [ey, em] = String(endIso).split('-').map(Number)
+    if (!sy || !ey) return {}
+    // The exact inverse of computeLeaseEnd (services/leaseDates.ts), so the
+    // number written in the landlord's own "a term of ___ months" blank is the
+    // number that would produce this end date: the first FULL month is the
+    // start month when it begins on the 1st and the next month otherwise, and
+    // the term runs to the last day of (first full month + months - 1).
+    //
+    // Doing this by raw month difference was wrong by one on any start that is
+    // not the 1st, which is most of them.
+    let fmY = sy, fmM = sm
+    if (sd !== 1) { fmM += 1; if (fmM > 12) { fmM = 1; fmY += 1 } }
+    const months = (ey - fmY) * 12 + (em - fmM) + 1
+    return months > 0 ? { [termField.id]: String(months) } : {}
+  }
+
   const shown = (f:any, v:string) => f.fieldType==='choice' && f.checkboxMark!=='initials' ? (f.checkboxMark==='check' ? '✓' : 'X') : v
   const myFields = activeFields.filter(isMine)
   const requiredFields = myFields.filter((f:any)=>f.required)
@@ -1033,7 +1077,27 @@ export function SignPage() {
       )}
 
       <div ref={containerRef} style={{ position:'relative', background:'#525659', borderRadius:12, overflow:'auto', maxHeight:'82vh', marginBottom:16 }}>
-        <div style={{ position:'relative', display:'inline-block', width:'100%' }}>
+        {/* 10/28 — ONE PIXEL FRAME FOR THE PAGE AND ITS BOXES.
+            Blue, mid-signing: the Exhibit A boxes were "all down and to the
+            right", and full screen "helped a little, but not really".
+
+            The boxes are placed in absolute pixels (left: f.x * scale), where
+            `scale` was measured ONCE from this container's clientWidth — while
+            the page image under them is laid out by CSS as width:100% of the
+            same container. Two widths for one frame. Anything that changes the
+            container's painted width after that measurement (the scroll bar
+            appearing as the canvas grows, a resize, browser zoom) leaves the
+            image re-fitted and the boxes still placed for the old width, so
+            every box drifts down and to the right by a factor that grows with
+            its distance from the top-left corner. Full screen changes the
+            width, which is why it only "helped a little".
+
+            Pinning the wrapper to the exact width the scale was computed for
+            makes the image and the boxes share one frame. Nothing stored moves:
+            the coordinates were always right, and the stamped PDFs were always
+            right — only the browser overlay was wrong. */}
+        <div style={{ position:'relative', display:'inline-block',
+                      width: pdfDims ? pdfDims.width : '100%' }}>
           <canvas ref={canvasRef}/>
           {pdfDims && pageFields.map((f:any) => {
             const s = scaleRef.current
@@ -1052,14 +1116,29 @@ export function SignPage() {
             // S629 (Nic): "I don't want something saying a year lease in the
             // system when the document has month to month."
             //
-            // lease_type is DERIVED — termPrefill turns the template's
-            // default_term_months into both the end date and the type, so they
-            // cannot disagree at draft time. Typing over it on the document is
-            // the only way to make them disagree, and it would put a term on
-            // signed paper that the record contradicts. Locked like a name: to
-            // change the term you change the template, and the document
-            // follows.
-            const DERIVED_LOCKED = new Set(['lease_type', 'end_date'])
+            // lease_type is DERIVED and stays locked — but 10/28 changed WHAT
+            // it is derived from, because locking the END DATE too made the
+            // rule unusable.
+            //
+            // Nic, 10/28, on a landlord who needed three years on one lease:
+            //   "If a tenant sets a month-to-month lease by having no end date,
+            //    the system needs to know it's month-to-month. And if they put
+            //    any sort of date on there, it needs to know to change it to a
+            //    fixed term."
+            //
+            // The end date was locked whenever it held a value — and the dash
+            // that MEANS month-to-month is a value (S535), so the box the
+            // landlord most needs was permanently unclickable and the tooltip
+            // sent him to edit a template, which a drafted document does not
+            // even read. He could not put a term on his own lease at all.
+            //
+            // So the date is the input and the type follows it, here and in
+            // buildLeaseFromDocument. S629's rule is kept — "I don't want
+            // something saying a year lease in the system when the document has
+            // month to month" — and kept by DERIVATION rather than by locking:
+            // picking a date writes the term beside it, the dash writes
+            // month-to-month, and neither can be edited into disagreeing.
+            const DERIVED_LOCKED = new Set(['lease_type'])
             // S648 (Nic): an onboarding resident's page 8 is not a move-in —
             // their first month is the rent and every move-in fee is $0.
             const ONBOARDING_LOCKED = data.existingTenancy && !doc?.renewsLeaseId && !!f.leaseColumn && (
@@ -1139,8 +1218,13 @@ export function SignPage() {
                 // the read-only policy explainer, not an editor).
                 onClick={()=>{ if (isPolicyLateFee || DERIVED_PRORATION) { setActiveField(f); return } if (!locked) handleFieldClick(f) }}
                 title={DERIVED_PRORATION ? 'Worked out from the lease start date, the rent and the due day — click to see how'
-                  : locked?(f.leaseColumn==='lease_type'||f.leaseColumn==='end_date'
-                    ? 'Set by the lease template’s term — change the template, not the document, so the record and the paper agree'
+                  : locked?(f.leaseColumn==='lease_type'
+                    // 10/28: the term follows the END DATE now, so this says
+                    // where to change it instead of sending the landlord to a
+                    // template, which a drafted document never re-reads — and
+                    // which, on every one of this landlord's templates, could
+                    // not have produced a fixed term anyway.
+                    ? 'Follows the end date — set the end date and this says the term; a dash there means month-to-month'
                     : 'Linked to the unit/tenant record — edit the record, not the document'):isPolicyLateFee?'Set by the property late-fee policy — click for details':undefined}
                 style={{
                   position:'absolute', left:f.x*s, top:f.y*s, width:f.width*s, height:f.height*s,
@@ -1337,7 +1421,7 @@ export function SignPage() {
             {activeField.leaseColumn === 'end_date' && (
               <div style={{ marginBottom:14 }}>
                 <button
-                  onClick={()=>{ setFieldValues(p=>({...p,[activeField.id]:'-'})); const id=activeField.id; setActiveField(null); setTimeout(()=>jumpToNext(id),150) }}
+                  onClick={()=>{ setFieldValues(p=>({...p, [activeField.id]:'-', ...termFieldValue('-')})); const id=activeField.id; setActiveField(null); setTimeout(()=>jumpToNext(id),150) }}
                   style={{ width:'100%', padding:'10px', borderRadius:8, border:'1.5px solid #c9a227', background:'#fdf8ec', color:'#78350f', fontWeight:700, fontSize:'.82rem', cursor:'pointer', marginBottom:8 }}>
                   Month-to-month — no end date (enters &quot;-&quot;)
                 </button>
@@ -1423,7 +1507,10 @@ export function SignPage() {
               <div style={{ marginBottom:14 }}>
                 <LeaseDateCalendar key={activeField.id}
                   value={documentDateToIso(fieldValues[activeField.id])}
-                  onChange={iso=>{ setFieldValues(p=>({...p,[activeField.id]:isoToDocumentDate(iso)})) }}
+                  onChange={iso=>{ setFieldValues(p=>({...p, [activeField.id]:isoToDocumentDate(iso),
+                    // 10/28: a real date is a fixed term, and the term box says
+                    // so without the landlord having to find it.
+                    ...(activeField.leaseColumn==='end_date' ? termFieldValue(iso) : {})})) }}
                 />
               </div>
             )}

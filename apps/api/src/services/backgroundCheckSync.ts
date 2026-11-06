@@ -5,7 +5,7 @@
  * background check. I have sent the link to a couple more people through text
  * message today."
  *
- * Checkr finished Anastacio Erreguin's report at 15:19 Phoenix on September 9.
+ * Checkr finished Bryce Belmont's report at 15:19 Phoenix on September 9.
  * GAM never heard: no webhook has ever reached /api/background/webhook in the
  * whole log window. His screening sat at `processing` for twenty-two hours
  * until Nic opened it and decided it by hand — on a report he could not see,

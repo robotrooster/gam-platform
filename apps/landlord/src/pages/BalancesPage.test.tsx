@@ -85,7 +85,7 @@ const owingRow = (tenantId: string, first: string, paymentId: string) => ({
 })
 
 const payLinkRow = {
-  tenantId: null, payLinkId: 'pl1', firstName: 'Andres', lastName: 'Razo', phone: null, email: 'a@x.test',
+  tenantId: null, payLinkId: 'pl1', firstName: 'Cora', lastName: 'Castellan', phone: null, email: 'a@x.test',
   unitNumber: null, propertyId: 'prop-mv', propertyIds: ['prop-mv'], propertyName: 'Mountain View',
   balance: '42.00', creditAvailable: 0, creditOnAccount: 0, oldestDueDate: '2026-10-01',
   months: [{ month: '2026-10', amount: 42 }], daysLate: 0, clearing: 0, workTrade: false,
@@ -130,8 +130,8 @@ describe('the pay-link breakdown is given its property', () => {
   it('on Outstanding Balances: the register read names the link’s property, and Adjust finds the link', async () => {
     server.balances = [payLinkRow]
     await render(<BalancesPage />)
-    await until(() => text().includes('Andres Razo'), 'the pay link row')
-    const row = [...host.querySelectorAll('tr.cd-row')].find(tr => tr.textContent?.includes('Andres Razo')) as HTMLElement
+    await until(() => text().includes('Cora Castellan'), 'the pay link row')
+    const row = [...host.querySelectorAll('tr.cd-row')].find(tr => tr.textContent?.includes('Cora Castellan')) as HTMLElement
     await act(async () => { row.click() })
     await until(() => linkReads().length > 0, 'the register read')
     expect(linkReads()[0]).toBe('/pos/tickets/pl1?kind=pay_link&propertyId=prop-mv')
@@ -145,7 +145,7 @@ describe('the pay-link breakdown is given its property', () => {
   it('on the Front Desk call list too', async () => {
     server.balances = [payLinkRow]
     await render(<FrontDeskPage />)
-    await until(() => text().includes('Andres Razo'), 'the pay link line')
+    await until(() => text().includes('Cora Castellan'), 'the pay link line')
     await act(async () => { button(/what.s on it/)!.click() })
     await until(() => linkReads().length > 0, 'the register read')
     expect(linkReads()[0]).toBe('/pos/tickets/pl1?kind=pay_link&propertyId=prop-mv')
@@ -178,7 +178,7 @@ describe('Record payment at the top finds everyone on the list', () => {
     server.user = { role: 'onsite_manager', permissions: { 'balances.view': true, take_payment: true } }
     server.balances = [payLinkRow]
     await render(<BalancesPage />)
-    await until(() => text().includes('Andres Razo'), 'the list')
+    await until(() => text().includes('Cora Castellan'), 'the list')
     expect(text()).not.toContain('Total owed')
   })
 })

@@ -421,7 +421,7 @@ describe('POST /api/pos/transactions — happy paths', () => {
   })
 
   // 10/24 (Nic): "one propane sale got marked as cash when the person dropped
-  // off a check... I want you to re-record Donald Hamp as paid with check. I
+  // off a check... I want you to re-record Wren Westbrook as paid with check. I
   // don't want to void the sale and redo it. I don't like voiding sales. It's
   // just like it makes it look like it was there when it wasn't."
   describe('correcting the tender on a sale already rung', () => {
@@ -3273,7 +3273,7 @@ describe('10/20 the customer book spans every company the account owns', () => {
 // customer name … I need to be able to choose a customer from the drop-down menu
 // to link to that transaction and it should show their name on the pay screen."
 describe('S654 the breakdown on the reader while the cart is rung, with the customer', () => {
-  async function residentAt(f: PosFixture, first = 'Dakota', last = 'Lane'): Promise<string> {
+  async function residentAt(f: PosFixture, first = 'Tobin', last = 'Thornbury'): Promise<string> {
     const client = await db.connect()
     try {
       const tenantId = await seedTenant(client)
@@ -3323,7 +3323,7 @@ describe('S654 the breakdown on the reader while the cart is rung, with the cust
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ propertyId: f.propertyId, items: [{ id: itemId, name: 'Ice', qty: 1, price: 4 }], tenantId })
     expect(ok.status, JSON.stringify(ok.body)).toBe(200)
-    expect((showCartOnReaderMock.mock.calls as any[])[0][0].who).toBe('Dakota Lane')
+    expect((showCartOnReaderMock.mock.calls as any[])[0][0].who).toBe('Tobin Thornbury')
 
     // 10/2: the breakdown never fails over the person — somebody who cannot be
     // named here shows no name, and nothing of theirs reaches the reader.

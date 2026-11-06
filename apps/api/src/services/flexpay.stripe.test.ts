@@ -1647,7 +1647,7 @@ describe('handleFlexPayPaymentNsf — any terminal failure', () => {
     expect(t.flexpay_enrolled).toBe(true)
   })
 
-  it('a second write-off ends FlexPay for good', async () => {
+  it('a second write-off ends FlexPay with the longer wait', async () => {
     const { h, row } = await failedPull({ retryCount: 2, nextRetryAt: null })
     await db.query(
       `INSERT INTO flexpay_advances (cycle_month, tenant_id, landlord_id, unit_id, lease_id,
@@ -1658,7 +1658,7 @@ describe('handleFlexPayPaymentNsf — any terminal failure', () => {
     const t = (await db.query<any>(
       `SELECT flexpay_permanently_banned, flexpay_disqualified_reason, flexpay_disqualified_until FROM tenants WHERE id = $1`,
       [h.tenantId])).rows[0]
-    expect(t).toMatchObject({ flexpay_permanently_banned: true, flexpay_disqualified_reason: 'permanent_second_default',
+    expect(t).toMatchObject({ flexpay_permanently_banned: true, flexpay_disqualified_reason: 'second_default_longer_cooloff',
                               flexpay_disqualified_until: null })
   })
 
@@ -1679,7 +1679,7 @@ describe('handleFlexPayPaymentNsf — any terminal failure', () => {
     expect(t.flexpay_disqualified_until).not.toBeNull()
   })
 
-  it('a write-off recovered since by GAM-first routing still counts: a second ends FlexPay for good', async () => {
+  it('a write-off recovered since by GAM-first routing still counts: a second takes the longer wait', async () => {
     const { h, row } = await failedPull({ retryCount: 2, nextRetryAt: null })
     await db.query(
       `INSERT INTO flexpay_advances (cycle_month, tenant_id, landlord_id, unit_id, lease_id,
@@ -1825,7 +1825,7 @@ describe('handleFlexPayPaymentNsf — any terminal failure', () => {
                                           still_open: FIXTURE_PULL + FLEXPAY_ACH_RETURN_FEE, rejoin_never: false })
   })
 
-  it('a tenant with autopay on is not told autopay is off; a second write-off says FlexPay is gone for good', async () => {
+  it('a tenant with autopay on is not told autopay is off; a second write-off says the wait is longer', async () => {
     const { h, row } = await failedPull({ retryCount: 2, nextRetryAt: null })
     await db.query(`INSERT INTO tenant_autopay (tenant_id, lease_id, enabled, pull_day) VALUES ($1, $2, TRUE, 7)`,
       [h.tenantId, h.leaseId])
@@ -1836,7 +1836,8 @@ describe('handleFlexPayPaymentNsf — any terminal failure', () => {
       [h.tenantId, h.landlordId, h.unitId, h.leaseId])
     await handleFlexPayPaymentNsf(row.id)
     const [ended] = (await tenantNotices(h.tenantUserId)).filter((n: any) => n.type === 'flexpay_ended')
-    expect(ended.body).toContain('This is the second time, so FlexPay is no longer available on your account.')
+    // 10/27: a later ending waits longer; it does not end FlexPay.
+    expect(ended.body).toContain('the wait before you can join again is longer')
     expect(ended.body).not.toContain('join FlexPay again')
     expect(ended.body).not.toContain('Autopay is off')
     expect(ended.data).toMatchObject({ rejoin_never: true })
@@ -2586,7 +2587,7 @@ describe('handleFlexPayPullReversed — a settled pull taken back by the bank', 
     expect(await handleFlexPayPullReversed(row.id)).toMatchObject({ reversed: false })
   })
 
-  it('a second disputed pull bans for good', async () => {
+  it('a second disputed pull takes the longer wait', async () => {
     const { h, row } = await settledPull()
     await db.query(
       `INSERT INTO flexpay_advances (cycle_month, tenant_id, landlord_id, unit_id, lease_id,
@@ -2597,10 +2598,10 @@ describe('handleFlexPayPullReversed — a settled pull taken back by the bank', 
     const t = (await db.query<any>(
       `SELECT flexpay_permanently_banned, flexpay_disqualified_reason, flexpay_disqualified_until FROM tenants WHERE id = $1`,
       [h.tenantId])).rows[0]
-    expect(t).toMatchObject({ flexpay_permanently_banned: true, flexpay_disqualified_reason: 'permanent_second_default',
+    expect(t).toMatchObject({ flexpay_permanently_banned: true, flexpay_disqualified_reason: 'second_default_longer_cooloff',
                               flexpay_disqualified_until: null })
     const alert = (await db.query<any>(`SELECT title FROM admin_notifications WHERE category = 'flexpay_pull_taken_back'`)).rows
-    expect(alert[0].title).toMatch(/ended for good/)
+    expect(alert[0].title).toMatch(/longer wait/)
   })
 
   it('a pull taken back that had recovered an earlier written-off advance writes that one off again, and names any other GAM balance it paid', async () => {
@@ -2922,13 +2923,17 @@ describe('Step 10 — FlexPay\'s failure rules and joining again', () => {
                                      pull_day, status, defaulted_at, default_reason)
        VALUES ('2026-08-01', $1, $2, $3, $4, 1060, 25, 10, 'defaulted', NOW() - interval '100 days', 'pull_not_collected') RETURNING id`,
       [h.tenantId, h.landlordId, h.unitId, h.leaseId])).rows[0].id
-    await db.query(`UPDATE tenants SET flexpay_disqualified_until = NOW() + interval '10 days' WHERE id = $1`, [h.tenantId])
+    // 10/27: the unserved wait is a count plus a start date, served in days
+    // on GAM — a stored end date is no longer read.
+    await db.query(
+      `UPDATE tenants SET flexpay_default_count = 1, flexpay_cooldown_from = NOW() WHERE id = $1`, [h.tenantId])
     let r = await join(h)
     expect(r.ok).toBe(false)
     expect((r as any).reason).toMatch(/can join FlexPay again on/)
     expect((r as any).reason).toMatch(/still open with GAM/)
     // The wait is over, but what FlexPay paid is still open: still refused.
-    await db.query(`UPDATE tenants SET flexpay_disqualified_until = NOW() - interval '1 day' WHERE id = $1`, [h.tenantId])
+    await db.query(
+      `UPDATE tenants SET flexpay_cooldown_from = NOW() - interval '800 days' WHERE id = $1`, [h.tenantId])
     r = await join(h)
     expect(r.ok).toBe(false)
     expect((r as any).reason).toMatch(/still open with GAM/)

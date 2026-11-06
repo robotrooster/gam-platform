@@ -30,14 +30,12 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { geoBounds } from 'd3-geo'
 import type { Feature, MultiLineString } from 'geojson'
-import { MetricsGlobe } from './MetricsGlobe'
+import { MetricsGlobe, thinMesh } from './MetricsGlobe'
 import {
   US_VIEW, dragRotate, globeProjection,
   type GeoArea, type GlobeView, type LayerShapes, type UsAtlas,
 } from './metricsMapGeo'
-
-const W = 975
-const H = 610
+import { H, W, recordCanvas, type Shot } from './__fixtures__/metricsCanvasRecorder'
 
 // ── The shapes ───────────────────────────────────────────────────────────────
 
@@ -85,52 +83,11 @@ const us: UsAtlas = {
   nation: parallel(BAND.nation),
 }
 
-// ── The canvas stand-in ──────────────────────────────────────────────────────
+// ── The canvas stand-in ──────────────────────────────────────────
 
-interface Shot { frame: number; color: string; width: number; points: Array<[number, number]> }
-
-function recordCanvas() {
-  const fills: Shot[] = []
-  const strokes: Shot[] = []
-  let points: Array<[number, number]> = []
-  let fillStyle = '#808080'
-  /** How many frames have painted: the globe sets the canvas transform once a frame, and nothing else does. */
-  let frame = 0
-  const ctx: any = {
-    strokeStyle: '', fillStyle: '#808080', lineWidth: 0, globalAlpha: 1,
-    setTransform() { frame++ },
-    clearRect() {},
-    // The globe's own color reader asks a 1×1 canvas what a CSS color comes
-    // out as; jsdom has no stylesheet here, so it reads back the gray it was
-    // given first. These tests go by WHERE things were drawn, not their color.
-    fillRect() {}, getImageData: () => ({ data: [128, 128, 128] }),
-    beginPath() { points = [] },
-    moveTo(x: number, y: number) { points.push([x, y]) },
-    lineTo(x: number, y: number) { points.push([x, y]) },
-    arc(x: number, y: number) { points.push([x, y]) },
-    closePath() {},
-    fill() { fills.push({ frame, color: String(fillStyle), width: 0, points: [...points] }) },
-    stroke() { strokes.push({ frame, color: String(ctx.strokeStyle), width: Number(ctx.lineWidth), points: [...points] }) },
-  }
-  Object.defineProperty(ctx, 'fillStyle', { get: () => fillStyle, set: (v: string) => { fillStyle = v } })
-  vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(ctx)
-  vi.spyOn(HTMLCanvasElement.prototype, 'getBoundingClientRect').mockReturnValue({
-    width: W, height: H, top: 0, left: 0, right: W, bottom: H, x: 0, y: 0, toJSON: () => ({}),
-  })
-  return {
-    /** How many frames have painted at all. */
-    get frames() { return frame },
-    /**
-     * What is on the canvas now: the last frame that actually painted. The
-     * LAST one and not the only one on purpose — a globe that has stopped
-     * painting still SHOWS the picture it drew last, which is what Nic was
-     * looking at, so a frozen canvas reads here as the stale picture it is
-     * rather than as having drawn nothing.
-     */
-    get fills() { return fills.filter(s => s.frame === frame) },
-    get strokes() { return strokes.filter(s => s.frame === frame) },
-  }
-}
+// It is in metricsCanvasRecorder, shared with the card's own tests.
+// These tests go by WHERE things were drawn; no theme is dressed on it here,
+// so every color it reads back is the gray it was given first.
 
 /** Which boundary layers a frame drew, read off the points it drew them with. */
 const drawnBoundaries = (strokes: Shot[], view: GlobeView): Set<string> => {
@@ -375,26 +332,30 @@ describe('MetricsGlobe boundaries while it moves', () => {
     expect(drawnBoundaries(painted.strokes, US_VIEW)).toEqual(ALL)
   })
 
-  it('skips every boundary mid-drag — not half of them — and brings them all back', async () => {
-    // 10/19 (Nic): "how come all of the other countries lines go away when I'm
-    // clicking and holding to drag? But the United States ones all stay
-    // there." The state lines and the country's outline sat outside the gate
-    // the rest of the line art was behind. All or nothing now.
+  it('keeps every boundary up through a drag, and all of them after it', async () => {
+    // 10/31 (Nic): "I wish that you would keep all the boundaries, the
+    // highlighted kind of bluish gray color around each boundary… those would
+    // stay on when dragging the map so you can see like where you want to
+    // stop."
+    //
+    // This test used to assert the opposite — that a drag draws NO boundary —
+    // because of the 10/19 decision that the lines all behave the same way and
+    // the only affordable way to make them agree was to drop them all. His
+    // reason for wanting them back is orientation, so what a drag draws now is
+    // every boundary from a THINNED copy of each mesh (thinMesh): the same
+    // lines, a straighter version of them, about 22fps instead of 7. The
+    // thinning is invisible here on purpose — these fixtures are three-point
+    // parallels and thinMesh leaves any line of three or fewer points alone —
+    // so what this asserts is the rule, and the test below asserts the saving.
     await everything()
     await flush()
     const moved = dragRotate(US_VIEW, 190, 60, W, H)
 
     await drag(190, 60)
     await flush()
-    expect(drawnBoundaries(painted.strokes, moved)).toEqual(new Set())
+    expect(drawnBoundaries(painted.strokes, moved)).toEqual(ALL)
 
-    // What a drag DOES draw: the land, every place GAM is in, and the earth's
-    // rim — two strokes, the grid and the rim, neither of them a boundary.
-    expect(painted.fills).toHaveLength(3)
-    expect(painted.strokes).toHaveLength(2)
-
-    // "When I stop dragging, everything else lights up for boundaries" — all
-    // of it, on the rotation the drag left it at.
+    // And all of it at full detail on the rotation the drag left it at.
     await stopped()
     await flush()
     expect(drawnBoundaries(painted.strokes, moved)).toEqual(ALL)
@@ -412,7 +373,9 @@ describe('MetricsGlobe boundaries while it moves', () => {
 
     await drag(190, 60)
     await flush()
-    expect(drawnBoundaries(painted.strokes, moved)).toEqual(new Set())
+    // Mid-drag now draws the lines it knows about (10/31) — the provinces are
+    // not among them yet, which is the point of what follows.
+    expect(drawnBoundaries(painted.strokes, moved)).toEqual(ALL_BUT_PROVINCES)
 
     // The provinces land in the moment after the last move, before the drag
     // has settled — a layer the globe has not drawn once yet.
@@ -431,14 +394,17 @@ describe('MetricsGlobe boundaries while it moves', () => {
     expect(drawnBoundaries(painted.strokes, US_VIEW)).toEqual(ALL)
   })
 
-  it('skips them for a zoom too, not just a drag', async () => {
+  it('keeps them through a zoom too, not just a drag', async () => {
     await everything()
     await flush()
     await act(async () => {
       canvas().dispatchEvent(new WheelEvent('wheel', { deltaY: -120, bubbles: true, cancelable: true }))
     })
     await flush()
-    expect(painted.strokes).toHaveLength(2)
+    // A wheel zoom goes through the same moving state as a drag, so it gets
+    // the same thinned lines rather than a bare globe.
+    const zoomed = { rotate: US_VIEW.rotate, zoom: US_VIEW.zoom * Math.exp(120 * 0.0018) }
+    expect(drawnBoundaries(painted.strokes, zoomed)).toEqual(ALL)
 
     await stopped()
     await flush()
@@ -477,9 +443,37 @@ describe('MetricsGlobe boundaries while it moves', () => {
     await flush()
     await drag(190, 60)
     await flush()
-    // The grid, the rim, and Nevada's own outline: three strokes, no boundary.
-    expect(painted.strokes).toHaveLength(3)
+    // 10/31: a drag now draws the boundaries too, so what this test is for is
+    // narrower than it was — the PICK is still its own mark, drawn at its own
+    // weight, and not one of them. Exactly one stroke at 1.6 is the assertion
+    // that carries the meaning; the boundary count is the test above's job.
     expect(painted.strokes.filter(s => s.width === 1.6)).toHaveLength(1)
-    expect(drawnBoundaries(painted.strokes, dragRotate(US_VIEW, 190, 60, W, H))).toEqual(new Set())
+    expect(drawnBoundaries(painted.strokes, dragRotate(US_VIEW, 190, 60, W, H))).toEqual(ALL)
+  })
+
+  it('thins a mesh for a drag without shortening any line', () => {
+    // The saving that makes keeping the lines affordable, tested on the thing
+    // that does it rather than on the canvas. It cannot be read off a frame:
+    // d3-geo RESAMPLES a sparse line back up to meet the projection's
+    // precision, so a thinned mesh and a full one can put a similar number of
+    // points on the canvas while costing very different amounts to build. The
+    // saving measured against the real files at 975x610 was 79.2ms to 12.0ms.
+    const line = Array.from({ length: 61 }, (_, i) => [-120 + i * 0.4, 49] as [number, number])
+    const thinned = thinMesh({ type: 'MultiLineString', coordinates: [line] }, 12)!
+    const out = thinned.coordinates[0]
+
+    expect(out.length).toBeLessThan(line.length / 3)
+    // The ends are what stop a thinned border pulling away from its neighbour.
+    expect(out[0]).toEqual(line[0])
+    expect(out[out.length - 1]).toEqual(line[line.length - 1])
+    // Still in order, and every point is one the full line had.
+    expect(out.map(p => p[0])).toEqual([...out.map(p => p[0])].sort((a, b) => a - b))
+    for (const p of out) expect(line).toContainEqual(p)
+
+    // A line with nothing to spare is handed back whole: three points are a
+    // corner, and dropping its middle would move the border.
+    const short = { type: 'MultiLineString' as const, coordinates: [[[-106, 49], [-100, 49], [-94, 49]] as Array<[number, number]>] }
+    expect(thinMesh(short, 12)).toEqual(short)
+    expect(thinMesh(null, 12)).toBeNull()
   })
 })

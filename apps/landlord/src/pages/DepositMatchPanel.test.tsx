@@ -139,7 +139,7 @@ describe('the owner’s bank review', () => {
   it('a TRANSFER memo with an amount-only match opens with nothing picked: Record stays off until the owner picks, then confirms that tenant’s charges', async () => {
     server.deposits = [deposit({
       id: 'txn1', description: 'ONLINE TRANSFER FROM CHK 1234', transferMemo: true,
-      candidates: [cand({ leaseId: 'l1', tenantName: 'Kim Harland', unit: 'APT 04', confidence: 'amount_unique', preselect: false, chargeIds: ['c1'] })],
+      candidates: [cand({ leaseId: 'l1', tenantName: 'Yvette Bexley', unit: 'APT 04', confidence: 'amount_unique', preselect: false, chargeIds: ['c1'] })],
     })]
     await open()
     expect(text()).toContain('The bank says this was a transfer between accounts — most often your own money.')
@@ -151,9 +151,9 @@ describe('the owner’s bank review', () => {
     expect(server.posts).toHaveLength(0)
 
     await click(radios()[0])
-    await until(() => !!button(/Record as paid by Kim Harland/), 'the deliberate pick')
-    expect(button(/Record as paid by Kim Harland/)!.disabled).toBe(false)
-    await click(button(/Record as paid by Kim Harland/))
+    await until(() => !!button(/Record as paid by Yvette Bexley/), 'the deliberate pick')
+    expect(button(/Record as paid by Yvette Bexley/)!.disabled).toBe(false)
+    await click(button(/Record as paid by Yvette Bexley/))
     await until(() => server.posts.length === 1, 'the confirm')
     expect(server.posts[0]).toEqual({
       url: '/bank-feed/deposits/txn1/confirm', body: { chargeIds: ['c1'], method: 'cash', declarationId: null },
@@ -163,16 +163,16 @@ describe('the owner’s bank review', () => {
   it('a match the server is sure of opens picked; one it is not sure of does not', async () => {
     server.deposits = [
       deposit({ id: 'txn1', description: 'DEPOSIT', transferMemo: false,
-        candidates: [cand({ leaseId: 'l1', tenantName: 'Kim Harland', unit: 'APT 04', confidence: 'amount_unique', preselect: true, chargeIds: ['c1'] })] }),
+        candidates: [cand({ leaseId: 'l1', tenantName: 'Yvette Bexley', unit: 'APT 04', confidence: 'amount_unique', preselect: true, chargeIds: ['c1'] })] }),
       deposit({ id: 'txn2', description: 'DEPOSIT', transferMemo: false,
         candidates: [
-          cand({ leaseId: 'l2', tenantName: 'Russ Fuller', unit: 'RV 02', confidence: 'amount_ambiguous', preselect: false, chargeIds: ['c2'] }),
-          cand({ leaseId: 'l3', tenantName: 'Shane Rueff', unit: 'MH 11', confidence: 'amount_ambiguous', preselect: false, chargeIds: ['c3'] }),
+          cand({ leaseId: 'l2', tenantName: 'Tamsin Wrenfield', unit: 'RV 02', confidence: 'amount_ambiguous', preselect: false, chargeIds: ['c2'] }),
+          cand({ leaseId: 'l3', tenantName: 'Xenia Cholmondeley', unit: 'MH 11', confidence: 'amount_ambiguous', preselect: false, chargeIds: ['c3'] }),
         ] }),
     ]
     await open()
     expect(radios().map(r => r.checked)).toEqual([true, false, false])
-    expect(button(/Record as paid by Kim Harland/)!.disabled).toBe(false)
+    expect(button(/Record as paid by Yvette Bexley/)!.disabled).toBe(false)
     expect(button(/Pick who paid this deposit/)!.disabled).toBe(true)
     // The transfer note is only for a transfer.
     expect(text()).not.toContain('transfer between accounts')
@@ -180,7 +180,7 @@ describe('the owner’s bank review', () => {
 
   it('every button on a card is a real button (base btn class), so “Pick who paid this deposit” shows as off while nobody is picked', async () => {
     server.deposits = [deposit({ id: 'txn1', description: 'ONLINE TRANSFER FROM CHK 1234', transferMemo: true,
-      candidates: [cand({ leaseId: 'l1', tenantName: 'Kim Harland', unit: 'APT 04', confidence: 'amount_unique', preselect: false, chargeIds: ['c1'] })] })]
+      candidates: [cand({ leaseId: 'l1', tenantName: 'Yvette Bexley', unit: 'APT 04', confidence: 'amount_unique', preselect: false, chargeIds: ['c1'] })] })]
     await open()
     const all = [...host.querySelectorAll('button')]
     expect(all.length).toBeGreaterThan(0)
@@ -192,11 +192,11 @@ describe('the owner’s bank review', () => {
 
   it('a refused confirm says the server’s sentence once and the list is read again in place', async () => {
     server.deposits = [deposit({ id: 'txn1', description: 'DEPOSIT', transferMemo: false,
-      candidates: [cand({ leaseId: 'l1', tenantName: 'Kim Harland', unit: 'APT 04', confidence: 'named_exact', preselect: true, chargeIds: ['c1'] })] })]
+      candidates: [cand({ leaseId: 'l1', tenantName: 'Yvette Bexley', unit: 'APT 04', confidence: 'named_exact', preselect: true, chargeIds: ['c1'] })] })]
     await open()
     const before = server.gets.length
     server.fail = { status: 409, error: 'That deposit was already matched' }
-    await click(button(/Record as paid by Kim Harland/))
+    await click(button(/Record as paid by Yvette Bexley/))
     await until(() => text().includes('That deposit was already matched. The list has been read again.'), 'the sentence')
     await until(() => server.gets.length > before, 'the list read again')
     expect(text().split('That deposit was already matched').length - 1).toBe(1)
@@ -206,7 +206,7 @@ describe('the owner’s bank review', () => {
 
 describe('“Not a rent payment”', () => {
   const transfer = () => deposit({ id: 'txn1', description: 'ONLINE TRANSFER FROM CHK 1234', transferMemo: true,
-    candidates: [cand({ leaseId: 'l1', tenantName: 'Kim Harland', unit: 'APT 04', confidence: 'amount_unique', preselect: false, chargeIds: ['c1'] })] })
+    candidates: [cand({ leaseId: 'l1', tenantName: 'Yvette Bexley', unit: 'APT 04', confidence: 'amount_unique', preselect: false, chargeIds: ['c1'] })] })
 
   it('takes the deposit off the list, says where it went, and offers Undo, which puts it back', async () => {
     server.deposits = [transfer()]
@@ -216,7 +216,7 @@ describe('“Not a rent payment”', () => {
     expect(server.posts).toEqual([{ url: '/bank-feed/deposits/txn1/not-rent', body: {} }])
     await until(() => !text().includes('Posted 2026-10-03'), 'the deposit to leave the list')
     expect(text()).toContain('The $450.00 deposit posted 2026-10-03 is set aside as not a rent payment: it is no longer offered against tenants, and GAM will not record it as a tenant\'s payment. It waits on the Bank feed tab under Needs review, where you file it or ignore it.')
-    expect(text()).not.toContain('Kim Harland')
+    expect(text()).not.toContain('Yvette Bexley')
     // Undo is the back-out: gray, never gold — and a real button (the base
     // `btn` class carries the padding and the disabled look).
     expect(button(/^Undo$/)!.classList.contains('btn')).toBe(true)
@@ -366,9 +366,9 @@ describe('“Not a rent payment”', () => {
 describe('a failed action is said once, by the deposit it belongs to', () => {
   const two = () => [
     deposit({ id: 'txn1', description: 'DEPOSIT', transferMemo: false,
-      candidates: [cand({ leaseId: 'l1', tenantName: 'Kim Harland', unit: 'APT 04', confidence: 'named_exact', preselect: true, chargeIds: ['c1'] })] }),
+      candidates: [cand({ leaseId: 'l1', tenantName: 'Yvette Bexley', unit: 'APT 04', confidence: 'named_exact', preselect: true, chargeIds: ['c1'] })] }),
     { ...deposit({ id: 'txn2', description: 'DEPOSIT', transferMemo: false,
-      candidates: [cand({ leaseId: 'l2', tenantName: 'Russ Fuller', unit: 'RV 02', confidence: 'named_exact', preselect: true, chargeIds: ['c2'] })] }),
+      candidates: [cand({ leaseId: 'l2', tenantName: 'Tamsin Wrenfield', unit: 'RV 02', confidence: 'named_exact', preselect: true, chargeIds: ['c2'] })] }),
       amount: 275, postedDate: '2026-10-02' },
   ]
   const card = (who: RegExp) => button(who)!.closest('.card') as HTMLElement
@@ -377,11 +377,11 @@ describe('a failed action is said once, by the deposit it belongs to', () => {
     server.deposits = two()
     await open()
     server.fail = { status: 502, error: 'The bank page did not answer' }
-    await click(button(/Record as paid by Russ Fuller/))
+    await click(button(/Record as paid by Tamsin Wrenfield/))
     const said = 'The bank page did not answer. Try again; if it keeps happening, tell GAM support.'
     await until(() => text().includes(said), 'the sentence')
-    expect(card(/Record as paid by Russ Fuller/).textContent).toContain(said)
-    expect(card(/Record as paid by Kim Harland/).textContent).not.toContain(said)
+    expect(card(/Record as paid by Tamsin Wrenfield/).textContent).toContain(said)
+    expect(card(/Record as paid by Yvette Bexley/).textContent).not.toContain(said)
     expect(text().split('The bank page did not answer').length - 1).toBe(1)
     expect(text()).not.toContain('The list has been read again')
   })
@@ -390,7 +390,7 @@ describe('a failed action is said once, by the deposit it belongs to', () => {
     server.deposits = two()
     await open()
     server.fail = { status: 429, error: '' }
-    await click(button(/Record as paid by Kim Harland/))
+    await click(button(/Record as paid by Yvette Bexley/))
     await until(() => text().includes('GAM was too busy to do that just now. Try again; if it keeps happening, tell GAM support.'), 'the sentence')
   })
 
@@ -399,10 +399,10 @@ describe('a failed action is said once, by the deposit it belongs to', () => {
     await open()
     server.fail = { status: 409, error: 'That deposit was already matched' }
     server.deposits = server.deposits.filter(d => d.transactionId !== 'txn2')   // someone else matched it
-    await click(button(/Record as paid by Russ Fuller/))
+    await click(button(/Record as paid by Tamsin Wrenfield/))
     const said = 'The $275.00 deposit posted 2026-10-02: That deposit was already matched. The list has been read again.'
     await until(() => text().includes(said), 'the sentence above the list')
-    await until(() => !button(/Record as paid by Russ Fuller/), 'the deposit gone')
+    await until(() => !button(/Record as paid by Tamsin Wrenfield/), 'the deposit gone')
     expect(text().split('That deposit was already matched').length - 1).toBe(1)
     expect(text()).not.toContain('Try again')
     // It can be put away: a gray × beside it.
@@ -418,10 +418,10 @@ describe('a failed action is said once, by the deposit it belongs to', () => {
     let release!: () => void
     server.postGate = new Promise<void>(r => { release = r })
     await open()
-    await click(button(/Record as paid by Kim Harland/))
+    await click(button(/Record as paid by Yvette Bexley/))
     await until(() => !!button(/^Recording…$/), 'the in-flight label')
     expect([...host.querySelectorAll('button')].filter(b => b.textContent === 'Recording…')).toHaveLength(1)
-    expect(button(/Record as paid by Russ Fuller/)!.disabled).toBe(true)
+    expect(button(/Record as paid by Tamsin Wrenfield/)!.disabled).toBe(true)
     await act(async () => { release() })
     await until(() => !button(/^Recording…$/), 'the record to finish')
   })

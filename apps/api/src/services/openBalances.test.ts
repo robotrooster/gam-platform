@@ -92,7 +92,7 @@ async function generalCredit(p: { landlordId: string; userId: string }, tenantId
 describe('S654 listOpenTenantBalances', () => {
   it('counts utilities, not just rent — every open charge', async () => {
     const p = await park()
-    const t = await resident('Rashawn Bump')
+    const t = await resident('Phaedra Stanhope')
     const s = await space(p, 'RV 10')
     await bill(p, t, s, daysAgo(30), [['rent', 440], ['utility', 997], ['utility', 25]])
     const rows = await listOpenTenantBalances({ landlordIds: [p.landlordId] })
@@ -116,7 +116,7 @@ describe('S654 listOpenTenantBalances', () => {
 
   it('overdueDays keeps only bills five or more days late', async () => {
     const p = await park()
-    const t = await resident('Jay Jones')
+    const t = await resident('Kipp Larkspur')
     const s = await space(p, 'RV 25')
     await bill(p, t, s, daysAgo(6), [['rent', 440]])
     await bill(p, t, s, daysAgo(2), [['rent', 440]])    // not late enough yet
@@ -142,7 +142,7 @@ describe('S654 listOpenTenantBalances', () => {
 
   it('eviction-mode units are left out only when asked', async () => {
     const p = await park()
-    const t = await resident('Lena Christian')
+    const t = await resident('Brisa Elsmore')
     const s = await space(p, 'MH 09')
     await bill(p, t, s, daysAgo(30), [['rent', 440]])
     await db.query(`UPDATE units SET payment_block = TRUE WHERE id = $1`, [s.unitId])
@@ -166,7 +166,7 @@ describe('S654 listOpenTenantBalances', () => {
 describe('S655 the full balance, with credit beside it', () => {
   it('Outstanding shows the full balance with usable credit beside it', async () => {
     const p = await park()
-    const t = await resident('Josh Roby')
+    const t = await resident('Soren Tremaine')
     const a = await space(p, 'MH 03')
     const b = await space(p, 'RV 27')
     await bill(p, t, a, daysAgo(30), [['rent', 500]])
@@ -210,7 +210,7 @@ describe('S655 the full balance, with credit beside it', () => {
 
   it('credit never pays a home payment, so it is on the account but not available for one', async () => {
     const p = await park()
-    const t = await resident('Shane Rueff')
+    const t = await resident('Xenia Cholmondeley')
     const s = await space(p, 'MH 11')
     await bill(p, t, s, daysAgo(2), [['home_payment', 200]])
     await generalCredit(p, t, 50)

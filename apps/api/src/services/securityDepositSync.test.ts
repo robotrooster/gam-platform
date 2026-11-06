@@ -22,6 +22,7 @@ import {
   seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
 import type { PoolClient } from 'pg'
+import { todayIn } from '../lib/timezone'
 
 beforeEach(cleanupAllSchema)
 
@@ -350,7 +351,7 @@ describe('decisions #46.3: who holds a deposit is set by how it was collected', 
       const { settleManualRentPayment } = await import('./manualPaymentSettle')
       const r = await settleManualRentPayment(client, {
         payment: { id: charge, landlord_id: s.landlordId, tenant_id: s.tenantId, unit_id: s.unitId, lease_id: s.leaseId,
-                   due_date: new Date().toISOString().slice(0, 10) } as any,
+                   due_date: todayIn(null) } as any,
         method: 'cash', settledAt: null, settleHousehold: true, amountTendered: 500, takenBy: null, source: 'desk',
         sendReceipt: false,
       })
@@ -369,7 +370,7 @@ describe('decisions #46.3: who holds a deposit is set by how it was collected', 
       const { settleManualRentPayment } = await import('./manualPaymentSettle')
       const r = await settleManualRentPayment(client, {
         payment: { id: charge, landlord_id: s.landlordId, tenant_id: s.tenantId, unit_id: s.unitId, lease_id: s.leaseId,
-                   due_date: new Date().toISOString().slice(0, 10) } as any,
+                   due_date: todayIn(null) } as any,
         method: 'check', settledAt: null,
       })
       expect(r.depositRecords).toEqual([expect.objectContaining({ amount: 500, heldBy: 'landlord' })])

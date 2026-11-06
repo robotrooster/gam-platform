@@ -376,9 +376,9 @@ describe('GAM\'s own money: the Stripe balance, split by whose it is (10/3)', ()
     ownerSharesOwed: 2869.72, heldItemsOwed: 4.25, payoutsReserved: 0, depositsInTrust: 0,
     managerPmCutsOwed: 0, paidAheadHeld: 0, checkrHeld: 75.88,
     clearing: [
-      { kind: 'tenant_payment', id: 'fierro', paymentIntentId: 'pi_f', method: 'bank', createdAt: '2026-10-01T15:00:00Z', othersShare: 460, gamFee: 6, gross: 466, who: 'Mireya Fierro' },
-      { kind: 'tenant_payment', id: 'cox', paymentIntentId: 'pi_c', method: 'bank', createdAt: '2026-10-01T15:00:00Z', othersShare: 557.79, gamFee: 6, gross: 563.79, who: 'Randall Cox' },
-      { kind: 'tenant_payment', id: 'troy', paymentIntentId: 'pi_t', method: 'bank', createdAt: '2026-10-01T15:00:00Z', othersShare: 541.5, gamFee: 6, gross: 547.5, who: 'Troy Street' },
+      { kind: 'tenant_payment', id: 'mortmain', paymentIntentId: 'pi_f', method: 'bank', createdAt: '2026-10-01T15:00:00Z', othersShare: 460, gamFee: 6, gross: 466, who: 'Jarrah Mortmain' },
+      { kind: 'tenant_payment', id: 'cox', paymentIntentId: 'pi_c', method: 'bank', createdAt: '2026-10-01T15:00:00Z', othersShare: 557.79, gamFee: 6, gross: 563.79, who: 'Osric Rookwood' },
+      { kind: 'tenant_payment', id: 'delphine', paymentIntentId: 'pi_t', method: 'bank', createdAt: '2026-10-01T15:00:00Z', othersShare: 541.5, gamFee: 6, gross: 547.5, who: 'Delphine Illingworth' },
     ],
     heldPayLinkPayments: 0,
     collected: { processingFees: 341.51, registerCardFees: 2.83, screeningKept: 14.10, landlordChargesCollected: 136, flexpayKept: 0, sweptIn: 10.33, keptFeesRecovered: 0, gamOwnedBillLines: 0,
@@ -402,7 +402,7 @@ describe('GAM\'s own money: the Stripe balance, split by whose it is (10/3)', ()
   it('a clearing bank payment counts only once Stripe has put it on the balance; its fees are not GAM\'s yet', () => {
     const s = splitPlatformBalance(book(), live())
     expect(s.clearing.landlordsOnBalance).toBe(1017.79)
-    expect(s.clearing.landlordsNotYetOnBalance).toBe(541.5)       // Troy: not on the balance, not subtracted
+    expect(s.clearing.landlordsNotYetOnBalance).toBe(541.5)       // Delphine: not on the balance, not subtracted
     expect(s.clearing.gamFees).toBe(18)
     expect(s.clearing.stripeTook).toBe(5.15)
     expect(s.clearing.netOnBalance).toBe(1024.64)
@@ -412,7 +412,7 @@ describe('GAM\'s own money: the Stripe balance, split by whose it is (10/3)', ()
     const s = splitPlatformBalance(book(), live())
     expect(s.clearing.gamTotal).toBe(18)
     expect(s.clearing.gamOnBalance).toBe(6.85)        // the figure both cards show
-    expect(s.clearing.gamNotYetOnBalance).toBe(6)     // Troy: Stripe has not recorded it
+    expect(s.clearing.gamNotYetOnBalance).toBe(6)     // Delphine: Stripe has not recorded it
     expect(Math.round((s.clearing.gamOnBalance + s.clearing.stripeTook + s.clearing.gamNotYetOnBalance) * 100))
       .toBe(Math.round(s.clearing.gamTotal * 100))
     // What the clearing payments put on the balance: the landlords' part and GAM's part, nothing else.
@@ -648,7 +648,7 @@ describe('a payment made late in one month and cleared in the next (10/3 review)
       [tenantId, landlordId, amount, status, method, fee, pi, at, settled])
     // September: one card payment, its day posted.
     await remit('settled', 'card', 460, 16.65, 'pi_sep_card', '2026-09-15T18:00:00Z', '2026-09-15T18:00:00Z')
-    // Randall Cox: made Sep 28, cleared Oct 6. Stripe posted its $2.63 fee Sep 28.
+    // Osric Rookwood: made Sep 28, cleared Oct 6. Stripe posted its $2.63 fee Sep 28.
     await remit('settled', 'ach', 520.20, 6, 'pi_cox', '2026-09-28T15:00:00Z', '2026-10-06T15:00:00Z')
     // GAM's own fees pulled from the landlord's bank: made Sep 29, cleared Oct 4.
     await db.query(

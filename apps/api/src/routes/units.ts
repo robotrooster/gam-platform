@@ -206,7 +206,7 @@ unitsRouter.get('/', async (req, res, next) => {
     // MONTH" — the household's months paid on time since it joined GAM (all
     // time, services/householdMonths), the figure the profile, the Rent Roll and
     // the tenant's own screen show. It used to be paid rows ÷ rows due, which
-    // never checked a date (Gerald Logue: 25% here, 6% on his profile, 0% on
+    // never checked a date (Arlo Braddock: 25% here, 6% on his profile, 0% on
     // his own screen; 1 of 2 months, 50%, under the one definition). NULL
     // until a month is judged. Scoped to the viewer's companies and properties.
     //
@@ -5801,7 +5801,7 @@ unitsRouter.get('/schedule/master', requirePerm(
     // that day. We have an exact log of the day they change spots."
     //
     // This drew one bar per lease on the lease's CURRENT space, from the day
-    // the lease began. Move Dakota Lane from RV 18 to RV 44 and the schedule
+    // the lease began. Move Tobin Thornbury from RV 18 to RV 44 and the schedule
     // would have said he had been on 44 all along — over the top of whoever
     // really was — and that 18 had been empty for a year. The move history
     // (lease_unit_history) is the log of who was where: one bar per stretch,

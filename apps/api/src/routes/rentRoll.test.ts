@@ -202,15 +202,42 @@ describe('GET /api/balances/rent-roll/properties', () => {
 // ─── The Payments page: the open month ──────────────────────────────────────
 
 describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
+  // ── 11/4 (Nic): "Something about the layout is off" ──────────────────────
+  //
+  // Two faults in this page's own comparator, both of which this covers: it
+  // sorted lines ALPHABETICALLY by label, so Electric printed above Rent; and
+  // the paid slice of a bill paid in part came before the rest only via
+  // "owed > 0", which is equal once BOTH halves are paid — MH 29's October
+  // exactly — and then fell through to a raw uuid.
+  it('a bill reads rent first, then utilities, late fees last — and the paid slice before the rest', async () => {
+    const p = await park()
+    const h = await household(p, 'RV 7', 'Nadia Quill')
+    await bill(p, h, THIS, [
+      { type: 'utility', amount: 60 },
+      { type: 'late_fee', amount: 50 },
+      { type: 'rent', amount: 400, paidDay: 1 },
+      { type: 'rent', amount: 50, remainder: true, notes: 'What is left of this bill after a part payment' },
+      { type: 'home_payment', amount: 200 },
+    ])
+    const res = await openMonth(owner(p), p.propertyId)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
+    const row = res.body.data.rows.find((r: any) => r.space === 'RV 7')
+    // Rent first (its paid slice, then what is left of it), then the utility,
+    // then the trailer payment, and the late fee last.
+    expect(row.charges.map((c: any) => [c.label, c.invoiced])).toEqual([
+      ['Rent', 400], ['Rent', 50], ['Utility', 60], ['Home payment', 200], ['Late fee', 50],
+    ])
+  })
+
   it('every space in space order below anyone still owing; Invoiced, Paid, Owed, the method and one status pill', async () => {
     const p = await park()
     const penny = await household(p, 'RV 10', 'Penny Paid')
-    const gerald = await household(p, 'RV 2', 'Gerald Logue')
+    const arlo = await household(p, 'RV 2', 'Arlo Braddock')
     const paula = await household(p, 'RV 1', 'Paula Partial')
     const walt = await household(p, 'RV 20', 'Walt Worktrade')
     await space(p, 'RV 3')                                 // empty
     await rent(p, penny, THIS, 495, 1)
-    const geraldRent = await rent(p, gerald, THIS, 495)
+    const geraldRent = await rent(p, arlo, THIS, 495)
     await bill(p, paula, THIS, [
       { type: 'rent', amount: 200, paidDay: 1 },
       { type: 'rent', amount: 295, remainder: true, notes: 'What is left of this bill after a part payment' },
@@ -218,12 +245,12 @@ describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
     await bill(p, walt, THIS, [{ type: 'rent', amount: 495, workTrade: true }])
     // Work-trade rent due the 1st (owes nothing) + a trailer payment due the
     // 10th (the only thing owed) — the mixed-date household.
-    const lisa = await household(p, 'RV 21', 'Lisa Trailer')
-    await bill(p, lisa, THIS, [{ type: 'rent', amount: 495, workTrade: true }])
-    await bill(p, lisa, THIS, [{ type: 'home_payment', amount: 333.33 }], 10)
+    const calla = await household(p, 'RV 21', 'Calla Trailer')
+    await bill(p, calla, THIS, [{ type: 'rent', amount: 495, workTrade: true }])
+    await bill(p, calla, THIS, [{ type: 'home_payment', amount: 333.33 }], 10)
     // Someone at another park is never on this one.
     const other = await park('Oak Park Motel and RV', p)
-    await rent(other, await household(other, 'MH 03', 'Josh Roby'), THIS, 440)
+    await rent(other, await household(other, 'MH 03', 'Soren Tremaine'), THIS, 440)
 
     const res = await openMonth(owner(p), p.propertyId)
     expect(res.status, JSON.stringify(res.body)).toBe(200)
@@ -232,8 +259,8 @@ describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
     // Owing first (RV 1, RV 2 in space order), then every other space in its spot — the empty one included.
     expect(d.rows.map((r: any) => [r.space, r.residents.map((x: any) => x.name).join(), r.status === 'vacant'])).toEqual([
       ['RV 1', 'Paula Partial', false],
-      ['RV 2', 'Gerald Logue', false],
-      ['RV 21', 'Lisa Trailer', false],
+      ['RV 2', 'Arlo Braddock', false],
+      ['RV 21', 'Calla Trailer', false],
       ['RV 3', '', true],
       ['RV 10', 'Penny Paid', false],
       ['RV 20', 'Walt Worktrade', false],
@@ -255,12 +282,12 @@ describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
     expect(row('RV 1').status).toBe(PAST_GRACE_NOW > 0 ? 'owes' : 'partial')
     expect(row('RV 1').charges.map((c: any) => [c.invoiced, c.owed])).toEqual([[200, 0], [295, 295]])
     // 10/25 (Nic): a month work trade covered says "Covered", not "Paid" —
-    // Lisa Scheeler read the green "Paid" as her trailer payment being paid.
+    // Calla Fitzhugh read the green "Paid" as her trailer payment being paid.
     // Method "Work trade"; never paid money, never owed.
     expect(row('RV 20')).toMatchObject({ status: 'covered', statusLabel: 'Covered', statusColor: 'green', workTradeOnly: true, methods: ['Work trade'], workTrade: 495, paid: 0, owed: 0 })
     // An empty space: gray Vacant, nothing on it.
     expect(row('RV 3')).toMatchObject({ status: 'vacant', statusLabel: 'Vacant', leaseId: null, householdId: null, invoiced: 0, recordWith: null, payments: [], charges: [] })
-    // 10/26 (Nic, Lisa Scheeler MH 01): the date on the pill is the oldest due
+    // 10/26 (Nic, Calla Fitzhugh MH 01): the date on the pill is the oldest due
     // date of what is OWED. Her rent is work trade — suspended on the 1st, owes
     // nothing — and her trailer payment is due the 10th, so the card read "Due
     // Oct 1" and would have gone red on the 2nd for a bill not late until the
@@ -443,7 +470,7 @@ describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
   it('who: "View all payments", "View who owes" (10/14) or the owner; staff get no sums; a property that is not theirs is a 404', async () => {
     const p = await park()
     const elsewhere = await park('Oak Park Motel and RV', p)
-    await rent(p, await household(p, 'RV 48', 'Gerald Logue'), THIS, 495)
+    await rent(p, await household(p, 'RV 48', 'Arlo Braddock'), THIS, 495)
     expect((await openMonth(await teamToken(p, 'onsite_manager', { 'payments.view': true, take_payment: true }), p.propertyId)).status).toBe(403)
     const desk = await openMonth(await teamToken(p, 'onsite_manager', { 'balances.view': true, 'payments.view': true }), p.propertyId)
     expect(desk.status).toBe(200)
@@ -457,7 +484,7 @@ describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
     expect(pm.body.data.totals).toBeDefined()
     const locked = await openMonth(await teamToken(p, 'onsite_manager', { 'payments.view_all': true }, [elsewhere.propertyId]), p.propertyId)
     expect(locked.status).toBe(404)
-    expect(JSON.stringify(locked.body)).not.toContain('Gerald')
+    expect(JSON.stringify(locked.body)).not.toContain('Arlo')
     const stranger = await park('Someone Else')
     expect((await openMonth(owner(stranger), p.propertyId)).status).toBe(404)
     expect((await get(owner(p), '/api/balances/rent-roll/open-month')).status).toBe(400)
@@ -468,7 +495,7 @@ describe('GET /api/balances/rent-roll/open-month — the Payments page', () => {
 // ─── 10/14 (Nic): the front desk sees the Payments page ─────────────────────
 
 describe('10/14 (Nic): the front desk ("View who owes") sees the open month, without the top view', () => {
-  // About Lisa Scheeler, Mountain View's on-site manager: "they should see at
+  // About Calla Fitzhugh, Mountain View's on-site manager: "they should see at
   // least the payments tab ... kind of the same way that I see it, but not with
   // that top view ... not show all the totals, the work trade, all these things
   // at the top in the header. Just have it show the record payment like it does
@@ -478,18 +505,18 @@ describe('10/14 (Nic): the front desk ("View who owes") sees the open month, wit
     const p = await park()
     const oak = await park('Oak Park Motel and RV', p)
     const penny = await household(p, 'RV 10', 'Penny Paid')
-    const gerald = await household(p, 'RV 2', 'Gerald Logue')
+    const arlo = await household(p, 'RV 2', 'Arlo Braddock')
     const walt = await household(p, 'RV 20', 'Walt Worktrade')
     const wanda = await household(p, 'RV 21', 'Wanda Halftrade')
     await space(p, 'RV 3')
     await rent(p, penny, THIS, 495, 1)
-    const geraldRent = await rent(p, gerald, THIS, 495)
+    const geraldRent = await rent(p, arlo, THIS, 495)
     await bill(p, walt, THIS, [{ type: 'rent', amount: 495, workTrade: true }])
     await bill(p, wanda, THIS, [{ type: 'rent', amount: 295, paidDay: 1 }, { type: 'utility', amount: 200, workTrade: true }])
-    await rent(oak, await household(oak, 'MH 03', 'Josh Roby'), THIS, 440)
+    await rent(oak, await household(oak, 'MH 03', 'Soren Tremaine'), THIS, 440)
 
-    const lisa = await teamToken(p, 'onsite_manager', { 'balances.view': true, 'payments.view': true, take_payment: true }, [p.propertyId])
-    const res = await openMonth(lisa, p.propertyId)
+    const calla = await teamToken(p, 'onsite_manager', { 'balances.view': true, 'payments.view': true, take_payment: true }, [p.propertyId])
+    const res = await openMonth(calla, p.propertyId)
     expect(res.status, JSON.stringify(res.body)).toBe(200)
     const d = res.body.data
     expect(d).toMatchObject({ propertyId: p.propertyId, propertyName: 'Mountain View RV Ranch', month: THIS })
@@ -514,19 +541,19 @@ describe('10/14 (Nic): the front desk ("View who owes") sees the open month, wit
     expect(mine.rows.find((r: any) => r.space === 'RV 21')).toMatchObject({ invoiced: 495, workTrade: 200, methods: ['Cash', 'Work trade'] })
     expect(mine.totals).toMatchObject({ invoiced: 1980, workTrade: 695, owed: 495 })
     // Another property is not hers; the picker lists hers alone.
-    expect((await openMonth(lisa, oak.propertyId)).status).toBe(404)
-    expect((await get(lisa, '/api/balances/rent-roll/properties')).body.data.map((x: any) => x.name)).toEqual(['Mountain View RV Ranch'])
+    expect((await openMonth(calla, oak.propertyId)).status).toBe(404)
+    expect((await get(calla, '/api/balances/rent-roll/properties')).body.data.map((x: any) => x.name)).toEqual(['Mountain View RV Ranch'])
     // The Rent Roll (history, payment health), the tenant report and the Payments ledger stay "View all payments".
-    expect((await history(lisa, p.propertyId, 'range=all')).status).toBe(403)
-    expect((await report(lisa, gerald.tenantId)).status).toBe(403)
-    expect((await get(lisa, `/api/balances/payments-by-month?month=${THIS}`)).status).toBe(403)
+    expect((await history(calla, p.propertyId, 'range=all')).status).toBe(403)
+    expect((await report(calla, arlo.tenantId)).status).toBe(403)
+    expect((await get(calla, `/api/balances/payments-by-month?month=${THIS}`)).status).toBe(403)
   })
 
   it('"View who owes" without "View all payments" is the desk\'s view for a property manager too; no desk window without "Take payments"', async () => {
     const p = await park()
     const walt = await household(p, 'RV 20', 'Walt Worktrade')
     await bill(p, walt, THIS, [{ type: 'rent', amount: 495, workTrade: true }])
-    await rent(p, await household(p, 'RV 2', 'Gerald Logue'), THIS, 495)
+    await rent(p, await household(p, 'RV 2', 'Arlo Braddock'), THIS, 495)
     const desk = await openMonth(await teamToken(p, 'property_manager', { 'balances.view': true }), p.propertyId)
     expect(desk.status).toBe(200)
     expect(desk.body.data.totals).toBeUndefined()
@@ -689,7 +716,7 @@ describe('10/13 (Nic): the stays on the Payments page — "show all money coming
     // The detail: date, amount, method and what it was for.
     expect(row(`stay:${rhea}`)).toMatchObject({
       invoiced: 0, owed: 0, owedEarlier: 0, methods: ['Cash'], recordWith: null, householdId: null, residents: [], charges: [],
-      delinquent: false, stay: { bookingId: rhea, checkIn: `${THIS}-01`, nights: 31, statusLabel: 'Checked in', refunded: 0, refunds: [] },
+      delinquent: false, stay: { bookingId: rhea, checkIn: `${THIS}-01`, nights: monthNights, statusLabel: 'Checked in', refunded: 0, refunds: [] },
     })
     expect(row(`stay:${rhea}`).payments).toEqual([{
       paymentId: rheaPaid, paidOn: `${THIS}-01`, amount: 589, credit: 0, methodLabel: 'Cash', status: 'settled', statusLabel: 'Settled',
@@ -775,7 +802,7 @@ describe('10/13 (Nic): the stays on the Payments page — "show all money coming
 
   it('the desk window rides only for a viewer who may take a payment', async () => {
     const p = await park()
-    const h = await household(p, 'RV 5', 'Gerald Logue')
+    const h = await household(p, 'RV 5', 'Arlo Braddock')
     const r = await rent(p, h, THIS, 495)
     const recordWith = async (token: string) => (await openMonth(token, p.propertyId)).body.data.rows[0].recordWith
     expect(await recordWith(owner(p))).toBe(r.paymentId)
@@ -863,11 +890,11 @@ describe('10/13 (Nic): "the payments page ... should show all money coming in" �
     // Propane to a walk-in, in cash.
     const propane = await sale(p, { method: 'cash', total: 23.92, day: `${THIS}-01`, items: ['Propane'] })
     // A pay link for a site and its electric, emailed to someone with no lease
-    // or stay here (Andres Razo's, RV 27), by card online — the card fee paid
+    // or stay here (Cora Castellan's, RV 27), by card online — the card fee paid
     // on top is not the property's money.
     const link = await sale(p, {
       method: 'card', total: 779.05, surcharge: 26.88, day: `${THIS}-01`, paidOnline: true,
-      items: ['RV site — monthly', 'Electric (per kWh)'], payLink: { customerName: 'Andres Razo' },
+      items: ['RV site — monthly', 'Electric (per kWh)'], payLink: { customerName: 'Cora Castellan' },
     })
     // A card swiped at the register by a customer on file.
     const swiped = await sale(p, { method: 'card', total: 4.19, day: `${THIS}-01`, items: ['Propane'], customer: 'Cora Card' })
@@ -893,7 +920,7 @@ describe('10/13 (Nic): "the payments page ... should show all money coming in" �
     const d = res.body.data
     expect(d.otherMoney.map((x: any) => [x.saleId, x.kind, x.day, x.amount, x.methodLabel, x.forLabel, x.who])).toEqual([
       [propane, 'sale', `${THIS}-01`, 23.92, 'Cash', 'Propane · at the register', null],
-      [link, 'sale', `${THIS}-01`, 752.17, 'Card · online', 'Electric (per kWh), RV site — monthly · pay link', 'Andres Razo'],
+      [link, 'sale', `${THIS}-01`, 752.17, 'Card · online', 'Electric (per kWh), RV site — monthly · pay link', 'Cora Castellan'],
       [swiped, 'sale', `${THIS}-01`, 4.19, 'Card · in person', 'Propane · at the register', 'Cora Card'],
       [mixed, 'sale', `${THIS}-01`, 20, 'Cash', 'Propane, RV site — weekly · at the register · the stay’s part is on its row', null],
     ].sort((a, z) => String(a[0]).localeCompare(String(z[0]))))
@@ -1036,10 +1063,10 @@ describe('10/13 (Nic): a bookkeeper sees the Payments page and the Rent Roll, re
   it('their property boxes narrow every read; no desk window; contact details never reach them', async () => {
     const p = await park('Mountain View RV Ranch')
     const oak = await park('Oak Park Motel and RV', p)
-    const h = await household(p, 'RV 48', 'Gerald Logue')
-    await db.query(`UPDATE users SET email = 'gerald.secret@t.dev', phone = '480-555-0199' WHERE id = (SELECT user_id FROM tenants WHERE id = $1)`, [h.tenantId])
+    const h = await household(p, 'RV 48', 'Arlo Braddock')
+    await db.query(`UPDATE users SET email = 'arlo.secret@t.dev', phone = '480-555-0199' WHERE id = (SELECT user_id FROM tenants WHERE id = $1)`, [h.tenantId])
     await rent(p, h, THIS, 495)
-    await rent(oak, await household(oak, 'MH 03', 'Josh Roby'), THIS, 440)
+    await rent(oak, await household(oak, 'MH 03', 'Soren Tremaine'), THIS, 440)
     const bk = (await bookkeeperToken(p, [p.propertyId])).token
 
     const props = await get(bk, '/api/balances/rent-roll/properties')
@@ -1047,14 +1074,14 @@ describe('10/13 (Nic): a bookkeeper sees the Payments page and the Rent Roll, re
     expect(props.body.data.map((x: any) => x.name)).toEqual(['Mountain View RV Ranch'])
     const month = await openMonth(bk, p.propertyId)
     expect(month.status).toBe(200)
-    expect(month.body.data.rows.map((r: any) => [r.space, r.residents[0]?.name, r.owed, r.recordWith])).toEqual([['RV 48', 'Gerald Logue', 495, null]])
+    expect(month.body.data.rows.map((r: any) => [r.space, r.residents[0]?.name, r.owed, r.recordWith])).toEqual([['RV 48', 'Arlo Braddock', 495, null]])
     // decisions #25: bookkeepers see the sums (A/R totals: yes, 10/12).
     expect(month.body.data.totals).toMatchObject({ invoiced: 495, owed: 495 })
     const hist = await history(bk, p.propertyId, `from=${THIS}&to=${THIS}`)
     expect(hist.status).toBe(200)
-    expect(hist.body.data.rows.map((r: any) => r.residents[0].name)).toEqual(['Gerald Logue'])
+    expect(hist.body.data.rows.map((r: any) => r.residents[0].name)).toEqual(['Arlo Braddock'])
     for (const body of [props.body, month.body, hist.body]) {
-      expect(JSON.stringify(body)).not.toContain('gerald.secret')
+      expect(JSON.stringify(body)).not.toContain('arlo.secret')
       expect(JSON.stringify(body)).not.toContain('480-555-0199')
     }
     // A property not ticked for them is not one they can see.
@@ -1328,7 +1355,7 @@ describe('a payment logged by hand after the late fee posted counts late from th
 describe('GET /api/tenants/:id/payment-report', () => {
   it('the household\'s health, every billed month in How late, its lease terms in words and every charge', async () => {
     const p = await park()
-    const h = await household(p, 'RV 48', 'Gerald Logue')
+    const h = await household(p, 'RV 48', 'Arlo Braddock')
     await db.query(`UPDATE leases SET late_fee_enabled = TRUE, late_fee_initial_amount = 0, late_fee_accrual_amount = 5,
                            late_fee_accrual_type = 'flat', late_fee_accrual_period = 'daily', late_fee_accrual_from = 'due_date'
                      WHERE id = $1`, [h.leaseId])
@@ -1338,7 +1365,7 @@ describe('GET /api/tenants/:id/payment-report', () => {
     const res = await report(owner(p), h.tenantId)
     expect(res.status, JSON.stringify(res.body)).toBe(200)
     const r = res.body.data
-    expect(r.name).toBe('Gerald Logue')
+    expect(r.name).toBe('Arlo Braddock')
     expect(r.leases[0]).toMatchObject({ grace_days: 5, grace_source: 'property', unit_number: 'RV 48',
       late_fee_terms: '$5 a day, counted back to the due date once the grace period has passed; no cap' })
     // 10/13 (Nic): every billed month — the one paid on time too — newest first, each with its pill.
@@ -1365,9 +1392,9 @@ describe('GET /api/tenants/:id/payment-report', () => {
   // overnight flag (it lags a payment until the nightly job runs).
   it('Delinquent is the Payments page\'s rule, lease by lease: past grace with money owed, cleared the moment it is paid', async () => {
     const p = await park()
-    const mh23 = await household(p, 'MH 23', 'Arturo Melendez')
+    const mh23 = await household(p, 'MH 23', 'Elan Everly')
     const sept = await rent(p, mh23, LAST, 525)                      // past grace, unpaid
-    const mh15 = await household(p, 'MH 15', 'Arturo Melendez', { tenantId: mh23.tenantId })
+    const mh15 = await household(p, 'MH 15', 'Elan Everly', { tenantId: mh23.tenantId })
     await rent(p, mh15, LAST, 460, 2)
     const pat = await household(p, 'MH 24', 'Pat Paid')
     await rent(p, pat, LAST, 525, 2)
@@ -1414,7 +1441,7 @@ describe('GET /api/tenants/:id/payment-report', () => {
 
   it('a lease the person is not on, or one the viewer cannot see, is a 404; a lease id that is not one is a 400', async () => {
     const p = await park()
-    const h = await household(p, 'RV 48', 'Gerald Logue')
+    const h = await household(p, 'RV 48', 'Arlo Braddock')
     const other = await household(p, 'RV 49', 'Nora Neighbor')
     await rent(p, h, LAST, 495, 2)
     expect((await report(owner(p), h.tenantId, `?leaseId=${other.leaseId}`)).status).toBe(404)
@@ -1426,7 +1453,7 @@ describe('GET /api/tenants/:id/payment-report', () => {
 
   it('staff without "View all payments" are refused; another company never sees it', async () => {
     const p = await park()
-    const h = await household(p, 'RV 48', 'Gerald Logue')
+    const h = await household(p, 'RV 48', 'Arlo Braddock')
     await rent(p, h, THIS, 495)
     expect((await report(await teamToken(p, 'onsite_manager', { 'balances.view': true }), h.tenantId)).status).toBe(403)
     const stranger = await park('Someone Else')
@@ -1474,12 +1501,12 @@ describe('GET /api/tenants/:id/payment-report', () => {
 
   it('a staff member locked to another property finds no history for a resident who never lived there', async () => {
     const p = await park()
-    const h = await household(p, 'RV 48', 'Gerald Logue')
+    const h = await household(p, 'RV 48', 'Arlo Braddock')
     await rent(p, h, LAST, 495, 2)
     const elsewhere = await park('Oak Park Motel and RV', p)
     const res = await report(await teamToken(p, 'onsite_manager', { 'payments.view_all': true }, [elsewhere.propertyId]), h.tenantId)
     expect(res.status).toBe(404)
-    expect(JSON.stringify(res.body)).not.toContain('Gerald')
+    expect(JSON.stringify(res.body)).not.toContain('Arlo')
   })
 })
 
@@ -1487,7 +1514,7 @@ describe('the report for a staff member kept to some properties (S655)', () => {
   it('names only the residents who lived there and only the work trade there', async () => {
     const p = await park()
     const other = await park('Oak Park', p)
-    const here = await household(p, 'RV 48', 'Gerald Logue')
+    const here = await household(p, 'RV 48', 'Arlo Braddock')
     await rent(p, here, LAST, 495, 2)
     // The same primary resident on a lease at the other park, with a co-tenant there only.
     const c = await db.connect()
@@ -1506,12 +1533,12 @@ describe('the report for a staff member kept to some properties (S655)', () => {
     expect(all.work_trade.agreements).toHaveLength(1)
     const locked = await report(await teamToken(p, 'onsite_manager', { 'payments.view_all': true }, [p.propertyId]), here.tenantId)
     expect(locked.status).toBe(200)
-    expect(locked.body.data.members.map((m: any) => m.name)).toEqual(['Gerald Logue'])
+    expect(locked.body.data.members.map((m: any) => m.name)).toEqual(['Arlo Braddock'])
     expect(locked.body.data.work_trade.agreements).toEqual([])
     expect(locked.body.data.leases.map((l: any) => l.unit_number)).toEqual(['RV 48'])
     // One lease named: that lease's residents and work trade only.
     const one = (await report(owner(p), here.tenantId, `?leaseId=${here.leaseId}`)).body.data
-    expect(one.members.map((m: any) => m.name)).toEqual(['Gerald Logue'])
+    expect(one.members.map((m: any) => m.name)).toEqual(['Arlo Braddock'])
     expect(one.work_trade.agreements).toEqual([])
   })
 
@@ -1588,7 +1615,7 @@ describe('10/12 review: a month close\'s work trade', () => {
   // The Tenants list keeps the payment health from staff the profile keeps it from (S641).
   it('the Tenants list shows the health only to a viewer who may see payment histories', async () => {
     const p = await park()
-    const h = await household(p, 'RV 48', 'Gerald Logue')
+    const h = await household(p, 'RV 48', 'Arlo Braddock')
     await rent(p, h, LAST, 495, 2)
     const healthFor = async (token: string) => ((await get(token, '/api/units')).body.data as any[])
       .find(u => u.tenant_id === h.tenantId).payment_health
@@ -1601,7 +1628,7 @@ describe('10/12 review: a month close\'s work trade', () => {
 describe('one household, one health number on every screen', () => {
   it('the Tenants list, the profile, the Rent Roll, the report and the resident\'s own heartbeat agree', async () => {
     const p = await park()
-    const h = await household(p, 'RV 48', 'Gerald Logue')
+    const h = await household(p, 'RV 48', 'Arlo Braddock')
     await rent(p, h, addMonths(LAST, -2), 495, 2)   // on time
     // 7 days past grace, with daily late fees on the bill: never a bill, never a "month".
     await bill(p, h, addMonths(LAST, -1), [
@@ -1674,15 +1701,15 @@ describe('the Tenants list and the profile split payment health by lease', () =>
     expect((await get(owner(stranger), '/api/tenants/health-by-unit')).body.data).toEqual([])
   })
 
-  // 10/13 review: Arturo Melendez's new MH 15 lease (waiting for signatures)
+  // 10/13 review: Elan Everly's new MH 15 lease (waiting for signatures)
   // read "Ended" beside his MH 23. Each lease says where it stands.
   it('each lease carries its own status — one not signed yet is pending, never ended', async () => {
     const p = await park()
-    const mh23 = await household(p, 'MH 23', 'Arturo Melendez')
+    const mh23 = await household(p, 'MH 23', 'Elan Everly')
     await rent(p, mh23, LAST, 525, 2)
-    const mh15 = await household(p, 'MH 15', 'Arturo Melendez', { tenantId: mh23.tenantId })
+    const mh15 = await household(p, 'MH 15', 'Elan Everly', { tenantId: mh23.tenantId })
     await db.query(`UPDATE leases SET status = 'pending' WHERE id = $1`, [mh15.leaseId])
-    const old = await household(p, 'MH 09', 'Arturo Melendez', { tenantId: mh23.tenantId, status: 'expired' })
+    const old = await household(p, 'MH 09', 'Elan Everly', { tenantId: mh23.tenantId, status: 'expired' })
     await rent(p, old, addMonths(LAST, -1), 525, 2)
     const profile = (await get(owner(p), `/api/tenants/${mh23.tenantId}/profile`)).body.data
     const leases = profile.stats.healthByLease.map((l: any) => [l.unit_number, l.status, l.current])
@@ -1696,7 +1723,7 @@ describe('the Tenants list and the profile split payment health by lease', () =>
 describe('the profile\'s Payment History: the household, a page at a time', () => {
   it('no 36-row cap: newest first, every charge across the pages, none twice', async () => {
     const p = await park()
-    const h = await household(p, 'RV 48', 'Gerald Logue')
+    const h = await household(p, 'RV 48', 'Arlo Braddock')
     const extra = 7
     const total = PROFILE_HISTORY_PAGE_SIZE + extra
     // One late fee a day (one per bill per day), spread over three bills.
@@ -1823,12 +1850,12 @@ describe('10/13 (Nic), round 3: "Pay links / register sales that name a space go
     await rent(p, lena, THIS, 495, 1)
     const rv2 = await space(p, 'RV 2')
     const rv27 = await space(p, 'RV 27')
-    // Andres Razo's pay link — a month and September's electric at RV 27 (empty now), by card online.
-    const andres = await sale(p, {
+    // Cora Castellan's pay link — a month and September's electric at RV 27 (empty now), by card online.
+    const cora = await sale(p, {
       method: 'card', total: 779.05, surcharge: 26.88, day: `${THIS}-01`, paidOnline: true,
-      items: ['RV site — monthly', 'Electric (per kWh)', 'Electric (per kWh) — September, RV 27'], payLink: { customerName: 'Andres Razo' },
+      items: ['RV site — monthly', 'Electric (per kWh)', 'Electric (per kWh) — September, RV 27'], payLink: { customerName: 'Cora Castellan' },
     })
-    const back = await registerRefund(p, andres, 10, `${THIS}-02`)
+    const back = await registerRefund(p, cora, 10, `${THIS}-02`)
     // A sale naming Lena's space ("rv01" is RV 1): on her household's row, beside her bills.
     const lenas = await sale(p, { method: 'cash', total: 20, day: `${THIS}-02`, items: ['Propane — rv01'] })
     // A stay paid on a ticket naming its site, with propane: the propane is on the stay's row too.
@@ -1849,8 +1876,8 @@ describe('10/13 (Nic), round 3: "Pay links / register sales that name a space go
     // RV 27 stays a gray Vacant row in its spot — its money is on it, never Invoiced, Paid or Owed.
     expect(row(`vacant:${rv27}`)).toMatchObject({ status: 'vacant', invoiced: 0, paid: 0, owed: 0, otherIn: 752.17, otherRefunded: 10 })
     expect(row(`vacant:${rv27}`).otherMoney.map((x: any) => [x.id, x.saleId, x.kind, x.amount, x.methodLabel, x.who])).toEqual([
-      [andres, andres, 'sale', 752.17, 'Card · online', 'Andres Razo'],
-      [back, andres, 'refund', 10, 'Cash', 'Andres Razo'],
+      [cora, cora, 'sale', 752.17, 'Card · online', 'Cora Castellan'],
+      [back, cora, 'refund', 10, 'Cash', 'Cora Castellan'],
     ])
     // RV 2 is not RV 27.
     expect(row(`vacant:${rv2}`)).toMatchObject({ otherMoney: [], otherIn: 0, otherRefunded: 0 })
@@ -1872,16 +1899,16 @@ describe('10/13 (Nic), round 3: "Pay links / register sales that name a space go
   })
 })
 
-// 10/13 (Nic): "When Andres Razo paid by card online for his stay ... it looks
+// 10/13 (Nic): "When Cora Castellan paid by card online for his stay ... it looks
 // like that charge is just for electric. It's not ... not clickable to show an
 // expanded breakdown ... It's not got a good breakdown between what's a
 // billback on the electricity and what is not."
 describe('10/13 (Nic): a register sale or pay link carries its breakdown', () => {
-  // Andres Razo's pay link as production has it (read-only, 10/13): Oct 6, card
+  // Cora Castellan's pay link as production has it (read-only, 10/13): Oct 6, card
   // online, $752.17 + a $26.88 card fee = $779.05; its three line items.
   const ANDRES: RegisterSale = {
     id: 'ff58520a', sold_on: '2026-10-06', sold_in_month: true, method: 'card', paid_online: true, via_link: true,
-    base: '752.17', screening: '0', who: 'Andres Razo',
+    base: '752.17', screening: '0', who: 'Cora Castellan',
     items: 'Electric (per kWh), Electric (per kWh) — September, RV 27, RV site — monthly', stays: [], refunds: [],
     lines: [
       { name: 'Electric (per kWh)', category: 'Utilities', qty: 387, unitPrice: 0.21, subtotal: 81.27, stayUnit: null },
@@ -1892,7 +1919,7 @@ describe('10/13 (Nic): a register sale or pay link carries its breakdown', () =>
   }
   const sum = (parts: Array<{ amount: number }>) => Math.round(parts.reduce((t, x) => t + Math.round(x.amount * 100), 0)) / 100
 
-  it('Andres Razo\'s $752.17: two electric bill-backs apart from the month\'s site rent, each its own amount; the card fee apart', () => {
+  it('Cora Castellan\'s $752.17: two electric bill-backs apart from the month\'s site rent, each its own amount; the card fee apart', () => {
     const [line] = splitRegisterMoney([ANDRES]).other
     expect(line).toMatchObject({ kind: 'sale', amount: 752.17, cardFee: 26.88 })
     expect(line.parts).toEqual([
@@ -1975,8 +2002,8 @@ describe('10/13 (Nic): a register sale or pay link carries its breakdown', () =>
     const siteMonth = (await db.query<{ id: string }>(
       `INSERT INTO pos_items (landlord_id, property_id, name, category_id, sell_price, cost_price, tax_rate, stock_qty, stock_min, stock_max, stay_unit)
        VALUES ($1,$2,'RV site — monthly',$3,589,0,0,999,0,999,'month') RETURNING id`, [p.landlordId, p.propertyId, cat])).rows[0].id
-    const andres = await sale(p, {
-      method: 'card', total: 779.05, surcharge: 26.88, day: `${THIS}-01`, paidOnline: true, items: [], payLink: { customerName: 'Andres Razo' },
+    const cora = await sale(p, {
+      method: 'card', total: 779.05, surcharge: 26.88, day: `${THIS}-01`, paidOnline: true, items: [], payLink: { customerName: 'Cora Castellan' },
       lines: [
         { name: 'RV site — monthly', category: 'Stays', qty: 1, price: 589, itemId: siteMonth },
         { name: 'Electric (per kWh)', category: 'Utilities', qty: 387, price: 0.21 },
@@ -1993,7 +2020,7 @@ describe('10/13 (Nic): a register sale or pay link carries its breakdown', () =>
     const d = res.body.data
     const onRow = d.rows.find((r: any) => r.key === `vacant:${rv27}`).otherMoney
     expect(onRow).toHaveLength(1)
-    expect(onRow[0]).toMatchObject({ saleId: andres, amount: 752.17, cardFee: 26.88 })
+    expect(onRow[0]).toMatchObject({ saleId: cora, amount: 752.17, cardFee: 26.88 })
     expect(onRow[0].parts.map((x: any) => [x.label, x.what, x.qty, x.unitPrice, x.unit, x.amount])).toEqual([
       ['Electric (per kWh)', 'Electric bill-back', 387, 0.21, 'kWh', 81.27],
       ['Electric (per kWh) — September, RV 27', 'Electric bill-back', 390, 0.21, 'kWh', 81.9],
@@ -2099,7 +2126,7 @@ describe('10/13 (Nic), round 3: the Rent Roll\'s stays — "an aggregate by line
        VALUES ($1,$2,'Gus G',$3::date,$4::date,'checked_in','month_to_month') RETURNING id`,
       [rv31, p.landlordId, `${LAST}-01`, `${THIS}-01`])).rows[0].id
     await siteDepositOn(p, g, 589, `${LAST}-01`)
-    // A month sold on a pay link with no stay on the schedule — its sale names RV 27 (Andres Razo's).
+    // A month sold on a pay link with no stay on the schedule — its sale names RV 27 (Cora Castellan's).
     await at('RV 27')
     await staySale(p, { item: monthly, qty: 1, price: 589, day: `${LAST}-06`, payLink: true, method: 'card',
       also: ['Electric (per kWh) — September, RV 27'] })

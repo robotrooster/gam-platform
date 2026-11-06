@@ -169,7 +169,10 @@ export function DialogHost() {
             onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
             title="Click to dismiss"
             style={{
-              pointerEvents: 'auto', maxWidth: 480, padding: '10px 16px', borderRadius: 8,
+              // 10/30: 480px centred on a 390px phone hangs ~45px off each side,
+              // and error toasts never time out, so the person was left reading a
+              // message whose both ends were unreachable.
+              pointerEvents: 'auto', maxWidth: 'min(480px, calc(100vw - 32px))', padding: '10px 16px', borderRadius: 8,
               background: 'var(--bg-1)', color: 'var(--text-0)', fontSize: '.85rem', lineHeight: 1.45,
               border: `1px solid ${t.kind === 'error' ? 'var(--red, #dc2626)' : 'var(--gold)'}`,
               boxShadow: '0 8px 30px rgba(0,0,0,.45)', cursor: 'pointer',
@@ -186,7 +189,11 @@ export function DialogHost() {
       {/* prompt modal */}
       {promptReq && (
         <div onClick={() => { promptReq.resolve(null); setPromptReq(null) }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 5100, padding: 16 }}>
-          <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', maxWidth: 440, background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 12, boxShadow: '0 20px 60px rgba(0,0,0,0.5)', padding: '16px 20px' }}>
+          {/* 10/30: no height cap and no inner scroll. The prompt auto-focuses
+              its field, so the keyboard opens and pushes OK/Cancel below the
+              screen with no way to reach them. .modal in globals.css has
+              guarded against this for ages; these three skipped it. */}
+          <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', maxWidth: 440, maxHeight: 'calc(var(--vh) - 32px)', overflowY: 'auto', background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 12, boxShadow: '0 20px 60px rgba(0,0,0,0.5)', padding: '16px 20px' }}>
             <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 6 }}>{promptReq.title}</div>
             <div style={{ fontSize: '.85rem', color: 'var(--text-1)', lineHeight: 1.5, marginBottom: 10, whiteSpace: 'pre-wrap' }}>{promptReq.message}</div>
             <input className="form-input" autoFocus value={promptValue}
@@ -204,7 +211,7 @@ export function DialogHost() {
       {/* choose modal (10/12, G6) */}
       {chooseReq && (
         <div onClick={() => { chooseReq.resolve(null); setChooseReq(null) }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 5100, padding: 16 }}>
-          <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', maxWidth: 460, background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 12, boxShadow: '0 20px 60px rgba(0,0,0,0.5)', padding: '16px 20px' }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', maxWidth: 460, maxHeight: 'calc(var(--vh) - 32px)', overflowY: 'auto', background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 12, boxShadow: '0 20px 60px rgba(0,0,0,0.5)', padding: '16px 20px' }}>
             <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 6 }}>{chooseReq.title}</div>
             <div style={{ fontSize: '.85rem', color: 'var(--text-1)', lineHeight: 1.5, marginBottom: 14, whiteSpace: 'pre-wrap' }}>{chooseReq.message}</div>
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
@@ -222,7 +229,7 @@ export function DialogHost() {
       {/* confirm modal */}
       {confirmReq && (
         <div onClick={() => settle(false)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 5100, padding: 16 }}>
-          <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', maxWidth: 440, background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 12, boxShadow: '0 20px 60px rgba(0,0,0,0.5)' }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: '100%', maxWidth: 440, maxHeight: 'calc(var(--vh) - 32px)', overflowY: 'auto', background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 12, boxShadow: '0 20px 60px rgba(0,0,0,0.5)' }}>
             <div style={{ padding: '16px 20px 0', display: 'flex', gap: 10, alignItems: 'flex-start' }}>
               {confirmReq.danger && <AlertTriangle size={18} style={{ color: 'var(--red, #dc2626)', flexShrink: 0, marginTop: 2 }} />}
               <div>

@@ -1,11 +1,11 @@
 /**
  * S651 — Mattoon load, stage 1: the lots.
  *
- * Source: "Illinois Trip.xlsx", sheet "Mattoon Lot Inspection Log" — Blu Haws'
+ * Source: "Illinois Trip.xlsx", sheet "Mattoon Lot Inspection Log" — Hollis Harkness'
  * own walk of Country Acres (Howard's MHP) at 10055 US-45, Mattoon IL.
  *
  * Nic: create every lot and MARK the dead ones, so the numbering matches the
- * paper Blu works from. Lots 12–14 and 25–26 were removed by the city and can
+ * paper Hollis works from. Lots 12–14 and 25–26 were removed by the city and can
  * never be rented; they exist here retired so a gap in the numbers never reads
  * as a missing record.
  *
@@ -17,7 +17,7 @@ import fs from 'fs'
 const DRY = process.env.DRY === '1'
 const SRC = __dirname + '/lots.json'
 const PROPERTY = 'e9743bfa-1972-4e40-8a1b-ad76a52a17b9'   // Country Acres - Mattoon
-const LANDLORD = 'e8904104-ab16-4d02-b6f8-cac88d738aae'   // TruBlu Management LLC (Blu Haws)
+const LANDLORD = 'e8904104-ab16-4d02-b6f8-cac88d738aae'   // TruHollis Management LLC (Hollis Harkness)
 
 /** The city removed these pads. They exist in the numbering and nowhere else. */
 const REMOVED = new Set(['12', '13', '14', '25', '26'])

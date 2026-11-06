@@ -1168,7 +1168,7 @@ describe('GET /api/stripe/tenant/payment-methods', () => {
 // ─── S571: default + one-of-each swap ─────────────────────────
 // ── S637: A BANK MID-VERIFICATION MUST STILL APPEAR ──────────────────
 //
-// Randall Cox set up ACH, believed he had paid, and his saved-methods list
+// Osric Rookwood set up ACH, believed he had paid, and his saved-methods list
 // showed only a card — no sign the bank existed at all. paymentMethods.list
 // returns ATTACHED methods, and in the descriptor-code microdeposit flow
 // Stripe does not attach the bank until the code is confirmed. So the bank

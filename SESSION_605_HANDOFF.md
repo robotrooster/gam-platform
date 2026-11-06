@@ -10,9 +10,9 @@
 
 ---
 
-## 1. ⭐ THE SIGNUP — Charlie Moore, 2026-08-15 05:46 Phoenix
+## 1. ⭐ THE SIGNUP — Noor Netherton, 2026-08-15 05:46 Phoenix
 
-`charlie.moore69@mx-mailsrv.com` · phone `6040606731` · organic, no referral code
+`noor.moore69@mx-mailsrv.com` · phone `6040606731` · organic, no referral code
 · user `f0e4b651-…` · landlord `a56f4658-…`
 
 **The whole session was 52 seconds.** Landed on the landlord app → `/login` →
@@ -222,7 +222,7 @@ lease trigger + booking trigger)
   before more landlords onboard", and it is not a reorder: the wizard has **no
   unit step at all** (profile → property → bank → agreement). Options: (a) add a
   units step + fee quote before bank, (b) make bank deferrable so onboarding can
-  complete without it, (c) just move bank last. **Charlie is the evidence this
+  complete without it, (c) just move bank last. **Noor is the evidence this
   matters** — he quit at this wizard.
 - **Multi-LLC at signup** — signup accepts exactly one entity with no way to add a
   second. DB and portfolio views already handle multi-entity (`landlord_members`);

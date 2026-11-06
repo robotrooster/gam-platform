@@ -925,8 +925,8 @@ export const ONBOARDING_FIRST_BILL_NEAR_DAYS = 10
 export const LATE_FEE_LEASE_COLUMNS = [
   'late_fee_grace_days',
   'late_fee_initial_flat', 'late_fee_initial_percent',
-  'late_fee_accrual_flat_daily', 'late_fee_accrual_flat_weekly', 'late_fee_accrual_flat_monthly',
-  'late_fee_accrual_percent_daily', 'late_fee_accrual_percent_weekly', 'late_fee_accrual_percent_monthly',
+  'late_fee_accrual_flat_daily', 'late_fee_accrual_flat_weekly',
+  'late_fee_accrual_percent_daily', 'late_fee_accrual_percent_weekly',
   'late_fee_cap_flat', 'late_fee_cap_percent',
 ] as const
 export function isLateFeeColumn(col: string | null | undefined): boolean {
@@ -2291,6 +2291,17 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
         { key: 'maintenance.view_costs', label: 'View cost breakdown', sensitive: true,
           hint: 'Has no effect for staff: the job counts and cost totals on Maintenance are owner-only.' },
       ]},
+      // 10/31: the contractor marketplace. Its own keys, at its own grain,
+      // because posting a job out for bids and choosing who gets it are
+      // different sizes of decision — picking a bid commits the money.
+      { label: 'Contractor marketplace', items: [
+        { key: 'marketplace.view',  label: 'View posted jobs',
+          hint: 'Shows the jobs you have put out for contractors to bid on, and the bids that came in.' },
+        { key: 'marketplace.post',  label: 'Post a job for bids',
+          hint: 'Put a job on the contractor marketplace and set whether it needs a bonded and insured contractor.' },
+        { key: 'marketplace.award', label: 'Choose a bid', sensitive: true,
+          hint: 'Award a job to one contractor at their price, and mark the finished job settled. This commits the money.' },
+      ]},
     ],
   },
   {
@@ -2339,6 +2350,21 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
       // phone straight onto the resident's record — nothing else in Documents.
       { key: 'documents.post_photo', label: 'Add photos & posted notices to a resident',
         hint: 'Take a photo on their phone (like a posted notice) and add it to a resident\'s record.' },
+    ]}],
+  },
+  {
+    // 11/01: insurance has a home now (insurance_policies) — a property's
+    // building policy, a resident's renters liability, a vendor's general
+    // liability and bond, and the list of what has lapsed. The front desk
+    // collects a resident's certificate at move-in and maintenance checks a
+    // contractor's before letting them on site, so this is genuinely a job
+    // that gets handed out, not an owner-only screen.
+    category: 'insurance', label: 'Insurance',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'insurance.view',   label: 'View insurance policies',
+        hint: 'Shows insurance certificates on file for your properties, residents and vendors, and the list of what has expired or expires soon. Look only.' },
+      { key: 'insurance.manage', label: 'Record & verify policies',
+        hint: 'Record a certificate (carrier, policy number, coverage amount, dates), upload the scan, mark one checked, or take one off the record with a reason. Verifying puts their name on it.' },
     ]}],
   },
   {
@@ -2928,7 +2954,7 @@ export const UNIT_TYPE_ICON: Record<UnitType, string> = {
 //     priced identically and there's no monthly-vs-nightly arbitrage.
 //   • FURNISHED / SERVICED LODGING (apartment, single_family, mobile_home,
 //     hotel_room) → 5% of booking revenue short-term (the Airbnb-competitor
-//     lane, higher value + more GAM does). A motel room is FURNISHED, not a bare
+//     lysander, higher value + more GAM does). A motel room is FURNISHED, not a bare
 //     site → 5%, same category as a cabin/apartment STR (Nic S577). The gap vs
 //     monthly $2 is intentional.
 //   • A MONTH STAY WITH NO LEASE (10/5, Nic R12) is a stay: it counts exactly
@@ -3374,6 +3400,351 @@ export const MAINTENANCE_PRIORITY_LABEL: Record<MaintenancePriority, string> = {
   low:       'Low',
 }
 
+// ─── Contractor marketplace (10/31) ──────────────────────────────────────────
+//
+// Nic's vision, dictated: a landlord posts a job open for bids, contractors
+// browse the board like eBay and bid, every bid is private to the landlord and
+// the one contractor who made it, contractors are on the platform for free,
+// and GAM takes 3% of the finished job. Explicitly NOT the Angie's List model
+// of charging for leads.
+//
+// This is a DIFFERENT product from the business portal, in his words: "The
+// business portal is for somebody operating their small business... That is
+// subscription based. Contractors that are looking for one-off jobs on bids,
+// that's a percentage of the cut. It's two different things."
+
+/**
+ * What kind of work a contractor does and a job needs.
+ *
+ * Deliberately the SAME vocabulary as a maintenance request's category, not a
+ * parallel list — a tenant's maintenance request promoted to a marketplace job
+ * carries its category straight through as the trade, and there is only one
+ * allowed-value set to keep in step with the database.
+ */
+export const CONTRACTOR_TRADES = MAINTENANCE_CATEGORIES
+export type ContractorTrade = MaintenanceCategory
+export const CONTRACTOR_TRADE_LABEL = MAINTENANCE_CATEGORY_LABEL
+
+/** Mirrors contractors_status_check. */
+export const CONTRACTOR_STATUSES = ['active', 'suspended', 'retired'] as const
+export type ContractorStatus = typeof CONTRACTOR_STATUSES[number]
+export const CONTRACTOR_STATUS_LABEL: Record<ContractorStatus, string> = {
+  active:    'Taking work',
+  suspended: 'Suspended',
+  retired:   'No longer working',
+}
+
+/** Mirrors contractor_credentials_kind_check. Insurance and bond are NOT here —
+ *  a policy lives in the one insurance home, never in two places. */
+export const CONTRACTOR_CREDENTIAL_KINDS = ['license', 'certification', 'registration', 'other'] as const
+export type ContractorCredentialKind = typeof CONTRACTOR_CREDENTIAL_KINDS[number]
+export const CONTRACTOR_CREDENTIAL_KIND_LABEL: Record<ContractorCredentialKind, string> = {
+  license:       'Trade license',
+  certification: 'Certification',
+  registration:  'Registration',
+  other:         'Other paperwork',
+}
+
+/** Mirrors marketplace_jobs_status_check. */
+export const MARKETPLACE_JOB_STATUSES = ['open', 'awarded', 'in_progress', 'completed', 'cancelled'] as const
+export type MarketplaceJobStatus = typeof MARKETPLACE_JOB_STATUSES[number]
+export const MARKETPLACE_JOB_STATUS_LABEL: Record<MarketplaceJobStatus, string> = {
+  open:        'Taking bids',
+  awarded:     'Awarded',
+  in_progress: 'Work started',
+  completed:   'Finished',
+  cancelled:   'Cancelled',
+}
+
+/** Mirrors marketplace_bids_status_check. */
+export const MARKETPLACE_BID_STATUSES = ['submitted', 'withdrawn', 'accepted', 'declined'] as const
+export type MarketplaceBidStatus = typeof MARKETPLACE_BID_STATUSES[number]
+export const MARKETPLACE_BID_STATUS_LABEL: Record<MarketplaceBidStatus, string> = {
+  submitted: 'Bid in',
+  withdrawn: 'Withdrawn',
+  accepted:  'Won',
+  declined:  'Not chosen',
+}
+
+/**
+ * GAM's cut of a finished marketplace job, as it stands today.
+ *
+ * The authority is the `marketplace_cut_rates` price card in the database, read
+ * through `requireMarketplaceCutPercent()` — re-pricing appends a forward-dated
+ * row and never reaches back into a job already awarded. This constant exists
+ * only so a screen can say "3%" without a round trip, exactly as PROCESSING_FEES
+ * mirrors platform_processing_rates. It is NEVER the value a charge is computed
+ * from, and a missing price card is an error, never a zero.
+ */
+export const MARKETPLACE_CUT_PERCENT_TODAY = 3
+
+// ─── Financing a job (10/31, Nic) ────────────────────────────────────────────
+//
+// "We're also going to offer financing for landlords. Landlords can do a big
+//  job... Let's match kind of our flex deposit scale with the Affirm style 2 or
+//  4 payments, and have an appropriately matched fee according to that."
+//
+// Asked how far up the table should go, he answered with an AFFORDABILITY rule
+// instead of a ceiling, which is the better answer:
+//
+// "based on landlord revenue and ability to repay. a one unit landlord at 800
+//  rent can never cover a job that big. lets say monthly payment 2 or 4 has to
+//  be equal or less than 25 percent of incoming invoices. scoped to leased
+//  units not short term stays. short term stays price off the lowest income
+//  over the last 6 months"
+//
+// So there is NO fixed maximum job. What a landlord can finance is whatever
+// their own book can carry, and a one-unit park at $800 simply cannot reach a
+// $20,000 roof.
+
+/** The monthly payment may not exceed this share of monthly income. */
+export const FINANCING_PAYMENT_SHARE_OF_INCOME = 0.25
+
+/**
+ * Affirm-style: two, four, or — on bigger jobs only — six.
+ *
+ * Two and four mirror FlexDeposit exactly, which is the consistency Nic chose
+ * ("that way we have some consistency across the platform"). Six was added
+ * 10/31 for jobs over $5,000: the 25% affordability rule does all the
+ * gatekeeping, so a longer plan is the only lever that lets a smaller operator
+ * reach a big job. A $20,000 roof needs ~$20,960 of monthly flat rent over four
+ * payments and ~$14,230 over six.
+ *
+ * Six is NOT offered below $5,000 — a $1,000 job over six months is $180 a
+ * month and helps nobody, and the same amount can be a FlexDeposit, which has
+ * only two lengths. The database enforces the floor as well
+ * (job_financing_six_is_for_big_jobs), so the rule cannot be lost by somebody
+ * appending a row.
+ */
+export const FINANCING_PAYMENT_COUNTS = [2, 4, 6, 12] as const
+export type FinancingPaymentCount = typeof FINANCING_PAYMENT_COUNTS[number]
+
+/**
+ * Six and twelve payments start here. Below it, two or four.
+ *
+ * Reuses the floor Nic set for six rather than inventing a second threshold —
+ * an eleven-month float on a $900 job earns $23 and helps nobody. The database
+ * enforces it too (job_financing_long_plans_are_for_big_jobs).
+ */
+export const FINANCING_LONG_PLAN_FLOOR = 5000
+
+/**
+ * WHAT GAM CHARGES TO SPREAD A JOB — a flat fee per month its money is out.
+ *
+ * 10/31 (Nic), settling it: "Pick the line where the to-pay payments on the job
+ * is 235 $235 on a $10,000 job. And go from there. Use that across the board.
+ * Two, four, six, and 12."
+ *
+ *     fee = 0.05 x (0.47 x job) x (payments - 1)
+ *         = 0.0235 x job x (payments - 1)
+ *
+ * $235 on a $10,000 job over two payments, which is $50 for every $1,000 of
+ * GAM's money per month.
+ *
+ * (payments - 1) because GAM's money is out one month FEWER than there are
+ * payments: the first lands the day the job finishes, the last squares it up.
+ * He asked exactly this — "wouldn't the four payment fee just be double what
+ * the two payment fee is?" — and it is TRIPLE, one month out against three.
+ *
+ * The authority is the `job_financing_fee_schedule` price card, read through
+ * `requireFinancingFee`. These constants exist so a screen can state the price
+ * without a round trip and so the table can be regenerated and audited. A
+ * missing bracket is an error, never a free plan.
+ */
+export const FINANCING_PER_DOLLAR_MONTH = 0.05
+/** The share of a job GAM has outstanding on average, whatever the plan length. */
+export const FINANCING_AVERAGE_OUTSTANDING_SHARE = 0.47
+
+/**
+ * HOW A FINANCING FEE IS DERIVED — dollar-months of GAM's own capital.
+ *
+ * 10/31 (Nic), on being shown that the four-payment plan earned less per dollar
+ * of capital than the two-payment one: "If the four payment plan is weak, we
+ * need to strengthen that. Two payments, four payments, and six payments need
+ * to be accurately handled."
+ *
+ * And the reason the inherited curve was wrong here, in his words: "Flex
+ * deposit was about helping low income fixed... relieving a burden on their
+ * ability to move into a place." FlexDeposit is priced for that purpose and
+ * GAM floats nothing on it. A landlord financing a roof is a business expense
+ * and GAM fronts the contractor, so job financing carries its own cost of
+ * capital and does NOT copy FlexDeposit's curve. FlexDeposit is untouched.
+ *
+ * THE MODEL. GAM pays the contractor the finished price less its marketplace
+ * cut, then collects the plan's equal payments, the first on the day the job
+ * finishes. What is still out, summed month by month, per $1 of job:
+ *
+ *     2 payments   0.470      4 payments   1.410
+ *     6 payments   2.350     12 payments   5.170
+ *
+ * Which is 0.470 x (payments - 1) every time, because the AVERAGE outstanding
+ * is always 0.47 of the job and only the duration changes. One rate per month
+ * therefore prices every plan length consistently, which is what "accurately
+ * handled" means — no plan length subsidising another.
+ */
+export function financingCapitalMonths(payments: number, cutPercent = 3): number {
+  if (!Number.isFinite(payments) || payments < 1) return 0
+  const fronted = 1 - cutPercent / 100
+  let total = 0
+  for (let k = 0; k < payments; k++) {
+    // Outstanding after the (k+1)-th payment. The first lands on day one, so
+    // the plan's own first payment is already netted off what GAM fronted.
+    const balance = fronted - (k + 1) / payments
+    if (balance > 0) total += balance
+  }
+  return Math.round(total * 1000) / 1000
+}
+
+/**
+ * The fee that earns `annualReturn` on the capital a plan of this length ties
+ * up. Rounded to the nearest $5, as every bracket in the schedule is.
+ *
+ * The TARGET is a product decision and lives with whoever sets the price card —
+ * this only does the arithmetic, so a table can be regenerated and checked
+ * rather than taken on trust.
+ */
+export function financingFeeForReturn(opts: {
+  job: number
+  payments: number
+  /** e.g. 0.60 for 60% a year on deployed capital. */
+  annualReturn: number
+  cutPercent?: number
+}): number {
+  const dollarMonths = financingCapitalMonths(opts.payments, opts.cutPercent ?? 3) * opts.job
+  const perMonth = opts.annualReturn / 12
+  return Math.round(dollarMonths * perMonth / 5) * 5
+}
+
+/**
+ * How far back the unpredictable half of the book is measured, and it is taken
+ * at its WORST month rather than its average.
+ *
+ * His words: "short term stays price off the lowest income over the last 6
+ * months." A seasonal park that takes nothing in July contributes nothing from
+ * stays, because a payment plan has to survive July. An average would lend
+ * against a peak the landlord cannot repeat.
+ */
+export const FINANCING_VARIABLE_LOOKBACK_MONTHS = 6
+
+/**
+ * WHEN the financing fee is collected, which changes what the 25% rule measures.
+ *
+ * Open as of 10/31 — the three shapes on the table, so the capacity arithmetic
+ * can be written once and the choice dropped in:
+ *
+ *   'spread'    the fee divides across the payments like the job does. Every
+ *               payment is the same. Affirm's way.
+ *   'first'     the whole fee rides payment 1, which is then the biggest and is
+ *               the one the rule has to be measured against. FlexDeposit's way,
+ *               and his reasoning there was "we get our fee at the first
+ *               payment... that's money that can be deployed sooner", plus: if
+ *               they bail, GAM has at least collected the fee.
+ *   'up_front'  paid when the plan is agreed, before the work starts, so the
+ *               payments carry the job alone.
+ */
+export const FINANCING_FEE_TIMINGS = ['spread', 'first', 'up_front'] as const
+export type FinancingFeeTiming = typeof FINANCING_FEE_TIMINGS[number]
+
+/**
+ * SETTLED 10/31 for job financing: the fee is SPREAD, so every payment is the
+ * same. His words, drawing the line against FlexDeposit on purpose: "On flex
+ * deposit, the whole fee rides installment 1... For landlords, we can split. We
+ * could split the fee for landlords across the whole thing, across the 4
+ * payments." A fixed-income resident funding a deposit and a landlord paying
+ * for a roof are not the same person.
+ *
+ * FlexDeposit keeps 'first' and is untouched by this.
+ */
+export const FINANCING_FEE_SPLIT_ACROSS_PAYMENTS: FinancingFeeTiming = 'spread'
+
+/**
+ * What GAM keeps on a marketplace job that finished at `finalAmount`, and what
+ * the contractor nets — rounded to the cent.
+ *
+ * ONE implementation, used by the server when it books the cut
+ * (services/marketplace.ts) and by both screens when they state the two shares
+ * before anyone commits to anything: the landlord's settle step and the
+ * contractor's bid form. Three copies of the same money arithmetic is three
+ * chances for the figure on screen to disagree with the figure booked, and the
+ * contractor's page is in an app with no test harness, so the arithmetic lives
+ * where it can be tested.
+ *
+ * `percent` always comes from the price card — the snapshot on an awarded job,
+ * or today's rate for a preview. Never a constant.
+ */
+export function marketplaceCutSplit(finalAmount: number, percent: number): {
+  cut: number; contractorNet: number
+} {
+  if (!Number.isFinite(finalAmount) || finalAmount < 0
+      || !Number.isFinite(percent) || percent < 0) {
+    return { cut: 0, contractorNet: 0 }
+  }
+  const cut = Math.round(finalAmount * (percent / 100) * 100) / 100
+  return { cut, contractorNet: Math.round((finalAmount - cut) * 100) / 100 }
+}
+
+// ── The paid top spot, and what it costs where ──────────────────────────────
+//
+// 10/31 (Nic): "Paid spot per trade per area code should be based on cost of
+// living in the area. LA/NY prices don't touch Wyoming or Oklahoma."
+//
+// Joining the marketplace is free and always will be. What is for sale is
+// POSITION: one contractor at the top of one trade in one area, exclusive,
+// with the free board open to everybody underneath it.
+
+/**
+ * How an area's territory is drawn.
+ *
+ * 'metro'       — a BEA metropolitan statistical area (its CBSA code is the key)
+ * 'state_rural' — everywhere in that state outside a metro (the state is the key)
+ * 'area_code'   — a telephone area code, if the territory is ever redrawn that
+ *                 way. Nothing is seeded as one: cost of living is published per
+ *                 metro and per state and NOT per area code, so an area-code row
+ *                 would need its index decided rather than read.
+ */
+export const MARKETPLACE_AREA_KINDS = ['metro', 'state_rural', 'area_code'] as const
+export type MarketplaceAreaKind = typeof MARKETPLACE_AREA_KINDS[number]
+
+/** What a top spot costs where the cost of living is the US average. */
+export const PLACEMENT_BASE_MONTHLY = 55
+
+/**
+ * How steeply the price climbs across the country.
+ *
+ * Solved from Nic's own two anchors (10/31): "$30 bucks in the least expensive
+ * areas… about 100 in NY/LA", then "make it cheaper in the cheap area so the
+ * curve lands at 100-120". $55 to the sixth power puts the cheapest areas at
+ * $20 and both New York and Los Angeles at $120.
+ *
+ * SAID PLAINLY, because at the sixth power this is no longer a price
+ * proportional to the cost of living: the index ORDERS the areas, which is
+ * published fact, and this exponent sets how steeply price climbs across that
+ * order. The index itself only spans 83.6 to 115.6 — goods cost nearly the
+ * same everywhere and only housing and labour move — so proportional pricing
+ * would put Los Angeles at $75 against Tulsa's $43. The sixth power turns that
+ * 1.38x gap into 6x, which puts most of the revenue on the expensive metros,
+ * where the jobs are bigger and the competition for the one top spot is
+ * fiercer.
+ */
+export const PLACEMENT_INDEX_EXPONENT = 6
+
+/** Where the index comes from. One string, so the screen and the seed agree. */
+export const PLACEMENT_INDEX_SOURCE = 'BEA Regional Price Parities, all items'
+
+/**
+ * The base formula, for the one job of PROVING the price card matches it.
+ *
+ * The live price always comes from `marketplace_placement_rates` — a band, like
+ * every other GAM price card, so a re-price is a row and not a deploy. This is
+ * how the nine bands were derived (read at each band's middle, rounded to $5)
+ * and the test asserts every one of them against it.
+ */
+export function placementMonthlyFromIndex(index: number): number {
+  if (!Number.isFinite(index) || index <= 0) return 0
+  const raw = PLACEMENT_BASE_MONTHLY * Math.pow(index / 100, PLACEMENT_INDEX_EXPONENT)
+  return Math.round(raw / 5) * 5
+}
+
 export enum DepositStatus {
   PENDING    = 'pending',     // FlexDeposit installments in progress
   FUNDED     = 'funded',      // Fully funded
@@ -3811,7 +4182,7 @@ export function formatAddendumDiffValue(field: string, raw: string | null | unde
     return raw === 'flat' ? 'Flat $' : raw === 'percent_of_rent' ? '% of rent' : raw
   }
   if (field === 'late_fee_accrual_period') {
-    return raw === 'daily' ? 'Daily' : raw === 'weekly' ? 'Weekly' : raw === 'monthly' ? 'Monthly' : raw
+    return raw === 'daily' ? 'Daily' : raw === 'weekly' ? 'Weekly' : raw
   }
   if (field === 'late_fee_enabled') {
     return raw === 'true' ? 'Yes' : raw === 'false' ? 'No' : raw
@@ -3884,8 +4255,8 @@ export const LEASE_COLUMNS = [
   // lease columns are legal/audit snapshot.
   'late_fee_grace_days',
   'late_fee_initial_flat', 'late_fee_initial_percent',
-  'late_fee_accrual_flat_daily', 'late_fee_accrual_flat_weekly', 'late_fee_accrual_flat_monthly',
-  'late_fee_accrual_percent_daily', 'late_fee_accrual_percent_weekly', 'late_fee_accrual_percent_monthly',
+  'late_fee_accrual_flat_daily', 'late_fee_accrual_flat_weekly',
+  'late_fee_accrual_percent_daily', 'late_fee_accrual_percent_weekly',
   'late_fee_cap_flat', 'late_fee_cap_percent',
   // fee_row (lease_fees table) — one row per tag at finalize
   'pet_deposit', 'key_deposit', 'cleaning_deposit',
@@ -3961,10 +4332,8 @@ export const LEASE_COLUMN_CATEGORY: Record<LeaseColumn, LeaseColumnCategory> = {
   late_fee_initial_percent:             'writable',
   late_fee_accrual_flat_daily:          'writable',
   late_fee_accrual_flat_weekly:         'writable',
-  late_fee_accrual_flat_monthly:        'writable',
   late_fee_accrual_percent_daily:       'writable',
   late_fee_accrual_percent_weekly:      'writable',
-  late_fee_accrual_percent_monthly:     'writable',
   late_fee_cap_flat:                    'writable',
   late_fee_cap_percent:                 'writable',
   // fee_row
@@ -4103,10 +4472,8 @@ export const LEASE_COLUMN_LABEL: Record<LeaseColumn, string> = {
   late_fee_initial_percent:             'Late fee — initial (% of rent)',
   late_fee_accrual_flat_daily:          'Late fee — daily accrual (flat $)',
   late_fee_accrual_flat_weekly:         'Late fee — weekly accrual (flat $)',
-  late_fee_accrual_flat_monthly:        'Late fee — monthly accrual (flat $)',
   late_fee_accrual_percent_daily:       'Late fee — daily accrual (% of rent)',
   late_fee_accrual_percent_weekly:      'Late fee — weekly accrual (% of rent)',
-  late_fee_accrual_percent_monthly:     'Late fee — monthly accrual (% of rent)',
   late_fee_cap_flat:                    'Late fee — cap (flat $)',
   late_fee_cap_percent:                 'Late fee — cap (% of rent)',
   pet_deposit:            'Pet deposit',
@@ -4191,10 +4558,8 @@ export const LEASE_COLUMN_INPUT: Record<LeaseColumn, LeaseColumnInput> = {
   late_fee_initial_percent:             'text',
   late_fee_accrual_flat_daily:          'text',
   late_fee_accrual_flat_weekly:         'text',
-  late_fee_accrual_flat_monthly:        'text',
   late_fee_accrual_percent_daily:       'text',
   late_fee_accrual_percent_weekly:      'text',
-  late_fee_accrual_percent_monthly:     'text',
   late_fee_cap_flat:                    'text',
   late_fee_cap_percent:                 'text',
   pet_deposit:            'text',
@@ -4256,10 +4621,8 @@ export type WritableLeaseColumn =
   | 'late_fee_initial_percent'
   | 'late_fee_accrual_flat_daily'
   | 'late_fee_accrual_flat_weekly'
-  | 'late_fee_accrual_flat_monthly'
   | 'late_fee_accrual_percent_daily'
   | 'late_fee_accrual_percent_weekly'
-  | 'late_fee_accrual_percent_monthly'
   | 'late_fee_cap_flat'
   | 'late_fee_cap_percent'
 
@@ -4371,10 +4734,26 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
     // leases_lease_type_check. The document is the wrong place to demand
     // machine values; the lease says what it says. Map it instead, and fall
     // back to fixed_term rather than ever writing something the column refuses.
+    //
+    // 10/28 (Nic): AND THE OTHER DIRECTION TOO. "If a tenant sets a
+    // month-to-month lease by having no end date, the system needs to know it's
+    // month-to-month. And if they put any sort of date on there, it needs to
+    // know to change it to a fixed term."
+    //
+    // The first half was already here. The second was not: a document whose
+    // term box still read "Month-to-month" while a real end date was typed
+    // produced a month-to-month lease WITH an end date — the same incoherence
+    // this spec exists to prevent, pointing the other way. It is reachable the
+    // moment a landlord puts a term on a lease drafted from a month-to-month
+    // template, which is exactly what happened on 10/28.
+    //
+    // So the DATE decides, both ways. A named commercial term still stands —
+    // nnn is a kind of fixed term, not a contradiction of one.
     parse: (v) => {
       const rawEnd = (v.end_date || '').trim()
       if (!rawEnd || rawEnd === '-') return { lease_type: 'month_to_month' }
-      return { lease_type: normaliseLeaseType(v.lease_type) }
+      const named = normaliseLeaseType(v.lease_type)
+      return { lease_type: named === 'month_to_month' ? 'fixed_term' : named }
     },
   },
   auto_renew: {
@@ -4435,11 +4814,6 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
       ? { late_fee_accrual_amount: v.late_fee_accrual_flat_weekly, late_fee_accrual_type: 'flat', late_fee_accrual_period: 'weekly' }
       : {},
   },
-  late_fee_accrual_flat_monthly: {
-    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_flat_monthly != null && Number.isFinite(Number(v.late_fee_accrual_flat_monthly))
-      ? { late_fee_accrual_amount: v.late_fee_accrual_flat_monthly, late_fee_accrual_type: 'flat', late_fee_accrual_period: 'monthly' }
-      : {},
-  },
   late_fee_accrual_percent_daily: {
     parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_percent_daily != null && Number.isFinite(Number(v.late_fee_accrual_percent_daily))
       ? { late_fee_accrual_amount: v.late_fee_accrual_percent_daily, late_fee_accrual_type: 'percent_of_rent', late_fee_accrual_period: 'daily' }
@@ -4448,11 +4822,6 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
   late_fee_accrual_percent_weekly: {
     parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_percent_weekly != null && Number.isFinite(Number(v.late_fee_accrual_percent_weekly))
       ? { late_fee_accrual_amount: v.late_fee_accrual_percent_weekly, late_fee_accrual_type: 'percent_of_rent', late_fee_accrual_period: 'weekly' }
-      : {},
-  },
-  late_fee_accrual_percent_monthly: {
-    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_percent_monthly != null && Number.isFinite(Number(v.late_fee_accrual_percent_monthly))
-      ? { late_fee_accrual_amount: v.late_fee_accrual_percent_monthly, late_fee_accrual_type: 'percent_of_rent', late_fee_accrual_period: 'monthly' }
       : {},
   },
   late_fee_cap_flat: {
@@ -5138,8 +5507,11 @@ export const RUBS_ALLOCATION_METHODS: readonly RubsAllocationMethod[] =
 export type LateFeeAmountType = 'flat' | 'percent_of_rent'
 export const LATE_FEE_AMOUNT_TYPES: readonly LateFeeAmountType[] = ['flat', 'percent_of_rent'] as const
 
-export type LateFeeAccrualPeriod = 'daily' | 'weekly' | 'monthly'
-export const LATE_FEE_ACCRUAL_PERIODS: readonly LateFeeAccrualPeriod[] = ['daily', 'weekly', 'monthly'] as const
+// 10/30 (Nic): the cadences have ONE definition, in ./lateFees — star-exported
+// at the foot of this file. This file used to declare its own copy of these two
+// names as well, and a local declaration silently beats a star re-export, so
+// every consumer got the copy here and dropping a cadence in lateFees.ts changed
+// nothing anyone could see. Add or remove a cadence in ./lateFees only.
 
 // ============================================================================
 // DEPOSIT ENUMS (properties.deposit_* + security_deposits.held_by, S24+)
@@ -6208,6 +6580,7 @@ export * from './autoPlaceEstimate'
 export * from './screeningFee'
 // === S655 money plan: credits, report bases, property breakdown, bank, FlexPay ===
 export * from './money'
+export * from './idScan'
 
 // ============================================================
 // S26a: Invoice types
@@ -6556,8 +6929,41 @@ export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> =
 // "our cost" or "passed through at cost" (the $4 ACH return fee is roughly at
 // cost; this one is not). Tenant-facing wording: "declined-payment fee".
 //
-// CARD ONLY. ACH keeps its own $4.00 return fee (FLEXPAY_ACH_RETURN_FEE).
+// CARD ONLY. A refused BANK debit carries ACH_RETURN_FEE instead, just below.
 export const CARD_DECLINE_FEE = 1.00
+
+// 11/4 (Nic): "the $4 return fee is any bounce payment... We are not eating
+// that. GAM eats no fees."
+//
+// The $4.00 a returned ACH debit costs GAM, passed on to the resident whose
+// bank refused it, on EVERY bounce — not only the FlexPay ones. It used to be
+// charged in exactly two places: FlexPay folded FLEXPAY_RETURNED_PULL_FEE into
+// the repriced pull, and a payment that SETTLED and was later clawed back was
+// billed RETURNFEE on the reversal path. An ordinary pull that the bank simply
+// refused — far and away the common case — passed on nothing at all, so GAM
+// paid for every one of them. It is charged as a 'fee' row with
+// entry_description 'RETURNFEE' and revenue_owner 'gam', and it rides the
+// resident's next bill rather than starting a pull of its own.
+//
+// At cost and never marked up (unlike CARD_DECLINE_FEE above, which is a flat
+// fee): tenant-facing wording is "returned-payment fee". Equal by construction
+// to FLEXPAY_RETURNED_PULL_FEE in money.ts, which FlexPay charges on its own
+// path; a test holds the two equal so a re-price moves both or neither.
+export const ACH_RETURN_FEE = 4.00
+
+// 11/4 (Nic): "they fail once, they retry, it fails again, the payment method
+// is blocked. That's it."
+//
+// How many times GAM re-pulls a bank that refused an ordinary debit: ONE. The
+// cap used to be 2, written as a bare `2` in four places, so a bounce meant
+// three debits against the same account across roughly nine days — three
+// chances to be refused, three $4 returns, and three marks against GAM's
+// unauthorized-debit ratio. The resident-facing email already promised one
+// retry, so the code and the promise disagreed.
+//
+// FlexPay keeps its own ladder (FLEXPAY_PULL_MAX_RETRIES), which its terms
+// state and its residents agreed to.
+export const ACH_MAX_RETRIES = 1
 
 // S568 (Nic): the onboarding-transition "prior arrangement" settlement. During
 // a landlord's move onto GAM, an IMPORTED tenant may have already paid the FIRST
@@ -6805,6 +7211,29 @@ export type PmStaffRole = typeof PM_STAFF_ROLES[number]
 export const PM_STAFF_STATUSES = ['active', 'inactive', 'removed'] as const
 export type PmStaffStatus = typeof PM_STAFF_STATUSES[number]
 
+/**
+ * 11/01: the Staff tab printed `role` and `status` straight out of the
+ * database, so a management company's own list read "manager" / "active" in
+ * lowercase. No raw enum reaches a screen ([[gam-no-raw-enums-in-ui]]).
+ *
+ * The role wording says what the person can DO rather than naming a rank,
+ * because that is the question a PM owner is answering when they add somebody:
+ * Nic, 10/22 — "If I own the property management company and I have somebody
+ * working for me that does maintenance, they are scoped to maintenance. I add
+ * them as a team member for maintenance."
+ */
+export const PM_STAFF_ROLE_LABEL: Record<PmStaffRole, string> = {
+  owner:   'Runs the company',
+  manager: 'Manages properties',
+  staff:   'Works assigned properties',
+}
+
+export const PM_STAFF_STATUS_LABEL: Record<PmStaffStatus, string> = {
+  active:   'Working',
+  inactive: 'Switched off',
+  removed:  'No longer here',
+}
+
 // Fee-cut taxonomy. Mirrors the per-property allocation rule shapes from
 // 16a (DEFERRED.md item 16a) so a pm_fee_plan composes cleanly with the
 // allocation engine when S109 wires the cut.
@@ -6898,6 +7327,7 @@ export * from './flexFees';
 // to. Nic printed an eviction balance summary in dark mode and got a solid
 // black sheet. Browser-only — never imported by the API.
 export * from './printTheme';
+export * from './stackTables';
 // S624: property timezone from state + ZIP. Fifteen states split, so state alone
 // is wrong for all of them — and an unresolvable ZIP is FLAGGED, not guessed.
 export * from './propertyTimezone';
@@ -7864,6 +8294,117 @@ export const meterReadingModulus = (digits: number) => 10 ** digits
 // a tenant's invoice. Numbers are Nic's first guesses ("kwh ive never
 // seen over 1500 so over 5k"; water unsure) — tune freely, they only
 // gate the review flag, not the billing math. null = never flag.
+/**
+ * 10/31 (Nic) — WHERE IN THE PARK THIS HOUSEHOLD SITS.
+ *
+ *   "I'd like a way to flag high usage people as billing kind of not the
+ *    highest in the park, but on the upper end of the spectrum... you can kind
+ *    of tell when there's people that are there all day, every day versus
+ *    people that go to work. The RV zoos have 4 people in that RV, 2 young kids
+ *    that I'm sure are just going crazy with everything. There's a difference
+ *    between that and a single person that's working 12-hour shifts."
+ *
+ * Only used while a meter is BROKEN, to pick where in the neighbours' usage the
+ * estimate lands. A meter that reads always bills its own reads, whatever this
+ * says.
+ *
+ *   low     — the 25th percentile of credible occupied usage. The default, and
+ *             S647's rule unchanged: "the low end of where people are starting
+ *             to cluster." Conservative, because three quarters used more.
+ *   typical — the median. A household nobody has a read on either way.
+ *   upper   — the 75th percentile. A full rig, people home all day. Deliberately
+ *             NOT the maximum: one outlier must never set somebody's bill.
+ *
+ * When the landlord knows the actual figure, utility_meters.expected_monthly_usage
+ * beats all three — a real number from their own records is better than any
+ * percentile of their neighbours.
+ */
+/**
+ * 10/24 (Nic) — "if a meter read is within one or two digits of the other read,
+ * even if it's lower, just go straight into marking it as potentially broken...
+ * Maybe last month somebody rounded it to 40,000 and this month it was read as
+ * 39999. So it could, when it's within one or two, like it could be really just
+ * broken, not actually less than before. There's a rounding error."
+ *
+ * Lives here because the REVIEW WINDOW has to ask the same question the billing
+ * engine answers. It did not, and on 10/31 Nic was offered "the meter rolled
+ * past 99999" for a read one unit low — a wrap that would have billed 99,999 kWh.
+ */
+/**
+ * 10/31 (Nic) — WHAT STAYS IN THE DRAWER, AND WHY IT IS NEVER JUST A NUMBER.
+ *
+ * Asked what a "float" was, he had never heard the word — so it is not in the
+ * product. The screen says STARTING CASH: what stays in the drawer so the next
+ * person can make change. It is also what makes a count mean anything: a drawer
+ * that started with $200 and rang $340 of cash should hold $540, and counting
+ * $525 is $15 short.
+ *
+ * On why a bare total is not enough (10/30): "$200 in the drawer" satisfied with
+ * two $100 bills is useless, because nobody can break a hundred for a guest
+ * buying a $4 bag of ice. So the amount is sayable by denomination — "five 5s
+ * and 75 1s" — as well as a plain total.
+ *
+ * $2 bills and half dollars are included deliberately. They are rare, but a
+ * denomination the screen cannot show is a drawer that cannot be reconciled.
+ */
+export const CASH_DENOMINATIONS = [10000, 5000, 2000, 1000, 500, 200, 100, 50, 25, 10, 5, 1] as const
+export type CashDenomination = typeof CASH_DENOMINATIONS[number]
+
+/** Cents -> what a cashier calls it. */
+export const CASH_DENOMINATION_LABEL: Record<number, string> = {
+  10000: '$100', 5000: '$50', 2000: '$20', 1000: '$10', 500: '$5', 200: '$2', 100: '$1',
+  50: '50\u00a2', 25: 'Quarters', 10: 'Dimes', 5: 'Nickels', 1: 'Pennies',
+}
+
+/**
+ * What GAM puts in the box when a register is first set up. A SUGGESTION, never
+ * a default — Nic, 10/31: "I don't want to have any default for that at the
+ * platform level. Like, I mean, it can suggest $100, but nothing is set in
+ * stone. They would have to confirm it."
+ *
+ * Nothing inherits. A register's starting cash is set on that register and no
+ * company or property number ever fills it in ([[feedback-three-setting-levels]]).
+ * His own case for per-register: a second register is often break coverage a
+ * manager opens for twenty minutes, and "it doesn't need to be the same across
+ * each register at the property."
+ */
+export const STARTING_CASH_SUGGESTION_CENTS = 10000
+
+/** Over this, closing a shift asks what happened. Set per register; this is the suggestion. */
+export const DRAWER_VARIANCE_REASON_SUGGESTION_CENTS = 500
+
+export const REGISTER_SHIFT_STATUSES = ['open', 'closed'] as const
+export type RegisterShiftStatus = typeof REGISTER_SHIFT_STATUSES[number]
+
+export const POS_REGISTER_STATUSES = ['active', 'retired'] as const
+export type PosRegisterStatus = typeof POS_REGISTER_STATUSES[number]
+
+/** Cents from a {denomination_cents: count} map. The one definition both sides use. */
+export function cashBreakdownTotalCents(breakdown: Record<string, number> | null | undefined): number {
+  if (!breakdown) return 0
+  return Object.entries(breakdown).reduce((sum, [denom, count]) => {
+    const d = Number(denom), n = Number(count)
+    if (!Number.isFinite(d) || !Number.isFinite(n) || d <= 0 || n < 0) return sum
+    return sum + Math.round(d) * Math.floor(n)
+  }, 0)
+}
+
+export const READING_BARELY_MOVED_UNITS = 2
+
+export const METER_USAGE_BANDS = ['low', 'typical', 'upper'] as const
+export type MeterUsageBand = typeof METER_USAGE_BANDS[number]
+
+/** The percentile each band estimates at, nearest-rank. */
+export const METER_USAGE_BAND_PERCENTILE: Record<MeterUsageBand, number> = {
+  low: 0.25, typical: 0.50, upper: 0.75,
+}
+
+export const METER_USAGE_BAND_LABEL: Record<MeterUsageBand, string> = {
+  low: 'Uses less than most',
+  typical: 'About average for the park',
+  upper: 'Uses more than most',
+}
+
 export const METER_USAGE_ALERT_THRESHOLDS: Record<string, number | null> = {
   electric: 5000,   // kWh
   water: 10000,     // gallons
@@ -7959,8 +8500,13 @@ export const WORK_TRADE_FIELD_PERMISSION_LABEL: Record<WorkTradeFieldPermission,
 //   auto_friday      the scheduled weekly run
 //   catch_up         money that landed after the weekly run, paid the next day
 //   stripe_dashboard a payout the landlord made themselves in Stripe
+//   month_end_sweep  10/28: the S641 push 2 business days before month end. It
+//                    was missing here, so the sweep rendered as a SECOND
+//                    "Weekly payout" a day after the real one and the owner
+//                    could not tell his own payouts apart on any screen.
 export const DISBURSEMENT_TRIGGER_LABEL: Record<string, string> = {
   auto_friday:      'Weekly payout',
+  month_end_sweep:  'Month-end sweep',
   catch_up:         'Landed after the weekly run',
   manual_on_demand: 'Requested payout',
   otp_legacy:       'On-Time Pay (legacy)',
@@ -8600,7 +9146,7 @@ export function dateDigitSettles(which: 'mm' | 'dd', digits: string): boolean {
 // ── S639: PEOPLE'S NAMES GET TYPED IN A HURRY ────────────────────────────────
 //
 // Nic: "On the tenant portal invites, I want to have it be title case on the
-// names. I accidentally put Gerald Logue as a lower case, and I have no way to
+// names. I accidentally put Alan Mercer as a lower case, and I have no way to
 // change that invite."
 //
 // A tenant's name is typed once, at speed, during a bulk onboarding — and then
@@ -9031,3 +9577,87 @@ export * from './metricsMap'
 // sentences for both, shared by the matcher that scores a pair and the screen that asks.
 export * from './duplicatePeople'
 
+
+/**
+ * WHICH POINT IDENTIFIED SOMEBODY as the person a left-owing debt belongs to.
+ * One definition, because the CHECK on `tenant_left_owing_match_reviews`
+ * lists the same values and 10/29 proved what happens when it does not: a
+ * fourth point was added here, the constraint still allowed three, and the
+ * close call it raised was swallowed instead of reaching a person.
+ *
+ * Strongest first — that is the order the matcher reads them in.
+ */
+export const LEFT_OWING_MATCH_POINTS = ['account', 'licence', 'email', 'phone'] as const
+export type LeftOwingMatchPoint = typeof LEFT_OWING_MATCH_POINTS[number]
+
+/**
+ * WHAT SOMEBODY WALKED AWAY FROM. One walk-away debt per person per landlord,
+ * added up from one part per thing (11/5, Nic: "it needs to be able to be
+ * infused from different sources... a lease contributes, a stay contributes, an
+ * unpaid countersale contributes").
+ *
+ *   'lease'   a tenancy that ended owing
+ *   'stay'    a reservation that was never paid off
+ *   'counter' a register tab or pay link nobody came back for — his propane
+ *             case: "my card wasn't working... I'm going to come back with a
+ *             new card," and they never do
+ *   'carried' the share of an EARLIER landlord's debt that the landlord doing
+ *             the collecting paid out when the resident left part-way through
+ *   'import'  a balance another operator recorded before GAM
+ *
+ * One definition, because the CHECK on `tenant_left_owing_parts.kind` lists the
+ * same values — the lesson LEFT_OWING_MATCH_POINTS above was written for.
+ */
+export const LEFT_OWING_PART_KINDS = ['lease', 'stay', 'counter', 'carried', 'import'] as const
+export type LeftOwingPartKind = typeof LEFT_OWING_PART_KINDS[number]
+
+/**
+ * 11/01 — INSURANCE: THE THREE KINDS, AND WHICH KIND OF COVER FITS WHICH.
+ *
+ * One definition, because the CHECK constraints on `insurance_policies` list
+ * the same values twice (the type itself, and the pairing against the subject)
+ * and drift between a schema CHECK and a code constant is a bug.
+ *
+ * A subtype classifies. It never prices anything, and nothing here states a
+ * required coverage amount: what an operator asks of a resident or a vendor is
+ * theirs to decide.
+ */
+export const INSURANCE_SUBJECTS = ['property', 'resident', 'vendor', 'contractor'] as const
+export type InsuranceSubject = typeof INSURANCE_SUBJECTS[number]
+
+export const INSURANCE_COVERAGE_TYPES = [
+  'building', 'general_liability', 'renters_liability', 'surety_bond',
+] as const
+export type InsuranceCoverageType = typeof INSURANCE_COVERAGE_TYPES[number]
+
+/** Which kinds of cover may hang off each subject — mirrors the DB pairing CHECK. */
+export const INSURANCE_COVERAGE_BY_SUBJECT: Record<InsuranceSubject, readonly InsuranceCoverageType[]> = {
+  property:   ['building', 'general_liability'],
+  resident:   ['renters_liability'],
+  vendor:     ['general_liability', 'surety_bond'],
+  contractor: ['general_liability', 'surety_bond'],
+}
+
+/** No raw enum ever reaches a screen ([[gam-no-raw-enums-in-ui]]). */
+export const INSURANCE_COVERAGE_LABEL: Record<InsuranceCoverageType, string> = {
+  building:          'Building / property policy',
+  general_liability: 'General liability',
+  renters_liability: 'Renters liability',
+  surety_bond:       'Surety bond',
+}
+
+export const INSURANCE_SUBJECT_LABEL: Record<InsuranceSubject, string> = {
+  property:   'Property',
+  resident:   'Resident',
+  vendor:     'Vendor',
+  contractor: 'Contractor',
+}
+
+/**
+ * The lapse window. "Expires within N days" is the operator's question, and the
+ * default is a month because that is how much notice a renewal needs. Already
+ * expired is always included — a certificate that lapsed last week is the whole
+ * reason the list exists.
+ */
+export const INSURANCE_LAPSE_DEFAULT_DAYS = 30
+export const INSURANCE_LAPSE_MAX_DAYS = 365

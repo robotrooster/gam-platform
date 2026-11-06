@@ -7,7 +7,16 @@
 export const LATE_FEE_KINDS = ['flat', 'percent_of_rent'] as const;
 export type LateFeeKind = (typeof LATE_FEE_KINDS)[number];
 
-export const LATE_FEE_ACCRUAL_PERIODS = ['daily', 'weekly', 'monthly'] as const;
+// The cadences a late fee can RECUR on while a bill stays unpaid. 10/30 (Nic):
+// 'monthly' is gone. It was an exact duplicate of the one-time fee — a monthly
+// late fee is one fee on that bill, and if rent still isn't paid when the next
+// invoice goes out, that invoice carries its own fee, which is what a one-time
+// fee with nothing in the ongoing box already does. It was also the only cadence
+// with calendar math (months differ in length, so a fee on the 31st has to clamp
+// back to the 30th in June), and that math was the sole source of the engine's
+// anchor bugs. Weekly stays: it recurs on the same bill like daily, with no
+// clamping, and how landlords bill differs by state and on the business portal.
+export const LATE_FEE_ACCRUAL_PERIODS = ['daily', 'weekly'] as const;
 export type LateFeeAccrualPeriod = (typeof LATE_FEE_ACCRUAL_PERIODS)[number];
 
 // S577: where the daily/period accrual starts COUNTING once grace is crossed.
@@ -32,11 +41,6 @@ function formatISODate(y: number, m: number, d: number): string {
   const mm = String(m).padStart(2, '0');
   const dd = String(d).padStart(2, '0');
   return `${y}-${mm}-${dd}`;
-}
-
-function daysInMonth(y: number, m: number): number {
-  // m is 1-indexed
-  return new Date(Date.UTC(y, m, 0)).getUTCDate();
 }
 
 function addDaysISO(iso: string, days: number): string {
@@ -73,23 +77,12 @@ export function lateFeeStartDate(dueDate: string, graceDays: number): string {
 }
 
 /**
- * `n` accrual periods after `anchor`: n days, n weeks, or the same day of the
- * month n months on (clamped to the month's last day, counted from the anchor
- * so a 31st stays a 31st where the month has one).
+ * `n` accrual periods after `anchor`: n days, or n weeks. Both are plain day
+ * arithmetic — no month lengths, so an accrual day can never be clamped and the
+ * day a bill's fees sit on can never drift (see LATE_FEE_ACCRUAL_PERIODS).
  */
 export function addAccrualPeriods(anchor: string, period: LateFeeAccrualPeriod, n: number): string {
-  if (period === 'daily') {
-    return addDaysISO(anchor, n);
-  }
-  if (period === 'weekly') {
-    return addDaysISO(anchor, n * 7);
-  }
-  const { y, m, d } = parseISODate(anchor);
-  const totalMonths = (m - 1) + n;
-  const targetY = y + Math.floor(totalMonths / 12);
-  const targetM = (totalMonths % 12) + 1;
-  const targetD = Math.min(d, daysInMonth(targetY, targetM));
-  return formatISODate(targetY, targetM, targetD);
+  return addDaysISO(anchor, period === 'weekly' ? n * 7 : n);
 }
 
 /**
@@ -108,7 +101,6 @@ export function addAccrualPeriods(anchor: string, period: LateFeeAccrualPeriod, 
  *
  * - daily: anchor + N days
  * - weekly: anchor + (N * 7) days
- * - monthly: same day-of-month N months after anchor, clamped to last-of-month.
  */
 export function nextAccrualDate(
   dueDate: string,

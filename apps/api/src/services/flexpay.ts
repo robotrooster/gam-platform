@@ -3,6 +3,9 @@ import {
   FLEXPAY_FORBIDDEN_PULL_DAYS,
   FLEXPAY_RETURNED_PULL_FEE,
   FLEXPAY_REJOIN_WAIT_DAYS,
+  FLEXPAY_COOLDOWN_ON_PLATFORM_DAYS,
+  flexPayCooldownDays,
+  flexPayReentrySurcharge,
   FLEXPAY_PULL_RETRY_DAYS,
   FLEXPAY_PULL_MAX_RETRIES,
   PAYMENT_ENTRY_DESCRIPTION_LABELS,
@@ -38,7 +41,7 @@ import { readStripeMethodFacts } from './tenantBankMethods'
 import { recordPlatformRevenue } from './platformRevenue'
 import { extractReturnCode, decideRetry, bankRefusedDebit } from './achRetry'
 import { logger } from '../lib/logger'
-import { dateIn, monthStartOf } from '../lib/timezone'
+import { dateIn, monthStartOf, todayIn} from '../lib/timezone'
 import { graceDaysSql } from './lateness'
 
 // ============================================================
@@ -293,9 +296,29 @@ export function flexPayCountedDefaultSql(a = 'fa'): string {
  */
 export function earlierFlexPayEndingSql(t: string, writeOffsAtHand: 0 | 1): string {
   if (!/^[a-z_][a-z0-9_]*$/i.test(t)) throw new Error(`earlierFlexPayEndingSql: "${t}" is not a table alias`)
-  return `(${t}.flexpay_permanently_banned
-           OR (${t}.flexpay_enrolled_at IS NOT NULL AND ${t}.flexpay_disqualified_until IS NOT NULL
-               AND ${t}.flexpay_disqualified_until <= ${t}.flexpay_enrolled_at)
+  // 10/27: flexpay_default_count is now the plain record of how many times
+  // FlexPay has ended for this tenant, and it is what decides whether THIS
+  // ending is a later one.
+  //
+  // It replaces the old "a wait that expired before the current enrolment"
+  // inference, which read flexpay_disqualified_until — a column the ladder no
+  // longer maintains, because a stored end date keeps running while somebody
+  // is off the platform. Inferring the count from a date that is no longer
+  // written would quietly make every later ending look like a first.
+  //
+  // The written-off-advance count stays: a GAM-side failure writes neither a
+  // count nor a counted write-off, so it still never counts (decisions #37.D).
+  // The count alone is not enough: an ending and a write-off inside the SAME
+  // enrolment are ONE ending, and the first of them has already raised the
+  // count. So a recorded ending only counts as an EARLIER one when it happened
+  // before the current enrolment began — which is the same test the old code
+  // made against flexpay_disqualified_until, now made against the start date
+  // the ladder actually maintains.
+  return `((${t}.flexpay_default_count > 0
+            AND (${t}.flexpay_enrolled_at IS NULL
+                 OR ${t}.flexpay_cooldown_from IS NULL
+                 OR ${t}.flexpay_cooldown_from <= ${t}.flexpay_enrolled_at))
+           OR ${t}.flexpay_permanently_banned
            OR (SELECT COUNT(*) FROM flexpay_advances fa_e
                 WHERE fa_e.tenant_id = ${t}.id AND ${flexPayCountedDefaultSql('fa_e')}) > ${writeOffsAtHand})`
 }
@@ -398,7 +421,40 @@ export async function requireFlexPayCycleFee(
   return fee
 }
 
-/** @deprecated 10/26 — the flat $25. Use requireFlexPayCycleFee. */
+/**
+ * ── 10/27 (Nic): THIS RESIDENT'S PRICE, SURCHARGE INCLUDED ──────────────────
+ *
+ *   "they can get back on at the same price the first time... Maybe we have a
+ *    tier up for re-entry pricing. Every chart on the table, every possible
+ *    price point on that chart would be $5 more on a re-entry."
+ *
+ * quoteFlexPayCycleFee and requireFlexPayCycleFee above return the GRID price
+ * and know nothing about who is being charged. This is the one function that
+ * knows both, so a resident on their second return is quoted and charged the
+ * same number — the surcharge living in only one of those two places is how a
+ * signed figure ends up disagreeing with the pull.
+ *
+ * The first return is at the ordinary price on purpose: "I get that things
+ * happen. Maybe somebody had an issue with their bank."
+ *
+ * Returns null where the grid does not reach (a bill of $3,000 or more), which
+ * callers must treat as "not offered" and never as free.
+ */
+export async function flexPayCycleFeeForTenant(args: {
+  tenantId:       string
+  amountFronted:  number
+  pullDay:        number
+  asOf:           string
+}): Promise<{ fee: number; grid: number; surcharge: number } | null> {
+  const grid = await quoteFlexPayCycleFee(args.amountFronted, args.pullDay, args.asOf)
+  if (grid === null) return null
+  const t = await queryOne<{ defaults: number }>(
+    `SELECT flexpay_default_count AS defaults FROM tenants WHERE id = $1`, [args.tenantId])
+  const surcharge = flexPayReentrySurcharge(t?.defaults ?? 0)
+  return { fee: round2(grid + surcharge), grid, surcharge }
+}
+
+/** @deprecated 10/26 — the flat $25. Use flexPayCycleFeeForTenant. */
 export function calculateFlexPayFee(pullDay: number): number {
   if (!Number.isInteger(pullDay) || pullDay < 1 || pullDay > FLEXPAY_MAX_PULL_DAY) {
     throw new Error(`pullDay must be an integer 1..${FLEXPAY_MAX_PULL_DAY}`)
@@ -489,7 +545,11 @@ export const FLEXPAY_BLOCKERS = [
   'tenant_not_found',
   'flex_deposit_active',
   'not_ssi_ssdi',
-  'permanently_banned',
+  // 10/27: 'permanently_banned' is gone. S578 made a 2nd lifetime default
+  // terminal; Nic's ladder gives a 2nd and 3rd chance behind longer on-GAM
+  // cool-offs, so nothing pushes it any more and a blocker nobody can reach
+  // is just a message waiting to be shown by mistake. The wait itself is
+  // reported as 'tenant_suspended_nsf'.
 ] as const
 export type FlexPayBlocker = typeof FLEXPAY_BLOCKERS[number]
 
@@ -515,7 +575,6 @@ export const FLEXPAY_BLOCKER_LABEL: Record<FlexPayBlocker, string> = {
   tenant_not_found:        'We could not find your account. Contact GAM support.',
   flex_deposit_active:     'FlexPay opens once your FlexDeposit plan is complete.',
   not_ssi_ssdi:            'FlexPay is available only to SSI or SSDI recipients with verified income.',
-  permanently_banned:      'FlexPay is no longer available on your account: GAM could not collect a FlexPay payment twice.',
 }
 
 /** The sentences for an ineligible tenant, in blocker order; the rejoin wait names its day. */
@@ -548,6 +607,107 @@ export function flexPayBlockerReasons(elig: Pick<FlexPayEligibility, 'blockers' 
  * cross-product lever; clears once the plan completes (custody model
  * plan_status is 'active' | 'completed').
  */
+/**
+ * 10/27 — DAYS OF TENANCY ON GAM SINCE THE LAST DEFAULT, as SQL.
+ *
+ * One definition, used by flexPayCooldown (which reports it) and by the
+ * enrollment UPDATE's own guard (which must decide it atomically, inside the
+ * statement, or two requests race through the door together). Two copies of
+ * this would be two different answers to "has the wait been served".
+ *
+ * Overlapping leases are merged by range_agg before the days are summed: a
+ * resident holding two spaces at once lived one stretch of time, and counting
+ * both would serve the cool-off in half the days.
+ */
+function onPlatformDaysSql(t: string): string {
+  return `COALESCE((
+    SELECT SUM(upper(r)::date - lower(r)::date)
+      FROM (
+        SELECT unnest(range_agg(daterange(
+                 GREATEST(l.start_date, ${t}.flexpay_cooldown_from::date),
+                 LEAST(COALESCE(l.end_date, CURRENT_DATE), CURRENT_DATE) + 1
+               ))) AS r
+          FROM lease_tenants lt
+          JOIN leases l ON l.id = lt.lease_id
+         WHERE lt.tenant_id = ${t}.id
+           AND l.start_date IS NOT NULL
+           AND COALESCE(l.end_date, CURRENT_DATE) >= ${t}.flexpay_cooldown_from::date
+           AND l.start_date <= CURRENT_DATE
+      ) merged
+  ), 0)`
+}
+
+/**
+ * The rung this tenant is on, as SQL, BUILT FROM THE SHARED CONSTANT so the
+ * ladder cannot be 90/182/365 in TypeScript and something else in a query.
+ */
+function cooldownRequiredDaysSql(t: string): string {
+  const rungs = FLEXPAY_COOLDOWN_ON_PLATFORM_DAYS
+  const whens = rungs.map((d, i) => `WHEN ${t}.flexpay_default_count = ${i + 1} THEN ${d}`).join(' ')
+  return `CASE ${whens} ELSE ${rungs[rungs.length - 1]} END`
+}
+
+/** Has the on-GAM cool-off been served? True when they never defaulted. */
+function cooldownClearedSql(t: string): string {
+  return `(${t}.flexpay_default_count = 0
+           OR ${onPlatformDaysSql(t)} >= ${cooldownRequiredDaysSql(t)})`
+}
+
+/**
+ * ── 10/27 (Nic): HOW LONG THE COOL-OFF STILL HAS TO RUN ─────────────────────
+ *
+ *   "Doesn't matter if they change landlords. If they're 3 months into their
+ *    year-long cooldown and they switch landlords, that cooldown only counts
+ *    while they're on GAM. So if they leave GAM for 2 years, they need to be
+ *    back on GAM for the remaining 9 months."
+ *
+ * So the wait is measured in DAYS OF TENANCY HERE, not calendar days, and
+ * there is deliberately no stored end date — a date keeps ticking while
+ * somebody is gone, which is the opposite of what he asked for.
+ *
+ * The rung comes from how many times they have defaulted: 90 days, then six
+ * months, then a year (flexPayCooldownDays). Getting current is a separate
+ * condition and both must hold — "They can't just get back in if they haven't
+ * paid what they owe" — which is the `write_off_not_recovered` blocker, not
+ * this.
+ *
+ * Overlapping leases are MERGED before the days are counted (range_agg): a
+ * resident holding two spaces at once has lived one stretch of time, not two,
+ * and double-counting would clear their cool-off in half the time.
+ */
+export async function flexPayCooldown(tenantId: string): Promise<{
+  defaults:          number
+  /** Days on the platform required for this rung. 0 when never defaulted. */
+  required_days:     number
+  /** Days of tenancy on GAM since the default. */
+  on_platform_days:  number
+  /** Days still to serve. 0 once it is done. */
+  remaining_days:    number
+  cleared:           boolean
+  since:             string | null
+}> {
+  const row = await queryOne<{ defaults: number; since: string | null; days: string }>(
+    `SELECT t.flexpay_default_count AS defaults,
+            t.flexpay_cooldown_from::text AS since,
+            ${onPlatformDaysSql('t')}::text AS days
+       FROM tenants t
+      WHERE t.id = $1`,
+    [tenantId],
+  )
+  const defaults = row?.defaults ?? 0
+  const required = flexPayCooldownDays(defaults)
+  const served = row?.since == null ? 0 : Math.max(0, Math.trunc(Number(row.days)))
+  const remaining = Math.max(0, required - served)
+  return {
+    defaults,
+    required_days:    required,
+    on_platform_days: served,
+    remaining_days:   remaining,
+    cleared:          remaining === 0,
+    since:            row?.since ?? null,
+  }
+}
+
 export async function getFlexPayEligibility(tenantId: string): Promise<FlexPayEligibility> {
   const row = await queryOne<{
     ach_verified: boolean
@@ -569,8 +729,17 @@ export async function getFlexPayEligibility(tenantId: string): Promise<FlexPayEl
   const blockers: FlexPayEligibility['blockers'] = []
   let suspendedUntil: string | null = null
 
-  // S578: 2nd lifetime default is terminal — no cooldown clears it.
-  if (row.flexpay_permanently_banned) blockers.push('permanently_banned')
+  // ── 10/27 (Nic): THE BAN IS GONE; THE LADDER REPLACES IT ────────────────
+  //
+  // S578 made a 2nd lifetime default terminal with no cooldown clearing it.
+  // That cannot coexist with what he settled on 10/27: "6 months the second
+  // time and a year the third time." A permanent ban and a six-month second
+  // wait are not both true, and the ladder is the newer, explicit instruction.
+  //
+  // flexpay_permanently_banned is still WRITTEN, as a record that a second
+  // default happened, and is deliberately no longer READ as a gate. The wait
+  // below is what holds them off now, and it is counted in days on GAM
+  // (flexPayCooldown), so leaving the platform does not run it down.
   if (!row.ach_verified) blockers.push('ach_unverified')
   // M7: ach_verified now means only "has a verified bank"; the NACHA block
   // lives in its own column, and pullOne refuses to pull across it.
@@ -580,12 +749,14 @@ export async function getFlexPayEligibility(tenantId: string): Promise<FlexPayEl
   // S512: FlexPay is an SSDI/SSI service tier (income verified at onboarding,
   // not a credit decision). Same field/gate FlexDeposit uses (tenants.ssi_ssdi).
   if (!row.ssi_ssdi) blockers.push('not_ssi_ssdi')
-  if (row.flexpay_disqualified_until) {
-    const until = new Date(row.flexpay_disqualified_until)
-    if (until.getTime() > Date.now()) {
-      blockers.push('tenant_suspended_nsf')
-      suspendedUntil = row.flexpay_disqualified_until
-    }
+  // The cool-off, measured in tenancy time here rather than read off a stored
+  // end date. `suspended_until` is still reported for the surfaces that show a
+  // date, but it is now DERIVED — the earliest it could end if they stay — and
+  // it moves out if they leave, which is the whole point.
+  const cool = await flexPayCooldown(tenantId)
+  if (!cool.cleared) {
+    blockers.push('tenant_suspended_nsf')
+    suspendedUntil = new Date(Date.now() + cool.remaining_days * 86400000).toISOString()
   }
 
   // S310: FlexDeposit-active gate. A tenant funding their deposit over an
@@ -693,7 +864,7 @@ export async function enrollFlexPay(args: {
   // refuses the enrollment rather than signing a price that does not exist.
   const fee = await requireFlexPayCycleFee(
     await flexPayAmountToFront(args.tenantId), args.pullDay,
-    new Date().toISOString().slice(0, 10))
+    todayIn(null))
 
   // Render the populated Subscription Terms BEFORE opening the tx so
   // any data-lookup failure aborts early without holding row locks.
@@ -743,8 +914,12 @@ export async function enrollFlexPay(args: {
           AND flexpay_enrolled = FALSE
           AND ach_verified = TRUE
           AND ach_suspended_at IS NULL
-          AND flexpay_permanently_banned = FALSE
-          AND (flexpay_disqualified_until IS NULL OR flexpay_disqualified_until <= NOW())
+          -- 10/27: the ladder, decided inside the statement so two requests
+          -- cannot both pass the door. flexpay_permanently_banned is no longer
+          -- a gate (Nic gave a 2nd and 3rd chance behind longer waits) and
+          -- flexpay_disqualified_until is no longer trusted — it keeps ticking
+          -- while somebody is off the platform, which is what he ruled out.
+          AND ${cooldownClearedSql('tenants')}
           AND NOT EXISTS (SELECT 1 FROM flexpay_advances fa
                            WHERE fa.tenant_id = tenants.id AND fa.status = 'defaulted')`,
       [args.pullDay, fee, args.tenantId],
@@ -831,7 +1006,7 @@ export async function changeFlexPayPullDay(tenantId: string, newPullDay: number)
   try {
     fee = await requireFlexPayCycleFee(
       await flexPayAmountToFront(tenantId), newPullDay,
-      new Date().toISOString().slice(0, 10))
+      todayIn(null))
   } catch (e: any) { return { ok: false, reason: e?.message ?? 'Invalid pull day' } }
   if (!isAllowedFlexPayPullDay(newPullDay)) return { ok: false, reason: FORBIDDEN_DAY_REASON }
 
@@ -1151,6 +1326,29 @@ const COVER_LINE_TYPES_SQL = (ALLOCATABLE_PAYMENT_TYPES as readonly string[])
   .map(t => `'${t}'`).join(', ')
 
 /**
+ * 10/27 — THE KINDS OF LINE FLEXPAY WOULD EVER FRONT, and nothing about
+ * whether a particular one is open right now.
+ *
+ * coverLineSql below is the live cover's predicate and is deliberately
+ * narrower: it also demands the line be UNPAID, because it is choosing what to
+ * pay tonight. The savings comparison (services/flexpaySavings.ts) asks the
+ * same question of SETTLED history, where that clause excludes everything, so
+ * it needs the type rule without the payable rule.
+ *
+ * Exported so there is one definition of "FlexPay fronts this kind of line".
+ * Two copies would let the screen that sells the product disagree with the
+ * engine that runs it, and the resident would be shown a price built on a bill
+ * FlexPay would never have covered.
+ */
+export function coverableLineTypeSql(p: string): string {
+  return `${p}.revenue_owner = 'landlord'
+          AND ${p}.type IN (${COVER_LINE_TYPES_SQL})
+          AND ${p}.type NOT IN ('late_fee', 'carried_balance', 'deposit', 'home_payment')
+          AND NOT ${depositOrMoveOutRowSql(p)}
+          AND ${p}.reversal_id IS NULL`
+}
+
+/**
  * The bill lines FlexPay pays, on a payments alias: open LANDLORD lines
  * (coverOneCycle explains each exclusion). Never a home payment, whatever
  * allocation splits (decisions #35 point 7(e): a payment toward owning a home
@@ -1159,12 +1357,11 @@ const COVER_LINE_TYPES_SQL = (ALLOCATABLE_PAYMENT_TYPES as readonly string[])
  * a tenant a bill has nothing open.
  */
 function coverLineSql(p: string): string {
+  // The type rule is shared with the savings comparison (coverableLineTypeSql);
+  // what is added here is the part that only makes sense for a line being paid
+  // TONIGHT — it must still be open, and no credit may already have spent it.
   return `${payableRowSql(p)}
-          AND ${p}.revenue_owner = 'landlord'
-          AND ${p}.type IN (${COVER_LINE_TYPES_SQL})
-          AND ${p}.type NOT IN ('late_fee', 'carried_balance', 'deposit', 'home_payment')
-          AND NOT ${depositOrMoveOutRowSql(p)}
-          AND ${p}.reversal_id IS NULL
+          AND ${coverableLineTypeSql(p)}
           AND NOT EXISTS (SELECT 1 FROM credit_uses cu
                            WHERE cu.payment_id = ${p}.id AND cu.status IN ('applied', 'reversed'))`
 }
@@ -1238,7 +1435,11 @@ async function coverOneCycle(group: CoverCandidate[]): Promise<CoverOutcome> {
     const rejoin = stopped.permanent
       ? 'FlexPay had already ended for them once before, so this ended it for good: they can never join again.'
       : `They can join again after ${FLEXPAY_NSF_COOLDOWN_DAYS} days, and only once ${noBank ? 'a verified bank is on file' : 'bank payments are working again on their account'}.`
-    const ending = stopped.permanent ? 'their FlexPay has ended for good' : `their FlexPay has ended, with the ${FLEXPAY_NSF_COOLDOWN_DAYS}-day rejoin wait`
+    // 10/27: no ending is permanent any more — a later one just waits longer,
+    // and the wait is counted in days the tenant is actually on GAM.
+    const ending = stopped.permanent
+      ? 'their FlexPay has ended, with a longer wait before they can join again'
+      : `their FlexPay has ended, with the ${FLEXPAY_NSF_COOLDOWN_DAYS}-day rejoin wait`
     if (stillDue.length > 0) {
       await alertAdmin('warn', 'flexpay_ended_bank_stopped',
         `FlexPay did not pay a bill: bank payments are stopped (tenant ${head.tenant_id}, due ${head.due_date})`,
@@ -1407,7 +1608,18 @@ async function coverOneCycle(group: CoverCandidate[]): Promise<CoverOutcome> {
         // actually being fronted (`covered` — the whole bill, utilities and
         // all) and the benefit Wednesday the pull day falls in. A bill with no
         // bracket refuses the cover rather than fronting it for nothing.
-        const cycleFee = await requireFlexPayCycleFee(covered, t.flexpay_pull_day, coverDay)
+        // 10/27: the CHARGE, so it has to carry the re-entry surcharge too —
+        // a resident quoted the dearer price at enrollment and pulled at the
+        // grid price would make the signed terms wrong.
+        const priced = await flexPayCycleFeeForTenant({
+          tenantId: head.tenant_id, amountFronted: covered,
+          pullDay: t.flexpay_pull_day, asOf: coverDay,
+        })
+        if (priced === null) {
+          throw new AppError(409,
+            `FlexPay is not offered on a bill of ${money(covered)}. It covers bills under $3,000.`)
+        }
+        const cycleFee = priced.fee
         const ins = await client.query<{ id: string }>(
           `INSERT INTO flexpay_advances (
              cycle_month, tenant_id, landlord_id, unit_id, lease_id,
@@ -2686,7 +2898,10 @@ async function notifyTenantFlexPayEnded(
     }
     const after = f.open > 0.005 ? ', once that amount is collected' : ''
     const rejoinAt = f.rejoinAt && new Date(f.rejoinAt).getTime() > Date.now() ? f.rejoinAt : null
-    if (f.banned) parts.push('This is the second time, so FlexPay is no longer available on your account.')
+    // 10/27 (Nic): a second ending is a LONGER WAIT, not the end of FlexPay.
+    // "6 months the second time and a year the third time" — and the wait only
+    // counts while they are on GAM.
+    if (f.banned) parts.push('This is not the first time, so the wait before you can join again is longer. It counts only while you have a lease on GAM.')
     else if (why.kind === 'bank_stopped') {
       const bankOk = why.noBank ? 'a verified bank account is on your account' : 'bank payments are working again on your account'
       parts.push(rejoinAt
@@ -2820,7 +3035,7 @@ async function writeOffForUnavailableBank(
   if (written === null) return
   await alertAdmin('warn', 'flexpay_advance_defaulted',
     permanent
-      ? `FlexPay ended for good: the tenant's bank cannot be pulled (second time) — ${c.cycle_month}`
+      ? `FlexPay ended with a longer wait: the tenant's bank cannot be pulled (not the first time) — ${c.cycle_month}`
       : `FlexPay pull not possible: the tenant's bank cannot be pulled — ${c.cycle_month}`,
     `GAM could not collect the FlexPay pull for tenant ${c.tenant_id} (advance ${c.advance_id}): ${lastError}. ` +
     `That is the tenant's bank, so it counts as the last try failing: $${written.toFixed(2)} is written off and is recovered only by GAM-first routing on their next payment. ` +
@@ -2888,8 +3103,8 @@ async function requeueGamSidePull(
       WHERE id = $1
       RETURNING rent_amount::text AS rent_amount, tenant_fee_amount::text AS tenant_fee_amount, cycle_month::text AS cycle_month`,
     [a.advanceId, (a.why ?? 'failed on GAM\'s side').slice(0, 1000),
-     (a.released ? `${FLEXPAY_RELEASED_NOTE_MARK} ${new Date().toISOString().slice(0, 10)}. ` : '') +
-     `${FLEXPAY_REQUEUE_NOTE_MARK} ${new Date().toISOString().slice(0, 10)}: it failed on GAM's side` +
+     (a.released ? `${FLEXPAY_RELEASED_NOTE_MARK} ${todayIn(null)}. ` : '') +
+     `${FLEXPAY_REQUEUE_NOTE_MARK} ${todayIn(null)}: it failed on GAM's side` +
      (a.why ? ` (${a.why})` : '') +
      (fees > 0 ? `; the try collects $${fees.toFixed(2)} of returned-pull fees (${bounces} × $${FLEXPAY_ACH_RETURN_FEE.toFixed(2)}) at cost.` : '.')])).rows[0]
   const covered = Number(adv.rent_amount)
@@ -3329,7 +3544,12 @@ async function markTenantForWriteOff(
               flexpay_clean_streak        = 0,
               flexpay_permanently_banned  = TRUE,
               flexpay_disqualified_until  = NULL,
-              flexpay_disqualified_reason = 'permanent_second_default'
+              -- 10/27: the ladder. The count picks the rung (90d / 6mo / 1yr)
+              -- and the start date is what the on-GAM clock runs from. No end
+              -- date is stored: it would keep ticking while they are away.
+              flexpay_default_count       = tenants.flexpay_default_count + 1,
+              flexpay_cooldown_from       = NOW(),
+              flexpay_disqualified_reason = 'second_default_longer_cooloff'
         WHERE id = $1`,
       [tenantId],
     )
@@ -3341,7 +3561,11 @@ async function markTenantForWriteOff(
               flexpay_pull_day            = NULL,
               flexpay_monthly_fee         = NULL,
               flexpay_clean_streak        = 0,
+              -- Kept for the surfaces that still read a date, but the gate is
+              -- the computed on-GAM cool-off (flexPayCooldown), not this.
               flexpay_disqualified_until  = NOW() + make_interval(days => $2::int),
+              flexpay_default_count       = tenants.flexpay_default_count + 1,
+              flexpay_cooldown_from       = NOW(),
               flexpay_disqualified_reason = $3
         WHERE id = $1`,
       [tenantId, FLEXPAY_NSF_COOLDOWN_DAYS, reason],
@@ -3369,7 +3593,11 @@ async function endFlexPayForStoppedBank(
             flexpay_permanently_banned = t.flexpay_permanently_banned OR ${second},
             flexpay_disqualified_until = CASE WHEN ${second} THEN NULL
               ELSE GREATEST(COALESCE(t.flexpay_disqualified_until, NOW()), NOW() + make_interval(days => $2::int)) END,
-            flexpay_disqualified_reason = CASE WHEN ${second} THEN 'permanent_second_default' ELSE $3 END,
+            -- 10/27: every ending climbs the ladder a rung and restarts the
+            -- on-GAM clock, whichever way FlexPay ended.
+            flexpay_default_count = t.flexpay_default_count + 1,
+            flexpay_cooldown_from = NOW(),
+            flexpay_disqualified_reason = CASE WHEN ${second} THEN 'second_default_longer_cooloff' ELSE $3 END,
             updated_at = NOW()
       WHERE t.id = $1 AND t.flexpay_enrolled = TRUE
         AND (NOT $4::boolean OR t.ach_suspended_at IS NOT NULL OR t.ach_verified = FALSE)
@@ -3549,7 +3777,7 @@ async function sendPullNotCollectedNotices(paymentId: string, alert: {
     (alert.fees > 0 ? `, including $${alert.fees.toFixed(2)} of returned-pull fees passed on at cost` : '')
   await alertAdmin('warn', 'flexpay_advance_defaulted',
     alert.permanent
-      ? `FlexPay ended for good (second write-off) — ${alert.cycle}`
+      ? `FlexPay ended with a longer wait (not the first write-off) — ${alert.cycle}`
       : `FlexPay pull not collected — ${alert.cycle}`,
     alert.permanent
       ? `Tenant ${alert.tenantId}'s FlexPay pull for ${alert.cycle} failed on its last try; advance ${alert.advanceId} is written off and is recovered only by GAM-first routing on their next payment: ${amounts}. This is their second write-off, so they can never rejoin FlexPay.`
@@ -3750,7 +3978,7 @@ export async function handleFlexPayPullReversed(
         WHERE id = $1
         RETURNING (rent_amount + tenant_fee_amount)::text AS written`,
       [adv.id, FLEXPAY_DEFAULT_REASONS.pullNotCollected, fees,
-       `The pull was taken back by the bank on ${new Date().toISOString().slice(0, 10)}; written off again` +
+       `The pull was taken back by the bank on ${todayIn(null)}; written off again` +
        (fees > 0 ? ` with $${fees.toFixed(2)} of Stripe fees passed on at cost.` : '.')],
     )).rows[0].written
     let feeReversed = await reverseFlexPayFee(adv.id, c, 'its pull was taken back by the bank')
@@ -3805,7 +4033,7 @@ async function sendPullReversedNotices(paymentId: string, alert: {
     : ''
   await alertAdmin('critical', 'flexpay_pull_taken_back',
     alert.permanent
-      ? `FlexPay pull taken back; FlexPay ended for good — ${alert.cycle}`
+      ? `FlexPay pull taken back; FlexPay ended with a longer wait — ${alert.cycle}`
       : `FlexPay pull taken back by the bank — ${alert.cycle}`,
     `Tenant ${alert.tenantId}'s FlexPay pull for ${alert.cycle} (payment ${paymentId}) had settled and was taken back by their bank. ` +
     `Advance ${alert.advanceId} is written off again ($${alert.written.toFixed(2)}` +

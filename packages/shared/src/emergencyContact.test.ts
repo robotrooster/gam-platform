@@ -9,18 +9,18 @@ import { parseEmergencyContact, formatPhone, usDigits, typingPhone, namesLikelyS
 
 describe('S640 parsing what somebody wrote on a lease', () => {
   it('name then number', () => {
-    const r = parseEmergencyContact('Leigh Fisher 520-903-8134')
-    expect(r).toMatchObject({ name: 'Leigh Fisher', phone: '5209038134', quality: 'complete' })
+    const r = parseEmergencyContact('Ansel Daventry 520-903-8134')
+    expect(r).toMatchObject({ name: 'Ansel Daventry', phone: '5209038134', quality: 'complete' })
   })
 
   it('number then name', () => {
-    const r = parseEmergencyContact('502 330 3810 Joe Martínez ')
-    expect(r).toMatchObject({ name: 'Joe Martínez', phone: '5023303810', quality: 'complete' })
+    const r = parseEmergencyContact('502 330 3810 Nevin Cholmondeley ')
+    expect(r).toMatchObject({ name: 'Nevin Cholmondeley', phone: '5023303810', quality: 'complete' })
   })
 
   it('spaces instead of dashes', () => {
-    expect(parseEmergencyContact('Judy Platt 928 713 7544')).toMatchObject({
-      name: 'Judy Platt', phone: '9287137544', quality: 'complete',
+    expect(parseEmergencyContact('Thea Daventry 928 713 7544')).toMatchObject({
+      name: 'Thea Daventry', phone: '9287137544', quality: 'complete',
     })
   })
 
@@ -32,8 +32,8 @@ describe('S640 parsing what somebody wrote on a lease', () => {
 
   // Nic's case: the one that needs a human or a cross-match to finish.
   it('a name and nothing else', () => {
-    expect(parseEmergencyContact('Irma Fuentes')).toMatchObject({
-      name: 'Irma Fuentes', phone: null, quality: 'name_only',
+    expect(parseEmergencyContact('Gwendolen Mapperley')).toMatchObject({
+      name: 'Gwendolen Mapperley', phone: null, quality: 'name_only',
     })
   })
 
@@ -66,7 +66,7 @@ describe('S640 parsing what somebody wrote on a lease', () => {
   })
 
   it('always keeps the original text, whatever it made of it', () => {
-    for (const s of ['Tara Starr 817-597-6359', 'NA', 'Wife', '5208414602']) {
+    for (const s of ['Berenice Greenhalgh 817-597-6359', 'NA', 'Wife', '5208414602']) {
       expect(parseEmergencyContact(s).raw).toBe(s)
     }
   })
@@ -121,15 +121,18 @@ describe('S640 formatting', () => {
 
 describe('S640 matching a contact to somebody already here', () => {
   it('matches on first and last, ignoring case and accents', () => {
-    expect(namesLikelySamePerson('Irma Fuentes', 'irma fuentes')).toBe(true)
-    expect(namesLikelySamePerson('Joe Martínez', 'Joe Martinez')).toBe(true)
+    expect(namesLikelySamePerson('Gwendolen Mapperley', 'gwendolen mapperley')).toBe(true)
+    // The accent case: the same person written with and without them. Both
+    // sides have to be the SAME invented name or this stops testing accents
+    // and starts asserting that two different people match.
+    expect(namesLikelySamePerson('Renée Dupré', 'Renee Dupre')).toBe(true)
   })
 
   // Strict on purpose: this offers somebody's phone number to staff as the
   // right one to call in an emergency. A loose match is worse than none.
   it('refuses a single name, or a different person', () => {
-    expect(namesLikelySamePerson('Irma', 'Irma Fuentes')).toBe(false)
-    expect(namesLikelySamePerson('Kevin Black', 'Kevin Blackwood')).toBe(false)
-    expect(namesLikelySamePerson('Amy Robinson', 'Bret Robinson')).toBe(false)
+    expect(namesLikelySamePerson('Gwendolen', 'Gwendolen Mapperley')).toBe(false)
+    expect(namesLikelySamePerson('Wilda Illingworth', 'Wilda Blackwood')).toBe(false)
+    expect(namesLikelySamePerson('Ansel Kingsnorth', 'Jarrah Thrushwood')).toBe(false)
   })
 })

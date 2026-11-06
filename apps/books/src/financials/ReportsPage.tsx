@@ -36,6 +36,7 @@ import {
   usDay, chargeDay, chargeKey, reportErrorText, latestOnly, PAID_AHEAD_COUNTED_NOTE, PAID_AHEAD_ON_HAND_KEY,
   lastTwelveMonths, lastMonthKey, dayRows, expensesLoggedText,
   type CategoryRow, type ChargeRow, type BesideItem, type MoneyView, type MoneyThree, type DayLine,
+  partsAddUp, type ChargedParts,
 } from './incomeBasis'
 import './reports-basis.css'
 
@@ -120,6 +121,9 @@ function PrintStyles() {
       .rb-three tr.rb-net td { font-weight: 700; color: var(--gold); border-top: 1px solid var(--border-0); }
       .rb-three tr.rb-sub td:first-child { padding-left: 22px; color: var(--text-2); }
       .rb-three td.rb-blank { color: var(--text-3); }
+      /* 11/4 (Nic): why a row's three figures do not subtract into each other. */
+      .rb-why td { padding-top: 0 !important; font-size: .72rem; color: var(--text-3); line-height: 1.5; border-top: none !important; }
+      .rb-why b { color: var(--text-2); font-weight: 600; }
       .rb-tie { margin: 8px 6px 2px; font-size: .74rem; color: var(--text-2); line-height: 1.55; }
       .rb-tie p { margin: 0 0 3px; }
       .rb-pos { color: var(--green); }
@@ -213,6 +217,96 @@ function PeriodPicker({ year, setYear, month, setMonth, allowAll }: {
  * what tenants still owed at the end of the period, and the line under each
  * table shows how it got there.
  */
+// ── 11/3 (Nic): WHICH COMPANY, OR WHICH PROPERTY ──────────────
+/**
+ * 11/3 (Nic): "there's no filter to sort that monthly itemized monthly
+ * breakdown by property. Or by company. So you can't choose TruBlu Management
+ * or Oak Park Motel and RV until after you click into a specific month. And we
+ * want to be able to review yearly style thing, the one that's on that page
+ * filtered by a company."
+ *
+ * ONE control, not two. Every company he operates holds a single property, so
+ * a Company dropdown beside a Property dropdown would list "Oak Park Motel and
+ * RV LLC" next to "Oak Park Motel and RV" — two controls for one answer, which
+ * is the layout he has already called confusing. So the COMPANIES are the rows,
+ * and a company's properties sit under it only where it holds more than one —
+ * which is the only case where "the company" and "the property" are different
+ * questions.
+ *
+ * It renders nothing when there is nothing to choose: one company holding one
+ * property is the whole report already.
+ *
+ * The options come from the report itself (`scope`), computed from the viewer's
+ * own scope, so the control can never offer a slice the server then refuses —
+ * and never collapses to the one company just chosen.
+ */
+interface ReportScope {
+  companies: Array<{ id: string; name: string; properties: Array<{ id: string; name: string }> }>
+  /** False when the slice on screen is one property of a company holding several. */
+  payoutsBelongHere?: boolean
+}
+type ScopeOption = { value: string; label: string; under: boolean }
+
+/** '' = every company the account owns; `c:<id>` one company; `p:<id>` one property. */
+export function scopeOptions(scope: ReportScope | undefined): ScopeOption[] {
+  const companies = scope?.companies ?? []
+  const out: ScopeOption[] = []
+  for (const c of companies) {
+    if (companies.length > 1) out.push({ value: `c:${c.id}`, label: c.name, under: false })
+    // A lone property under a named company is that company's own row again.
+    if (c.properties.length > 1 || companies.length === 1) {
+      for (const pr of c.properties) out.push({ value: `p:${pr.id}`, label: pr.name, under: companies.length > 1 })
+    }
+  }
+  return out
+}
+
+export function scopeQuery(pick: string): string {
+  if (pick.startsWith('c:')) return `?landlordId=${encodeURIComponent(pick.slice(2))}`
+  if (pick.startsWith('p:')) return `?propertyId=${encodeURIComponent(pick.slice(2))}`
+  return ''
+}
+
+/** The company behind the chosen slice, so a month's P&L opens on that company. */
+export function scopeCompanyId(scope: ReportScope | undefined, pick: string): string {
+  if (pick.startsWith('c:')) return pick.slice(2)
+  if (pick.startsWith('p:')) {
+    const id = pick.slice(2)
+    return scope?.companies.find(c => c.properties.some(pr => pr.id === id))?.id ?? ''
+  }
+  return ''
+}
+
+/** What the figures cover, in words — for the heading, and for the printout. */
+export function scopeName(scope: ReportScope | undefined, pick: string): string | null {
+  return scopeOptions(scope).find(o => o.value === pick)?.label ?? null
+}
+
+export function ScopePicker({ scope, value, onChange }: {
+  scope: ReportScope | undefined
+  value: string
+  onChange: (next: string) => void
+}) {
+  const opts = scopeOptions(scope)
+  // One answer is not a choice.
+  if (opts.length < 2) return null
+  const manyCompanies = (scope?.companies.length ?? 0) > 1
+  return (
+    <div className="no-print" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
+      <label className="form-label" style={{ margin: 0, fontSize: '.72rem' }}>Showing</label>
+      <select className="input" style={{ width: 'auto', minWidth: 240 }} value={value} onChange={e => onChange(e.target.value)}>
+        <option value="">{manyCompanies ? 'Every company you own' : 'All properties'}</option>
+        {opts.map(o => (
+          <option key={o.value} value={o.value}>{o.under ? `\u00A0\u00A0\u21B3 ${o.label}` : o.label}</option>
+        ))}
+      </select>
+      <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>
+        {value ? 'Every figure on this tab is this one alone.' : 'Every company and property added together.'}
+      </span>
+    </div>
+  )
+}
+
 function MoneyLegend() {
   const { data } = useQuery<any>(['reports-ledger-status'], () => apiGet('/reports/ledger-status'))
   const cols = data?.live ? moneyColumns(true) : COLS
@@ -465,7 +559,23 @@ function ThreeCells({ v }: { v: Partial<Record<MoneyColumn, number | null | unde
 
 // ── OVERVIEW (S69 + S512 #20 drill-in) ────────────────────────
 function OverviewTab() {
-  const { data: report, isLoading, error } = useQuery<any>(['reports-summary'], () => apiGet('/reports/summary'))
+  // 11/3 (Nic): one company or one property, chosen above — see ScopePicker.
+  // EVERY figure below narrows with it: the cards, the charts and the monthly
+  // rows. Narrowing the table alone would leave account-wide cards above a
+  // one-property table, which is the confusion he called out on 10/3.
+  const [pick, setPick] = useState('')
+  const { data: report, isLoading, isPreviousData, error } = useQuery<any>(
+    ['reports-summary', pick], () => apiGet('/reports/summary' + scopeQuery(pick)),
+    // The last figures stay up, dimmed, while the newly chosen slice loads —
+    // so the picker never vanishes mid-fetch and the page never blinks empty.
+    { keepPreviousData: true })
+  // The options are REMEMBERED, so a failed request cannot strand him inside a
+  // filter: without this, a 500 on the narrowed slice renders the error with no
+  // control left to get back to every company, and only a page reload recovers.
+  const lastScope = useRef<ReportScope | undefined>(undefined)
+  if (report?.scope) lastScope.current = report.scope
+  const scope: ReportScope | undefined = report?.scope ?? lastScope.current
+  const showing = scopeName(scope, pick)
   const [openMonth, setOpenMonth] = useState<string | null>(null)
   // 10/11: the card opens the owner's Balances page where there is one to open.
   const { openOwnerPage } = useViewer()
@@ -477,8 +587,15 @@ function OverviewTab() {
   return (
     <>
       <div className={openMonth ? 'rb-print-hide' : undefined}>
+      <ScopePicker scope={scope} value={pick} onChange={setPick} />
+      {/* Printed, deliberately: a page of figures has to say what it covers. */}
+      {showing && (
+        <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 12 }}>
+          These figures cover <strong style={{ color: 'var(--gold)' }}>{showing}</strong> alone.
+        </div>
+      )}
       {error ? <ReportError error={error} what="the summary" /> : isLoading ? <div style={{padding:32,color:'var(--text-3)',textAlign:'center'}}>Loading…</div> : (
-        <div className="rb-stack" style={{gap:16}}>
+        <div className="rb-stack" style={{gap:16, opacity: isPreviousData ? 0.55 : 1, transition: 'opacity .15s'}} aria-busy={isPreviousData || undefined}>
           <div className="rb-kpis">
             <div className="kpi-card"><div className="kpi-label">{MONEY_COLUMN_LABEL.received} this month</div><div className="kpi-value green">{fmt0(card.received)}</div></div>
             <div className="kpi-card"><div className="kpi-label">{MONEY_COLUMN_LABEL.charged} this month</div><div className="kpi-value">{fmt0(card.charged)}</div></div>
@@ -499,10 +616,16 @@ function OverviewTab() {
           <TieLines lines={report?.thisMonth?.tieText ?? card.notes} />
           <CollectionsCharts ytdMonthly={report?.ytdMonthly ?? []} ytd={ytd} />
           <div className="card">
-            <div className="card-header"><span className="card-title">Monthly Breakdown</span></div>
+            <div className="card-header"><span className="card-title">Monthly Breakdown{showing ? ` — ${showing}` : ''}</span></div>
             <div style={{padding:'4px 0 16px'}}>
-              <div style={{fontSize:'.72rem',color:'var(--text-3)',padding:'0 0 10px'}}>Click a month to open its profit &amp; loss and the money behind it.</div>
-              <div className="data-table-wrap">
+              {/* 11/3 (Nic): "12 rows on the table for rolling 12 at a glance."
+                  The window is said out loud, because a trailing-twelve review
+                  is only readable if you know it is twelve and where it ends. */}
+              <div style={{fontSize:'.72rem',color:'var(--text-3)',padding:'0 0 10px'}}>The last 12 months, newest first. Click a month to open its profit &amp; loss and the money behind it.</div>
+              {/* rb-three is a comparative statement — period against period,
+                  with subtotals and a net line. A statement is read down its
+                  columns, so it keeps its shape on a phone. */}
+              <div className="data-table-wrap" data-no-stack>
                 <table className="data-table rb-three">
                   {/* "Net" IS the net of the P&L the row opens: each money column less
                       GAM's platform fee, maintenance, lot rent, your expenses and the
@@ -527,7 +650,12 @@ function OverviewTab() {
                         <Cell v={m.expenses} />
                         <Cell v={m.netReceived ?? m.net} kind="net" />
                         <Cell v={m.netCharged} kind="net" />
-                        <td className="rb-num" title={`Payout fees ${fmt(m.fees)}`}>{fmt(m.disbursed)}</td>
+                        {/* 11/3: one property of a company holding several has no payout
+                            of its own — the cell says nothing rather than showing the
+                            whole company's money beside one property's income. */}
+                        <td className="rb-num" title={m.disbursed == null
+                          ? 'A payout is per company, not per property'
+                          : `Payout fees ${fmt(m.fees)}`}>{fmt(m.disbursed)}</td>
                         <td style={{color:'var(--text-3)',textAlign:'right'}}>›</td>
                       </tr>
                     )) : (
@@ -541,7 +669,9 @@ function OverviewTab() {
         </div>
       )}
       </div>
-      {openMonth && <MonthlyPLModal month={openMonth} onClose={() => setOpenMonth(null)} />}
+      {/* 11/3: the month opens on the company the row was built from, so the
+          drill-in never asks again for the company already chosen above. */}
+      {openMonth && <MonthlyPLModal month={openMonth} company={scopeCompanyId(scope, pick)} onClose={() => setOpenMonth(null)} />}
     </>
   )
 }
@@ -629,7 +759,10 @@ function ByPropertyTab() {
         </div>
         <div style={{ padding: '4px 0 12px' }}>
           {error ? <ReportError error={error} what="the property report" /> : isLoading ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
-            <div className="data-table-wrap">
+            <div className="data-table-wrap" data-no-stack>
+              {/* Same: a statement, not a list — and the comment lives INSIDE
+                  the div because this branch of the ternary may have exactly
+                  one child. */}
               <table className="data-table rb-three">
                 <thead><tr>
                   <th>Property</th><th style={{textAlign:'center'}}>Occupancy</th>
@@ -903,7 +1036,7 @@ export function CategoryBreakdownCard({ title, view, categories, groups, initial
   const [mode, setMode] = useState<IncomeReportView>(initialMode ?? 'summary')
   const details = view?.details ?? []
   const detailed = mode === 'detailed' && details.length > 0
-  type Row = MoneyThree & { key: string; label: string; level: 0 | 1 | 2; group?: boolean }
+  type Row = MoneyThree & { key: string; label: string; level: 0 | 1 | 2; group?: boolean; parts?: ChargedParts }
   // 10/14 (Nic): a Summary row, then its own itemized lines (level 1) and
   // each line's subtypes (level 2) — the lines add up to the row.
   const withLines = (key: string, row: Row): Row[] => {
@@ -927,9 +1060,9 @@ export function CategoryBreakdownCard({ title, view, categories, groups, initial
         ...d.subtypes.map(t => ({ key: `d:${d.key}|${t.name}`, label: t.name, charged: t.charged, received: t.received, owed: t.owed, level: 1 as const })),
       ])
     : view
-    ? view.categories.map(c => ({ key: c.category, label: c.label || categoryLabel(c), charged: c.charged, received: c.received, owed: c.owed, level: 0 as const }))
+    ? view.categories.map(c => ({ key: c.category, label: c.label || categoryLabel(c), charged: c.charged, received: c.received, owed: c.owed, parts: c.parts, level: 0 as const }))
     : activeCategories(categories).map(r => ({ key: r.category, label: categoryLabel(r), ...categoryThree(r), level: 0 as const }))
-  const lines: Row[] = detailed ? [] : (view?.uncategorized ?? []).map(l => ({ key: l.line, label: l.label, charged: l.charged, received: l.received, owed: l.owed, level: 0 as const }))
+  const lines: Row[] = detailed ? [] : (view?.uncategorized ?? []).map(l => ({ key: l.line, label: l.label, charged: l.charged, received: l.received, owed: l.owed, parts: l.parts, level: 0 as const }))
   const all = [...rows, ...lines]
   // Under a group (the monthly report): its lines set in, a subtype further in.
   // On its own (Detailed elsewhere): the subtype set in beneath its line.
@@ -966,14 +1099,15 @@ export function CategoryBreakdownCard({ title, view, categories, groups, initial
             </tr></thead>
             <tbody>
               {/* data-label: on a phone each row stacks, every figure named. */}
-              {all.map(r => (
+              {all.map(r => [
                 <tr key={r.key} className={rowClass(r)}>
                   <td className={nameClass(r)}>{r.label}</td>
                   {COLS.map(c => (
                     <td key={c.key} data-label={c.label} className={`rb-num${c.key === 'owed' && r.owed ? ' rb-owed' : ''}`}>{fmt(r[c.key])}</td>
                   ))}
-                </tr>
-              ))}
+                </tr>,
+                <WhyRow key={`${r.key}~why`} r={r} span={COLS.length + 1} />,
+              ])}
             </tbody>
             <tfoot>
               <tr>
@@ -986,6 +1120,69 @@ export function CategoryBreakdownCard({ title, view, categories, groups, initial
       )}
       <TieLines lines={view?.tieText} />
     </div>
+  )
+}
+
+/**
+ * 11/4 (Nic, DIRECTIVE): WHY A ROW'S THREE FIGURES DO NOT SUBTRACT.
+ *
+ *   "Rent is showing $15,000 received, almost $16,000, but over $18,500
+ *    charged, and owed is only $955. And that's almost a $3,000 discrepancy...
+ *    every line is actually wrong. Nothing maths out exactly right except for
+ *    the home and trailer payments, $333 received, $333 charged, $0 owed."
+ *
+ * That last sentence is the whole specification. He reads every row and checks
+ * Charged − Received against Owed; the one row that passed is the one with
+ * nothing in the fourth bucket. So this row appears on exactly the rows where
+ * that check fails, and says what the difference is:
+ *
+ *   of $18,502.00 charged: $16,958.00 collected · $955.00 still owed on the
+ *   last day of the period · $589.00 settled without money (a credit you gave
+ *   or work trade)
+ *
+ * It never appears where the subtraction works, because there is nothing to
+ * explain and a note on every row is noise.
+ *
+ * Two different questions share the word "owed" here, which is the other half
+ * of why the page read wrong. The Owed COLUMN is every unpaid bill at the end
+ * of the period, months before this one included; the figure in this row is
+ * this period's charges only. At Oak Park in October the column reads
+ * $5,720.00 of rent and this row reads $2,860.00, and the strip under the
+ * table accounts for the $4,506.87 carried in.
+ */
+function WhyRow({ r, span }: { r: MoneyThree & { parts?: ChargedParts }; span: number }) {
+  const p = r.parts
+  // No parts: the records path, or a viewer who may not see Owed (the server
+  // takes `parts` off with the Owed figure, so this stays silent for them).
+  if (!p) return null
+  const off = Math.round((Number(r.charged) - Number(r.received) - Number(r.owed)) * 100) / 100
+  if (off === 0) return null
+  // Never hide a breakdown that does not add up — the same rule the proof
+  // strip follows ("These do not add up: they are off by $X"). The server
+  // builds these four as a split of this row's own Charged, so this should be
+  // unreachable; if it ever is reached, saying so beats printing a sum that
+  // does not sum.
+  if (!partsAddUp(r)) {
+    const sum = Math.round((p.collected + p.clearing + p.owed + p.other) * 100) / 100
+    return (
+      <tr className="rb-why">
+        <td colSpan={span}>
+          of {fmt(r.charged)} charged, what became of it adds to {fmt(sum)} — these do not add up,
+          and they are off by {fmt(Math.round((sum - Number(r.charged)) * 100) / 100)}.
+        </td>
+      </tr>
+    )
+  }
+  const bits = [<><b>{fmt(p.collected)}</b> collected</>]
+  if (p.clearing) bits.push(<><b>{fmt(p.clearing)}</b> still clearing</>)
+  if (p.owed) bits.push(<><b>{fmt(p.owed)}</b> of these charges still owed at the end of the period</>)
+  if (p.other) bits.push(<><b>{fmt(p.other)}</b> settled without money (a credit you gave, or work trade)</>)
+  return (
+    <tr className="rb-why">
+      <td colSpan={span}>
+        of {fmt(r.charged)} charged: {bits.map((b, i) => <span key={i}>{i ? ' · ' : ''}{b}</span>)}
+      </td>
+    </tr>
   )
 }
 
@@ -1330,7 +1527,7 @@ const dayLabel = (iso: string) =>
 const timeLabel = (iso: string) =>
   new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
 
-function MonthlyPLModal({ month, onClose }: { month: string; onClose: () => void }) {
+function MonthlyPLModal({ month, company, onClose }: { month: string; company?: string; onClose: () => void }) {
   const [year, mo] = month.split('-').map(Number)
   // ── S637: A P&L BELONGS TO ONE COMPANY ──────────────────────────────
   //
@@ -1343,7 +1540,9 @@ function MonthlyPLModal({ month, onClose }: { month: string; onClose: () => void
   // two of them (reportEntity, S633). This modal never sent one, so for any
   // multi-company account it 400'd on open. Every other report tab already
   // carries the picker; this one was missed.
-  const [companyId, setCompanyId] = useState<string>('')
+  // 11/3: seeded with the company the Overview tab is filtered to, when it is
+  // filtered to one; still changeable here, because a P&L is per company.
+  const [companyId, setCompanyId] = useState<string>(company ?? '')
   const { data, isLoading, error } = useQuery<MonthlyPL>(
     ['monthly-pl', month, companyId],
     () => apiGet(`/reports/monthly-pl?year=${year}&month=${mo}` + (companyId ? `&landlordId=${companyId}` : '')),

@@ -28,7 +28,7 @@ import {
   cleanupAllSchema,
   seedLandlord, seedTenant,
   seedProperty, seedUnit,
-  seedRentPayment, seedLease,
+  seedRentPayment, seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
 
 // Mock the lib/stripe getStripe() factory. The service imports the
@@ -41,6 +41,11 @@ const confirmFn = vi.fn<[string, any?], Promise<{ id: string }>>(
 // with the account it tried on last_payment_error.
 const retrieveFn = vi.fn(async (id: string): Promise<any> => ({
   id, status: 'requires_payment_method', payment_method: null,
+  // 11/5: a real pull is the CHARGES PLUS THE PAYER'S PROCESSING FEE — $1,000
+  // of rent and the flat $6 ACH fee. The fee has no row of its own, so a test
+  // whose intent was worth exactly the rows would not have caught the fold
+  // rebuilding the amount from them and giving the $6 away.
+  amount: 100_600,
   payment_method_types: ['us_bank_account'],
   last_payment_error: { code: 'insufficient_funds', payment_method: { id: 'pm_tenant_bank', type: 'us_bank_account' } },
 }))
@@ -124,6 +129,205 @@ async function seedRetryablePayment(args: RetryablePaymentInput): Promise<string
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+// ── 11/5 (Nic): THE RETURNED-PAYMENT FEE RIDES THE RETRY ────────────────────
+//
+//   "Every time going forward, the fee needs to ride the retry amount. And then
+//    if it fails again, the doubled up fee, because it happened twice, needs to
+//    ride immediately for whatever next payment method they're going to try."
+//
+// Every refused bank debit costs GAM $4 Stripe keeps. Until 11/5 that $4 was
+// written held and waited for the next bill, so GAM financed it for up to a
+// month. The retry three days later already pulls from the same account for the
+// same bill, so it goes out with it.
+describe("the bank's $4 goes out with the retry", () => {
+  /**
+   * A bounced pull plus the RETURNFEE the webhook wrote for it.
+   *
+   * The charge is put on a real LEASE, because that is the boundary the fold
+   * scopes to and because every production rent row has one — seedRentPayment
+   * does not set it, so a fixture without this would have proved nothing.
+   */
+  async function bouncedWithFee(pi: string, opts: { held?: boolean } = {}) {
+    const paymentId = await seedRetryablePayment({
+      paymentIntentId: pi, nextRetryAtOffsetSec: -60, retryCount: 0, status: 'failed' })
+    const seeded = (await db.query<any>(
+      `SELECT unit_id, tenant_id, landlord_id FROM payments WHERE id = $1`, [paymentId])).rows[0]
+    const client = await getClient()
+    try {
+      const leaseId = await seedLease(client, {
+        unitId: seeded.unit_id, landlordId: seeded.landlord_id })
+      await seedLeaseTenant(client, { leaseId, tenantId: seeded.tenant_id })
+      await client.query(`UPDATE payments SET lease_id = $2 WHERE id = $1`, [paymentId, leaseId])
+    } finally { client.release() }
+    const p = (await db.query<any>(
+      `SELECT unit_id, lease_id, tenant_id, landlord_id FROM payments WHERE id = $1`,
+      [paymentId])).rows[0]
+    const fee = (await db.query<{ id: string }>(
+      `INSERT INTO payments
+         (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+          entry_description, due_date, notes, revenue_owner, held_for_next_bill_at)
+       VALUES ($1,$2,$3,$4,'fee',4.00,'pending','RETURNFEE', CURRENT_DATE,
+               $5, 'gam', $6)
+       RETURNING id`,
+      [p.unit_id, p.lease_id, p.tenant_id, p.landlord_id,
+       `Returned bank payment — ${pi} (evt_${pi})`,
+       opts.held ? new Date() : null])).rows[0]
+    return { paymentId, feeId: fee.id }
+  }
+
+  const feeRow = async (id: string) => (await db.query<{
+    pi: string | null; status: string; held: boolean
+  }>(
+    `SELECT stripe_payment_intent_id AS pi, status,
+            (held_for_next_bill_at IS NOT NULL) AS held
+       FROM payments WHERE id = $1`, [id])).rows[0]
+
+  it('raises the pull by the fee and puts the fee on it, before the confirm', async () => {
+    const { feeId } = await bouncedWithFee('pi_fee_rides')
+    await processAchRetries()
+
+    // $1000 of rent + the $4 the bank charged GAM, in one debit.
+    expect(updateFn).toHaveBeenCalledWith('pi_fee_rides', { amount: 101_000 })
+    // ...and raised BEFORE the pull is sent, or the bank would be asked for
+    // the old amount.
+    expect(updateFn.mock.invocationCallOrder[0])
+      .toBeLessThan(confirmFn.mock.invocationCallOrder[0])
+
+    // The fee is part of this pull now, so the settle webhook clears it with
+    // the rent and a failure puts it back to owed with the rent.
+    expect(await feeRow(feeId)).toEqual(
+      { pi: 'pi_fee_rides', status: 'processing', held: false })
+  })
+
+  it('leaves a HELD fee behind — Heather\'s 11/4 row still rides her next bill', async () => {
+    // 11/4 (Nic): "That $4 retry fee just needs to go on. It needs to ride the
+    // next bill." He kept that for her when the rule changed on 11/5, and this
+    // is what honours it — not a one-off exception naming her.
+    const { feeId } = await bouncedWithFee('pi_fee_held', { held: true })
+    await processAchRetries()
+
+    expect(updateFn).not.toHaveBeenCalled()
+    expect(await feeRow(feeId)).toEqual({ pi: null, status: 'pending', held: true })
+  })
+
+  it('two bounces ride as two: the doubled fee goes out together', async () => {
+    const { paymentId } = await bouncedWithFee('pi_fee_twice')
+    const p = (await db.query<any>(
+      `SELECT unit_id, lease_id, tenant_id, landlord_id FROM payments WHERE id = $1`,
+      [paymentId])).rows[0]
+    // The second refusal's $4 — a different event, so a different row.
+    await db.query(
+      `INSERT INTO payments
+         (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+          entry_description, due_date, notes, revenue_owner)
+       VALUES ($1,$2,$3,$4,'fee',4.00,'pending','RETURNFEE', CURRENT_DATE, $5, 'gam')`,
+      [p.unit_id, p.lease_id, p.tenant_id, p.landlord_id,
+       'Returned bank payment — pi_fee_twice (evt_pi_fee_twice_b)'])
+
+    await processAchRetries()
+    expect(updateFn).toHaveBeenCalledWith('pi_fee_twice', { amount: 101_400 })
+  })
+
+  it("an EARLIER bounce's fee rides too, even though Stripe gave it a new intent", async () => {
+    // Heather in MH 28 bounced 11/1 and again 11/3, and the second attempt was
+    // a new payment intent. Matching fees by the intent named in their note
+    // would have left one of her two $4 fees uncollectable by any pull — and a
+    // second attempt usually IS a new intent, so that was the normal case.
+    await bouncedWithFee('pi_fee_mine')
+    const p = (await db.query<any>(
+      `SELECT unit_id, lease_id, tenant_id, landlord_id FROM payments
+        WHERE stripe_payment_intent_id = 'pi_fee_mine' AND type = 'rent'`)).rows[0]
+    await db.query(
+      `INSERT INTO payments
+         (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+          entry_description, due_date, notes, revenue_owner)
+       VALUES ($1,$2,$3,$4,'fee',4.00,'pending','RETURNFEE', CURRENT_DATE, $5, 'gam')`,
+      [p.unit_id, p.lease_id, p.tenant_id, p.landlord_id,
+       'Returned bank payment — pi_an_earlier_attempt (evt_earlier)'])
+
+    await processAchRetries()
+    // Both of this household's unpaid fees: $1,006 + $4 + $4.
+    expect(updateFn).toHaveBeenCalledWith('pi_fee_mine', { amount: 101_400 })
+  })
+
+  it("another household's fee never rides this pull", async () => {
+    // The lease is the boundary. One resident's bounce must never be collected
+    // from another resident's bank account.
+    const { feeId: mine } = await bouncedWithFee('pi_fee_scoped')
+    const other = await bouncedWithFee('pi_fee_elsewhere')
+
+    await db.query(
+      `UPDATE payments SET next_retry_at = NULL
+        WHERE stripe_payment_intent_id = 'pi_fee_elsewhere'`)
+    await processAchRetries()
+
+    expect(updateFn).toHaveBeenCalledWith('pi_fee_scoped', { amount: 101_000 })
+    expect(await feeRow(other.feeId)).toEqual({ pi: null, status: 'pending', held: false })
+    expect((await feeRow(mine)).pi).toBe('pi_fee_scoped')
+  })
+
+  it("keeps the payer's processing fee in the pull — Heather's $114", async () => {
+    // Her real pull: a $100 trailer payment plus the flat $6 ACH fee, which has
+    // no charge row of its own. Two bounces, two $4 fees, so the retry must ask
+    // for $114. Rebuilding the amount from the rows instead of adding to what
+    // the pull already asked for gave the $6 away on every retry.
+    const { paymentId } = await bouncedWithFee('pi_heather')
+    await db.query(`UPDATE payments SET amount = 100.00 WHERE id = $1`, [paymentId])
+    retrieveFn.mockImplementationOnce(async (id: string): Promise<any> => ({
+      id, status: 'requires_payment_method', payment_method: null,
+      amount: 10_600,                       // $100 trailer + $6 ACH
+      payment_method_types: ['us_bank_account'],
+      last_payment_error: { code: 'insufficient_funds', payment_method: { id: 'pm_tenant_bank', type: 'us_bank_account' } },
+    }))
+    const p = (await db.query<any>(
+      `SELECT unit_id, lease_id, tenant_id, landlord_id FROM payments WHERE id = $1`,
+      [paymentId])).rows[0]
+    await db.query(
+      `INSERT INTO payments
+         (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+          entry_description, due_date, notes, revenue_owner)
+       VALUES ($1,$2,$3,$4,'fee',4.00,'pending','RETURNFEE', CURRENT_DATE, $5, 'gam')`,
+      [p.unit_id, p.lease_id, p.tenant_id, p.landlord_id,
+       'Returned bank payment — pi_heather (evt_pi_heather_b)'])
+
+    await processAchRetries()
+    expect(updateFn).toHaveBeenCalledWith('pi_heather', { amount: 11_400 })
+  })
+
+  it('hands the folded fees back when the pull is not sent — they are owed again, not stuck', async () => {
+    // 11/5, found on the first real run: Heather's two $4 fees were stamped
+    // onto her pull by the fold, the confirm then failed, and the give-back
+    // released only the charges it had claimed. The fees sat 'processing' on a
+    // cancelled intent — invisible to every ask and resolved by nothing.
+    const { feeId } = await bouncedWithFee('pi_fee_givenback')
+    confirmFn.mockRejectedValueOnce(new Error('No such payment_method'))
+    retrieveFn.mockImplementation(async (id: string): Promise<any> => ({
+      id, status: 'requires_payment_method', amount: 100_600,
+      payment_method: null, payment_method_types: ['us_bank_account'],
+      last_payment_error: { code: 'insufficient_funds', payment_method: { id: 'pm_tenant_bank', type: 'us_bank_account' } },
+    }))
+
+    await processAchRetries()
+
+    // Plainly owed again, and off the dead intent so the next pull takes it.
+    expect(await feeRow(feeId)).toEqual({ pi: null, status: 'pending', held: false })
+  })
+
+  it('the rent is still pulled when the fee cannot be folded in', async () => {
+    // The money that must be collected is the rent. A fee that misses this
+    // pull is still ordinary owed money and rides whatever comes next, so a
+    // Stripe refusal here must not stop the debit.
+    const { feeId } = await bouncedWithFee('pi_fee_stripe_down')
+    updateFn.mockRejectedValueOnce(new Error('Stripe says no'))
+
+    await processAchRetries()
+    expect(confirmFn).toHaveBeenCalled()
+    // Not taken onto the pull, so it is still plainly owed.
+    expect(await feeRow(feeId)).toEqual({ pi: null, status: 'pending', held: false })
+  })
+})
+
 
 describe('processAchRetries', () => {
   it('fires confirm for a due retry; bumps retry_count, clears next_retry_at, marks the rows in progress', async () => {
@@ -635,7 +839,6 @@ describe('the retry names a debit authorization only for a bank account', () => 
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { createPaidAhead, holdCredit, supersedeScheduledRetry } from './creditUse'
-import { seedLeaseTenant } from '../test/dbHelpers'
 
 /**
  * A bounced bank pull due for its retry, the way the portal made it: rent and

@@ -1,5 +1,5 @@
 /**
- * S652 — Lot 8 (Vickie Kimery): her home burned down before onboarding began;
+ * S652 — Lot 8 (Gwendolen Lillywhite): her home burned down before onboarding began;
  * the sheet was never updated. Nic: "hers needs to be gone completely." GAM
  * never erases — the packet is VOIDED (nine documents), the pending home sale
  * is cancelled by the void trigger, and her invite row is cancelled.

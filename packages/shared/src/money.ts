@@ -227,15 +227,63 @@ export const PLATFORM_REVENUE_TYPES = [
   // GAM's actual cost of the reader. Only the markup is earnings; the cost
   // part of the payments is GAM's money coming back (readerOrderMoney).
   'device_markup',
+  // 10/27: FlexDeposit, which until now earned money with nowhere to put it —
+  // the fee was a payments row and never reached this book, while FlexPay's
+  // cycle fee always did. The last two are the OTHER side of the product:
+  // GAM covers a landlord for the part of a deposit a resident never funded
+  // ("The landlord gets what they're owed, full stop"), so that outflow is a
+  // line here rather than an 'adjustment'. See the migration
+  // 20261028020000_flexdeposit_revenue_and_reserve.sql.
+  'flexdeposit_fee',
+  'flexdeposit_move_fee',
+  /** NEGATIVE — cash paid to a landlord for an unfunded deposit. */
+  'flexdeposit_shortfall',
+  /** That money coming back, when a resident later pays through GAM. */
+  'flexdeposit_recovery',
+  // 10/29 (Nic): GAM's 15% of a left-owing settlement, "for the coordination".
+  // Booked per collection as it arrives, never on the arrangement — a debt
+  // that is part-paid earns GAM only the part that was paid.
+  'left_owing_share',
+  // 10/31 (Nic): 3% of a finished contractor-marketplace job, off the
+  // contractor's payout. Booked when the job is marked complete, against the
+  // amount it ACTUALLY finished at, at the rate snapshotted when it was
+  // awarded. Nothing is earned on a job that is merely bid or awarded — the
+  // whole competitive position is that GAM charges for won, finished work and
+  // never for a listing or a lead.
+  'marketplace_job_cut',
 ] as const
 export type PlatformRevenueTypeValue = typeof PLATFORM_REVENUE_TYPES[number]
 
-/** Mirrors held_payout_items_source_type_check (M11 adds deposit_settlement). */
-export const HELD_PAYOUT_SOURCE_TYPES = [
-  'pos_sale', 'booking_deposit', 'business_invoice_payment', 'business_pos_sale',
-  'refund', 'dispute', 'platform_fee', 'prepaid_draw', 'deposit_settlement',
-] as const
-export type HeldPayoutSourceType = typeof HELD_PAYOUT_SOURCE_TYPES[number]
+/**
+ * 10/27 — the types the FlexDeposit reserve is computed from.
+ *
+ * The reserve is simply what FlexDeposit has earned less what it has paid out,
+ * so it is a SUM over exactly these four and nothing else: GAM's other revenue
+ * lines (rent spread, subscriptions, screening) are not standing behind this
+ * product and must not inflate the number that decides how many plans can be
+ * taken on.
+ *
+ * Signs are already correct in the rows, so the reserve is a plain SUM(amount)
+ * — never a sum of absolute values, and never read off balance_after, which a
+ * backdated row restates (services/platformRevenue.ts).
+ */
+export const FLEXDEPOSIT_RESERVE_TYPES = [
+  'flexdeposit_fee', 'flexdeposit_move_fee',
+  'flexdeposit_shortfall', 'flexdeposit_recovery',
+] as const satisfies readonly PlatformRevenueTypeValue[]
+
+/**
+ * Mirrors held_payout_items_source_type_check.
+ *
+ * 10/27: this WAS a second hand-written copy of the same list that
+ * landlordGamMoney.ts holds as HELD_ITEM_SOURCES, and the two drifted the
+ * moment a source type was added — the CHECK and one list moved, the other did
+ * not, and migrations.creditUses.test.ts went red for a list nobody knew was a
+ * duplicate. CLAUDE.md's rule is one definition per allowed-value set, so this
+ * is now an alias of that one and cannot drift again.
+ */
+export { HELD_ITEM_SOURCES as HELD_PAYOUT_SOURCE_TYPES } from './landlordGamMoney'
+export type { HeldItemSource as HeldPayoutSourceType } from './landlordGamMoney'
 
 // ─── Bank: deposit slips, match kinds, rent channels ─────────────────────────
 
@@ -316,9 +364,73 @@ export const FLEXPAY_RETURNED_PULL_FEE = 4
  * which is never retried (Consumer ToS § 9.2). Only a terminal failure ends
  * FlexPay; a failed first retry with the second still scheduled does not. The
  * FlexPay service locks it as FLEXPAY_NSF_COOLDOWN_DAYS; a test holds the two
- * equal. A second time ends FlexPay for that tenant for good (S578).
+ * equal.
+ *
+ * 10/27: this is the FIRST rung of a ladder, and the "a second time ends
+ * FlexPay for good (S578)" that used to be written here is gone — see
+ * FLEXPAY_COOLDOWN_ON_PLATFORM_DAYS.
  */
 export const FLEXPAY_REJOIN_WAIT_DAYS = 90
+
+/**
+ * 10/27 (Nic) — THE COOL-OFF LADDER, AND WHY IT IS COUNTED IN DAYS ON GAM.
+ *
+ *   "90 days is a cool-off period before they're re-invited for the first
+ *    time. After that, the time might be longer. 6 months the second time and
+ *    a year the third time."
+ *
+ * Indexed by how many times they have defaulted, so the 1st default waits the
+ * 90 days above, the 2nd six months, the 3rd and anything after it a year.
+ * Getting current is a SEPARATE condition and both must hold: "They can't just
+ * get back in if they haven't paid what they owe."
+ *
+ * These are days OF TENANCY ON THE PLATFORM, not calendar days:
+ *
+ *   "If they're 3 months into their year-long cooldown and they switch
+ *    landlords, that cooldown only counts while they're on GAM. So if they
+ *    leave GAM for 2 years, they need to be back on GAM for the remaining 9
+ *    months."
+ *
+ * Which is why nothing stores an end date — a stored date keeps ticking while
+ * somebody is gone. services/flexpay.ts computes the elapsed figure from the
+ * tenant's actual leases (flexPayCooldown).
+ *
+ * This REPLACES the S578 rule that a 2nd lifetime default was terminal. A
+ * permanent ban and a six-month second cool-off cannot both be true.
+ */
+export const FLEXPAY_COOLDOWN_ON_PLATFORM_DAYS = [90, 182, 365] as const
+
+/** The cool-off for an Nth default, in days on the platform. */
+export function flexPayCooldownDays(defaultCount: number): number {
+  if (!Number.isFinite(defaultCount) || defaultCount <= 0) return 0
+  const i = Math.min(Math.trunc(defaultCount), FLEXPAY_COOLDOWN_ON_PLATFORM_DAYS.length) - 1
+  return FLEXPAY_COOLDOWN_ON_PLATFORM_DAYS[i]
+}
+
+/**
+ * 10/27 (Nic) — WHAT A SECOND CHANCE COSTS.
+ *
+ *   "they can get back on at the same price the first time. I get that things
+ *    happen. Maybe somebody had an issue with their bank... Maybe we have a
+ *    tier up for re-entry pricing. Every chart on the table, every possible
+ *    price point on that chart would be $5 more on a re-entry. I think that
+ *    keeps it simple."
+ *
+ * So the FIRST return is at the ordinary grid price, and from the second
+ * default onward every bracket in every Wednesday column is $5 dearer. One
+ * flat step, not an escalating one — he asked for simple.
+ *
+ * It is NOT risk pricing keyed to anything about the person: it is keyed to a
+ * count of times GAM could not collect, which is a fact about this account's
+ * own history with this product. The grid itself stays uniform for everybody
+ * on the same rung.
+ */
+export const FLEXPAY_REENTRY_SURCHARGE = 5
+
+/** Dearer by the surcharge from the second default on; the grid price before. */
+export function flexPayReentrySurcharge(defaultCount: number): number {
+  return Number.isFinite(defaultCount) && defaultCount >= 2 ? FLEXPAY_REENTRY_SURCHARGE : 0
+}
 
 export interface FlexPayTermsSection {
   key: string

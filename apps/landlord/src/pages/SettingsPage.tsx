@@ -1,12 +1,14 @@
 import { MAINTENANCE_CATEGORIES, MAINTENANCE_CATEGORY_LABEL } from '@gam/shared'
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { api, apiGet, apiPatch } from '../lib/api'
+import { api, apiGet, apiPatch, apiPost, apiDelete } from '../lib/api'
+import { PasskeySettings } from '../../../../packages/shared-ui/Passkeys'
 import { EntityPicker } from '../components/EntityPicker'
 import { Check, DollarSign, X } from 'lucide-react'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 import { useAuth } from '../context/AuthContext'
 import { ChangeSignInEmail } from '../components/ChangeSignInEmail'
+import { ChangePassword } from '../components/ChangePassword'
 import { BirthdayField } from '../components/BirthdayField'
 import { usePerms } from '../lib/permissions'
 import { NotificationPrefsSection } from './NotificationPrefsPage'
@@ -364,6 +366,19 @@ export function SettingsPage() {
           {/* Security / 2FA */}
           <SecurityCard />
 
+          {/* 10/30 (Nic): "a passkey replaces the emailed code; password + code
+              stays the fallback." ONE list for the whole platform — in
+              production every portal is a subdomain of one apex, so a device
+              added here also opens the register, GAM Books and the tenant
+              portal. Outside the settings.account_view gate for the same
+              reason ChangePassword is: a staff login sets up its own Face ID. */}
+          <PasskeySettings api={passkeyApi} />
+
+          {/* 10/30 (Nic): "there's no way in the portal to change my password
+              that I can find." Deliberately outside the settings.account_view
+              gate above — a staff login changes its own password too. */}
+          <ChangePassword />
+
           {/* S631: first billing cycle */}
           {can('settings.billing_view') && <><FirstBillingCycleCard />
           <MeterPhotosCard /><MaintenanceRequestsCard /></>}
@@ -531,6 +546,14 @@ export function SettingsPage() {
       )}
     </div>
   )
+}
+
+// The shared passkey card speaks this portal's API client: apiPost hands back
+// the whole envelope and the card wants the payload.
+const passkeyApi = {
+  get:  (url: string) => apiGet(url),
+  post: (url: string, body?: any) => apiPost(url, body).then((r: any) => r.data),
+  del:  (url: string) => apiDelete(url),
 }
 
 // Two-factor authentication surface. S574: email-code 2FA is MANDATORY for

@@ -52,6 +52,7 @@ import {
 import { posRouter } from './pos'
 import { posPayLinksRouter } from './posPayLinks'
 import { errorHandler } from '../middleware/errorHandler'
+import { todayIn } from '../lib/timezone'
 
 function buildApp() {
   const app = express()
@@ -68,8 +69,12 @@ beforeEach(async () => {
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_register_final_utility_retake'
 })
 
+// 11/01: anchored to GAM's calendar day at noon UTC. This used to step off the
+// bare wall clock, which is already tomorrow in UTC after 5pm Phoenix, so every
+// day() was a day out for seven hours of every day.
 const day = (n: number) => {
-  const d = new Date(); d.setUTCDate(d.getUTCDate() + n)
+  const d = new Date(`${todayIn(null)}T12:00:00Z`)
+  d.setUTCDate(d.getUTCDate() + n)
   return d.toISOString().slice(0, 10)
 }
 
@@ -132,12 +137,12 @@ async function resident(p: Park) {
 async function laterStay(p: Park) {
   const c = await db.connect()
   try {
-    const email = `andres-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `cora-${Math.random().toString(36).slice(2)}@example.com`
     const tenantId = await seedTenant(c, { email })
     const b = await c.query<{ id: string }>(
       `INSERT INTO unit_bookings (unit_id, landlord_id, tenant_id, check_in, check_out, booked_check_out,
                                   status, lease_type, stay_terms, guest_name, guest_email)
-       VALUES ($1,$2,$3,$4::date,$5::date,$5::date,'checked_out','month_to_month','stay','Andres Razo',$6)
+       VALUES ($1,$2,$3,$4::date,$5::date,$5::date,'checked_out','month_to_month','stay','Cora Castellan',$6)
        RETURNING id`,
       [p.unitId, p.landlordId, tenantId, day(-5), day(0), email])
     await c.query(
@@ -379,7 +384,7 @@ describe('the re-raise never crosses households', () => {
     const line = (await raised(p, c.leaseId)).body.data.lines[0]
     await release(p, [line.utilityBillId])
 
-    // Andres took the same space a few days later, pays his own utilities, and
+    // Cora took the same space a few days later, pays his own utilities, and
     // is now at the counter closing out. There is one bill slot per meter,
     // space and month, and it is holding CURTIS'S bill — so the engine refuses
     // to write a second one and the re-raise is reached with somebody else's
@@ -399,7 +404,7 @@ describe('the re-raise never crosses households', () => {
     expect(his.body.data.notes[0]).not.toMatch(/already paid|answered for|monthly run/i)
 
     // Curtis's bill is untouched: still his, still owed, still at his figure,
-    // and nothing opened an ask against it on Andres's ticket.
+    // and nothing opened an ask against it on Cora's ticket.
     const bl = await bills(p.meterId)
     expect(bl).toHaveLength(1)
     expect(bl[0]).toMatchObject({ status: 'unbilled', charge: '81.27' })

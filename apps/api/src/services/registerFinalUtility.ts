@@ -1418,9 +1418,29 @@ export async function recordCounterReads(
             SET looks_broken_at = COALESCE(looks_broken_at, NOW()),
                 looks_broken_reason = $2, updated_at = NOW()
           WHERE id = $1`,
+        // ── 11/1 (Nic): A UNIT OR TWO IS THE SAME READ, NOT A SWAP ───────────
+        //
+        //   "when it rolls back by 1 or 2 or forward by 1 or 2, don't flag it.
+        //    It's essentially the same meter read. Number 6, it rolled backward
+        //    by 1, and you're flagging it as possibly broken or swapped. And
+        //    it's 1 number off."
+        //
+        // The old sentence said "the dial barely moved, OR WENT BACKWARDS...
+        // may be stuck OR SWAPPED", which is two wrong claims. A swap shows up
+        // as a wholly different figure, not a figure one unit away, and a
+        // genuine reversal is a steady month-after-month descent
+        // ([[gam-electric-meter-reversal-causes]]). Within the reading margin
+        // there is exactly one honest reading of it: the dial did not turn. On
+        // a pointer-dial meter a needle just shy of a digit reads one too high,
+        // so a one-unit "drop" is the margin of error and nothing more.
+        //
+        // The flag itself stays: a meter that is not turning on a space
+        // somebody is paying for is worth a look, and is the question Nic wants
+        // asked (absentee, or broken?). It is the WORDS that were wrong.
         [m.id, `Read ${r.value.toLocaleString()} on ${reading.day} against `
-             + `${(m.priorValue ?? 0).toLocaleString()} before it — the dial barely moved, or went backwards. `
-             + `The read was taken and billed as no usage; the meter may be stuck or swapped.`])
+             + `${(m.priorValue ?? 0).toLocaleString()} before it — within a unit or two, so the dial has `
+             + `not turned. Billed as no usage. Either nobody is using this space or the meter has stopped; `
+             + `go and look at the face.`])
     }
 
     if (quote.block === 'double_check' || quote.block === 'no_baseline') {

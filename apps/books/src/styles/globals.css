@@ -1,0 +1,201 @@
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg0:#080a0c;--bg1:#0d1014;--bg2:#121519;--bg3:#181c22;--bg4:#1e2330;
+  --b0:#1a1f28;--b1:#222a38;--b2:#2a3547;
+  --t0:#eef0f6;--t1:#b8c4d8;--t2:#7a8aaa;--t3:#475060;
+  --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;--purple:#a855f7;--teal:#14b8a6;
+  --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace;
+  /* 10/31 — the long names, at the ROOT. financialsHost.css already defines
+     this whole family, but scoped to .fin-host, so they exist only inside the
+     financials subtree. dialogs.tsx and ErrorBoundary.tsx render at the app
+     root and ask for --bg-1, --border-1, --text-0 and --text-1; verified in
+     the browser that all four are undefined there, which made those
+     declarations invalid — a Books confirm box painted no background and no
+     border, the same bug admin and the support console had. */
+  --bg-0:var(--bg0);--bg-1:var(--bg1);--bg-2:var(--bg2);--bg-3:var(--bg3);--bg-4:var(--bg4);
+  --border-0:var(--b0);--border-1:var(--b1);--border-2:var(--b2);
+  --text-0:var(--t0);--text-1:var(--t1);--text-2:var(--t2);--text-3:var(--t3)
+}
+html{-webkit-font-smoothing:antialiased;height:100%}
+body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
+h1,h2,h3{font-family:var(--font-d);color:var(--t0);line-height:1.2}
+button{cursor:pointer;font-family:var(--font-b)}input,select,textarea{font-family:var(--font-b)}
+.shell{display:flex;height:100vh;overflow:hidden}
+.sidebar{width:230px;flex-shrink:0;background:var(--bg1);border-right:1px solid var(--b0);position:fixed;top:0;left:0;bottom:0;z-index:50;display:flex;flex-direction:column;overflow-y:auto}
+.main{flex:1;margin-left:230px;height:100vh;display:flex;flex-direction:column;min-width:0;overflow:hidden}
+.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40;gap:12px;flex-shrink:0}
+.page{flex:1;min-height:0;padding:28px;max-width:1600px;width:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:none}
+.logo{padding:18px;border-bottom:1px solid var(--b0)}
+.logo-n{font-family:var(--font-d);font-size:1.05rem;font-weight:800;color:var(--gold)}
+.logo-s{font-size:.65rem;color:var(--t3);margin-top:2px;text-transform:uppercase;letter-spacing:.1em}
+.nav{padding:10px;flex:1}
+.nl{font-size:.62rem;color:var(--t3);text-transform:uppercase;letter-spacing:.12em;padding:10px 8px 4px;font-weight:600}
+.ni{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:7px;color:var(--t2);font-size:.82rem;font-weight:500;transition:all .12s;width:100%;background:none;border:none;cursor:pointer;text-decoration:none}
+.ni:hover{background:var(--bg3);color:var(--t0)}
+.ni.active{background:rgba(201,162,39,.1);color:var(--gold);border:1px solid rgba(201,162,39,.2)}
+.sfooter{padding:10px;border-top:1px solid var(--b0)}
+.card{background:var(--bg2);border:1px solid var(--b1);border-radius:10px;padding:18px}
+.ct{font-size:.72rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.07em;margin-bottom:14px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+@media(max-width:1100px){.grid4{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:800px){.grid2,.grid3,.grid4{grid-template-columns:1fr}}
+.ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding-bottom:14px;border-bottom:1px solid var(--b0);flex-wrap:wrap;gap:10px}
+.pt{font-family:var(--font-d);font-size:1.4rem;font-weight:800;color:var(--t0)}
+.ps{font-size:.78rem;color:var(--t3);margin-top:2px}
+.kpi{background:var(--bg2);border:1px solid var(--b1);border-radius:10px;padding:16px;position:relative;overflow:hidden}
+.kpi::after{content:'';position:absolute;bottom:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--gold),transparent);opacity:.4}
+.kl{font-size:.65rem;color:var(--t3);text-transform:uppercase;letter-spacing:.09em;font-weight:600;margin-bottom:6px}
+.kv{font-family:var(--font-d);font-size:1.6rem;font-weight:800;color:var(--t0);line-height:1;margin-bottom:4px}
+.ks{font-size:.7rem;color:var(--t3)}
+.kv.g{color:var(--green)}.kv.r{color:var(--red)}.kv.a{color:var(--amber)}.kv.gold{color:var(--gold)}.kv.b{color:var(--blue)}.kv.t{color:var(--teal)}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:7px;font-size:.78rem;font-weight:600;border:none;cursor:pointer;transition:all .12s;font-family:var(--font-b);text-decoration:none}
+.bp{background:var(--gold);color:#080a0c}.bp:hover{background:#d9af3a}
+.bg-btn{background:var(--bg4);color:var(--t1);border:1px solid var(--b2)}.bg-btn:hover{background:var(--bg3)}
+.bd{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.2)}.bd:hover{background:rgba(239,68,68,.14)}
+.bt{background:rgba(20,184,166,.08);color:var(--teal);border:1px solid rgba(20,184,166,.2)}
+.bsm{padding:4px 9px;font-size:.72rem}
+.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:20px;font-size:.65rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.bg2{background:rgba(34,197,94,.08);color:var(--green);border:1px solid rgba(34,197,94,.18)}
+.ba{background:rgba(245,158,11,.08);color:var(--amber);border:1px solid rgba(245,158,11,.18)}
+.br{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.18)}
+.bgold{background:rgba(201,162,39,.08);color:var(--gold);border:1px solid rgba(201,162,39,.18)}
+.bmu{background:var(--bg4);color:var(--t3);border:1px solid var(--b1)}
+.bb{background:rgba(59,130,246,.08);color:var(--blue);border:1px solid rgba(59,130,246,.18)}
+.bteal{background:rgba(20,184,166,.08);color:var(--teal);border:1px solid rgba(20,184,166,.18)}
+.tbl{width:100%;border-collapse:collapse;font-size:.78rem}
+.tbl th{background:var(--bg3);color:var(--t3);font-size:.64rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;padding:9px 12px;text-align:left;border-bottom:1px solid var(--b1)}
+.tbl td{padding:9px 12px;border-bottom:1px solid var(--b0);color:var(--t1)}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tr:hover td{background:rgba(255,255,255,.012)}
+.mono{font-family:var(--font-m);font-size:.8rem}
+.alert{display:flex;align-items:flex-start;gap:10px;padding:10px 14px;border-radius:8px;font-size:.78rem;margin-bottom:14px}
+.ae{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.18);color:#fca5a5}
+.aw{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.18);color:#fcd34d}
+.ag{background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.18);color:#86efac}
+.agold{background:rgba(201,162,39,.08);border:1px solid rgba(201,162,39,.18);color:var(--gold)}
+.empty{text-align:center;padding:48px 20px;color:var(--t3)}
+.loading-pg{display:flex;align-items:center;justify-content:center;height:100vh;font-family:var(--font-d);font-size:1.1rem;color:var(--t3)}
+.spinner{width:16px;height:16px;border:2px solid var(--b2);border-top-color:var(--gold);border-radius:50%;animation:spin .6s linear infinite;flex-shrink:0}
+.dr{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--b0);font-size:.78rem}
+.dr:last-child{border-bottom:none}
+.dk{color:var(--t3)}.dv{color:var(--t0);font-weight:500}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--b0);margin-bottom:20px}
+.tab{padding:9px 14px;background:none;border:none;color:var(--t3);font-size:.78rem;font-weight:600;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .12s;font-family:var(--font-b)}
+.tab:hover{color:var(--t1)}.tab.on{color:var(--gold);border-bottom-color:var(--gold)}
+/* Modal */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}
+.modal{background:var(--bg2);border:1px solid var(--b1);border-radius:12px;padding:24px;width:100%;max-width:520px;max-height:90vh;overflow-y:auto}
+.modal-h{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;padding-bottom:14px;border-bottom:1px solid var(--b0)}
+.modal-t{font-family:var(--font-d);font-size:1.1rem;font-weight:700;color:var(--t0)}
+.frow{margin-bottom:14px}
+.frow2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
+label{display:block;font-size:.72rem;font-weight:600;color:var(--t3);margin-bottom:5px;text-transform:uppercase;letter-spacing:.06em}
+/* 10/12: tel too — the Employees, Contractors and Vendors phone boxes were drawn unstyled. */
+input[type=text],input[type=email],input[type=tel],input[type=number],input[type=date],input[type=password],select,textarea{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:7px;color:var(--t0);padding:8px 11px;font-size:.875rem;outline:none;transition:border .12s}
+input:focus,select:focus,textarea:focus{border-color:var(--gold)}
+.factions{display:flex;gap:8px;justify-content:flex-end;margin-top:20px;padding-top:14px;border-top:1px solid var(--b0)}
+@keyframes spin{to{transform:rotate(360deg)}}
+/* S655: the "Money received" / "Money billed" switch */
+.dr-sub .dk{padding-left:14px}
+.bnote{margin-top:10px;font-size:.72rem;color:var(--t3);line-height:1.5}
+/* S655: which company's books (a landlord account with several) */
+.company-pick{max-width:560px}
+.company-pick-list{display:grid;gap:8px;margin-top:16px}
+.company-pick-list .btn{justify-content:space-between;padding:11px 14px;font-size:.84rem;text-align:left;flex-wrap:wrap}
+.company-pick-sub{font-weight:500;font-size:.72rem;opacity:.75}
+
+/* The hamburger. Off on a desktop, where the sidebar never closes. */
+.hamburger{display:none;align-items:center;justify-content:center;background:none;border:none;
+  color:var(--t1);cursor:pointer;padding:6px;margin-left:-4px;border-radius:7px}
+.hamburger:hover{background:var(--bg3);color:var(--t0)}
+
+/* ── PHONE (10/31) ─────────────────────────────────────────────────────
+   "even though we're only planning a few native apps, every portal should be
+   mobile compatible… I may occasionally want to see some stats from browsing
+   on my phone."
+
+   GAM Books had no phone rules beyond collapsing its card grids: a fixed
+   sidebar with the page pushed over by the same width. Same package as admin,
+   whose shell class names this app shares.
+
+   THE LEDGERS ARE NOT LISTS. A trial balance, a general ledger and a journal
+   entry's line editor are grids whose columns have to line up to be read at
+   all — debit under debit, credit under credit — so they carry
+   [data-no-stack] and scroll sideways instead of becoming cards. Everything
+   that really is a list of rows cards up.
+
+   Fires at 820px, matching every other portal. Selector names differ here (.main, .page, .ph, and short
+   colour tokens) — the long-form aliases added to :root above are what let
+   these rules be the landlord's rules rather than a second dialect. */
+@media(max-width:820px){
+  body{overflow:auto;height:auto}
+  .shell{display:block;height:auto;overflow:visible}
+
+  /* The sidebar stays FIXED (as on desktop) and slides. Making it static was
+     what forced the sideways strip in the first place. */
+  .sidebar{width:min(86vw,300px);transform:translateX(-100%);transition:transform .22s ease;will-change:transform}
+  .sidebar.is-open{transform:translateX(0);box-shadow:0 0 40px rgba(0,0,0,.55)}
+  .nav-scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:45;border:none;padding:0;margin:0}
+  .hamburger{display:inline-flex!important}
+
+  .main{margin-left:0;height:auto;overflow:visible}
+
+  /* A 52px bar carrying the console's full name plus the menu and theme
+     buttons has nothing left at 375px; the name goes and the sidebar says it. */
+  .topbar{padding:0 10px;gap:8px}
+  .topbar>*{min-width:0}
+  .topbar-name{display:none}
+
+  .page{max-width:none;overflow:visible;
+    padding:16px max(14px,env(safe-area-inset-left,0px))
+            calc(32px + env(safe-area-inset-bottom,0px))
+            max(14px,env(safe-area-inset-right,0px))}
+  .ph{flex-wrap:wrap;gap:10px}
+  .ph>*{min-width:0;max-width:100%}
+
+  /* An inline grid of fixed or fr columns becomes one column. minmax(0,1fr)
+     rather than 1fr because 1fr means minmax(auto,1fr), and that auto floor is
+     content-based — one long line inflates the track and the row pushes past
+     the screen. A row that WANTS to stay side by side says so with an "auto"
+     in its template (a label beside its value, a row with a button on the
+     end), and is left alone. An inline style can only be beaten with
+     !important, which is why these carry it. */
+  [style*="grid-template-columns"]:not([style*="auto"]){grid-template-columns:minmax(0,1fr)!important}
+  [style*="grid-template-columns"]:not([style*="auto"])>*{min-width:0}
+
+  /* Inline flex rows wrap, and their children may shrink. In a COLUMN flex
+     container the line sizes to its widest item and items stretch to the LINE,
+     not the container, so min-width:0 alone does not hold them in — max-width
+     does. */
+  [style*="display: flex"]:not([style*="flex-wrap"]){flex-wrap:wrap}
+  [style*="display: flex"]>*{min-width:0;max-width:100%}
+
+  /* TABLES BECOME CARDS (Nic, 10/30): "I don't want the tables to scroll. I
+     want the things to be resized so you can view. When I see the tenant's
+     name and the unit number and I have to scroll over to the right to see if
+     they paid, that's not okay. It needs to be shortened and condensed into a
+     card."
+     Each row becomes a card, each cell a labelled line. installTableStacking
+     (shared) puts the column's name on the cell; the min-width:0 !important is
+     what beats the inline pinned widths several admin tables carry. A grid
+     that is a picture rather than a list opts out with [data-no-stack]. */
+  table:not([data-no-stack] table),
+  table:not([data-no-stack] table) tbody,
+  table:not([data-no-stack] table) tr,
+  table:not([data-no-stack] table) td{
+    display:block;width:auto;max-width:100%;min-width:0!important}
+  table:not([data-no-stack] table) thead{
+    position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  table:not([data-no-stack] table) tr{padding:12px 2px;border-bottom:1px solid var(--b0)}
+  table:not([data-no-stack] table) td{border:none;padding:3px 0;white-space:normal}
+  table:not([data-no-stack] table) td[data-label]{
+    display:flex;gap:10px;align-items:baseline;justify-content:space-between}
+  table:not([data-no-stack] table) td[data-label]::before{
+    content:attr(data-label);font-size:.68rem;font-weight:700;letter-spacing:.06em;
+    text-transform:uppercase;color:var(--t3);flex:0 0 auto}
+  /* A table's own scroll box has nothing left to scroll once its rows are
+     cards, and an empty 100%-wide scroller eats a screen of height. */
+  .tbl-wrap,[style*="overflow-x: auto"]:not([data-no-stack]){overflow-x:visible}
+}

@@ -70,6 +70,15 @@ async function openFilledForm() {
   await until(() => !!button(/^Report this deposit$/) && text().includes('watch'), 'the form')
   await act(async () => { (host.querySelector('input[type="checkbox"]') as HTMLInputElement).click() })
   await setValue(host.querySelector('#report-deposit-reference') as HTMLInputElement, 'DEP-5', 'input')
+  // 11/1 (Blue, via Nic): the photo of the bank's receipt is required too, so
+  // these tests fill it here and leave the HOUR as the only thing missing —
+  // which is what each one is actually about.
+  const pic = host.querySelector('#report-deposit-photo') as HTMLInputElement
+  Object.defineProperty(pic, 'files', {
+    value: [new File([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])], 'receipt.jpg', { type: 'image/jpeg' })],
+    configurable: true,
+  })
+  await act(async () => { pic.dispatchEvent(new Event('change', { bubbles: true })) })
 }
 
 describe('about what time they were at the bank', () => {

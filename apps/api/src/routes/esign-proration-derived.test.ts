@@ -12,7 +12,7 @@
  * a proration that disagrees with the lease's own start date, rent and due day
  * is refused here, whatever drew the form that sent it.
  *
- * The real numbers, from Mountain View: Kay Howard (RV 21) and Clint Cook
+ * The real numbers, from Mountain View: Verity Winthrop (RV 21) and Quill Quarrier
  * (RV 18) were both drafted days after they arrived, both dated 10/15 — the day
  * the forms were filled out — and both charged $323.00, which is the 17 days
  * from the 15th at $589 a month across a 31-day October. From 10/13 it is
@@ -114,7 +114,7 @@ async function draft(p: Park, r: Res, opts: {
   await db.query(
     `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
      VALUES ($1,$2,'landlord','Nic Rhoades','ll@test.dev',1,$3,'sent'),
-            ($1,$4,'primary','Kay Howard',$5,2,$6,'sent')`,
+            ($1,$4,'primary','Verity Winthrop',$5,2,$6,'sent')`,
     [documentId, p.userId, crypto.randomBytes(32).toString('hex'),
      r.userId, r.email, crypto.randomBytes(32).toString('hex')])
   const values: Record<string, string> = {
@@ -190,13 +190,13 @@ describe('a typed proration never lands through the signing route', () => {
     expect(await storedProration(documentId)).toBe('323.00')
   })
 
-  it('checks it against the start date being SIGNED, not the one on file — the Kay/Clint case', async () => {
+  it('checks it against the start date being SIGNED, not the one on file — the Verity/Quill case', async () => {
     const p = await park()
     const r = await resident()
     const documentId = await draft(p, r)
     const box = await boxes(documentId)
 
-    // Kay actually arrived on the 13th. 10/15's $323.00 is $38 short.
+    // Verity actually arrived on the 13th. 10/15's $323.00 is $38 short.
     const refused = await landlordSigns(documentId, p.token, [
       { fieldId: box.start_date, value: '10/13/2026' },
       { fieldId: box.move_in_proration, value: '323.00' },

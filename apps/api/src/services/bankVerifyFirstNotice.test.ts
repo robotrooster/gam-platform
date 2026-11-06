@@ -2,7 +2,7 @@
  * S641 (Nic) — "do we have it set up where as soon as Stripe sends the
  * microdeposits or the verification code, it will email the tenant as well?"
  *
- * We did not. Dominic Gonzalez started a bank setup on September 2 and sat in
+ * We did not. Vesper Vanterpool started a bank setup on September 2 and sat in
  * requires_action for nine days: nothing told him a deposit was coming, so
  * there was nothing for him to act on.
  *
@@ -65,7 +65,7 @@ afterEach(() => { delete process.env.EMAIL_SEND_LIVE })
 const sent = () => (resendSendMock.mock.calls.at(-1) as any[])![0]
 
 const base = {
-  tenantName: 'Dominic',
+  tenantName: 'Vesper',
   bankLast4: '2991',
   arrivedOn: 'Thursday, September 3',
   verificationKind: 'descriptor_code' as const,

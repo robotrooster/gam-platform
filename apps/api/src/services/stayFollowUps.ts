@@ -38,7 +38,7 @@
  *
  * WHAT AN ANSWER DOES: nothing. Nic: "just a note, nothing scheduled." Saying
  * "they're leaving on the 9th" writes no lease end date — that is the exact
- * mechanism that put a hard end on James Fenton's RV 15 lease. He ends the
+ * mechanism that put a hard end on Juno Kendrew's RV 15 lease. He ends the
  * tenancy by hand when they actually go.
  */
 import { query } from '../db'

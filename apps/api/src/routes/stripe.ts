@@ -450,7 +450,7 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
     // Nic: "do we have it set up where as soon as Stripe sends the microdeposits
     // or the verification code, it will email the tenant as well?"
     //
-    // We did not, and the cost was visible: Dominic Gonzalez started a setup on
+    // We did not, and the cost was visible: Vesper Vanterpool started a setup on
     // September 2 and sat in `requires_action` for nine days. Nothing told him
     // anything was coming, so there was nothing to act on.
     //

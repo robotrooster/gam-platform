@@ -140,9 +140,11 @@ describe('shouldRunToday at the real 01:00 UTC firing instant (S617)', () => {
   })
 
   it('is FALSE at 01:00 UTC on the other weekdays late in the month', () => {
-    expect(shouldRunToday(atUtc('2026-07-27'))).toBe(false)
-    expect(shouldRunToday(atUtc('2026-07-30'))).toBe(false)   // Thursday — no longer the day
-    expect(shouldRunToday(atUtc('2026-07-31'))).toBe(false)   // Friday after the 10th
+    expect(shouldRunToday(atUtc('2026-07-27'))).toBe(false)   // Monday
+    expect(shouldRunToday(atUtc('2026-07-30'))).toBe(false)   // Thursday — never the day
+    // 10/28: Friday the 31st IS a payout day now (Fridays run all month), and
+    // it is July's last business day, so it is the month-end run.
+    expect(isMonthEndSweepDay(atUtc('2026-07-31'))).toBe(true)
   })
 
   it('is FALSE at 01:00 UTC on the weekend', () => {
@@ -151,26 +153,60 @@ describe('shouldRunToday at the real 01:00 UTC firing instant (S617)', () => {
   })
 })
 
-// ── 10/5 (Nic): TUESDAY AND FRIDAY THROUGH THE 10TH, THEN TUESDAYS ──────────
+// ── 10/28 (Nic): TUESDAY AND FRIDAY ALL MONTH, AND ALWAYS THE LAST DAY ──────
+//
+//   "Let's do Tuesdays and Fridays indefinitely when there's money, even
+//    towards the end of the month... We want to always hit the last business
+//    day of the month... If there's ever a calendar holiday that interferes
+//    with it, then just keep the original Tuesday and Friday."
+//
+// This replaces 10/5's "Tuesday and Friday through the 10th, then Tuesdays",
+// which is what left October with no payout day after the 27th — so the 29th
+// and 30th rolled into November, the very thing the month-end push existed to
+// prevent and wasn't preventing.
 describe('the payout days', () => {
-  it('October 2026: Fri 2, Tue 6, Fri 9, then Tuesdays only', () => {
+  it('October 2026: Tuesdays and Fridays all month, ending on the last business day', () => {
     const runs = Array.from({ length: 31 }, (_, i) => `2026-10-${String(i + 1).padStart(2, '0')}`)
-      .filter(d => shouldRunToday(atUtc(d)))
-    expect(runs).toEqual(['2026-10-02', '2026-10-06', '2026-10-09', '2026-10-13', '2026-10-20', '2026-10-27'])
+      .filter(d => shouldRunToday(atUtc(d)) || isMonthEndSweepDay(atUtc(d)))
+    expect(runs).toEqual(['2026-10-02', '2026-10-06', '2026-10-09', '2026-10-13',
+                          '2026-10-16', '2026-10-20', '2026-10-23', '2026-10-27', '2026-10-30'])
+    // The last one is Friday the 30th — October's last business day — so
+    // nothing earned on the 28th, 29th or 30th waits for November.
+    expect(isMonthEndSweepDay(atUtc('2026-10-30'))).toBe(true)
   })
 
-  it('a Friday after the 10th is not a payout day; the 10th itself is', () => {
+  it('a Friday late in the month IS a payout day now', () => {
     expect(shouldRunToday(atUtc('2027-09-10'))).toBe(true)    // Friday the 10th
-    expect(shouldRunToday(atUtc('2026-09-11'))).toBe(false)   // Friday the 11th
+    expect(shouldRunToday(atUtc('2026-09-11'))).toBe(true)    // Friday the 11th — was false
   })
 
-  it('a payout day on a federal holiday moves to the next business day', () => {
-    // Veterans Day 2025 is Tuesday Nov 11 → Wednesday Nov 12.
+  it('a holiday does not move the schedule — the next scheduled day takes it', () => {
+    // Veterans Day 2025 is Tuesday Nov 11. No payout, and no payout pushed
+    // onto Wednesday either: Friday the 14th is the next one.
     expect(shouldRunToday(atUtc('2025-11-11'))).toBe(false)
-    expect(shouldRunToday(atUtc('2025-11-12'))).toBe(true)
-    // Independence Day 2025 is Friday Jul 4 (inside the 1st–10th) → Monday Jul 7.
-    expect(shouldRunToday(atUtc('2025-07-04'))).toBe(false)
-    expect(shouldRunToday(atUtc('2025-07-07'))).toBe(true)
+    expect(shouldRunToday(atUtc('2025-11-12'))).toBe(false)
+    expect(shouldRunToday(atUtc('2025-11-14'))).toBe(true)
+    // Christmas 2026 is Friday Dec 25. The push used to land it on Monday the
+    // 28th while Tuesday the 29th was already a payout day — two payouts a day
+    // apart, which is what started this. Now: nothing on either, Tuesday pays.
+    expect(shouldRunToday(atUtc('2026-12-25'))).toBe(false)
+    expect(shouldRunToday(atUtc('2026-12-28'))).toBe(false)
+    expect(shouldRunToday(atUtc('2026-12-29'))).toBe(true)
+  })
+
+  it('the scheduled day beside the last business day stands down', () => {
+    // 10/28 (Nic): "I would skip Tuesday if the last business day was
+    // Wednesday, I would skip Friday if the last business day was Thursday."
+    //
+    // December 2026 ends Thursday the 31st, so the Friday after it is New
+    // Year's Day — skipped, and January opens on Tuesday the 5th: "it'll let
+    // people pay over the weekend and build the balance up."
+    expect(isMonthEndSweepDay(atUtc('2026-12-31'))).toBe(true)
+    expect(shouldRunToday(atUtc('2027-01-01'))).toBe(false)
+    expect(shouldRunToday(atUtc('2027-01-05'))).toBe(true)
+    // June 2027 ends Wednesday the 30th: the Tuesday before it stands down.
+    expect(isMonthEndSweepDay(atUtc('2027-06-30'))).toBe(true)
+    expect(shouldRunToday(atUtc('2027-06-29'))).toBe(false)
   })
 
   it('a holiday that is not a payout day changes nothing', () => {
@@ -219,15 +255,20 @@ describe('nextPayoutDateUtc', () => {
   })
 })
 
-describe('shouldRunToday — late in the month only Tuesday (10/5)', () => {
+describe('shouldRunToday — Tuesday and Friday, every week (10/28)', () => {
   it('is TRUE on Tuesday', () => {
     expect(shouldRunToday(TUESDAY)).toBe(true)
+  })
+  it('is TRUE on Friday too, late in the month', () => {
+    // 10/28 (Nic): "Let's do Tuesdays and Fridays indefinitely when there's
+    // money, even towards the end of the month." This FRIDAY constant is the
+    // 24th of July 2026 — well past the 10th, and now a payout day.
+    expect(shouldRunToday(FRIDAY)).toBe(true)
   })
   it('is FALSE on every other weekday', () => {
     expect(shouldRunToday(MONDAY)).toBe(false)
     expect(shouldRunToday(WEDNESDAY)).toBe(false)
     expect(shouldRunToday(THURSDAY)).toBe(false)
-    expect(shouldRunToday(FRIDAY)).toBe(false)
   })
   it('is FALSE on the weekend', () => {
     expect(shouldRunToday(SATURDAY)).toBe(false)

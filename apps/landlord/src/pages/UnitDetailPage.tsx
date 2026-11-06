@@ -1853,7 +1853,7 @@ function SaleTermsControls({ unitId, contract }: { unitId: string; contract: any
         How this contract is paid
       </div>
 
-      {/* 10/25 (Nic), on Dominic Gonzalez's contract: "it is not going to go
+      {/* 10/25 (Nic), on Vesper Vanterpool's contract: "it is not going to go
           billed through the property. It's not going to get invoiced through
           the property. It's just going to be a ledger that keeps track and when
           that payment comes in, we will mark that it was paid, but it stays off

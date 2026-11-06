@@ -15,7 +15,7 @@
  *
  * The two populations, and nobody gets asked twice:
  *   * Onboarded from today on — step two is already done. Pinned below.
- *   * Already onboarded (Blu Haws finished at 18:24 on 10/19, before the
+ *   * Already onboarded (Hollis Harkness finished at 18:24 on 10/19, before the
  *     switch; Nic's own two companies linked their feeds separately in
  *     September) — step two stays, ONCE. Nic: "he still only has to do step two
  *     either way, right?" Yes. Pinned below that it is never twice.
@@ -275,10 +275,14 @@ describe('a landlord whose onboarding granted transactions', () => {
   })
 
   it('a link that only carries payment_method is not adopted — permissions are read, never assumed', async () => {
-    // Blu's actual link, as live Stripe reports it: fca_1USLR9…, active,
-    // permissions ["payment_method"], finished 18:24 on 10/19 — before the switch.
-    const { landlordId } = await landlord({ connectAccount: 'acct_1USLGxRfStEbjiIZ' })
-    connectHeldLink('acct_1USLGxRfStEbjiIZ', 'fca_1USLR9RfStEbjiIZi6QYsn9v', ['payment_method'])
+    // Hollis's actual link, as live Stripe reported it: active, permissions
+    // ["payment_method"], finished 18:24 on 10/19 — before the switch.
+    // 11/5: the real Stripe ids were in here, and this repo is public. A
+    // Connect account id is not a credential, but it identifies a real
+    // business's Stripe account and nothing about the test needs the true
+    // value — the SHAPE and the permissions are what it is checking.
+    const { landlordId } = await landlord({ connectAccount: 'acct_1HollisOnboardingTest' })
+    connectHeldLink('acct_1HollisOnboardingTest', 'fca_1PaymentMethodOnlyTest', ['payment_method'])
 
     const out = await ensureOnboardingBankLink(landlordId)
     expect(out.state).toBe('not_readable')
@@ -295,8 +299,8 @@ describe('a landlord whose onboarding granted transactions', () => {
 
 describe('a landlord onboarded before the switch', () => {
   it('still gets step two, and gets it exactly once', async () => {
-    const { landlordId } = await landlord({ connectAccount: 'acct_1USLGxRfStEbjiIZ' })
-    connectHeldLink('acct_1USLGxRfStEbjiIZ', 'fca_1USLR9RfStEbjiIZi6QYsn9v', ['payment_method'])
+    const { landlordId } = await landlord({ connectAccount: 'acct_1HollisOnboardingTest' })
+    connectHeldLink('acct_1HollisOnboardingTest', 'fca_1PaymentMethodOnlyTest', ['payment_method'])
 
     // Step two is outstanding: no link, so the Bank page asks.
     expect((await ensureOnboardingBankLink(landlordId)).state).toBe('not_readable')

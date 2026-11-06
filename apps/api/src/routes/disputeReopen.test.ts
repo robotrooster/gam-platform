@@ -133,6 +133,18 @@ async function household(o: { achFeePayer?: 'tenant' | 'landlord' } = {}): Promi
     await seedAllocationRule(c, { propertyId, achFeePayer: o.achFeePayer ?? 'tenant', cardFeePayer: 'tenant' })
     const leaseId = await seedLease(c, { unitId, landlordId, rentAmount: 1000 })
     await seedLeaseTenant(c, { leaseId, tenantId })
+    // 10/29: every test here was written assuming the landlord has NO rent
+    // coming inside REVERSAL_NETTING_WINDOW_DAYS (5), so a dispute recovery
+    // stays 'pending' instead of becoming 'scheduled_netting'. The seeded due
+    // day is the 1st, which is only far enough away for most of the month —
+    // from the 27th on, the 1st is inside the window and the recoveries
+    // silently became netted. The suite failed on the date, not on the code.
+    // Step round the 28-day cycle (a due day is 1-28) so the next rent is
+    // always about a fortnight out, whatever today is.
+    await c.query(
+      `UPDATE leases SET rent_due_day =
+         ((EXTRACT(DAY FROM (NOW() AT TIME ZONE 'America/Phoenix'))::int - 1 + 14) % 28) + 1
+        WHERE id = $1`, [leaseId])
     return { landlordId, landlordUserId, tenantId, propertyId, unitId, leaseId }
   } finally { c.release() }
 }
@@ -959,7 +971,18 @@ describe('Step 10 fix pass 3 — a dispute on a charge whose money was banked af
     // The event's fee is recorded once and billed to the tenant once.
     expect((await db.query<any>(`SELECT reversal_fee::float AS f FROM payment_reversals WHERE stripe_event_id = 'evt_fp3_unauth'`)).rows)
       .toEqual([{ f: 4 }])
-    expect((await db.query<any>(`SELECT amount::float AS a FROM payments WHERE entry_description = 'RETURNFEE'`)).rows).toEqual([{ a: 4 }])
+    // 11/4 (Nic): TWO RETURNS, TWO FEES — "GAM eats no fees."
+    //
+    // This scenario refuses the pull (R02, which bills the $4 the bank charges
+    // GAM for the return — routes/webhooks), banks it, and then has Stripe take
+    // the money back as unauthorized (which bills that reversal's own fee). GAM
+    // paid both, so the resident owes both. An earlier draft voided the first
+    // one here, on the reasoning that a payment which eventually went through
+    // should carry no fee; Stripe does not give the return fee back when a
+    // later pull clears, so that was simply GAM eating $4.
+    expect((await db.query<any>(
+      `SELECT amount::float AS a FROM payments WHERE entry_description = 'RETURNFEE' AND voided_at IS NULL ORDER BY amount`)).rows)
+      .toEqual([{ a: 4 }, { a: 4 }])
     // The tenant's own $100: the use the failed charge set aside was given back, and the
     // one the whole-bill check made stays spent on the bill.
     expect((await db.query<any>(`SELECT status, amount::float AS a FROM credit_uses WHERE prepaid_credit_id = $1 ORDER BY status`, [credit!])).rows)
@@ -1040,7 +1063,11 @@ describe('Step 10 fix pass 4 — a partial claim is never left on nobody', () =>
     expect(owedAgain - await usable(banked)).toBe(450)
     // The dispute fee is recorded once and billed to the tenant once.
     expect((await db.query<any>(`SELECT COALESCE(SUM(reversal_fee), 0)::float AS f FROM payment_reversals`)).rows[0].f).toBe(15)
-    expect((await db.query<any>(`SELECT amount::float AS a FROM payments WHERE entry_description = 'RETURNFEE'`)).rows).toEqual([{ a: 15 }])
+    // The $4 beside it is the bank's return fee from the refused pull this
+    // fixture starts with (11/4): two real costs, both the resident's.
+    expect((await db.query<any>(
+      `SELECT amount::float AS a FROM payments WHERE entry_description = 'RETURNFEE' AND voided_at IS NULL ORDER BY amount`)).rows)
+      .toEqual([{ a: 4 }, { a: 15 }])
     // Nothing was left over: no shortfall alert.
     expect((await db.query(`SELECT 1 FROM admin_notifications WHERE category IN ('payment_reversal_short', 'disputed_credit_short', 'payment_reversal_nothing_reopened')`)).rowCount).toBe(0)
   })
@@ -1072,7 +1099,11 @@ describe('Step 10 fix pass 4 — a partial claim is never left on nobody', () =>
       stripeEventId: 'evt_fp4_b', stripeObjectId: 'py_fp4', rawEvent: {} })
     expect(second.feeRowId).toBeNull()
     expect((await db.query<any>(`SELECT COALESCE(SUM(reversal_fee), 0)::float AS f FROM payment_reversals WHERE stripe_object_id = 'py_fp4'`)).rows[0].f).toBe(4)
-    expect((await db.query<any>(`SELECT amount::float AS a FROM payments WHERE entry_description = 'RETURNFEE'`)).rows).toEqual([{ a: 4 }])
+    // Two rows, two causes: the refused pull's bank return fee and this
+    // reversal's — billed once each, however many events carry them (11/4).
+    expect((await db.query<any>(
+      `SELECT amount::float AS a FROM payments WHERE entry_description = 'RETURNFEE' AND voided_at IS NULL ORDER BY amount`)).rows)
+      .toEqual([{ a: 4 }, { a: 4 }])
   })
 
   it('a partial claim that neither the paid-ahead money nor the bills can carry tells an admin the shortfall', async () => {

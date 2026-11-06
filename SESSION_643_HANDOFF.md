@@ -43,7 +43,7 @@ with no code change went green. Don't chase these as regressions.
 
 ## SHIPPED AND LIVE TODAY
 
-**Calvin Curtis** had two accounts — the invited one (lease, invoice, $520.20) and a
+**Kesh Kilbride** had two accounts — the invited one (lease, invoice, $520.20) and a
 self-registered one he made after his link dead-ended. Merged by moving the EMAIL onto
 the account holding the lease, never the reverse: `tenants(id)` is referenced by 56
 tables and `lease_document_signers.user_id` binds a signed lease to its signer. He
@@ -51,11 +51,11 @@ signed in and paid $520.20 the same day.
 
 **Tenant accounts have exactly two doors now.** An invite, or the screening form.
 "Create account" sat beside the sign-in box and had never once been used by a resident
-on purpose — only in error, by Calvin. Account creation now happens *inside* the
+on purpose — only in error, by Kesh. Account creation now happens *inside* the
 screening form (email + password, no name), and the standalone signup page is deleted.
 The screener's **matched legal name** becomes the account's name when the report lands.
 
-**Rent-collected emails** stated the lease's base rent, not the money. Calvin paid
+**Rent-collected emails** stated the lease's base rent, not the money. Kesh paid
 $495 rent + $25.20 electricity on one intent and the landlord was told "$495.00". Now
 sums the whole event and itemises it.
 

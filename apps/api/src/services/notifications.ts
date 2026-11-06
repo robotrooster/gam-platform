@@ -47,11 +47,11 @@ export function emailTemplate(title: string, body: string, cta?: { label: string
 /**
  * ── 10/25 (Nic, DIRECTIVE) — A TEAM MEMBER GETS NO EMAIL FROM GAM ───────────
  *
- *   "You mentioned Lisa Scheeler getting the emails. Why is she getting emails?
+ *   "You mentioned Calla Fitzhugh getting the emails. Why is she getting emails?
  *    She is a front desk employee. She looks at the screen when she's there, and
  *    when she's clocked out at home, that's it. She is operating as a team
  *    member, not as a landlord. She doesn't need the wake-up calls at 3 in the
- *    morning... Lisa does not need any emails from GAM except for two-factor
+ *    morning... Calla does not need any emails from GAM except for two-factor
  *    authentication to log in or like changing a password if she ever requests
  *    to do that. Because I've already had her be confused by emails. She's
  *    gotten an email and said, well, I thought I already took care of this."
@@ -238,7 +238,18 @@ export async function notifyAchRetryScheduled(o: {
   landlordId: string;
   landlordRecipients: Array<{ userId: string; email: string }>;
   unitNumber: string; propertyName: string;
+  /** What the resident's charges come to — the landlord's figure. */
   amount: number;
+  /**
+   * 11/4 (Nic): WHAT THE BANK WILL ACTUALLY BE DEBITED, which is not `amount`:
+   * every bank payment carries the $6 ACH fee, and the notice used to name the
+   * charges and then debit more. Heather Miller was told $100 and charged $106.
+   * The retry re-confirms the same PaymentIntent, so this is that intent's own
+   * amount. Omitted, the resident's copy falls back to `amount`.
+   */
+  debit?: number;
+  /** The debit's lines (achRetry.pullDebitLines); empty when they do not sum to it. */
+  lines?: Array<{ label: string; amount: number }>;
   reason: string | null;                   // plain-words reason (ACH_RETURN_CONFIG.plain); null = unreadable
   retryDate: string;                       // ISO date string (YYYY-MM-DD)
   retryAttempt: 1 | 2;                     // which retry this is
@@ -250,22 +261,42 @@ export async function notifyAchRetryScheduled(o: {
   }
   const day = retryDayLabel(o.retryDate)
   const amt = `$${o.amount.toFixed(2)}`
+  const debit = o.debit ?? o.amount
+  const debitAmt = `$${debit.toFixed(2)}`
+  const lines = o.lines ?? []
   const because = o.reason ? ` because ${o.reason}` : ''
+  const linesPlain = lines.length
+    ? `\n\n${lines.map(l => `  ${l.label}: $${l.amount.toFixed(2)}`).join('\n')}\n  Total: ${debitAmt}`
+    : ''
+  const linesHtml = lines.length
+    ? `<div style="margin:14px 0;padding:14px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">`
+      + lines.map(l =>
+          `<div style="display:flex;justify-content:space-between;font-size:.86rem;color:#b8c4d8;margin-bottom:5px">
+             <span>${l.label}</span><span>$${l.amount.toFixed(2)}</span>
+           </div>`).join('')
+      + `<div style="display:flex;justify-content:space-between;font-weight:800;color:#eef1f8;
+                     border-top:1px solid #1e2530;padding-top:7px;margin-top:6px">
+           <span>What your bank will be asked for</span><span>${debitAmt}</span>
+         </div></div>`
+    : ''
 
   // Tenant: actionable — tells them what failed, why, and when we'll try again
   await createNotification({
     userId: o.tenantUserId,
     type: 'ach_retry_scheduled',
     title: `Payment retry scheduled — ${day}`,
-    body: `Your ${amt} payment for Unit ${o.unitNumber} didn't go through${because}. We'll try your bank again on ${day}. Please make sure the money is in the account by then.`,
-    data: { ...shared, tenantUserId: o.tenantUserId },
+    body: `Your ${debitAmt} payment for Unit ${o.unitNumber} didn't go through${because}. `
+      + `We'll try your bank again on ${day} for ${debitAmt}. Please make sure the money is in the account by then.`
+      + linesPlain,
+    data: { ...shared, tenantUserId: o.tenantUserId, debit, lines },
     actionUrl: '/payments',
     sendEmail: true, emailTo: o.tenantEmail,
     emailSubject: `Payment retry scheduled — ${day}`,
     emailHtml: emailTemplate(
       `We'll Try Your Payment Again on ${day}`,
-      `<p>Your <b>${amt}</b> payment for ${o.propertyName} Unit ${o.unitNumber} didn't go through${because}.</p>` +
-      `<p>We'll try your bank again on <b>${day}</b>. Please make sure the money is in the account before then.</p>` +
+      `<p>Your <b>${debitAmt}</b> payment for ${o.propertyName} Unit ${o.unitNumber} didn't go through${because}.</p>` +
+      `<p>We'll try your bank again on <b>${day}</b>, for <b>${debitAmt}</b>. Please make sure that much is in the account before then.</p>` +
+      linesHtml +
       `<p style="font-size:.85rem;color:#4a5568">${retryFootnote(o.retryAttempt)}</p>`
     ),
     // 10/5: replies reach the people who run this property (services/replyRouting).
@@ -291,16 +322,22 @@ export async function notifyAchRetryScheduled(o: {
 }
 
 /**
- * What happens if this retry fails too. A short-of-money bounce gets two
- * retries (the webhook schedules another while retry_count < 2), so after the
- * FIRST one there is still one more — "we can't try again" is only true of the
- * second. A first retry that bounces for a different reason (a closed account)
- * is not retried, hence "for the same reason".
+ * What happens if this retry fails too.
+ *
+ * 11/4 (Nic): "they fail once, they retry, it fails again, the payment method
+ * is blocked. That's it." An ordinary bounce now gets exactly ONE retry
+ * (ACH_MAX_RETRIES), so there is no "first of two" any more and every retry is
+ * the last one. The old wording promised a second attempt the code will no
+ * longer make, which would have read as GAM going quiet after saying it would
+ * try again.
+ *
+ * The parameter is kept so a caller that has the attempt number need not change
+ * and so a future ladder has somewhere to go, but both arms say the same thing
+ * while the cap is one.
  */
-function retryFootnote(attempt: 1 | 2): string {
-  return attempt === 1
-    ? `This is the first of two retries. If it doesn't go through for the same reason, we'll try one last time three days later. We'll email you either way.`
-    : `This is the last retry. If it doesn't go through, we can't try your bank again and you'll need to pay another way.`
+function retryFootnote(_attempt: 1 | 2): string {
+  return `This is the only retry. If it doesn't go through, we can't try your bank again, `
+       + `the payment method comes off your account, and you'll need to pay another way.`
 }
 
 /** 'YYYY-MM-DD' → "Sunday, October 4" (a calendar date, so read in UTC). */

@@ -126,7 +126,7 @@ export function AcceptInvitePage() {
   if (error && !inviteInfo) return (
     <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#060809', padding: 24, fontFamily: 'system-ui' }}>
       <div style={{ maxWidth: 400, textAlign: 'center', color: '#b8c4d8' }}>
-        {/* S642 (Nic, via Calvin Curtis): "the lease link said to contact the
+        {/* S642 (Nic, via Kesh Kilbride): "the lease link said to contact the
             landlord." He had activated on September 7 and has a working
             account — he had reopened the invite email, whose link is spent.
             S637 kept the token from then on so we could say "you're already set

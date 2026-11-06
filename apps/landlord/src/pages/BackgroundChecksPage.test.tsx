@@ -61,8 +61,8 @@ const twoCompanies = () => {
     { id: OP, businessName: 'Oak Park Motel and RV LLC', propertyCount: 1 },
   ]
   server.checks = [
-    check({ id: 'c1', firstName: 'Victor', lastName: 'Cardoza', landlordId: MV, propertyId: 'p-mv', propertyName: 'Mountain View' }),
-    check({ id: 'c2', firstName: 'Nemesio', lastName: 'Rivera', landlordId: MV, propertyId: 'p-mv', propertyName: 'Mountain View' }),
+    check({ id: 'c1', firstName: 'Horatio', lastName: 'Mapperley', landlordId: MV, propertyId: 'p-mv', propertyName: 'Mountain View' }),
+    check({ id: 'c2', firstName: 'Kestrel', lastName: 'Norrington', landlordId: MV, propertyId: 'p-mv', propertyName: 'Mountain View' }),
     check({ id: 'c3', firstName: 'Annie', lastName: 'Annex', landlordId: MV, propertyId: 'p-annex', propertyName: 'Mountain View Annex' }),
     check({ id: 'c4', firstName: 'Olive', lastName: 'Oakley', landlordId: OP, propertyId: 'p-op', propertyName: 'Oak Park Motel' }),
     check({ id: 'c5', firstName: 'Opal', lastName: 'Oldham', landlordId: OP, propertyId: 'p-op', propertyName: 'Oak Park Motel', bucket: 'past', status: 'approved' }),
@@ -117,7 +117,7 @@ describe('narrowing the screening list', () => {
   it('starts on every company, then shows one company and only its parks', async () => {
     twoCompanies()
     await render()
-    expect(rows()).toEqual(['Victor Cardoza', 'Nemesio Rivera', 'Annie Annex', 'Olive Oakley'])
+    expect(rows()).toEqual(['Horatio Mapperley', 'Kestrel Norrington', 'Annie Annex', 'Olive Oakley'])
 
     const company = selectWith('Choose a company')!
     expect(company).toBeTruthy()
@@ -136,7 +136,7 @@ describe('narrowing the screening list', () => {
     twoCompanies()
     await render()
     await choose(selectWith('Choose a company')!, MV)
-    expect(rows()).toEqual(['Victor Cardoza', 'Nemesio Rivera', 'Annie Annex'])
+    expect(rows()).toEqual(['Horatio Mapperley', 'Kestrel Norrington', 'Annie Annex'])
 
     await choose(selectWith('All properties')!, 'p-annex')
     expect(rows()).toEqual(['Annie Annex'])
@@ -187,7 +187,7 @@ describe('a cleared stay that is over', () => {
   it('says the stay finished instead of inviting a check-in', async () => {
     server.entities = [{ id: MV, businessName: 'Mountain View RV Park Ranch LLC', propertyCount: 1 }]
     server.checks = [check({
-      id: 'c1', firstName: 'Victor', lastName: 'Cardoza', status: 'approved', bucket: 'past',
+      id: 'c1', firstName: 'Horatio', lastName: 'Mapperley', status: 'approved', bucket: 'past',
       clearedForStay: true, stayOver: true, stayBookingId: 'b1', stayCheckIn: ymd(-15), stayCheckOut: ymd(-1),
       landlordId: MV, propertyId: 'p-mv', propertyName: 'Mountain View',
     })]
@@ -205,7 +205,7 @@ describe('a cleared stay that is over', () => {
   it('a stay still to come, or still running, keeps the check-in wording', async () => {
     server.entities = [{ id: MV, businessName: 'Mountain View RV Park Ranch LLC', propertyCount: 1 }]
     server.checks = [check({
-      id: 'c1', firstName: 'Victor', lastName: 'Cardoza', status: 'approved', bucket: 'past',
+      id: 'c1', firstName: 'Horatio', lastName: 'Mapperley', status: 'approved', bucket: 'past',
       clearedForStay: true, stayOver: false, stayBookingId: 'b1', stayCheckIn: ymd(0), stayCheckOut: ymd(30),
       landlordId: MV, propertyId: 'p-mv', propertyName: 'Mountain View',
     })]
@@ -224,7 +224,7 @@ describe('a cleared stay that is over', () => {
     // day ahead of the park — while the park's own date still has the guest on
     // site and waiting to be checked in. The park wins.
     server.checks = [check({
-      id: 'c1', firstName: 'Victor', lastName: 'Cardoza', status: 'approved', bucket: 'past',
+      id: 'c1', firstName: 'Horatio', lastName: 'Mapperley', status: 'approved', bucket: 'past',
       clearedForStay: true, stayOver: false, stayBookingId: 'b1', stayCheckIn: ymd(-15), stayCheckOut: ymd(-1),
       landlordId: MV, propertyId: 'p-mv', propertyName: 'Mountain View',
     })]
@@ -272,23 +272,23 @@ describe('a filter can only narrow, never widen', () => {
   it('a one-company account gets no company control, and loses no row to it', async () => {
     server.entities = [{ id: MV, businessName: 'Mountain View RV Park Ranch LLC', propertyCount: 2 }]
     server.checks = [
-      check({ id: 'c1', firstName: 'Victor', lastName: 'Cardoza', landlordId: MV, propertyId: 'p-mv', propertyName: 'Mountain View' }),
+      check({ id: 'c1', firstName: 'Horatio', lastName: 'Mapperley', landlordId: MV, propertyId: 'p-mv', propertyName: 'Mountain View' }),
       // A row whose company is not in the entities list (an entity created
       // since this login, so it is in the data but not in the token's list)
       // must still be on screen — the picker is not even rendered.
-      check({ id: 'c2', firstName: 'Nemesio', lastName: 'Rivera', landlordId: 'company-newer', propertyId: 'p-new', propertyName: 'Copper Canyon' }),
+      check({ id: 'c2', firstName: 'Kestrel', lastName: 'Norrington', landlordId: 'company-newer', propertyId: 'p-new', propertyName: 'Copper Canyon' }),
     ]
     await render()
     expect(selectWith('Choose a company')).toBeUndefined()
-    expect(rows()).toEqual(['Victor Cardoza', 'Nemesio Rivera'])
+    expect(rows()).toEqual(['Horatio Mapperley', 'Kestrel Norrington'])
   })
 
   it('a staff login with no company list of its own still sees its screenings', async () => {
     // A team login gets a 403 on the entities list, which reads as none.
     server.entities = []
-    server.checks = [check({ id: 'c1', firstName: 'Victor', lastName: 'Cardoza', landlordId: MV, propertyId: 'p-mv', propertyName: 'Mountain View' })]
+    server.checks = [check({ id: 'c1', firstName: 'Horatio', lastName: 'Mapperley', landlordId: MV, propertyId: 'p-mv', propertyName: 'Mountain View' })]
     await render()
     expect(selectWith('Choose a company')).toBeUndefined()
-    expect(rows()).toEqual(['Victor Cardoza'])
+    expect(rows()).toEqual(['Horatio Mapperley'])
   })
 })

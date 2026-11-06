@@ -71,6 +71,7 @@ export async function bill(co: TenantCo, o: {
   settledAt?: string | null; flexpayAdvanceId?: string | null; workTradeSettlementId?: string | null
   workTradeCredit?: number; homeSaleInstallmentId?: string | null; depositCollectedBy?: string | null
   notes?: string | null; reversalId?: string | null; landlordId?: string; tenantId?: string
+  leftOwingCollectionId?: string | null
 }): Promise<string> {
   const type = o.type ?? 'rent'
   const entry = o.entry ?? ({ rent: 'RENT', utility: 'UTILITY', late_fee: 'LATEFEE', deposit: 'DEPOSIT', fee: 'OTHERFEE',
@@ -78,12 +79,14 @@ export async function bill(co: TenantCo, o: {
   const r = await db.query<{ id: string }>(
     `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description,
                            revenue_owner, lease_fee_id, manual_method, settled_at, flexpay_advance_id, work_trade_settlement_id,
-                           work_trade_credit, home_sale_installment_id, deposit_collected_by, notes, reversal_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) RETURNING id`,
+                           work_trade_credit, home_sale_installment_id, deposit_collected_by, notes, reversal_id,
+                           left_owing_collection_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING id`,
     [o.unitId ?? co.unitId, o.leaseId ?? co.leaseId, o.tenantId ?? co.tenantId, o.landlordId ?? co.landlordId, type, o.amount,
      o.status ?? 'pending', o.due, entry, o.revenueOwner ?? 'landlord', o.leaseFeeId ?? null, o.manualMethod ?? null,
      o.settledAt ?? null, o.flexpayAdvanceId ?? null, o.workTradeSettlementId ?? null, o.workTradeCredit ?? 0,
-     o.homeSaleInstallmentId ?? null, o.depositCollectedBy ?? null, o.notes ?? null, o.reversalId ?? null])
+     o.homeSaleInstallmentId ?? null, o.depositCollectedBy ?? null, o.notes ?? null, o.reversalId ?? null,
+     o.leftOwingCollectionId ?? null])
   return r.rows[0].id
 }
 
@@ -237,6 +240,51 @@ export interface ActiveLine {
 }
 
 /** The lines of a source's ACTIVE postings, every kind (cents). */
+/**
+ * 11/3 — EVERY LINE OF EVERY OPENING THIS COMPANY HAS.
+ *
+ * The opening stopped being one posting: there is one per property (source id
+ * `landlordId|propertyId`) plus the company's own (the bare `landlordId`) for
+ * the lines that name no property, a bank balance above all. "What does the
+ * opening hold" is now the union of those, which is what every test here means
+ * when it asks.
+ */
+export async function openingLines(landlordId: string): Promise<ActiveLine[]> {
+  const r = await db.query<any>(
+    `SELECT p.posting_kind AS kind, p.intended_date::text AS day, l.account_role AS role,
+            round(l.debit * 100)::bigint::text AS dr, round(l.credit * 100)::bigint::text AS cr, l.property_id,
+            l.report_category, l.cash_effect, l.payment_id, l.tenant_id, l.lease_id, l.system_line
+       FROM ledger_postings p JOIN ledger_posting_lines l ON l.posting_id = p.id
+      WHERE p.source_type = 'opening' AND (p.source_id = $1 OR p.source_id LIKE $1 || '|%')
+        AND p.role = 'post' AND p.superseded_at IS NULL
+      ORDER BY p.source_id, p.posting_kind, l.line_no`, [landlordId])
+  return r.rows.map((x: any) => ({
+    kind: x.kind, day: x.day, role: x.role, dr: Number(x.dr), cr: Number(x.cr), propertyId: x.property_id,
+    category: x.report_category, cash: x.cash_effect, paymentId: x.payment_id, tenantId: x.tenant_id, leaseId: x.lease_id,
+    system: x.system_line,
+  }))
+}
+
+/** How many opening POSTINGS this company has standing (one per property that has money before its start, plus the company's own). */
+export async function openingPostingCount(landlordId: string): Promise<number> {
+  const r = await db.query<{ n: string }>(
+    `SELECT count(*)::text AS n FROM ledger_postings
+      WHERE source_type = 'opening' AND (source_id = $1 OR source_id LIKE $1 || '|%')
+        AND role = 'post' AND superseded_at IS NULL`, [landlordId])
+  return Number(r.rows[0].n)
+}
+
+/** Queue every opening this company has, the way picking a books start date does. */
+export async function markOpenings(landlordId: string): Promise<void> {
+  await db.query(
+    `INSERT INTO ledger_outbox (source_type, source_id, owner_id)
+     SELECT 'opening', $1::text, $1::uuid
+      UNION ALL
+     SELECT 'opening', $1::text || '|' || p.id::text, $1::uuid
+       FROM properties p WHERE p.landlord_id = $1::uuid AND p.books_start_date IS NOT NULL`,
+    [landlordId])
+}
+
 export async function activeLines(sourceType: string, sourceId: string, landlordId?: string): Promise<ActiveLine[]> {
   const r = await db.query<any>(
     `SELECT p.posting_kind AS kind, p.intended_date::text AS day, l.account_role AS role,

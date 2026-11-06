@@ -16,6 +16,7 @@
 import { useState } from 'react'
 import { useQueries, useQuery, useQueryClient } from 'react-query'
 import { paidByLabel, formatCurrency, humanize, humanizeEntryDescription, chargeLabel, PAYMENT_STATUS_LABEL, type PaymentStatus } from '@gam/shared'
+import { FlexDepositOfferPrompt } from '../components/FlexDepositOfferPrompt'
 import { ReportBankDepositModal, ReportedDeposits, type WithdrawRefusal } from '../components/ReportBankDeposit'
 import { apiGet, apiPost, apiPut } from '../lib/api'
 import { owedOf, requiredOf, creditOffer, planCharges, roundCents, type LeaseBill } from '../lib/payCredit'
@@ -69,6 +70,8 @@ interface RemitLine {
   // sends it (lib/utilityLine reads the note until then).
   notes?:           string | null
   label?:           string | null
+  /** 11/4: the detail under the name — a meter read, a period (chargeDetail). */
+  detail?:          string | null
   utilityType?:     string | null
 }
 
@@ -298,6 +301,10 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
     'payments',
     () => apiGet<Payment[]>('/tenants/payments'),
   )
+  // 10/29: the same record the home page reads, so the deposit offer above the
+  // bill and the one on the home page are always the same offer. Shared cache
+  // key — this costs no extra request.
+  const { data: tenantMe } = useQuery<any>('tenant-me', () => apiGet<any>('/tenants/me'))
   const { data: balanceCtx } = useQuery<{
     totalOutstanding: number
     paymentBlocked: boolean
@@ -581,6 +588,10 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
           finishes it HERE rather than on a Stripe-hosted page. Renders itself
           away when nothing is pending. */}
       <VerifyMicrodepositsCard onVerified={() => qc.invalidateQueries('tenant-payment-methods')} />
+      {/* 10/29 (Nic): "if they log in to go and pay their bill, that needs to
+          ask if they want to sign up for flex deposit at that point." Above
+          the bill, because the whole deposit is sitting in it. */}
+      <FlexDepositOfferPrompt offer={tenantMe?.flexDepositOffer} where="payments" />
       <div className="ph">
         <div>
           {/* S615: a utility-service payer pays no rent, so the subtitle would
@@ -774,7 +785,20 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                   reports={declaredDeposits} onWithdrawn={refetchAll}
                   refusal={cardRefusal} onRefusal={setDepositRefusal} />
                 {/* 10/6 (Nic): only where the landlord takes rent deposited at their bank. */}
-                {payable.filter((l) => l.bankDepositsTaken === true).map((l) => (
+                {/* ── 11/4: AND WHETHER OR NOT THEY OWE ANYTHING ─────────────
+                    This read `payable`, which is leases with owedOf(l) > 0, so
+                    the button vanished for anybody PAYING AHEAD — the one case
+                    where GAM cannot work the deposit out on its own and the
+                    resident telling us is the only way it is ever matched.
+                    Kim Bowman's $1,175 on 10/30 is the live example: paid
+                    ahead, nothing owed, no button, and the bank line sat
+                    unmatched until somebody went looking for it by hand.
+                    The server never minded — POST /declared-deposits asks only
+                    that the lease is theirs, the park takes bank deposits and
+                    the date is within 45 days — and the modal already opens
+                    with an empty amount when nothing is owed. Only this filter
+                    stood in the way. */}
+                {leaseGroups.filter((l) => l.bankDepositsTaken === true && !l.paymentBlocked).map((l) => (
                   <button key={l.leaseId} className="btn-ghost"
                     onClick={() => setReportDepositFor({ leaseId: l.leaseId, outstanding: owedOf(l) })}
                     style={{ width: '100%', marginTop: 8, fontSize: '.78rem', padding: '8px 12px' }}>
@@ -973,11 +997,15 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
           waitingOnBank={new Set((balanceCtx?.awaitingCardConfirmations ?? []).map((a) => a.remittanceId).filter((x): x is string => !!x))} />
       )}
 
+      {/* 10/30 (Nic): six columns at 720px in a ~360px box put Paid by and
+          Charge off the right edge. Same treatment as the documents table — each
+          row becomes a card on a phone, labels move onto the cells, and the
+          width lives in the class so a media query can undo it. */}
       <div className="card" style={{ padding: 0, overflowX: 'auto', marginTop: 16 }}>
         {paymentsLoading ? (
           <div style={{ padding: 32, color: 'var(--t3)', textAlign: 'center' }}>Loading…</div>
         ) : (
-          <table className="tbl" style={{ minWidth: 720 }}>
+          <table className="tbl tbl--stack">
             <thead>
               <tr>
                 <th>Due</th>
@@ -996,22 +1024,22 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                       <td className="mono" style={{ fontSize: '.75rem' }}>
                         {new Date(p.dueDate).toLocaleDateString()}
                       </td>
-                      <td>
+                      <td data-label="Type">
                         <span className="badge b-muted">{humanize(p.type)}</span>
                       </td>
-                      <td className="mono" style={{ color: 'var(--t0)', fontWeight: 600 }}>
+                      <td data-label="Amount" className="mono" style={{ color: 'var(--t0)', fontWeight: 600 }}>
                         {formatCurrency(p.amount)}
                       </td>
-                      <td>
+                      <td data-label="Status">
                         <span className={`badge ${STATUS_BADGE[p.status] || 'b-muted'}`}>
                           {statusLabel(p.status)}
                         </span>
                       </td>
-                      <td style={{ fontSize: '.75rem', color: 'var(--t3)' }}>
+                      <td data-label="Charge" style={{ fontSize: '.75rem', color: 'var(--t3)' }}>
                         {/* decisions #17: a utility line names its utility. */}
                         {p.type === 'utility' ? utilityLine(p).label : chargeLabel(p.entryDescription, p.notes)}
                       </td>
-                      <td style={{ fontSize: '.75rem', color: 'var(--t2)', whiteSpace: 'nowrap' }}>
+                      <td data-label="Paid by" style={{ fontSize: '.75rem', color: 'var(--t2)' }}>
                         {(p.status === 'settled' || p.status === 'processing') ? (paidByLabel(p.paidBy, p.paymentChannel) ?? '—') : '—'}
                       </td>
 
@@ -1182,13 +1210,20 @@ function RemittancesCard({ remittances, prepaidRemaining, prepaidMonthlyDraw, wa
                     {r.lines.map((ln) => (
                       <tr key={ln.paymentId}>
                         <td>
-                          {/* decisions #17: a utility line names its utility — Water, Trash… */}
+                          {/* 11/4: the SERVER names the line now (chargeLabel — the same
+                              words as the bill, the receipt email and the landlord's
+                              screens), so a utility reads "Water" and not "Utility" and
+                              nothing here humanizes a raw database type. The old local
+                              naming stays as the fallback for a response from before
+                              the API carried a label. */}
                           <span className="badge b-muted" style={{ marginRight: 6 }}>
-                            {ln.type === 'utility' ? utilityLine(ln).label : humanize(ln.type)}
+                            {ln.label || (ln.type === 'utility' ? utilityLine(ln).label : humanize(ln.type))}
                           </span>
-                          {ln.type !== 'utility' && ln.entryDescription && norm(ln.entryDescription) !== norm(ln.type) && (
-                            <span style={{ fontSize: '.72rem', color: 'var(--t3)' }}>{humanizeEntryDescription(ln.entryDescription)}</span>
-                          )}
+                          {ln.detail
+                            ? <span style={{ fontSize: '.72rem', color: 'var(--t3)' }}>{ln.detail}</span>
+                            : !ln.label && ln.type !== 'utility' && ln.entryDescription && norm(ln.entryDescription) !== norm(ln.type) && (
+                                <span style={{ fontSize: '.72rem', color: 'var(--t3)' }}>{humanizeEntryDescription(ln.entryDescription)}</span>
+                              )}
                         </td>
                         <td className="mono" style={{ fontSize: '.72rem' }}>
                           {new Date(ln.dueDate.slice(0, 10) + 'T00:00:00').toLocaleDateString()}
@@ -1267,7 +1302,6 @@ type DepositInterestData = {
     stateCode:       string
     effectiveYear:   number
     annualRatePct:  string
-    statuteCitation: string | null  // null for landlord_override
     notes:            string | null
   } | null
   accruals: Array<{
@@ -1334,15 +1368,11 @@ function SecurityDepositCard() {
 
       {data.rate ? (
         <div style={{ fontSize: '.74rem', color: 'var(--t3)', lineHeight: 1.5, padding: 10, background: 'var(--bg-2)', borderRadius: 6 }}>
-          {data.rate.source === 'statutory' ? (
-            <>
-              {data.rate.stateCode} requires {Number(data.rate.annualRatePct).toFixed(2)}% annual interest on held deposits per <em>{data.rate.statuteCitation}</em>. Interest accrues monthly and is paid out with your refund at move-out.
-            </>
-          ) : (
-            <>
-              Your landlord pays {Number(data.rate.annualRatePct).toFixed(2)}% annual interest on your deposit ({data.rate.effectiveYear}). Interest accrues monthly and is paid out with your refund at move-out.
-            </>
-          )}
+          {/* 10/30 (Nic): only a rate the LANDLORD set is shown — their own
+              lease term. A statutory rate never reaches here (the API stops
+              sending it), so there is no state, no statute and no "your
+              landlord owes you" on a resident's screen. */}
+          Your landlord pays {Number(data.rate.annualRatePct).toFixed(2)}% annual interest on your deposit ({data.rate.effectiveYear}). Interest accrues monthly and is paid out with your refund at move-out.
         </div>
       ) : (
         <div style={{ fontSize: '.74rem', color: 'var(--t3)', lineHeight: 1.5, padding: 10, background: 'var(--bg-2)', borderRadius: 6 }}>

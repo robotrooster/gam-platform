@@ -89,7 +89,7 @@ interface PendingInvoice {
 // ─── What a charge line is called (decisions #17) ────────────────────────────
 //
 // Nic (10/3): "Bill and email lines name the utility: 'Water', 'Electric',
-// 'Trash', 'Sewer' — never a generic 'Utilities' line." Kim Harland's October
+// 'Trash', 'Sewer' — never a generic 'Utilities' line." Yvette Bexley's October
 // email read "Utilities $10.45" (her water) and "Utilities $25" (her trash).
 // And a line was named after whatever its note said first, so a utility the
 // desk had recorded read "Recorded as manual money_order payment (ref …)".
@@ -119,6 +119,14 @@ export interface ChargeLabelRow {
    * note is only the reopen tag, so its name and detail come from this one.
    */
   origin_notes?: string | null
+  /**
+   * 11/5 (Nic): "just separate the line items by putting the bounce date on
+   * there." payments.returned_on — the day the bank refused the debit or the
+   * card was declined, on GAM's own pass-through fees. It is the ONLY thing
+   * that tells two of them apart on one bill, and without it Heather Miller's
+   * November bill showed "Returned-payment fee $4.00" twice over.
+   */
+  returned_on?: string | null
 }
 
 const SQL_ALIAS = /^[a-z_][a-z0-9_]*$/i
@@ -168,7 +176,16 @@ export function chargeLabelColumnsSql(p = 'p'): string {
           (SELECT NULLIF(btrim(lf_l.description), '') FROM lease_fees lf_l WHERE lf_l.id = ${feeId}) AS fee_description,
           CASE WHEN ${p}.reversal_id IS NOT NULL
                THEN (${labelSourcesSql(p, 'ls_n')}
-                     SELECT ls_n.notes FROM ls_n WHERE ls_n.depth > 0 ORDER BY ls_n.depth DESC LIMIT 1) END AS origin_notes`
+                     SELECT ls_n.notes FROM ls_n WHERE ls_n.depth > 0 ORDER BY ls_n.depth DESC LIMIT 1) END AS origin_notes,
+          -- 11/5: read by ID and not off the alias. Two callers pass a CTE
+          -- (householdMonths' judged, openBills' mine) that carries a chosen
+          -- set of payments columns, so reading the column off the alias was
+          -- "column j.returned_on does not exist" and took the Rent Roll, the
+          -- balances page and every receipt down with it. The id is the one
+          -- column this function already requires of every caller, so going
+          -- through it cannot be forgotten by the next CTE either.
+          (SELECT to_char(lo_r.returned_on, 'YYYY-MM-DD') FROM payments lo_r
+            WHERE lo_r.id = ${p}.id) AS returned_on`
 }
 
 const UTILITY_WORDS: Array<[RegExp, UtilityType]> = [
@@ -185,16 +202,47 @@ const UTILITY_WORDS: Array<[RegExp, UtilityType]> = [
  * toward the old balance; …" / "part of the old balance; …" (an old balance
  * paid down) — never shown as what the charge is.
  */
-const TAG = /^(recorded as|covered by|paid (with|on time|off-platform|in full|in part)|partly paid|part of the old balance|work trade|suspended|waived|reopened|corrected|correction|settled|refunded|s\d{3,}:)/i
+// 11/4: "Returned bank payment …" and "Declined card attempt …" are payment
+// tags too — the notes GAM's own $4 return fee and $1 decline fee carry
+// (routes/webhooks). Those notes are a DEDUPE KEY, which is how a re-delivered
+// Stripe event is stopped from billing the fee twice, and they were printing as
+// the line's detail: a bill read "Returned-payment fee — Returned bank payment
+// — pi_3S… (evt_1N…)". The fee's own label is the information; the ids are
+// machine data.
+// 11/4: so are "Automatic bank retry stopped …" (the pull was taken off
+// autopay) and "Re-applied to <month> …" (where the money went, oldest balance
+// first). Both are facts about a PAYMENT and both were printing as the name of
+// the charge they sit on: MH 29's October rent read
+// "Rent · What is left of this bill after a part payment — Automatic bank retry
+// stopped 11/4 (Nic): this pull was refused for insufficient funds…".
+const TAG = /^(recorded as|covered by|paid (with|on time|off-platform|in full|in part)|partly paid|part of the old balance|work trade|suspended|waived|reopened|corrected|correction|settled|refunded|returned bank payment|declined card attempt|automatic bank retry stopped|re-applied to|s\d{3,}:)/i
 /** A note segment that only names the space ("RV 44"): the bill already says where. */
 const SPACE_ONLY = /^(rv|mh|apt|apartment|unit|lot|site|space|spot|house|cabin|storage)\s*#?\s*[\w-]{1,6}$/i
+/**
+ * 11/4: a segment that is nothing but machine identifiers — a Stripe id, on its
+ * own or with a second in parentheses. A note written as a dedupe key splits
+ * into segments and the tag above only catches the words at the front, so the
+ * second half of "Returned bank payment — pi_3S… (evt_1N…)" was the bare id and
+ * it printed on the bill. No charge is ever CALLED one of these.
+ */
+const IDS_ONLY = /^(pi|ch|py|evt|in|sub|cs|txn|re|dp|du|card|cus)_[A-Za-z0-9_]+(\s*\([^)]*\))?$/i
+/**
+ * 11/4: and the keys that are not a bare Stripe id. services/paymentReversal
+ * writes a dispute's fee note around a DISPUTE id (dp_/du_, now in the list
+ * above) and an admin-recorded return around `manual_return:pi_…`, which is a
+ * prefix in front of an id and so matched neither test. The first real dispute
+ * or hand-recorded return would have printed a raw key as the fee's detail on
+ * the resident's bill — the exact thing these two rules exist to stop.
+ */
+const MACHINE_KEY = /^(manual_return|gam_debit|dispute|reversal|evt)[:_]/i
 
 function noteSegments(notes: string | null | undefined): string[] {
   return String(notes ?? '').split(' — ').map(x => x.trim()).filter(Boolean)
 }
-/** The note's segments that describe the charge: no payment tags, no bare space name. */
+/** The note's segments that describe the charge: no payment tags, no bare space name, no machine ids. */
 function describingSegments(notes: string | null | undefined): string[] {
-  return noteSegments(notes).filter(x => !TAG.test(x) && !SPACE_ONLY.test(x))
+  return noteSegments(notes).filter(x =>
+    !TAG.test(x) && !SPACE_ONLY.test(x) && !IDS_ONLY.test(x) && !MACHINE_KEY.test(x))
 }
 
 /**
@@ -239,6 +287,27 @@ function feeName(feeType: string): string {
 }
 
 /** What a charge line is called, in plain words. Never "Utilities". */
+/**
+ * The fees that are GAM's own pass-through and can appear more than once on one
+ * bill, so each needs the day it happened in its name. Nothing else does: rent
+ * is once a month, a late fee is once a cycle, and a deposit is once.
+ */
+const DATED_FEES = new Set(['RETURNFEE', 'DECLINEFEE'])
+
+/**
+ * 'Nov 1' from '2026-11-01'. Built from the plain calendar string and never
+ * through a Date, because `new Date('2026-11-01')` is midnight UTC and prints
+ * as Oct 31 for everybody west of Greenwich — the resident's own bill would
+ * name the day before the one the bank refused.
+ */
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+export function monthDay(ymd: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd)
+  if (!m) return ymd
+  return `${MONTHS[Number(m[2]) - 1] ?? m[2]} ${Number(m[3])}`
+}
+
 export function chargeLabel(row: ChargeLabelRow): string {
   const entry = String(row.entry_description ?? '').toUpperCase()
   const firstNote = chargeSegments(row)[0] ?? ''
@@ -258,6 +327,17 @@ export function chargeLabel(row: ChargeLabelRow): string {
   if (entry === 'PROPANE') return UTILITY_TYPE_LABEL.propane
   if (entry === 'DEPOSIT') return 'Security deposit'
   const coded = (PAYMENT_ENTRY_DESCRIPTION_LABELS as Record<string, string | undefined>)[entry]
+  // 11/5 (Nic): "just separate the line items by putting the bounce date on
+  // there." A bill can carry more than one of GAM's pass-through fees, and
+  // every one of them read exactly the same — two $4 refusals printed as
+  // "Returned-payment fee $4.00" twice, which is how a real second bounce came
+  // to be reported to Nic as a duplicate. The day it happened is the only
+  // thing that distinguishes them, so it goes in the name of the line rather
+  // than in a detail underneath it: a reader comparing two lines is looking at
+  // the names.
+  if (coded && row.returned_on && DATED_FEES.has(entry)) {
+    return `${coded} — ${monthDay(row.returned_on)}`
+  }
   if (coded) return coded
   if (firstNote) return firstNote.length > 60 ? `${firstNote.slice(0, 57)}…` : firstNote
   return row.type === 'fee' ? 'Fee' : humanize(row.type)
@@ -344,7 +424,7 @@ export async function sendPendingInvoiceNotices(
       LEFT JOIN tenants t ON t.id = i.tenant_id
       LEFT JOIN users tu  ON tu.id = t.user_id
      WHERE i.sent_at IS NULL
-       -- S652 (Nic): Donald Hamp paid his first bill by check the day it was
+       -- S652 (Nic): Wren Westbrook paid his first bill by check the day it was
        -- made, and the next morning's pass mailed him "$137.43 due". A bill
        -- that is already settled (or voided) is never announced as due.
        AND i.status NOT IN ('settled', 'void')

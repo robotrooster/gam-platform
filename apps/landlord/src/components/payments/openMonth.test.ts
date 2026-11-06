@@ -36,8 +36,8 @@ describe('which property the page shows', () => {
 
 describe('a row', () => {
   it('names the household, primary first', () => {
-    expect(householdName(row({ residents: [{ tenantId: 'a', name: 'Russ Fuller', primary: true }, { tenantId: 'b', name: 'Ann Fuller', primary: false }] })))
-      .toBe('Russ Fuller & Ann Fuller')
+    expect(householdName(row({ residents: [{ tenantId: 'a', name: 'Tamsin Wrenfield', primary: true }, { tenantId: 'b', name: 'Ann Wrenfield', primary: false }] })))
+      .toBe('Tamsin Wrenfield & Ann Wrenfield')
     expect(householdName(row({ residents: [] }))).toBe('No tenant on file')
   })
   it('opens the report for its lease; an empty space has none', () => {
@@ -143,7 +143,7 @@ describe('the register\'s and pay links\' money (its folder\'s head)', () => {
     expect(otherMoneyMeta([sale, refund, refund], { folderIn: 23.92, folderRefunded: 7 })).toBe('1 sale · 2 refunds · $23.92 · $7.00 refunded')
   })
   it('who paid: the name, else that nobody was named', () => {
-    expect(otherMoneyWho({ who: 'Andres Razo' })).toBe('Andres Razo')
+    expect(otherMoneyWho({ who: 'Cora Castellan' })).toBe('Cora Castellan')
     expect(otherMoneyWho({ who: null })).toBe('No name given')
     expect(otherMoneyWho({ who: '  ' })).toBe('No name given')
   })
@@ -153,7 +153,7 @@ describe('the register\'s and pay links\' money (its folder\'s head)', () => {
 describe('round 3: what is still owed on a stay; the register\'s money on the space it names', () => {
   const line = (over: any = {}) => ({
     id: 's1', saleId: 's1', kind: 'sale' as const, day: '2026-10-06', amount: 752.17, methodLabel: 'Card · online',
-    forLabel: 'Electric (per kWh) — September, RV 27 · pay link', who: 'Andres Razo', ...over,
+    forLabel: 'Electric (per kWh) — September, RV 27 · pay link', who: 'Cora Castellan', ...over,
   })
   it('under a stay\'s Owed: the day its balance link went out while owed; before arrival, what is left and when it comes due', () => {
     const day = (d: string) => `Oct ${Number(d.slice(8))}`
@@ -190,7 +190,7 @@ describe('round 3: what is still owed on a stay; the register\'s money on the sp
   })
 })
 
-// 10/13 (Nic): "When Andres Razo paid by card online for his stay ... it looks
+// 10/13 (Nic): "When Cora Castellan paid by card online for his stay ... it looks
 // like that charge is just for electric. It's not ... not clickable to show an
 // expanded breakdown ... It's not got a good breakdown between what's a
 // billback on the electricity and what is not."
@@ -202,7 +202,7 @@ describe('a register sale or pay link opens to its breakdown', () => {
     expect(saleOpens({ kind: 'sale' })).toBe(false)
     expect(saleOpens({ kind: 'refund', parts: [part()] })).toBe(false)
   })
-  it('each part says what it is and how many — Andres Razo\'s pay link as the register wrote it', () => {
+  it('each part says what it is and how many — Cora Castellan\'s pay link as the register wrote it', () => {
     expect(salePartDetail(part({ what: 'Electric bill-back', qty: 390, unitPrice: 0.21, unit: 'kWh' }))).toBe('Electric bill-back · 390 kWh × $0.21')
     expect(salePartDetail(part({ what: 'Site rent', qty: 1, unitPrice: 589, unit: null }))).toBe('Site rent')
     // Propane at the counter: no bill-back, its gallons as sold (never "6.800").

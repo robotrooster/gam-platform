@@ -1,7 +1,7 @@
 /**
  * S651 — telling the landlord when their mail is bouncing.
  *
- * Nic invited Arnoldo Arvizu to RV 39 at Mountain View three times and all
+ * Nic invited Dell Dunmore to RV 39 at Mountain View three times and all
  * three bounced. Bounce events only ever raised a GAM-side admin notification,
  * so the one person who could fix the address never heard about it and could
  * only conclude the tenant was ignoring them.
@@ -79,12 +79,12 @@ describe('GET /api/landlords/me/undelivered-email', () => {
     try { const l = await seedLandlord(c); landlordId = l.landlordId; userId = l.userId }
     finally { c.release() }
 
-    await seedUser('arnoldo@icloud.com')
-    await logEmail(landlordId, 'arnoldo@icloud.com', { event: 'bounced', at: '2026-09-09T12:00:00Z' })
+    await seedUser('dell@icloud.com')
+    await logEmail(landlordId, 'dell@icloud.com', { event: 'bounced', at: '2026-09-09T12:00:00Z' })
     const res = await ask(userId, landlordId)
     expect(res.status).toBe(200)
     expect(res.body.data).toHaveLength(1)
-    expect(res.body.data[0].email).toBe('arnoldo@icloud.com')
+    expect(res.body.data[0].email).toBe('dell@icloud.com')
     expect(res.body.data[0].outcome).toBe('bounced')
   })
 
@@ -139,7 +139,7 @@ describe('GET /api/landlords/me/undelivered-email', () => {
     // logins BECAUSE the invite bounced. A tenant invite creates the user row
     // and hangs a token off it (users.tenant_invite_token) — `invitations` is
     // team roles only and its CHECK refuses 'tenant' — so the users test above
-    // is what keeps them visible. Rashawn Bump's exact shape.
+    // is what keeps them visible. Phaedra Stanhope's exact shape.
     const c = await db.connect()
     let landlordId = '', userId = ''
     try { const l = await seedLandlord(c); landlordId = l.landlordId; userId = l.userId }

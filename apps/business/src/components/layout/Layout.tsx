@@ -7,8 +7,7 @@ import {
   LayoutDashboard, Users, UserCog, Settings, LogOut,
   Building2, Truck, Trash2, CalendarClock, Route as RouteIcon,
   Receipt, CalendarDays, Package, ShoppingCart, Wrench, Car, FileText,
-  BarChart3, Repeat, Tag, Banknote, BookOpen, Sun, Moon,
-} from 'lucide-react'
+  BarChart3, Repeat, Tag, Banknote, BookOpen, Sun, Moon, Hammer } from 'lucide-react'
 
 // S466 + S492: section-grouped nav with feature-gating.
 //   - `roles` admits which user roles see the item
@@ -56,6 +55,16 @@ const NAV_ITEMS: Array<{
   { to: '/work-orders',   icon: Wrench,          label: 'Work orders',
     roles: ['business_owner', 'business_staff'],
     feature: 'work_orders' },
+  // 10/31: the contractor marketplace — bid on one-off jobs landlords post.
+  //
+  // NO `feature` ON PURPOSE. Every other entry here is gated on a subscription
+  // feature flag, and gating this one would fold the marketplace into the
+  // subscription. Nic drew the line explicitly: the business portal is
+  // subscription-based for running your own shop, and bidding on one-off jobs
+  // is "a percentage of the cut. A cut of the job. It's two different things."
+  // Joining the board is free; the only charge is 3% of work actually finished.
+  { to: '/job-bids',      icon: Hammer,          label: 'Job bids',
+    roles: ['business_owner'] },
   { to: '/customer-vehicles', icon: Car,         label: 'Customer vehicles',
     roles: ['business_owner', 'business_staff'],
     feature: 'customer_vehicles' },

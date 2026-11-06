@@ -309,6 +309,13 @@ export const LEDGER_ACCOUNT_ROLE_DEFS = [
   { role: 'utility_tax_payable',         code: '2045', name: 'Utility tax payable',                               type: 'liability', control: false },
   { role: 'tenant_prepayments',          code: '2050', name: 'Tenant prepayments (paid ahead)',                   type: 'liability', control: true },
   { role: 'guest_deposits',              code: '2060', name: 'Guest deposits, not yet earned',                    type: 'liability', control: true },
+  // 10/27 (Nic): a debt a resident left with ANOTHER operator, collected on
+  // their behalf. The installment is billed on this landlord's invoice, so the
+  // money arrives through them — and it is never their income. It sits here
+  // from the day the bill is raised until the weekly payout takes it off and
+  // pays the operator who is owed. A control account: the balance comes from
+  // the arrangement and from nowhere else, so no hand entry may touch it.
+  { role: 'collected_for_another_operator', code: '2070', name: 'Money you collect for another operator',          type: 'liability', control: true },
   { role: 'due_to_gam',                  code: '2080', name: 'Due to GAM',                                        type: 'liability', control: true },
   { role: 'equipment_owed_to_gam',       code: '2085', name: 'Equipment owed to GAM, not yet billed',             type: 'liability', control: true },
   { role: 'mortgage_payable',            code: '2100', name: 'Mortgage payable',                                  type: 'liability', control: false },
@@ -670,6 +677,60 @@ export const LEDGER_SOURCE_ERROR_REASONS = [
 export type LedgerSourceErrorReason = typeof LEDGER_SOURCE_ERROR_REASONS[number]
 
 /**
+ * 11/1 (Nic) — WHICH QUESTION A BLOCKED POSTING IS WAITING ON.
+ *
+ * `owner_not_ready` and `no_books_start` are two reason codes covering SIX
+ * different unanswered questions, and three of their messages carry a
+ * landlord's own loan name or a date in the text — so neither the reason code
+ * nor the message can group a notice. Country Acres sat on one of these for two
+ * months, 67 postings deep and ~1,795 retries, and nothing ever said so,
+ * because the waiting-on-owner case is excluded from every alert path on
+ * purpose (LEDGER_WAITING_ON_OWNER_REASONS).
+ *
+ * This is the stable key the notice groups by: one notice per company per
+ * question, naming the question.
+ *
+ * `business_phase` is deliberately NOT owner-actionable — a business's books
+ * post in a later phase, so there is nothing for anyone to answer. It carries a
+ * slug so the grouping is total, and the notice skips it.
+ */
+export const LEDGER_WAITING_ON_CAUSES = [
+  'books_start',
+  'home_sale_method',
+  'work_trade_method',
+  'opening_balances_stale',
+  'loan_opening_balance',
+  'loan_proceeds_destination',
+  'business_phase',
+] as const
+export type LedgerWaitingOnCause = typeof LEDGER_WAITING_ON_CAUSES[number]
+
+/** What the operator is asked to go and do, in their words. */
+export const LEDGER_WAITING_ON_LABEL: Record<LedgerWaitingOnCause, string> = {
+  books_start:               'the date their books start',
+  home_sale_method:          'how home sales count',
+  work_trade_method:         'how work-trade hours that cover rent count',
+  opening_balances_stale:    'opening balances entered for a different books start date',
+  loan_opening_balance:      'what was still owed on a loan when the books started',
+  loan_proceeds_destination: 'where the money from a loan went',
+  business_phase:            'a business whose books post in a later phase',
+}
+
+/** Where they go to answer it. */
+export const LEDGER_WAITING_ON_PAGE: Record<LedgerWaitingOnCause, string> = {
+  books_start:               'Books settings',
+  home_sale_method:          'Books settings',
+  work_trade_method:         'Books settings',
+  opening_balances_stale:    'Opening balances',
+  loan_opening_balance:      'Loans',
+  loan_proceeds_destination: 'Loans',
+  business_phase:            '—',
+}
+
+/** Nothing anyone can answer — the notice leaves it out. */
+export const LEDGER_WAITING_NOT_ACTIONABLE: readonly LedgerWaitingOnCause[] = ['business_phase']
+
+/**
  * 10/12 (Nic) review: ledger_outbox.source_type of the mark a MOVED books start
  * date leaves (the landlords trigger in migration 20261013200600; never a
  * posting source, so not in LEDGER_SOURCE_TYPES). source_id is
@@ -964,6 +1025,21 @@ export const LEDGER_EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   // the landlord who fronted it, 20% written off), which is a posting about
   // today, not this record of what happened years ago.
   tenant_left_owing: 'a frozen record of a debt left at another landlord; no money moves when it is written',
+  // 11/5 (Nic): the things ONE person walked away from, each a line of the
+  // record above — a tenancy that ended owing, a stay never paid off, a counter
+  // sale nobody came back for. "We need a way for it to only record once, but
+  // it needs to be able to be infused from different sources." A part explains
+  // how the parent's figure is made up; it is not a second debt, and posting it
+  // as well would book the same dollars twice. The parent is excluded for the
+  // same reason, and settling still posts where the money actually moves.
+  tenant_left_owing_parts: 'the lines that make up one walk-away debt; the figure is the parent record, so posting these too would count the same dollars twice',
+  // 10/27 (Nic): the arrangement by which a LATER landlord collects one of
+  // those debts on behalf of the landlord owed. The row is the agreement —
+  // what is owed, to whom, in how many installments — and writing it moves
+  // nothing. Each installment rides the resident's rent as an ordinary
+  // payments row (type='carried_balance') and posts from there, so the
+  // dollar is counted once, where it actually moved.
+  left_owing_collections: 'the agreement to collect a debt left elsewhere; each installment is a payments row and posts from there',
   commission_accruals: "GAM's sales commissions",
   pos_reader_order_costs: "GAM's own cost of a card reader (Nic A1b); the landlord's book carries the price charged (pos_reader_orders, landlord_gam_charges, design H4)",
   platform_fee_accruals: "GAM's fee worked out; what the landlord owes posts through landlord_gam_charges (design H1)",
@@ -1049,6 +1125,39 @@ export const LEDGER_EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   space_rent_carryforwards: 'whose unpaid space rent it is and the day it was paid off; the money is the one carried_balance payments row it holds (space_carryforward_id)',
   space_carryforward_installments: 'what a payment arrangement asked for each cycle; it bills nothing of its own — the whole balance is already the carried_balance payments row',
   maintenance_requests: "a repair's cost posts only through its expense, never by itself (design I3)",
+  // 10/31: the contractor marketplace. A JOB and a BID are both offers, not
+  // money that moved. A bid is what a contractor says they would charge; a job
+  // carries the figure one of them was awarded at and, once finished, what it
+  // actually settled at. Nothing in either row is a dollar GAM or a landlord
+  // has paid or received, so neither belongs in the books on its own.
+  //
+  // What DOES post is GAM's cut, and only when the work is finished: one
+  // 'marketplace_job_cut' row on platform_revenue_ledger referencing the job
+  // (services/marketplace.ts → completeJob). The landlord pays the contractor
+  // the price they agreed, which is their own expense when they pay it.
+  marketplace_jobs: "a job put out for bids, and the figure it was awarded and finished at; the only money is GAM's cut, posted to platform_revenue_ledger when the work is finished (services/marketplace.ts)",
+  marketplace_bids: 'what a contractor says they would charge; an offer, never a dollar that moved. The winning bid becomes the job\'s awarded amount',
+  // 10/31: what GAM charges a landlord to spread a finished job over 2, 4 or 6
+  // payments. A PRICE LIST, not a transaction — nothing in it has been paid by
+  // or to anybody. The money that moves is the plan's payments and GAM's fee
+  // when it is earned, each on its own row.
+  job_financing_fee_schedule: 'a price list for spreading a job over payments; the money is the plan\'s own payments and the fee when it is earned, never this table',
+  // 10/31: what a contractor pays for the top spot in one trade in one area,
+  // banded by the local cost of living. A PRICE LIST, same as the one above —
+  // nothing in it has been paid by or to anybody. The money is the monthly
+  // charge when a spot is actually bought, on its own row.
+  marketplace_placement_rates: 'a price list for the paid top spot, banded by local cost of living; the money is a spot actually bought, never this table',
+  // 11/1 (Nic): income the operator earned BEFORE joining GAM, typed in for
+  // their own books. It is money already received, outside the period GAM's
+  // ledger covers — the ledger opens when the company does. It is not on the
+  // landlord ledger for the same reason it is not on GAM's fee: it happened
+  // before the platform. It still shows as income for its own month on the
+  // income reports, which read it directly.
+  //
+  // IF a later phase wants it inside the double-entry books (Nic's ask was "for
+  // bookkeeping", and the Books product is meant to replace QuickBooks), that
+  // is a projector and an opening-period decision, not a re-label here.
+  pre_gam_income_history: 'income from before the company joined GAM, for the operator’s own books; outside the period the ledger covers, and never on GAM’s fee or anybody’s balance',
   purchase_requests: 'a request to buy; what is bought posts as an expense',
   pos_purchase_orders: 'an order to a supplier; a received order becomes an expense (design F8)',
   pos_purchase_order_items: 'an order to a supplier; a received order becomes an expense (design F8)',
@@ -1056,6 +1165,15 @@ export const LEDGER_EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   pos_sessions: 'a register cart before the sale; pos_transactions is the sale',
   pos_session_items: 'a register cart before the sale; pos_transaction_items is the sale',
   utility_owner_use_absorptions: "the landlord's own use of a utility it pays for; no money moves",
+  // 11/01: the one home for insurance (a property's building policy, a
+  // resident's renters liability, a vendor's general liability and bond).
+  // coverage_amount is a LIMIT — what a third-party insurer would pay out if
+  // something happened — so it is not a dollar that has moved and it is not the
+  // landlord's. The money insurance actually involves is the PREMIUM, which is
+  // the operator's own cost and posts as an expense like any other bill. A
+  // posting source here would put a carrier's policy limit on a landlord's
+  // books, which is a six-figure line nobody paid.
+  insurance_policies: "a policy's coverage LIMIT, not a dollar that moved; the premium posts as an expense",
   // Configuration, measurements, logs, not money
   pos_items: CONFIGURATION,
   pos_item_variants: CONFIGURATION,

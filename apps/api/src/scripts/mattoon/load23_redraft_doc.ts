@@ -1,7 +1,7 @@
 /**
  * S652 — Draft one packet document again from its template, in the same slot,
  * with the same signers, after a voided copy. Built for MH 30's lead-based
- * paint sales disclosure, which Jeff Bowman's (now removed) Decline button
+ * paint sales disclosure, which Linnea Merriweather's (now removed) Decline button
  * voided after Blu and Kim had signed it.
  *     npx ts-node src/scripts/mattoon/load23_redraft_doc.ts --doc <voided document id> [--apply] [--email]
  * --email sends Blu (the first signer) his signing link for the new copy.

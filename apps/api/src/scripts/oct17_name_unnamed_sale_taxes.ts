@@ -8,7 +8,7 @@
  *   some change. Nothing we have priced comes out that way."
  *
  * WHAT WAS WRONG. The $13 and some change was FOUR GALLONS OF PROPANE AT $3.30
- * = $13.20 — Steven Starr's pay link, paid 9/29, with $0.87 of tax on top
+ * = $13.20 — Zelda Esterhazy's pay link, paid 9/29, with $0.87 of tax on top
  * ($14.07 charged, plus the $1.04 card fee). The arithmetic was right. Two
  * things were not:
  *

@@ -4,7 +4,7 @@
  * This morning's run created an August-cycle electric bill for four sites
  * whose August was already charged (RV 49 Parker $96.81 and RV 36 Avalos $81.27
  * on their September bills, both paid; RV 04 Kenyon's August was an estimate,
- * $25.20, paid) or belonged to the previous occupant (RV 44 Dakota Lane moved in
+ * $25.20, paid) or belonged to the previous occupant (RV 44 Tobin Thornbury moved in
  * September 2; the August usage on that meter is not his). Each line rides the
  * October 1 invoice and was in the emailed total.
  *

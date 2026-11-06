@@ -946,7 +946,7 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
          spaceOccupiedWhilePaused ?? null]
       )).rows[0]
 
-      // 10/12 (Nic, Curtis Clabough): a change of coverage used to reach only
+      // 10/12 (Nic, Sage Stillwell): a change of coverage used to reach only
       // the NEXT bill. Now a type added brings the still-open charges of it on
       // this agreement's bills under the trade, and a type taken off does what
       // the landlord chose for its open parked charges. An agreement that has

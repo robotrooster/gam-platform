@@ -1,4 +1,4 @@
-import { meterReadingModulus, METER_USAGE_ALERT_THRESHOLDS } from '@gam/shared'
+import { meterReadingModulus, METER_USAGE_ALERT_THRESHOLDS, METER_USAGE_BAND_PERCENTILE, type MeterUsageBand } from '@gam/shared'
 import { db, query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
@@ -75,6 +75,35 @@ function cycleUsageFromReadings(
   // usage, which is the single biggest wrong number this function can produce.
   if (readingBarelyMoved(priorVal, cycleVal)) return Math.max(0, usage) * (multiplier > 0 ? multiplier : 1)
   if (usage < 0 && isRollover) usage = (meterReadingModulus(digits) - priorVal) + cycleVal
+  // ── 10/31 (Nic): THE DIAL MOVED. THAT MOVEMENT IS THE USAGE. ──────────────
+  //
+  //   "It's defensible to go by what's on the meter. If the meter turned
+  //    backwards, that's the number we're going to go off of. If it starts
+  //    turning forwards again, we'll go off of that."
+  //
+  // Old induction-disc meters at Mountain View run backwards for months at a
+  // time, then stall, then climb again, with nobody touching the wiring. Until
+  // today a backwards cycle billed NOTHING and the landlord re-keyed a figure
+  // by hand to force the series upward — RV 25 was padded +1,000 one month and
+  // +2,000 the next, which billed 467 and 675 kWh against a park median of 115
+  // and 166. Hand-made numbers are worse than the dial, however tired the dial
+  // is: the dial is at least a measurement somebody can go and look at.
+  //
+  // So the magnitude of the movement bills, in either direction. This is the
+  // landlord's call on their own property and GAM does not gate it.
+  //
+  // THE ORDER OF THE THREE RULES ABOVE MATTERS AND IS NOT INTERCHANGEABLE:
+  //   a plausible wrap is forward usage and is taken first;
+  //   a unit or two down is a reading error or a dead face, never usage;
+  //   anything else that moved down is movement, and bills.
+  //
+  // WHAT STILL CATCHES A REPLACED HEAD: a new meter reading 00006 where the old
+  // one ended at 05901 would bill 5,895 turns of fiction. It does not go
+  // through, because the usage it produces blows past the utility type's
+  // plausibility threshold (usageNeedsDoubleCheck) and is held for the
+  // landlord's window, where "that was a meter swap" zeroes it. The guard that
+  // stops a slipped digit is the same guard that stops a swap.
+  if (usage < 0) usage = -usage
   return usage * (multiplier > 0 ? multiplier : 1)
 }
 
@@ -131,7 +160,8 @@ export function usageNeedsDoubleCheck(utilityType: string, usage: number): boole
  * every held read gets, and the fact that the meter looks stuck goes in the
  * landlord's review note, which only the landlord sees.
  */
-export const READING_BARELY_MOVED_UNITS = 2
+export { READING_BARELY_MOVED_UNITS } from '@gam/shared'
+import { READING_BARELY_MOVED_UNITS } from '@gam/shared'
 
 /**
  * True when a read is level with the one before, or under it by at most
@@ -158,6 +188,34 @@ export const readingBarelyMoved = (
   if (priorDay && readDay && priorDay.slice(0, 10) === readDay.slice(0, 10)) return false
   return true
 }
+
+/**
+ * 10/31 (Nic) — THE SAME RULE, AS SQL, FOR THE REVIEW QUEUE.
+ *
+ *   "I should not need to double check a read that's off by one. RV 37 should
+ *    not be showing up on this list."
+ *
+ * Removing the flag from the ENTRY path stopped new ones; it did nothing about
+ * rows already carrying `needs_review` from the old rule, and Mountain View
+ * RV 37 sat in his queue holding the park's October run for a one-unit drop.
+ *
+ * So the queue and the run's held-count both apply the rule at READ time
+ * instead of trusting the stored boolean: a read within
+ * READING_BARELY_MOVED_UNITS of the one before it is not reviewable, whatever
+ * some older row says. That covers RV 37, every other leftover, and anything
+ * that ever sets such a flag again.
+ *
+ * `a` is the reading's alias; `prior` must be a lateral giving the preceding
+ * read's `reading_value` and `reading_date` (both queries already needed one).
+ * Mirrors readingBarelyMoved above, same-day guard included — two reads on one
+ * day measure no time and are never compared.
+ */
+export const barelyMovedSql = (a: string, prior = 'prior') => `(
+  ${prior}.reading_value IS NOT NULL
+  AND ${a}.reading_value <= ${prior}.reading_value
+  AND ${prior}.reading_value - ${a}.reading_value <= ${READING_BARELY_MOVED_UNITS}
+  AND ${prior}.reading_date < ${a}.reading_date
+)`
 
 /** The landlord-only note on a barely-moved read. Never shown at a counter — it says which way. */
 export const BARELY_MOVED_REVIEW_NOTE =
@@ -213,6 +271,8 @@ async function holdMoveOutReadForDoubleCheck(
 export async function lowestComparableUsage(args: {
   brokenMeterId: string; propertyId: string; utilityType: string;
   unitType: string | null; rvAmpService: string | null; cycleIso: string;
+  /** 10/31: where in the neighbours' spread this household sits. Default 'low' = S647 unchanged. */
+  usageBand?: MeterUsageBand | null;
 }): Promise<number | null> {
   const run = (matchType: boolean) => query<{ usage: string }>(`
     -- S613: comparable usage is in BILLING UNITS, not face turns. Each meter
@@ -242,7 +302,7 @@ export async function lowestComparableUsage(args: {
        --
        -- A vacant spot reads zero because nobody is there, and averaging that
        -- in would estimate an occupied home at nothing — which is exactly the
-       -- bill Chris Ast got. Only a lived-in spot tells you what living there
+       -- bill Orin Oakhurst got. Only a lived-in spot tells you what living there
        -- costs. Zero-usage comparables are excluded for the same reason: a
        -- stuck meter must not become the yardstick for the next stuck meter.
        -- OCCUPIED MEANS SOMEBODY LIVES THERE — an active LEASE, not the unit's
@@ -250,7 +310,7 @@ export async function lowestComparableUsage(args: {
        -- lease (RV 09 was, to hold it off the booking calendar), and such a spot
        -- draws almost nothing: 2 kWh against a real household's 120. Taking the
        -- unit flag at face value made that empty spot the yardstick and would
-       -- have billed Julie Kenyon 42 cents for a month of electricity — the
+       -- have billed Ulric Vandermere 42 cents for a month of electricity — the
        -- same near-zero bill this whole rule exists to prevent.
        AND EXISTS (SELECT 1 FROM leases cl
                     WHERE cl.unit_id = cu.id AND cl.status = 'active')
@@ -287,8 +347,8 @@ export async function lowestComparableUsage(args: {
   //
   // A TENTH, not a quarter. At Mountain View the occupied spots ran 120, 461,
   // 592, 891 and 1259 kWh — a quarter of the median would have discarded the
-  // 120 and estimated Julie Kenyon at $96.81 off the next one up. But 120 is
-  // Randall Cox, a real household that simply uses little. The empty spot read
+  // 120 and estimated Ulric Vandermere at $96.81 off the next one up. But 120 is
+  // Osric Rookwood, a real household that simply uses little. The empty spot read
   // 2. A tenth separates those two cleanly; a quarter punishes frugality.
   const median = usages[Math.floor(usages.length / 2)]
   const floor = median * 0.10
@@ -296,15 +356,15 @@ export async function lowestComparableUsage(args: {
 
   // ── S647 (Nic, DIRECTIVE): THE LOW END OF THE CLUSTER, NOT THE MINIMUM ──
   //
-  //   "Let's do kind of the low end of the cluster of people. Blanca and Little
+  //   "Let's do kind of the low end of the cluster of people. Gail and Little
   //    Joe use more, but still less than a majority of people. That weeds out
   //    the two outliers — we want to be at the low end of where people are
   //    starting to cluster."
   //
   // The plain minimum was always going to be whoever used least, and at
-  // Mountain View in August that was Randall Cox (120) and David Shultz (197):
-  // real households, but two outliers below where everyone else sits. Martin
-  // Alvarado's household of three was estimated off them. The 25th percentile of
+  // Mountain View in August that was Osric Rookwood (120) and Ursa Underhill (197):
+  // real households, but two outliers below where everyone else sits. Faye
+  // Inglewood's household of three was estimated off them. The 25th percentile of
   // the credible occupied usage is the low edge of the main group — 387 on that
   // cycle, which is the number Nic picked by eye — and it stays conservative:
   // three quarters of the neighbors used more.
@@ -315,7 +375,7 @@ export async function lowestComparableUsage(args: {
 
   // ── NOT BUILT YET (Nic, S637) — a meter that dies MID-month ──────────────
   //
-  //   "Randall Cox may also have a meter that stopped working mid month... It's
+  //   "Osric Rookwood may also have a meter that stopped working mid month... It's
   //    tough to tell until the next month when we know if his turns at all.
   //    Eventually I'd like it to flag somewhat consistent usage versus... takes
   //    the history of that spot and sees that, hey, it was a lot higher — that
@@ -334,7 +394,10 @@ export async function lowestComparableUsage(args: {
   // If everything looked suspicious, the median is the honest answer — better a
   // typical bill than one drawn from the emptiest spot on the property.
   if (credible.length === 0) return Math.floor(median)
-  return Math.floor(clusterLow(credible))
+  // 10/31 (Nic): the band moves WHERE in the spread the estimate lands, nothing
+  // else. 'low' is S647's 25th percentile and the default for every meter.
+  const pct = METER_USAGE_BAND_PERCENTILE[args.usageBand ?? 'low'] ?? 0.25
+  return Math.floor(clusterAt(credible, pct))
 }
 
 /** S647: the 25th percentile, nearest-rank, of an ascending list. */
@@ -412,7 +475,7 @@ export async function flagBrokenMeter(
       + `space had a reading to estimate from, so nothing is billed for it this month. `
       + `Replace or repair it, then mark it repaired on the Utilities page with its new reading so it bills again.`
   // 10/12 (Nic), M1: the other way back into service, beside "Repaired" — the
-  // meter works and the household on it uses nothing (Gerald at Mountain View:
+  // meter works and the household on it uses nothing (Arlo at Mountain View:
   // gone, not plugged in, paying for occupancy).
   const worksNoUse = ` If the meter works and the household on it simply uses no `
     + `${UTILITY_USAGE_NOUN[m.utility_type as UtilityType] ?? what.toLowerCase()}, `
@@ -585,14 +648,14 @@ const CLOSING_READ_REASONS = new Set(['move_out_final', 'stay_turnover'])
 /**
  * ── 10/12 (Nic): A METER CONFIRMED WORKING ON A HOUSEHOLD THAT USES NOTHING ──
  *
- *   "Gerald Logue (Mountain View RV 48): void his $22.47 estimated electric
+ *   "Arlo Braddock (Mountain View RV 48): void his $22.47 estimated electric
  *    and mark his meter working (zero use then bills $0). Mountain View's
  *    estimate setting stays on."
  *
  * utility_meters.zero_use_confirmed_at (services/meterRepair) says somebody
  * confirmed the meter works and the household on it uses nothing — the
  * landlord's "Works, tenant uses no power" choice beside "Repaired" (M1), or
- * the one-time repair of Gerald's meter. While it
+ * the one-time repair of Arlo's meter. While it
  * stands, a flat read on an occupied space is taken at its word — zero use,
  * billed $0 — instead of being marked stuck, estimated and the landlord told
  * (both stuck tests: the monthly run and a lease being signed). It stands until
@@ -621,7 +684,7 @@ const CLOSING_READ_REASONS = new Set(['move_out_final', 'stay_turnover'])
  * A NEW HOUSEHOLD ON THE SPACE. This rule is the M1 build's reading of what
  * "tenant" in "Works, tenant uses no power" covers — not Nic's words (his M1
  * answer: "ADD 'Works, tenant uses no power' choice next to 'Repaired'
- * (Gerald specifically is gone, not plugged in, paying for occupancy)"). The
+ * (Arlo specifically is gone, not plugged in, paying for occupancy)"). The
  * confirmation is about the household that was there, not the space forever.
  * A move-out read is how a departure is normally seen, but a household can
  * follow another without one. So it also stops standing once a lease has
@@ -875,9 +938,19 @@ async function leasePausedAtCycleRead(
 }
 
 export function clusterLow(ascending: number[]): number {
-  if (ascending.length === 0) throw new Error('clusterLow: empty list')
-  const rank = Math.ceil(0.25 * ascending.length)
-  return ascending[Math.max(0, rank - 1)]
+  return clusterAt(ascending, 0.25)
+}
+
+/**
+ * 10/31: the same nearest-rank pick at any percentile, so a household the
+ * landlord has placed at the upper end of the park estimates there instead
+ * (METER_USAGE_BAND_PERCENTILE). Nearest-rank means the answer is always a usage
+ * figure some real neighbour actually had — never an interpolation nobody used.
+ */
+export function clusterAt(ascending: number[], pct: number): number {
+  if (ascending.length === 0) throw new Error('clusterAt: empty list')
+  const rank = Math.ceil(pct * ascending.length)
+  return ascending[Math.min(ascending.length - 1, Math.max(0, rank - 1))]
 }
 
 
@@ -1436,7 +1509,7 @@ export async function generateBillsForMeter(
   // The estimation below has always worked — but only for a meter somebody had
   // marked out_of_service BY HAND, and in practice nobody ever has: not one
   // meter in the system carries the flag. So a submeter reading the identical
-  // number two cycles running billed ZERO instead of estimating, and Chris Ast
+  // number two cycles running billed ZERO instead of estimating, and Orin Oakhurst
   // paid a month's rent at RV 07 with no electricity on it at all.
   //
   // Occupied plus no movement is the correlation. A vacant spot reading zero is
@@ -1472,7 +1545,7 @@ export async function generateBillsForMeter(
   // the read span — below — which reaches every occupied status through the
   // lease behind it, and owner_use / utility_service, which have none, by name.)
   //
-  // S642 (Nic, via Calvin Curtis on RV 40): "it's not showing any electricity —
+  // S642 (Nic, via Kesh Kilbride on RV 40): "it's not showing any electricity —
   // we're supposed to be matching broken reads that are active spots."
   //
   // The test was the unit's status AT THIS INSTANT, and the instant is wrong.
@@ -1511,12 +1584,15 @@ export async function generateBillsForMeter(
   // read was taken) to the cycle read. With no read before it, only the cycle
   // read's day is known (the prior fields are null).
   const move = meter.billing_method === 'submeter'
-    ? await queryOne<{ usage: string | null; prior_date: string | null; cycle_date: string; prior_reason: string | null }>(`
+    ? await queryOne<{ usage: string | null; prior_date: string | null; cycle_date: string; prior_reason: string | null; is_rollover: boolean; prior_value: string | null; cycle_value: string | null }>(`
       SELECT (cyc.reading_value - pri.reading_value)::text AS usage,
              to_char(pri.reading_date, 'YYYY-MM-DD') AS prior_date,
              to_char(cyc.reading_date, 'YYYY-MM-DD') AS cycle_date,
-             pri.reason AS prior_reason
-        FROM (SELECT reading_value, reading_date, created_at
+             pri.reason AS prior_reason,
+             COALESCE(cyc.is_rollover, FALSE) AS is_rollover,
+             pri.reading_value::text AS prior_value,
+             cyc.reading_value::text AS cycle_value
+        FROM (SELECT reading_value, reading_date, created_at, is_rollover
                 FROM utility_meter_readings
                WHERE meter_id = $1 AND billing_cycle_month = $2
                  AND reason = 'monthly_cycle'
@@ -1591,11 +1667,34 @@ export async function generateBillsForMeter(
     // the same number twice is no evidence the meter is dead. Oak Park RV 24's
     // new water meter opened at 21800 on 9/30, September's read day; a
     // brand-new meter was marked broken the moment it was read.
-    stuckOnOccupied = move?.usage != null && move.prior_date != null && Number(move.usage) === 0
-      && move.prior_date < move.cycle_date
+    // 10/31 (Nic): A UNIT OR TWO DOWN IS THE SAME THING AS NOT MOVING.
+    //
+    //   "I thought we built a thing to kind of ignore the rollback by just like
+    //    a single digit. That's within a margin of error... especially on some
+    //    of these old meters where the dial is kind of whatever."
+    //
+    // He did build it — READING_BARELY_MOVED_UNITS, 10/24 — but only in the
+    // billing arithmetic (cycleUsageFromReadings clamps it to zero) and in the
+    // move-out path. The stuck test asked for a delta of EXACTLY zero, so a
+    // face reading 64063 then 64062 fell through it, and the entry flag caught
+    // it instead: Mountain View RV 37 held its run for one unit.
+    //
+    // It is the stuck-meter case by his own description — "the meter may not be
+    // turning, or the last figure was rounded" — so it belongs here, where an
+    // occupied space gets told about it and billed the low comparable where the
+    // property estimates. A vacant one stays quiet: nothing to bill.
+    stuckOnOccupied = move != null && move.prior_date != null
+      && readingBarelyMoved(
+           move.prior_value == null ? null : Number(move.prior_value),
+           Number(move.cycle_value), move.prior_date, move.cycle_date)
       && await occupiedAcrossReadSpan(units, move.prior_date, move.cycle_date,
            CLOSING_READ_REASONS.has(move.prior_reason ?? ''))
   }
+
+  // 10/31 (Nic): A DIAL THAT WENT BACKWARDS IS NOT BROKEN — it moved, and that
+  // movement bills (cycleUsageFromReadings). "If the meter turned backwards,
+  // that's the number we're going to go off of." Only a face that did NOT move,
+  // or moved within the reading margin, reaches the broken path below.
 
   // S648 (Nic, DIRECTIVE): estimating is the LANDLORD's per-property choice
   // (properties.estimates_stuck_meters, off by default). Off: a broken meter
@@ -1616,12 +1715,28 @@ export async function generateBillsForMeter(
   // already written down as paused, after the household is back.
   if (broken && propertyEstimates && !pausedCycle) {
     const brokenUnit = units[0]
-    const compUsage = await lowestComparableUsage({
+    // ── 10/31 (Nic): THE LANDLORD'S OWN FIGURE COMES FIRST ──────────────────
+    //
+    // `lowestComparableUsage` is the low end of what comparable spaces used. On
+    // most spaces that is the right, tenant-protective guess. On a HEAVY user it
+    // under-bills badly and quietly: Mountain View RV 39 genuinely runs about
+    // 786 kWh a month (the landlord's own earlier reads: 801, 728, 837, 349,
+    // 1,215) while the park's median those months was 115 and 166, floor near
+    // zero. Estimating her off the park would lose roughly $130 every month the
+    // meter stayed dead.
+    //
+    // So when the landlord has stated what the space normally uses, that is used
+    // instead. It is their figure for their own space, they are the only one who
+    // can know it (every read GAM holds for a dead meter is jitter), and it is
+    // reached for ONLY here — a meter that reads always bills its own reads.
+    const expected = meter.expected_monthly_usage == null ? null : Number(meter.expected_monthly_usage)
+    const compUsage = expected != null && expected > 0 ? expected : await lowestComparableUsage({
       brokenMeterId: meterId, propertyId: meter.property_id,
       utilityType: meter.utility_type,
       unitType: brokenUnit?.unit_type ?? null,
       rvAmpService: brokenUnit?.rv_amp_service ?? null,
       cycleIso,
+      usageBand: meter.usage_band ?? 'low',
     })
     // ── 10/3 (final sweep): AN ESTIMATED METER IS STILL A BROKEN METER ──────
     //
@@ -1686,7 +1801,10 @@ export async function generateBillsForMeter(
           allocationMethod: 'comparable_low', allocationBasis: compUsage,
           baseFeeShare: Number(meter.base_fee || 0),
           notes: `Owner-occupied unit, meter not reading — estimated at ${compUsage} `
-            + `from the lowest real occupied usage on the property. Paid by the landlord, billed to nobody.`,
+            + (expected != null && expected > 0
+                ? `from what the landlord states this space normally uses.`
+                : `from the lowest real occupied usage on the property.`)
+            + ` Paid by the landlord, billed to nobody.`,
         })
         skipped++
         continue
@@ -2649,7 +2767,7 @@ async function onboardingWindowOpenForUnit(unitId: string): Promise<boolean> {
  * utilities held that nobody claims, we'll just anticipate those to be settled
  * off platform because somebody moved out just before or in the middle of the
  * onboarding window ... we will not bill that to anybody else." Mountain View
- * RV 16 (Harold Cunningham, billed off-platform) and RV 30 were the first two.
+ * RV 16 (Cedric Danforth, billed off-platform) and RV 30 were the first two.
  *
  * Closed out, never deleted — the row keeps its amount, dates and the reason.
  * Runs nightly; idempotent.
@@ -2755,6 +2873,29 @@ async function reportUsageNobodyToBill(
   try {
     const usage = Number(args.usageAmount ?? 0)
     if (args.allocationMethod !== 'submeter' || !(usage > 0) || !(Number(args.chargeAmount) > 0)) return
+    // ── 10/31 (Nic): AN EMPTY SPOT THAT TICKED ONE UNIT IS NOT NEWS ──────────
+    //
+    //   "I don't want to be involved with every fucking meter that's off by just
+    //    one spot. Especially in a slow season when a bunch of vacant spaces may
+    //    be off by one or two. It needs to be handled automatically."
+    //
+    // A dial on an empty space that reads one or two turns different — either
+    // way — is the same rounding error READING_BARELY_MOVED_UNITS already covers
+    // going downward. Downward was silent; upward was not, because one turn
+    // times the rate is a charge above zero, so every such space raised a notice
+    // nobody could act on. In a slow season that is most of the park.
+    //
+    // Measured in FACE TURNS, not billing units, because that is what he said:
+    // "off by only one or two." Two turns on a per-hundred face is 200 gallons
+    // and is a real figure worth reporting; two turns is two turns.
+    //
+    // Only where there is NOBODY to bill. A turnover notice exists precisely
+    // because somebody owes for days nobody read, and that still goes out.
+    if (why === 'nobody'
+        && args.readingStart != null && args.readingEnd != null
+        && Math.abs(Number(args.readingEnd) - Number(args.readingStart)) <= READING_BARELY_MOVED_UNITS) {
+      return
+    }
     const settledOutside = await queryOne<{ n: number }>(`
       SELECT 1 AS n FROM utility_meter_readings
        WHERE meter_id = $1 AND reason = 'billed_off_platform'
@@ -3583,7 +3724,7 @@ function round2(n: number): number {
 //
 // Measured: 16 held August trash cycles and 17 September ones, generated
 // 2026-09-01 and 2026-09-02 — one day apart, one month apart on paper. Three
-// tenants (Covey, Fuller, Rhoades) were billed $50 of trash on a single
+// tenants (Satterlee, Fuller, Rhoades) were billed $50 of trash on a single
 // invoice; the rest were queued to be as they signed.
 //
 // A flat rate has no reading, so it has no arrears cycle to catch up on. There
@@ -3705,8 +3846,8 @@ export async function generateBillsForLandlord(
 /**
  * The billing cycle, as a landlord reads it.
  *
- * S637 (Nic, on his Payments page): "you have Jonathan Covey for rent,
- * Jonathan Covey for trash... Jonathan Covey for another trash can. They're
+ * S637 (Nic, on his Payments page): "you have Rilla Satterlee for rent,
+ * Rilla Satterlee for trash... Rilla Satterlee for another trash can. They're
  * only supposed to have one trash can."
  *
  * They have one can. The two rows were Aug and Sep — but this returned the raw
@@ -3796,9 +3937,9 @@ export async function releaseSuspendedChargesForLease(args: {
   // Releasing HELD charges only helps a unit that had a hold. A unit with
   // nobody invited to it at billing time gets no hold at all — the run passes
   // over it — so a resident invited afterwards is invisible to that cycle
-  // forever. Blanca Avalos was invited to RV 36 three hours after the Sept 2
-  // run and had no electric on her bill at all; so did Jeremy Parker at RV 49
-  // and Julie Kenyon at RV 04.
+  // forever. Gail Glenmore was invited to RV 36 three hours after the Sept 2
+  // run and had no electric on her bill at all; so did Margo Northcott at RV 49
+  // and Ulric Vandermere at RV 04.
   //
   // Now the lease itself triggers the billing for its own unit: any cycle that
   // has reads but produced no bill for this unit is generated here, with the
@@ -3870,8 +4011,8 @@ export async function releaseSuspendedChargesForLease(args: {
   // is a broken meter, not a free month. A lease being SIGNED goes through here
   // instead — and the insert above requires `(cyc - base) > 0`, so a stuck
   // meter simply produced nothing. During onboarding nearly every lease takes
-  // this road: Chris Ast (RV 07), Jared Coil (RV 23), Calvin Curtis (RV 40),
-  // MH 04, RV 41, and Martin Alvarado (RV 34) all fell through it.
+  // this road: Orin Oakhurst (RV 07), Jared Coil (RV 23), Kesh Kilbride (RV 40),
+  // MH 04, RV 41, and Faye Inglewood (RV 34) all fell through it.
   //
   // So the same rule applies here, with the same estimate the monthly run uses.
   // Only for an EXISTING tenancy: those residents lived there during the cycle.
@@ -4130,7 +4271,7 @@ async function attachBillToOpenInvoice(
   if (!(amount > 0)) {
     // 10/12 (Nic): "$0 lines are ignored." A share that bills nothing is
     // billed as nothing — read, charged nothing, no line — so the monthly run
-    // never turns it into a $0 line later (Gerald Logue's August electric).
+    // never turns it into a $0 line later (Arlo Braddock's August electric).
     await q(`UPDATE utility_bills SET status = 'billed', billed_at = COALESCE(billed_at, NOW()), updated_at = NOW()
               WHERE id = $1 AND payment_id IS NULL AND status = 'unbilled'`, [billId])
     return
@@ -4181,7 +4322,7 @@ async function attachBillToOpenInvoice(
                 SET payment_id = $1, status = 'billed', billed_at = NOW(), updated_at = NOW()
               WHERE id = $2`, [pay.id, billId])
 
-    // 10/12 (Nic, Curtis Clabough): a covered share is brought under its
+    // 10/12 (Nic, Sage Stillwell): a covered share is brought under its
     // month the way a coverage change brings a line (services/workTradeCoverage
     // bringLinesUnderTrade). It used to be parked with the month's covered
     // amount left as it was; the close credits only that amount and then lifts

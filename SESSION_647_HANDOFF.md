@@ -12,7 +12,7 @@ Covers S644 through S647 (Sept 15–16). Everything listed as built is committed
 - **Some move-in boxes are wired to billing.** On page 8: Pet deposit (`pet_deposit`), Pet fee (`pet_fee`), and Rent pre-payment (`last_month_rent`). On page 2: Security deposit (`security_deposit`). When the landlord signs, each of these becomes a `lease_fees` row and bills on the move-in invoice.
 - **The property schedule does NOT pre-fill the lease.** Its only job today is to flag a lease fee as an "override" when it differs from the property default. Setting a $350 pet deposit at the property level puts nothing on page 8.
 - **Four page 8 boxes are tied to nothing:** First month's rent, Proration, Total due, and a second Security deposit box that duplicates page 2's. Billing never reads them.
-  - This is how Martin Alvarado's lease (RV 34) said $589 on page 2 and $495 on page 8. Nic typed $495 in the two untagged page 8 boxes, and billing followed page 2.
+  - This is how Faye Inglewood's lease (RV 34) said $589 on page 2 and $495 on page 8. Nic typed $495 in the two untagged page 8 boxes, and billing followed page 2.
 - **There is no utility-deposit charge type.**
 
 ### What Nic said (directives from the end of this session)
@@ -41,7 +41,7 @@ Covers S644 through S647 (Sept 15–16). Everything listed as built is committed
 - **Don't mix up units.** When he's talking about RV 34, don't bring in RV 09. Always scope to the unit and property he named.
 - **Describe the product as designed, not the old mechanics.** Earlier I told him tenants can sign from the emailed link before accepting; that isn't the flow he designed, and it confused him.
 - **Say "test data" plainly.** A made-up date in a test fixture is not one of his leases.
-- **Don't void or redraft a document he may have open.** I voided Clay's draft while Nic had it open, and his signature wouldn't finalize.
+- **Don't void or redraft a document he may have open.** I voided Pell's draft while Nic had it open, and his signature wouldn't finalize.
 
 ---
 
@@ -87,8 +87,8 @@ Landlord onboards names → **no tenant email** → leases draft into the landlo
 
 ### Known issue to raise with Nic
 
-`PATCH /me/pending-intents/:id/contact` (the contact edit Nic used for Clay):
-- saves whatever name is on the form, which reverted Clay to "Simpsosn"
+`PATCH /me/pending-intents/:id/contact` (the contact edit Nic used for Pell):
+- saves whatever name is on the form, which reverted Pell to "Simpsosn"
 - does not update names on an unsigned draft
 - defaults to **resending the old portal invite**, which conflicts with the new one-email flow
 
@@ -97,25 +97,25 @@ Landlord onboards names → **no tenant email** → leases draft into the landlo
 ## 4. Data fixes done this session
 
 - **Six leases the landlord had already signed were issued** (backfill): Mountain View MH 18 $460, MH 19 $589, RV 08 $0 (Ignacio, work trade), RV 09 $495.42 (moved to Oct 1), Oak Park MH 08 $440, RV 31 $470.22 (includes $30.22 of released utility). All are existing tenancies with full-month billing.
-- **Fourteen households still waiting on old-flow invites** were drafted into Nic's queue by the background sweep: MV MH 05, MH 08 (Todd Niemeier), RV 25, RV 27, RV 50; OP MH 02, MH 03 & RV 27 (Josh Roby), MH 09, RV 20, RV 23, RV 25, RV 34 & RV 35 (Billy Jose Miranda).
-- **Martin Alvarado, MV RV 34:**
+- **Fourteen households still waiting on old-flow invites** were drafted into Nic's queue by the background sweep: MV MH 05, MH 08 (Caspian Hawksmoor), RV 25, RV 27, RV 50; OP MH 02, MH 03 & RV 27 (Soren Tremaine), MH 09, RV 20, RV 23, RV 25, RV 34 & RV 35 (Billy Jose Miranda).
+- **Faye Inglewood, MV RV 34:**
   - The rent box on his signed lease was changed from $589 to $495, carried through to the lease, the invoice, and the unit.
   - His meter read 61808 on both Aug 1 and Sept 2, so August electric was billed at an estimated 387 kWh = **$81.27** (method `comparable_low`).
   - His invoice INV-2026-00038 = **$576.27**.
   - Co-tenants Lily and Luis are still pending signature.
-- **Clay Simpson, MV RV 25:**
-  - Account corrected to Simpson; email `clay_simpson@hotmail.com` is correct (Nic changed it on purpose).
-  - His draft was redrafted and now reads Clay Simpson (document `50985638…`). Two earlier drafts are voided.
-- **Harold Cunningham** was MV RV 16. Invited Sept 1, never accepted, cancelled Sept 11. **916 kWh** Aug 1 → Sept 2 ($192.36); Nic is billing it off-platform.
-- **Gerald Logue**, MV RV 48: $495 rent, no electric (camper in storage). Correct as-is.
+- **Pell Pennington, MV RV 25:**
+  - Account corrected to Pennington; email `pell_pennington@hotmail.com` is correct (Nic changed it on purpose).
+  - His draft was redrafted and now reads Pell Pennington (document `50985638…`). Two earlier drafts are voided.
+- **Cedric Danforth** was MV RV 16. Invited Sept 1, never accepted, cancelled Sept 11. **916 kWh** Aug 1 → Sept 2 ($192.36); Nic is billing it off-platform.
+- **Arlo Braddock**, MV RV 48: $495 rent, no electric (camper in storage). Correct as-is.
 
 ---
 
 ## 5. Stuck meters (fixed this session)
 
-- **Root cause of the repeated misses:** there were two roads to a first utility bill. The monthly run (`generateBillsForMeter`) handled stuck meters. The lease-signing road (`releaseSuspendedChargesForLease`) required the meter to have moved, so every onboarding lease with a stuck meter billed $0. That's why it kept recurring: Chris Ast RV 07, Jared Coil RV 23, Calvin Curtis RV 40, MH 04, RV 41, Martin RV 34.
+- **Root cause of the repeated misses:** there were two roads to a first utility bill. The monthly run (`generateBillsForMeter`) handled stuck meters. The lease-signing road (`releaseSuspendedChargesForLease`) required the meter to have moved, so every onboarding lease with a stuck meter billed $0. That's why it kept recurring: Orin Oakhurst RV 07, Jared Coil RV 23, Kesh Kilbride RV 40, MH 04, RV 41, Faye RV 34.
 - **Fix:** the signing road now estimates stuck meters for **existing tenancies only**. It runs inside a savepoint so it can never abort a signature.
-- **New estimate rule (Nic):** "low end of the cluster." The 25th percentile (nearest-rank) of credible occupied usage (`clusterLow()` in `utilityBilling.ts`). On August at Mountain View that's **387**. Randall Cox (120) and David Shultz (197) stay in the pool but no longer set the price alone.
+- **New estimate rule (Nic):** "low end of the cluster." The 25th percentile (nearest-rank) of credible occupied usage (`clusterLow()` in `utilityBilling.ts`). On August at Mountain View that's **387**. Osric Rookwood (120) and Ursa Underhill (197) stay in the pool but no longer set the price alone.
 - **Meters to check physically:** RV 34 (the Sept 2 reading equals Aug 1) and RV 19 (identical reads twice).
 - **Still deferred:** detecting a meter that died mid-month (needs history per space).
 

@@ -393,7 +393,7 @@ describe('payment health, lease by lease', () => {
     await until(() => text().includes('REPORT /tenants/t1/report?leaseId=L31'), 'that lease\'s report')
   })
 
-  // 10/13 review: Arturo Melendez's new MH 15 lease, waiting for signatures,
+  // 10/13 review: Elan Everly's new MH 15 lease, waiting for signatures,
   // read "Ended" beside his MH 23.
   it('each lease says where it stands: Current, Pending (not signed yet) or Ended', async () => {
     server.profile = profile({ stats: { ...profile().stats,

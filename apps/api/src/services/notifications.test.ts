@@ -248,7 +248,7 @@ describe('createNotification — best-effort error swallow', () => {
 // ─── S642: the rent-collected card states the money, not the lease ──────────
 //
 // Nic: "It's only showing the base rent in the email card. It's not showing
-// what they actually paid. So it's misleading… Calvin Curtis paid four ninety
+// what they actually paid. So it's misleading… Kesh Kilbride paid four ninety
 // five for unit RV 40. That is not the total he paid."
 //
 // He settled $495.00 rent and $25.20 electricity on ONE intent. The webhook
@@ -274,7 +274,7 @@ describe('notifyRentCollected — S642: the figure is the money that arrived', (
       landlordUserId: userId,
       landlordId,
       landlordEmail:  email,
-      tenantName:     'Calvin Curtis',
+      tenantName:     'Kesh Kilbride',
       unitNumber:     'RV 40',
       propertyName:   'Mountain View RV Ranch',
       amount:         520.20,
@@ -397,6 +397,77 @@ describe('ACH retry notices — the tenant is told once per failed payment', () 
     const text = JSON.stringify(rows[0].data)
     for (const r of landlordRecipients) expect(text).not.toContain(r.email)
     expect(rows[0].data.retryDate).toBe('2026-10-04')
+  })
+
+  // ── 11/4 (Nic): THE FIGURE IS WHAT THE BANK WILL BE ASKED FOR ─────────────
+  //
+  //   "Have the retry email state the correct amount that is actually going to
+  //    be charged. Pull up line items at the time of, that the email is going
+  //    out."
+  //
+  // Heather Miller was told her $100 payment would be retried and $106.00 was
+  // debited: the $6 ACH fee rides every bank payment and the notice named only
+  // the charges. The resident's copy now names the DEBIT and lists it; the
+  // landlord's copy still names what their resident owes THEM, which is a
+  // different question with a different answer.
+  it('tells the resident the debit and its lines, and the landlord the charges', async () => {
+    const { tenant, landlordId, landlordRecipients } = await setup(1)
+    await notifyAchRetryScheduled({
+      tenantUserId: tenant.userId, tenantEmail: tenant.email, tenantName: 'Test Tenant',
+      landlordId, landlordRecipients,
+      unitNumber: 'MH 25', propertyName: 'Oak Park',
+      amount: 100, debit: 106,
+      lines: [{ label: 'Rent', amount: 100 }, { label: 'Bank fee', amount: 6 }],
+      reason: 'there was not enough money in the account', retryDate: '2026-10-04', retryAttempt: 1,
+    })
+
+    const toTenant = (sendNotificationEmailMock.mock.calls as any[][])
+      .map(c => c[0] as any).find(c => c.notificationType === 'ach_retry_scheduled')
+    expect(toTenant.html).toContain('$106.00')
+    expect(toTenant.html).toContain('Rent')
+    expect(toTenant.html).toContain('Bank fee')
+    expect(toTenant.html).toContain('What your bank will be asked for')
+    // and never the charges-only figure it used to lead with
+    expect(toTenant.html).not.toContain('$100.00</b> payment')
+
+    const toLandlord = (sendNotificationEmailMock.mock.calls as any[][])
+      .map(c => c[0] as any).find(c => c.notificationType === 'ach_retry_scheduled_info')
+    expect(toLandlord.html).toContain('$100.00')
+    expect(toLandlord.html).not.toContain('$106.00')
+  })
+
+  // A pull whose parts do not add up to the debit (credit covered some of a
+  // charge, money was paid ahead on top) shows the figure alone: achRetry
+  // .pullDebitLines returns no lines, and a total with parts that do not sum to
+  // it reads as the sender's arithmetic error.
+  it('names the debit with no lines when the lines would not add up', async () => {
+    const { tenant, landlordId, landlordRecipients } = await setup(1)
+    await notifyAchRetryScheduled({
+      tenantUserId: tenant.userId, tenantEmail: tenant.email, tenantName: 'Test Tenant',
+      landlordId, landlordRecipients,
+      unitNumber: 'MH 25', propertyName: 'Oak Park',
+      amount: 100, debit: 106, lines: [],
+      reason: null, retryDate: '2026-10-04', retryAttempt: 1,
+    })
+    const toTenant = (sendNotificationEmailMock.mock.calls as any[][])
+      .map(c => c[0] as any).find(c => c.notificationType === 'ach_retry_scheduled')
+    expect(toTenant.html).toContain('$106.00')
+    expect(toTenant.html).not.toContain('What your bank will be asked for')
+  })
+
+  // The old shape still works: a caller that knows only the charges total gets
+  // that figure, and no lines.
+  it('falls back to the charges total when no debit is given', async () => {
+    const { tenant, landlordId, landlordRecipients } = await setup(0)
+    await notifyAchRetryScheduled({
+      tenantUserId: tenant.userId, tenantEmail: tenant.email, tenantName: 'Test Tenant',
+      landlordId, landlordRecipients,
+      unitNumber: 'MH 25', propertyName: 'Oak Park', amount: 450,
+      reason: null, retryDate: '2026-10-04', retryAttempt: 1,
+    })
+    const toTenant = (sendNotificationEmailMock.mock.calls as any[][])
+      .map(c => c[0] as any).find(c => c.notificationType === 'ach_retry_scheduled')
+    expect(toTenant.html).toContain('$450.00')
   })
 })
 
@@ -525,18 +596,19 @@ describe('the retry-scheduled notice reads plainly', () => {
 
   // S654 (review): the first retry is not the last — a short-of-money bounce on
   // retry 1 schedules retry 2. "We can't try your bank again" was false there.
-  it('the FIRST retry says one more try follows if it bounces for the same reason — never "can\'t try again"', async () => {
+  // 11/4 (Nic): "they fail once, they retry, it fails again, the payment method
+  // is blocked. That's it." There is one retry now (ACH_MAX_RETRIES), so the
+  // notice can no longer promise "the first of two" — an attempt GAM will not
+  // make — and it says the method comes off if this one bounces.
+  it('the retry says it is the only one, and what happens if it bounces', async () => {
     const mail = await fireRetry(1)
-    expect(mail.html).toContain('This is the first of two retries')
-    expect(mail.html).toContain('we\'ll try one last time three days later')
-    expect(mail.html).not.toMatch(/can't try your bank again|another way/)
+    expect(mail.html).toContain('This is the only retry')
+    expect(mail.html).toContain('the payment method comes off your account')
+    expect(mail.html).not.toContain('first of two')
   })
 
-  it('the SECOND retry is the last, and says so', async () => {
-    const mail = await fireRetry(2)
-    expect(mail.html).toContain('This is the last retry')
-    expect(mail.html).toContain('we can\'t try your bank again and you\'ll need to pay another way')
-    expect(mail.html).not.toContain('first of two')
+  it('says the same thing whichever attempt number it is handed — the cap is one', async () => {
+    expect((await fireRetry(2)).html).toContain('This is the only retry')
   })
 })
 

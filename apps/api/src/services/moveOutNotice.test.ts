@@ -39,9 +39,9 @@ async function world(opts: { endDate?: string | null } = {}) {
     const leaseId = await seedLease(c, { unitId, landlordId: ll.landlordId, startDate: '2026-01-01',
       leaseType: opts.endDate ? 'fixed_term' : 'month_to_month' })
     if (opts.endDate) await c.query(`UPDATE leases SET end_date=$2 WHERE id=$1`, [leaseId, opts.endDate])
-    const tenantId = await seedTenant(c, { email: 'razo@test.dev' })
+    const tenantId = await seedTenant(c, { email: 'castellan@test.dev' })
     await seedLeaseTenant(c, { leaseId, tenantId })
-    await c.query(`UPDATE users SET first_name='Andres', last_name='Razo' WHERE id=(SELECT user_id FROM tenants WHERE id=$1)`, [tenantId])
+    await c.query(`UPDATE users SET first_name='Cora', last_name='Castellan' WHERE id=(SELECT user_id FROM tenants WHERE id=$1)`, [tenantId])
     const m = await c.query<{ id: string }>(
       `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, digits)
        VALUES ($1,'electric','RV 27 electric','submeter',6) RETURNING id`, [propertyId])
@@ -71,7 +71,7 @@ describe('marking a resident as leaving', () => {
     expect(notify).toHaveBeenCalledTimes(1)
     const n = (notify.mock.calls[0] as any)[0]
     expect(n.type).toBe('lease_move_out_notice')
-    expect(n.emailTo).toBe('razo@test.dev')
+    expect(n.emailTo).toBe('castellan@test.dev')
     expect(n.body).toContain('RV 27')
   })
 
@@ -152,9 +152,9 @@ describe('marking a resident as leaving', () => {
     const w = await world()
     const sat = iso(today().plus({ days: 4 }))
     await recordMoveOutNotice({ leaseId: w.leaseId, on: sat, byUserId: w.userId })
-    const byName = await listResidentsForDesk({ landlordIds: [w.landlordId], propertyIds: null, q: 'razo' })
+    const byName = await listResidentsForDesk({ landlordIds: [w.landlordId], propertyIds: null, q: 'castellan' })
     expect(byName).toHaveLength(1)
-    expect(byName[0]).toMatchObject({ lease_id: w.leaseId, unit_number: 'RV 27', end_date: sat, names: 'Andres Razo' })
+    expect(byName[0]).toMatchObject({ lease_id: w.leaseId, unit_number: 'RV 27', end_date: sat, names: 'Cora Castellan' })
     expect(byName[0].move_out_notice_at).toBeTruthy()
     const bySpace = await listResidentsForDesk({ landlordIds: [w.landlordId], propertyIds: null, q: 'rv 27' })
     expect(bySpace).toHaveLength(1)

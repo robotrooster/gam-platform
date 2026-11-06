@@ -513,6 +513,13 @@ async function terminateInTx(
       WHERE id = $1`,
     [requestId],
   )
+  // 11/1 (Nic): a terminated tenancy stops owing rent for the time after it.
+  // This path only ever ADDED money (the early-termination fee); anything
+  // already billed for a month the resident will not be there for stayed owed.
+  // Arrears are untouched; the fee just added is dated today and so is not
+  // "past the end" (services/leaseEndPullBack). Inside the caller's transaction.
+  const { pullBackChargesPastLeaseEnd } = await import('./leaseEndPullBack')
+  await pullBackChargesPastLeaseEnd(client, { leaseId })
 
   // Credit-ledger event. 'no_policy' path emits a generic
   // lease_terminated_early_by_tenant since that's the closest match;

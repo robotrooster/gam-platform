@@ -38,7 +38,7 @@ const day = (iso: string) =>
 const today = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
 
 /** Everything owed across a household's open bills, by column. */
-const sum = (h: { bills: Bill[] }, key: 'totalAmount' | 'amountPaid' | 'creditApplied' | 'balance') =>
+const sum = (h: { bills: Bill[] }, key: 'totalAmount' | 'amountPaid' | 'creditApplied' | 'balance' | 'gamOwed') =>
   Math.round(h.bills.reduce((t, b) => t + Number(b[key] ?? 0) * 100, 0)) / 100
 
 /**
@@ -100,6 +100,10 @@ export function itemizeSheet(bills: Bill[]): { charges: SheetItem[]; lateFees: S
   }>()
   for (const b of bills) {
     for (const l of b.lines) {
+      // 10/28: a charge of GAM's is not one of the landlord's priced lines —
+      // it would make the itemized rows sum to more than their own subtotal.
+      // It is stated once, under their totals, as "Tenant owes GAM".
+      if (l.gam) continue
       const unit = Math.round(Number(l.amount) * 100) / 100
       const key = `${l.label}\u0000${l.detail ?? ''}\u0000${unit}`
       const on = String(l.dueDate ?? b.dueDate).slice(0, 10)
@@ -137,11 +141,11 @@ export type Letterhead = {
   address: string | null; cityLine: string | null
   phone: string | null; email: string | null
 }
-type Line = { id: string; type?: string; label: string; detail: string | null; amount: string | number; dueDate?: string; open: boolean }
+type Line = { id: string; type?: string; label: string; detail: string | null; amount: string | number; dueDate?: string; open: boolean; gam?: boolean }
 type Bill = {
   id: string; invoiceNumber: string; dueDate: string; unitNumber: string | null
   propertyName: string | null; amountPaid: number; creditApplied: number
-  balance: number; totalAmount: number; lines: Line[]
+  balance: number; totalAmount: number; gamOwed?: number; lines: Line[]
 }
 type Household = { tenantId: string; name: string; unitNumber: string | null; bills: Bill[] }
 
@@ -276,6 +280,17 @@ export function BillPrintPage() {
                     <tr><td>Credit applied</td><td>{money(-sum(h, 'creditApplied'))}</td></tr>
                   )}
                   <tr className="inv-balance"><td>Balance due</td><td>{money(owed)}</td></tr>
+                  {/* 10/28 (Nic): money the resident owes GAM, not this
+                      landlord — "not counted in the landlord's books", so it
+                      sits under their balance rather than inside it. Worded
+                      generically on purpose: their deposit already reads paid
+                      in full above.
+                      10/29: it names the resident as the one who owes it, so
+                      the landlord cannot read it as their money or as money
+                      being taken off them (openBills.OWED_TO_GAM). */}
+                  {sum(h, 'gamOwed') > 0 && (
+                    <tr><td>Tenant owes GAM</td><td>{money(sum(h, 'gamOwed'))}</td></tr>
+                  )}
                 </tbody>
               </table>
             </section>

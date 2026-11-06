@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef, CSSProperties, Fragment } from 'r
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPut, apiDelete, apiPatch, api } from '../lib/api'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, UTILITY_TYPE_LABEL, type UtilityType, METER_READING_DEFAULT_DIGITS, METER_READING_DIGIT_OPTIONS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL, UTILITY_USAGE_NOUN, meterWorksNoUseLabel } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, UTILITY_TYPE_LABEL, type UtilityType, READING_BARELY_MOVED_UNITS, METER_USAGE_BANDS, METER_USAGE_BAND_LABEL, type MeterUsageBand, METER_READING_DEFAULT_DIGITS, METER_READING_DIGIT_OPTIONS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL, UTILITY_USAGE_NOUN, meterWorksNoUseLabel } from '@gam/shared'
 import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench, Pencil, Check, PowerOff } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
 import { usePerms } from '../lib/permissions'
@@ -262,7 +262,15 @@ export function UtilityMetersPage({ embeddedPropertyId }: { embeddedPropertyId?:
                       flagged reads in the card below, and the last one settled sends
                       the month's bills. */}
                   {openRun.status === 'double_check'
-                    ? (canReview
+                    ? (openRun.flaggedCount === 0
+                        // 10/31 (Nic): "If there's nothing for a double check, why
+                        // would I go back in to review bills or choose to
+                        // complete?" The old copy said zero readings looked off
+                        // and asked him to go and settle them anyway.
+                        ? (openRun.needsApproval
+                            ? `Every meter is read and nothing looks off. Look the bills over and approve, and they go out on each tenant's next invoice.`
+                            : `Every meter is read and nothing looks off. The month's bills go out on their own — nothing is waiting on you.`)
+                      : canReview
                         ? `Every meter is read. ${openRun.flaggedCount} reading${openRun.flaggedCount === 1 ? ' looks' : 's look'} off — settle ${openRun.flaggedCount === 1 ? 'it' : 'them'} in "Readings to double-check" below and the month's bills go out.`
                         : `Every meter is read. ${openRun.flaggedCount} reading${openRun.flaggedCount === 1 ? ' is' : 's are'} with the landlord to double-check; the month's bills go out when ${openRun.flaggedCount === 1 ? "it's" : "they're"} settled.`)
                     : needsOpening.count > 0
@@ -519,7 +527,10 @@ function BrokenMeterPolicyCard({ property }: { property: any }) {
 function ReviewReadingModal({ reading, onClose }: { reading: any; onClose: () => void }) {
   const navigate = useNavigate()
   const [value, setValue] = useState('')
-  const [reason, setReason] = useState<'rollover' | 'swap' | null>(null)
+  // 'rounding' (10/31): within a unit or two — no usage, and the engine marks the
+  // meter as not reading if the space is lived in. Sent as rollover:false, which
+  // is what it already means; the distinction is what the landlord is ASKED.
+  const [reason, setReason] = useState<'rollover' | 'swap' | 'rounding' | null>(null)
   const digits = Number(reading.digits) || METER_READING_DEFAULT_DIGITS
   const valueOk = new RegExp(`^\\d{${digits}}$`).test(value)
   const prior = reading.priorReadingValue != null ? Number(reading.priorReadingValue) : null
@@ -530,6 +541,19 @@ function ReviewReadingModal({ reading, onClose }: { reading: any; onClose: () =>
   const enteredIsLow = prior != null && Number(reading.readingValue) < prior
   const correctionIsLow = valueOk && prior != null && Number(value) < prior
   const reasonNeeded = (value === '' && enteredIsLow) || correctionIsLow
+  // ── 10/31 (Nic): "I thought we were detecting rounding errors." ───────────
+  //
+  // We were — in the billing arithmetic (READING_BARELY_MOVED_UNITS, 10/24) —
+  // but this window never knew. Reviewing a read ONE unit low, the only answers
+  // on offer were "the meter rolled past 99999", which would bill a whole face
+  // of usage, and "the meter was replaced", which was simply untrue.
+  //
+  // A wrap is arithmetically impossible within a unit or two of the last read,
+  // so it is not offered there at all.
+  const lowBy = prior == null ? null
+    : (value === '' ? prior - Number(reading.readingValue) : prior - Number(value))
+  const barelyMoved = reasonNeeded && lowBy != null
+    && lowBy > 0 && lowBy <= READING_BARELY_MOVED_UNITS
   const resolve = useMutation(
     (p: { correctedValue?: number; rollover?: boolean }) => apiPost(`/utility/readings/${reading.id}/resolve-review`, p),
     { onSuccess: onClose, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not resolve') }
@@ -567,10 +591,23 @@ function ReviewReadingModal({ reading, onClose }: { reading: any; onClose: () =>
           <div style={{ marginTop:12 }}>
             <span style={lbl}>Why is the read lower than last month?</span>
             <div style={{ display:'grid', gap:6 }}>
+              {barelyMoved ? (
+                <label style={{ display:'flex', alignItems:'flex-start', gap:8, padding:'8px 12px', borderRadius:8, background:'var(--bg-2)', cursor:'pointer', fontSize:'.82rem' }}>
+                  <input type="radio" name="low-reason" checked={reason==='rounding'} onChange={()=>setReason('rounding')} style={{ marginTop:3 }} />
+                  <span>
+                    Only {lowBy} {lowBy === 1 ? 'unit' : 'units'} lower — a rounding error, or the face is not turning
+                    <span style={{ display:'block', color:'var(--text-3)', fontSize:'.74rem', marginTop:2, lineHeight:1.45 }}>
+                      No usage billed from it. If the space is lived in, the meter is marked as not reading and
+                      billed from comparable spaces, so somebody goes and looks at the face.
+                    </span>
+                  </span>
+                </label>
+              ) : (
               <label style={{ display:'flex', alignItems:'center', gap:8, padding:'8px 12px', borderRadius:8, background:'var(--bg-2)', cursor:'pointer', fontSize:'.82rem' }}>
                 <input type="radio" name="low-reason" checked={reason==='rollover'} onChange={()=>setReason('rollover')} />
                 Meter rolled past {'9'.repeat(digits)} — bill the wrap-around usage
               </label>
+              )}
               <label style={{ display:'flex', alignItems:'center', gap:8, padding:'8px 12px', borderRadius:8, background:'var(--bg-2)', cursor:'pointer', fontSize:'.82rem' }}>
                 <input type="radio" name="low-reason" checked={reason==='swap'} onChange={()=>setReason('swap')} />
                 Meter was replaced or reset — no charge this cycle
@@ -2677,7 +2714,7 @@ function MeterBackInServiceModal({ meter, onClose, onSaved }: {
     { enabled: flagged, staleTime: 0 })
   const waiting = estimates?.count ?? 0
   const save = useMutation((body: {
-    outOfService: false; repairedStartingReading?: number; zeroUseConfirmed?: true; voidFlaggedEstimates?: boolean
+    outOfService: false; repairedStartingReading?: number; zeroUseConfirmed?: true; voidFlaggedEstimates?: boolean; readsStand?: true
     voidEstimateIds?: string[]; stopFlatCharge?: boolean
   }) => apiPatch(`/utility/meters/${meter.id}`, body), {
     onSuccess: (r: any, body) => {
@@ -2699,6 +2736,8 @@ function MeterBackInServiceModal({ meter, onClose, onSaved }: {
         ? (flagged
           ? `${meter.label} is back in service — ${effect}.${voidedWords}${keptWords}`
           : `${meter.label} confirmed working — ${effect}.`)
+        : body.readsStand
+        ? `${meter.label} is back in service on its own reads — this cycle bills the usage they show`
         : `${meter.label} marked repaired — its next bill is measured from ${body.repairedStartingReading}`)
       onSaved()
       onClose()
@@ -2745,6 +2784,34 @@ function MeterBackInServiceModal({ meter, onClose, onSaved }: {
               Repaired
             </button>
           </div>
+        </div>}
+        {/* ── 10/31 (Nic): IT WAS READING FINE — BILL ITS OWN READS ──────────
+            "on meter 22, mark it working again and make that bill use the used
+            water reading."
+
+            The third way back, and the only one that keeps the gallons. The two
+            above both throw this cycle's usage away: "Repaired" re-baselines to
+            today's figure (correct for a swapped head, wrong for a meter that
+            never stopped), and "Works, nobody using it" bills $0. A meter that
+            was marked broken and has since plainly moved needs neither — its
+            odometer is continuous, so the cycle bills the difference.
+
+            Offered on a submeter only: it is the one kind of meter whose bill is
+            measured between two reads, so it is the only one where "bill its own
+            reads" means anything. No zero-use confirmation goes with it, which is
+            deliberate — the stuck-meter test keeps watching, and a meter that
+            reads the same number twice again gets flagged again. */}
+        {flagged && meter.billingMethod === 'submeter' && <div style={choice}>
+          <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>It was reading fine</div>
+          <div style={why}>
+            Nothing was replaced — the meter was turning the whole time and the reads it already has are good.
+            No new reading: this cycle bills the {noun} between its last two reads, like any other meter.
+            It stays watched, so if it reads the same number twice again it comes back here.
+          </div>
+          <button className="btn btn-primary" disabled={save.isLoading}
+            onClick={() => save.mutate({ outOfService: false, readsStand: true })}>
+            It was reading fine — bill its reads
+          </button>
         </div>}
         <div style={choice}>
           <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>{worksLabel}</div>
@@ -3043,6 +3110,13 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
   // RUBS master's own base fee is set with the property rates. Kept so the value
   // round-trips unchanged on an edit rather than being zeroed.
   const [baseFee] = useState(meter?.baseFee != null ? String(meter.baseFee) : '')
+  // 10/31 (Nic): what this space normally uses, and where in the park it sits.
+  // Both are reached for ONLY while the meter is broken and the property
+  // estimates — a meter that reads always bills its own reads.
+  const [usageBand, setUsageBand] = useState(meter?.usageBand ?? 'low')
+  const [expectedUsage, setExpectedUsage] = useState(
+    meter?.expectedMonthlyUsage != null ? String(Number(meter.expectedMonthlyUsage)) : '')
+  const [expectedNote, setExpectedNote] = useState(meter?.expectedUsageNote ?? '')
   const [alloc, setAlloc] = useState(meter?.rubsAllocationMethod ?? 'occupant_count')
   // S607: config for the bases that need one. Kept as discrete pieces of state
   // rather than a JSON box — a landlord should never be asked to type JSON.
@@ -3089,6 +3163,11 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
           // rejects the row: a RUBS master requires one, anything else must
           // have none. Sending null explicitly is what CLEARS it when someone
           // switches a master to a submeter.
+          ...(method === 'submeter' ? {
+            usageBand,
+            expectedMonthlyUsage: expectedUsage.trim() === '' ? null : Number(expectedUsage),
+            expectedUsageNote: expectedUsage.trim() === '' ? null : (expectedNote.trim() || null),
+          } : {}),
           rubsAllocationMethod: method === 'rubs' ? alloc : null,
           ...(method === 'rubs' ? {
             rubsBasis: basis,
@@ -3165,6 +3244,39 @@ function MeterModal({ propertyId, meter, onClose, onSaved }: {
             {(METER_READING_DIGIT_OPTIONS as readonly number[]).map(d => <option key={d} value={d}>{d} digits</option>)}
           </select>
           <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3 }}>Changing this never alters past reads — it sets the largest number a read can be and where the dial rolls over.</div>
+        </div>
+        )}
+        {method === 'submeter' && (
+        <div style={{ marginBottom: 10, padding: 10, border: '1px solid var(--border-1)', borderRadius: 'var(--r-md)' }}>
+          <label style={lbl}>If this meter stops reading</label>
+          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', margin: '3px 0 8px', lineHeight: 1.45 }}>
+            None of this touches a meter that works — it bills its own reads, always. This is only what to
+            estimate from if the face dies, and only where you have estimating turned on for the property.
+          </div>
+          <select className="form-select" value={usageBand} onChange={e => setUsageBand(e.target.value)}
+            style={{ width: '100%', marginBottom: 8 }}>
+            {(METER_USAGE_BANDS as readonly string[]).map(b => (
+              <option key={b} value={b}>{METER_USAGE_BAND_LABEL[b as MeterUsageBand]}</option>
+            ))}
+          </select>
+          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.45 }}>
+            Where in the neighbors' usage to land. "Uses more than most" is the upper end of the spread, not
+            the highest in the park — one heavy space never sets somebody else's bill.
+          </div>
+          <label style={lbl}>Or, what this space normally uses in a month</label>
+          <input className="input mono" type="text" inputMode="decimal" value={expectedUsage}
+            onChange={e => setExpectedUsage(e.target.value.replace(/[^\d.]/g, ''))}
+            placeholder="leave empty to use the band above" style={{ width: '100%' }} />
+          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.45 }}>
+            If you know the real figure from your own records, put it here and it is used instead of the
+            neighbors. {UTILITY_UNITS[utilityType] ? `In ${UTILITY_UNITS[utilityType]}.` : ''}
+          </div>
+          {expectedUsage.trim() !== '' && (
+            <input className="input" value={expectedNote} maxLength={500}
+              onChange={e => setExpectedNote(e.target.value)}
+              placeholder="where the figure came from (optional)"
+              style={{ width: '100%', marginTop: 8 }} />
+          )}
         </div>
         )}
         {!locked && (

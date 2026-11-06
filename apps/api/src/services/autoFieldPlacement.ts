@@ -91,7 +91,7 @@ export interface LateFeeTerms {
   initialType:    'flat' | 'percent' | null
   accrualAmount:  number | null
   accrualType:    'flat' | 'percent' | null
-  accrualPeriod:  'daily' | 'weekly' | 'monthly' | null
+  accrualPeriod:  'daily' | 'weekly' | null
   rawText:        string
 }
 
@@ -1267,13 +1267,17 @@ export function detectLateFeeTerms(pages: any[]): LateFeeTerms | null {
   const perMonth = /\bper\s+month\b|\bmonthly\b/i.test(clause)
 
   if (amt != null && amt > 0) {
-    if (perDay || perWeek || perMonth) {
+    if (perDay || perWeek) {
       out.accrualAmount = amt
       out.accrualType = isPercent ? 'percent' : 'flat'
-      out.accrualPeriod = perDay ? 'daily' : perWeek ? 'weekly' : 'monthly'
+      out.accrualPeriod = perDay ? 'daily' : 'weekly'
       out.initialAmount = 0
       out.initialType = 'flat'
     } else {
+      // 10/30 (Nic): a clause reading "$50 per month" falls through to here on
+      // purpose. A monthly late fee is ONE fee on that bill; if rent still isn't
+      // paid when the next invoice goes out, that invoice carries its own — which
+      // is the one-time fee, so perMonth is read as one and never as an accrual.
       out.initialAmount = amt
       out.initialType = isPercent ? 'percent' : 'flat'
     }

@@ -10,7 +10,7 @@ import { PropertySelect } from '../components/ListControls'
 // 10/12 (Nic): no "Money received" / "Money billed" switch — the income card
 // and the property-health card show Charged, Received and Owed side by side.
 import {
-  moneyCardView, rentBillsPaidRate, healthStatus, HEALTH_STATUS_LABEL,
+  moneyCardView, rentBillsPaidRate, healthStatus, HEALTH_STATUS_LABEL, money,
   // 10/18 (Nic): the health block's own figures, printed as the subtraction
   // they are, and the words that keep the money table beside them from reading
   // as its parts (see the helper for the Mountain View figures).
@@ -36,6 +36,17 @@ interface DashStats {
   /** S642: of collectedMtd, how much is ACH still clearing. */
   collectedInFlight?: number
   outstanding: number
+  /**
+   * 11/3 (Nic) — this month's money from ONE population, so the three figures
+   * actually subtract. `charged = collected + clearing + stillOwed`, to the
+   * cent; work trade is beside them and in neither; `stillOwed + earlierOwed`
+   * is exactly `outstanding`, which is what makes this month a slice of the
+   * Outstanding card instead of a figure that can exceed it.
+   */
+  monthMoney?: {
+    charged: number; collected: number; clearing: number
+    stillOwed: number; workTrade: number; earlierOwed: number
+  }
   // S640: rent that trades for labor — contracted, real, and never arriving as
   // money. Reported apart from monthlyRentVolume/outstanding, not inside them.
   workTradeRent?: number
@@ -189,6 +200,9 @@ export function DashboardPage() {
   // 10/12 (Nic): this month's Charged, Received and Owed side by side — the
   // same card the Reports overview shows — with how they tie under it.
   const incomeCard = moneyCardView(stats?.incomeCard)
+  // 11/3 (Nic): this month's money from one population — the figures that
+  // actually subtract. Absent (an older reply) falls back to incomeCard.
+  const mm = stats?.monthMoney
 
   // Platform fee: authoritative per-property number from the API — $2/billable
   // unit floored at the $10 property minimum (full stop), summed across every
@@ -293,13 +307,12 @@ export function DashboardPage() {
           <div>
             <strong>{stats!.evictionModeUnits} unit(s) in Eviction Mode</strong> — All tenant ACH hard blocked. No rent will be collected. Disbursement held. Check your local laws before accepting any payment.
           </div>
-          <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>View →</span>
+          <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600,whiteSpace:'nowrap'}}>View →</span>
         </div>
       )}
       {/* ── S641 (Nic): "it needs to read any outstanding charges" ──────────
           The units table counts unpaid RENT only — correct for the eviction
-          clock, wrong for a card a landlord reads as "who owes me". Jeremy
-          Parker paid his rent and not his electricity, so his spot read clean
+          clock, wrong for a card a landlord reads as "who owes me". Margo Northcott paid his rent and not his electricity, so his spot read clean
           while the money was still owed. */}
       {(stats?.unitsOwing ?? stats?.delinquentUnits ?? 0) > 0 && (
         // S641: opens the BALANCES page, not the delinquent-unit filter. The
@@ -316,6 +329,13 @@ export function DashboardPage() {
         // will actually be charged — the API reads each lease's own terms.
         <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/payments')}>
           <Clock size={16} />
+          {/* 10/30 (Nic): "all the notifications banners are shit. They don't
+              read right." `.alert` is a flex ROW, so every <strong> and every
+              loose text node here became its OWN flex item and got squeezed
+              into a one-word column — "8 units with an / outstanding / balance"
+              down the screen. The eviction banner above always read correctly
+              because its text sits in a single <div>. Same wrapper here. */}
+          <div>
           {(() => {
             const owing = stats!.unitsOwing ?? stats!.delinquentUnits ?? 0
             const past = stats?.unitsPastGrace ?? 0
@@ -332,14 +352,17 @@ export function DashboardPage() {
               </>
             )
           })()}
-          <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>View →</span>
+          </div>
+          <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600,whiteSpace:'nowrap'}}>View →</span>
         </div>
       )}
       {((stats as any)?.leasesNeedReview || 0) > 0 && (
         <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/leases?review=1')}>
           <AlertTriangle size={16} />
-          <strong>{(stats as any).leasesNeedReview} lease(s) need review</strong> — Imported with default values. Open to confirm the real terms.
-          <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>View →</span>
+          <div>
+            <strong>{(stats as any).leasesNeedReview} lease(s) need review</strong> — Imported with default values. Open to confirm the real terms.
+          </div>
+          <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600,whiteSpace:'nowrap'}}>View →</span>
         </div>
       )}
 
@@ -427,11 +450,21 @@ export function DashboardPage() {
           <div className="dash-three">
             {/* 10/12 (Nic, L2): Received leads. */}
             <div><span className="dash-three-label">{MONEY_COLUMN_LABEL.received}</span><span className="dash-three-value green">{fmtWhole(incomeCard.received)}</span></div>
-            <div><span className="dash-three-label">{MONEY_COLUMN_LABEL.charged}</span><span className="dash-three-value">{fmtWhole(incomeCard.charged)}</span></div>
-            <div><span className="dash-three-label">{MONEY_COLUMN_LABEL.owed}</span><span className="dash-three-value" style={{ color: incomeCard.owed > 0 ? 'var(--amber)' : undefined }}>{fmtWhole(incomeCard.owed)}</span></div>
+            <div><span className="dash-three-label">{MONEY_COLUMN_LABEL.charged}</span><span className="dash-three-value">{fmtWhole(mm ? mm.charged : incomeCard.charged)}</span></div>
+            <div><span className="dash-three-label">{MONEY_COLUMN_LABEL.owed}</span><span className="dash-three-value" style={{ color: (mm ? mm.stillOwed : incomeCard.owed) > 0 ? 'var(--amber)' : undefined }}>{fmtWhole(mm ? mm.stillOwed : incomeCard.owed)}</span></div>
           </div>
           <div className="kpi-sub" style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-            {incomeCard.notes.map(n => <span key={n}>{n}</span>)}
+            {/* 11/3 (Nic): the notes are built from the SAME population as the
+                three figures above, so this sentence is a subtraction that
+                subtracts. It used to mix a month's flow, a hardcoded zero and a
+                cumulative balance, and was $218.76 out. */}
+            {mm ? [
+              `Of ${money(mm.charged)} charged: ${money(mm.collected)} collected`
+                + (mm.clearing ? ` · ${money(mm.clearing)} clearing at the bank` : '')
+                + ` · ${money(mm.stillOwed)} still owed`,
+              ...(mm.workTrade ? [`${money(mm.workTrade)} is covered by work trade — hours pay it, so it is not charged and not owed`] : []),
+            ].map(n => <span key={n}>{n}</span>)
+             : incomeCard.notes.map(n => <span key={n}>{n}</span>)}
           </div>
         </div>
         {/* S527 W-3: outstanding → the who-owes-what list, not Reports.
@@ -450,7 +483,22 @@ export function DashboardPage() {
               it now reads the one shared open-charge rule the balances page
               this card opens reads — the words RENT_HEALTH_SCOPE_NOTE already
               uses of this card, "every open charge of every month". */}
-          <div className="kpi-sub">every open charge, every month</div>
+          {/* 11/3 (Nic): "It needs to be a grand fucking total of every
+              outstanding money owed to us." It already was — what was missing
+              is that nothing on the screen showed this month as a SLICE of it,
+              so the card beside it (a cumulative balance) could read larger and
+              look like a contradiction. The word "open" was also doing silent
+              work: it means payable now, so money already moving at the bank
+              and work trade are not in it, and neither is owed. */}
+          <div className="kpi-sub" style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <span>every unpaid charge, every month</span>
+            {mm && (
+              <span>
+                {money(mm.stillOwed)} this month
+                {mm.earlierOwed > 0 ? ` · ${money(mm.earlierOwed)} earlier months` : ''}
+              </span>
+            )}
+          </div>
         </div>
         {/* Row 2 (span 3): portfolio + operations */}
         <div className="kpi-card" {...dash.bind('occupancy-rate')} onClick={()=>navigate('/units')}>
@@ -503,7 +551,12 @@ export function DashboardPage() {
           <div className="kpi-sub">{(stats as any)?.maintenance?.inProgress||0} in progress · {(stats as any)?.maintenance?.completed30d||0} done this month</div>
         </div>
         {/* Row 3 (span 6): applications + next payout */}
-        <div className="kpi-card" {...dash.bind('applications')} onClick={()=>navigate('/background')}>
+        {/* 10/30 (Nic): "property specific links need to be used from kpi
+            cards… if you are on the wrong property the screen gets linked
+            wrong." Whatever property this dashboard is filtered to rides along,
+            so the application link on the other side is already the right one. */}
+        <div className="kpi-card" {...dash.bind('applications')}
+          onClick={()=>navigate(`/background${propertyId ? `?propertyId=${encodeURIComponent(propertyId)}` : ''}`)}>
           <div className="kpi-label">Applications</div>
           <div className="kpi-value" style={{fontSize:'1.4rem',color:(stats as any)?.bgPending>0?'var(--amber)':'var(--green)'}}>{(stats as any)?.bgPending||0}</div>
           <div className="kpi-sub">{(stats as any)?.bgPending>0?'pending review':'no pending applications'}</div>
@@ -640,7 +693,7 @@ export function DashboardPage() {
         </div>
 
         {/* To-Do List — a place on the board like everything else now. */}
-        <div {...dash.bind('todo')}><TodoCard /></div>
+        <div {...dash.bind('todo')}><TodoCard propertyId={propertyId} /></div>
       </div>
 
       {/* S159: PM cut MTD vs net to owner — only renders when there's
@@ -688,13 +741,26 @@ export function DashboardPage() {
   )
 }
 
-function TodoCard() {
+/**
+ * 10/29 (Nic): "the to-do list does not filter by property. So anybody that's
+ * only an owner of one property only sees that correctly, but people that own
+ * both don't have any way to make the entire dashboard accurate to one
+ * property."
+ *
+ * Takes the dashboard's own filter. The company-level task — finish Stripe
+ * payouts — has no property to belong to and stays visible under every filter;
+ * hiding it would mean a landlord reading one park never learns they cannot be
+ * paid at all.
+ */
+function TodoCard({ propertyId }: { propertyId: string }) {
   const navigate = useNavigate()
   const [expanded, setExpanded] = React.useState<{ stayMoney: boolean; paidAhead: boolean; depositRefunds: boolean; onboarding: boolean; leases: boolean; ach: boolean; maintenance: boolean; workTrade: boolean }>({ stayMoney: false, paidAhead: false, depositRefunds: false, onboarding: false, leases: false, ach: false, maintenance: false, workTrade: false })
 
   const { data: todos, isLoading } = useQuery<any>(
-    'landlord-todos',
-    () => apiGet('/landlords/me/todos'),
+    // Keyed by the filter, so switching parks refetches instead of showing the
+    // park you just left.
+    ['landlord-todos', propertyId],
+    () => apiGet(`/landlords/me/todos${propertyId ? `?propertyId=${propertyId}` : ''}`),
     { staleTime: 30000 } // 30s
   )
 

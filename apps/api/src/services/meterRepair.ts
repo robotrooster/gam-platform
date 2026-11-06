@@ -2,8 +2,8 @@
  * MARK A BROKEN METER REPAIRED — the one code path (10/12).
  *
  * The landlord's "Mark repaired" button (PATCH /api/utility/meters/:id with
- * outOfService: false) and the one-time repair of Gerald Logue's meter
- * (scripts/oct12_gerald_meter) both come through here, so a meter is never put
+ * outOfService: false) and the one-time repair of Arlo Braddock's meter
+ * (scripts/oct12_meter_estimate_repair) both come through here, so a meter is never put
  * back in service two different ways.
  *
  * S648 (Nic): "for the meters marked broken and then marked as repaired, they
@@ -28,7 +28,7 @@
  * meter").
  *
  * 10/12 (Nic), M1: "ADD 'Works, tenant uses no power' choice next to
- * 'Repaired' (Gerald specifically is gone, not plugged in, paying for
+ * 'Repaired' (Arlo specifically is gone, not plugged in, paying for
  * occupancy)." That choice is markMeterWorksNoUse below: back in service and
  * the zero-use confirmation recorded, with NO new reading — the meter was never
  * broken, so the readings it already has are right and the next one is
@@ -80,6 +80,52 @@ export async function markMeterRepaired(client: PoolClient, a: {
            'meter_replaced', $3
       FROM properties p WHERE p.id = $4`,
     [a.meterId, a.startingReading, a.userId, meter.property_id])
+}
+
+/**
+ * "IT WAS READING FINE — BILL ITS OWN READS" (10/31, Nic).
+ *
+ *   "on meter 22, mark it working again and make that bill use the used water
+ *    reading."
+ *
+ * The third way back into service, and the only one that keeps the water.
+ * Country Acres Lot 22 was marked broken on 9/30 because it read 2072 twice;
+ * it was estimated a flat 1,000 gallons for September. Then on 10/28 it read
+ * 2082 — ten turns, 1,000 real gallons, by a household that really used them.
+ * Neither existing choice could bill that:
+ *
+ *   "Mark repaired" writes a `meter_replaced` read at today's figure, because
+ *     a swapped head's old number means nothing. Measured from 2082, this
+ *     cycle is zero and the gallons are given away.
+ *   "Works, tenant uses no power" says the household uses nothing, so a flat
+ *     read bills $0 — and this one is not flat.
+ *
+ * This says the plain third thing: nothing was replaced and nobody is claiming
+ * zero use, the meter was turning the whole time, so the reads it already has
+ * are good and the cycle bills the difference like any other meter. No new
+ * reading (there is nothing to re-baseline) and no zero-use confirmation (the
+ * stuck test must keep watching it — if it reads 2082 twice it gets flagged
+ * again, which is right).
+ *
+ * The landlord is asserting the odometer is CONTINUOUS. That is why it is a
+ * separate choice and not a looser "Mark repaired": the reading requirement on
+ * that path exists precisely to stop a cycle being measured across two
+ * different devices, and this path must not become a way around it.
+ */
+export async function markMeterReadsStand(client: PoolClient, a: {
+  meterId: string
+  /** Who said so (the landlord or staff member). */
+  userId: string
+}): Promise<void> {
+  const meter = (await client.query(
+    `UPDATE utility_meters
+        SET out_of_service = FALSE, out_of_service_since = NULL, updated_at = NOW()
+      WHERE id = $1
+      RETURNING id`, [a.meterId])).rows[0]
+  if (!meter) throw new Error(`markMeterReadsStand: meter ${a.meterId} not found`)
+  // Deliberately nothing else. No replacement read, no zero-use confirmation.
+  logger.info({ meterId: a.meterId, userId: a.userId },
+    '[meter-repair] back in service on its own reads — nothing replaced, no zero-use claim')
 }
 
 /**

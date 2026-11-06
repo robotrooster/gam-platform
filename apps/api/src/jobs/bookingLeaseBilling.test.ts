@@ -2293,7 +2293,7 @@ describe('S548 pull-out meter read prompt', () => {
 
   // 10/18 (Nic): "if there was a final bill and somebody moved out, the system
   // did not alert us to do a meter read. Um, speaking of that, my RV spaces 10
-  // and 11, Victor Cardoza and Nemesio Rivera, they paid for a month. They both
+  // and 11, Horatio Mapperley and Kestrel Norrington, they paid for a month. They both
   // left early, so I need to get those meter reads."
   //
   // Leaving early used to make a departure invisible twice over: the stay is

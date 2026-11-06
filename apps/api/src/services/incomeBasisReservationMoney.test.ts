@@ -117,7 +117,14 @@ async function moveIn(r: R): Promise<void> {
 async function rentRows(r: R): Promise<Array<{ id: string; due: string; amount: number }>> {
   return (await db.query<any>(
     `SELECT id, to_char(due_date, 'YYYY-MM-DD') AS due, amount::float AS amount FROM payments
-      WHERE lease_id = $1 AND type = 'rent' ORDER BY due_date`, [r.leaseId])).rows
+      -- 11/5: FULLY ORDERED, because 'ORDER BY due_date' alone was not. Two
+      -- rent rows on one due date (the month's rent, plus a re-bill of nights a
+      -- banked credit covered) came back in whichever order Postgres felt like,
+      -- and under full-suite load that flipped — a passing assertion failed
+      -- once in the 11/5 run with 930 and 480 simply swapped. Biggest first is
+      -- the rent, then the extra, and the id settles any remaining tie.
+      WHERE lease_id = $1 AND type = 'rent'
+      ORDER BY due_date, amount DESC, id`, [r.leaseId])).rows
 }
 
 async function settleCash(id: string, at: string): Promise<void> {
@@ -221,7 +228,7 @@ describe('reservation money that came back through a rent bill is still the rese
     expect(bOct.total).toBe(122.58)
     expect(bOct.parts).toMatchObject({ paid: 0, coveredByPaidAhead: 122.58 })
     expect(bOct.beside.collectedSoFar).toBe(122.58)
-    expect((await rentCard(r, 'billed', '2026-10')).billed).toEqual({ amount: 122.58, collected: 122.58, clearing: 0, stillOwed: 0 })
+    expect((await rentCard(r, 'billed', '2026-10')).billed).toEqual({ amount: 122.58, collected: 122.58, clearing: 0, stillOwed: 0, other: 0 })
     const ev = (await incomeEvents({ landlordIds: [r.landlordId], start: '2026-10-01', end: '2026-10-31', basis: 'billed' }))
       .filter(e => e.line === 'stayShortened').map(e => ({ part: e.part, amount: e.amount }))
     expect(ev.sort((x, y) => x.amount - y.amount)).toEqual([
@@ -462,7 +469,13 @@ describe('two shortenings of one stay each come off their own month', () => {
     await settleCash(octRow.id, '2026-10-01T10:00:00-07:00')
     const credits = async () => (await db.query<{ id: string; amount: number; anchor: string | null }>(
       `SELECT id, amount_original::float AS amount, source_payment_id AS anchor FROM lease_prepaid_credits
-        WHERE lease_id = $1 AND voided_at IS NULL ORDER BY created_at, id`, [r.leaseId])).rows
+        -- 10/27: amount_original before id. Two credits banked in the same
+        -- statement share created_at to the microsecond, so the only tiebreak
+        -- was a random uuid: the array came back in a different order roughly
+        -- one run in six and the comparison failed on ordering, not on values.
+        -- id stays last as a final determinism backstop.
+        WHERE lease_id = $1 AND voided_at IS NULL
+        ORDER BY created_at, amount_original, id`, [r.leaseId])).rows
 
     // Oct 16: the guest leaves; October's 16 nights paid past the new end are banked.
     await leaveEarly(r, '2026-10-16', '2026-10-16')
@@ -517,8 +530,8 @@ describe('two shortenings of one stay each come off their own month', () => {
       { paymentId: novRow.id, day: '2026-11-01', amount: -651 },
     ])
     // The rent card: October's two rent rows less A, November less B.
-    expect((await rentCard(r, 'billed', '2026-10')).billed).toEqual({ amount: 930, collected: 930, clearing: 0, stillOwed: 0 })
-    expect((await rentCard(r, 'billed', '2026-11')).billed).toEqual({ amount: 279, collected: 279, clearing: 0, stillOwed: 0 })
+    expect((await rentCard(r, 'billed', '2026-10')).billed).toEqual({ amount: 930, collected: 930, clearing: 0, stillOwed: 0, other: 0 })
+    expect((await rentCard(r, 'billed', '2026-11')).billed).toEqual({ amount: 279, collected: 279, clearing: 0, stillOwed: 0, other: 0 })
 
     // The totals are what they were: Money billed's months add up to the same
     // $1,259 (the $1,081 of credit not used yet is paid ahead), and Money
@@ -569,7 +582,10 @@ async function bookingLease(o: { start: string; end: string; total: number }): P
 
 const leaseCredits = async (r: R) => (await db.query<{ amount: number; anchor: string | null; voided: boolean }>(
   `SELECT amount_original::float AS amount, source_payment_id AS anchor, voided_at IS NOT NULL AS voided
-     FROM lease_prepaid_credits WHERE lease_id = $1 ORDER BY created_at, id`, [r.leaseId])).rows
+     FROM lease_prepaid_credits WHERE lease_id = $1
+     -- 10/27: see the note on the other credits read — a uuid tiebreak made
+     -- this intermittently order-flip.
+     ORDER BY created_at, amount_original, id`, [r.leaseId])).rows
 
 // Production settle times carry microseconds (settled_at = NOW()); a credit's
 // received_at is copied from its bill's settled_at through a JS Date, which

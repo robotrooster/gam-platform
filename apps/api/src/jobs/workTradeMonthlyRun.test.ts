@@ -171,7 +171,7 @@ async function financedHome(s: { unitId: string; tenantId: string; landlordId: s
  *    rent? Yeah, let's do that."
  *
  * S654 put the installment on the rent bill so every surface could see it. The
- * cost was that it could not be paid on its own — and Lisa Scheeler, on work
+ * cost was that it could not be paid on its own — and Calla Fitzhugh, on work
  * trade, gets no rent bill at all for it to ride. It is its own bill now.
  */
 /**
@@ -329,7 +329,7 @@ describe('the home payment is its own bill, never the rent invoice', () => {
   })
 
   it('a work-trade resident buying their home still owes the home payment', async () => {
-    // Lisa Scheeler's case. The trade covers what it can of living there; the
+    // Calla Fitzhugh's case. The trade covers what it can of living there; the
     // home is not a cost of living there, and hours worked do not buy a
     // trailer — so the home payment is owed in full, on a bill of its own.
     const s = await stack({ waterBill: 40 })

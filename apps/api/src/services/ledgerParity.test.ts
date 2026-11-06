@@ -107,15 +107,39 @@ describe('the ledger against the money records', () => {
   // 10/12 (Nic, ledger P8 integration): the parity shadow on a copy of
   // production found three differences every company had and nothing named,
   // so no company could switch on its own. Each is now named and expected.
-  it('a bill on hold for work trade: charged on its due day on the books, left out by the records — named, expected', async () => {
+  // 11/4 — THIS TEST USED TO ASSERT THE DIFFERENCE, AND NOW ASSERTS ITS ABSENCE.
+  //
+  // It was written 10/12 to pin a real, named difference: the books charged a
+  // bill held for work trade on its due day, the money records left it out
+  // until the work-trade month settled, and a reason explained the gap.
+  //
+  // Nic's 11/3 directive — "it should never show as November's money in the
+  // first place" — took that money out of every month figure, so
+  // ledgerReports' NOT_WORK_TRADE_HELD now leaves the held bill out of the
+  // books' Charged too. Both sides read $0 and there is nothing left to
+  // explain, so the reason was retired with it.
+  //
+  // KEEPING THE OLD EXPECTATION WOULD HAVE BEEN THE DANGEROUS OUTCOME, not a
+  // red test: `explained` is subtracted from `difference` to get `unexplained`,
+  // so a retired difference with a live reason drives unexplained to -$460,
+  // parity fails, and every report for a real company silently reverts off the
+  // books onto the money records. The assertion below is what proves that
+  // cannot happen — it fails if either half is ever reintroduced alone.
+  it('a bill on hold for work trade is not that month\'s money on EITHER side (11/3 directive) — no difference, nothing to explain', async () => {
     const co = await tenantCo()
     const held = await bill(co, { amount: 460, due: '2026-10-01' })
     await db.query(`UPDATE payments SET work_trade_suspended_at = '2026-10-01T16:00:00Z' WHERE id = $1`, [held])
     await drain()
     const m = await parityForMonth(co.landlordId, '2026-10-01', '2026-10-12')
     const charged = m.measures.find(x => x.key === 'charged')!
-    expect([charged.records, charged.ledger, charged.difference, charged.explained]).toEqual([0, 460, 460, 460])
-    expect(charged.reasons.map(r => r.reason)).toEqual([expect.stringMatching(/on hold for work trade/)])
+    expect([charged.records, charged.ledger, charged.difference, charged.explained]).toEqual([0, 0, 0, 0])
+    expect(charged.reasons.map(r => r.reason)).not.toContainEqual(expect.stringMatching(/on hold for work trade/))
+    // `unexplained` is what parity actually gates on, and for a measure it is
+    // difference - explained (ledgerParity: a measure counts as unexplained
+    // when that is non-zero). Asserted as the arithmetic rather than a field,
+    // because the field lives on the RESULT and is a count of failing
+    // measures, not an amount.
+    expect(Math.round((charged.difference - charged.explained) * 100) / 100).toBe(0)
   })
 
   it('work-trade hours booked as full rent plus a labor cost (L12): the full rent is charged on the books — named, expected', async () => {
@@ -150,6 +174,100 @@ describe('the ledger against the money records', () => {
     // Money received is the same day on both sides.
     const rec = (await parityForMonth(co.landlordId, '2026-10-01', '2026-10-12')).measures.find(x => x.key === 'received')!
     expect([rec.records, rec.ledger]).toEqual([300, 300])
+  })
+
+  /**
+   * 11/2 — THE LINK NOBODY PAID.
+   *
+   * The test above covers a link that was SENT in one month and PAID in the
+   * next, and it passed while Mountain View's October reported $554.05 of
+   * difference that did not exist. Two of that company's reservation links
+   * ($24.50 and $10.45, sent 10/24) are simply still open: the money records
+   * bill a link the day it goes out and carry it as still owed, the books have
+   * nothing until money arrives — correctly — and no reason named the gap.
+   *
+   * The dollar is read off the records reader's own events rather than
+   * re-queried, because the records side carries real conditions (one link per
+   * reservation, never one past its expiry, nothing for a link that is only a
+   * background check) and a second hand-written copy of them is what let this
+   * out in the first place.
+   */
+  it('a one-time pay link nobody has paid: the records bill it, the books have nothing — named', async () => {
+    const co = await tenantCo()
+    await db.query(
+      `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items, subtotal, total, customer_email, status, created_at)
+       VALUES (gen_random_uuid()::text, $1, $2, $3, 'one_time', 'Site deposit', '[]'::jsonb, 24.50, 24.50, 'guest@t.dev', 'open', '2026-10-24T17:04:00Z')`,
+      [co.landlordId, co.propertyId, co.ownerUserId])
+    await drain()
+    const oct = (await parityForMonth(co.landlordId, '2026-10-01', '2026-10-31')).measures.find(x => x.key === 'charged')!
+    // Records bill it; the books have nothing; the whole difference is named,
+    // so the month leaves nothing unexplained and raises no warning.
+    expect([oct.records, oct.ledger, oct.difference, oct.explained]).toEqual([24.5, 0, -24.5, -24.5])
+    expect(oct.reasons.map(r => r.reason)).toEqual([expect.stringMatching(/one-time pay link/)])
+
+    const r = await checkCompanyParity(co.landlordId, '2026-10-31')
+    expect(r.unexplained).toBe(0)
+    const n = await notices()
+    expect(n).toHaveLength(1)
+    expect(n[0].severity).toBe('info')
+  })
+
+  /**
+   * 11/2 (Nic: "leave it in September") — CASH IN ONE MONTH, THE BILL IT PAID IN
+   * ANOTHER.
+   *
+   * MH 29 at Country Acres paid $500 toward September: $100 early in the month
+   * and $400 that reached the bank on 10/05. September is where that income
+   * belongs — dating it to arrival would put pre-GAM rent into October and
+   * charge GAM's fee on it — so the bill is settled 09/01 while the books hold
+   * the cash on 10/05. Nothing named it, so $400 read as unexplained and kept
+   * that company's books from going live.
+   */
+  it("money that paid an older month's bill: cash on the books the day it came, records in the month of the bill — named both ways", async () => {
+    const co = await tenantCo()
+    const sep = await bill(co, { type: 'carried_balance', amount: 500, due: '2026-09-01' })
+    // $100 of it arrived in September, like his did...
+    await receipt(co, {
+      method: 'bank_deposit', settledAt: '2026-09-03T12:00:00Z',
+      apps: [{ paymentId: sep, amount: 100 }], settleRows: false,
+    })
+    // ...and $400 reached the bank on 10/05. settleRows:false, then settle the
+    // bill in September by hand — the exact shape a carried balance takes when
+    // it is settled on the day it belongs to rather than the day the money
+    // turned up.
+    await receipt(co, {
+      method: 'bank_deposit', settledAt: '2026-10-05T12:00:00Z',
+      apps: [{ paymentId: sep, amount: 400 }], settleRows: false,
+    })
+    await db.query(
+      `UPDATE payments SET status = 'settled', settled_at = $2, manual_method = 'bank_deposit' WHERE id = $1`,
+      [sep, '2026-09-01T12:00:00Z'])
+    await drain()
+
+    const oct = (await parityForMonth(co.landlordId, '2026-10-01', '2026-10-31')).measures.find(x => x.key === 'received')!
+    expect([oct.difference, oct.explained]).toEqual([400, 400])
+    expect(oct.reasons.map(r => r.reason)).toEqual([expect.stringMatching(/older month's bill/)])
+
+    // The same two dates read the other way round from September's side.
+    const sepM = (await parityForMonth(co.landlordId, '2026-09-01', '2026-09-30')).measures.find(x => x.key === 'received')!
+    expect([sepM.difference, sepM.explained]).toEqual([-400, -400])
+  })
+
+  it('an expired open link is billed by neither side, so there is nothing to name', async () => {
+    // The records skip a link past its expiry. A reason that did not would
+    // explain a dollar nobody billed and push the month negative.
+    const co = await tenantCo()
+    await db.query(
+      `INSERT INTO pos_pay_links (token, landlord_id, property_id, created_by, kind, label, items, subtotal, total, customer_email, status, created_at, expires_at)
+       VALUES (gen_random_uuid()::text, $1, $2, $3, 'one_time', 'Site deposit', '[]'::jsonb, 24.50, 24.50, 'guest@t.dev', 'open', '2026-10-24T17:04:00Z', '2026-10-25T17:04:00Z')`,
+      [co.landlordId, co.propertyId, co.ownerUserId])
+    await drain()
+    const oct = (await parityForMonth(co.landlordId, '2026-10-01', '2026-10-31')).measures.find(x => x.key === 'charged')!
+    // Neither side billed it, AND nothing was named: a reason that explained a
+    // dollar nobody billed would leave `explained` non-zero against a zero
+    // difference, which is a phantom in the other direction.
+    expect([oct.records, oct.ledger, oct.difference, oct.explained]).toEqual([0, 0, 0, 0])
+    expect(oct.reasons).toEqual([])
   })
 
   it('parityMonths: last month whole and this month to date (and across a new year)', () => {

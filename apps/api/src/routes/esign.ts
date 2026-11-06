@@ -248,7 +248,30 @@ async function residentsTiedHere(ids: string[], own: string[], q: RowsQuery = po
         AND i.cancelled_at IS NULL
      UNION
      SELECT d.tenant_user_id FROM pending_lease_drafts d
-      WHERE d.tenant_user_id = ANY($1::uuid[]) AND d.landlord_id = ANY($2::uuid[])`,
+      WHERE d.tenant_user_id = ANY($1::uuid[]) AND d.landlord_id = ANY($2::uuid[])
+     UNION
+     -- 10/28 (Nic): A SCREENING WITH THIS COMPANY IS A TIE TO IT.
+     --
+     -- Blue's case, and the reason every door refused it: a person who applied
+     -- to his park, completed his background check and was approved has no
+     -- lease, no invite and no draft — so this rule called them a stranger and
+     -- Send Document answered "Invite them first", while the invite door
+     -- refused the occupied space. There was no door left, and the thing
+     -- standing in the way was a relationship the applicant had already made.
+     --
+     -- WHY THIS DOES NOT REOPEN WHAT S654 CLOSED. That rule exists because
+     -- landlord B looked up landlord A's invitee and put them in B's primary
+     -- seat to capture A's password link. A merely REQUESTED check cannot be
+     -- used that way and is deliberately not counted here: B can type any
+     -- address into a screening link, so a row B created alone would be a tie B
+     -- manufactured. An APPROVED check cannot be manufactured — the applicant
+     -- submitted their own identity and consent to this company to reach that
+     -- status. Pool checks stay out too (landlord_id IS NULL): consenting to
+     -- share a check with the marketplace is not joining a company.
+     SELECT t.user_id FROM tenants t
+       JOIN background_checks bc ON bc.user_id = t.user_id
+      WHERE t.user_id = ANY($1::uuid[]) AND bc.landlord_id = ANY($2::uuid[])
+        AND bc.status IN ('approved', 'completed', 'clear')`,
     [ids, companies])
   return new Set(rows.map((r: any) => r.user_id))
 }
@@ -639,7 +662,7 @@ async function dueDayRuleForUnit(
  * Blu signed Country Acres MH 06 with an end date of 8/1/2026 and MH 17 with
  * 2/26/2026, on 9/22/2026. The landlord's signature issued both leases, that
  * night's lease-end job found them past their end, expired them, removed
- * Curtis Clabough and Cameron Valdez from their homes and marked both sites
+ * Sage Stillwell and Mabel Mawdsley from their homes and marked both sites
  * vacant. Nothing said a word until October's invoices went missing.
  *
  * An end date on or before today is refused where the dates are read — at
@@ -680,6 +703,13 @@ export async function createDocumentRecord(client: any, opts: {
   // only from the drafting screen, after the landlord has been shown whose
   // tenancy it is and confirmed; never by a booking or application draft.
   replacesLeaseId?: string | null,
+  /**
+   * 10/28 (Nic): the home-sale contract this document hands over. The new buyer
+   * signing it is what makes them the buyer — "why would a person make the
+   * payments if they're not on the contract?" Mirrors replacesLeaseId: the
+   * space and the home are two signatures, each on its own paper.
+   */
+  supersedesHomeSaleContractId?: string | null,
   // S604 (Nic): the landlord ALREADY holds this tenant's deposit — migration
   // onboarding. The lease still states the deposit; it just isn't billed.
   depositAlreadyHeld?: boolean,
@@ -727,8 +757,9 @@ export async function createDocumentRecord(client: any, opts: {
       title, base_pdf_url,
       document_type, target_lease_tenant_id, promote_lease_tenant_id,
       renews_lease_id, replaces_lease_id, deposit_already_held,
-      package_group_id, package_id, package_sort_order, template_version
-    ) VALUES ($1,$2,$3,$4, $5,$6, $7,$8,$9, $10,$11,$12, $13,$14,$15,$16)
+      package_group_id, package_id, package_sort_order, template_version,
+      supersedes_home_sale_contract_id
+    ) VALUES ($1,$2,$3,$4, $5,$6, $7,$8,$9, $10,$11,$12, $13,$14,$15,$16, $17)
     RETURNING *`,
     [
       opts.templateId, opts.landlordId, opts.unitId, opts.leaseId,
@@ -741,7 +772,11 @@ export async function createDocumentRecord(client: any, opts: {
       opts.replacesLeaseId || null,
       opts.depositAlreadyHeld === true,
       opts.packageGroupId ?? null, opts.packageId ?? null,
-      opts.packageSortOrder ?? null, opts.templateVersion ?? null
+      opts.packageSortOrder ?? null, opts.templateVersion ?? null,
+      // The purchase this paper takes over. NULL is an ordinary sale, which
+      // creates its own contract; set, it hands an existing one over and the
+      // first contract's terms and history are never touched.
+      opts.supersedesHomeSaleContractId || null
     ]).then((r: any) => r.rows[0])
 
   // S605 (Nic): "if a previous run drafted the lease, then it should know that
@@ -794,8 +829,8 @@ export async function createDocumentRecord(client: any, opts: {
     const pv: Record<string, string> = (opts as any).prefillValues = (opts as any).prefillValues || {}
     for (const k of Object.keys(pv)) if (k.startsWith('late_fee_')) delete pv[k]
     for (const tag of ['late_fee_grace_days', 'late_fee_initial_flat', 'late_fee_initial_percent',
-      'late_fee_accrual_flat_daily', 'late_fee_accrual_flat_weekly', 'late_fee_accrual_flat_monthly',
-      'late_fee_accrual_percent_daily', 'late_fee_accrual_percent_weekly', 'late_fee_accrual_percent_monthly',
+      'late_fee_accrual_flat_daily', 'late_fee_accrual_flat_weekly',
+      'late_fee_accrual_percent_daily', 'late_fee_accrual_percent_weekly',
       'late_fee_cap_flat', 'late_fee_cap_percent']) {
       pv[tag] = 'N/A'
     }
@@ -1002,7 +1037,7 @@ export async function createDocumentRecord(client: any, opts: {
         //
         // S637: the DEPOSIT is seeded only for a genuinely new tenancy.
         //
-        // Seeding it from the unit alongside the rent (S636) charged Cameron
+        // Seeding it from the unit alongside the rent (S636) charged Mabel
         // Gaefcke $350 on a lease that papers a tenancy already in place — the
         // unit carries a standing deposit figure for NEW residents, and every
         // Oak Park space carries $350, so every existing resident signing an
@@ -1027,7 +1062,7 @@ export async function createDocumentRecord(client: any, opts: {
         // The returning-resident invite (the landlord's attestation that
         // skipped the background check) is recorded on the resident's intent
         // at this property — not on the unit — so it is looked up through the
-        // residents on THIS document. Donald Hamp's lease for Mountain View
+        // residents on THIS document. Wren Westbrook's lease for Mountain View
         // RV 47 drafted with the park's $200 for a guest who comes every year.
         // Still only a default: the landlord can type a deposit in.
         const residentIds = (opts.signers ?? []).filter((sg: any) => sg.role !== 'landlord' && sg.role !== 'witness').map((sg: any) => sg.userId).filter(Boolean)
@@ -2184,14 +2219,46 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   // generateMoveInInvoice already honors for a deposit carried between GAM
   // leases. Reusing that guard rather than adding a second suppression path
   // keeps one code path responsible for "never bill a deposit twice".
-  if (doc.deposit_already_held) {
+  //
+  // 10/29: the custody row is created EITHER WAY. Read the deposit once, here,
+  // so the already-held branch and the ordinary one cannot disagree about the
+  // amount.
+  {
     const depFee = await client.query(
       `SELECT amount::text AS amount FROM lease_fees
         WHERE lease_id = $1 AND fee_type = 'security_deposit' AND due_timing = 'move_in'
         LIMIT 1`,
       [lease.id])
     const heldAmount = Number((depFee.rows[0] as any)?.amount ?? 0)
-    if (heldAmount > 0 && primarySigner.tenant_id) {
+
+    // ── 10/29: AN E-SIGNED LEASE GOT NO CUSTODY ROW AT ALL ────────────────
+    //
+    // S515 made syncSecurityDepositRow the one production creation point for
+    // `security_deposits`, and every writer of a deposit amount calls it —
+    // the lease editor, the landlord route, the lease parser. The SIGNING
+    // path never did: it writes its lease_fees deposit row itself through
+    // FEE_ROW_SPECS (S196) and so never went through the sync.
+    //
+    // Found live on MH 28 at Country Acres - Mattoon, signed 10/28 with a $450
+    // deposit due 11/01 and `security_deposits` empty platform-wide — the
+    // first real deposit GAM has ever billed, and nothing would have recorded
+    // holding it. reconcileSettledDepositPayment returns null when there is no
+    // row, so the settle would have done nothing: no holder, no interest
+    // accrual, nothing on Deposits held, and no FlexDeposit offer at signing
+    // (flexDepositSignPrompt needs a pending/partial row to have anything to
+    // prompt about). Move-out would still have paid out — liveDepositPool
+    // falls back to summing settled deposit payments — which is exactly why
+    // this stayed invisible.
+    //
+    // Runs on the signing transaction's client, before the move-in invoice is
+    // built below, so the settle has a row waiting for it. Idempotent: the
+    // sync upserts and leaves an enrolled or funded row alone.
+    if (!doc.deposit_already_held) {
+      const { syncSecurityDepositRow } = await import('../services/leaseFeesSync')
+      await syncSecurityDepositRow(lease.id, heldAmount, client)
+    }
+
+    if (doc.deposit_already_held && heldAmount > 0 && primarySigner.tenant_id) {
       // held_by mirrors the S604 custody gate: GAM only takes custody where the
       // state permits its vehicle. A migrated deposit the landlord physically
       // holds stays with the landlord regardless, so this is landlord-held.
@@ -3646,7 +3713,9 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
     const { templateId, unitId, title, signers, basePdfUrl, prefillValues, depositAlreadyHeld,
             // 10/24: the tenancy this lease replaces, confirmed on the drafting
             // screen. Checked against the space below — never taken on trust.
-            replacesLeaseId } = req.body
+            replacesLeaseId,
+            // 10/28: the installment purchase this paper takes over.
+            supersedesHomeSaleContractId } = req.body
     if (!title || !signers?.length) throw new AppError(400, 'title and signers required')
 
     // Validate signer shape
@@ -4024,7 +4093,7 @@ esignRouter.post('/standalone-documents', requireAuth, requirePerm('esign.templa
 // ─────────────────────────────────────────────────────────────
 //
 // Nic, 10/20, after Blu could not get his work-trade form signed: "can he just
-// go into Curtis's file, add a template that way, and have it signed to him?
+// go into Sage's file, add a template that way, and have it signed to him?
 // Like, there's some sort of broken flow there that we need to get fixed."
 //
 // That is this door. Blu opens the resident, picks the form, and presses send.
@@ -4163,7 +4232,7 @@ esignRouter.get('/resident-forms/:tenantId', requireAuth, requirePerm('esign.sen
   } catch (e) { next(e) }
 })
 
-/** "Mattoon Work Trade — Curtis Bell (Lot 1)", which is what the list shows. */
+/** "Mattoon Work Trade — Sage Bell (Lot 1)", which is what the list shows. */
 function residentDocumentTitle(templateName: string, ctx: { residentName: string; unitLabel: string | null }): string {
   const where = ctx.unitLabel ? ` (${ctx.unitLabel})` : ''
   return `${templateName} — ${ctx.residentName}${where}`.slice(0, 160)
@@ -4241,6 +4310,36 @@ esignRouter.post('/resident-documents', requireAuth, requirePerm('esign.send'), 
       promoteLeaseTenantId: null,
       signers,
     })
+
+    // ── 10/27 (Nic): A WORK-TRADE PAPER RAISED HERE BELONGS TO ITS AGREEMENT ─
+    //
+    // The two work-trade doors that go through the work-trade flow already set
+    // this (the addendum draft and the renewal auto-draft). This door — "send
+    // a document" from the resident's own page — did not, so a work-trade
+    // addendum raised the way a landlord actually reaches for one ended up
+    // belonging to nobody: `lease_documents.work_trade_agreement_id` stayed
+    // NULL and the agreement's own page never showed the paper that made it.
+    //
+    // Matched on the template's PURPOSE, which is the only thing that says
+    // what this paper is, and on the resident's own live agreement. Silent when
+    // there is no agreement to point at: a landlord may well raise the form
+    // before the arrangement exists, and that is not an error.
+    if (tmpl.purpose === 'work_trade_addendum') {
+      await client.query(
+        // A PAUSED agreement still owns its paper — the Nielsens' is paused
+        // every winter they are away and the addendum is still theirs — so an
+        // active one is preferred and a paused one still counts. An ended one
+        // never does: that paper would be history attached to a live form.
+        `UPDATE lease_documents
+            SET work_trade_agreement_id = (
+              SELECT a.id FROM work_trade_agreements a
+               WHERE a.tenant_id = $2 AND a.status IN ('active', 'paused')
+               ORDER BY (a.status = 'active') DESC, a.created_at DESC
+               LIMIT 1)
+          WHERE id = $1`,
+        [doc.id, body.tenantId])
+    }
+
     await client.query('COMMIT')
 
     res.status(201).json({ success: true, data: {
@@ -6550,6 +6649,34 @@ async function authOrSignerToken(req: any, res: any, next: any) {
       }
       signer = replacement
     }
+    // 10/30 (Nic) — A FULLY EXECUTED DOCUMENT LOCKS ITS SIGNING LINK.
+    //
+    // His words: "as soon as everybody's signed the document and it's fully
+    // executed, it should lock, because signing was just bypassed for ease of
+    // onboarding. But to actually view anything, it should be immediately, you
+    // have to get signed back in."
+    //
+    // What he saw on his phone that prompted this: he opened
+    // landlord.goldassetmanagement.com, was NOT signed in, and a completed
+    // lease for a resident — name, space, terms — rendered above the sign-in
+    // screen. Nothing leaked that the link did not already carry: the token in
+    // that URL was the landlord signer slot on that document, and this gate
+    // deliberately admits a token so an emailed link opens without a session
+    // (S629). It checked for 'voided' and never for 'completed', so a link
+    // stayed live forever after there was anything left to sign.
+    //
+    // The two completed-document emails already attach the signed PDF and send
+    // the recipient to their portal home rather than to a token URL, so this
+    // takes nothing away from them — it closes the standing door.
+    if (signer.doc_status === 'completed') {
+      return res.status(410).json({
+        success: false,
+        code: 'document_completed',
+        error: 'This document is fully signed, so the signing link is closed. '
+             + 'Sign in to your GAM account to read your copy — it is also attached '
+             + 'to the email we sent when the last signature landed.',
+      })
+    }
     req.params.documentId = signer.document_id
     req.user = { userId: signer.user_id, role: 'signer', email: signer.email, profileId: null }
     req.signerToken = supplied
@@ -6717,26 +6844,22 @@ esignRouter.get('/sign/:documentId', authOrSignerToken, async (req, res, next) =
       // S654: the rate year in effect where the PROPERTY is — the UTC year
       // turned over at 5 pm Phoenix on December 31.
       const currentYear = Number(todayIn(doc.property_timezone).slice(0, 4))
-      const statutory = await queryOne<{
-        annual_rate_pct:  string
-        statute_citation: string
-      }>(
-        `SELECT annual_rate_pct::text AS annual_rate_pct, statute_citation
-           FROM state_deposit_interest_rates
-          WHERE state_code = $1 AND effective_year = $2
-          LIMIT 1`,
-        [doc.property_state, currentYear],
-      )
-      if (statutory) {
-        deposit_interest_context = {
-          source:           'statutory',
-          state_code:       doc.property_state,
-          effective_year:   currentYear,
-          annual_rate_pct:  statutory.annual_rate_pct,
-          statute_citation: statutory.statute_citation,
-        }
-      } else if (doc.property_landlord_id) {
-        // Fall through to landlord override.
+      // 10/30 (Nic): the statutory branch is GONE. It put "State law (A.R.S.
+      // § 33-1431(B)) requires 5.00% annual interest" on the screen of a
+      // resident in the act of signing — the state telling them their landlord
+      // owes them money, which is the confrontation we do not start. Nothing
+      // about state law reaches a resident; the landlord still gets the rate
+      // and the accrual still runs.
+      //
+      // Removing it also kills a real defect rather than papering over it: the
+      // query here matched on STATE ONLY, with no unit type and no ORDER BY, so
+      // an Arizona apartment signer was quoted the MOBILE-HOME statute at 5.00%
+      // when their own rate is zero. That is the same bug S604 fixed on the
+      // payments path (see tenants.ts) and this path never got the fix. There
+      // is now nothing here to get wrong.
+      //
+      // A rate the LANDLORD chose is their own term and still shows.
+      if (doc.property_landlord_id) {
         const override = await queryOne<{
           annual_rate_pct: string
           source_notes:    string | null
@@ -7183,7 +7306,9 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     }
     // S652 (Nic): the landlord TYPES the sale terms on the installment contract
     // and they become the record. Read them now, while he can still fix a box,
-    // rather than after his signature is on the paper.
+    // rather than after his signature is on the paper. A takeover types terms
+    // like any other sale — that is the point of it: the landlord may carry the
+    // old payment over or write a new one.
     if (signer.role === 'landlord' && isFinancedSaleDoc) {
       const { saleTermsFromFields, resolveTypedSaleTerms } = await import('../services/homeSale')
       resolveTypedSaleTerms(saleTermsFromFields(
@@ -7195,7 +7320,13 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
       // now the first is already billing and cannot simply give way. Signed
       // anyway, the new terms would never record and the old ones would go on
       // billing the buyer every month. Refused here, before anything is signed.
-      const billing = (await client.query(
+      // 10/28: EXCEPT when this paper TAKES THAT CONTRACT OVER. A handover is
+      // the one case where a second installment document on a billing home is
+      // right: it creates no contract, changes no terms, and its whole purpose
+      // is the purchase already billing. Without this the takeover packet could
+      // not be signed at all, and the resident who walked away would keep being
+      // billed for the trailer.
+      const billing = doc.supersedes_home_sale_contract_id ? null : (await client.query(
         `SELECT 1 FROM home_sale_contracts
           WHERE unit_id = $1 AND status = 'active' AND purchase_document_id IS DISTINCT FROM $2 LIMIT 1`,
         [doc.unit_id, doc.id])).rows[0]
@@ -7216,7 +7347,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     // The page gives the landlord nothing to type into that box. A page is one
     // door, and this value lands through here — so a submit carrying a
     // proration that disagrees with the start date is refused, whatever drew
-    // the form that sent it. Kay Howard (RV 21) and Clint Cook (RV 18) both
+    // the form that sent it. Verity Winthrop (RV 21) and Quill Quarrier (RV 18) both
     // signed $323.00 — the 17 days from the day the forms were filled out, not
     // from the day either of them arrived — and nothing said a word.
     //
@@ -7390,7 +7521,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
     // on there and verify an account later on." The signing link went to their
     // inbox and they opened it and signed a lease with it — a stronger proof of
     // the address than a verification click — so the account stops being one
-    // that login will refuse. Ellen Gregory (Oak Park MH 02) hit exactly that
+    // that login will refuse. Zeph Ashcombe (Oak Park MH 02) hit exactly that
     // wall with a password she had just reset.
     if (signer.user_id) {
       await client.query(
@@ -7469,7 +7600,18 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
             logger.error({ err, documentId: doc.id }, '[HomeSale] own-signature check failed — billing waits for the buyer')
             return [{ userId: '', name: '' }]
           })
-        if (buyerWaits.length > 0) {
+        // 10/28 (Nic): "it just supersedes the old one AFTER SIGNATURE."
+        //
+        // A takeover's contract is written on the landlord's signature like any
+        // other, but it must not START until the new resident signs — the home
+        // it is for is already being billed under the contract it replaces, and
+        // activating now would bill the same trailer twice, to two people, on
+        // the same month. It activates at completion, in the same breath as the
+        // old one being retired.
+        if (doc.supersedes_home_sale_contract_id) {
+          logger.info({ documentId: doc.id, supersedes: doc.supersedes_home_sale_contract_id },
+            '[HomeSale] takeover: the new contract waits for the buyer, and retires the old one when it starts')
+        } else if (buyerWaits.length > 0) {
           logger.info({ documentId: doc.id }, '[HomeSale] billing waits for the buyer\'s own signature (another company\'s account)')
         } else {
           try {
@@ -7777,6 +7919,32 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
         if (claimedNoLease.length === 0) {
           return res.json({ success: true, data: { completed: true, deduped: true } })
         }
+        // 10/28 (Nic): the trailer goes with the space, on its own signature.
+        // Post-claim and best-effort — a signed paper is never undone because
+        // the handover could not be written; the landlord is told instead, and
+        // until it is written the person on the contract keeps being billed.
+        if (doc.supersedes_home_sale_contract_id) {
+          try {
+            const { startTakeoverContractAndRetireTheOld } = await import('../services/homeSale')
+            const out = await startTakeoverContractAndRetireTheOld(doc.id)
+            logger.info({ documentId: doc.id, ...out }, '[HomeSale] takeover: new contract started, old one retired')
+            if (!out.started) {
+              await createAdminNotification({
+                severity: 'critical', category: 'home_sale_takeover_not_started',
+                title: `Trailer takeover signed but the new contract did not start — document ${doc.id}`,
+                body: out.reason ?? 'unknown',
+                context: { document_id: doc.id, new_contract_id: out.newContractId, old_contract_id: out.oldContractId },
+              }).catch(() => {})
+            }
+          } catch (e: any) {
+            logger.error({ err: e, documentId: doc.id }, '[HomeSale] takeover failed')
+            await createAdminNotification({
+              severity: 'critical', category: 'home_sale_takeover_failed',
+              title: `Trailer takeover signed but it did not go through — document ${doc.id}`,
+              body: e?.message ?? String(e), context: { document_id: doc.id },
+            }).catch(() => {})
+          }
+        }
       }
 
       // S629 (Nic): "a pending unit should have the amount of water show as
@@ -8046,7 +8214,7 @@ esignRouter.post('/sign/:documentId', authOrSignerToken, async (req, res, next) 
 // don't complete the signature if they're choosing not to."
 //
 // This used to be the S234 decline path: one signer's refusal voided the whole
-// document, which is how Jeff Bowman's "Decline" on MH 30's lead-paint sales
+// document, which is how Linnea Merriweather's "Decline" on MH 30's lead-paint sales
 // disclosure killed a document Blu and Kim had already signed. There is no
 // decline any more, on any sign page, for anyone. The route stays only so an
 // old client gets a sentence instead of a 404.
@@ -8201,9 +8369,24 @@ async function authOrSignerTokenQuery(req: any, res: any, next: any) {
   const t = String(req.query?.t || '')
   if (!SIGNER_TOKEN_RE.test(t)) return requireAuth(req, res, next)
   try {
+    // 10/30: the document's status comes back with the signer for the same
+    // reason it does in authOrSignerToken above — "to actually view anything,
+    // it should be immediately, you have to get signed back in." Locking the
+    // signing page and leaving the PDF behind it readable by the same token
+    // would have been a lock on the door of a room with no wall.
     const signer = await queryOne<any>(
-      `SELECT user_id, email FROM lease_document_signers WHERE token = $1`, [t])
+      `SELECT s.user_id, s.email, d.status AS doc_status
+         FROM lease_document_signers s
+         JOIN lease_documents d ON d.id = s.document_id
+        WHERE s.token = $1`, [t])
     if (!signer) return res.status(404).json({ success: false, error: 'That signing link is not valid.' })
+    if (signer.doc_status === 'completed') {
+      return res.status(410).json({
+        success: false,
+        code: 'document_completed',
+        error: 'This document is fully signed. Sign in to your GAM account to read your copy.',
+      })
+    }
     req.user = { userId: signer.user_id, role: 'signer', email: signer.email, profileId: null }
     return next()
   } catch (e) { return next(e) }

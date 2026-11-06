@@ -70,7 +70,7 @@ async function stay(client: PoolClient, p: Park, o: {
         guest_name, total_amount, balance_paid_at)
      VALUES ($1, $2, 'month_to_month', 'checked_out', $3::date, $4::date, $5::date, $6, 589, now())
      RETURNING id`,
-    [p.unitId, p.landlordId, checkIn, leftOn, bookedThrough, o.guest ?? 'Victor Cardoza'])).rows[0].id
+    [p.unitId, p.landlordId, checkIn, leftOn, bookedThrough, o.guest ?? 'Horatio Mapperley'])).rows[0].id
 }
 
 /** The same month-rate stay, on a named site. */
@@ -253,7 +253,7 @@ describe('a wash: left early, kept the money, eat the power', () => {
     expect(pairs[0].evenedOutBy).toBe(-30.27)
     expect(pairs[0].closingReadsIn).toBe(true)
     expect(pairs[0].heldStubs).toBe(0)
-    expect(pairs[0].who).toBe('Victor Cardoza')
+    expect(pairs[0].who).toBe('Horatio Mapperley')
   })
 
   it('a billing re-run writes the same absorbed row, never a second one', async () => {
@@ -353,7 +353,7 @@ describe('a wash: left early, kept the money, eat the power', () => {
 
   it('a property that never gives money back washes without anyone being asked', async () => {
     const noRefunds = await park(client, { refunds: false })
-    const bookingId = await stay(client, noRefunds, { guest: 'Nemesio Rivera' })
+    const bookingId = await stay(client, noRefunds, { guest: 'Kestrel Norrington' })
     // No check-out decision at all: there was no question to put to the desk.
     const verdict = await washVerdict({ bookingId }, noRefunds.landlordId, client)
     expect(verdict.verdict).toBe('wash')
@@ -770,7 +770,7 @@ describe('the money answer and the closing read, in either order', () => {
     const nbUnit = await seedUnit(client, { propertyId: p.propertyId, landlordId: p.landlordId, unitType: 'rv_spot' })
     const nbMeter = await seedUtilityMeter(client, { propertyId: p.propertyId, utilityType: 'electric', billingMethod: 'submeter' })
     await client.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [nbMeter, nbUnit])
-    const neighborBooking = await stayOnUnit(client, p, nbUnit, 'Nemesio Rivera')
+    const neighborBooking = await stayOnUnit(client, p, nbUnit, 'Kestrel Norrington')
     const neighborLease = await leaseOnStay(client, p, neighborBooking, { unitId: nbUnit })
     const neighborBill = await leaseKeyedBill(client, p, neighborLease, { meterId: nbMeter, unitId: nbUnit })
 
@@ -892,11 +892,11 @@ describe('two departures on one site in one month — the key that matters', () 
     // The old owner-use key was (meter, unit, cycle month): these two would
     // have collided and the park would have been short one departure, silently.
     const first = await stay(client, p, {
-      checkIn: '2026-10-01', leftOn: '2026-10-10', bookedThrough: '2026-10-31', guest: 'Victor Cardoza',
+      checkIn: '2026-10-01', leftOn: '2026-10-10', bookedThrough: '2026-10-31', guest: 'Horatio Mapperley',
     })
     await answer(client, p, first, { choice: 'no_refund', leftOn: '2026-10-10' })
     const second = await stay(client, p, {
-      checkIn: '2026-10-12', leftOn: '2026-10-25', bookedThrough: '2026-11-12', guest: 'Nemesio Rivera',
+      checkIn: '2026-10-12', leftOn: '2026-10-25', bookedThrough: '2026-11-12', guest: 'Kestrel Norrington',
     })
     await answer(client, p, second, { choice: 'no_refund', leftOn: '2026-10-25' })
 

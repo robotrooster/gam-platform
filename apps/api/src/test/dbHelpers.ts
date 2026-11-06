@@ -55,6 +55,23 @@ const CLEANUP_KEEPS: readonly string[] = [
   // 10/27: what moving a FlexDeposit to a new unit costs. A price card like
   // the grids — FK-free, seeded by its own migration — so the wipe keeps it.
   'flexdeposit_move_fee_schedule',
+  // 10/31: GAM's cut of a finished contractor-marketplace job. Same kind of
+  // thing — FK-free, seeded by its own migration — and the marketplace
+  // deliberately REFUSES to settle a job when the card is missing, so a file
+  // that borrowed the table would hand every later file that refusal instead
+  // of a rate. Kept, and restored below.
+  'marketplace_cut_rates',
+  // 10/31: what GAM charges a landlord to spread a job over 2 or 4 payments.
+  // Same kind of card, and services/jobFinancing REFUSES to price a plan when
+  // the row is missing, so a file that borrowed the table would hand every
+  // later file that refusal instead of a fee. Kept, and restored below.
+  'job_financing_fee_schedule',
+  // 10/31: where a contractor can buy the top spot, how expensive it is to live
+  // there, and what a month costs in that band. The areas are published BEA
+  // figures seeded by their own migration and the bands refuse rather than
+  // default, so a file that emptied either one would hand every later file a
+  // refusal in place of a price. Kept, and restored below.
+  'marketplace_areas', 'marketplace_placement_rates',
   // What the agents and the documents are made of.
   'agent_knowledge_chunks', 'disclosure_library_documents', 'disclosure_library_fields',
   'document_sleeves', 'library_coverage_items', 'platform_announcements', 'sales_calendar_feed',
@@ -383,9 +400,36 @@ export async function seedUnit(
     `INSERT INTO units (property_id, landlord_id, unit_number, rent_amount, unit_type)
      VALUES ($1, $2, $3, $4, $5) RETURNING id`,
     [params.propertyId, params.landlordId,
-     formatUnitNumber(`U-${randomUUID().slice(0, 6)}`), params.rentAmount ?? 1000, unitType]
+     nextFixtureUnitNumber(), params.rentAmount ?? 1000, unitType]
   )
   return res.rows[0].id
+}
+
+/**
+ * 10/28: the seeded unit number is unique BY CONSTRUCTION, not by luck.
+ *
+ * It used to be `U-${randomUUID().slice(0, 6)}` — 24 bits drawn fresh for every
+ * unit — and on 10/28 two units in one property drew the same six characters,
+ * breaking monthlyReportItemized1014 on the deploy gate. First time in 23 full
+ * runs, which is exactly what makes it worth removing rather than re-running:
+ * the collision is reachable on any run, and the run it lands on is random.
+ *
+ * A per-process counter cannot collide, because two units in ONE property are
+ * always seeded by one test file in one process — separate workers seed
+ * separate properties, so they can never meet in this index. The 3-hex tag
+ * keeps numbers distinguishable between files sharing a worker.
+ *
+ * The leading LETTER is deliberate, and it also retires the S613 trap below:
+ * an all-digit suffix canonicalises with a space ('U-123456' → 'U 123456')
+ * instead of a hyphen, which several suites had to write comments around. A
+ * seeded number now always keeps its hyphen.
+ */
+let unitFixtureSeq = 0
+const UNIT_FIXTURE_TAG =
+  'abcdef'[randomUUID().charCodeAt(0) % 6] + randomUUID().slice(0, 3)
+function nextFixtureUnitNumber(): string {
+  const seq = (++unitFixtureSeq).toString(16).padStart(2, '0')
+  return formatUnitNumber(`U-${UNIT_FIXTURE_TAG}${seq}`)
 }
 
 /** S537: explicit per-(property, unit_type) late-fee decision. Defaults to
@@ -819,4 +863,28 @@ export async function seedRentPayment(
      params.stripePaymentIntentId ?? null]
   )
   return res.rows[0].id
+}
+
+/**
+ * 10/29: the S604 deposit-custody rule for a state. `cleanupAllSchema`
+ * truncates `state_deposit_custody_rules`, and every custody reader fails
+ * CLOSED on a missing row — silence means "nobody has checked", never "go
+ * ahead". So a suite that exercises a deposit has to say which state it is in,
+ * the way production does. Defaults to Arizona supported, which is what
+ * `seedProperty` defaults the state to.
+ */
+export async function seedDepositCustodyRule(
+  runner: { query: (sql: string, params?: any[]) => Promise<any> },
+  opts: { state?: string; supported?: boolean } = {},
+): Promise<void> {
+  const state = opts.state ?? 'AZ'
+  const supported = opts.supported !== false
+  await runner.query(
+    `INSERT INTO state_deposit_custody_rules
+       (state_code, custody_status, allows_treasury_bills, statute_citation)
+     VALUES ($1, $2, $3, 'test fixture')
+     ON CONFLICT (state_code) DO UPDATE
+        SET custody_status = EXCLUDED.custody_status,
+            allows_treasury_bills = EXCLUDED.allows_treasury_bills`,
+    [state, supported ? 'supported' : 'blocked', supported])
 }

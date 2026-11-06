@@ -232,7 +232,7 @@ describe('S655 credit_uses: what a use may be', () => {
    * 10/26 (Nic): "let their own overpayment pay a trailer payment." A home
    * payment is the one charge whose eligibility depends on WHICH KIND of credit
    * is being spent — the tenant's own overpayment may, a credit the landlord
-   * issued may not. Kim Bowman's $10.40 of change could not reach the $100 he
+   * issued may not. Xander Allerton's $10.40 of change could not reach the $100 he
    * owed, so the money was stuck on both sides while the net was right.
    */
   it("a home payment takes the tenant's own overpayment, and no other credit", async () => {
@@ -921,13 +921,13 @@ describe('S655 credit_uses: status moves the balance exactly once', () => {
         /only for the deploy backfill/)
 
       await c.query(`SET LOCAL gam.credit_backfill = 'on'`)
-      // Kim Harland: the $450 move-in special already came off her credit and her
+      // Yvette Bexley: the $450 move-in special already came off her credit and her
       // rent already settled. The backfill records it without spending it twice.
-      const kim = await issued(c, f, 450)
-      await c.query(`UPDATE tenant_credits SET amount_remaining = 0 WHERE id = $1`, [kim])
+      const yvette = await issued(c, f, 450)
+      await c.query(`UPDATE tenant_credits SET amount_remaining = 0 WHERE id = $1`, [yvette])
       const rent = await charge(c, f, { amount: 935.45, status: 'settled', manualMethod: 'money_order' })
-      await use(c, { tenantCreditId: kim, paymentId: rent, leaseId: f.leaseId, amount: 450, source: 'backfill', month: '2026-09-01' })
-      expect(await remaining(c, 'tenant_credits', kim)).toBe(0)
+      await use(c, { tenantCreditId: yvette, paymentId: rent, leaseId: f.leaseId, amount: 450, source: 'backfill', month: '2026-09-01' })
+      expect(await remaining(c, 'tenant_credits', yvette)).toBe(0)
       expect(await issuedOn(c, rent)).toBe(450)
       // The switch changes nothing for any other source.
       const other = await issued(c, f, 100)
@@ -1437,7 +1437,7 @@ describe('S655 contract step C0', () => {
       expect(await remaining(c, 'lease_prepaid_credits', money)).toBe(70)
       // Other columns are untouched by the guard: a void leaves the balance alone.
       await c.query(`UPDATE tenant_credits SET status = 'void', voided_at = now() WHERE id = $1`, [credit])
-      // The deploy backfill may restore Russ Fuller's credit before voiding it.
+      // The deploy backfill may restore Tamsin Wrenfield's credit before voiding it.
       await c.query(`SET LOCAL gam.credit_backfill = 'on'`)
       await c.query(`UPDATE tenant_credits SET amount_remaining = 100 WHERE id = $1`, [credit])
       await c.query(`INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining) VALUES ($1,$2,37.60,0)`,

@@ -74,6 +74,34 @@ async function press(label: string) {
 const creditBox = () => [...host.querySelectorAll('label')]
   .find((l) => l.textContent?.startsWith('Use my account credit first'))?.querySelector('input') as HTMLInputElement | undefined
 
+// 10/30 (Nic): "I want it to default on and not be so obnoxiously loud that
+// they all turn it off... It'll be a slider bar. It'll be visible."
+describe('autopay comes on with the first payment method', () => {
+  it('switches itself on for a resident who has never chosen', async () => {
+    server.autopay = [row({ everSet: false })]
+    await render()
+    await new Promise(r => setTimeout(r, 0))
+    expect(server.puts).toEqual([{ url: '/autopay', body: { leaseId: 'L1', enabled: true } }])
+  })
+
+  it('leaves alone a resident who turned it off themselves', async () => {
+    // A row EXISTS, so they decided. Turning their own "off" back on behind
+    // their back is exactly the obnoxious version.
+    server.autopay = [row({ everSet: true, enabled: false })]
+    await render()
+    await new Promise(r => setTimeout(r, 0))
+    expect(server.puts).toEqual([])
+  })
+
+  it('does nothing when there is no chargeable method to use', async () => {
+    server.autopay = [row({ everSet: false })]
+    server.methods = [methods[1]]  // a bank still verifying — cannot be charged
+    await render()
+    await new Promise(r => setTimeout(r, 0))
+    expect(server.puts).toEqual([])
+  })
+})
+
 describe('autopay and account credit', () => {
   it('"Use my account credit first" is off by default, and turning autopay on sends it off', async () => {
     server.autopay = [row()]

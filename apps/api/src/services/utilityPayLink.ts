@@ -30,7 +30,7 @@
  *
  *   RUNG UP BY HAND. The clerk taps a catalog button whose own row says what it
  *     is (pos_items.recovers_utility), with no bill behind it. This is what
- *     really happened: Andres Razo's August and September power at Mountain
+ *     really happened: Cora Castellan's August and September power at Mountain
  *     View, 387 and 390 kWh at $0.21, $163.17, paid in full on a link on
  *     10/06 — and RV 27's submeter has never had a utility_bills row for those
  *     cycles. The money came in; no bill was ever closed by it. It still has to
@@ -491,7 +491,7 @@ function billFromRow(r: any): UtilityBillForLink {
  * through as it lands.
  *
  * A bill with NO charge is untouched by this: nobody has been asked for it any
- * other way, so it is owed, which is the ordinary case and the Andres shape.
+ * other way, so it is owed, which is the ordinary case and the Cora shape.
  */
 type ChargeAnswered = 'in_flight' | 'paid' | 'from_deposit' | 'work_trade'
 
@@ -740,7 +740,7 @@ export async function utilityBillsNotPayable(q: Q, link: any): Promise<{ note: s
 export interface UtilitySettlementRecorded {
   /** Bills closed out by this sale. */
   bills: Array<{ billId: string; utilityType: UtilityType; amount: number }>
-  /** Lines rung up by hand that are recovery with no bill behind them (the Andres shape). */
+  /** Lines rung up by hand that are recovery with no bill behind them (the Cora shape). */
   withoutBill: Array<{ utilityType: UtilityType; amount: number }>
   /** Charge rows on the payer's invoice this collection voided. */
   chargesVoided: string[]

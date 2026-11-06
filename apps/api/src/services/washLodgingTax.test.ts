@@ -2,7 +2,7 @@
  * 10/20 (Nic) — THE LODGING TAX GOES INTO THE WASH DIFFERENCE, EVEN THOUGH
  * NOBODY WAS CHARGED IT.
  *
- *   "Victor and Nemesio, it's $269 each at 2 weeks, but it's also plus the
+ *   "Horatio and Kestrel, it's $269 each at 2 weeks, but it's also plus the
  *    short-term lodging tax. That, like, even though they weren't charged the
  *    tax needs to be factored in as opposed to the difference calculation for
  *    the wash, [be]cause that's tax we would have to pay if we refunded the
@@ -97,7 +97,7 @@ async function stay(client: PoolClient, p: Park, o: {
      VALUES ($1,$2,'month_to_month','checked_out',$3::date,$4::date,$5::date,$6,$7,$8,now())
      RETURNING id`,
     [o.unitId ?? p.unitId, p.landlordId, ARRIVED, o.leftOn ?? LEFT,
-     o.bookedThrough ?? BOOKED_THROUGH, o.guest ?? 'Victor Cardoza',
+     o.bookedThrough ?? BOOKED_THROUGH, o.guest ?? 'Horatio Mapperley',
      o.total ?? 589, o.stampedTaxRate ?? 0.0635])).rows[0].id
 }
 
@@ -217,7 +217,7 @@ describe('the lodging tax a re-priced stay would owe (10/20)', () => {
     const p = await park(client)
     await client.query(
       `UPDATE properties SET early_departure_refunds = false WHERE id = $1`, [p.propertyId])
-    const bookingId = await stay(client, p, { guest: 'Nemesio Rivera' })
+    const bookingId = await stay(client, p, { guest: 'Kestrel Norrington' })
     const kept = await moneyKeptForDeparture({ bookingId }, p.landlordId, client)
     expect(kept!.amountKept).toBe(51)
     expect(kept!.lodgingTaxOwed).toBe(35.51)
@@ -233,7 +233,7 @@ describe('the money kept on the report (10/20)', () => {
       `UPDATE units SET unit_number = 'RV 11', nightly_rate = 49, weekly_rate = 269,
               monthly_rate = 589 WHERE id = $1`, [second])
 
-    for (const [guest, unitId] of [['Victor Cardoza', p.unitId], ['Nemesio Rivera', second]] as const) {
+    for (const [guest, unitId] of [['Horatio Mapperley', p.unitId], ['Kestrel Norrington', second]] as const) {
       const bookingId = await stay(client, p, { guest, unitId })
       const decisionId = await answer(client, p, bookingId)
       const rec = await recordMoneyKeptOnDeparture({

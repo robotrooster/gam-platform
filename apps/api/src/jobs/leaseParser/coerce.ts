@@ -109,7 +109,7 @@ export function splitName(full: string): { firstName: string; lastName: string }
 }
 
 /**
- * "Kevin Black 303-949-2683" -> { name, phone }.
+ * "Wilda Yeardley 303-949-2683" -> { name, phone }.
  * Phone is the trailing run that coerces to 10 digits; everything else is name.
  */
 export function splitNameAndPhone(raw: string): { name: string; phone: string | null } {

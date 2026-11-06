@@ -262,7 +262,10 @@ function RegisterTab() {
   }
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 380px', gap: 16 }}>
+    /* 10/30 (Nic): same as the property register, worse — 380px of cart is
+       wider than a phone's whole usable width, and THIS is the one a merchant
+       at a swap meet uses. Restacks to a single column on a phone. */
+    <div className="pos-register-split" style={{ display: 'grid', gridTemplateColumns: '1fr 380px', gap: 16 }}>
       {/* Left: item grid */}
       <div>
         {err && <div style={errStyle}>{err}</div>}

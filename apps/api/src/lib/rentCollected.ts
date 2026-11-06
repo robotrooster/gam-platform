@@ -34,12 +34,12 @@
 import { DEFAULT_INCOME_BASIS, type IncomeBasis } from '@gam/shared'
 import { query } from '../db'
 import { todayIn, monthStartOf } from './timezone'
-import { incomeEvents, summarize, ledgerOwedDay, landlordIncomeSql, type IncomeEvent } from '../services/incomeBasis'
+import { incomeEvents, summarize, ledgerOwedDay, chargedBucketOf, landlordIncomeSql, type IncomeEvent } from '../services/incomeBasis'
 import { withinCutoffsSql, cutoffsParam, type PropertyCutoff } from './bookkeeperScope'
 // 10/18: the ONE rule for what is owed, row by row off the charges — the same
 // fragments the balances page, the tenant portal, Pay Now, the 7am overdue
 // digest and the agents read (services/openBalances).
-import { openBalanceSql, openAmountSql, workTradeOpenRowSql } from '../services/openBalances'
+import { openBalanceSql, openAmountSql, workTradeOpenRowSql, inFlightRowSql } from '../services/openBalances'
 import { RENT_RECEIVED_STATUSES as RECEIVED } from '../services/moneyPredicates'
 
 /**
@@ -58,8 +58,17 @@ export interface RentCollected {
   inFlight: number
   /** Of `collected`, paid-ahead money that arrived this month for later bills. */
   paidAhead: number
-  /** Money billed this month: the bill and what became of it (adds up to `amount`). */
-  billed: { amount: number; collected: number; clearing: number; stillOwed: number }
+  /**
+   * Money billed this month: the bill and what became of it. The four add
+   * back to `amount` to the cent — 11/4 (Nic, one population per figure).
+   * `other` is charged money that was never going to BE money (a credit
+   * given, rent covered by work trade, a balance written off); it nets to
+   * about nothing company-wide, because a credit's own minus line is in
+   * `amount` too, but on a SCOPED slice like rent-only it is the whole
+   * difference, and without it the card cannot add up. Mountain View's
+   * October rent: $18,502.00 charged = $16,958.00 + $0.00 + $955.00 + $589.00.
+   */
+  billed: { amount: number; collected: number; clearing: number; stillOwed: number; other: number }
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100
@@ -146,13 +155,31 @@ export function rentCollectedFrom(
   const pick = (list: readonly IncomeEvent[]) => scope === 'rent' ? list.filter(rentOnly) : list
   const r = summarize(pick(rx), 'received')
   const b = summarize(pick(bx), 'billed')
-  // 10/12 (Nic, ledger P8): on the books, of what was billed — what tenants
-  // paid against bills in the month, and what they still owed at its end
-  // (every bill, design §10); nothing is "clearing" on the books.
+  // 11/4 (Nic, DIRECTIVE: one population per figure) — THREE FIGURES ON ONE
+  // CARD THAT CAME FROM THREE DIFFERENT READS.
+  //
+  // This card says "of $X charged: $Y collected, $Z still owed" for a MONTH,
+  // and on the books path it used to build that sentence out of three
+  // unrelated things: `amount` was the month's charges, `collected` was the
+  // proof strip's received term (a FLOW through the month, so money that
+  // arrived in October for September's bill counted toward October's
+  // charges), `clearing` was hardcoded 0 on the reasoning that "nothing is
+  // clearing on the books" — true of the books, but the money record knows
+  // perfectly well that $1,701.92 of Mountain View's November charges was
+  // paid and still in flight — and `stillOwed` was the whole receivables
+  // balance, every bill from every month, on a card headed with one month.
+  // That last one is the $14,391 figure Nic rejected on 11/3: "a card headed
+  // with a month must not carry a cumulative balance."
+  //
+  // All three now come from the SAME facts as `amount`: the `ledger: 'part'`
+  // facts, which split each of the month's charges by what became of it
+  // (services/ledgerReports chargedPartFacts). So collected + clearing +
+  // stillOwed = amount by construction, and every figure is this month's.
   const fromBooks = bx.some(e => !!e.ledger)
   const picked = fromBooks ? pick(bx) : []
-  const owedDay = fromBooks ? ledgerOwedDay(picked) : null
   const sumOf = (f: (e: IncomeEvent) => boolean) => round2(picked.filter(f).reduce((x, e) => x + e.amount, 0))
+  const bucket = (k: 'collected' | 'clearing' | 'owed' | 'other') =>
+    sumOf(e => e.ledger === 'part' && chargedBucketOf(e.part) === k)
   return {
     basis,
     collected: r.total,
@@ -161,15 +188,19 @@ export function rentCollectedFrom(
     billed: fromBooks
       ? {
           amount: b.total,
-          collected: round2(-sumOf(e => e.ledger === 'proof' && e.proofTerm === 'received')) || 0,
-          clearing: 0,
-          stillOwed: sumOf(e => e.ledger === 'owed' && e.day === owedDay),
+          collected: bucket('collected'),
+          clearing: bucket('clearing'),
+          stillOwed: bucket('owed'),
+          other: bucket('other'),
         }
       : {
           amount: b.total,
           collected: b.beside.collectedSoFar,
           clearing: b.beside.clearing,
           stillOwed: b.beside.stillOwed,
+          // The records path reads each bill's own status, so every dollar it
+          // charged has an outcome and the residual is what is left over.
+          other: round2(b.total - b.beside.collectedSoFar - b.beside.clearing - b.beside.stillOwed) || 0,  // never −0
         },
   }
 }
@@ -186,7 +217,7 @@ export function incomeCardFrom(all: RentCollected, basis: IncomeBasis): IncomeCa
 export interface IncomeCard {
   basis: IncomeBasis
   received: { amount: number; paidAhead: number; clearing: number }
-  billed: { amount: number; collected: number; clearing: number; stillOwed: number }
+  billed: { amount: number; collected: number; clearing: number; stillOwed: number; other: number }
 }
 
 /** The dashboard's income card, both ways (the switch picks which one leads). */
@@ -371,6 +402,102 @@ export interface OutstandingBalance {
    * to $0 owed.
    */
   workTradeSuspended: number
+}
+
+/**
+ * 11/3 — ONE MONTH'S MONEY, FROM ONE POPULATION, SO THE PARTS CANNOT FAIL TO
+ * ADD UP.
+ *
+ * Nic, 11/3, on the dashboard showing three different "still owed" figures:
+ * "It needs to be a grand fucking total of every outstanding money owed to us.
+ * So how can 14,000 dollars in this month be higher than the total outstanding
+ * from the other months? ... it's going to be confusing to fucking everybody."
+ *
+ * The card that said $14,391 was reading the cumulative `ar_tenants` BALANCE,
+ * which carried earlier months, money already clearing at the bank, and work
+ * trade into a figure headed "This month". It decomposed exactly:
+ * 8,426.81 this month owed + 615.00 earlier + 1,701.92 clearing + 3,647.68
+ * work trade = 14,391.41.
+ *
+ * WHY ONE QUERY AND NOT THREE. The old figures came from three different
+ * populations — `collected` a month flow off ledger proof events, `clearing`
+ * hardcoded to `0`, and `stillOwed` a cumulative balance — so the sentence the
+ * card prints ("Of $X charged: $Y collected · $Z still owed") was $218.76 out
+ * and could never tie. Every bucket here is the SAME set of charges, so
+ * `charged` is their sum by construction and the card cannot print a
+ * subtraction that does not subtract.
+ *
+ * DELIBERATELY NOT IN `charged` OR `stillOwed`:
+ *  - money clearing at the bank — already PAID, never owed
+ *    (openBalances.inFlightRowSql, decisions #29). Reported beside.
+ *  - work trade — labor is paying it, so it is never that month's money at all
+ *    (Nic, 11/3). Reported beside, never inside either.
+ *
+ * `earlierOwed` is the same open-charge rule applied to charges due BEFORE the
+ * month, which is what lets the dashboard show this month as a SLICE of the
+ * Outstanding card instead of a figure that can exceed it.
+ */
+export interface MonthMoneyBuckets {
+  /** collected + clearing + stillOwed, to the cent. Work trade is not in it. */
+  charged: number
+  /** Settled, or kept from a deposit. Credit already spent is netted off. */
+  collected: number
+  /** Money moving at the bank: paid, not yet landed. */
+  clearing: number
+  /** Still owed of THIS month, by the same rule the Outstanding card uses. */
+  stillOwed: number
+  /** Covered by work trade — beside the three, never inside them. */
+  workTrade: number
+  /** Still owed from BEFORE this month, so the month reads as a slice. */
+  earlierOwed: number
+}
+
+export async function monthMoneyBuckets(
+  landlordIds: string[] | null | undefined,
+  property: string | readonly string[] | null | undefined,
+  /** The month, as its first day: 'YYYY-MM-01'. Its last day is derived here so
+   *  a caller cannot pass a start and an end that disagree. */
+  month: string,
+  opts: { cutoffs?: readonly PropertyCutoff[] } = {},
+): Promise<MonthMoneyBuckets> {
+  const none: MonthMoneyBuckets = { charged: 0, collected: 0, clearing: 0, stillOwed: 0, workTrade: 0, earlierOwed: 0 }
+  const propertyIds = property == null ? null : typeof property === 'string' ? [property] : [...property]
+  if (landlordIds?.length === 0 || propertyIds?.length === 0) return none
+
+  const OPEN = openBalanceSql('p')
+  const TRADED = workTradeOpenRowSql('p')
+  const FLIGHT = `(${inFlightRowSql('p')} AND p.work_trade_suspended_at IS NULL)`
+  const OWED = openAmountSql('p')
+  // Settled money, net of credit already spent on the row — the same netting
+  // the owed side uses, so the two are the same kind of number. 'processing' is
+  // in RECEIVED but belongs to `clearing` here, so it is taken back out.
+  const GOT = `(p.status = ANY($4::text[]) AND p.status <> 'processing' AND p.work_trade_suspended_at IS NULL)`
+  const IN_MONTH = `(p.due_date >= $5::date AND p.due_date < ($5::date + INTERVAL '1 month'))`
+
+  const [r] = await query<Record<string, number>>(`
+    SELECT COALESCE(SUM(CASE WHEN ${IN_MONTH} AND ${GOT}    THEN ${OWED}  END), 0)::float AS collected,
+           COALESCE(SUM(CASE WHEN ${IN_MONTH} AND ${FLIGHT} THEN ${OWED}  END), 0)::float AS clearing,
+           COALESCE(SUM(CASE WHEN ${IN_MONTH} AND ${OPEN}   THEN ${OWED}  END), 0)::float AS still_owed,
+           COALESCE(SUM(CASE WHEN ${IN_MONTH} AND ${TRADED} THEN p.amount END), 0)::float AS work_trade,
+           COALESCE(SUM(CASE WHEN p.due_date < $5::date AND ${OPEN} THEN ${OWED} END), 0)::float AS earlier_owed
+      FROM payments p
+      LEFT JOIN units u ON u.id = p.unit_id
+     WHERE ($1::uuid[] IS NULL OR p.landlord_id = ANY($1::uuid[]))
+       AND p.revenue_owner <> 'gam'
+       AND p.entry_description IS DISTINCT FROM 'FLEXPAY'
+       AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
+       AND ${withinCutoffsSql('u.property_id', 'p.due_date', '$3')}`,
+    [landlordIds ?? null, propertyIds, cutoffsParam(opts.cutoffs), [...RECEIVED], month])
+
+  const collected = round2(Number(r?.collected ?? 0))
+  const clearing = round2(Number(r?.clearing ?? 0))
+  const stillOwed = round2(Number(r?.still_owed ?? 0))
+  return {
+    collected, clearing, stillOwed,
+    charged: round2(collected + clearing + stillOwed),
+    workTrade: round2(Number(r?.work_trade ?? 0)),
+    earlierOwed: round2(Number(r?.earlier_owed ?? 0)),
+  }
 }
 
 /**

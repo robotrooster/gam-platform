@@ -28,7 +28,6 @@ import { canDeleteLateFees, deleteLateFee, LATE_FEE_DELETE_NOT_ALLOWED } from '.
 import { runWholeBillCheckAfterCommit, supersedeScheduledRetry, cancelSupersededIntents,
          usablePaidAheadSql, disputeClaimJoinSql } from '../services/creditUse'
 import { logger } from '../lib/logger'
-import { todayIn } from '../lib/timezone'
 
 export const paymentsRouter = Router()
 paymentsRouter.use(requireAuth)
@@ -285,13 +284,13 @@ paymentsRouter.get('/', async (req, res, next) => {
     //
     // Nic: "on the outstanding balances tab six leases that are all overdue,
     // and on the payments tab it's only showing five... The outstanding balance
-    // still has Steven Starr. The payments tab, his name is removed from."
+    // still has Zelda Esterhazy. The payments tab, his name is removed from."
     //
     // 52 payments, LIMIT 50, and every single one of them due 2026-09-01 —
     // rent and utilities are all billed on the 1st, so `ORDER BY due_date DESC`
     // was one flat tie across the whole table. Postgres may return a tie in any
     // order it likes, so which two rows fell off the page was arbitrary and
-    // could differ between refreshes. Steven Starr's $589 rent and $264.39
+    // could differ between refreshes. Zelda Esterhazy's $589 rent and $264.39
     // utilities were two of them, on the screen the desk collects money from.
     //
     // Two things were wrong and both are fixed: the sort now has a deterministic
@@ -1332,17 +1331,33 @@ paymentsRouter.get('/remittances', async (req: any, res, next) => {
 
     const linesByRemit = new Map<string, any[]>()
     if (remits.length > 0) {
+      // ── 11/4: THE RESIDENT'S RECEIPT NAMES THE CHARGE, NOT ITS TYPE ──────
+      //
+      // This sent `type` and nothing else, so the tenant portal's "Applied to"
+      // table humanized a raw enum: every utility read "Utility" whatever it
+      // was for, and everything else was its database type. That breaks the
+      // no-raw-enums rule on the one screen a resident checks their own money
+      // on, and it disagrees with the words on their bill, their receipt email
+      // and the landlord's screens — all of which call the same chargeLabel.
+      // Now the server names the line once, the way everything else does.
       const lines = await query<any>(
         `SELECT ra.remittance_id, ra.payment_id,
                 ra.amount_applied::float AS amount_applied,
-                p.type, p.due_date::text AS due_date,
-                p.entry_description, p.status AS payment_status
+                p.type, p.due_date::text AS due_date, p.notes,
+                p.entry_description, p.status AS payment_status,
+                ${chargeLabelColumnsSql('p')}
            FROM remittance_applications ra
            JOIN payments p ON p.id = ra.payment_id
           WHERE ra.remittance_id = ANY($1::uuid[])
           ORDER BY p.due_date ASC, p.created_at ASC`,
         [remits.map((r: any) => r.id)])
       for (const ln of lines) {
+        ln.label = chargeLabel(ln as ChargeLabelRow)
+        ln.detail = chargeDetail(ln as ChargeLabelRow)
+        // The note is the landlord's and GAM's working text (meter reads,
+        // dedupe keys); the label and detail are what a resident is shown.
+        delete ln.notes
+        delete ln.origin_notes
         const bucket = linesByRemit.get(ln.remittance_id)
         if (bucket) bucket.push(ln)
         else linesByRemit.set(ln.remittance_id, [ln])
@@ -1460,8 +1475,8 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
     // Ownership is checked against the contract: a buyer may have no lease
     // here at all (the investor who owns homes in parks he does not own), and
     // a buyer who does have one must still be able to pay this bill without
-    // paying the space rent — Lisa Scheeler is on work trade and gets no rent
-    // bill, and Dominic Gonzalez's trailer money is the trust's while his
+    // paying the space rent — Calla Fitzhugh is on work trade and gets no rent
+    // bill, and Vesper Vanterpool's trailer money is the trust's while his
     // space rent is the park's.
     if (body.homeSaleContractId) {
       const owns = await queryOne<{ id: string }>(
@@ -2097,7 +2112,7 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
     }
     // S641 — TWO DIFFERENT THINGS, and only one of them is a manager's call.
     //
-    // Nic: "Lisa should have all access to take payments in whatever form they
+    // Nic: "Calla should have all access to take payments in whatever form they
     // come, including giving change out at the register… or applying credit to
     // the next bill if that's what she wants. She cannot just issue random
     // credits that a landlord would issue for, you know, waiving a late fee."
@@ -2551,6 +2566,7 @@ paymentsRouter.post('/:id/record-prior-arrangement', requirePerm('take_payment')
 // decline or a walk-away leaves the ledger untouched.
 import { holdForTheCart, createRentReaderPaymentIntent, processPaymentIntentOnReader, retrieveTerminalPaymentIntent, cancelTerminalPaymentIntent, showCartOnReader, cancelReaderAction, clearCartOnReader, readerAction } from '../services/posTerminal'
 import { chargeLabel, chargeDetail, chargeLabelColumnsSql, type ChargeLabelRow } from '../services/invoiceNotice'
+import { todayIn } from '../lib/timezone'
 
 /** A charge's line on the reader: its name, then its detail (the meter read), kept short for the screen. */
 function readerLineName(row: ChargeLabelRow): string {

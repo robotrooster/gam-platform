@@ -2,7 +2,7 @@
  * 10/19 (Nic) — UNPAID SPACE RENT FOLLOWS THE SPACE ON A TENANT-OWNED HOME.
  *
  * Built from the live situation at Oak Park, with the figures it actually has:
- * MH 09, a tenant-owned mobile home. Rashawn Bump left, the trailer was sold
+ * MH 09, a tenant-owned mobile home. Phaedra Stanhope left, the trailer was sold
  * privately, and the new owner moves in on top of $880.00 of unpaid space rent,
  * $1,051.00 of utilities and $95.00 of late fees that were still climbing $5 a
  * day.
@@ -20,7 +20,7 @@
  *    So, and we're not recording a payment like that until it's fully settled."
  *   "Don't count it on his, you know, payment health history, his late fees."
  *
- * Nothing here names Rashawn or Jacob to the code; they are the shapes the
+ * Nothing here names Phaedra or Jacob to the code; they are the shapes the
  * fixtures are built in.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
@@ -456,7 +456,7 @@ describe('the resident who takes the space on', () => {
     expect(charge).toHaveLength(1)
     expect(charge[0].lease_id).toBe(next.leaseId)                   // the space's lease carries it
     // The desk asks the resident who took the space on — "He is going to be
-    // responsible for paying the bill that Rashawn left behind."
+    // responsible for paying the bill that Phaedra left behind."
     expect(charge[0].tenant_id).toBe(next.tenantId)
     expect(charge[0].type).toBe('carried_balance')                  // never folded into rent
     expect(charge[0].invoice_id).toBeNull()
@@ -497,7 +497,7 @@ describe('the resident who takes the space on', () => {
 
     // His payment health does not see it. Nic: "Don't count it on his, you
     // know, payment health history, his late fees ... that's carried forward as
-    // Rashawn's."
+    // Phaedra's."
     const health = await healthByLease({ landlordIds: [p.landlordId], leaseIds: [next.leaseId] })
     const h = health.get(next.leaseId)
     expect(h?.percent ?? null).toBeNull()   // nothing of his has been judged
@@ -871,7 +871,7 @@ describe('taking a carried balance off', () => {
 describe('the books', () => {
   /** Oak Park with its books on from before any of this was billed. */
   async function withBooks(p: Park): Promise<void> {
-    await db.query(`UPDATE landlords SET books_start_date = $2::date WHERE id = $1`,
+    await db.query(`UPDATE properties SET books_start_date = $2::date WHERE landlord_id = $1`,
       [p.landlordId, await parkDay(120)])
     registerTenantLedgerProjectors()
     await drain()
@@ -1017,7 +1017,19 @@ describe('a payment arrangement on a carried balance', () => {
       } catch (e) { await cc.query('ROLLBACK'); throw e } finally { cc.release() }
     }
 
-    const month1 = `${today.slice(0, 8)}${String(day).padStart(2, '0')}`
+    // 10/29: when today is the 29th-31st the arrangement day wraps to the 1st
+    // (above), and the first cycle is then the 1st of NEXT month. This built it
+    // in the CURRENT month — a date already past, before the arrangement even
+    // started — so the job had nothing to ask for and the suite failed on the
+    // date rather than on the code. Only reachable three days a month, which is
+    // why it sat here. Resolve the first occurrence of `day` on or after today.
+    const month1 = (() => {
+      const y = Number(today.slice(0, 4))
+      const m = Number(today.slice(5, 7))
+      const thisMonth = day >= dayOfMonth
+      return new Date(Date.UTC(y, m - 1 + (thisMonth ? 0 : 1), day))
+        .toISOString().slice(0, 10)
+    })()
     const first = await runOn(month1)
     expect(first.asked).toBe(1)
     // Running it again on the same cycle asks for nothing more.

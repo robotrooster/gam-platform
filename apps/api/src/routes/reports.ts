@@ -9,7 +9,8 @@ import {
   MONEY_COLUMNS, MONEY_COLUMN_LABEL, MONEY_COLUMN_NOTE, MONEY_COLUMN_NOTE_LEDGER, MONTHLY_REPORT_MAX_EXTRA_EMAILS,
   type IncomeBasis, type MaintenanceCategory,
 } from '@gam/shared'
-import { query, queryOne } from '../db'
+import { db, query, queryOne } from '../db'
+import { preGamIncomeSummary } from '../services/preGamIncome'
 import { requireAuth, requirePerm, getScopedPropertyIds, bookkeeperRequestScopeOf, propertyCutoffsOf } from '../middleware/auth'
 import { companyWideRefusal, cutoffsParam, withinCutoffsSql, MONTHLY_REPORT_REFUSAL, type PropertyCutoff } from '../lib/bookkeeperScope'
 import { AppError } from '../middleware/errorHandler'
@@ -93,8 +94,11 @@ const LEGACY_BASIS: IncomeBasis = 'received'
  * says it in words. Charged, Received and the nets stay — they are not what
  * anyone owes. The screens print "—" where a figure is absent.
  */
-function dropOwed<T extends { owed: number }>(x: T): Omit<T, 'owed'> {
-  const { owed: _owed, ...rest } = x
+function dropOwed<T extends { owed: number; parts?: unknown }>(x: T): Omit<T, 'owed' | 'parts'> {
+  // 11/4: `parts` carries the same row's owed figure (collected + clearing +
+  // owed + other = charged), so leaving it on would hand back exactly the
+  // number the rest of this function removes — by subtraction if not directly.
+  const { owed: _owed, parts: _parts, ...rest } = x
   return rest
 }
 
@@ -112,11 +116,11 @@ export function viewForViewer(view: MoneyView, seesTotals: boolean) {
     // 10/14 (Nic I1): the Detailed view's lines, and their subtypes, without Owed too.
     ...(details ? { details: details.map(d => ({ ...dropOwed(d), subtypes: d.subtypes.map(dropOwed) })) } : {}),
     tie: { received: tie.received, stillClearing: tie.stillClearing },
-    // moneyTieText: the second line is what became of what was charged (it
-    // names what is still owed); the first says what the money received was
-    // for (10/12, Nic: Received leads), and a third, when there is one, what
-    // is still clearing.
-    tieText: tieText.filter((_, i) => i !== 1),
+    // 11/4: the sentences that do not name what is still owed, chosen where
+    // they are written (MoneyView.tieTextNoOwed) rather than by position here
+    // — the books path now carries both a charged sentence and a proof strip,
+    // and both name the owed figure.
+    tieText: view.tieTextNoOwed ?? tieText.filter((_, i) => i !== 1),
   }
 }
 
@@ -441,7 +445,8 @@ reportsRouter.get('/ledger-status', async (req, res, next) => {
 //                      (lib/rentCollected outstandingBalanceOf), the same
 //                      figure the dashboard's Outstanding card shows. 10/18.
 //   occupancyRate    — round(100 × active / total) across landlord's units
-//   monthly[]        — last 6 months: charged / received / owed and the net
+//   monthly[]        — the ROLLING 12 MONTHS (11/3, Nic): charged / received /
+//                      owed and the net
 //                      on each (10/12), collected (= received), rent,
 //                      disbursed, fees, net
 //   thisMonth, ytd   — 10/12 (Nic): Charged / Received / Owed this month (with
@@ -458,18 +463,119 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
     // S633: spans every entity the account owns. Scoped to one entity, the
     // headline figures on the Reports page silently excluded the other
     // company's rent — a number that is wrong with no sign that it is wrong.
-    const landlordIds = isAdmin ? null : reportScope(req.user!)
+    const ownScope = isAdmin ? null : reportScope(req.user!)
+
+    // ── 11/3 (Nic): ONE COMPANY, OR ONE PROPERTY, FROM THE TOP OF THE PAGE ──
+    //
+    //   "there's no filter to sort that monthly itemized monthly breakdown by
+    //    property. Or by company. So you can't choose TruBlu Management or Oak
+    //    Park Motel and RV until after you click into a specific month. And we
+    //    want to be able to review yearly style thing, the one that's on that
+    //    page filtered by a company."
+    //
+    // EVERY FIGURE IN THE REPLY NARROWS TOGETHER — the cards, the charts and
+    // the monthly rows. Narrowing the table alone would leave account-wide
+    // cards sitting above a one-property table, which is exactly the three-
+    // different-balances confusion he called out on 10/3 ("that is a huge
+    // confusion problem").
+    //
+    // Named by `landlordId` and `propertyId`, the spellings /monthly-pl and the
+    // dashboard already use, so the drill-in a row opens carries the same
+    // company the row was built from.
+    const asked = (v: unknown) =>
+      typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v.trim())
+        ? v.trim() : null
+    const askedCompany = asked(req.query.landlordId)
+    const askedProperty = asked(req.query.propertyId)
+    // Checked against the viewer's OWN scope, which is also where the picker's
+    // options come from — so the control can never offer a slice this check
+    // then refuses, and a filter can only ever narrow what the viewer already
+    // reads. An admin (no landlord scope) gets no options and names none.
+    const covers = (id: string | null | undefined) => !!id && !!ownScope && ownScope.includes(id)
+    if (askedCompany && !covers(askedCompany)) {
+      throw new AppError(403, 'That company is not one this report covers.')
+    }
+    const askedPropertyCompany = askedProperty
+      ? (await queryOne<{ landlord_id: string }>(
+          `SELECT landlord_id FROM properties WHERE id = $1`, [askedProperty]))?.landlord_id ?? null
+      : null
+    if (askedProperty && !askedPropertyCompany) throw new AppError(404, 'Property not found')
+    if (askedProperty && !covers(askedPropertyCompany)) {
+      throw new AppError(403, 'That property is not one this report covers.')
+    }
+    if (askedCompany && askedPropertyCompany && askedCompany !== askedPropertyCompany) {
+      throw new AppError(400, 'That property belongs to a different company than the one you chose.')
+    }
+    // A property names its company: one property of Oak Park is read inside
+    // Oak Park's books, never across the account.
+    const narrowTo = askedCompany ?? askedPropertyCompany
+    const landlordIds = narrowTo ? [narrowTo] : ownScope
+    // PLATFORM-WIDE is what `isAdmin` meant at every site below, and saying so
+    // is what lets a filter work for an admin too: an admin who names a company
+    // reads it the way its owner does rather than the whole platform's.
+    const platformWide = landlordIds === null
     // S655 (gam-audience-data-isolation): a team member assigned to some
     // properties sees those properties' money only — every figure below.
-    const scopedIds = isAdmin ? null : await getScopedPropertyIds(req.user)
+    const assignedIds = platformWide ? null : await getScopedPropertyIds(req.user)
+    // INTERSECT, never replace: a filter narrows an assignment, so a team
+    // member cannot name their way out to a property they are not assigned to.
+    if (askedProperty && assignedIds && !assignedIds.includes(askedProperty)) {
+      throw new AppError(403, 'You are not assigned to that property.')
+    }
+    const scopedIds = askedProperty ? [askedProperty] : assignedIds
     // 10/12 (Nic): a bookkeeper's former property stops at the day it left.
     const cutoffs = await propertyCutoffsOf(req.user)
     const userId = req.user!.userId
 
+    // 11/3: THE COMPANIES AND PROPERTIES THIS VIEWER'S REPORT COVERS — the
+    // picker's options, so a control can never offer a slice the report cannot
+    // show. Built from the viewer's WHOLE scope, never the narrowed one: read
+    // off the narrowed scope, choosing a company would leave the picker holding
+    // that one option with no way back to the rest.
+    //
+    // `company_properties` is the company's TRUE property count, not the count
+    // this viewer may see, because it answers "can a payout belong to one
+    // property here" — a fact about the company, not about who is looking.
+    const scopeRows = ownScope?.length
+      ? await query<{ id: string; name: string; landlord_id: string; company_name: string; company_properties: number }>(`
+          SELECT p.id, p.name, p.landlord_id,
+                 COALESCE(l.business_name, lu.first_name || ' ' || lu.last_name, 'Unnamed company') AS company_name,
+                 (SELECT COUNT(*) FROM properties p2 WHERE p2.landlord_id = p.landlord_id)::int AS company_properties
+            FROM properties p
+            JOIN landlords l ON l.id = p.landlord_id
+            LEFT JOIN users lu ON lu.id = l.user_id
+           WHERE p.landlord_id = ANY($1::uuid[])
+             AND ($2::uuid[] IS NULL OR p.id = ANY($2::uuid[]))
+           ORDER BY company_name, p.name`, [ownScope, assignedIds])
+      : []
+    const scopeCompanies: Array<{ id: string; name: string; properties: Array<{ id: string; name: string }> }> = []
+    for (const r of scopeRows) {
+      const seen = scopeCompanies.find(c => c.id === r.landlord_id)
+      const into = seen ?? { id: r.landlord_id, name: r.company_name, properties: [] }
+      if (!seen) scopeCompanies.push(into)
+      into.properties.push({ id: r.id, name: r.name })
+    }
+    // Does a payout belong to the slice on screen? Per company, always. Per
+    // property, only where the company holds that one property and nothing else.
+    const payoutsBelongHere = !askedProperty
+      || (scopeRows.find(r => r.id === askedProperty)?.company_properties ?? 1) <= 1
+
     // S655: each month's figure IS that month's P&L total under the basis —
     // the row and the P&L it opens can never disagree. Calendar months by the
     // Phoenix clock, the current one included.
-    const months = lastMonths(6)
+    //
+    // 11/3 (Nic): "12 rows on the table for rolling 12 at a glance." A ROLLING
+    // twelve — this month and the eleven before it, not a calendar year — so the
+    // table reads as a trailing-twelve review on any day of any month instead of
+    // shrinking to one row every January.
+    const months = lastMonths(12)
+    // The payout window IS the table's window, taken from `months` rather than
+    // restated as an interval beside it. The 6 → 12 change is exactly how a
+    // second copy of a window gets left behind: `NOW() - INTERVAL '6 months'`
+    // would have zeroed the Paid out column on the six oldest rows, and nothing
+    // would have looked broken. Phoenix midnight, because every session runs on
+    // Phoenix time (db/index.ts), which is the same boundary `months` uses.
+    const tableStart = months[0] + '-01'
     const today = todayIn(null)
     const yearStart = `${today.slice(0, 4)}-01-01`
     const windowStart = months[0] + '-01' < yearStart ? months[0] + '-01' : yearStart
@@ -491,26 +597,32 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
       return moneyViewFrom(perMonthBilled.get(ym) ?? [], perMonth.get(ym) ?? [], { start: d.first, end: d.last, label: monthWords(ym) })
     }
 
-    const disbursementRows = isAdmin
+    // 11/3: A PAYOUT IS PER COMPANY, and `disbursements.landlord_id` says which
+    // (every row in production carries one). Chosen a company, these are that
+    // company's payouts alone — which is the Mountain View / Oak Park split a
+    // landlord reads when two payouts land on the same day. Unfiltered, the
+    // query is the one that has always run.
+    const disbursementRows = platformWide
       ? await query<any>(`
           SELECT to_char(date_trunc('month', created_at), 'YYYY-MM') AS month,
                  SUM(amount)::numeric AS disbursed,
                  SUM(fee_charged)::numeric AS fees
             FROM disbursements
-           WHERE created_at > NOW() - INTERVAL '6 months'
+           WHERE created_at >= $1::date
              AND status IN ('pending', 'processing', 'settled')
            GROUP BY 1
-        `)
+        `, [tableStart])
       : await query<any>(`
           SELECT to_char(date_trunc('month', d.created_at), 'YYYY-MM') AS month,
                  SUM(d.amount)::numeric AS disbursed,
                  SUM(d.fee_charged)::numeric AS fees
             FROM disbursements d
            WHERE d.user_id = $1
-             AND d.created_at > NOW() - INTERVAL '6 months'
+             AND ($2::uuid IS NULL OR d.landlord_id = $2::uuid)
+             AND d.created_at >= $3::date
              AND d.status IN ('pending', 'processing', 'settled')
            GROUP BY 1
-        `, [userId])
+        `, [userId, narrowTo, tableStart])
     const disb = new Map<string, { disbursed: number; fees: number }>()
     for (const r of disbursementRows) {
       disb.set(r.month, { disbursed: parseFloat(r.disbursed ?? '0'), fees: parseFloat(r.fees ?? '0') })
@@ -551,8 +663,11 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
         netReceived: paid == null ? null : round2(v.received - paid),
         collected: t.total,
         rent: t.lines.rent,
-        disbursed: d.disbursed,
-        fees: d.fees,
+        // 11/3: one property of a company that holds several HAS no payout of
+        // its own, so the column says nothing rather than showing the whole
+        // company's money beside one property's income.
+        disbursed: payoutsBelongHere ? d.disbursed : null,
+        fees: payoutsBelongHere ? d.fees : null,
         expenses,
         net: paid == null ? null : round2(t.total - paid),
       }
@@ -613,13 +728,13 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
     const keepsNoPropertyMoney = req.user!.role === 'bookkeeper' && Array.isArray(scopedIds) && scopedIds.length === 0
     const showOutstanding = seesTotals && !keepsNoPropertyMoney
     const outstanding = !showOutstanding ? 0
-      : (await outstandingBalanceOf(isAdmin ? null : landlordIds, scopedIds, { cutoffs })).outstanding
+      : (await outstandingBalanceOf(landlordIds, scopedIds, { cutoffs })).outstanding
 
     // S616 (Nic): occupancy counts SHORT STAYS — "aggregate thirty nights of
     // bookings as well" — and excludes service points, which are a neighbor's
     // building rather than this landlord's inventory. Shares one formula with
     // the Dashboard's Occupancy card so the two cannot disagree.
-    const occRow = isAdmin
+    const occRow = platformWide
       ? await queryOne<any>(`
           SELECT
             COUNT(*) FILTER (WHERE status <> 'utility_service')::int AS total,
@@ -647,7 +762,7 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
          AND b.status NOT IN ('cancelled','no_show')
          AND b.check_in  < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
          AND b.check_out > date_trunc('month', CURRENT_DATE)`,
-      [isAdmin ? null : landlordIds, scopedIds])
+      [landlordIds, scopedIds])
     const total = parseInt(occRow?.total ?? '0', 10)
     const active = parseInt(occRow?.active ?? '0', 10)
     const occupancyRate = occupancyRateFrom(active, nightsRow?.nights || 0, total)
@@ -705,6 +820,7 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
       totalUnits: total,
       monthly,
       ytdMonthly,
+      scope: { companies: scopeCompanies, landlordId: askedCompany, propertyId: askedProperty, payoutsBelongHere },
       ownerVsManager: {
         ownerShare: parseFloat(splitRow?.owner_share ?? '0'),
         managerFee: parseFloat(splitRow?.manager_fee ?? '0'),
@@ -736,6 +852,47 @@ reportsRouter.get('/summary', requirePerm('payments.view_all'), async (req, res,
 //               charge's own new money on the day it settled; Money billed
 //               lists each bill due this month with what became of it.
 //               rowsTotal is their sum.
+// ── GET /api/reports/pre-gam-income ─────────────────────────────────────────
+//
+// 11/1 (Nic): income the operator earned BEFORE they joined GAM, typed in for
+// their own books — an RV guest or a weekly stay with no lease behind it.
+//
+// SHOWN BESIDE THE P&L, NOT INSIDE IT, and that is deliberate. The P&L is
+// derived from the ledger facts, and the ledger rebuild has to be able to
+// explain every figure on it ([[gam-every-dollar-counted-once]]). This money is
+// outside the period the ledger covers — the ledger opens when the company
+// does — so folding it into totalIncome would make the statement disagree with
+// the only record that can account for it. The operator sees it as its own
+// clearly-named figure for the month it happened in, which is what makes it
+// usable for bookkeeping without corrupting the statement.
+//
+// It is never a charge, never in a balance, never collectible, never on GAM's
+// own fee, and never shown to the person it names (services/preGamIncome).
+reportsRouter.get('/pre-gam-income', requirePerm('payments.view_all'), async (req, res, next) => {
+  try {
+    const landlordId = reportEntity(req.user!, req.query.landlordId)
+    const day = (v: unknown) =>
+      typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null
+    const { preGamIncomeSummary } = await import('../services/preGamIncome')
+    // `db` (the pool), NOT the module's `query` helper: that one returns the
+    // rows themselves while this reads `.rows`, so the cast would have compiled
+    // and then found undefined at runtime.
+    const rows = await preGamIncomeSummary(db,
+      { landlordId, from: day(req.query.from), to: day(req.query.to) })
+    const byMonth = new Map<string, number>()
+    for (const r of rows) byMonth.set(r.month, round2((byMonth.get(r.month) ?? 0) + r.total))
+    res.json({
+      success: true,
+      data: {
+        rows,
+        byMonth: [...byMonth.entries()].map(([month, total]) => ({ month, total }))
+          .sort((a, b) => b.month.localeCompare(a.month)),
+        total: round2(rows.reduce((t, r) => t + r.total, 0)),
+      },
+    })
+  } catch (e) { next(e) }
+})
+
 reportsRouter.get('/monthly-pl', requirePerm('payments.view_all'), async (req, res, next) => {
   try {
     const basis = LEGACY_BASIS
@@ -771,10 +928,33 @@ reportsRouter.get('/monthly-pl', requirePerm('payments.view_all'), async (req, r
     const { rows: paymentRows, rowsTotal, chargeCount } = await chargesBehind(events)
     const summary = summarize(events, basis)
 
+    // ── 11/1 (Nic): "Pnl needs to count all money from books recorded." ──────
+    //
+    //   "September for country acres needs to not bill because it was collected
+    //    off platform but still show all the books in one place."
+    //
+    // Income from before the company joined GAM, typed in from their own
+    // records. Nothing was billed and nobody owes it — and it is still their
+    // income for that month, so the P&L counts it.
+    //
+    // Its OWN line, never folded into rent: the ledger rebuild has to be able
+    // to account for every figure here, and this money is outside the period
+    // the ledger covers. Named, the gap between this statement and the ledger
+    // IS this line and can be explained. Unnamed, they would just disagree.
+    const preGamRows = await preGamIncomeSummary(db, { landlordId, from: first, to: last })
+    const preGamIncome = round2(preGamRows.reduce((t, r) => t + r.total, 0))
+    const grossWithPreGam = preGamIncome > 0
+      ? { ...pl.gross, preGamIncome, total: round2(pl.gross.total + preGamIncome) }
+      : { ...pl.gross, preGamIncome: 0 }
+    const linesWithPreGam = preGamIncome > 0
+      ? [...pl.lineItems, { line: 'preGamIncome', label: 'Collected before GAM', amount: preGamIncome }]
+      : pl.lineItems
+
     res.json({ success: true, data: {
       period: { year, month, start, end },
-      gross: pl.gross,
-      lines: pl.lineItems,
+      gross: grossWithPreGam,
+      lines: linesWithPreGam,
+      preGamIncomeByUnit: preGamRows,
       beside: pl.besideItems,
       parts: partList(summary.parts),
       depositsHeld: pl.depositsHeld,
@@ -986,7 +1166,26 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
     const balancesCollected  = pl.gross.balances   // "Balances collected"
     const bankedOtherIncome  = pl.gross.otherIncome // income the landlord banked outside GAM (S605)
     const otherIncome        = pl.gross.other       // every line but rent, so rent + other = total
-    const totalIncome        = pl.gross.total
+    // ── 11/1 (Nic): THE P&L SHOWS ALL THE MONEY, IN ONE PLACE ───────────────
+    //
+    //   "Pnl needs to count all money from books recorded. September for
+    //    country acres needs to not bill because it was collected off platform
+    //    but still show all the books in one place."
+    //
+    // Income the operator earned before they joined GAM, typed in from their
+    // own records (services/preGamIncome). It was collected off-platform, so
+    // nothing is billed and nobody owes it — and it is still their income for
+    // that month, so it belongs on their statement.
+    //
+    // It is its OWN named figure, not folded silently into another line, for a
+    // reason that matters: the ledger rebuild has to be able to account for
+    // every number on this statement ([[gam-every-dollar-counted-once]]), and
+    // this money sits outside the period the ledger covers. Named, the
+    // difference between the statement and the ledger is exactly this line and
+    // can be explained. Unnamed, the two would simply disagree.
+    const preGamRows = await preGamIncomeSummary(db, { landlordId, from: first, to: last })
+    const preGamIncome = round2(preGamRows.reduce((t, r) => t + r.total, 0))
+    const totalIncome        = round2(pl.gross.total + preGamIncome)
     const depositsCollected  = pl.depositsHeld
     // S655: what the listed charges brought in. Money received: their own new
     // money (rowsTotal). Money billed: the collected parts of this month's
@@ -1033,6 +1232,9 @@ reportsRouter.get('/monthly-statement', requirePerm('payments.view_all'), async 
           // income
           rentCollected, feesCollected, utilitiesCollected, homeSaleCollected,
           balancesCollected, bankedOtherIncome, otherIncome,
+          // 11/1: collected off-platform before GAM. In totalIncome, and named
+          // so the statement and the ledger can be reconciled against it.
+          preGamIncome, preGamIncomeByUnit: preGamRows,
           depositsCollected, totalIncome, totalCollected,
           // expenses
           totalPlatformFees, totalMaintCost, lotRent, enteredExpenses, processingFees, cardFeesRefunded, pmFee, totalExpenses,

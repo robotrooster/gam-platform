@@ -70,6 +70,24 @@ const TZ = 'America/Phoenix'
 const today = () => DateTime.now().setZone(TZ).toISODate()!
 const plusDays = (n: number) => DateTime.now().setZone(TZ).plus({ days: n }).toISODate()!
 
+/**
+ * A rent due day that ALWAYS leaves the old lease ONE unmade bill inside the
+ * bill run's 30-day catch-up window, whatever date the suite runs on.
+ *
+ * The renewal hand-off waits while the old lease still has a bill to make
+ * (scheduler.processLeaseEnds → invoiceGeneration.unbilledDueDates). That
+ * window is [successor start − CATCHUP_DAYS, successor start − 1]: 30
+ * consecutive days, which hold every day-of-month EXCEPT the successor start's
+ * own. The tests below start the successor TODAY, so a lease billed on the 1st
+ * has no unmade bill in reach on the 1st of a month — on 2026-11-01 the missing
+ * October 1 bill sat exactly ONE DAY outside the window, the hand-off correctly
+ * stopped waiting (a bill the run will never make again must not block a
+ * tenancy forever), and the premise these two tests assert simply could not
+ * exist. Billing 14 days off today's date keeps a due date inside the window
+ * every day of the year, and staying ≤ 28 keeps it a real day in February.
+ */
+const dueDayInsideCatchup = () => ((DateTime.now().setZone(TZ).day + 13) % 28) + 1
+
 beforeEach(async () => {
   await cleanupAllSchema()
   for (const m of Object.values(mocks)) m.mockClear()
@@ -121,7 +139,7 @@ async function seedPark() {
 
 /** A household on a month-to-month (or a fixed term), $500 deposit held, due the 1st. */
 async function addHousehold(park: Awaited<ReturnType<typeof seedPark>>, opts: {
-  rent?: number; end?: string | null; start?: string
+  rent?: number; end?: string | null; start?: string; dueDay?: number
 } = {}): Promise<Household> {
   const c = await db.connect()
   try {
@@ -134,9 +152,9 @@ async function addHousehold(park: Awaited<ReturnType<typeof seedPark>>, opts: {
     const lease = await c.query<{ id: string }>(
       `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date,
                            rent_due_day, signed_by_landlord, signed_by_tenant)
-       VALUES ($1,$2,$3,$4,'active',$5,$6,1,TRUE,TRUE) RETURNING id`,
+       VALUES ($1,$2,$3,$4,'active',$5,$6,$7,TRUE,TRUE) RETURNING id`,
       [unitId, park.landlordId, opts.rent ?? 1000, opts.end ? 'fixed_term' : 'month_to_month',
-       opts.start ?? '2025-06-15', opts.end ?? null])
+       opts.start ?? '2025-06-15', opts.end ?? null, opts.dueDay ?? 1])
     const leaseId = lease.rows[0].id
     await c.query(
       `INSERT INTO lease_tenants (lease_id, tenant_id, role, status, added_at, added_reason, financial_responsibility)
@@ -629,7 +647,9 @@ describe('canceling a new lease', () => {
 
   it('from its start date a cancel is refused even while the hand-off still waits on the old lease\'s last bill — the household is never moved out', async () => {
     const park = await seedPark()
-    const h = await addHousehold(park)
+    // Billed on a day the catch-up window always holds, so the hand-off below
+    // really does wait — see dueDayInsideCatchup.
+    const h = await addHousehold(park, { dueDay: dueDayInsideCatchup() })
     const { docId } = await newLeaseSignedByLandlord(park, h, plusDays(40))
     const nlId = (await successorOf(h))!
     await db.query(`UPDATE leases SET start_date=$2 WHERE id=$1`, [nlId, today()])
@@ -774,7 +794,9 @@ describe('canceling a new lease', () => {
 describe('a leaving date once the new lease has taken over', () => {
   it('goes on the new lease, even while the hand-off waits — and the household leaves from it', async () => {
     const park = await seedPark()
-    const h = await addHousehold(park)
+    // Billed on a day the catch-up window always holds, so the hand-off below
+    // really does wait — see dueDayInsideCatchup.
+    const h = await addHousehold(park, { dueDay: dueDayInsideCatchup() })
     await newLeaseSignedByLandlord(park, h, plusDays(40))
     const nlId = (await successorOf(h))!
     await db.query(`UPDATE leases SET start_date=$2 WHERE id=$1`, [nlId, today()])
@@ -1255,20 +1277,22 @@ describe('the never-signed draft and the reminders', () => {
       .toEqual({ cancelled_at: null, resolved_at: null, draft_document_id: null })
   })
 
-  // 10/14 (Nic, #4): only what no money touched is deleted. A lapsed draft the
-  // erase's test keeps (a rent change from it already reached the bill) is
-  // canceled exactly as before, and the landlord hears the old words.
-  it('a lapsed draft the erase keeps is voided as before, and the notice keeps the canceled wording', async () => {
+  // 10/14 (Nic, #4): only what no money touched is deleted.
+  // 11/4 (Nic): "I don't want to void things." A lapsed draft the erase's test
+  // KEEPS (a rent change from it already reached the bill) is now LEFT AS IT IS
+  // — not voided, the lease under it not unwound, nobody emailed. Unwinding a
+  // lease money has already run through would take that money with it.
+  it('a lapsed draft the erase keeps is left alone, not voided, and tells nobody', async () => {
     const park = await seedPark()
     const h = await addHousehold(park)
     const lapsed = await seedDoc(h, { issued: false, start: plusDays(-1) })
     await db.query(
       `INSERT INTO scheduled_lease_changes (lease_id, change_type, effective_date, new_rent_amount, status, source_document_id)
        VALUES ($1,'rent', CURRENT_DATE, 600, 'applied', $2)`, [h.leaseId, lapsed.docId])
+    const wasStatus = await docStatus(lapsed.docId)
     await processNewLeaseSignings({ hour: 12 })
-    expect(await docStatus(lapsed.docId)).toBe('voided')
-    expect(mocks.draftLapsed.mock.calls.length).toBeGreaterThan(0)
-    expect(mocks.draftLapsed.mock.calls.every((c: any[]) => c[3]?.deleted === false)).toBe(true)
+    expect(await docStatus(lapsed.docId)).toBe(wasStatus)
+    expect(mocks.draftLapsed.mock.calls).toHaveLength(0)
   })
 
   it('a new lease the landlord signed is never canceled for want of the tenant\'s signature', async () => {

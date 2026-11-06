@@ -114,6 +114,7 @@ import { webhooksRouter } from './webhooks'
 import { emitPaymentSettledEvent, emitPaymentFailedEvent } from '../services/creditLedgerEmitters'
 import { sendNotificationEmail } from '../services/email'
 import { db, getClient } from '../db'
+import { payableRowSql } from '../services/moneyPredicates'
 import {
   cleanupAllSchema,
   seedLandlord, seedManager, seedTenant,
@@ -1132,6 +1133,247 @@ describe('POST /webhooks/stripe — payment_intent.payment_failed: what the tena
     expect(rows.rows.every((r) => r.next_retry_at !== null)).toBe(true)
   })
 
+  // ── 11/4 (Nic): THE NOTICE NAMES WHAT THE BANK WILL BE DEBITED ────────────
+  //
+  //   "Have the retry email state the correct amount that is actually going to
+  //    be charged. Pull up line items at the time of, that the email is going
+  //    out."
+  //
+  // Heather Miller was told $100 and $106.00 was debited. Both tests here use
+  // the same pull: $1,000 rent + $25.20 water, with the $6 ACH fee on the
+  // receipt, so the intent is for $1,031.20 and the charges come to $1,025.20.
+  async function receiptFor(pi: string, fee: number, gross: number) {
+    const p = (await db.query<{ tenant_id: string; landlord_id: string }>(
+      `SELECT tenant_id, landlord_id FROM payments WHERE stripe_payment_intent_id = $1 LIMIT 1`, [pi])).rows[0]
+    await db.query(
+      `INSERT INTO tenant_remittances
+         (tenant_id, landlord_id, amount, applied_amount, unapplied_amount, status,
+          payment_method, stripe_payment_intent_id, gross_amount, processing_fee_amount)
+       VALUES ($1, $2, $3, $3, 0, 'processing', 'ach', $4, $5, $6)`,
+      [p.tenant_id, p.landlord_id, (gross - fee).toFixed(2), pi, gross.toFixed(2), fee.toFixed(2)])
+  }
+
+  it('the retry notice names the intent\'s own amount and lists it, fee included', async () => {
+    await seedPull({
+      paymentIntentId: 'pi_real_debit',
+      lines: [{ type: 'rent', amount: 1000 }, { type: 'utility', amount: 25.20 }],
+    })
+    await receiptFor('pi_real_debit', 6, 1031.20)
+    await post(failedEvent('pi_real_debit', bankError('insufficient_funds'), { amount: 103120 }))
+
+    const html: string = mailOf('ach_retry_scheduled')[0].html
+    expect(html).toContain('$1031.20')                       // what the bank will be asked for
+    expect(html).toContain('What your bank will be asked for')
+    expect(html).toContain('Bank fee')                       // the $6 it used to leave out
+    expect(html).toContain('<span>Rent</span><span>$1000.00</span>')
+    expect(html).toContain('<span>Utility</span><span>$25.20</span>')
+    expect(html).toContain('<span>Bank fee</span><span>$6.00</span>')
+
+    // The landlord's copy is their own question: what their resident owes THEM.
+    const info: string = mailOf('ach_retry_scheduled_info')[0]?.html ?? ''
+    expect(info).toContain('$1025.20')
+    expect(info).not.toContain('$1031.20')
+  })
+
+  it("quotes what the retry will REALLY pull, fees included — Heather's $114", async () => {
+    // 11/5 (Nic). Her pull is $106: a $100 trailer payment plus the flat $6 ACH
+    // fee. She had already bounced once, so an unpaid $4 was on her lease, and
+    // this bounce writes a second. The retry folds both in three days from now
+    // (services/achRetry), so the notice has to say $114 — quoting the intent's
+    // own $106 would tell her one number and take another, which is the defect
+    // the test above exists for, arriving from the other end.
+    const { ids } = await seedPull({
+      paymentIntentId: 'pi_heather_notice', lines: [{ type: 'rent', amount: 100 }] })
+    await receiptFor('pi_heather_notice', 6, 106)
+
+    // Put the charge on a real lease: that is the boundary the fold scopes to,
+    // and every production charge has one.
+    const client = await getClient()
+    try {
+      const row = (await client.query<any>(
+        `SELECT unit_id, tenant_id, landlord_id FROM payments WHERE id = $1`, [ids.rent])).rows[0]
+      const leaseId = await seedLease(client, {
+        unitId: row.unit_id, landlordId: row.landlord_id })
+      await seedLeaseTenant(client, { leaseId, tenantId: row.tenant_id })
+      await client.query(`UPDATE payments SET lease_id = $2 WHERE id = $1`, [ids.rent, leaseId])
+      // The $4 from her FIRST bounce, still unpaid.
+      await client.query(
+        `INSERT INTO payments
+           (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+            entry_description, due_date, notes, revenue_owner)
+         VALUES ($1,$2,$3,$4,'fee',4.00,'pending','RETURNFEE', CURRENT_DATE, $5, 'gam')`,
+        [row.unit_id, leaseId, row.tenant_id, row.landlord_id,
+         'Returned bank payment — an earlier attempt'])
+    } finally { client.release() }
+
+    await post(failedEvent('pi_heather_notice', bankError('insufficient_funds'), { amount: 10600 }))
+
+    const html: string = mailOf('ach_retry_scheduled')[0].html
+    expect(html).toContain('$114.00')          // $100 + $6 bank fee + two $4 returns
+    expect(html).not.toContain('$106.00')      // never the intent's own amount alone
+    // Named once per bounce, so two returns read as two lines.
+    expect(html.match(/Returned-payment fee/g) ?? []).toHaveLength(2)
+  })
+
+  it('falls back to the charges when the event does not name an amount', async () => {
+    await seedPull({ paymentIntentId: 'pi_no_amount', lines: [{ type: 'rent', amount: 450 }] })
+    await post(failedEvent('pi_no_amount', bankError('insufficient_funds')))
+    expect(mailOf('ach_retry_scheduled')[0].html).toContain('$450.00')
+  })
+
+  // ── 11/4 (Nic): THE $4 IS REAL AT ONCE AND ASKED FOR BY NOTHING YET ───────
+  //
+  //   11/5 (Nic), SUPERSEDING the 11/4 hold: "Every time going forward, the fee
+  //   needs to ride the retry amount. And then if it fails again, the doubled up
+  //   fee... needs to ride immediately for whatever next payment method they're
+  //   going to try."
+  //
+  // So the fee is ordinary owed money from the moment the bank refuses the
+  // debit. It still carries no invoice — the bill the bounced pull was for is
+  // the one the resident is mid-way through paying, and dropping a GAM fee onto
+  // it was the 11/4 defect. The 11/4 HOLD is gone: a fee that waits a month is
+  // one GAM has already paid the bank for and is financing. Heather's own held
+  // row from 11/4 is untouched and still rides her next bill, which is the
+  // `held_for_next_bill_at IS NULL` test in achRetry, not an exception here.
+  it('bills the bank\'s $4 return fee immediately, on no bill, so the retry can carry it', async () => {
+    await seedPull({ paymentIntentId: 'pi_return_fee', lines: [{ type: 'rent', amount: 450 }] })
+    await post(failedEvent('pi_return_fee', bankError('insufficient_funds'), { amount: 45600 }))
+
+    const fee = (await db.query<{
+      amount: string; owner: string; invoiced: boolean; held: boolean; payable: boolean
+    }>(
+      `SELECT p.amount::text AS amount, p.revenue_owner AS owner,
+              (p.invoice_id IS NOT NULL) AS invoiced,
+              (p.held_for_next_bill_at IS NOT NULL) AS held,
+              ${payableRowSql('p')} AS payable
+         FROM payments p WHERE p.entry_description = 'RETURNFEE'`)).rows
+    expect(fee).toEqual([{ amount: '4.00', owner: 'gam', invoiced: false, held: false, payable: true }])
+  })
+
+  // ── 11/5 (Nic): THE FEE CARRIES THE DAY THE BANK REFUSED IT ───────────────
+  //
+  //   "For now, just separate the line items by putting the bounce date on
+  //    there."
+  //
+  // And the day is the PROPERTY'S day. Heather's second refusal landed 11/3 at
+  // 7:11pm in Phoenix, which is already 11/4 in UTC — so a date taken from the
+  // server's clock, or from .toISOString(), would print the day AFTER the bank
+  // said no, and only in the evening, which is when nobody is checking.
+  it('stamps the refusal with the property\'s own day, not UTC\'s', async () => {
+    await seedPull({ paymentIntentId: 'pi_evening_bounce', lines: [{ type: 'rent', amount: 450 }] })
+    // 11/3 7:11pm Phoenix === 11/4 02:11 UTC.
+    const phoenixEvening = Date.UTC(2026, 10, 4, 2, 11, 45) / 1000
+    await post(JSON.stringify({
+      id: 'evt_evening_bounce', type: 'payment_intent.payment_failed',
+      created: phoenixEvening,
+      data: { object: { id: 'pi_evening_bounce', metadata: {},
+        last_payment_error: bankError('insufficient_funds') } },
+    }))
+
+    const fee = (await db.query<{ returned_on: string | null }>(
+      `SELECT to_char(returned_on, 'YYYY-MM-DD') AS returned_on
+         FROM payments WHERE entry_description = 'RETURNFEE'`)).rows
+    expect(fee).toEqual([{ returned_on: '2026-11-03' }])
+  })
+
+  // An event with no timestamp of its own (and every pre-11/5 fee) still gets a
+  // day rather than nothing: the webhook's own, which for a live delivery is
+  // the same day the bank refused it.
+  it('falls back to today when the event carries no moment', async () => {
+    await seedPull({ paymentIntentId: 'pi_no_moment', lines: [{ type: 'rent', amount: 450 }] })
+    await post(failedEvent('pi_no_moment', bankError('insufficient_funds')))
+    const fee = (await db.query<{ same: boolean }>(
+      `SELECT (returned_on = CURRENT_DATE) AS same
+         FROM payments WHERE entry_description = 'RETURNFEE'`)).rows
+    expect(fee).toEqual([{ same: true }])
+  })
+
+  it('a re-delivered return event bills the $4 once; a second real return bills a second', async () => {
+    await seedPull({ paymentIntentId: 'pi_two_returns', lines: [{ type: 'rent', amount: 450 }] })
+    const count = async () => Number((await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM payments WHERE entry_description = 'RETURNFEE'`)).rows[0].n)
+
+    await post(failedEvent('pi_two_returns', bankError('insufficient_funds')))
+    expect(await count()).toBe(1)
+    // Stripe re-delivers the SAME event: the handler runs again and bills nothing.
+    await post(failedEvent('pi_two_returns', bankError('insufficient_funds')))
+    expect(await count()).toBe(1)
+    // A second real return: the retry cron claimed the pull (rows back to
+    // 'processing', achRetry.claimPull) and the bank refused it again. A second
+    // event, and a second $4 GAM really paid.
+    await db.query(
+      `UPDATE payments SET status = 'processing', retry_count = retry_count + 1, next_retry_at = NULL
+        WHERE stripe_payment_intent_id = 'pi_two_returns' AND entry_description <> 'RETURNFEE'`)
+    await post(JSON.stringify({
+      id: 'evt_pi_two_returns_b', type: 'payment_intent.payment_failed',
+      data: { object: { id: 'pi_two_returns', metadata: {}, last_payment_error: bankError('insufficient_funds') } },
+    }))
+    expect(await count()).toBe(2)
+  })
+
+  // ── 11/5 (Nic): THE $1 DECLINE FEE ON EVERY ROUTE ─────────────────────────
+  //
+  //   "I did not realize that Stripe charged us $1 for failed debit card
+  //    charges. That also needs to be the $1 for debit cards and the $4 for ACH
+  //    needs to match. Every route, every path that it could happen, people
+  //    need to be charged for those, because we're not going to be out of
+  //    pocket for people's lack of preparation."
+  //
+  // Two holes, both found on 11/5 and both the same shape: GAM paid the
+  // authorization and billed nobody.
+  const cardError = (type: string) => ({ code: 'card_declined', payment_method: { type } })
+  const declineCount = async () => Number((await db.query<{ n: string }>(
+    `SELECT COUNT(*)::text AS n FROM payments WHERE entry_description = 'DECLINEFEE'`)).rows[0].n)
+
+  it('a card DIPPED AT THE FRONT DESK is charged, not only one typed in the app', async () => {
+    // A reader card is 'card_present', never 'card' (routes/payments
+    // front_desk_reader). Both tests in the handler asked only for 'card', so
+    // every counter decline cost GAM its authorization fee and billed nothing —
+    // on the one path where somebody is standing there to be told.
+    await seedPull({ paymentIntentId: 'pi_desk_decline', lines: [{ type: 'rent', amount: 450 }] })
+    await post(failedEvent('pi_desk_decline', cardError('card_present')))
+
+    const fee = (await db.query<{ amount: string; owner: string }>(
+      `SELECT amount::text AS amount, revenue_owner AS owner
+         FROM payments WHERE entry_description = 'DECLINEFEE'`)).rows
+    expect(fee).toEqual([{ amount: '1.00', owner: 'gam' }])
+  })
+
+  it('a second decline on one card is a second fee; a re-delivered event is not', async () => {
+    // Stripe bills GAM per AUTHORIZATION, so two refusals cost twice. The key
+    // used to be the PaymentIntent, which read "one fee per intent" however
+    // many times the card was refused — the same hole RETURNFEE already had
+    // fixed, left open here.
+    await seedPull({ paymentIntentId: 'pi_two_declines', lines: [{ type: 'rent', amount: 450 }] })
+
+    await post(failedEvent('pi_two_declines', cardError('card')))
+    expect(await declineCount()).toBe(1)
+    // Stripe re-delivers the SAME event: one real cost, one fee.
+    await post(failedEvent('pi_two_declines', cardError('card')))
+    expect(await declineCount()).toBe(1)
+    // A second REAL attempt on the same intent: another authorization, another
+    // $0.28 out of GAM's pocket, another fee.
+    await db.query(
+      `UPDATE payments SET status = 'pending'
+        WHERE stripe_payment_intent_id = 'pi_two_declines' AND entry_description <> 'DECLINEFEE'`)
+    await post(JSON.stringify({
+      id: 'evt_pi_two_declines_b', type: 'payment_intent.payment_failed',
+      data: { object: { id: 'pi_two_declines', metadata: {}, last_payment_error: cardError('card') } },
+    }))
+    expect(await declineCount()).toBe(2)
+  })
+
+  it('a refused BANK debit still takes the $4 and never the $1', async () => {
+    // The two fees must not both land on one failure: ACH carries its own.
+    await seedPull({ paymentIntentId: 'pi_bank_not_card', lines: [{ type: 'rent', amount: 450 }] })
+    await post(failedEvent('pi_bank_not_card', bankError('insufficient_funds')))
+
+    const fees = (await db.query<{ tag: string; amount: string }>(
+      `SELECT entry_description AS tag, amount::text AS amount
+         FROM payments WHERE entry_description IN ('RETURNFEE', 'DECLINEFEE')`)).rows
+    expect(fees).toEqual([{ tag: 'RETURNFEE', amount: '4.00' }])
+  })
+
   it('the rent line speaks for the pull in the credit history, even when a fee line shares it', async () => {
     const { ids } = await seedPull({
       paymentIntentId: 'pi_anchor_rent',
@@ -1195,24 +1437,28 @@ describe('POST /webhooks/stripe — payment_intent.payment_failed: what the tena
   // ── S654 (review): a retry in flight bounces again ──────────────────────
   // The retry cron marks a pull's rows 'processing' while the bank works on it.
   // A second bounce must put them back to owed, with the right notice.
-  it('a first retry that bounces short of money again: owed, one more retry set, "this is the last retry"', async () => {
+  // 11/4 (Nic): "they fail once, they retry, it fails again, the payment method
+  // is blocked. That's it." The cap is ACH_MAX_RETRIES = 1, so a retry that
+  // bounces again is TERMINAL — no second retry is scheduled and the resident is
+  // told they must pay another way. This test used to assert the opposite (a
+  // second retry set, "this is the last retry"), which was the two-retry rule.
+  it('a retry that bounces short of money again is the end of it: owed, no further retry', async () => {
     const { ids } = await seedPull({ paymentIntentId: 'pi_retry1_bounce', retryCount: 1 })
     await post(failedEvent('pi_retry1_bounce', bankError('insufficient_funds')))
     const row = (await db.query<{ status: string; next_retry_at: string | null }>(
       `SELECT status, next_retry_at FROM payments WHERE id = $1`, [ids.rent])).rows[0]
-    expect(row.status).toBe('failed')
-    expect(row.next_retry_at).not.toBeNull()
-    const html: string = mailOf('ach_retry_scheduled')[0].html
-    expect(html).toContain('This is the last retry')
-    expect(html).not.toContain('first of two')
+    expect(row).toMatchObject({ status: 'failed', next_retry_at: null })
+    expect(mailOf('ach_retry_scheduled')).toHaveLength(0)
   })
 
-  it('a first bounce schedules the first of two retries — it never says "can\'t try again"', async () => {
+  // 11/4: one retry, so the notice says so. It used to promise "the first of
+  // two" — an attempt GAM will no longer make.
+  it('a first bounce schedules the one retry and calls it the only one', async () => {
     await seedPull({ paymentIntentId: 'pi_first_of_two' })
     await post(failedEvent('pi_first_of_two', bankError('insufficient_funds')))
     const html: string = mailOf('ach_retry_scheduled')[0].html
-    expect(html).toContain('This is the first of two retries')
-    expect(html).not.toContain('can\'t try your bank again')
+    expect(html).toContain('This is the only retry')
+    expect(html).not.toContain('first of two')
   })
 
   it('a retry in flight that bounces on a closed account: owed, final, "your bank turned down"', async () => {

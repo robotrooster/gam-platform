@@ -215,6 +215,22 @@ export const payoutHeldItemProjector: LedgerProjector = {
         ]
         break
       }
+      // 10/27 (Nic) — A DEBT COLLECTED FOR ANOTHER OPERATOR, SETTLING BETWEEN
+      // THE TWO COMPANIES. Neither side books income: the rent was earned and
+      // reported in its own months, by the landlord who was left without it.
+      case 'left_owing_netted':
+        // The collecting landlord. The charge put the money in a liability
+        // (tenantCharges A8c) because it was never theirs; this takes the
+        // liability off and the payout with it. Their equity never moves.
+        memo = 'Collected for another operator, taken from your payout'
+        lines = [...dr('collected_for_another_operator', -a, { ...at, memo }), ...cr('due_from_gam', -a, { ...at, memo })]
+        break
+      case 'left_owing_paid':
+        // The landlord who was owed. Their receivable from the resident who
+        // left comes down as the money arrives — a recovery, not new income.
+        memo = 'Collected toward what a former resident left owing'
+        lines = [...dr('due_from_gam', a, { ...at, memo }), ...cr('ar_tenants', a, { ...at, memo })]
+        break
       default:
         // 'prepaid_draw' (L13), 'pos_sale', 'booking_deposit': their own source posts them.
         return []
@@ -229,7 +245,8 @@ export const payoutHeldItemProjector: LedgerProjector = {
       `SELECT h.id::text AS id, ${localDaySql('h.created_at', propertyTzSql('h.property_id', 'h.landlord_id'))} AS day
          FROM held_payout_items h
         WHERE h.landlord_id = $1
-          AND (h.source_type IN ('deposit_settlement', 'platform_fee', 'dispute')
+          AND (h.source_type IN ('deposit_settlement', 'platform_fee', 'dispute',
+                                 'left_owing_netted', 'left_owing_paid')
                OR (h.source_type = 'refund' AND (h.source_id LIKE 'gam_debit_dispute_won:%' OR h.source_id LIKE 'gam_charge_voided:%')))
           AND ($2::date IS NULL OR h.created_at >= $2::date - INTERVAL '1 day')`,
       [owner.landlordId, opts.since ?? null])

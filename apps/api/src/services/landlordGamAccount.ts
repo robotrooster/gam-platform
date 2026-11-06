@@ -102,6 +102,40 @@ export async function chargeLandlord(
  */
 export const GAM_CHARGE_OWED_SQL = (c: string) => `(${c}.collected_amount < ${c}.amount AND ${c}.voided_at IS NULL)`
 
+/**
+ * SQL: this landlord has a NETTING route — GAM can take what it is owed out of
+ * money already on its way to them, with no bank pull and no transfer cost.
+ *
+ * 11/2 (Nic): "When somebody doesn't have an account set up to debit from, we
+ * pull from their next disbursement. That's already in the code." It was — in
+ * netAgainstDisbursement below, reached from the payout batch's reserve leg —
+ * but the three readers that decide whether a landlord is COLLECTABLE each
+ * carried their own idea of it, and the one that mails the landlord
+ * (landlordGamDebit uncollectableLandlords) had none at all. Mountain View,
+ * whose last seven charges were every one of them netted and which had
+ * $3,410.76 of owner-share sitting on the platform balance against $185.50
+ * owed, was mailed "we cannot collect your balance" six and a half hours after
+ * the charge was raised, on a Sunday, before a payout batch could run. One
+ * definition, used by every reader, so that cannot drift back apart.
+ *
+ * Two ways in, and BOTH are needed:
+ *   - claimable owner-share — the exact money netAgainstDisbursement will take;
+ *   - money settled through GAM here in the last 35 days — because the first
+ *     test is momentarily empty right after a batch pays out, and a landlord
+ *     must not read as uncollectable on the morning after being paid.
+ */
+export const NETTING_ROUTE_SQL = (l: string) => `(
+  EXISTS (SELECT 1 FROM payments p
+            JOIN user_balance_ledger ubl ON ubl.reference_id = p.id
+             AND ubl.reference_type = 'payment'
+             AND ubl.type = 'allocation_owner_share'
+             AND ubl.stripe_transfer_id IS NULL
+           WHERE p.landlord_id = ${l}.id AND p.platform_held = TRUE AND p.status = 'settled')
+  OR EXISTS (SELECT 1 FROM payments p
+              WHERE p.landlord_id = ${l}.id AND p.status = 'settled'
+                AND p.created_at >= NOW() - INTERVAL '35 days')
+)`
+
 /** Everything this landlord still owes GAM, to the cent. */
 export async function outstandingForLandlord(landlordId: string): Promise<number> {
   const row = await queryOne<{ owed: string }>(

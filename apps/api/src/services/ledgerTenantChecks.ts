@@ -69,6 +69,17 @@ import { registerLedgerCheck, unregisterLedgerCheck, type LedgerCheck, type Ledg
 import type { LedgerOwner } from './ledgerOwner'
 import { loadPendingScope, waitingFor, severityOf, PAYMENT_PROPERTY, type PendingRule } from './ledgerPending'
 
+/**
+ * 11/3 — The books start day that governs a FIXED ASSET: its own property's,
+ * else the company's earliest. The asset's property is nullable, and a CHECK
+ * forces it NULL when the cost is split across units, so the company's
+ * earliest is a real fallback and not just defensiveness.
+ */
+const ASSET_BOOKS_START_SQL = (fa: string) => `COALESCE(
+  (SELECT p.books_start_date FROM properties p WHERE p.id = ${fa}.property_id),
+  (SELECT min(p2.books_start_date) FROM properties p2 WHERE p2.landlord_id = ${fa}.landlord_id))`
+
+
 const cents = (v: string | number | null | undefined) => Math.round(Number(v ?? 0))
 const C = (expr: string) => `round((${expr}) * 100)::bigint`
 
@@ -227,14 +238,16 @@ export const undepositedFundsCheck: LedgerCheck = {
                       AND sb.status = 'matched' AND sb.auto_settle_undo->>'kind' = 'deposit_slip'), 0)
        - COALESCE((SELECT ${C('sum(xp.amount)')} FROM landlord_expense_payments xp
                     WHERE xp.landlord_id = $1 AND xp.method = 'cash' AND xp.voided_at IS NULL), 0)
-       - COALESCE((SELECT ${C('sum(fa.cost)')} FROM books_fixed_assets fa JOIN landlords fl ON fl.id = fa.landlord_id
+       - COALESCE((SELECT ${C('sum(fa.cost)')} FROM books_fixed_assets fa
                     WHERE fa.landlord_id = $1 AND fa.funded_by = 'cash' AND fa.voided_at IS NULL AND fa.source_expense_id IS NULL
-                      AND fl.books_start_date IS NOT NULL AND fa.acquired_on >= fl.books_start_date), 0)
+                      AND ${ASSET_BOOKS_START_SQL('fa')} IS NOT NULL
+                      AND fa.acquired_on >= ${ASSET_BOOKS_START_SQL('fa')}), 0)
        - COALESCE((SELECT ${C('sum(fx.amount)')} FROM books_fixed_asset_funding fx
-                     JOIN books_fixed_assets fa ON fa.id = fx.asset_id JOIN landlords fl ON fl.id = fa.landlord_id
+                     JOIN books_fixed_assets fa ON fa.id = fx.asset_id
                     WHERE fa.landlord_id = $1 AND fx.kind = 'cash' AND fx.replaced_at IS NULL AND fa.voided_at IS NULL
                       AND fa.source_expense_id IS NULL
-                      AND fl.books_start_date IS NOT NULL AND fa.acquired_on >= fl.books_start_date), 0))::text AS n`, [id])
+                      AND ${ASSET_BOOKS_START_SQL('fa')} IS NOT NULL
+                      AND fa.acquired_on >= ${ASSET_BOOKS_START_SQL('fa')}), 0))::text AS n`, [id])
     const expected = new Map([['', cents(r.rows[0]?.n)]])
     return compare('undeposited_funds', await severityFor(client, id, TENANT_CHECK_RULES.undepositedFunds), ledger, expected, [], 1)
   },

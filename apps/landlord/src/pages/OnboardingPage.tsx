@@ -613,7 +613,7 @@ export function OnboardingPage() {
             {/* ── STEP 3: GET PAID (Stripe Connect) ── */}
             {/* S649: this was `step === 4` — the Bank Feed step's index — since
                 Add Your Units was inserted ahead of it, so Get Paid rendered an
-                empty screen with Next disabled (Nicholas Fausett, stuck). */}
+                empty screen with Next disabled (Lysander Oglethorpe, stuck). */}
             {/* 10/19 (Nic): "Merge it all so it's one flow." This step used to
                 be a pitch with a button that navigated AWAY to the Disbursement
                 Account page to do the actual Stripe verification — the second

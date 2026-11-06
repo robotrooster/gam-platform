@@ -53,7 +53,7 @@ describe('B1: a card or bank payment through GAM', () => {
       const unitId = await seedUnit(c, { propertyId, landlordId })
       const leaseId = await seedLease(c, { unitId, landlordId })
       await seedLeaseTenant(c, { leaseId, tenantId: co.tenantId })
-      await c.query(`UPDATE landlords SET books_start_date = '2026-01-01' WHERE id = $1`, [landlordId])
+      await c.query(`UPDATE properties SET books_start_date = '2026-01-01' WHERE landlord_id = $1`, [landlordId])
       return { landlordId, unitId, leaseId, propertyId }
     })
     await db.query(`DELETE FROM ledger_outbox WHERE owner_id = $1`, [other.landlordId])

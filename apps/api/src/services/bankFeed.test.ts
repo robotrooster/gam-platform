@@ -444,7 +444,7 @@ describe('bank feed sync', () => {
   // always false, so pre-start rows landed in the review queue.
   it('rows dated before the books start date land ignored as before_books; on/after it, for review', async () => {
     const f = await seed()
-    await db.query(`UPDATE landlords SET books_start_date = '2026-08-01' WHERE id = $1`, [f.landlordId])
+    await db.query(`UPDATE properties SET books_start_date = '2026-08-01' WHERE landlord_id = $1`, [f.landlordId])
     await upsertTransactions(f.connectionId, f.landlordId, [
       { externalId: 'pre_1', postedDate: '2026-07-31', amount: -50, description: 'LOWES 0057 MESA' },
       { externalId: 'on_1',  postedDate: '2026-08-01', amount: -60, description: 'LOWES 0057 MESA' },
@@ -635,7 +635,7 @@ describe('the bank’s own state is followed', () => {
 describe('books start date moves only what it hid', () => {
   it('never brings back a copy, a voided row, or a row the landlord ignored', async () => {
     const f = await seed()
-    await db.query(`UPDATE landlords SET books_start_date = '2026-09-01' WHERE id = $1`, [f.landlordId])
+    await db.query(`UPDATE properties SET books_start_date = '2026-09-01' WHERE landlord_id = $1`, [f.landlordId])
     await upsertTransactions(f.connectionId, f.landlordId, [
       { externalId: 'mine',  postedDate: '2026-09-05', amount: -10, description: 'PERSONAL' },
       { externalId: 'void',  postedDate: '2026-09-06', amount: -11, description: 'HOLD' },

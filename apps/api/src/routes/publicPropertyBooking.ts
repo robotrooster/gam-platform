@@ -6,6 +6,7 @@ import { DateTime } from 'luxon'
 import { query, queryOne, getClient } from '../db'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { AppError } from '../middleware/errorHandler'
+import { logger } from '../lib/logger'
 import { todayIn } from '../lib/timezone'
 import { STAY_TERMS, stayHeldWords, type StayTerms } from '@gam/shared'
 import {
@@ -518,7 +519,9 @@ publicPropertyBookingRouter.get('/property/:slug/booking/:id', async (req, res, 
               b.deposit_amount, b.total_amount, b.hold_expires_at, b.stay_terms,
               b.check_out::text AS check_out_ymd,
               (SELECT sp.amount FROM screening_prepayments sp
-                WHERE sp.booking_id = b.id AND sp.status <> 'void' LIMIT 1) AS screening_paid
+                WHERE sp.booking_id = b.id AND sp.status <> 'void' LIMIT 1) AS screening_paid,
+              EXISTS (SELECT 1 FROM tenant_identifications i WHERE i.booking_id = b.id)
+                AS have_identification
          FROM unit_bookings b
          JOIN units u ON u.id = b.unit_id
         WHERE b.id = $1 AND u.property_id = $2`,
@@ -541,6 +544,31 @@ publicPropertyBookingRouter.get('/property/:slug/booking/:id', async (req, res, 
         heldWords: terms === 'stay' ? stayHeldWords(b.check_out_ymd) : null,
         // R8: the background check paid with this booking (its link is emailed).
         screeningPaid: b.screening_paid != null ? Number(b.screening_paid) : null,
+        /**
+         * ── THE LICENCE, ASKED FOR ON THE PAGE THEY ALREADY LAND ON ───────
+         *
+         * 10/29 (Nic): "Deposit is already paid during booking for people that
+         * do it online... Ask for the ID during the deposit checkout that they
+         * already go through. No sign in, no flow change."
+         *
+         * Offered only once the booking is actually confirmed — a page still
+         * polling for the deposit webhook should be about the deposit — and
+         * only when nothing is on file yet, so a guest who already sent it is
+         * not asked twice. Best-effort: a confirmation page must not fail over
+         * an optional step.
+         */
+        idCaptureUrl: await (async () => {
+          if (b.status !== 'confirmed' && b.status !== 'checked_in') return null
+          if (b.have_identification) return null
+          try {
+            const { guestIdCaptureLink } = await import('./publicGuestId')
+            return await guestIdCaptureLink(req.params.id)
+          } catch (err) {
+            logger.warn({ err, bookingId: req.params.id },
+              '[booking] could not offer the licence step on the confirmation page')
+            return null
+          }
+        })(),
       },
     })
   } catch (e) { next(e) }

@@ -19,3 +19,16 @@ apps/*/vite.config.d.ts
 
 # DB checkpoint dumps are local reset assets — never in git (real data)
 deploy/*.dump
+
+# 10/29 (Ben): tesseract.js writes its 5MB language model into the process's
+# working directory on first use (cachePath defaults to '.'), which put an
+# untracked eng.traineddata at the repo root. The model we actually use is
+# committed on purpose at apps/api/assets/tessdata and named by langPath, with
+# cacheMethod 'none' so nothing is fetched or written at runtime. This line is
+# the belt: a stray copy at the root is never committed by accident.
+/*.traineddata
+/*.traineddata.gz
+# 11/5: and the aside-copy the 10/29 fix left at the root. It was byte-identical
+# to apps/api/assets/tessdata/eng.traineddata and would have put 5MB of
+# duplicate binary in the repo.
+/*.traineddata.moved

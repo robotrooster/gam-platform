@@ -141,11 +141,14 @@ describe('the payment-health percentage reads invoiced against paid', () => {
     expect(h.owed).toBe(460)          // the one resident who really owes rent
     expect(h.invoiced + h.workTradeHeld).toBe(2509)
 
-    // Why health needed its own figure: the books charge the held bill on its
-    // due day like any other, so Money billed counts it — correctly, for the
-    // question IT answers. That card is unchanged.
+    // 11/3 (Nic, DIRECTIVE): the money card agrees with health on this now.
+    // It used to charge the held bill on its due day like any other and read
+    // $2,509 — "it should never show as November's money in the first place."
+    // Health still earns its own figure for the OTHER reason below: a bill a
+    // credit settled is paid, and Money received never sees a credit.
     const card = await collectedRentMtd([w.landlordId], null, { month: MONTH })
-    expect(card.billed.amount).toBe(2509)
+    expect(card.billed.amount).toBe(2049)
+    expect(card.billed.amount).toBe(h.invoiced)
   })
 
   it('a bill settled by an account credit is PAID, though no money arrived', async () => {
@@ -166,7 +169,11 @@ describe('the payment-health percentage reads invoiced against paid', () => {
     const h = await rentHealthMtd([w.landlordId], null, { month: MONTH })
     expect(Math.round((h.paid / h.invoiced) * 100)).toBe(78)
     const card = await collectedRentMtd([w.landlordId], null, { month: MONTH })
-    expect(Math.round((card.billed.collected / card.billed.amount) * 100)).toBe(40)
+    // 11/4: 49%, not 40% — the held work-trade bill is out of the card's
+    // Charged now, so its denominator fell from $2,509 to $2,049. The two
+    // cards still differ, and for the reason health was built: the $589 a
+    // credit settled is paid to health and is not money to the card.
+    expect(Math.round((card.billed.collected / card.billed.amount) * 100)).toBe(49)
   })
 
   it("owed is THIS MONTH'S RENT left to collect, and stays that when other money is open", async () => {
@@ -266,8 +273,10 @@ describe('the dashboard hands the card its own figure', () => {
     // What the card draws: paid over invoiced, rounded (the landlord portal's
     // rentBillsPaidRate, covered by its own test).
     expect(Math.round((h.paid / h.invoiced) * 100)).toBe(78)
-    // The money card is beside it, with its own meaning untouched.
-    expect(r.body.data.rentCard.billed.amount).toBe(2509)
+    // The money card is beside it. Since 11/3 it leaves a held work-trade
+    // bill out of Charged too, so the two agree on what was billed and differ
+    // only on what counts as paid.
+    expect(r.body.data.rentCard.billed.amount).toBe(2049)
   })
 
   /**
@@ -392,22 +401,26 @@ describe('the health figures tie, and the figures beside them stay their own', (
     const { w } = await monthInMiniature()
     const d = await dash(w)
     const owedOf = (c: string) => d.propertyHealth.categories.find((x: any) => x.category === c)
-    // Charged: the month's bills of EVERY kind, the work-trade-held one
-    // included — the books charge it on its due day (services/ledgerParity).
-    expect(owedOf('space_rent').charged).toBe(2509)
+    // Charged: the month's bills of every kind EXCEPT a bill on hold for work
+    // trade — 11/3 (Nic): that is never this month's money, so it is out of
+    // Charged and out of Owed, and reported beside them instead
+    // (services/ledgerReports workTradeAside).
+    expect(owedOf('space_rent').charged).toBe(2049)
     expect(owedOf('utility_other').charged).toBe(120)
     expect(owedOf('other_fees').charged).toBe(40)
     // Owed: what tenants still owed at the END of the month, every bill of
-    // every month. $460 of this month's rent, the $460 on hold, last month's
-    // $500, the $120 water and the $40 on the plan.
+    // every month — EXCEPT the $460 on hold for work trade, which 11/3 took
+    // out of this figure too ("not charged, not owed"). So: $460 of this
+    // month's rent, last month's $500, the $120 water and the $40 on the plan.
     const sumOf = (k: 'charged' | 'received' | 'owed') =>
       Math.round(d.propertyHealth.categories.reduce((s: number, c: any) => s + c[k], 0) * 100) / 100
-    expect(sumOf('owed')).toBe(1580)
-    expect(owedOf('space_rent').owed).toBe(1420)
-    // Mountain View's three figures in miniature: $2,669 charged, $1,000
-    // received, $1,580 owed — and no two of them subtract to the third, which
-    // is the whole reason the card now says so in words.
-    expect(sumOf('charged')).toBe(2669)
+    expect(sumOf('owed')).toBe(1120)
+    expect(owedOf('space_rent').owed).toBe(960)
+    // Mountain View's three figures in miniature: $2,209 charged, $1,000
+    // received, $1,120 owed — and no two of them subtract to the third, which
+    // is the whole reason the card now says so in words, and per row
+    // (financials/ReportsPage WhyRow).
+    expect(sumOf('charged')).toBe(2209)
     expect(sumOf('received')).toBe(1000)
     expect(d.propertyHealth.total).toBe(1000)
     expect(sumOf('charged') - sumOf('received')).not.toBe(sumOf('owed'))

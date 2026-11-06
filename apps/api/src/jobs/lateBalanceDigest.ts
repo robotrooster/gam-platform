@@ -4,7 +4,7 @@
  * It used to sum RENT payment rows, one line per row. Oak Park's email said
  * 7 lines / $2,860 every morning from 9/23 while $4,519.33 was open: the
  * September utility bills were invisible to it, and Billy Miranda (RV 34 +
- * RV 35) and Josh Roby (MH 03 + RV 27) each showed up twice.
+ * RV 35) and Soren Tremaine (MH 03 + RV 27) each showed up twice.
  *
  * Now it asks the same question the front desk asks (services/openBalances),
  * limited to households past their grace period (10/12: the one rule,

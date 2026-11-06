@@ -255,6 +255,7 @@ describe('S655 money predicates', () => {
     const facts: MoneyRowFacts = {
       status: 'pending', amount: '6.00', stripe_payment_intent_id: null, work_trade_suspended_at: null,
       entry_description: 'RETURNFEE', revenue_owner: 'gam', type: 'fee', lease_fee_id: null, reversal_id: null,
+      held_for_next_bill_at: null,
       unit_id: '00000000-0000-0000-0000-0000000000a1', lease_id: '00000000-0000-0000-0000-0000000000b1',
     }
     expect(isPayableRow(facts)).toBe(true)          // owed: an online payment settles it
@@ -278,6 +279,7 @@ describe('S655 money predicates', () => {
     const full: MoneyRowFacts = {
       status: 'pending', amount: 100, stripe_payment_intent_id: 'pi_live', work_trade_suspended_at: null,
       entry_description: 'RETURNFEE', revenue_owner: 'gam', type: 'fee', lease_fee_id: null, reversal_id: null,
+      held_for_next_bill_at: null,
       unit_id: 'u', lease_id: 'l',
     }
     // Each omission used to fail OPEN: a GAM fee read as the landlord's, a row

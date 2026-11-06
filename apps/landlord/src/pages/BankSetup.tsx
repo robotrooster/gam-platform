@@ -14,7 +14,7 @@
  * out. Two nav entries, two headings, two "connect a bank" buttons, and no
  * sequence anywhere telling a landlord what was still undone.
  *
- * Blu Haws (TruBlu Management LLC, Country Acres - Mattoon) started onboarding
+ * Hollis Harkness (TruHollis Management LLC, Country Acres - Mattoon) started onboarding
  * 8/28 at 5:27pm and never finished. He came back on 10/5, went to the
  * Disbursement Account page, found the old pre-Stripe "Add Bank Account" form
  * still sitting there, typed in his First Mid routing and account number, and
@@ -135,8 +135,8 @@ export function useConnectStatus(
  * that picked a company looked at PAYOUTS (lib/payoutReadiness) — it never
  * looked at the read-only feed — so with payouts live everywhere no company was
  * chosen, so nothing was "known", so no banner rendered on any tab and the page
- * opened on the feed. That is Blu one step from now: Oak Park paid and linked,
- * TruBlu paid and NOT linked, and no screen saying so.
+ * opened on the feed. That is Hollis one step from now: Oak Park paid and linked,
+ * TruHollis paid and NOT linked, and no screen saying so.
  *
  * Step 1 comes free with the company list (`connectPayoutsEnabled`). Step 2 is
  * one small read per company, under the SAME query key the chosen company's own
@@ -169,9 +169,9 @@ export function useBankSetupByCompany(isOwner: boolean, companies: PayoutCompany
  * Which company bank setup is for, on the standalone destination.
  *
  * 10/12 (Nic): this was pinned to user.profileId, which /auth/me fills with the
- * account's OLDEST company. Blu owns Oak Park (paid) and TruBlu Management LLC
+ * account's OLDEST company. Hollis owns Oak Park (paid) and TruHollis Management LLC
  * (Country Acres, no Stripe account), so the page opened on Oak Park and told
- * the Country Acres owner "you're all set" with no button to set TruBlu up.
+ * the Country Acres owner "you're all set" with no button to set TruHollis up.
  * It starts on NO company (S654: none is the default) and lands on one only
  * for a reason, in this order: the company a to-do or banner linked to
  * (?entity=), the one company whose rent has nowhere to go, or — 10/19
@@ -786,7 +786,7 @@ export function BankSetupFlow({ surface }: { surface: BankSetupSurface }) {
       <div style={{ marginBottom: 14, fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.6 }}>
         {/* 10/19 (Nic): "I don't know why there's two different fucking signups.
             It should all be in one flow." It is one flow — and it says out loud
-            that it isn't finished until both steps are done, which is what Blu
+            that it isn't finished until both steps are done, which is what Hollis
             had no way to know. */}
         {!s.known
           ? (s.setupKnown && !entityId && s.unfinishedCompanies.length > 0
@@ -838,7 +838,7 @@ export function OwnPayoutAccount() {
 
 /**
  * /banking — the old Disbursement Account address. Kept working forever: a
- * landlord may have it bookmarked, and Blu does. Follows the S605 precedent
+ * landlord may have it bookmarked, and Hollis does. Follows the S605 precedent
  * (/bank-feed and /bank-reconciliation redirect into /bank), and carries the
  * query string through so a to-do's ?entity=<company> still opens that company.
  */

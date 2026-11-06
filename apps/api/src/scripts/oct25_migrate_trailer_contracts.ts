@@ -18,12 +18,12 @@
  *
  * WHO IS HERE, and who is not:
  *
- *   Ivett Paredes, MH 19 — $312.04, 23 payments from 2026-11-01 to 2028-09-01.
+ *   Indra Jeffcoat, MH 19 — $312.04, 23 payments from 2026-11-01 to 2028-09-01.
  *     Nic: "Yvette does not need to be able to pay those separately. It's all or
  *     nothing." Her trailer payment rides her rent invoice, which is how GAM
  *     bills today, and that suits her.
  *
- *   Lisa Scheeler, MH 01 — $333.33, 34 payments from 2026-10-10 to 2029-07-10.
+ *   Calla Fitzhugh, MH 01 — $333.33, 34 payments from 2026-10-10 to 2029-07-10.
  *
  *     WHY 34 AND NOT THE 33 SQUARE SHOWS. Nic: "it's months going forward, but
  *     she has not paid October yet, which is the point that makes it 34. She's
@@ -46,7 +46,7 @@
  *     (jobs/workTradeMonthlyRun.test: "a work-trade resident buying their home
  *     still owes the home payment").
  *
- *   Dominic Gonzalez, MH 25 — NOT in this script, deliberately. His $312.34 goes
+ *   Vesper Vanterpool, MH 25 — NOT in this script, deliberately. His $312.34 goes
  *     to the TRUST that owns the property while his space rent goes to the
  *     Mountain View LLC, so his needs its own invoice and must never be payable
  *     online or land in these books. GAM has no contract-level flag for that
@@ -61,11 +61,11 @@ import { queryOne, getClient } from '../db'
 const MOUNTAIN_VIEW = '96ec7df3-362d-4777-b54c-e9604313820f'
 
 const CONTRACTS = [
-  { who: 'Ivett Paredes',  unit: 'MH 19', monthly: 312.04, payments: 23, startMonth: '2026-11-01',
+  { who: 'Indra Jeffcoat',  unit: 'MH 19', monthly: 312.04, payments: 23, startMonth: '2026-11-01',
     note: 'last bill 2028-09-01' },
   // 34, not Square's 33: Square's figure is what remains after October, and
   // October 10 is still unpaid — so it is installment 1 of 34 here.
-  { who: 'Lisa Scheeler',  unit: 'MH 01', monthly: 333.33, payments: 34, startMonth: '2026-10-10',
+  { who: 'Calla Fitzhugh',  unit: 'MH 01', monthly: 333.33, payments: 34, startMonth: '2026-10-10',
     note: 'unpaid Oct 10 + the 33 Square shows; last lands 2029-07-10, $11,333.22' },
 ]
 

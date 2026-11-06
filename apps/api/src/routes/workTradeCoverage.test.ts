@@ -1,5 +1,5 @@
 /**
- * 10/12 (Nic, Curtis Clabough) — a change of what a work trade covers reaches
+ * 10/12 (Nic, Sage Stillwell) — a change of what a work trade covers reaches
  * the bills already out.
  *
  *   "for some reason you're billing him water or it's set up to bill him water.
@@ -56,7 +56,7 @@ interface World {
   agreementId: string; ownerToken: string; tenantToken: string
 }
 
-/** Curtis's shape: a 25-hour trade covering rent; October's bill holds rent (parked) and water (owed). */
+/** Sage's shape: a 25-hour trade covering rent; October's bill holds rent (parked) and water (owed). */
 async function world(o: { covers?: string[] } = {}): Promise<World> {
   const c = await getClient()
   try {

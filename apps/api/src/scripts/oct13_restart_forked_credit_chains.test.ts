@@ -148,7 +148,7 @@ describe('oct13_restart_forked_credit_chains', () => {
   })
 
   // 10/13 review: on production 5 of the 12 split more than two ways (3, 5 and
-  // 7 branches) and Jonathan Covey's split at two entries. The note is hashed
+  // 7 branches) and Rilla Satterlee's split at two entries. The note is hashed
   // with the restart and can never be corrected: it names every split.
   it('a chain split three ways and again further on: planned, noted and sealed with every split', async () => {
     const tenantId = await newTenant()

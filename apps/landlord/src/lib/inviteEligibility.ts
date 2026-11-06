@@ -44,7 +44,7 @@ export function canInviteToUnit(u: InvitableUnit): boolean {
  *    process. So we need to do that."
  *
  * Country Acres MH 28 is the case the succession subsystem was built for
- * (services/spotSuccession, 10/24): Susie McCoy is leaving and the Bowmans'
+ * (services/spotSuccession, 10/24): Amias Fotheringay is leaving and the Bowmans'
  * daughter is taking the spot from November 1. The machinery fires off the
  * REPLACEMENT'S signature — but a lease has to be drafted for that spot first,
  * and that could not happen because the invite list showed only vacancies.

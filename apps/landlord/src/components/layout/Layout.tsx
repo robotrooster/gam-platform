@@ -1,6 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useUiLayout, applyOrder, moved } from '../../lib/useUiLayout'
+import { installTableStacking } from '../../lib/stackTables'
 import { NotificationBell } from '../NotificationBell'
+import PortalSearch from './PortalSearch'
 import { ChatWidget } from '../ChatWidget'
 import { apiGet } from '../../lib/api'
 import { Outlet, NavLink, Navigate, useNavigate, useLocation } from 'react-router-dom'
@@ -14,7 +16,7 @@ import {
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
   UserSearch, ClipboardList, HeartHandshake, Briefcase, PenTool, UserPlus,
   Landmark, ClipboardCheck, MessageSquare,
-  Sun, Moon, Globe, Headphones, Camera, Gauge, BookOpen, Receipt } from 'lucide-react'
+  Sun, Moon, Globe, Headphones, Camera, Gauge, BookOpen, Receipt, Menu, Hammer, ShieldCheck } from 'lucide-react'
 import { BOOKS_PATHS } from '../../bookkeeping/adapter'
 import { usePerms } from '../../lib/permissions'
 
@@ -152,7 +154,7 @@ const NAV_ITEMS: Array<{
   // 10/19 (Nic): and "Disbursement Account" (/banking) is folded in as its Bank
   // setup tab. "I don't know why there's two different fucking signups. It
   // should all be in one flow." Two entries three letters apart — Bank and
-  // Banking — is what sent Blu Haws to the wrong screen on 10/5, where he typed
+  // Banking — is what sent Hollis Harkness to the wrong screen on 10/5, where he typed
   // a routing number into a form that never reached Stripe. ONE entry now; the
   // old address redirects (main.tsx), and the page itself shows a staff member
   // with direct deposit only their own payout account (BankPage), which is all
@@ -209,6 +211,17 @@ const NAV_ITEMS: Array<{
   { to: BOOKS_PATHS.categories,      icon: BookOpen, label: 'Categories',          section: null, hub: 'bookkeeping', bookkeeper: true, everyBookkeeper: true },
   // Operations
   { to: '/maintenance',   icon: Wrench,           label: 'Maintenance',      section: 'Operations',  category: 'maintenance' },
+  // 10/31: the contractor marketplace. Under the maintenance category because
+  // its permission keys live in that group — a job out for bids is repair work
+  // that happens to be priced by strangers.
+  { to: '/marketplace',   icon: Hammer,           label: 'Contractor Bids',  section: 'Operations',  category: 'maintenance' },
+  // 11/01: every certificate in one place, and what is about to lapse.
+  { to: '/insurance',     icon: ShieldCheck,      label: 'Insurance',        section: 'Operations',  category: 'insurance' },
+  // 11/01: the owner's side of a managed park — what the manager collected,
+  // kept, and paid out. Owner-only on purpose: no `category`, so no staff key
+  // can open it. A manager's own staff must never read the statement of what
+  // that manager kept.
+  { to: '/my-statements', icon: FileText,         label: 'My Statements',    section: 'Financials',  hub: 'financials' },
   { to: '/inspections',   icon: ClipboardCheck,   label: 'Inspections',      section: null,          category: 'inspections' },
   { to: '/documents',     icon: FileText,         label: 'Documents',        section: null,          category: 'documents' },
   // S652 (Nic): a maintenance worker's way to put a posted notice or a record
@@ -572,15 +585,20 @@ function AnnouncementBar() {
   )
   const [idx, setIdx] = useState(0)
   const ann = (items as any[])[idx]
+  // 10/30 (Nic, on a phone): this is the portal's own name sitting in a 375px
+  // bar that also has to hold a hamburger, search and three icons. It wrapped
+  // to four lines and shoved the page down. The sidebar already says who we
+  // are, so the brand is hidden on a phone (CSS) while a real announcement
+  // below is not — a critical platform notice has to survive a small screen.
   if (!(items as any[]).length) return (
-    <div style={{ display:'flex', flexDirection:'column', justifyContent:'center' }}>
+    <div className="topbar-brand" style={{ display:'flex', flexDirection:'column', justifyContent:'center' }}>
       <span style={{ fontWeight:600, fontSize:'.95rem', color:'var(--text-0)', lineHeight:1.2 }}>Gold Asset Management</span>
       <span style={{ fontSize:'.75rem', color:'var(--text-3)', lineHeight:1.2 }}>Property Management Platform</span>
     </div>
   )
   const color = ann.priority === 'critical' ? 'var(--red)' : ann.priority === 'warning' ? 'var(--amber)' : 'var(--gold)'
   return (
-    <div style={{ display:'flex', alignItems:'center', gap:10, maxWidth:500 }}>
+    <div className="topbar-announce" style={{ display:'flex', alignItems:'center', gap:10, maxWidth:500, minWidth:0 }}>
       <div style={{ width:6, height:6, borderRadius:'50%', background:color, flexShrink:0 }} />
       <div style={{ overflow:'hidden' }}>
         <span style={{ fontWeight:600, fontSize:'.82rem', color, marginRight:6 }}>{ann.title}</span>
@@ -629,6 +647,13 @@ export function Layout() {
   // S595: light/dark toggle in the topbar (next to notifications/settings).
   // Per-device — the initial value is applied before paint by the inline script
   // in index.html; this state just reflects it and re-renders the sun/moon icon.
+
+  // 10/30 (Nic): the sidebar is a drawer on a phone. It closes on every
+  // navigation — a menu left open over the page you just chose is the classic
+  // mobile-nav bug, and with a 240px sidebar there is no page visible behind it.
+  const [navOpen, setNavOpen] = useState(false)
+  const navLoc = useLocation()
+  useEffect(() => { setNavOpen(false) }, [navLoc.pathname])
   const [theme, setTheme] = useState<'dark' | 'light'>(
     () => (document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark')
   )
@@ -638,6 +663,15 @@ export function Layout() {
     try { localStorage.setItem('gam_theme', next) } catch {}
     setTheme(next)
   }
+
+  // 10/30 (Nic): on a phone a table becomes one card per row, and a stacked
+  // cell needs its column's name beside the value or it is a bare number.
+  // stackTables copies that name off the <thead> for every table under here,
+  // including pages written later. The stylesheet does the rest.
+  // Watches the whole document, not just .page-content: a good number of these
+  // tables live in dialogs, which render through a portal at the body level and
+  // would otherwise keep their desktop columns on a phone.
+  useEffect(() => installTableStacking(document.body), [])
 
   const handleLogout = () => { logout(); navigate('/login') }
   // 10/11: a bookkeeper's portal is the financial pages alone — no signing
@@ -693,7 +727,7 @@ export function Layout() {
   return (
     <div className="app-shell">
       <style dangerouslySetInnerHTML={{__html: themeCss}} />
-      <aside className="sidebar">
+      <aside className={"sidebar" + (navOpen ? " is-open" : "")}>
         <div className="sidebar-logo">
           <div className="sidebar-logo-mark">⚡ GAM</div>
           <div className="sidebar-logo-sub">Gold Asset Management</div>
@@ -800,11 +834,23 @@ export function Layout() {
         </div>
       </aside>
 
+      {navOpen && <button className="nav-scrim" aria-label="Close menu" onClick={() => setNavOpen(false)} />}
       <div className="main-content">
         {!isBookkeeper && <PendingSignBanner />}
         <header className="topbar" style={{ position:'sticky', top:0, zIndex:100 }}>
+          {/* 10/30: the only way out of the drawer on a phone, and the only
+              way in. Hidden above 820px, where the sidebar is always open. */}
+          <button className="hamburger" onClick={() => setNavOpen(v => !v)}
+                  aria-label="Menu" aria-expanded={navOpen}>
+            <Menu size={20} />
+          </button>
           <AnnouncementBar />
           <div style={{ flex:1 }} />
+          {/* 10/27 (Nic): one search bar, on every page rather than only the
+              dashboard — the trouble he described is worst in the middle of
+              the portal, not on its front page. A bookkeeper sees the money
+              surfaces only, so there is nothing here for them to jump to. */}
+          {!isBookkeeper && <PortalSearch />}
           {!isBookkeeper && <NotificationBell />}
           <button
             className="btn btn-ghost btn-sm"
@@ -816,8 +862,14 @@ export function Layout() {
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
           </button>
           {!isBookkeeper && (
-            <button className="btn btn-ghost btn-sm" style={{ padding:'6px' }}>
-              <Settings size={16} style={{ cursor:'pointer' }} onClick={() => window.location.href='/settings'} />
+            /* 10/30: the click handler sat on the 16px ICON, so only a bullseye
+               hit did anything and the button's padding ring was dead — most
+               thumb taps simply did nothing. Moved onto the button, and given a
+               real target size. */
+            <button className="btn btn-ghost btn-sm" aria-label="Settings"
+                    style={{ padding:'6px', minWidth:40, minHeight:40, display:'inline-flex', alignItems:'center', justifyContent:'center' }}
+                    onClick={() => { window.location.href='/settings' }}>
+              <Settings size={16} />
             </button>
           )}
         </header>

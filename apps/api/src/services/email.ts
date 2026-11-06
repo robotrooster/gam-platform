@@ -12,7 +12,7 @@ import { logger } from '../lib/logger'
 // address, and every caller passed `undefined`, so every one of them shipped a
 // dead link. Nine had already gone out — five "your application is approved"
 // emails to real applicants among them. portalUrls exists because this happened
-// once before ("Lisa's email link is trying to go to localhost"); these were
+// once before ("Calla's email link is trying to go to localhost"); these were
 // missed. A default is evaluated at call time, so these read the real host.
 import { portalLink, portalUrl as portalUrlFor } from '../lib/portalUrls'
 import { replyAddressesFor, type ReplyTo } from './replyRouting'
@@ -132,7 +132,7 @@ export interface EmailAttachment {
 /**
  * ── 10/20 (Nic): THE SECOND GATE. THIS IS THE ROOT OF THE COMPLAINT. ───────
  *
- * Blu Haws sat down and answered every box on his settings page — 90 rows,
+ * Hollis Harkness sat down and answered every box on his settings page — 90 rows,
  * every optional email off, read out of `gam`. The 7am overdue digest, the
  * monthly bill, every payment receipt, the signing request, up to four signing
  * reminders and the monthly property report all kept arriving, because not one
@@ -251,7 +251,7 @@ async function send(
   //
   // Once Resend suppresses an address, every send to it is accepted, assigned a
   // message id, and thrown away. No delivered event, no bounced event, nothing.
-  // Thirteen emails to Rashawn Bump disappeared that way over three weeks —
+  // Thirteen emails to Phaedra Stanhope disappeared that way over three weeks —
   // invitations, reminders and two lease signing requests — every one of them
   // written here as 'sent'. From the landlord's side a tenant was ignoring him.
   //
@@ -288,13 +288,36 @@ async function send(
       // emailFlexsuiteEnrollment path passes a PDF.
       // S629: multipart — html AND text. See htmlToPlainText.
       //
-      // reply_to points at a monitored address even when the From is noreply@:
+      // replyTo points at a monitored address even when the From is noreply@:
       // a sender nobody can reply to is a bulk-mail signal, and a reply is one
       // of the strongest positive signals a mailbox provider has.
+      //
+      // ── 11/1: THE KEY IS camelCase, AND IT HAS TO BE ────────────────────
+      // This said `reply_to` from the day it was written (539fa45, 8/29) and
+      // GAM therefore emitted NO Reply-To header on any email, ever. The
+      // Resend SDK (v4+; 6.12.2 here) builds its request body from a fixed
+      // allowlist of camelCase keys and reads `replyTo` — an extra `reply_to`
+      // on the input is not copied, not rejected, just dropped. `sendArgs` is
+      // typed `any` for the optional attachments, so TypeScript never saw it.
+      //
+      // What it cost: with no Reply-To, every reply fell back to the From
+      // address, and ~40 templates send as 'support' — so tenants replying to
+      // "if any of this looks wrong, reply to this email and your landlord
+      // will take a look" reached support@goldassetmanagement.com, which
+      // Cloudflare forwards to Nic personally. The whole 10/5 reply-routing
+      // build (services/replyRouting) was correct and could never take effect.
+      // Nic, 11/1: "those are going to the landlord, but they're also still
+      // coming to me. support@goldassetmanagement.com. I don't really want to
+      // see those emails. I thought we fixed that."
+      //
+      // The guard that would have caught it is in email.test.ts: it drives the
+      // REAL SDK against a stubbed fetch and asserts the HTTP body carries
+      // reply_to, so the key name is checked against the library rather than
+      // against our own spelling of it.
       const sendArgs: any = {
         from: senderFor(from), to, subject, html,
         text: htmlToPlainText(html),
-        reply_to: routedReplyTo ?? (FROM_SUPPORT.replace(/^.*<|>.*$/g, '') || undefined),
+        replyTo: routedReplyTo ?? (FROM_SUPPORT.replace(/^.*<|>.*$/g, '') || undefined),
       }
       if (attachments && attachments.length > 0) sendArgs.attachments = attachments
       if (!resend) {
@@ -717,6 +740,53 @@ export async function emailBackgroundDecision(tenantEmail: string, tenantName: s
       relatedEntityType: ctx?.backgroundCheckId ? 'background_check' : null,
       relatedEntityId: ctx?.backgroundCheckId ?? null,
       metadata: { decision },
+      replyTo: ctx?.replyTo,
+    }
+  )
+}
+
+/**
+ * ── 10/29 (Nic): TELL THEM THE DEPOSIT CAN BE SPLIT ────────────────────────
+ *
+ * Sent ONCE to a resident sitting with a deposit they have not paid, who can
+ * be offered a plan. Everything in it is their own arithmetic — what they owe
+ * today, and the least they could pay instead — because a message that says
+ * "you may qualify for options" is not worth sending.
+ *
+ * The resident at MH 28 was the case for it: a $450 deposit due on the 1st, a
+ * verified bank, every check passed, and nothing anywhere that would have told
+ * her $179.50 was possible.
+ */
+export async function emailFlexDepositOffer(
+  tenantEmail: string,
+  tenantName: string,
+  o: { depositAmount: number; lowestFirstPull: number; splits: number[]; dueDate?: string | null },
+  portalUrl = portalLink('tenant', 'services?flexdeposit=1'),
+  ctx?: { landlordId?: string; tenantId?: string; replyTo?: ReplyTo },
+) {
+  const money = (n: number) => `$${n.toFixed(2)}`
+  await send(tenantEmail,
+    `You can split your ${money(o.depositAmount)} deposit`,
+    base(
+      h('Your deposit does not have to be paid all at once') +
+      p(`Hi ${tenantName},`) +
+      p(`Your security deposit is <strong style="color:#eef1f8">${money(o.depositAmount)}</strong>`
+        + (o.dueDate ? `, due ${o.dueDate}` : '')
+        + `. If paying it in one go is difficult, you can split it into `
+        + `${o.splits.join(' or ')} monthly payments instead.`) +
+      p(`The smallest first payment available to you is `
+        + `<strong style="color:#22c55e">${money(o.lowestFirstPull)}</strong>, which includes a `
+        + `one-time service fee. The rest comes monthly from your bank account. `
+        + `You will see each option priced before you choose anything.`) +
+      btn('See my options', portalUrl) +
+      p(`If you would rather pay the deposit in full, do nothing — this changes nothing about your bill.`)
+    ),
+    {
+      category: 'flexdeposit_offer',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.tenantId ? 'tenant' : null,
+      relatedEntityId: ctx?.tenantId ?? null,
+      metadata: { depositAmount: o.depositAmount, lowestFirstPull: o.lowestFirstPull },
       replyTo: ctx?.replyTo,
     }
   )
@@ -1247,7 +1317,7 @@ export async function emailNewLeaseTenantUnsigned(to: string, recipientName: str
  * is accepted at the boundary (so Resend reports `delivered`) and then silently
  * dropped or collapsed into the original conversation, where nobody looks.
  *
- * Lisa Scheeler's resent invitation did exactly this. Resend said delivered, the
+ * Calla Fitzhugh's resent invitation did exactly this. Resend said delivered, the
  * link was correct, and it never appeared in her mailbox — not even in spam.
  *
  * So a resend announces itself: different subject, different opening, and a line
@@ -2090,7 +2160,7 @@ export async function emailLoginCode(
   // Whoever can read this table has live database access, which already reads
   // every resident's record, moves an address or mints a session. In a backup
   // they are dead numbers. So the whole subject is logged, as history.
-  // 10/15 (Nic): Scott Vigne asked for twelve codes over two days and could
+  // 10/15 (Nic): Vance Ablewhite asked for twelve codes over two days and could
   // not sign in. Every one was delivered — and every one had the SAME subject,
   // so Gmail collapsed them into one conversation and the code he read was
   // never the newest. A resend retires the one before it, so a stale code
@@ -3241,7 +3311,7 @@ export async function emailPaymentReceipt(
 
 // ── S639: A TENANT-FACING BALANCE REMINDER ───────────────────────────────────
 //
-// Nic: "send Jeremy Parker's email a reminder that there's a new charge for
+// Nic: "send Margo Northcott's email a reminder that there's a new charge for
 // electricity, or just send the reminder that there's an outstanding balance
 // due."
 //
@@ -3314,7 +3384,7 @@ export async function emailBalanceDue(
 
 // ── S641: FINISH VERIFYING YOUR BANK ────────────────────────────────────────
 //
-// Found while chasing a Stripe error in the log. Dominic Gonzalez started a bank
+// Found while chasing a Stripe error in the log. Vesper Vanterpool started a bank
 // setup on September 2, Stripe's deposit landed on the 3rd, and he had been
 // parked in `requires_action` ever since. Nothing chased him: the portal showed
 // a bank on file and the engine saw somebody not paying.
@@ -3345,7 +3415,7 @@ export async function emailVerifyBankReminder(
      *
      * 'sent'     — fired the moment the deposit is on its way, so nobody is
      *              waiting on a message that never comes. This is the one that
-     *              would have saved Dominic Gonzalez nine days.
+     *              would have saved Vesper Vanterpool nine days.
      * 'reminder' — the chase, days later, if they still have not confirmed.
      *
      * Same facts, different tense. A first notice that scolds is wrong, and a
@@ -3554,7 +3624,7 @@ export async function emailInvoiceReady(
 // landlord — so an applicant who paid, closed the tab, and walked away had no
 // route back to the thing they had just paid for.
 //
-// Anastacio Erreguin paid $44.99 on 2026-09-04. His order failed because Checkr
+// Bryce Belmont paid $44.99 on 2026-09-04. His order failed because Checkr
 // had no card on file, and when it was re-placed five days later the only email
 // he had ever received from GAM was a sign-in code. He could not have finished
 // if he wanted to.
@@ -3686,6 +3756,103 @@ export async function emailMonthlyPropertyReport(args: {
       category: 'monthly_property_report',
       landlordId: args.landlordId,
       relatedEntityType: 'monthly_report_send',
+      relatedEntityId: args.sendId,
+      replyTo: args.replyTo,
+    },
+    'noreply',
+    [{ filename: args.filename, content: args.pdf }],
+  )
+}
+
+// ── THE OWNER STATEMENT ───────────────────────────────────────
+//
+// PM readiness 4. An owner whose park a manager runs on GAM received NOTHING:
+// services/ownerStatement computed a complete statement and it evaporated
+// after whoever asked for it closed the tab. This is the email that delivers
+// it, with the statement as a PDF attachment (services/ownerStatementPdf).
+//
+// ITS OWN EMAIL, never a line bolted onto the monthly property report (memory
+// gam-one-email-per-thing): a different document, a different audience, and
+// the two go to different people about different money — the report is a
+// landlord's view of their own park, this is what a manager owes an owner.
+//
+// The cover says the four figures an owner reads first and nothing more. The
+// statement itself — every property, the manager's fee, the itemized bills —
+// is the attachment, because that is the thing they hand their accountant.
+// A reply reaches the MANAGER (replyRouting), not GAM: they are the one who
+// can answer "why is my share lower than last month".
+export interface OwnerStatementEmailRow { name: string; collected: number; ownerShare: number; managementFee: number; expenses: number; net: number }
+
+export async function emailOwnerStatement(args: {
+  to: string
+  recipientName: string | null
+  /** The owner entity as the owner knows it. */
+  entityName: string
+  /** The manager who runs these properties. */
+  pmCompanyName: string
+  monthLabel: string
+  totals: { collected: number; ownerShare: number; managementFee: number; expenses: number; net: number }
+  rows: OwnerStatementEmailRow[]
+  pdf: Buffer
+  filename: string
+  /** The owner's own statements page, for an owner who does sign in. */
+  statementUrl: string | null
+  landlordId: string
+  sendId: string
+  /** The manager's owner-role staff member; unset = GAM support. */
+  replyTo?: ReplyTo
+}): Promise<string | null> {
+  const dollars = (n: number) => `${n < 0 ? '−' : ''}$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  const cell = 'padding:6px 8px;border-bottom:1px solid #1e2530;font-size:.8rem;color:#b8c4d8'
+  const num = `${cell};text-align:right;white-space:nowrap`
+  const head = 'padding:6px 8px;font-size:.66rem;color:#7a8699;text-transform:uppercase;letter-spacing:.05em'
+  const T = args.totals
+  const headline = `
+    <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%;border-collapse:collapse;margin:4px 0 18px">
+      <tr>
+        <td style="${head}">Net to you</td><td style="${head}">Your share</td>
+        <td style="${head}">Management fee</td><td style="${head}">Bills paid for you</td>
+      </tr>
+      <tr>
+        <td style="${cell};color:#c9a227;font-size:1.05rem;font-weight:700">${dollars(T.net)}</td>
+        <td style="${cell};color:#eef1f8">${dollars(T.ownerShare)}</td>
+        <td style="${cell}">${dollars(T.managementFee)}</td>
+        <td style="${cell}">${dollars(T.expenses)}</td>
+      </tr>
+    </table>`
+  const table = args.rows.length ? `
+    <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%;border-collapse:collapse;margin:8px 0 16px">
+      <tr><td style="${head}">Property</td><td style="${head};text-align:right">Collected</td><td style="${head};text-align:right">Your share</td><td style="${head};text-align:right">Expenses</td><td style="${head};text-align:right">Net</td></tr>
+      ${args.rows.map(r => `<tr>
+        <td style="${cell};color:#eef1f8">${escapeHtml(r.name)}</td>
+        <td style="${num}">${dollars(r.collected)}</td>
+        <td style="${num}">${dollars(r.ownerShare)}</td>
+        <td style="${num}">${dollars(r.expenses)}</td>
+        <td style="${num}">${dollars(r.net)}</td>
+      </tr>`).join('')}
+    </table>` : ''
+  const greeting = args.recipientName ? `Hi ${escapeHtml(args.recipientName.split(' ')[0])},` : 'Hello,'
+  const html = base(
+    h(`${escapeHtml(args.entityName)} — ${escapeHtml(args.monthLabel)}`) +
+    p(greeting) +
+    p(`Your statement for ${escapeHtml(args.monthLabel)} from ${escapeHtml(args.pmCompanyName)} is attached as a PDF: `
+      + 'every property, what residents paid, what management took, the bills paid on your behalf, and what is yours.') +
+    headline +
+    table +
+    p(`Collected is what residents paid before anyone’s cut. Your share is what was allocated to you as each payment `
+      + 'settled — the figure your bank will agree with. Net is your share less the bills paid on your behalf. '
+      + `GAM’s own fee is not on this statement: GAM bills ${escapeHtml(args.pmCompanyName)}, not you.`) +
+    (args.statementUrl ? btnWithLink('Open your statements', args.statementUrl) : '') +
+    `<div style="margin-top:20px;font-size:.72rem;color:#4a5568">Reply to this email to reach ${escapeHtml(args.pmCompanyName)} about anything on it.</div>`
+  )
+  return send(
+    args.to,
+    `Owner statement — ${args.entityName} — ${args.monthLabel}`,
+    html,
+    {
+      category: 'owner_statement',
+      landlordId: args.landlordId,
+      relatedEntityType: 'owner_statement_send',
       relatedEntityId: args.sendId,
       replyTo: args.replyTo,
     },

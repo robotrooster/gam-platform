@@ -2,11 +2,12 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { insertPosSale } from '../services/posSale'
 import { recordSaleTowardStay } from '../services/stayPayments'
-import { UTILITY_TYPES, type UtilityType } from '@gam/shared'
+import { cashBreakdownTotalCents, UTILITY_TYPES, type UtilityType } from '@gam/shared'
 import { cardFeeSplit, STAY_TERMS, STAY_SCREENING_NIGHTS, STAY_LEASE_CHOICE_NIGHTS, stayHeldWords, type CardFeePayer, type StayTerms } from '@gam/shared'
 
 const round2 = (n: number) => Math.round(n * 100) / 100
 import { db, query, queryOne, getClient } from '../db'
+import { canManageLandlordResource } from '../middleware/scope'
 import { requireAuth, requirePerm, userHasPerm, assertPropertyInScope, getScopedPropertyIds } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { calculateCartTax, computeCartTotals, aggregateCartTotals, effectiveItemTaxes } from '../services/posTax'
@@ -14,7 +15,6 @@ import { holdForTheCart, createConnectionToken, registerReader, listReaders, arc
 import crypto from 'crypto'
 import { DateTime } from 'luxon'
 import { logger } from '../lib/logger'
-import { todayIn } from '../lib/timezone'
 import { replyToProperty } from '../services/replyRouting'
 import { resolveLandlordTarget, ownsLandlord, landlordScopeIds } from '../lib/landlordScope'
 import { cardIdentityFromIntent, findOrCreateCustomerForCard, startSaveCardPrompt, readSaveCardAnswer, saveCardForCustomer, mergePosCustomers, readSaleCard, nameIsAPlaceholder, type CardIdentity, type CardCustomer } from '../services/posCustomerCards'
@@ -768,6 +768,25 @@ async function screeningAlreadyPaid(bookingId: string): Promise<boolean> {
 // not a thing a register may type.
 export interface CounterScreening { name: string; email: string; price: number }
 
+/**
+ * ── 10/31 (Nic): NO LONGER REACHABLE FROM ANY SCREEN ────────────────────────
+ *
+ * Paying for a background check at the counter was built on his 10/21 request —
+ * an applicant should not have to buy 22 nights to buy a check. On 10/30 he
+ * reversed it: "pos has nothing to do with screening... that shouldn't be
+ * there", and on 10/31 confirmed removing it. The Checks tab is gone from both
+ * register apps, and nothing sends a `screening` on a sale any more. No money
+ * ever went through it.
+ *
+ * Kept, not deleted, and deliberately: this sits inside the cart-quote and
+ * charge paths, which are the most heavily tested money code in the file, and
+ * tearing it out for tidiness is a worse trade than leaving it inert. The only
+ * way in now is a direct API call.
+ *
+ * If you are reading this because posCounterScreening.test.ts made you think
+ * the feature exists — it does not. The screening link and its QR live on the
+ * landlord's screening page, where the dashboard's Applications card lands.
+ */
 async function counterScreeningOf(
   landlordId: string, propertyId: string | null, raw: unknown, press: string,
 ): Promise<CounterScreening | null> {
@@ -2552,7 +2571,7 @@ posRouter.get('/tickets/:id', requirePerm('pos.ring_sale'), async (req: any, res
 
 // PUT /api/pos/tickets/:id — put a reopened ticket back on the list.
 //
-// 10/2 (Nic, the Scott Duffy ticket): Clear on a reopened ticket used to POST a
+// 10/2 (Nic, the Ulyssa Yoxall ticket): Clear on a reopened ticket used to POST a
 // SECOND ticket and leave the first open — two tickets for one tank, and a
 // double charge waiting to happen. Clear now puts the ORIGINAL back: unchanged
 // when the cart still matches it (the register sends nothing), updated in place
@@ -2625,7 +2644,14 @@ posRouter.get('/tickets', requirePerm('pos.ring_sale'), async (req: any, res, ne
     if (!propertyId) throw new AppError(400, 'Pick the property at the top of the register first.')
     await assertPropertyInScope(req.user, propertyId)
     const rows = await query<any>(
-      `SELECT t.*, ${ticketPersonNameSql('t')} AS customer_name
+      `SELECT t.*, ${ticketPersonNameSql('t')} AS customer_name,
+              -- 11/5: has the desk already said nobody came back for this one?
+              -- Read from the part itself so the button can never offer twice.
+              (SELECT lp.amount::text FROM tenant_left_owing_parts lp
+                JOIN tenant_left_owing lo ON lo.id = lp.owing_id
+                WHERE lp.kind = 'counter' AND lp.source_key = t.id::text
+                  AND lp.voided_at IS NULL AND lo.settled_at IS NULL
+                LIMIT 1) AS left_owing_amount
          FROM pos_open_tickets t
         WHERE t.property_id = $1 AND t.landlord_id = $2 AND t.status = 'open'
         ORDER BY t.created_at`,
@@ -2637,7 +2663,14 @@ posRouter.get('/tickets', requirePerm('pos.ring_sale'), async (req: any, res, ne
     const links = await query<any>(
       `SELECT l.id, l.property_id, l.landlord_id, l.items, l.total, l.discount_amount, l.label,
               l.tenant_id, l.pos_customer_id, l.booking_id, ${ticketPersonNameSql('l', 'l.customer_name')} AS customer_name, l.created_at,
-              'Emailed pay link — sent ' || to_char(l.created_at, 'Mon DD') AS note
+              'Emailed pay link — sent ' || to_char(l.created_at, 'Mon DD') AS note,
+              -- 11/5: has the desk already said nobody came back for this one?
+              -- Read from the part itself so the button can never offer twice.
+              (SELECT lp.amount::text FROM tenant_left_owing_parts lp
+                JOIN tenant_left_owing lo ON lo.id = lp.owing_id
+                WHERE lp.kind = 'counter' AND lp.source_key = l.id::text
+                  AND lp.voided_at IS NULL AND lo.settled_at IS NULL
+                LIMIT 1) AS left_owing_amount
          FROM pos_pay_links l
         WHERE l.property_id = $1 AND l.landlord_id = $2
           AND l.kind = 'one_time' AND l.status = 'open'
@@ -2698,7 +2731,155 @@ posRouter.post('/tickets/:id/void', requirePerm('pos.ring_sale'), async (req: an
     await query(
       `UPDATE pos_open_tickets SET status='voided', voided_at=NOW(), void_reason=$2, updated_at=NOW()
         WHERE id=$1`, [t.id, reason])
+    // 11/5: a voided ticket is not owed, so a walk-away part written against it
+    // is not either. Nothing happens when there is none, which is the usual case.
+    const { dropWalkAwayPart } = await import('../services/leftOwingParts')
+    await dropWalkAwayPart({ query: query as any }, {
+      landlordId: posLandlordId(req), kind: 'counter', sourceKey: t.id,
+      reason: reason ? `The ticket was voided — ${reason}`.slice(0, 500) : 'The ticket was voided',
+    })
     res.json({ success: true, data: { voided: true } })
+  } catch (e) { next(e) }
+})
+
+/**
+ * POST /api/pos/tickets/:id/never-came-back — THEY WALKED AWAY FROM IT.
+ *
+ * 11/5 (Nic). The open list has deliberately had no Discard since 10/24:
+ *
+ *   "Anything that's a ticket is a outstanding balance that needs to be paid.
+ *    If I send somebody a point of sale ticket and they never pay it, that's a
+ *    left owing money situation. Those are not able to be discarded."
+ *
+ * Settle is still the only thing that closes one by PAYMENT. This is the only
+ * thing that writes one into the walk-away book — his propane case: "my card
+ * wasn't working when I went to buy some propane, and I'm going to come back
+ * with a new card," and they never do.
+ *
+ * ── A PERSON DECIDES, NOT A TIMER ───────────────────────────────────────────
+ *
+ * There was an obvious alternative — sweep any tab still open past N days —
+ * and the real list refuses it. What is sitting open at Mountain View right
+ * now is September's electric on RV 30 ("left before it was billed; may be
+ * coming back"), which IS a walk-away; a ticket for a stay next January; and
+ * two unpaid reservation deposits. A timer would flag all four, and a
+ * walk-away debt follows somebody to every other park on the platform. So the
+ * desk says so, and the two reservation shapes are refused outright here even
+ * when somebody does press it — an unpaid hold has no timer and simply does
+ * not convert ([[gam-unpaid-hold-yields-to-payment]]).
+ *
+ * THE TICKET STAYS OPEN. It is still money owed, and he was explicit that a
+ * ticket is not discardable. Recording it does not close it; paying it later
+ * withdraws the part (the settle paths below do that), so somebody who comes
+ * back with a working card stops being flagged.
+ */
+posRouter.post('/tickets/:id/never-came-back', requirePerm('pos.ring_sale'), async (req: any, res, next) => {
+  try {
+    const id = String(req.params.id)
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new AppError(404, TICKET_GONE)
+    const landlordId = posLandlordId(req)
+
+    // The same two things the open list shows: a ticket, or a one-time pay
+    // link that was never paid. Whichever it is, the person on it comes back
+    // the same way — their account if they have one, else what the desk took
+    // down, else the guest on the reservation.
+    const who = `
+      (SELECT NULLIF(TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')), '')
+         FROM tenants tn JOIN users u ON u.id = tn.user_id WHERE tn.id = x.tenant_id),
+      (SELECT NULLIF(TRIM(COALESCE(cu.first_name, c.first_name, '') || ' ' || COALESCE(cu.last_name, c.last_name, '')), '')
+         FROM pos_customers c LEFT JOIN tenants ctn ON ctn.id = c.tenant_id
+         LEFT JOIN users cu ON cu.id = ctn.user_id WHERE c.id = x.pos_customer_id)`
+    const contact = (col: string, linkCol: string | null) => `
+      (SELECT NULLIF(btrim(COALESCE(u.${col}, '')), '')
+         FROM tenants tn JOIN users u ON u.id = tn.user_id WHERE tn.id = x.tenant_id),
+      (SELECT NULLIF(btrim(COALESCE(cu.${col}, c.${col}, '')), '')
+         FROM pos_customers c LEFT JOIN tenants ctn ON ctn.id = c.tenant_id
+         LEFT JOIN users cu ON cu.id = ctn.user_id WHERE c.id = x.pos_customer_id),
+      ${linkCol ? `NULLIF(btrim(COALESCE(x.${linkCol}, '')), ''),` : ''}
+      (SELECT NULLIF(btrim(COALESCE(b.guest_${col}, '')), '') FROM unit_bookings b WHERE b.id = x.booking_id)`
+
+    const found = await queryOne<{
+      kind: string; status: string; property_id: string; booking_id: string | null
+      items: any; discount_amount: string | null; total: string | null
+      user_id: string | null; who: string | null; email: string | null; phone: string | null
+      note: string | null
+    }>(
+      `SELECT 'ticket' AS kind, x.status, x.property_id, x.booking_id, x.items,
+              NULL::numeric AS discount_amount, NULL::numeric AS total, x.note,
+              (SELECT tn.user_id FROM tenants tn WHERE tn.id = x.tenant_id) AS user_id,
+              COALESCE(${who},
+                (SELECT NULLIF(btrim(COALESCE(b.guest_name, '')), '') FROM unit_bookings b WHERE b.id = x.booking_id)) AS who,
+              COALESCE(${contact('email', null)}) AS email,
+              COALESCE(${contact('phone', null)}) AS phone
+         FROM pos_open_tickets x
+        WHERE x.id = $1 AND x.landlord_id = $2
+        UNION ALL
+       SELECT 'pay_link' AS kind, x.status, x.property_id, x.booking_id, x.items,
+              x.discount_amount, x.total, x.label AS note,
+              (SELECT tn.user_id FROM tenants tn WHERE tn.id = x.tenant_id) AS user_id,
+              COALESCE(${who}, NULLIF(btrim(COALESCE(x.customer_name, '')), ''),
+                (SELECT NULLIF(btrim(COALESCE(b.guest_name, '')), '') FROM unit_bookings b WHERE b.id = x.booking_id)) AS who,
+              COALESCE(${contact('email', 'customer_email')}) AS email,
+              COALESCE(${contact('phone', 'customer_phone')}) AS phone
+         FROM pos_pay_links x
+        WHERE x.id = $1 AND x.landlord_id = $2 AND x.kind = 'one_time'`,
+      [id, landlordId])
+    if (!found) throw new AppError(404, TICKET_GONE)
+    await assertPropertyInScope(req.user, found.property_id)
+    if (found.status !== 'open') {
+      throw new AppError(409, `That one is already ${found.status} — open the list again to see what is still out.`)
+    }
+
+    // ── A RESERVATION'S MONEY IS NOT A WALK-AWAY ────────────────────────────
+    // A ticket held for a stay that has not happened, and a deposit link on a
+    // hold that was never paid, are both money that may still arrive. Nobody
+    // walked away from either; the hold simply lapses.
+    if (found.booking_id) {
+      const b = await queryOne<{ gone: boolean; label: string }>(
+        `SELECT (b.check_out IS NOT NULL AND b.check_out < CURRENT_DATE) AS gone,
+                COALESCE(to_char(b.check_in, 'Mon DD'), 'their stay') AS label
+           FROM unit_bookings b WHERE b.id = $1`, [found.booking_id])
+      if (!b?.gone) {
+        throw new AppError(409,
+          'This one belongs to a reservation that has not finished, so nobody has walked away from it. '
+          + `If the stay (${b?.label ?? 'their stay'}) is not happening, cancel it on the schedule instead.`)
+      }
+    }
+
+    // What they owe on it. A ticket is totaled the way the register totals it,
+    // as cash — no card fee, because nobody is paying by card.
+    const amount = found.kind === 'pay_link'
+      ? Math.round(Number(found.total ?? 0) * 100) / 100
+      : (await serverCartTotals(landlordId, found.items ?? [], 'cash', 0, undefined, found.property_id)).total
+    if (!(amount > 0)) {
+      throw new AppError(409, 'There is nothing owed on this one, so there is nothing to record. Settle it to take it off the list.')
+    }
+
+    const person = {
+      userId: found.user_id, who: found.who, email: found.email, phone: found.phone,
+    }
+    const { recordWalkAwayPart, walkAwayPersonKey } = await import('../services/leftOwingParts')
+    // FOOLPROOF: say what is missing rather than failing quietly. A name alone
+    // cannot be matched at another park, so without an email or a phone the
+    // debt would flag nobody and sit forever.
+    if (!walkAwayPersonKey(person)) {
+      throw new AppError(409,
+        'There is no email or phone on this one, so no other park could ever be told it is the same person. '
+        + 'Add their phone number to their customer record first, then press this again.')
+    }
+
+    const rec = await recordWalkAwayPart({ query: query as any }, {
+      landlordId, propertyId: found.property_id, person,
+      kind: 'counter', sourceKey: id, amount,
+      note: found.note ? `Never came back for it — ${found.note}`.slice(0, 500)
+                       : 'A counter tab nobody came back for',
+    })
+    if (!rec) {
+      throw new AppError(409,
+        'This person already has a balance being collected on, so its figure is fixed until that '
+        + 'arrangement finishes. The ticket stays on the list and is still owed.')
+    }
+    res.json({ success: true, data: { amount: rec.amount, owedInAll: rec.total, who: rec.who } })
   } catch (e) { next(e) }
 })
 
@@ -2729,6 +2910,9 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
   try {
     let { items, discountAmount } = req.body
     const { paymentMethod, tenantId, posCustomerId, propertyId, surcharge, changeGiven, stripePaymentIntentId, discountReason, openTicketId,
+            // 10/31 (Nic): the open shift whose drawer this sale goes into, so
+            // that drawer can be counted down. Checked below — never trusted.
+            registerShiftId,
             // S652 (Nic): an emailed pay link settled in person, from the
             // "out for delivery" list. The link is the bill: its lines, its
             // prices and its discount are charged, whatever the cart sent.
@@ -3386,6 +3570,15 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         if (!claimed.rows.length) {
           throw new AppError(409, 'That ticket has already been settled or voided at another register — nothing was charged here. Press Clear, then open the list to see what is still out.')
         }
+        // 11/5: they came back with a working card. If the desk had written
+        // this tab into the walk-away book, that part goes — somebody who paid
+        // must not stay flagged at every other park on the platform. Inside
+        // the sale's own transaction, so it cannot survive a rolled-back sale.
+        const { dropWalkAwayPart } = await import('../services/leftOwingParts')
+        await dropWalkAwayPart(client, {
+          landlordId: posLandlordId(req), kind: 'counter', sourceKey: String(openTicketId),
+          reason: 'They came back and paid it at the register',
+        })
       }
 
       // 10/20 (Nic): a utility bill on this link that was paid some other way
@@ -3410,6 +3603,69 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
         }
       }
 
+      // ── 10/31 (Nic): WHICH DRAWER THIS SALE WENT INTO ────────────────────
+      //
+      // The register app sends the shift it is ringing into. Nothing about it
+      // is trusted: it has to be OPEN and at THIS property, or the sale is
+      // refused rather than quietly landing in nobody's drawer and making a
+      // count wrong at the end of the shift. Absent is fine and normal — a
+      // property with no registers rings exactly as it always has.
+      let saleShiftId: string | null = null
+      if (typeof registerShiftId === 'string' && registerShiftId) {
+        const sh = (await client.query<{
+          id: string; status: string; property_id: string; name: string; opened_by: string
+        }>(`SELECT s.id, s.status, s.property_id, r.name, s.opened_by_user_id AS opened_by
+             FROM pos_register_shifts s JOIN pos_registers r ON r.id = s.register_id
+            WHERE s.id = $1`, [registerShiftId])).rows[0]
+        if (!sh) throw new AppError(400, 'That register shift does not exist — open a shift and ring it again.')
+        if (sh.status !== 'open') {
+          throw new AppError(409,
+            `${sh.name}'s shift has already been counted and closed. Open a new shift before ringing anything else.`)
+        }
+        if (propertyId && sh.property_id !== propertyId) {
+          throw new AppError(400, `${sh.name} is not at this property.`)
+        }
+        // 10/31 (Nic): "If I'm on the first register, that's it for the shift."
+        // Ringing into somebody else's open drawer would make their count wrong
+        // and leave the cash answerable by nobody.
+        if (sh.opened_by !== req.user!.userId) {
+          throw new AppError(403,
+            `${sh.name} is somebody else's drawer this shift. Ring it on your own register, or have them `
+            + `count theirs down first.`)
+        }
+        saleShiftId = sh.id
+      } else if (propertyId) {
+        // ── 10/31 (Nic): NO DRAWER, NO SALE ──────────────────────────────────
+        //
+        //   "If you were never signed into a register, without being dedicated
+        //    to a register, you shouldn't be able to just do transactions. Like,
+        //    if you put money in the drawer without being signed in, it would be
+        //    items that were not rung up, and under that scenario you would
+        //    always have an overage."
+        //
+        // Exactly right: cash in a till with nothing rung against it reads as an
+        // overage every time, and the count stops meaning anything.
+        //
+        // Only where the property HAS registers. Somewhere that never made one
+        // rings exactly as it always has — which is every property today and
+        // most of them forever. This cannot strand a counter that has not opted
+        // in; the moment a place makes its first register, it has opted in.
+        const hasRegisters = (await client.query<{ n: number }>(
+          `SELECT COUNT(*)::int AS n FROM pos_registers
+            WHERE property_id = $1 AND status = 'active'`, [propertyId])).rows[0]?.n ?? 0
+        if (hasRegisters > 0) {
+          const mine = (await client.query<{ name: string }>(
+            `SELECT r.name FROM pos_register_shifts s JOIN pos_registers r ON r.id = s.register_id
+              WHERE s.opened_by_user_id = $1 AND s.status = 'open' AND s.property_id = $2
+              LIMIT 1`, [req.user!.userId, propertyId])).rows[0]
+          throw new AppError(409, mine
+            ? `Your shift on ${mine.name} is open but this sale did not say which drawer it goes in. `
+              + `Reload the register and ring it again.`
+            : `Start a shift on a register before ringing a sale. Cash in a drawer with nothing rung `
+              + `against it shows up as an overage at the end of the shift.`)
+        }
+      }
+
       let tx: any
       try {
         // S648: the writes live in services/posSale so a paid pay link records
@@ -3420,6 +3676,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
           changeGiven, platformFee, stripePaymentIntentId: stripePaymentIntentId ?? cardOnFileIntentId,
           discountAmount: discountAmt, discountReason,
           paymentReference: paymentMethod === 'check' ? checkRef : null,
+          registerShiftId: saleShiftId,
           ...(paymentMethod === 'card' || paymentMethod === 'card_on_file'
             ? { payoutOwed: round2(Math.max(0, total - cardFee - gamKeeps)) } : {}),
           // 10/3 (decisions #21): a reservation's line is recorded at its price
@@ -3471,6 +3728,13 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
             throw new AppError(409, 'That pay link was paid a moment ago — nothing was charged here. Press Clear; it is no longer owed.')
           }
           await client.query(`UPDATE pos_transactions SET pay_link_id = $2 WHERE id = $1`, [tx.id, payLink.id])
+          // 11/5: paid, so a walk-away part the desk wrote against this link
+          // goes with it — nobody who paid stays flagged at the next park.
+          const { dropWalkAwayPart: dropLinkPart } = await import('../services/leftOwingParts')
+          await dropLinkPart(client, {
+            landlordId: posLandlordId(req), kind: 'counter', sourceKey: String(payLink.id),
+            reason: 'They came back and paid the link at the register',
+          })
           // 10/20 (Nic): "a paylink's utility line settles the bill and counts as
           // recovery" — AT THE COUNTER TOO. "A lot of people that move out are
           // going to get their final electric bill as a pay link anyway", and
@@ -4342,6 +4606,7 @@ posRouter.patch('/items/:id/variants/:variantId', requirePerm('pos.manage_invent
 
 import type { PoolClient } from 'pg'
 import { TAXES_EDIT_PERM } from '../lib/bookkeeperAccess'
+import { todayIn } from '../lib/timezone'
 
 /** The permission the tax list asks for — one catalog key (packages/shared). */
 const TAXES_EDIT = TAXES_EDIT_PERM
@@ -4803,7 +5068,7 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
     const { reopenUtilityPayLinkSettlements } = await import('../services/utilityPayLink')
     utilityRefund = await reopenUtilityPayLinkSettlements(client, {
       saleId: tx.id,
-      reason: `Refunded $${refundAmt.toFixed(2)} on ${new Date().toISOString().slice(0, 10)}`,
+      reason: `Refunded $${refundAmt.toFixed(2)} on ${todayIn(null)}`,
       refundedAmount: refundAmt,
       fullyRefunded: isFullRefund,
     })
@@ -5566,7 +5831,7 @@ posRouter.post('/terminal/readers/:stripeReaderId/cart', requirePerm('pos.ring_s
       return res.json({ success: true, data: { shown: false, cleared, stayNotPriced: true } })
     }
     const quoted = await serverCartTotals(landlordId, showable, 'card', req.body?.discountAmount, undefined, propertyId)
-    // 10/2 (the Scott Duffy ticket): putting the cart up never fails over the
+    // 10/2 (the Ulyssa Yoxall ticket): putting the cart up never fails over the
     // person. Somebody who cannot be named here shows no name; the sale itself
     // still checks who it names.
     const who = await nameForReader(landlordId, { tenantId: req.body?.tenantId, posCustomerId: req.body?.posCustomerId }, await whoIsAsking(req, landlordId))
@@ -6284,10 +6549,10 @@ posRouter.patch('/transactions/:id/customer', requirePerm('pos.ring_sale'), asyn
  * THE WRONG TENDER, AND A VOID IS THE WRONG WAY TO SAY SO.
  *
  *   "one propane sale got marked as cash when the person dropped off a check.
- *    $49.25 under Donald Hamp. So we need to correctly re-record that to be a
+ *    $49.25 under Wren Westbrook. So we need to correctly re-record that to be a
  *    check and not cash."
  *
- *   "I want you to re-record Donald Hamp as paid with check. I don't want to
+ *   "I want you to re-record Wren Westbrook as paid with check. I don't want to
  *    void the sale and redo it. I don't like voiding sales. It's just like it
  *    makes it look like it was there when it wasn't. And it's just extra data
  *    in the system that doesn't need to remain."
@@ -7007,3 +7272,284 @@ posRouter.post('/held-payments/:id/refund', requirePerm('pos.ring_sale'), async 
     res.json({ success: true, data: { refunded: true, amount: Number(row.amount), stripeFeeKept: kept } })
   } catch (e) { next(e) }
 })
+
+// ── COUNTING THE CASH DRAWER DOWN (10/31, Nic) ───────────────────────────────
+//
+// A register is a till at a location, and it carries its OWN starting cash —
+// what stays in the drawer so the next person can make change. Nothing
+// inherits: no company or property value is ever read to fill it in, and there
+// is no platform default. GAM SUGGESTS $100 and a person confirms it. His
+// words: "I don't want to have any default for that at the platform level...
+// it can suggest $100, but nothing is set in stone. They would have to confirm
+// it."
+//
+// Why per register: "a second one, it's probably going to be for backup
+// coverage for breaks... a manager may use it only sporadically while the
+// employee is on break." That drawer plainly needs a different amount than the
+// main one, so "it doesn't need to be the same across each register at the
+// property. It just has to know which one it is."
+//
+// The word "float" is not used anywhere a person can see. Asked what it meant,
+// he had never heard it.
+//
+// Gating follows the register's existing grain: configuring is
+// `pos.manage_inventory`, and opening or counting a drawer is the cashier's own
+// work (`pos.ring_sale` or `pos.end_of_day`).
+
+const CONFIG_DRAWER = requirePerm('pos.manage_inventory')
+const WORK_DRAWER   = requirePerm('pos.ring_sale', 'pos.end_of_day', 'pos.manage_inventory')
+
+/** The registers at a property, with whatever shift is open on each. */
+posRouter.get('/registers', WORK_DRAWER, async (req, res, next) => {
+  try {
+    const propertyId = z.string().uuid().parse(req.query.propertyId)
+    await assertPropertyInScope(req.user, propertyId)
+    const rows = await query<any>(`
+      SELECT r.id, r.name, r.status,
+             r.starting_cash_cents, r.starting_cash_breakdown,
+             r.starting_cash_confirmed_at, r.variance_reason_over_cents,
+             s.id AS open_shift_id, s.opened_at AS open_shift_opened_at,
+             s.opening_cash_cents AS open_shift_opening_cents,
+             -- 10/31: so the register page can tell MY drawer from a colleague's.
+             s.opened_by_user_id AS open_shift_opened_by,
+             NULLIF(BTRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')), '') AS open_shift_who
+        FROM pos_registers r
+        LEFT JOIN pos_register_shifts s ON s.register_id = r.id AND s.status = 'open'
+        LEFT JOIN users u ON u.id = s.opened_by_user_id
+       WHERE r.property_id = $1 AND r.status = 'active'
+       ORDER BY lower(r.name)`, [propertyId])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+posRouter.post('/registers', CONFIG_DRAWER, async (req, res, next) => {
+  try {
+    const body = z.object({
+      propertyId: z.string().uuid(),
+      name: z.string().trim().min(1).max(60),
+      // Omitted on purpose = nobody has confirmed an amount yet, and no shift
+      // can open until somebody does. GAM never writes one by itself.
+      startingCashCents: z.number().int().min(0).optional(),
+      startingCashBreakdown: z.record(z.number().int().min(0)).nullable().optional(),
+      varianceReasonOverCents: z.number().int().min(0).nullable().optional(),
+    }).parse(req.body)
+    await assertPropertyInScope(req.user, body.propertyId)
+    const prop = await queryOne<{ landlord_id: string }>(
+      `SELECT landlord_id FROM properties WHERE id = $1`, [body.propertyId])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    assertBreakdownMatches(body.startingCashCents, body.startingCashBreakdown)
+
+    const dup = await queryOne<{ id: string }>(
+      `SELECT id FROM pos_registers
+        WHERE property_id = $1 AND status = 'active' AND lower(btrim(name)) = lower(btrim($2))`,
+      [body.propertyId, body.name])
+    if (dup) throw new AppError(409, `There is already a register called "${body.name.trim()}" here.`)
+
+    const made = await queryOne<any>(`
+      INSERT INTO pos_registers
+        (landlord_id, property_id, name, starting_cash_cents, starting_cash_breakdown,
+         starting_cash_confirmed_at, starting_cash_confirmed_by_user_id, variance_reason_over_cents)
+      VALUES ($1,$2,$3,$4,$5,
+              CASE WHEN $4::int IS NULL THEN NULL ELSE NOW() END,
+              CASE WHEN $4::int IS NULL THEN NULL ELSE $6::uuid END,
+              $7)
+      RETURNING *`,
+      [prop.landlord_id, body.propertyId, body.name.trim(),
+       body.startingCashCents ?? null, body.startingCashBreakdown ?? null,
+       req.user!.userId, body.varianceReasonOverCents ?? null])
+    res.status(201).json({ success: true, data: made })
+  } catch (e) { next(e) }
+})
+
+posRouter.patch('/registers/:id', CONFIG_DRAWER, async (req, res, next) => {
+  try {
+    const body = z.object({
+      name: z.string().trim().min(1).max(60).optional(),
+      startingCashCents: z.number().int().min(0).nullable().optional(),
+      startingCashBreakdown: z.record(z.number().int().min(0)).nullable().optional(),
+      varianceReasonOverCents: z.number().int().min(0).nullable().optional(),
+      retire: z.boolean().optional(),
+    }).parse(req.body)
+    const reg = await queryOne<{ id: string; property_id: string; landlord_id: string; name: string }>(
+      `SELECT id, property_id, landlord_id, name FROM pos_registers WHERE id = $1`, [req.params.id])
+    if (!reg) throw new AppError(404, 'That register does not exist')
+    await assertPropertyInScope(req.user, reg.property_id)
+    if (!canManageLandlordResource(req.user, reg.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (body.startingCashCents !== undefined) {
+      assertBreakdownMatches(body.startingCashCents ?? undefined, body.startingCashBreakdown)
+    }
+    // A drawer being counted right now must not have its amount moved underneath
+    // the person counting it. The shift snapshots the amount, so a past count is
+    // safe either way — this is about the one in progress.
+    if (body.startingCashCents !== undefined || body.retire) {
+      const open = await queryOne<{ id: string }>(
+        `SELECT id FROM pos_register_shifts WHERE register_id = $1 AND status = 'open'`, [reg.id])
+      if (open) {
+        throw new AppError(409,
+          `${reg.name} has a shift open. Count it down and close it first, then change the register.`)
+      }
+    }
+    const updated = await queryOne<any>(`
+      UPDATE pos_registers
+         SET name = COALESCE($2, name),
+             starting_cash_cents = CASE WHEN $3::text = '__keep__' THEN starting_cash_cents ELSE $4::int END,
+             starting_cash_breakdown = CASE WHEN $3::text = '__keep__' THEN starting_cash_breakdown ELSE $5::jsonb END,
+             starting_cash_confirmed_at = CASE
+               WHEN $3::text = '__keep__' THEN starting_cash_confirmed_at
+               WHEN $4::int IS NULL THEN NULL ELSE NOW() END,
+             starting_cash_confirmed_by_user_id = CASE
+               WHEN $3::text = '__keep__' THEN starting_cash_confirmed_by_user_id
+               WHEN $4::int IS NULL THEN NULL ELSE $6::uuid END,
+             variance_reason_over_cents = CASE WHEN $7::text = '__keep__' THEN variance_reason_over_cents ELSE $8::int END,
+             status = CASE WHEN $9::boolean THEN 'retired' ELSE status END,
+             updated_at = NOW()
+       WHERE id = $1 RETURNING *`,
+      [reg.id, body.name?.trim() ?? null,
+       body.startingCashCents === undefined ? '__keep__' : 'set',
+       body.startingCashCents === undefined ? null : body.startingCashCents,
+       body.startingCashBreakdown ?? null, req.user!.userId,
+       body.varianceReasonOverCents === undefined ? '__keep__' : 'set',
+       body.varianceReasonOverCents === undefined ? null : body.varianceReasonOverCents,
+       body.retire === true])
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+/** What the drawer should hold right now — the live figure, for the count screen. */
+posRouter.get('/registers/shifts/:id', WORK_DRAWER, async (req, res, next) => {
+  try {
+    const shift = await queryOne<any>(`
+      SELECT s.*, r.name AS register_name, r.variance_reason_over_cents
+        FROM pos_register_shifts s JOIN pos_registers r ON r.id = s.register_id
+       WHERE s.id = $1`, [req.params.id])
+    if (!shift) throw new AppError(404, 'That shift does not exist')
+    await assertPropertyInScope(req.user, shift.property_id)
+    const { shiftMoney, varianceLeads } = await import('../services/posDrawer')
+    // 10/31 (Nic): a variance is never reported bare — "the bosses are going to
+    // want to know where that money went, not just that it's gone." The leads
+    // ride along with the figure so the count screen can show both at once.
+    const [money, leads] = await Promise.all([shiftMoney(shift.id), varianceLeads(shift.id)])
+    res.json({ success: true, data: { ...shift, money, leads } })
+  } catch (e) { next(e) }
+})
+
+/**
+ * ── 10/31 (Nic): PAST COUNTS ────────────────────────────────────────────────
+ *
+ *   "The bosses are going to want to know where that money went, not that just
+ *    that it's gone."
+ *
+ * The count and its leads were useless without somewhere to look back. This is
+ * every closed shift at a property, newest first: who counted it, what it
+ * should have held, what they counted, how far off, what they said about it, and
+ * what came out. A question like "how often is Register 1 short?" is answerable
+ * by reading down one column.
+ *
+ * Deliberately NOT paginated by anything clever — a property closes a handful of
+ * shifts a day, so a date window and a cap is the whole of it.
+ */
+posRouter.get('/registers/shifts', WORK_DRAWER, async (req, res, next) => {
+  try {
+    const q = z.object({
+      propertyId: z.string().uuid(),
+      registerId: z.string().uuid().optional(),
+      /** Inclusive, local calendar days. Defaults to the last 30. */
+      from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      limit: z.coerce.number().int().min(1).max(500).default(200),
+    }).parse(req.query)
+    await assertPropertyInScope(req.user, q.propertyId)
+
+    const rows = await query<any>(`
+      SELECT s.id, s.business_day, s.status,
+             s.opened_at, s.closed_at,
+             s.opening_cash_cents, s.counted_cash_cents, s.expected_cash_cents,
+             s.variance_cents, s.variance_reason, s.drop_cents, s.notes,
+             r.id AS register_id, r.name AS register_name,
+             NULLIF(BTRIM(COALESCE(ou.first_name,'') || ' ' || COALESCE(ou.last_name,'')), '') AS opened_by_name,
+             NULLIF(BTRIM(COALESCE(cu.first_name,'') || ' ' || COALESCE(cu.last_name,'')), '') AS closed_by_name,
+             -- Whether the money has been banked yet, so a boss can tell "it is
+             -- in the safe" from "it went to the bank on the 4th".
+             sl.deposit_date AS banked_on, sl.status AS banked_status
+        FROM pos_register_shifts s
+        JOIN pos_registers r ON r.id = s.register_id
+        LEFT JOIN users ou ON ou.id = s.opened_by_user_id
+        LEFT JOIN users cu ON cu.id = s.closed_by_user_id
+        LEFT JOIN bank_deposit_slip_items si ON si.register_shift_id = s.id AND si.voided_at IS NULL
+        LEFT JOIN bank_deposit_slips sl ON sl.id = si.slip_id AND sl.voided_at IS NULL
+       WHERE s.property_id = $1
+         AND ($2::uuid IS NULL OR s.register_id = $2)
+         AND s.business_day >= COALESCE($3::date, CURRENT_DATE - 30)
+         AND s.business_day <= COALESCE($4::date, CURRENT_DATE)
+       ORDER BY s.business_day DESC, s.opened_at DESC
+       LIMIT $5`,
+      [q.propertyId, q.registerId ?? null, q.from ?? null, q.to ?? null, q.limit])
+
+    // The run of numbers a boss actually asks for, over the window shown.
+    const closed = rows.filter(r => r.status === 'closed')
+    const varianceCents = closed.reduce((n, r) => n + Number(r.variance_cents ?? 0), 0)
+    const summary = {
+      shifts: closed.length,
+      short: closed.filter(r => Number(r.variance_cents) < 0).length,
+      over: closed.filter(r => Number(r.variance_cents) > 0).length,
+      balanced: closed.filter(r => Number(r.variance_cents) === 0).length,
+      netVarianceCents: varianceCents,
+      worstShortCents: closed.reduce((w, r) => Math.min(w, Number(r.variance_cents ?? 0)), 0),
+      droppedCents: closed.reduce((n, r) => n + Number(r.drop_cents ?? 0), 0),
+    }
+    res.json({ success: true, data: { shifts: rows, summary } })
+  } catch (e) { next(e) }
+})
+
+posRouter.post('/registers/:id/shifts', WORK_DRAWER, async (req, res, next) => {
+  try {
+    const reg = await queryOne<{ property_id: string }>(
+      `SELECT property_id FROM pos_registers WHERE id = $1`, [req.params.id])
+    if (!reg) throw new AppError(404, 'That register does not exist')
+    await assertPropertyInScope(req.user, reg.property_id)
+    const { openShift } = await import('../services/posDrawer')
+    const opened = await openShift({ registerId: req.params.id, userId: req.user!.userId })
+    res.status(201).json({ success: true, data: opened })
+  } catch (e) { next(e) }
+})
+
+posRouter.post('/registers/shifts/:id/count', WORK_DRAWER, async (req, res, next) => {
+  try {
+    const body = z.object({
+      countedCents: z.number().int().min(0),
+      countedBreakdown: z.record(z.number().int().min(0)).nullable().optional(),
+      varianceReason: z.string().trim().max(500).nullable().optional(),
+      notes: z.string().trim().max(500).nullable().optional(),
+    }).parse(req.body)
+    const shift = await queryOne<{ property_id: string }>(
+      `SELECT property_id FROM pos_register_shifts WHERE id = $1`, [req.params.id])
+    if (!shift) throw new AppError(404, 'That shift does not exist')
+    await assertPropertyInScope(req.user, shift.property_id)
+    const { closeShift } = await import('../services/posDrawer')
+    res.json({ success: true, data: await closeShift({
+      shiftId: req.params.id, userId: req.user!.userId,
+      countedCents: body.countedCents, countedBreakdown: body.countedBreakdown ?? null,
+      varianceReason: body.varianceReason ?? null, notes: body.notes ?? null,
+    }) })
+  } catch (e) { next(e) }
+})
+
+/**
+ * The bills and coins have to agree with the total, wherever an amount is set
+ * with a breakdown. "$200" handed over as two $100 bills is the thing
+ * denominations exist to prevent, so a breakdown that does not add up is a
+ * refusal rather than a silent preference for one of the two numbers.
+ */
+function assertBreakdownMatches(
+  cents: number | undefined,
+  breakdown: Record<string, number> | null | undefined,
+): void {
+  if (!breakdown || cents === undefined || cents === null) return
+  const sum = cashBreakdownTotalCents(breakdown)
+  if (sum !== cents) {
+    throw new AppError(400,
+      `The bills and coins add up to $${(sum / 100).toFixed(2)}, but the amount says `
+      + `$${(cents / 100).toFixed(2)}. Fix one of the two.`)
+  }
+}

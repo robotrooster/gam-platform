@@ -19,6 +19,7 @@ import '@fontsource/jetbrains-mono/400.css'
 import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import { NotificationPreferences } from '../../../packages/shared-ui/NotificationPreferences'
+import { PasskeySignIn } from '../../../packages/shared-ui/Passkeys'
 import { AcceptInvitePage } from './pages/AcceptInvitePage'
 import { BackgroundCheckPage } from './pages/BackgroundCheckPage'
 import { TenantNotificationsPage } from './pages/TenantNotificationsPage'
@@ -53,10 +54,12 @@ function DefaultPage() {
 import { SignPage } from './pages/SignPage'
 import { LeasePage } from './pages/LeasePage'
 import { LawsPage } from './pages/LawsPage'
+import { NotificationBell } from './components/NotificationBell'
 import { MaintenancePage } from './pages/MaintenancePage'
 import { ProfilePage } from './pages/ProfilePage'
 import { PayoutsPage } from './pages/PayoutsPage'
 import { WorkTradePage } from './pages/WorkTradePage'
+import { FlexPayLearnMorePage } from './pages/FlexPayLearnMorePage'
 import { MeterReadingsPage } from './pages/MeterReadingsPage'
 import { TenantSurveysPage } from './pages/TenantSurveysPage'
 import { PosCustomerOnboardingPage } from './pages/PosCustomerOnboardingPage'
@@ -72,7 +75,7 @@ import {
   ShieldCheck, Home, Star, CreditCard, Wrench, ClipboardCheck,
   Video, DoorOpen, CalendarClock, HeartHandshake, BarChart3, Scale, ScrollText,
   Bell, Landmark, User, Dumbbell, MessagesSquare, FileText, ClipboardList, Sun, Moon,
-  UserSearch, Gauge } from 'lucide-react'
+  UserSearch, Gauge, Menu } from 'lucide-react'
 
 // S550: first-party product telemetry — one page_view per route change.
 // Fire-and-forget; failures are silently ignored (never affects UX).
@@ -150,7 +153,7 @@ function AuthedVideo({ path, style }: { path: string; style?: React.CSSPropertie
 const LAUNCH_HIDDEN = new Set<string>(['/credit', '/my-disputes'])
 const LAUNCH_HIDE_FITNESS = true
 api.interceptors.request.use(c => { const t = localStorage.getItem('gam_tenant_token'); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
-// S650 (Ellen Gregory, Oak Park MH 02): REMOVED — a SECOND 401 handler on the
+// S650 (Yorick Kenworthy, Oak Park MH 02): REMOVED — a SECOND 401 handler on the
 // same axios client, without lib/api.ts's /auth/ carve-out. A refused sign-in
 // (hers: "verify your email first") wiped the token and reloaded /login before
 // the form could show the message, so the page just blinked and said nothing.
@@ -187,24 +190,24 @@ interface AuthUser { id:string;email:string;role:string;firstName:string;lastNam
 // into the TOTP second step when the backend gates on 2FA.
 type LoginResult = { kind:'success' } | { kind:'totp_required'; totpSession:string } | { kind:'email_otp_required'; emailOtpSession:string }
 type SignupInput = { firstName:string;lastName:string;email:string;password:string;acceptedTerms:boolean;landlordId?:string|null;unitId?:string|null }
-interface AuthCtx { user:AuthUser|null;token:string|null;loading:boolean;login:(e:string,p:string,emailFactor?:string|null)=>Promise<LoginResult>;signup:(input:SignupInput)=>Promise<{emailOtpSession:string}>;loginWithTotp:(totpSession:string,code:string)=>Promise<void>;loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>;resendEmailOtp:(emailOtpSession:string)=>Promise<void>;refresh:()=>Promise<void>;logout:()=>void }
+interface AuthCtx { user:AuthUser|null;token:string|null;loading:boolean;login:(e:string,p:string,emailFactor?:string|null)=>Promise<LoginResult>;signup:(input:SignupInput)=>Promise<{emailOtpSession:string}>;loginWithTotp:(totpSession:string,code:string)=>Promise<void>;loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>;resendEmailOtp:(emailOtpSession:string)=>Promise<void>;loginWithPasskey:(session:{token:string;user?:unknown})=>Promise<void>;refresh:()=>Promise<void>;logout:()=>void }
 const Ctx = React.createContext<AuthCtx>(null!)
 const useAuth = () => useContext(Ctx)
 
 function AuthProvider({children}:{children:React.ReactNode}) {
   // ── S639 SECURITY: A NEW SESSION MUST NOT INHERIT THE OLD ONE'S DATA ───────
   //
-  // Nick Platt clicked his fresh invite link on a browser where his wife Judy
+  // Maren Pemberton clicked his fresh invite link on a browser where his wife Judy
   // was already signed in, and landed in HER profile — her unit, her balance,
   // her lease. Nic: "it fully signed into her profile. So you fucked something
   // up."
   //
   // The token swap was correct: separate users, separate tenant rows, separate
-  // invite tokens, and the API resolved every request as Nick. What leaked was
+  // invite tokens, and the API resolved every request as Maren. What leaked was
   // the CLIENT cache. logout() dropped the token and the React state and left
   // react-query untouched, so 'tenant-me', 'tenant-payment-health' and the rest
   // still held Judy's responses under the same keys — and react-query served
-  // them to Nick instantly, before any request went out. The 304s in the API log
+  // them to Maren instantly, before any request went out. The 304s in the API log
   // are the tell: the app was revalidating her cached entries, not fetching his.
   //
   // Any change of identity now empties the cache. Nothing that belonged to the
@@ -284,6 +287,18 @@ function AuthProvider({children}:{children:React.ReactNode}) {
   const resendEmailOtp = async(emailOtpSession:string):Promise<void>=>{
     await post('/auth/email-otp/resend',{emailOtpSession})
   }
+  // 10/30 (Nic): "a passkey replaces the emailed code." routes/passkeys.ts has
+  // already checked the challenge, the origin, the relying party, the signature
+  // and the sign count and minted a FULL pass, so nothing follows this. Stored
+  // exactly as the code step stores its token, cache wipe included (S639: a
+  // change of identity empties the client cache).
+  const loginWithPasskey = async(session:{token:string;user?:unknown}):Promise<void>=>{
+    const tk=session.token
+    wipeCache();localStorage.setItem('gam_tenant_token',tk)
+    api.defaults.headers.common['Authorization']='Bearer '+tk
+    const u=await get<AuthUser>('/auth/me')
+    setUser(u);setToken(tk)
+  }
   // S578: prospect self-signup. Account is created FIRST (its own page), with
   // mandatory email-2FA — register-prospect returns a PENDING session, never a
   // full token. The SignupPage completes verification via loginWithEmailOtp,
@@ -292,125 +307,16 @@ function AuthProvider({children}:{children:React.ReactNode}) {
     const res=await post<any>('/auth/register-prospect',input)
     return { emailOtpSession: res.data!.emailOtpSession as string }
   }
-  return <Ctx.Provider value={{user,token,loading,login,signup,loginWithTotp,loginWithEmailOtp,resendEmailOtp,refresh,logout}}>{children}</Ctx.Provider>
+  return <Ctx.Provider value={{user,token,loading,login,signup,loginWithTotp,loginWithEmailOtp,resendEmailOtp,loginWithPasskey,refresh,logout}}>{children}</Ctx.Provider>
 }
 
-// ── STYLES ────────────────────────────────────────────────────
-const css = `
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{--bg0:#0a0b0e;--bg1:#0f1116;--bg2:#141720;--bg3:#1a1f2e;--bg4:#212636;
-  --b0:#1e2435;--b1:#252d42;--b2:#2f3a55;
-  --t0:#f0f2f7;--t1:#c4ccde;--t2:#8a96b0;--t3:#555f7a;
-  --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;
-  /* S562: long-form token aliases — newer feature pages (LeasePage, SignPage,
-     dialogs) reference the text / border / bg tokens by their long names, which
-     were never defined, so those surfaces rendered with browser-default
-     (invisible) colors. Map them to the canonical short tokens. Same fix class
-     as .inp (S544). */
-  --text-0:var(--t0);--text-1:var(--t1);--text-2:var(--t2);--text-3:var(--t3);
-  --border-0:var(--b0);--border-1:var(--b1);
-  --bg-0:var(--bg0);--bg-1:var(--bg1);--bg-2:var(--bg2);--bg-3:var(--bg3);
-  --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace}
-html{-webkit-font-smoothing:antialiased;height:100%}
-body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
-h1,h2,h3{font-family:var(--font-d);color:var(--t0);line-height:1.2}
-h1{font-size:1.8rem;font-weight:800}h2{font-size:1.3rem;font-weight:700}h3{font-size:1.1rem;font-weight:700}
-a{color:var(--gold);text-decoration:none}
-button{cursor:pointer;font-family:var(--font-b)}
-input,select,textarea{font-family:var(--font-b)}
-.shell{display:flex;height:100vh;overflow:hidden}
-.sidebar{width:220px;flex-shrink:0;background:var(--bg1);border-right:1px solid var(--b0);display:flex;flex-direction:column;position:fixed;top:0;left:0;bottom:0;z-index:50}
-.main{flex:1;margin-left:220px;height:100vh;display:flex;flex-direction:column;min-width:0;overflow:hidden}
-.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40;flex-shrink:0}
-.page{flex:1;min-height:0;padding:28px;max-width:1200px;width:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:none}
-.logo{padding:20px;border-bottom:1px solid var(--b0)}
-.logo-name{font-family:var(--font-d);font-size:1.1rem;font-weight:800;color:var(--gold)}
-.logo-sub{font-size:.7rem;color:var(--t3);margin-top:2px;text-transform:uppercase;letter-spacing:.08em}
-.nav{padding:12px;flex:1}
-.nav-lbl{font-size:.65rem;color:var(--t3);text-transform:uppercase;letter-spacing:.1em;padding:10px 8px 4px;font-weight:600}
-.ni{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;color:var(--t2);font-size:.875rem;font-weight:500;transition:all .15s;width:100%;background:none;border:none;cursor:pointer;text-decoration:none}
-.ni:hover{background:var(--bg3);color:var(--t0)}
-.ni.active{background:rgba(201,162,39,.08);color:var(--gold);border:1px solid rgba(201,162,39,.2)}
-.footer{padding:12px;border-top:1px solid var(--b0)}
-.card{background:var(--bg2);border:1px solid var(--b1);border-radius:12px;padding:20px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px}
-.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
-@media(max-width:1100px){.grid4{grid-template-columns:1fr 1fr}}
-@media(max-width:600px){.grid4{grid-template-columns:1fr}}
-@media(max-width:900px){.grid2,.grid3{grid-template-columns:1fr}}
-.ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--b0)}
-.pt{font-family:var(--font-d);font-size:1.5rem;font-weight:800;color:var(--t0)}
-.ps{font-size:.82rem;color:var(--t3);margin-top:2px}
-.kpi{background:var(--bg2);border:1px solid var(--b1);border-radius:12px;padding:20px}
-.kpi-l{font-size:.7rem;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;font-weight:600;margin-bottom:8px}
-.kpi-v{font-family:var(--font-d);font-size:1.6rem;font-weight:800;color:var(--t0);line-height:1;margin-bottom:4px}
-.kpi-s{font-size:.72rem;color:var(--t3)}
-.btn{display:inline-flex;align-items:center;gap:7px;padding:8px 16px;border-radius:8px;font-size:.82rem;font-weight:600;border:none;cursor:pointer;transition:all .15s;font-family:var(--font-b);text-decoration:none}
-.btn-p,.btn-primary{background:var(--gold);color:#0a0b0e}.btn-p:hover,.btn-primary:hover{background:#d9af3a}
-.btn-g,.btn-ghost{background:var(--bg4);color:var(--t1);border:1px solid var(--b2)}.btn-g:hover,.btn-ghost:hover{background:var(--bg3);color:var(--t0)}
-.btn-link{background:none;border:none;color:var(--gold);padding:0;font-weight:600;text-decoration:underline;font-size:.82rem}
-.btn-d{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.25)}
-.btn-sm{padding:5px 10px;font-size:.75rem}
-.btn:disabled{opacity:.4;cursor:not-allowed}
-.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
-.b-green{background:rgba(34,197,94,.08);color:var(--green);border:1px solid rgba(34,197,94,.2)}
-.b-amber{background:rgba(245,158,11,.08);color:var(--amber);border:1px solid rgba(245,158,11,.2)}
-.b-red{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.2)}
-.b-gold{background:rgba(201,162,39,.08);color:var(--gold);border:1px solid rgba(201,162,39,.2)}
-.b-muted{background:var(--bg4);color:var(--t3);border:1px solid var(--b1)}
-.alert{display:flex;align-items:flex-start;gap:12px;padding:12px 16px;border-radius:8px;font-size:.82rem;margin-bottom:16px}
-.a-gold{background:rgba(201,162,39,.08);border:1px solid rgba(201,162,39,.2);color:var(--gold)}
-.a-green{background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);color:#86efac}
-.a-red{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);color:#fca5a5}
-.a-warn{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);color:#fcd34d}
-.a-blue{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:#93c5fd}
-.modal-ov,.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;backdrop-filter:blur(4px)}
-.modal{background:var(--bg2);border:1px solid var(--b2);border-radius:16px;padding:24px;width:100%;max-width:500px;max-height:90vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.5)}
-.modal-t,.modal-title{font-family:var(--font-d);font-size:1.1rem;font-weight:800;color:var(--t0);margin-bottom:20px}
-.modal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
-.modal-f{display:flex;justify-content:flex-end;gap:10px;margin-top:20px;padding-top:16px;border-top:1px solid var(--b0)}
-.fg{margin-bottom:16px}
-.fl{display:block;font-size:.75rem;font-weight:600;color:var(--t2);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
-/* S544: .inp was used in 5 places but never defined — fields rendered
-   browser-default white on the dark theme. */
-.inp,.input,.form-input{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:10px 12px;font-size:.9rem;color-scheme:dark}
-.inp:focus,.input:focus,.form-input:focus{outline:none;border-color:var(--gold)}
-textarea.inp{resize:vertical}
-/* S595: same drift as .inp (S544) — className="input" fields were never aliased,
-   so they fell back to white browser boxes. Alias + uniform +6% type lift +
-   readable disabled (overrides the blanket :disabled{opacity:.4} so disabled
-   field VALUES stay legible instead of washing out). */
-html{font-size:17px}
-.inp:disabled,.input:disabled,.form-input:disabled,.fi:disabled,.fs:disabled,.fta:disabled,input:disabled,select:disabled,textarea:disabled,input[readonly],textarea[readonly]{background:var(--bg2);border-color:var(--b0);color:var(--t1);-webkit-text-fill-color:var(--t1);opacity:1;cursor:not-allowed}
-/* S595 LIGHT THEME (short token names; hyphenated aliases map to these so both flip). */
-:root[data-theme="light"]{color-scheme:light;--bg0:#f4f5f7;--bg1:#ffffff;--bg2:#ffffff;--bg3:#eef0f4;--bg4:#e5e8ee;--b0:#e7e9ef;--b1:#dde0e8;--b2:#ccd2de;--t0:#12151c;--t1:#333b49;--t2:#5b6474;--t3:#8a93a5;--gold-ink:#7a5f0f}
-:root[data-theme="light"] .inp,:root[data-theme="light"] .input,:root[data-theme="light"] .form-input,:root[data-theme="light"] .fi,:root[data-theme="light"] .fs,:root[data-theme="light"] .fta{color-scheme:light}
-:root[data-theme="light"] a,:root[data-theme="light"] .logo-name{color:var(--gold-ink)}
-:root[data-theme="light"] .ni.active{color:var(--gold-ink);background:rgba(201,162,39,.12);border-color:rgba(201,162,39,.32)}
-.fi,.fs,.fta{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:9px 12px;font-size:.875rem;font-family:var(--font-b);outline:none;transition:border-color .15s}
-.fi:focus,.fs:focus,.fta:focus{border-color:var(--gold)}
-.fi::placeholder{color:var(--t3)}
-.fta{resize:vertical;min-height:80px}
-.fg2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.dr{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--b0);font-size:.82rem}
-.dr:last-child{border-bottom:none}
-.dk{color:var(--t3)}.dv{color:var(--t0);font-weight:500}
-.mono{font-family:var(--font-m);font-size:.875rem}
-.tbl{width:100%;border-collapse:collapse;font-size:.82rem}
-.tbl th{background:var(--bg3);color:var(--t3);font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.07em;padding:10px 14px;text-align:left;border-bottom:1px solid var(--b1)}
-.tbl td{padding:11px 14px;border-bottom:1px solid var(--b0);color:var(--t1)}
-.tbl tr:last-child td{border-bottom:none}
-.empty{text-align:center;padding:48px 20px;color:var(--t3)}
-.loading{display:flex;align-items:center;justify-content:center;height:100vh;font-family:var(--font-d);font-size:1.2rem;color:var(--t3)}
-.spinner{width:18px;height:18px;border:2px solid var(--b2);border-top-color:var(--gold);border-radius:50%;animation:spin .6s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.service-card{background:var(--bg3);border:1px solid var(--b1);border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:12px;transition:border-color .2s}
-.service-card:hover{border-color:var(--b2)}
-.service-card.enrolled{border-color:rgba(34,197,94,.3);background:rgba(34,197,94,.03)}
-.price-tag{font-family:var(--font-d);font-size:1.4rem;font-weight:800;color:var(--t0)}
-.price-sub{font-size:.75rem;color:var(--t3)}
-`
+// ── STYLES ──────────────────────────────
+// 10/31: the STATIC stylesheet moved into a real file so rules can be
+// commented without backticks closing the literal. themeCss further down is
+// a different thing and stays where it is — it is built per landlord at
+// runtime and interpolates their colours.
+import { installTableStacking } from '@gam/shared'
+import './styles/globals.css'
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 30000 } } })
 
@@ -722,12 +628,23 @@ function Layout() {
   const mustSign = !!(tenantMe as any)?.pendingLeaseDocumentId
     && (tenantMe as any)?.pendingLeaseWaitingOnIsMe === true
     && (tenantMe as any)?.pendingLeaseLocks !== false
+
+  // S655: the phone drawer. Closed on every navigation — a drawer left open
+  // over the page the resident just chose is the classic mobile-nav bug.
+  const [navOpen, setNavOpen] = useState(false)
+  const navLoc = useLocation()
+  useEffect(() => { setNavOpen(false) }, [navLoc.pathname])
+  // 10/31: column names onto stacked cells, for every table rather than the
+  // two that carried .tbl--stack. It leaves a table whose author wrote its own
+  // data-label alone, so the documents card keeps its hand-tuned shape.
+  useEffect(() => installTableStacking(document.body), [])
+
   if (mustSign) return <Navigate to={'/sign/' + (tenantMe as any).pendingLeaseDocumentId} replace />
 
   return (
     <div className="shell">
       <style dangerouslySetInnerHTML={{__html: themeCss}} />
-      <aside className="sidebar">
+      <aside className={"sidebar" + (navOpen ? " open" : "")}>
         <div className="logo">
           <div className="logo-name">⚡ GAM Tenant</div>
           <div className="logo-sub">Gold Asset Management</div>
@@ -776,6 +693,8 @@ function Layout() {
             {/* S652 (Nic): the landlord-tenant act for their home, from the
                 government library, by state and unit type — automatic. */}
             <NavLink to="/laws" className={({isActive})=>`ni${isActive?' active':''}`}><Scale size={16}/>Landlord-Tenant Act</NavLink>
+            {/* S655: the page existed and was routed, but NOTHING linked to it. */}
+            <NavLink to="/notifications" className={({isActive})=>`ni${isActive?' active':''}`}><Bell size={16}/>Notifications</NavLink>
           </>}
           {/* S570 (Nic): Preferences + Security folded into Profile (which already
               has Notification-prefs + Security tabs). Notifications feed → Home. */}
@@ -799,13 +718,60 @@ function Layout() {
       </aside>
       <div className="main">
         <header className="topbar">
-          <button onClick={toggleTheme} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} aria-label="Toggle light/dark theme" style={{ marginLeft: 'auto', background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--t2)', padding: 6, display: 'inline-flex', alignItems: 'center', borderRadius: 6 }}>
-            {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
-          </button>
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 4 }}>
+            <NotificationBell />
+            <button onClick={toggleTheme} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} aria-label="Toggle light/dark theme" style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--t2)', padding: 6, display: 'inline-flex', alignItems: 'center', borderRadius: 6, minWidth: 34, minHeight: 34, justifyContent: 'center' }}>
+              {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+            </button>
+          </div>
         </header>
         <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <><NewLeaseBanner me={tenantMe} /><FixedIncomeBanner /><Outlet /></>}</div>
         <DialogHost />
       </div>
+      {navOpen && <button className="scrim" aria-label="Close menu" onClick={() => setNavOpen(false)} />}
+      {/* S655: the bottom bar carries only what this resident actually has —
+          the same conditions the sidebar uses, so a utilities-only or
+          renter-pool account never gets a tab leading nowhere. Everything else
+          stays one tap away under Menu. */}
+      {/* S655 (Nic, 10/30): FIVE slots, never six — five is what the phone
+          makers design their own tab bars around, and a sixth costs more in
+          cramped labels than it buys. Menu holds the right-hand slot and
+          Profile stays inside it: Profile is rarely tapped, Menu has to exist
+          permanently (fourteen items cannot all be tabs), and that trade buys
+          a slot worth using.
+
+          The FOURTH slot follows who the resident is rather than guessing one
+          answer for everyone. A lease is read once; hours are tapped twice a
+          day. Same conditions the drawer uses, so a tab can never lead
+          somewhere this account cannot go. Customisation was considered and
+          deliberately deferred (Nic: "just pick a default for now. They can
+          find everything else in the menu") — tenants do not choose their
+          landlord's software, so it is a novelty until there is traction. */}
+      <nav className="tabbar" aria-label="Main">
+        {(serviceOnly || (showFullNav && !isRenterPoolOnly)) && (
+          <NavLink to="/home" className={({isActive}) => isActive ? 'active' : ''}>
+            <Home size={18} /><span>Home</span></NavLink>)}
+        {(serviceOnly || (showFullNav && !isRenterPoolOnly)) && (
+          <NavLink to="/payments" className={({isActive}) => isActive ? 'active' : ''}>
+            <CreditCard size={18} /><span>{serviceOnly ? 'Billing' : 'Payments'}</span></NavLink>)}
+        {showFullNav && !serviceOnly && !isRenterPoolOnly && (
+          <NavLink to="/communication" className={({isActive}) => isActive ? 'active' : ''}>
+            <MessagesSquare size={18} /><span>Messages</span></NavLink>)}
+        {showFullNav && !serviceOnly && !isRenterPoolOnly && (
+          hasWorkTrade
+            ? <NavLink to="/work-trade" className={({isActive}) => isActive ? 'active' : ''}>
+                <HeartHandshake size={18} /><span>Work</span></NavLink>
+            : <NavLink to="/lease" className={({isActive}) => isActive ? 'active' : ''}>
+                <ScrollText size={18} /><span>Lease</span></NavLink>)}
+        {isRenterPoolOnly && !serviceOnly && (
+          <NavLink to="/find-a-place" className={({isActive}) => isActive ? 'active' : ''}>
+            <UserSearch size={18} /><span>Find</span></NavLink>)}
+        {!showFullNav && (
+          <NavLink to="/background-check" className={({isActive}) => isActive ? 'active' : ''}>
+            <ShieldCheck size={18} /><span>Application</span></NavLink>)}
+        <button onClick={() => setNavOpen(true)} aria-label="Open menu">
+          <Menu size={18} /><span>Menu</span></button>
+      </nav>
       {showFullNav && !serviceOnly && !isRenterPoolOnly && <FlexsuiteReAcceptanceGate />}
       {showFullNav && !serviceOnly && !isRenterPoolOnly && <LeaseNoticeGate />}
       <AgentChatWidget />
@@ -1600,6 +1566,9 @@ function HomePage() {
 
       <ServiceOutageBanner />
       <OnboardingWaitingNotice me={me} />
+      {/* 10/29 (Nic): the deposit offer, in front of them on every visit until
+          the deposit is settled one way or the other. */}
+      <FlexDepositOfferPrompt offer={me?.flexDepositOffer} where="home" />
       {/* S655: a lease from ANOTHER company (pendingLeaseLocks false — they
           live somewhere else on GAM, so it does not take their portal over)
           shows only once it has reached them, like UtilityServiceHome: the
@@ -1649,7 +1618,19 @@ function HomePage() {
             onMouseLeave={e=>(e.currentTarget as any).style.borderColor=''}>
             <div className="kpi-l">Security Deposit</div>
             <div className="kpi-v">{me?.depositTotal ? formatCurrency(me.depositTotal) : '—'}</div>
-            <div className="kpi-s">{me?.flexDepositEnrolled ? 'FlexDeposit installments' : 'Paid in full'} →</div>
+            {/* 10/29 (Nic, seen on the demo preview): this said "Paid in full"
+                for anybody NOT on a FlexDeposit plan — including every resident
+                who has not paid their deposit at all. It sat directly under the
+                prompt offering to split the deposit they still owe, telling
+                them it was already settled. It reads the deposit's own state
+                now: funded, part-funded, or owed. */}
+            <div className="kpi-s">
+              {me?.flexDepositEnrolled ? 'FlexDeposit installments'
+                : me?.depositFullyFunded ? 'Paid in full'
+                : Number(me?.depositCollected ?? 0) > 0
+                  ? `${formatCurrency(Number(me.depositCollected))} paid so far`
+                  : 'Not paid yet'} →
+            </div>
           </a>
         )}
         {propane && propane.totalCount > 0 && (
@@ -1866,6 +1847,7 @@ function PaymentHealthMonitor({ months, pct }: { months: { label: string; rate: 
 // real Pay Now flow + Stripe Financial Connections bank add via the
 // /api/payments/:id/pay destination charge backend.
 import { PaymentsPage as PaymentsPageImpl } from './pages/PaymentsPage'
+import { FlexDepositOfferPrompt } from './components/FlexDepositOfferPrompt'
 import { readBalanceContext } from './pages/payShared'
 
 // ── S639: THE CODE STEP MUST SURVIVE LEAVING THE PAGE ────────────────────────
@@ -2668,15 +2650,21 @@ function FlexDepositModal({
   const [error, setError] = useState('')
 
   const deposit = Number(eligibility?.depositAmount ?? 0)
+  // 10/29: everything else owed on this lease right now — their first month's
+  // rent and any move-in fees. The plan only replaces the deposit, so this is
+  // what makes "due at move-in" the real number (services/flexDeposit
+  // depositSiblingChargesDue). 0 when there is nothing else outstanding.
+  const otherDue = Number(eligibility?.otherDueNow ?? 0)
   const eligible = !!eligibility?.eligible
   const picked = choices.find(c => c.payments === count) ?? choices[0] ?? null
   const installmentAmt = picked?.installment ?? 0
   // 10/27 (Nic): a deposit over the top of the price grid is split on the
-  // CEILING and the rest is paid in full with the first payment, so the
-  // division shown has to be of the split part — "$4,000 ÷ 4" would read $1,000
-  // beside payments of $750.
+  // CEILING and the rest is paid in full with the first payment. 10/29: the
+  // "$X ÷ N installments" line that needed the split part is gone with the
+  // rest of the convolution — the screen names the payment itself now — but
+  // the part above the ceiling still has to be said, so it rides the
+  // due-at-move-in sentence.
   const upFront = Number(picked?.payUpFront ?? 0)
-  const splitPart = Math.round((deposit - upFront) * 100) / 100
 
   async function openFullTerms() {
     setLoadingTerms(true)
@@ -2722,7 +2710,7 @@ function FlexDepositModal({
             {eligibility?.blockers?.includes('no_bg_result')      && 'Your background check must complete before you can enroll in FlexDeposit.'}
             {eligibility?.blockers?.includes('bg_not_approved')   && 'Your background check must be approved before you can enroll in FlexDeposit.'}
             {eligibility?.blockers?.includes('risk_level_missing') && 'Your background check is missing a risk level. Contact GAM support.'}
-            {eligibility?.blockers?.includes('ach_unverified')    && 'You must verify your bank account before enrolling in FlexDeposit.'}
+            {eligibility?.blockers?.includes('no_bank_started')   && 'Add a bank account and we can set your plan up while it is being verified.'}
             {eligibility?.blockers?.includes('no_deposit_row')    && 'No upcoming deposit found. FlexDeposit must be enrolled before move-in.'}
             {eligibility?.blockers?.includes('already_funded')    && 'Your deposit is already fully funded. FlexDeposit can only be enrolled before paying the deposit.'}
             {eligibility?.blockers?.includes('not_ssi_ssdi')      && 'FlexDeposit is currently available only to SSDI/SSI recipients with verified income.'}
@@ -2738,6 +2726,13 @@ function FlexDepositModal({
             {eligibility?.blockers?.includes('bank_link_not_started_on_signing_day') && `To split your deposit, your bank had to be linked on the day you signed — verifying one takes a couple of days, so it has to start right away. Your deposit is owed as billed.`}
             {eligibility?.blockers?.includes('signing_window_closed') && `The window to split this deposit has closed. It is owed as billed.`}
             {eligibility?.blockers?.includes('insufficient_on_time_payment_history') && `FlexDeposit requires at least one on-time rent payment on a prior lease in the last 90 days.`}
+            {/* 10/27: both of these were in the blocker list with no copy, so
+                when either was the only reason the resident got an empty
+                warning box and a Close button. Said as facts about timing and
+                availability — never about anyone's standing. */}
+            {eligibility?.blockers?.includes('at_capacity') && `FlexDeposit is fully subscribed right now. Your deposit is owed as billed — check back for the next opening.`}
+            {eligibility?.blockers?.includes('lease_too_short_for_any_plan') && `This lease ends too soon to split the deposit into payments. It is owed as billed.`}
+            {eligibility?.blockers?.includes('tenant_not_found') && `We could not load your account. Contact GAM support.`}
           </div>
           <div className="modal-f"><button className="btn btn-g" onClick={onClose}>Close</button></div>
         </div>
@@ -2789,50 +2784,55 @@ function FlexDepositModal({
           </div>
         </div>
 
+        {/* ── 10/29 (Nic): LEAD WITH MOVE-IN DAY ──────────────────────────
+            "Due at move-in just shows the same fucking as line item above it.
+             And then it's still only showing the total of the installment, not
+             the total due at move-in... it looks like shit. It's so convoluted."
+
+            It was seven rows saying four things, headed by "Each payment" — and
+            nobody is deciding on the size of payment two. They are deciding
+            whether they can cover MOVE-IN DAY. So that is the number, in gold,
+            at the top, with one sentence of arithmetic under it and the monthly
+            tail after. The old "Total" row went: it was the plan's lifetime
+            cost, due on no date, competing with the figure that matters.
+
+            When there is nothing else outstanding this prints the deposit
+            figures alone rather than a "Due at move-in" line restating the one
+            above it — which is the duplication he was looking at. */}
         <div style={{background:'var(--bg3)',borderRadius:10,padding:16,marginBottom:16,marginTop:16}}>
-          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-            <span style={{fontWeight:700,color:'var(--t0)',fontSize:'.875rem'}}>Each payment</span>
-            <span style={{fontFamily:'var(--font-m)',fontSize:'1.4rem',fontWeight:800,color:'var(--gold)'}}>${installmentAmt.toFixed(2)}</span>
-          </div>
-          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>
-            ${splitPart.toFixed(2)} ÷ {count} installments. First due at move-in.
-            {upFront > 0 && ` The remaining $${upFront.toFixed(2)} of your deposit is paid in full with the first payment.`}
-          </div>
           {picked && (
-            <div style={{marginTop:12,paddingTop:12,borderTop:'1px solid var(--b1)'}}>
-              {/* What they actually hand over at move-in: installment 1 + the
-                  WHOLE fee. Showing only the installment size would understate
-                  it by the fee, which is the one number they are deciding on. */}
-              <div style={{display:'flex',justifyContent:'space-between',fontSize:'.78rem',color:'var(--t2)'}}>
-                <span>At move-in (first payment + the whole fee{upFront > 0 ? ` + $${upFront.toFixed(2)} of deposit` : ''})</span>
-                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--t0)'}}>
-                  ${picked.firstPull.toFixed(2)}
+            <>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <span style={{fontWeight:700,color:'var(--t0)',fontSize:'.875rem'}}>Due at move-in</span>
+                <span style={{fontFamily:'var(--font-m)',fontSize:'1.5rem',fontWeight:800,color:'var(--gold)'}}>
+                  ${(Math.round((otherDue + picked.firstPull) * 100) / 100).toFixed(2)}
                 </span>
               </div>
-              <div style={{display:'flex',justifyContent:'space-between',fontSize:'.78rem',color:'var(--t2)',marginTop:4}}>
-                <span>Then {count - 1} × ${picked.installment.toFixed(2)}, monthly</span>
+              <div style={{fontSize:'.73rem',color:'var(--t2)',marginTop:6,lineHeight:1.5}}>
+                {otherDue > 0 && <>${otherDue.toFixed(2)} rent and move-in charges, plus your </>}
+                {otherDue > 0 ? 'first' : 'Your first'} deposit payment of ${picked.installment.toFixed(2)}
+                {' '}and the ${picked.fee.toFixed(2)} service fee
+                {upFront > 0 && `, plus $${upFront.toFixed(2)} of deposit above the plan`}.
+              </div>
+
+              <div style={{marginTop:12,paddingTop:12,borderTop:'1px solid var(--b1)',
+                           display:'flex',justifyContent:'space-between',fontSize:'.8rem',color:'var(--t1)'}}>
+                <span>Then {count - 1} more {count - 1 === 1 ? 'payment' : 'payments'} of ${picked.installment.toFixed(2)}, monthly</span>
                 <span style={{fontFamily:'var(--font-m)',color:'var(--t2)'}}>
                   ${(Math.round(picked.installment * (count - 1) * 100) / 100).toFixed(2)}
                 </span>
               </div>
-              <div style={{display:'flex',justifyContent:'space-between',fontSize:'.78rem',marginTop:6,
-                           paddingTop:6,borderTop:'1px solid var(--b1)',fontWeight:700,color:'var(--t0)'}}>
-                <span>Total</span>
-                <span style={{fontFamily:'var(--font-m)'}}>${picked.total.toFixed(2)}</span>
+
+              <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:10,lineHeight:1.5}}>
+                Your ${deposit.toFixed(2)} deposit comes back to you at move-out. The
+                {' '}${picked.fee.toFixed(2)} service fee is what GAM charges, once — there is no
+                monthly charge for holding your deposit.
               </div>
-              <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>
-                ${deposit.toFixed(2)} deposit + ${picked.fee.toFixed(2)} service fee. The deposit is
-                yours and comes back to you at move-out; the fee is what GAM charges for the service.
-              </div>
-            </div>
+            </>
           )}
         </div>
 
         {error && <div className="alert a-warn" style={{marginBottom:12}}>{error}</div>}
-
-        <div style={{fontSize:'.72rem',color:'var(--t3)',marginBottom:16}}>
-          ⓘ A $3/month custody fee applies as long as your deposit is on the GAM platform.
-        </div>
 
         {/* S260: FlexDeposit Terms summary. S314: full populated SLA link + persisted acceptance. */}
         <div style={{background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:8,padding:14,marginBottom:14,fontSize:'.72rem',color:'var(--t2)',lineHeight:1.5}}>
@@ -3146,7 +3146,11 @@ function ServicesPage() {
   const [flexPayModal, setFlexPayModal] = useState(false)
   const [flexPayInquireModal, setFlexPayInquireModal] = useState(false)
   const [flexPayChangeModal, setFlexPayChangeModal] = useState(false)
-  const [flexDepositModal, setFlexDepositModal] = useState(false)
+  const [flexDepositModal, setFlexDepositModal] = useState(
+    // 10/29: the deposit prompt on the home and payments screens links here.
+    // Opening the chooser straight away is the point — a link that lands them
+    // on a page of tiles and makes them find it again is not a prompt.
+    () => new URLSearchParams(window.location.search).get('flexdeposit') === '1')
   const [featureModal, setFeatureModal] = useState(false)
   const fd = useQuery('tenant-flexdeposit', () => get<any>('/tenants/flexdeposit'), { enabled: flexVis.flexdeposit })
   // S541: FlexPay demand-test — the inquiry disposition drives the card.
@@ -3270,9 +3274,16 @@ function ServicesPage() {
       loading: false,
       highlight: me?.flexDepositEnrolled
         ? `Installment plan active — see plan below`
-        : !me?.achVerified ? '⚠ Bank account must be verified first'
+        // 10/28 (Nic): "they should be able to be like, hey, I'm interested in
+        // signing up. Okay, add your bank account and go into the bank account
+        // flow." Verification takes days on microdeposits, and it used to keep
+        // this tile shut — so nobody could read their own schedule or fee until
+        // it cleared. Now a link in flight is enough to look and to enrol;
+        // nothing is recorded as paid until an installment actually lands.
+        : !me?.achVerified && !me?.bankPending ? 'Add a bank account to get started'
+        : !me?.achVerified ? 'Your bank is still being verified — you can set your plan up now'
         : 'Tap to choose your installment plan',
-      locked: !me?.achVerified,
+      locked: !me?.achVerified && !me?.bankPending,
     },
   ]
 
@@ -3409,9 +3420,11 @@ function ServicesPage() {
               </div>
             ))}
           </div>
-          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:12}}>
-            ⓘ $3/month custody fee billed separately as long as your deposit is on the GAM platform.
-          </div>
+          {/* 10/29 (Nic): the $3/month custody fee line is GONE from here too.
+              It was superseded on 10/26 by the ONE service fee from the table,
+              collected in full with the first payment — nothing bills $3/month
+              and nothing has since. A resident already on a plan was being told
+              they owe a monthly charge that does not exist. */}
         </div>
       )}
 
@@ -4849,7 +4862,7 @@ function DocumentsPage() {
       <div className="ph"><div><h1 className="pt">Documents</h1><p className="ps">Your lease, agreements, and notices — download or print</p></div></div>
       <div className="card" style={{padding:0,overflowX:'auto'}}>
         {isLoading ? <div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div> : (
-          <table className="tbl" style={{minWidth:640}}>
+          <table className="tbl tbl--stack">
             <thead><tr><th>Document</th><th>Type</th><th>Status</th><th>Date</th><th></th></tr></thead>
             <tbody>
               {leaseDocs.map((l:any)=>{
@@ -4860,19 +4873,19 @@ function DocumentsPage() {
                     Lease — {l.propertyName}{l.unitNumber?` · Unit ${l.unitNumber}`:''}
                     <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>Term: {fmtD(l.startDate)} – {l.endDate?fmtD(l.endDate):'ongoing'}</div>
                   </td>
-                  <td><span className="badge b-muted">Lease</span></td>
-                  <td><span className={`badge ${active?'b-green':'b-muted'}`}>{active?'Active':'Expired'}</span></td>
-                  <td className="mono" style={{fontSize:'.75rem',color:'var(--t3)'}}>{fmtD(l.signedAt || l.startDate)}</td>
-                  <td><button onClick={()=>openAuthedUrl(l.documentUrl)} className="btn btn-g btn-sm">Download</button></td>
+                  <td data-label="Type"><span className="badge b-muted">Lease</span></td>
+                  <td data-label="Status"><span className={`badge ${active?'b-green':'b-muted'}`}>{active?'Active':'Expired'}</span></td>
+                  <td data-label="Date" className="mono" style={{fontSize:'.75rem',color:'var(--t3)'}}>{fmtD(l.signedAt || l.startDate)}</td>
+                  <td className="td-act"><button onClick={()=>openAuthedUrl(l.documentUrl)} className="btn btn-g btn-sm">Download</button></td>
                 </tr>
               )})}
               {docs.map((d:any)=>(
                 <tr key={d.id}>
                   <td style={{color:'var(--t0)'}}>{d.name}</td>
-                  <td><span className="badge b-muted">{humanize(d.type)}</span></td>
-                  <td><span className={`badge ${d.signedAt?'b-green':'b-amber'}`}>{d.signedAt?'Signed':'Pending signature'}</span></td>
-                  <td className="mono" style={{fontSize:'.75rem',color:'var(--t3)'}}>{new Date(d.createdAt).toLocaleDateString()}</td>
-                  <td><button onClick={()=>openDocumentFile(d.id)} className="btn btn-g btn-sm">Download</button></td>
+                  <td data-label="Type"><span className="badge b-muted">{humanize(d.type)}</span></td>
+                  <td data-label="Status"><span className={`badge ${d.signedAt?'b-green':'b-amber'}`}>{d.signedAt?'Signed':'Pending signature'}</span></td>
+                  <td data-label="Date" className="mono" style={{fontSize:'.75rem',color:'var(--t3)'}}>{new Date(d.createdAt).toLocaleDateString()}</td>
+                  <td className="td-act"><button onClick={()=>openDocumentFile(d.id)} className="btn btn-g btn-sm">Download</button></td>
                 </tr>
               ))}
               {isEmpty && <tr><td colSpan={5} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No documents yet.</td></tr>}
@@ -4884,9 +4897,18 @@ function DocumentsPage() {
   )
 }
 
+// 10/30 (Nic): "a passkey replaces the emailed code." The shared component
+// speaks this portal's own client: get already hands back the payload, post
+// hands back the whole envelope, and nothing here had needed a DELETE.
+const passkeyApi = {
+  get:  (url: string) => get<any>(url),
+  post: (url: string, body?: any) => post<any>(url, body).then(r => r.data),
+  del:  (url: string) => api.delete(url).then(r => r.data),
+}
+
 // ── LOGIN ─────────────────────────────────────────────────────
 function LoginPage() {
-  const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, token:signedIn, loading:authLoading } = useAuth(); const navigate = useNavigate()
+  const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, loginWithPasskey, token:signedIn, loading:authLoading } = useAuth(); const navigate = useNavigate()
   // S654 (Nic): the bill's Pay now link arrives as /login?ef=…&to=/payments —
   // `ef` is proof of the inbox (signEmailFactorToken on the API) so the
   // password alone finishes the sign-in; `to` is where to land. Read once and
@@ -5054,9 +5076,13 @@ function LoginPage() {
         <div className="card" style={{padding:28}}>
           <h2 style={{marginBottom:20}}>Sign in</h2>
           {err && <div className="alert a-warn" style={{marginBottom:16}}>{err}</div>}
+          {/* 10/30 (Nic): Face ID alone signs you in. Renders nothing on a
+              device with no sensor, so the password form below is exactly what
+              it has always been for everybody else. */}
+          <PasskeySignIn api={passkeyApi} onSignedIn={async s=>{ await loginWithPasskey(s); navigate(landing) }} />
           <form onSubmit={handleSubmit(onSubmit)}>
-            <div className="fg"><label className="fl">Email</label><input className="fi" type="email" {...register('email',{required:true})} autoFocus /></div>
-            <div className="fg"><label className="fl">Password</label><input className="fi" type="password" {...register('password',{required:true})} /></div>
+            <div className="fg"><label className="fl">Email</label><input className="fi" type="email" {...register('email',{required:true})} autoComplete="username webauthn" name="email" autoFocus /></div>
+            <div className="fg"><label className="fl">Password</label><input className="fi" type="password" {...register('password',{required:true})} autoComplete="current-password" name="password" /></div>
             <button className="btn btn-p" type="submit" disabled={loading} style={{width:'100%',justifyContent:'center',marginTop:8}}>
               {loading?<span className="spinner"/>:'Sign in'}
             </button>
@@ -5229,6 +5255,10 @@ function App() {
           <Route path="security"         element={<Navigate to="/profile" replace />} />
           <Route path="security/enroll"  element={<Navigate to="/profile" replace />} />
           <Route path="payouts"          element={<PayoutsPage />} />
+          {/* 10/26 (Nic): the destination the fixed-income banner's "Yes" has
+              always navigated to. It had no route, so that tap went nowhere.
+              Probe, then reveal (FLEXPAY_SAVINGS_SPEC). */}
+          <Route path="flexpay"          element={<FlexPayLearnMorePage />} />
         </Route>
       </Routes>
     </BrowserRouter>
@@ -5239,7 +5269,6 @@ function Root() {
   return (
     <QueryClientProvider client={qc}>
       <AuthProvider>
-        <style dangerouslySetInnerHTML={{__html: css}} />
         <App />
       </AuthProvider>
     </QueryClientProvider>

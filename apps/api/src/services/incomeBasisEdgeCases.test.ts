@@ -300,7 +300,7 @@ describe('Money billed: a shortened stay whose rent was then disputed', () => {
     // The rent card, the income card and the category breakdown say the same.
     for (const scope of ['rent', 'all'] as const) {
       const card = await collectedRentMtd([w.landlordId], null, { scope, basis: 'billed', month: '2026-11-15' })
-      expect(card.billed).toEqual({ amount: 160, collected: 0, clearing: 0, stillOwed: 160 })
+      expect(card.billed).toEqual({ amount: 160, collected: 0, clearing: 0, stillOwed: 160, other: 0 })
     }
     const rent = (await categoryTotals({ landlordIds: [w.landlordId], start: '2026-11-01', end: '2026-11-30', basis: 'billed' }))
       .categories.find(c => c.category === 'space_rent')!
@@ -393,7 +393,7 @@ describe('Money billed: rent a shortened stay moved to credit with no anchor bil
     expect(cats.lines).toEqual([])
     expect(cats.total).toBe(260)
     const card = await collectedRentMtd([w.landlordId], null, { scope: 'rent', basis: 'billed', month: '2026-11-15' })
-    expect(card.billed).toEqual({ amount: 260, collected: 260, clearing: 0, stillOwed: 0 })
+    expect(card.billed).toEqual({ amount: 260, collected: 260, clearing: 0, stillOwed: 0, other: 0 })
 
     // December's rent: the $200 credit and $260 cash.
     const dec = await charge(w, { amount: 460, due: '2026-12-01' })
@@ -673,7 +673,7 @@ describe('Money billed: a shortened stay’s credit comes back off where the mon
       .categories.find(c => c.category === 'space_rent')!
     expect(augRent).toMatchObject({ billed: 0, collected: 0, clearing: 0, stillOwed: 0 })
     const card = await collectedRentMtd([w.landlordId], null, { scope: 'rent', basis: 'billed', month: '2026-08-15' })
-    expect(card.billed).toEqual({ amount: 0, collected: 0, clearing: 0, stillOwed: 0 })
+    expect(card.billed).toEqual({ amount: 0, collected: 0, clearing: 0, stillOwed: 0, other: 0 })
 
     // July: the $538.71 of the reservation comes off the stay, the day the deposit counted.
     const jul = await tot(w, 'billed', '2026-07-01', '2026-07-31')
@@ -722,7 +722,7 @@ describe('Money billed: a shortened stay’s credit comes back off where the mon
     expect(sumParts(bOct.parts)).toBe(430.32)
     for (const [month, amount] of [['2026-10-15', 430.32], ['2026-11-15', 0]] as const) {
       const card = await collectedRentMtd([w.landlordId], null, { scope: 'rent', basis: 'billed', month })
-      expect(card.billed).toEqual({ amount, collected: amount, clearing: 0, stillOwed: 0 })
+      expect(card.billed).toEqual({ amount, collected: amount, clearing: 0, stillOwed: 0, other: 0 })
     }
   })
 
@@ -746,7 +746,7 @@ describe('Money billed: a shortened stay’s credit comes back off where the mon
     expect(cats.categories.find(c => c.category === 'space_rent')).toMatchObject({ billed: 0, collected: 0 })
     expect(cats.categories.find(c => c.category === 'stays_and_pay_links')).toMatchObject({ billed: 199, collected: 199 })
     const card = await collectedRentMtd([w.landlordId], null, { scope: 'rent', basis: 'billed', month: '2026-10-15' })
-    expect(card.billed).toEqual({ amount: 0, collected: 0, clearing: 0, stillOwed: 0 })
+    expect(card.billed).toEqual({ amount: 0, collected: 0, clearing: 0, stillOwed: 0, other: 0 })
     const stmt = await ownerStatement({ landlordId: w.landlordId, periodMonth: '2026-10' })
     expect(stmt.totals.grossCollected).toBe(0)
     expect(stmt.totals.billed).toEqual({ billed: 0, collectedSoFar: 0, clearing: 0, stillOwed: 0 })
@@ -844,7 +844,7 @@ describe('Money billed: each shortened-stay credit comes off its own bill, and a
     // The rent card and the owner statement's billed block read the same split.
     for (const [month, amount] of [['2026-10', 360], ['2026-11', 260]] as const) {
       const card = await collectedRentMtd([w.landlordId], null, { scope: 'rent', basis: 'billed', month: `${month}-15` })
-      expect(card.billed).toEqual({ amount, collected: amount, clearing: 0, stillOwed: 0 })
+      expect(card.billed).toEqual({ amount, collected: amount, clearing: 0, stillOwed: 0, other: 0 })
       const stmt = await ownerStatement({ landlordId: w.landlordId, periodMonth: month })
       expect(stmt.totals.billed).toEqual({ billed: amount, collectedSoFar: amount, clearing: 0, stillOwed: 0 })
     }
@@ -919,7 +919,7 @@ describe('Money billed: each shortened-stay credit comes off its own bill, and a
     expect(nov.lines.stayShortened).toBe(0)
     expect(nov.total).toBe(291.33)
     const card = await collectedRentMtd([w.landlordId], null, { scope: 'rent', basis: 'billed', month: '2026-11-15' })
-    expect(card.billed).toEqual({ amount: 291.33, collected: 291.33, clearing: 0, stillOwed: 0 })
+    expect(card.billed).toEqual({ amount: 291.33, collected: 291.33, clearing: 0, stillOwed: 0, other: 0 })
   })
 })
 

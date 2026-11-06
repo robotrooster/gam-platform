@@ -6,6 +6,15 @@
    ============================================================ */
 
 
+/* ── VIEWPORT HEIGHT ─────────────────────────────────────── */
+/* 11/3 — `dvh` arrived in Chrome 108, and an auto-update-expired Chromebook
+   sits on Chrome 103, where the whole declaration is DROPPED rather than
+   approximated. Declared in vh and upgraded to dvh only where dvh parses, so
+   an old engine keeps a working height and a phone still gets the
+   address-bar-aware one. Write var(--vh), never 100dvh. */
+:root { --vh: 100vh; }
+@supports (height: 1dvh) { :root { --vh: 100dvh; } }
+
 /* ── TOKENS ─────────────────────────────────────────────── */
 :root {
   /* Backgrounds */
@@ -669,6 +678,130 @@ fieldset:disabled { opacity: 1; }
 @media (max-width: 1100px) { .grid-4 { grid-template-columns: repeat(2,1fr); } }
 @media (max-width: 900px) { .grid-3, .grid-4, .form-grid-3 { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 640px) { .grid-2, .grid-3, .grid-4, .form-grid-2, .form-grid-3 { grid-template-columns: 1fr; } }
+
+/* ── PHONE: TABLES MUST BE REACHABLE (10/30, Nic) ─────────────────────────
+   POS is the one product whose user is ALWAYS on a phone — a merchant at a
+   counter or a swap meet. It had no phone rules at all beyond restacking
+   grids, and most of its tables sit in a plain card with no scroll container,
+   so the right-hand columns were not merely awkward, they were unreachable:
+   th is white-space: nowrap, the table runs past the card, and the page
+   cannot scroll sideways to follow it.
+
+   Making the TABLE itself the scroll container fixes every one of them at
+   once without touching a single cell — the ones already wrapped in an
+   overflow div (POSPayLinks) keep working, they just scroll one box in.
+   Deliberately not a restack: restacking needs a label on every cell, and a
+   register's rows are read as columns. Reachable first. */
+@media (max-width: 820px) {
+  /* 10/30 CORRECTION (same bug as the landlord portal): without max-width the
+     block grows to its content — 880px inside a 375px screen — so nothing
+     scrolls and the right-hand columns are just clipped. Applies to every
+     table, not only the classed ones. */
+  /* 10/30 (Nic): "I don't want the tables to scroll… It needs to be shortened
+     and condensed into a card." Row becomes a card, cell becomes a labelled
+     line. lib/stackTables.ts supplies data-label off the <thead>; the
+     !important on min-width beats the inline `style="min-width: …"` these
+     tables carry for desktop, without which the row stacks but stays 880px
+     wide and every value sits off the right edge. Full reasoning in the
+     landlord stylesheet. */
+  table:not([data-no-stack] table),
+  table:not([data-no-stack] table) tbody,
+  table:not([data-no-stack] table) tr,
+  table:not([data-no-stack] table) td {
+    display: block;
+    width: auto;
+    max-width: 100%;
+    min-width: 0 !important;
+  }
+  table:not([data-no-stack] table) thead {
+    position: absolute; width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+  }
+  table:not([data-no-stack] table) tr {
+    padding: 12px 2px; border-bottom: 1px solid var(--border-0);
+  }
+  table:not([data-no-stack] table) td {
+    border: none; padding: 3px 0; white-space: normal;
+  }
+  table:not([data-no-stack] table) td[data-label] {
+    display: flex; gap: 10px; align-items: baseline; justify-content: space-between;
+  }
+  table:not([data-no-stack] table) td[data-label]::before {
+    content: attr(data-label);
+    font-size: .68rem; font-weight: 700; letter-spacing: .06em;
+    text-transform: uppercase; color: var(--text-3); flex: 0 0 auto;
+  }
+  table:not([data-no-stack] table) td .btn { width: 100%; justify-content: center; }
+}
+
+/* The POS top bar is one row that never wrapped and never scrolled, so its
+   right end — the account menu, Lock register, Team — fell off a phone screen
+   with no way to reach it. Letting the nav side scroll sideways keeps every
+   control reachable without rearranging a counter clerk's muscle memory. */
+@media (max-width: 820px) {
+  .pos-topbar { padding: 0 10px; gap: 8px; }
+  .pos-topnav {
+    gap: 10px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    min-width: 0;
+  }
+  .pos-topnav::-webkit-scrollbar { display: none; }
+  .pos-topnav > * { flex: 0 0 auto; }
+}
+
+/* The register is items beside cart on a counter screen; on a phone that is
+   two things fighting over 350px. One column, cart under the items. The grid
+   columns are set inline in both register pages, so this needs the !important
+   to undo them — the alternative is threading a width prop through both. */
+@media (max-width: 820px) {
+  .pos-register-split { grid-template-columns: 1fr !important; }
+}
+
+/* 10/30 (Nic): the same phone fix the landlord portal carries. The register
+ * pages are byte-identical across both apps (pos-parity), so the ~20 inline
+ * column grids inside POSPage are here too, and a media query cannot reach an
+ * inline style. `!important` is what lets a stylesheet win that fight.
+ * :not([style*="auto"]) skips the already-responsive auto-fit grids and the
+ * `auto 1fr` label/value rows, which must stay side by side.
+ * Full reasoning: apps/landlord/src/styles/globals.css, same rule.
+ */
+@media (max-width: 820px) {
+  /* minmax(0, 1fr), NOT 1fr. A bare `1fr` is `minmax(auto, 1fr)`, and that
+     `auto` floor is the widest the content can possibly be — so one long
+     unbreakable line (a money sub-line, a long email) pushes the single track
+     past the screen and the card hangs off the right edge. Measured on the
+     dashboard at 375px: the track resolved to 718px inside a 347px grid.
+     minmax(0, …) lets the track shrink and the text wrap instead. */
+  [style*="grid-template-columns"]:not([style*="auto"]) {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  /* Same floor for the children, so a wide child cannot re-inflate the track. */
+  [style*="grid-template-columns"]:not([style*="auto"]) > * { min-width: 0; }
+
+  /* Inline flex rows wrap rather than run off the screen. A no-op while the
+     row fits. `.pos-topnav` is excluded — it scrolls sideways by design. */
+  [style*="display: flex"]:not([style*="flex-wrap"]):not(.pos-topnav) { flex-wrap: wrap; }
+
+  /* 10/30 (Nic, browsing on his phone): "To-do list items are cut off the side
+     of the screen. Same with ACH issues, connect your operating account."
+     A flex ITEM keeps `min-width: auto`, which resolves to how wide its content
+     wants to be — so one long line ("Lease needs review: Unit RV 01 — Sunset
+     Palms…") made a block inside a 305px column measure 652px and punch out of
+     the card. Measured, not guessed. `min-width: 0` lets the item shrink to its
+     container so the text wraps. A button that sets its own min-width in px
+     inline still wins (inline beats a stylesheet), so tap targets are safe. */
+  /* max-width too, and this is the one that actually does the work. In a
+     COLUMN flex container the line sizes to its widest item, and items
+     stretch to the LINE, not to the container — so a 305px card held a
+     652px line and the to-do text ran off the screen with min-width: 0
+     already set. Verified in the browser: min-width alone left it at 652.
+     max-width: 100% resolves against the containing block, pulling the
+     item back to the card. */
+  [style*="display: flex"] > * { min-width: 0; max-width: 100%; }
+  .pos-topnav { flex-wrap: nowrap; }
+}
 
 /* ── SEARCH / FILTER BAR ─────────────────────────────────── */
 .filter-bar {

@@ -18,6 +18,29 @@ export const HELD_ITEM_SOURCES = [
   'pos_sale', 'booking_deposit', 'business_invoice_payment',
   'business_pos_sale', 'refund', 'dispute', 'platform_fee', 'prepaid_draw',
   'deposit_settlement',
+  // 10/27 (Nic) — A DEBT COLLECTED FOR ANOTHER OPERATOR, MOVED BETWEEN THEM.
+  //
+  //   "they can pay you and we'll collect the money from you. But if you click
+  //    on this and they don't pay, we're collecting that debt from you. You're
+  //    going to be paying that debt on that tenant's behalf."
+  //
+  // The installment rides the collecting landlord's invoice, so the allocation
+  // engine credits it to them like any carried balance — and it is not theirs.
+  // These two lines move it in one batch: taken off the landlord who collected
+  // it, paid to the landlord who is owed.
+  //
+  //   left_owing_netted — NEGATIVE, the collecting landlord: the dollar was
+  //                       never their income, only their invoice
+  //   left_owing_paid   — POSITIVE, the landlord owed: their share of it
+  //   left_owing_share  — POSITIVE, the collecting landlord: their OWN share
+  //                       back, 10/29. The whole collection is netted off them
+  //                       first and their cut returns as its own line, because
+  //                       Nic wanted each movement readable on its own rather
+  //                       than one figure nobody can explain later.
+  //
+  // Separate names rather than one because held items are unique per
+  // (source_type, source_id) and all three are about the same payment.
+  'left_owing_netted', 'left_owing_paid', 'left_owing_share',
 ] as const
 export type HeldItemSource = typeof HELD_ITEM_SOURCES[number]
 

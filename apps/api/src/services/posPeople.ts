@@ -55,7 +55,7 @@
  * WHO A SALE CAN NAME. A register customer of this company, or a tenant tied to
  * it in ANY way (tenantOfCompanySql). Never gated on residency: a person with
  * only an invite, a booking or an earlier register sale here is still somebody
- * the counter sells to (10/2, the Scott Duffy ticket that could not be cleared
+ * the counter sells to (10/2, the Ulyssa Yoxall ticket that could not be cleared
  * or charged). The reader's breakdown never fails over the person at all — it
  * shows no name instead (nameForReader). Naming is ALL the any-tie rule allows.
  * What is on their own GAM account — its email and phone, and the card they
@@ -110,7 +110,7 @@ const sameText = (a?: string | null, b?: string | null) =>
  * SQL: tenant `t` is tied to the account behind company `l` in ANY way — a
  * lease of any status, an invite (resolved, cancelled or still open), a
  * booking, an earlier register sale, ticket or pay link, or a register record
- * carrying them. 10/2 (Nic, the Scott Duffy ticket): a person at the register
+ * carrying them. 10/2 (Nic, the Ulyssa Yoxall ticket): a person at the register
  * is never gated on residency. Two cancelled invites and no lease is still
  * somebody this company knows.
  *

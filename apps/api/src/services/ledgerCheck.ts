@@ -171,8 +171,13 @@ export async function engineChecks(client: PoolClient, owner: LedgerOwner): Prom
   // sorts. (The close-history read at ledgerClose.ts:499 was always written
   // `ORDER BY c.id DESC` and was never wrong.)
   const close = (await client.query<{ id: string; action: string; closed_through: string | null }>(
+    // 11/3: the PRIMARY row of the latest action. A close writes one sibling
+    // row per property beside it (so the per-line guard can ask about the
+    // line's own property), and the balance snapshot hangs off the primary —
+    // so taking the newest row of any kind here looked for a snapshot under a
+    // sibling's id, found none, and reported every closed month as drift.
     `SELECT id::text AS id, action, closed_through::text AS closed_through FROM books_period_closes
-      WHERE ${col} = $1 ORDER BY books_period_closes.id DESC LIMIT 1`, [id])).rows[0]
+      WHERE ${col} = $1 AND property_id IS NULL ORDER BY books_period_closes.id DESC LIMIT 1`, [id])).rows[0]
   if (close?.closed_through) {
     for (const r of (await client.query(
       `WITH snap AS (SELECT account_id, property_id, debits, credits FROM ledger_close_balances WHERE close_id = $2),

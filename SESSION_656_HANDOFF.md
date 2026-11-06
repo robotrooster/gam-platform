@@ -42,7 +42,7 @@ Runbook and logs: `~/gam-backups/deploy-1013/` (backups `gam-predeploy-0521.dump
 `gam_demo-predeploy-0521.dump`, previous `api-dist-live/`).
 
 - Migrations: 88 applied to `gam` and `gam_demo` (883 total), expand-only.
-- One-time scripts applied: 4 open $0 utility lines voided; Gerald Logue's
+- One-time scripts applied: 4 open $0 utility lines voided; Arlo Braddock's
   $22.47 estimate voided (INV-2026-00076 $517.47 → $495.00) and his meter
   marked "works, tenant uses no power"; ledger source facts backfilled.
   Work-trade basis resync: nothing to do.
@@ -171,7 +171,7 @@ and other money coming in; Delinquent tag; phone cards; health by lease).
 Tests: API 13,694 (711 files), frontends 1,107. Books after: integrity 0,
 drift 0; Oak Park nothing waiting. Record: `~/gam-backups/deploy-1013c/`.
 
-Arturo Melendez, MH 15 (Mountain View): lease drafted into the owner's
+Elan Everly, MH 15 (Mountain View): lease drafted into the owner's
 "Waiting on you to sign" (document a2f30572…), fields set to Nic's terms
 (start 10/01, $460, deposit $0, total due $460); nobody emailed. AFTER NIC
 SIGNS: check October is billed once at $460 and that late fees count from
@@ -193,8 +193,8 @@ the lease-birthdate backfill is applied — Nic's call). Map levels + 3D globe
 PARKED at ~/gam-parked/map-globe-1013 (Nic: wait on non-critical; Census files
 in ~/gam-geo-raw). Tests: API 13,876, frontends 1,210. Books: integrity 0,
 drift 0. Record: ~/gam-backups/deploy-1013d/. Open questions (29):
-~/gam-backups/deploy-1013d/questions_for_nic.txt. Arturo's MH 15: Nic signed;
-waiting on Arturo.
+~/gam-backups/deploy-1013d/questions_for_nic.txt. Elan's MH 15: Nic signed;
+waiting on Elan.
 
 ## 10/14: answers deploy (live ~4:20 pm Phoenix)
 
@@ -211,9 +211,9 @@ landlord-only edits, read-only for tenants), itemized income by space type with
 Detailed/Summary and an itemized monthly PDF. Tests: API 14,025, tenant 279,
 landlord 918. Migrations 20261016140000..158000 on gam + gam_demo.
 Production one-time steps applied (log `~/gam-backups/deploy-1014/`): late fees
-removed for Selene Arvizu, Valentin Flores, Michael Moreno, Billy Miranda; Dump
+removed for Winslow Bramhall, Floriane Kenworthy, Halcyon Kingsnorth, Billy Miranda; Dump
 station register button; MH 3.5 added, MH 11/26 $589, vacant trailers
-park-owned, wide tags; Andres Razo's RV 27 stay Aug 1-Sep 1; RV 09 erased; 81
+park-owned, wide tags; Cora Castellan's RV 27 stay Aug 1-Sep 1; RV 09 erased; 81
 birthdays copied; storage account renamed; Mountain View work trade left_out;
 both ledgers rebuilt from scratch (integrity 0, drift 0, pending 0).
 PARKED (weekly limit 98%): map levels + 3D globe, faster deploys, admin Metrics
@@ -232,7 +232,7 @@ Shipped `042a36e`..`b96eafc`:
   so a success, a failure and a ticket all looked like a closed modal. All three fixed.
   Pay links now hold a stay, GAM picks the site (chooseFreeSite) and the guest-facing
   label no longer names it; a stay link with no site/dates is refused at the card page
-  and the counter. Andres Razo's booking source corrected to pay_link.
+  and the counter. Cora Castellan's booking source corrected to pay_link.
 - **Deploys: 14,219 tests in ~7 min** (was 30+). cleanupAllSchema 190 deletes/145 ms →
   one statement/1-3 ms (38 tables named to KEEP, so a new table is cleaned by default);
   27 test files no longer race for the processing rate.

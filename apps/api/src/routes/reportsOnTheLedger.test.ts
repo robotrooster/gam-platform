@@ -73,7 +73,9 @@ describe('Reports read the books once they are live', () => {
     expect(v.source).toBe('ledger')
     expect([v.received, v.charged, v.owed]).toEqual([400, 1300, 1200])
     expect(v.proof).toMatchObject({ owedAtStart: 300, billed: 1300, received: 400, owedAtEnd: 1200 })
-    expect(v.tieText[1]).toMatch(/^Owed \$300\.00 at the end of Sep 30, 2026 \+ billed \$1,300\.00 − received against bills \$400\.00 = owed \$1,200\.00 at the end of Oct 31, 2026\.$/)
+    // 11/4: by content, not position — the charged sentence now sits ahead of
+    // the strip on the books path.
+    expect(v.tieText.some((s: string) => /^Owed \$300\.00 at the end of Sep 30, 2026 \+ billed \$1,300\.00 − received against bills \$400\.00 = owed \$1,200\.00 at the end of Oct 31, 2026\.$/.test(s))).toBe(true)
     // The repair was dated 10/4 and paid 10/20 — the same month either way.
     expect(r.body.data.nets).toEqual({ received: 250, charged: 1150 })
   })
@@ -126,9 +128,16 @@ describe('Reports read the books once they are live', () => {
     const w = await world()
     const all = await collectedRentMtd([w.landlordId], null, { scope: 'all', month: '2026-10-15' })
     expect(all.collected).toBe(400)
-    expect(all.billed).toEqual({ amount: 1300, collected: 400, clearing: 0, stillOwed: 1200 })
+    // 11/4 (Nic, one population per figure): the card's three figures are a
+    // split of its OWN total now and add back to it — 400 + 0 + 900 = 1300.
+    // They used to read stillOwed 1200, the whole receivables balance with
+    // September's $300 inside it, on a card headed with October: 400 + 0 +
+    // 1200 = 1600 against a total of 1300. That is the shape Nic rejected on
+    // 11/3 ("a card headed with a month must not carry a cumulative
+    // balance"), and it is the $14,391 figure he caught on the dashboard.
+    expect(all.billed).toEqual({ amount: 1300, collected: 400, clearing: 0, stillOwed: 900, other: 0 })
     const rent = await collectedRentMtd([w.landlordId], w.propertyId2, { month: '2026-10-15' })
-    expect(rent.billed).toEqual({ amount: 300, collected: 0, clearing: 0, stillOwed: 600 })
+    expect(rent.billed).toEqual({ amount: 300, collected: 0, clearing: 0, stillOwed: 300, other: 0 })
   })
 
   it('the utility recovery report takes what the property spent from the books', async () => {

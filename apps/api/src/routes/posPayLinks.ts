@@ -27,6 +27,7 @@ import { db, query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
+import { apiUrl } from '../lib/portalUrls'
 import { computeCartTotals } from '../services/posTax'
 import { insertPosSale } from '../services/posSale'
 import { activateBillingForMoneyMoved } from '../services/billingActivation'
@@ -61,7 +62,7 @@ import {
 export const posPayLinksRouter = Router()
 posPayLinksRouter.use(requireAuth)
 
-const apiBase = () => (process.env.API_PUBLIC_URL || 'http://localhost:4000').replace(/\/$/, '')
+const apiBase = apiUrl
 export const payLinkUrl = (token: string) => `${apiBase()}/api/public/pay/${token}`
 
 const round2 = (n: number) => Math.round(n * 100) / 100
@@ -2587,7 +2588,7 @@ posPayLinksRouter.get('/:id/qr.png', requirePerm('pos.ring_sale'), async (req, r
 // and reveals nothing else.
 export const publicPayRouter = Router()
 
-const page = (title: string, body: string) => `<!doctype html><html lang="en"><head>
+export const page = (title: string, body: string) => `<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title}</title>
 <style>body{margin:0;background:#0a0b0e;color:#c4ccde;font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;display:grid;place-items:center;min-height:100vh;padding:24px}
@@ -2595,7 +2596,7 @@ const page = (title: string, body: string) => `<!doctype html><html lang="en"><h
 h1{color:#f0f2f7;font-size:1.3rem;margin:0 0 8px}.g{color:#c9a227;font-weight:700;letter-spacing:.04em;font-size:.8rem;text-transform:uppercase}</style>
 </head><body><div class="c"><div class="g">Gold Asset Management</div>${body}</div></body></html>`
 
-const escapeHtml = (s: string) => String(s).replace(/[&<>"']/g, c =>
+export const escapeHtml = (s: string) => String(s).replace(/[&<>"']/g, c =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!))
 
 /** 10/2 (review): how long a card page opened from a link stays payable — Stripe's shortest (30 minutes), plus two for clock drift. */
@@ -2820,9 +2821,36 @@ publicPayRouter.get('/pay/:token/done', async (req, res, next) => {
          JOIN properties p ON p.id = l.property_id WHERE l.token = $1`, [req.params.token]) : null
     // 10/5 (Nic, R13): and, for a stay with no lease, how long the site is held.
     const held = link ? await linkHeldWords(link).catch(() => null) : null
+    /**
+     * ── AND, HAVING PAID, THE LICENCE (Nic, 10/29) ────────────────────────
+     *
+     *   "Ask for the ID during the deposit checkout that they already go
+     *    through. No sign in, no flow change."
+     *
+     * This page is where that lands. Stripe's own checkout cannot host a file
+     * upload, so the ask cannot sit before the payment without adding a page
+     * in front of it; here it adds nothing to the paying and the guest is
+     * already on a GAM page with their phone in their hand.
+     *
+     * Best-effort and never a blocker: a receipt page that failed because a
+     * token could not be minted would be a worse trade than no ask at all.
+     */
+    let idAsk = ''
+    if (link?.booking_id) {
+      try {
+        const { guestIdCaptureLink } = await import('./publicGuestId')
+        const url = await guestIdCaptureLink(link.booking_id)
+        idAsk = `<p style="margin-top:18px">One more thing, if you have a minute: `
+          + `<a href="${escapeHtml(url)}" style="color:#c9a227">add a photo of your licence</a>`
+          + ` so ${escapeHtml(link.property_name)} has it on file. It is optional.</p>`
+      } catch (e) {
+        logger.warn({ err: e, bookingId: link.booking_id },
+          '[pay-link] could not offer the licence step on the receipt page')
+      }
+    }
     res.send(page('Payment received',
       `<h1>Payment received — thank you</h1><p>${link ? `${escapeHtml(link.label)} at ${escapeHtml(link.property_name)}.` : ''} A receipt is on its way to your email.</p>`
-      + (held ? `<p>${escapeHtml(held)}</p>` : '')))
+      + (held ? `<p>${escapeHtml(held)}</p>` : '') + idAsk))
   } catch (e) { next(e) }
 })
 
@@ -3161,6 +3189,15 @@ export async function finalizePayLink(session: {
       await client.query(
         `UPDATE pos_pay_links SET status = 'paid', paid_at = NOW(), pos_transaction_id = $2, updated_at = NOW()
           WHERE id = $1`, [link.id, tx.id])
+      // 11/5: paid online, which is the ordinary way somebody "comes back with
+      // a new card". If the desk had written this link into the walk-away
+      // book, that part goes — in the sale's own transaction, so a flag can
+      // never outlive the payment that cleared it.
+      const { dropWalkAwayPart } = await import('../services/leftOwingParts')
+      await dropWalkAwayPart(client, {
+        landlordId: link.landlord_id, kind: 'counter', sourceKey: String(link.id),
+        reason: 'They came back and paid the link',
+      })
     }
     // S649: the arrival-day balance of a stay. 10/2 (review): one rule with the
     // counter (settleLinkBooking) — the booking is confirmed and names this

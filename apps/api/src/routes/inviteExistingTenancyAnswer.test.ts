@@ -129,7 +129,7 @@ async function addOneTenant(co: Co, existingResident: boolean) {
   const res = await request(buildApp())
     .post('/api/landlords/me/onboard-tenant-pending')
     .set('Authorization', `Bearer ${co.token}`)
-    .send({ firstName: 'Kay', lastName: 'Howard', email: `kay-${randomUUID().slice(0, 8)}@test.dev`,
+    .send({ firstName: 'Verity', lastName: 'Winthrop', email: `verity-${randomUUID().slice(0, 8)}@test.dev`,
             unitId: co.unitId, existingResident })
   expect(res.status).toBe(200)
   return res.body.data.intentId as string
@@ -167,7 +167,7 @@ async function pageEight(co: Co): Promise<Record<string, string | null>> {
       targetLeaseTenantId: null, promoteLeaseTenantId: null,
       signers: [
         { userId: co.userId, role: 'landlord', name: 'LL', email: 'll@mailer-test.co', orderIndex: 1 },
-        { userId: tenantUser.user_id, role: 'primary', name: 'Kay Howard', email: tenantUser.email, orderIndex: 2 },
+        { userId: tenantUser.user_id, role: 'primary', name: 'Verity Winthrop', email: tenantUser.email, orderIndex: 2 },
       ],
     })
     await client.query('COMMIT')
@@ -303,7 +303,7 @@ describe('after the property window closes but inside the landlord 28 days', () 
     const res = await request(buildApp())
       .post('/api/landlords/me/onboard-tenant-pending')
       .set('Authorization', `Bearer ${co.token}`)
-      .send({ firstName: 'Kay', lastName: 'Howard', email: `kay-${randomUUID().slice(0, 8)}@test.dev`,
+      .send({ firstName: 'Verity', lastName: 'Winthrop', email: `verity-${randomUUID().slice(0, 8)}@test.dev`,
               unitId: co.unitId, existingResident: true })
     expect(res.status).toBe(200)
     expect(res.body.data.screeningWaived).toBe(false)

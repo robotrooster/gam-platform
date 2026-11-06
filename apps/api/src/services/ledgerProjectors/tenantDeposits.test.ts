@@ -207,7 +207,11 @@ describe('refunds of paid-ahead money', () => {
 })
 
 describe('D2: a deposit the tenant pays in installments', () => {
-  it('shows the full deposit at enrollment (never the installments); a shortfall at move-out is an adjustment', async () => {
+  // 10/28 (Nic): "The landlord's books should only take the deposit when the
+  // fucking deposit is paid... they only get that when the first payment
+  // happens." It used to post on the ENROLLMENT day, which is why this said
+  // 2026-08-25 — the day the installment rows were written, before any money.
+  it('shows the full deposit on the day the FIRST INSTALLMENT LANDED (never the installments); a shortfall at move-out is an adjustment', async () => {
     const co = await tenantCo()
     const sd = await inTx(async c => {
       const id = (await c.query<{ id: string }>(
@@ -228,7 +232,9 @@ describe('D2: a deposit the tenant pays in installments', () => {
     await db.query(`UPDATE flex_deposit_installments SET payment_id = $1 WHERE security_deposit_id = $2 AND installment_number = 1`, [pull, sd])
     await drain()
     const lines = await activeLines('security_deposit', sd)
-    expect(lines[0]?.day).toBe('2026-08-25')
+    // The first installment settled 2026-09-01; the enrollment rows were
+    // written 2026-08-25 and no longer decide anything.
+    expect(lines[0]?.day).toBe('2026-09-01')
     expect(triples(lines)).toEqual([['deposits_gam_holds', 90000, 0], ['security_deposits_payable', 0, 90000]])
     expect(await activeLines('payment', pull)).toEqual([])
     const ret = await moveOut(co, { deposit: 600, cleaning: 100, refund: 500, securityDepositId: sd })
@@ -238,6 +244,33 @@ describe('D2: a deposit the tenant pays in installments', () => {
       ['security_deposits_payable', 30000, 0], ['deposits_gam_holds', 0, 30000],
     ])
     expect(await bal(co.landlordId, 'security_deposits_payable')).toBe(-50000)   // the refund still to send
+  })
+})
+
+describe('D2b: a deposit enrolled but not yet funded', () => {
+  // 10/28 (Nic): the whole point of moving the posting to real money — with
+  // enrollment about to be allowed while a bank is still verifying, the books
+  // must not claim custody of a deposit nobody has funded.
+  it('posts NOTHING on the landlord\'s books until an installment settles', async () => {
+    const co = await tenantCo()
+    const sd = await inTx(async c => {
+      const id = (await c.query<{ id: string }>(
+        `INSERT INTO security_deposits (unit_id, lease_id, tenant_id, total_amount, collected_amount, held_by, status,
+                                        flex_deposit_enabled, flex_deposit_plan_status)
+         VALUES ($1, $2, $3, 900, 0, 'gam_escrow', 'pending', TRUE, 'active') RETURNING id`,
+        [co.unitId, co.leaseId, co.tenantId])).rows[0].id
+      for (const n of [1, 2, 3]) {
+        await c.query(
+          `INSERT INTO flex_deposit_installments (security_deposit_id, tenant_id, installment_number, installment_count,
+                                                  amount, due_date, status, created_at)
+           VALUES ($1, $2, $3, 3, 300, '2026-09-01'::date + ($3 - 1) * interval '1 month', 'pending', '2026-08-25T18:00:00Z')`,
+          [id, co.tenantId, n])
+      }
+      return id
+    })
+    await drain()
+    expect(await activeLines('security_deposit', sd)).toEqual([])
+    expect(await bal(co.landlordId, 'deposits_gam_holds')).toBe(0)
   })
 })
 

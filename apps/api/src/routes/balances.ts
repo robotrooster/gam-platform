@@ -187,7 +187,7 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
     //   "Is that going to appear on the front desk person's list as like, hey,
     //    collect this money?"  → yes, "collect-only, can't be rung up".
     //
-    // Dominic Gonzalez's installment is the TRUST's money, not the park's, so
+    // Vesper Vanterpool's installment is the TRUST's money, not the park's, so
     // GAM invoices nothing for it and nothing of it may reach the park's books
     // (home_sale_contracts.tracked_not_billed). But he pays at the counter, and
     // a desk that is never told cannot collect — so the line is here, and it is
@@ -330,7 +330,7 @@ balancesRouter.get('/payments-by-month', requirePerm('payments.view_all'), async
  * server-side for anyone else; staff limited to their properties (a property
  * that is not theirs is a 404, never another property's money). Sums across
  * households ride only for a viewer seesGrandTotals admits (decisions #25).
- * 10/14 (Nic), about Lisa Scheeler (Mountain View's on-site manager: "View who
+ * 10/14 (Nic), about Calla Fitzhugh (Mountain View's on-site manager: "View who
  * owes" and "Take payments", not "View all payments"): "they should see at
  * least the payments tab ... kind of the same way that I see it, but not with
  * that top view ... not show all the totals, the work trade, all these things

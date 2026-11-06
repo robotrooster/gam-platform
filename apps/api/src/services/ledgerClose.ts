@@ -172,7 +172,9 @@ async function ledgerMarks(c: PoolClient, owner: LedgerOwner): Promise<LedgerMar
   const col = ownerColOf(owner)
   const r = (await c.query<{ postings: number; last_close: string | null; waiting: number; failing: number; reconciled: string }>(
     `SELECT (SELECT count(*)::int FROM ledger_postings WHERE ${col} = $1) AS postings,
-            (SELECT max(id)::text FROM books_period_closes WHERE ${col} = $1) AS last_close,
+            -- 11/3: primary rows only, so this change detector and the
+            -- snapshot it guards agree on what "the last close" is.
+            (SELECT max(id)::text FROM books_period_closes WHERE ${col} = $1 AND property_id IS NULL) AS last_close,
             -- 10/12 (P9): a statement undone since the snapshot changes this.
             -- 10/12 (Nic, review): every statement and its standing, not a
             -- count — one undone and another completed between the snapshot
@@ -281,6 +283,21 @@ export async function closeMonth(args: {
           `INSERT INTO books_period_closes (${ownerColOf(owner)}, action, closed_through, reason, acted_by, warnings)
            VALUES ($1, 'close', $2, $3, $4, $5::jsonb) RETURNING id::text AS id`,
           [ownerIdOf(owner), through, args.reason?.trim() || null, actorUserId, JSON.stringify(pre.warnings)])).rows[0]
+        // 11/3 — ONE SIBLING ROW PER PROPERTY. The guard on every ledger line
+        // asks what THE LINE'S OWN property is closed through
+        // (ledger_posting_lines_guard), so a close that wrote only the row
+        // above — whose property_id is NULL, meaning the company's own slice —
+        // would protect the property-less lines and leave the rent wide open.
+        // That is the one thing anyone closes a month for. Same action, same
+        // day, same reason, same warnings; the row above stays the one the
+        // balance snapshot and the history list hang off.
+        if (owner.landlordId) {
+          await c.query(
+            `INSERT INTO books_period_closes (landlord_id, property_id, action, closed_through, reason, acted_by, warnings)
+             SELECT $1::uuid, p.id, $2, $3::date, $4, $5::uuid, $6::jsonb
+               FROM properties p WHERE p.landlord_id = $1::uuid`,
+            [owner.landlordId, 'close', through, args.reason?.trim() || null, actorUserId, JSON.stringify(pre.warnings)])
+        }
         const snapshotRows = await writeSnapshot(c, owner, row.id, pre.balances)
         await c.query('COMMIT')
         done = { closeId: row.id, closedThrough: through, snapshotRows }
@@ -499,7 +516,13 @@ export async function getCloseStatus(args: { owner: LedgerOwner; viewerUserId: s
         `SELECT c.id::text AS id, c.action, c.closed_through::text AS closed_through, c.reason,
                 NULLIF(btrim(concat_ws(' ', u.first_name, u.last_name)), '') AS by_name, c.acted_at::text AS at, c.warnings
            FROM books_period_closes c LEFT JOIN users u ON u.id = c.acted_by
-          WHERE c.${ownerColOf(owner)} = $1 ORDER BY c.id DESC LIMIT 100`, [ownerIdOf(owner)])).rows
+          WHERE c.${ownerColOf(owner)} = $1
+            -- 11/3: the primary row of each action only. A close now writes one
+            -- sibling row per property beside it so the per-line guard can ask
+            -- about the line's own property; listing those would turn one close
+            -- into a screenful of identical entries.
+            AND c.property_id IS NULL
+          ORDER BY c.id DESC LIMIT 100`, [ownerIdOf(owner)])).rows
       await c.query('COMMIT')
       return {
         closedThrough: ctx.closedThrough, booksStartDate: ctx.booksStartDate, today: ctx.today,
@@ -585,6 +608,16 @@ export async function reopenMonth(args: {
       `INSERT INTO books_period_closes (${ownerColOf(owner)}, action, closed_through, reason, acted_by)
        VALUES ($1, 'reopen', $2, $3, $4) RETURNING id::text AS id`,
       [ownerIdOf(owner), keep, reason, actorUserId])).rows[0]
+    // 11/3: the same sibling-per-property rule as the close — a reopen that
+    // only moved the company's slice would leave every property still closed,
+    // so the month would read as open and refuse every line in it.
+    if (owner.landlordId) {
+      await c.query(
+        `INSERT INTO books_period_closes (landlord_id, property_id, action, closed_through, reason, acted_by)
+         SELECT $1::uuid, p.id, 'reopen', $2::date, $3, $4::uuid
+           FROM properties p WHERE p.landlord_id = $1::uuid`,
+        [owner.landlordId, keep, reason, actorUserId])
+    }
     const snapshotRows = await writeSnapshot(c, owner, row.id, balances)
     await c.query('COMMIT')
     await notifyOwners(owner, actorUserId, 'A closed month was reopened in your books',

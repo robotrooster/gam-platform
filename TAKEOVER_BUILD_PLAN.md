@@ -1,7 +1,7 @@
 # A resident takes over a spot and the home on it
 
 **Authorized 10/23 (Nic): "build it all."** Live case: Country Acres MH 28,
-Susie McCoy out, the Bowmans' daughter in, taking over BOTH the lot and the
+Amias Fotheringay out, the Bowmans' daughter in, taking over BOTH the lot and the
 $24,000 home-installment sale ($200/mo, 38 of 120 paid, 82 left).
 
 ## The rule this follows
@@ -62,7 +62,7 @@ addendum_add documents; all 109 lease_tenants rows are `added_reason='original'`
 - Then `services/homeSale.ts:853-857` — the standalone fallback bills only when
   no active lease has the buyer as primary — flips TRUE and starts billing
   **the departed buyer directly**. This is the sharp edge: do the swap before
-  the handover exists and Susie is billed forever.
+  the handover exists and Amias is billed forever.
 - Catch-up attach is buyer-locked: `homeSale.ts:689-696`, insert uses
   `c.tenant_id` at 703-708; household lock at 633.
 - Sale cannot start unless the unit is landlord-owned: `homeSale.ts:970`.

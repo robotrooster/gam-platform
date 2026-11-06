@@ -243,8 +243,8 @@ describe('collectedRentMtd — what comes back off the rent card', () => {
     // Rent was 700 of the 1,000 swept, so it takes 70% of the −600: 700 − 420.
     expect(oct.rent.collected).toBe(280)
     // Money billed says the same: of the $700 rent bill, $280 was kept and $420 is still owed.
-    expect(oct.rent.billed).toEqual({ amount: 700, collected: 280, clearing: 0, stillOwed: 420 })
-    expect(oct.all.billed).toEqual({ amount: 1100, collected: 400, clearing: 0, stillOwed: 700 })
+    expect(oct.rent.billed).toEqual({ amount: 700, collected: 280, clearing: 0, stillOwed: 420, other: 0 })
+    expect(oct.all.billed).toEqual({ amount: 1100, collected: 400, clearing: 0, stillOwed: 700, other: 0 })
   })
 
   it("Money billed: a move-out gap from unpaid rent — the rent card's collected so far equals what the pool kept, and the rest is still owed", async () => {
@@ -255,8 +255,8 @@ describe('collectedRentMtd — what comes back off the rent card', () => {
     await moveOut(w, { deposit: 400, cleaning: 100, swept: 700, gap: 400, at: fin })
     const oct = await card(w, '2026-10-01')
     // The shortfall goes to the cleaning first ($100 still owed), the rest to the rent ($300).
-    expect(oct.rent.billed).toEqual({ amount: 700, collected: 400, clearing: 0, stillOwed: 300 })
-    expect(oct.all.billed).toEqual({ amount: 800, collected: 400, clearing: 0, stillOwed: 400 })
+    expect(oct.rent.billed).toEqual({ amount: 700, collected: 400, clearing: 0, stillOwed: 300, other: 0 })
+    expect(oct.all.billed).toEqual({ amount: 800, collected: 400, clearing: 0, stillOwed: 400, other: 0 })
     // All that was swept was rent, so the two cards agree on what was collected.
     expect(oct.rent.billed.collected).toBe(oct.all.billed.collected)
     expect(oct.rent.collected).toBe(oct.all.collected)
@@ -272,12 +272,12 @@ describe('collectedRentMtd — what comes back off the rent card', () => {
       `SELECT gap_payment_id FROM deposit_returns WHERE landlord_id = $1`, [w.landlordId])).rows[0].gap_payment_id
     await db.query(`UPDATE payments SET status = 'settled', settled_at = '2026-10-20T10:00:00-07:00' WHERE id = $1`, [gap])
     const oct = await card(w, '2026-10-01')
-    expect(oct.rent.billed).toEqual({ amount: 700, collected: 700, clearing: 0, stillOwed: 0 })
+    expect(oct.rent.billed).toEqual({ amount: 700, collected: 700, clearing: 0, stillOwed: 0, other: 0 })
     expect(oct.rent.collected).toBe(700)          // was 400: the rent's $300 of the gap sat on an uncategorized line
     expect(oct.rent.collected).toBe(oct.rent.billed.collected)
     // The income card: $400 kept + $400 of the gap paid, both ways.
     expect(oct.all.collected).toBe(800)
-    expect(oct.all.billed).toEqual({ amount: 800, collected: 800, clearing: 0, stillOwed: 0 })
+    expect(oct.all.billed).toEqual({ amount: 800, collected: 800, clearing: 0, stillOwed: 0, other: 0 })
   })
 
   it('a move-out that swept rent and a utility: when the gap is paid, the rent card collects only the rent’s share of it', async () => {
@@ -292,9 +292,9 @@ describe('collectedRentMtd — what comes back off the rent card', () => {
     const oct = await card(w, '2026-10-01')
     // Rent: $280 kept at move-out + its $420 of the gap.
     expect(oct.rent.collected).toBe(700)
-    expect(oct.rent.billed).toEqual({ amount: 700, collected: 700, clearing: 0, stillOwed: 0 })
+    expect(oct.rent.billed).toEqual({ amount: 700, collected: 700, clearing: 0, stillOwed: 0, other: 0 })
     expect(oct.all.collected).toBe(1100)
-    expect(oct.all.billed).toEqual({ amount: 1100, collected: 1100, clearing: 0, stillOwed: 0 })
+    expect(oct.all.billed).toEqual({ amount: 1100, collected: 1100, clearing: 0, stillOwed: 0, other: 0 })
   })
 
   it('a paid gap later disputed: only the rent’s share comes off the rent card on the dispute day', async () => {
@@ -335,7 +335,7 @@ describe('collectedRentMtd — what comes back off the rent card', () => {
     const oct = await card(w, '2026-10-01')
     expect(oct.rent.collected).toBe(200)
     expect(oct.rent.inFlight).toBe(100)           // was 0: the dashboard read "+ $0 still clearing"
-    expect(oct.rent.billed).toEqual({ amount: 300, collected: 200, clearing: 100, stillOwed: 0 })
+    expect(oct.rent.billed).toEqual({ amount: 300, collected: 200, clearing: 100, stillOwed: 0, other: 0 })
     expect(oct.rent.inFlight).toBe(oct.rent.billed.clearing)
     expect(oct.all.inFlight).toBe(oct.all.billed.clearing)
   })
@@ -370,20 +370,20 @@ describe('collectedRentMtd — what comes back off the rent card', () => {
     // Each bill: its share paid less its share disputed, rounded row by row on both sides
     // (33.34 − 16.67, 33.33 − 16.67, 33.33 − 16.67): $200 kept + $49.99.
     expect(oct.rent.collected).toBe(249.99)
-    expect(oct.rent.billed).toEqual({ amount: 300, collected: 249.99, clearing: 0, stillOwed: 50.01 })
+    expect(oct.rent.billed).toEqual({ amount: 300, collected: 249.99, clearing: 0, stillOwed: 50.01, other: 0 })
     expect(oct.rent.collected).toBe(oct.rent.billed.collected)    // was 249.99 vs 250.01
     // The cent the rounding leaves sits on the shortfall's uncategorized part, the same way under both.
     expect(oct.all.collected).toBe(250)
-    expect(oct.all.billed).toEqual({ amount: 300, collected: 250, clearing: 0, stillOwed: 50 })
+    expect(oct.all.billed).toEqual({ amount: 300, collected: 250, clearing: 0, stillOwed: 50, other: 0 })
 
     // Oct 28: the reopened $50 is paid in cash. Every bill is whole again, both ways.
     await db.query(`UPDATE payments SET status = 'settled', settled_at = '2026-10-28T10:00:00-07:00', manual_method = 'cash'
                      WHERE id = $1`, [reopened])
     const paid = await card(w, '2026-10-01')
     expect(paid.rent.collected).toBe(300)
-    expect(paid.rent.billed).toEqual({ amount: 300, collected: 300, clearing: 0, stillOwed: 0 })
+    expect(paid.rent.billed).toEqual({ amount: 300, collected: 300, clearing: 0, stillOwed: 0, other: 0 })
     expect(paid.all.collected).toBe(300)
-    expect(paid.all.billed).toEqual({ amount: 300, collected: 300, clearing: 0, stillOwed: 0 })
+    expect(paid.all.billed).toEqual({ amount: 300, collected: 300, clearing: 0, stillOwed: 0, other: 0 })
   })
 
   it('a renewal-chain move-out (swept rent on the previous lease): the rent card equals what the deposit pool kept', async () => {
@@ -396,8 +396,8 @@ describe('collectedRentMtd — what comes back off the rent card', () => {
     const oct = await card(w, '2026-10-01')
     expect(oct.all.collected).toBe(400)
     expect(oct.rent.collected).toBe(400)     // was 700: matched by lease id, the shortfall never found the rent
-    expect(oct.rent.billed).toEqual({ amount: 700, collected: 400, clearing: 0, stillOwed: 300 })
-    expect(oct.all.billed).toEqual({ amount: 800, collected: 400, clearing: 0, stillOwed: 400 })
+    expect(oct.rent.billed).toEqual({ amount: 700, collected: 400, clearing: 0, stillOwed: 300, other: 0 })
+    expect(oct.all.billed).toEqual({ amount: 800, collected: 400, clearing: 0, stillOwed: 400, other: 0 })
   })
 
   it('a disputed pay-ahead comes off the rent card on the dispute day', async () => {

@@ -1,8 +1,8 @@
 /**
- * 10/12 (Nic, Curtis Clabough) — finish the coverage repair the hand script
+ * 10/12 (Nic, Sage Stillwell) — finish the coverage repair the hand script
  * started.
  *
- * scripts/oct12_curtis_full_utility_coverage.ts parked Curtis's open October
+ * scripts/oct12_full_utility_coverage_work_trade.ts parked Sage's open October
  * water ($110.55) under his work trade, but left October's work-trade month
  * priced over the rent alone (basis $450, 25 hours, $18.00 an hour). The month
  * close credits only the basis and then lifts every suspension on the bill, so
@@ -15,7 +15,7 @@
  * lines (basis = the parked lines, hour = basis ÷ the month's hours). It only
  * ever widens; the hours a month asks for are left alone.
  *
- * As of 10/12 the read-only check finds one: Curtis, October (INV-2026-00027),
+ * As of 10/12 the read-only check finds one: Sage, October (INV-2026-00027),
  * $450.00 → $560.55, $18.00 → $22.42 an hour.
  *
  * Dry run by default (one transaction, rolled back). --apply commits.

@@ -26,8 +26,11 @@
  */
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { Building2, Users, Receipt, Landmark, HeartHandshake } from 'lucide-react'
-import { apiGet, apiPost } from '../lib/api'
+import { Building2, Users, Receipt, Landmark, HeartHandshake, UserPlus, Mail, Send } from 'lucide-react'
+import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { PM_STAFF_ROLES, PM_STAFF_ROLE_LABEL, PM_STAFF_STATUS_LABEL,
+         type PmStaffRole, type PmStaffStatus } from '@gam/shared'
+import { toast, appConfirm } from '../components/dialogs'
 
 interface PmCompany { id: string; name: string; status?: string }
 interface OwnerRow {
@@ -40,8 +43,16 @@ interface FeePlan {
   flatAmount?: number | null; status?: string; isActive?: boolean
 }
 interface StaffRow {
-  id: string; userId: string; name?: string | null; email?: string | null
-  role: string; status: string
+  id: string; userId: string
+  // 11/01: this said `name`, which the endpoint never sends — it selects
+  // u.first_name / u.last_name, so every row's Name column read "—" for as
+  // long as the tab has existed.
+  firstName?: string | null; lastName?: string | null; email?: string | null
+  role: PmStaffRole; status: PmStaffStatus
+}
+interface StaffInvite {
+  id: string; email: string; role: PmStaffRole; status: string
+  expiresAt: string | null; acceptedAt: string | null; revokedAt: string | null
 }
 interface ConnectStatus {
   payoutsEnabled?: boolean; detailsSubmitted?: boolean; chargesEnabled?: boolean
@@ -265,26 +276,176 @@ function FeePlans({ companyId }: { companyId: string }) {
  * same kind of breakdown as the people that do it on site."
  */
 function Staff({ companyId }: { companyId: string }) {
+  const qc = useQueryClient()
+  const [inviting, setInviting] = useState(false)
+  const [email, setEmail] = useState('')
+  const [role, setRole] = useState<PmStaffRole>('staff')
+
   const { data: staff = [], isLoading } = useQuery<StaffRow[]>(
     ['pm-staff', companyId], () => apiGet<StaffRow[]>(`/pm/companies/${companyId}/staff`))
+  const { data: invites = [] } = useQuery<StaffInvite[]>(
+    ['pm-staff-invites', companyId],
+    () => apiGet<StaffInvite[]>(`/pm/companies/${companyId}/invitations`))
+
+  const refresh = () => {
+    qc.invalidateQueries(['pm-staff', companyId])
+    qc.invalidateQueries(['pm-staff-invites', companyId])
+  }
+
+  // 11/01: the invitation endpoint, not the add-by-user-id one. POST
+  // /staff wants a user UUID, which nobody running a management company
+  // knows — and a user search that would find it for them would let one
+  // company enumerate every account on the platform. Inviting by email is
+  // the door that already emails an accept link.
+  const invite = useMutation(
+    () => apiPost(`/pm/companies/${companyId}/invitations`, { email: email.trim(), role }),
+    {
+      onSuccess: () => {
+        toast('Invitation sent. They join once they accept it.')
+        setInviting(false); setEmail(''); setRole('staff'); refresh()
+      },
+      onError: (e: any) => toast(e?.response?.data?.error ?? 'Could not send that invitation.'),
+    })
+
+  const resend = useMutation(
+    (invId: string) => apiPost(`/pm/companies/${companyId}/invitations/${invId}/resend`, {}),
+    {
+      onSuccess: () => { toast('Sent again.'); refresh() },
+      onError: (e: any) => toast(e?.response?.data?.error ?? 'Could not send that again.'),
+    })
+
+  const change = useMutation(
+    (args: { staffId: string; body: Record<string, unknown> }) =>
+      apiPatch(`/pm/companies/${companyId}/staff/${args.staffId}`, args.body),
+    {
+      onSuccess: () => { toast('Saved.'); refresh() },
+      // The server refuses taking the last owner out, and says so in plain
+      // words — show its sentence rather than a generic failure.
+      onError: (e: any) => toast(e?.response?.data?.error ?? 'Could not save that.'),
+    })
+
+  const pending = invites.filter(i => !i.acceptedAt && !i.revokedAt && i.status !== 'accepted')
+  const nameOf = (s: StaffRow) =>
+    [s.firstName, s.lastName].filter(Boolean).join(' ') || null
+
   if (isLoading) return <div className="muted">Loading…</div>
   return (
     <div>
-      <p style={{ color: 'var(--text-3)', fontSize: '.85rem', marginTop: 0 }}>
-        Your people, and what each of them can do. Their access reaches only the properties owners
-        have engaged you for, and never more than the owner agreed to.
-      </p>
-      {!staff.length ? <div className="muted">Just you so far.</div> : (
-        <table className="table">
-          <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th></tr></thead>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+        <p style={{ color: 'var(--text-3)', fontSize: '.85rem', margin: 0, flex: 1, minWidth: 220 }}>
+          Your people, and what each of them can do. Their access reaches only the properties owners
+          have engaged you for, and never more than the owner agreed to.
+        </p>
+        {!inviting && (
+          <button className="btn btn-primary btn-sm" onClick={() => setInviting(true)}>
+            <UserPlus size={14} /> Add someone
+          </button>
+        )}
+      </div>
+
+      {inviting && (
+        <div className="card" style={{ marginTop: 12, display: 'grid', gap: 10, maxWidth: 460 }}>
+          <div>
+            <label style={{ fontSize: '.75rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>
+              Their email
+            </label>
+            <input type="email" value={email} onChange={e => setEmail(e.target.value)}
+                   placeholder="person@example.com" />
+          </div>
+          <div>
+            <label style={{ fontSize: '.75rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>
+              What they do
+            </label>
+            <select value={role} onChange={e => setRole(e.target.value as PmStaffRole)}>
+              {PM_STAFF_ROLES.map(r => (
+                <option key={r} value={r}>{PM_STAFF_ROLE_LABEL[r]}</option>
+              ))}
+            </select>
+          </div>
+          <p style={{ fontSize: '.75rem', color: 'var(--text-3)', margin: 0 }}>
+            They get an email with a link to join. Whatever you give them here, they still
+            only reach the properties your owners have engaged you for.
+          </p>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn btn-ghost btn-sm"
+                    onClick={() => { setInviting(false); setEmail('') }}>Cancel</button>
+            <button className="btn btn-primary btn-sm"
+                    disabled={invite.isLoading || !/.+@.+\..+/.test(email.trim())}
+                    onClick={() => invite.mutate()}>
+              {invite.isLoading ? 'Sending…' : 'Send the invitation'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!staff.length ? <div className="muted" style={{ marginTop: 12 }}>Just you so far.</div> : (
+        <table className="table" style={{ marginTop: 12 }}>
+          <thead><tr><th>Name</th><th>Email</th><th>What they do</th><th>Status</th><th></th></tr></thead>
           <tbody>
             {staff.map(s => (
               <tr key={s.id}>
-                <td>{s.name || '—'}</td><td>{s.email || '—'}</td><td>{s.role}</td><td>{s.status}</td>
+                <td>{nameOf(s) || '—'}</td>
+                <td>{s.email || '—'}</td>
+                <td>
+                  {/* An owner may change what somebody does; the server refuses
+                      taking the last owner out and says why. */}
+                  <select value={s.role} disabled={change.isLoading}
+                          onChange={e => change.mutate({ staffId: s.id, body: { role: e.target.value } })}>
+                    {PM_STAFF_ROLES.map(r => (
+                      <option key={r} value={r}>{PM_STAFF_ROLE_LABEL[r]}</option>
+                    ))}
+                  </select>
+                </td>
+                <td>{PM_STAFF_STATUS_LABEL[s.status] ?? s.status}</td>
+                <td>
+                  {s.status === 'active' ? (
+                    <button className="btn btn-ghost btn-sm" disabled={change.isLoading}
+                            onClick={async () => {
+                              const ok = await appConfirm(
+                                `${nameOf(s) || s.email || 'This person'} keeps their account but stops reaching any of your owners' properties. You can switch them back on later.`,
+                                { title: 'Switch this person off?', confirmLabel: 'Switch them off', danger: true })
+                              if (ok) change.mutate({ staffId: s.id, body: { status: 'inactive' } })
+                            }}>
+                      Switch off
+                    </button>
+                  ) : (
+                    <button className="btn btn-ghost btn-sm" disabled={change.isLoading}
+                            onClick={() => change.mutate({ staffId: s.id, body: { status: 'active' } })}>
+                      Switch back on
+                    </button>
+                  )}
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
+      )}
+
+      {pending.length > 0 && (
+        <div style={{ marginTop: 18 }}>
+          <h4 style={{ fontSize: '.85rem', margin: '0 0 8px', display: 'flex', alignItems: 'center', gap: 6 }}>
+            <Mail size={14} /> Waiting to accept ({pending.length})
+          </h4>
+          <div style={{ display: 'grid', gap: 6 }}>
+            {pending.map(i => (
+              <div key={i.id} style={{
+                display: 'grid', gap: '2px 10px', gridTemplateColumns: 'minmax(0, 1fr) auto',
+                alignItems: 'center', fontSize: '.85rem',
+                borderLeft: '3px solid var(--border-1, #2a2a2a)', paddingLeft: 10,
+              }}>
+                <span style={{ minWidth: 0 }}>{i.email}</span>
+                <button className="btn btn-ghost btn-sm" disabled={resend.isLoading}
+                        onClick={() => resend.mutate(i.id)}>
+                  <Send size={12} /> Send again
+                </button>
+                <span style={{ color: 'var(--text-3)', gridColumn: '1 / -1' }}>
+                  {PM_STAFF_ROLE_LABEL[i.role] ?? i.role}
+                  {i.expiresAt ? ` · link good until ${String(i.expiresAt).slice(0, 10)}` : ''}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   )

@@ -70,7 +70,7 @@ async function stay(client: PoolClient, p: Park, o: {
      VALUES ($1, $2, 'month_to_month', $3, $4::date, $5::date, $6::date, $7, $8, now())
      RETURNING id`,
     [p.unitId, p.landlordId, o.status ?? 'checked_out', checkIn, leftOn, bookedThrough,
-     o.guest ?? 'Victor Cardoza', o.paid ?? 589])).rows[0].id
+     o.guest ?? 'Horatio Mapperley', o.paid ?? 589])).rows[0].id
   // A stay that has checked out carries an ENDED agreement, the way stayTerms
   // leaves it — and only one live agreement per site is allowed, which is what
   // lets the next arrival have one of their own.

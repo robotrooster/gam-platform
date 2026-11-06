@@ -22,20 +22,20 @@ import { MONEY_COLUMNS, MONEY_COLUMN_LABEL, MONEY_COLUMN_NOTE, PAYMENT_STAMP_LET
 import type { MonthlyPropertyReport, ReportProperty, ReportPayments, ReportIncomeGroup } from './monthlyPropertyReport'
 import type { MoneyView } from './incomeBasis'
 
-const PAGE_W = 792    // 11" landscape
-const PAGE_H = 612    // 8.5"
-const MX = 36
-const TOP = 40
-const BOTTOM = 40
-const W = PAGE_W - MX * 2
+export const PAGE_W = 792    // 11" landscape
+export const PAGE_H = 612    // 8.5"
+export const MX = 36
+export const TOP = 40
+export const BOTTOM = 40
+export const W = PAGE_W - MX * 2
 
-const INK = rgb(0.10, 0.11, 0.13)
-const MUTED = rgb(0.42, 0.44, 0.48)
-const RULE = rgb(0.82, 0.83, 0.85)
-const ZEBRA = rgb(0.965, 0.965, 0.97)
-const HEAD_BG = rgb(0.93, 0.93, 0.94)
-const GOLD = rgb(0.72, 0.56, 0.13)
-const BAND = rgb(0.05, 0.07, 0.10)
+export const INK = rgb(0.10, 0.11, 0.13)
+export const MUTED = rgb(0.42, 0.44, 0.48)
+export const RULE = rgb(0.82, 0.83, 0.85)
+export const ZEBRA = rgb(0.965, 0.965, 0.97)
+export const HEAD_BG = rgb(0.93, 0.93, 0.94)
+export const GOLD = rgb(0.72, 0.56, 0.13)
+export const BAND = rgb(0.05, 0.07, 0.10)
 /** 10/14: how far an itemized line sits in from its group (a subtype twice as far). */
 const INDENT_STEP = 12
 
@@ -78,9 +78,9 @@ function dayWords(ymd: string): string {
   return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
 }
 
-interface Col { label: string; width: number; align?: 'left' | 'right' | 'center' }
+export interface Col { label: string; width: number; align?: 'left' | 'right' | 'center' }
 
-class Layout {
+export class Layout {
   page!: PDFPage
   y = 0
   pages: PDFPage[] = []

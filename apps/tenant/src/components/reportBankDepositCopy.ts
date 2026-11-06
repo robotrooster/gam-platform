@@ -103,7 +103,14 @@ export function pendingReportStatus(bankFeedLinked: boolean | null | undefined):
 }
 
 /** 10/5 (Nic): the report was made but its optional photo of the bank's receipt did not go up. */
-export const PHOTO_NOT_SENT = 'The photo of the bank’s receipt did not upload — your report is made without it.'
+// 11/1: the report IS made — only the picture failed — so this says so and
+// points at the way to finish it, which now exists (ADD_RECEIPT_PROMPT below).
+export const PHOTO_NOT_SENT = 'Your deposit is reported, but the photo of the bank’s receipt did not upload. '
+  + 'Add it from “Deposits you’ve reported” below — the report is not finished without it.'
+
+/** 11/1 (Blue, via Nic): the picture is required, so a report without one is unfinished. */
+export const ADD_RECEIPT_PROMPT = 'Add the bank’s receipt'
+export const ADD_RECEIPT_WHY = 'This report still needs a photo of the bank’s receipt.'
 
 /** Said when the same deposit was already reported (a double tap). */
 export function alreadyReportedMessage(w: BankWatch): string {

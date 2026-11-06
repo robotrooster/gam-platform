@@ -1,7 +1,7 @@
 /**
  * S648 (Nic) — correcting a tenant's name or email follows the one-email flow.
  *
- * Fixing Clay Simpson's invite: the name went onto his account but not onto the
+ * Fixing Pell Pennington's invite: the name went onto his account but not onto the
  * lease already drafted for him, and saving re-sent the OLD portal invite — an
  * email the flow no longer has. Nothing goes to a tenant before the landlord
  * signs; after, the one "set up and sign" email goes to wherever they are now.
@@ -51,7 +51,7 @@ async function fixture(opts: { landlordSigned: boolean; withDoc?: boolean }) {
     const tu = (await c.query(`SELECT user_id FROM tenants WHERE id=$1`, [tenantId])).rows[0].user_id
     // Never signed in: the account is still the landlord's to correct.
     await c.query(
-      `UPDATE users SET first_name='Clay', last_name='Simpsosn', last_login_at=NULL,
+      `UPDATE users SET first_name='Pell', last_name='Simpsosn', last_login_at=NULL,
               password_hash='$2b$10$placeholder_invite_pending', tenant_invite_accepted_at=NULL
         WHERE id=$1`, [tu])
     const propertyId = await seedProperty(c, { landlordId, ownerUserId: landlordUserId, managedByUserId: landlordUserId })
@@ -72,9 +72,9 @@ async function fixture(opts: { landlordSigned: boolean; withDoc?: boolean }) {
         [documentId, landlordUserId, crypto.randomBytes(32).toString('hex'), opts.landlordSigned ? 'signed' : 'sent'])
       await c.query(
         `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
-         VALUES ($1,$2,'primary','Clay Simpsosn',$3,2,$4,$5)`,
+         VALUES ($1,$2,'primary','Pell Simpsosn',$3,2,$4,$5)`,
         [documentId, tu, tenantEmail, crypto.randomBytes(32).toString('hex'), opts.landlordSigned ? 'sent' : 'pending'])
-      for (const [col, val] of Object.entries({ tenant_name: 'Clay Simpsosn', occupant_names: 'Clay Simpsosn', tenant_email: tenantEmail })) {
+      for (const [col, val] of Object.entries({ tenant_name: 'Pell Simpsosn', occupant_names: 'Pell Simpsosn', tenant_email: tenantEmail })) {
         await c.query(
           `INSERT INTO lease_document_fields (document_id, field_type, signer_role, lease_column, value, required)
            VALUES ($1,'text','landlord',$2,$3,FALSE)`, [documentId, col, val])
@@ -98,7 +98,7 @@ const docFields = async (documentId: string) => Object.fromEntries(
 describe('correcting a tenant before the landlord signs', () => {
   it('fixes the name on the draft and emails nobody', async () => {
     const f = await fixture({ landlordSigned: false })
-    const res = await edit(f, { lastName: 'Simpson', email: 'clay_simpson@example.com', resend: true })
+    const res = await edit(f, { lastName: 'Pennington', email: 'pell_pennington@example.com', resend: true })
     expect(res.status).toBe(200)
     expect(res.body.data.resent).toBe(false)
     expect(res.body.data.heldUntilLandlordSigns).toBe(true)
@@ -106,11 +106,11 @@ describe('correcting a tenant before the landlord signs', () => {
     expect(emailTenantInviteMock).not.toHaveBeenCalled()
 
     expect(await docFields(f.documentId!)).toEqual({
-      tenant_name: 'Clay Simpson', occupant_names: 'Clay Simpson', tenant_email: 'clay_simpson@example.com',
+      tenant_name: 'Pell Pennington', occupant_names: 'Pell Pennington', tenant_email: 'pell_pennington@example.com',
     })
     const signer = (await db.query(
       `SELECT name, email FROM lease_document_signers WHERE document_id=$1 AND role='primary'`, [f.documentId])).rows[0]
-    expect(signer).toEqual({ name: 'Clay Simpson', email: 'clay_simpson@example.com' })
+    expect(signer).toEqual({ name: 'Pell Pennington', email: 'pell_pennington@example.com' })
   })
 })
 
@@ -118,13 +118,13 @@ describe('correcting a tenant after the landlord signed', () => {
   it('sends the one lease email to the new address with a fresh link, and leaves the signed page alone', async () => {
     const f = await fixture({ landlordSigned: true })
     await db.query(`UPDATE users SET tenant_invite_token='old-token' WHERE id=$1`, [f.tenantUserId])
-    const res = await edit(f, { email: 'clay_simpson@example.com', resend: true })
+    const res = await edit(f, { email: 'pell_pennington@example.com', resend: true })
     expect(res.status).toBe(200)
     expect(res.body.data.resent).toBe(true)
     expect(emailTenantInviteMock).not.toHaveBeenCalled()
     expect(emailSigningRequestMock).toHaveBeenCalledTimes(1)
     const [to, , , , , url, meta] = emailSigningRequestMock.mock.calls[0]
-    expect(to).toBe('clay_simpson@example.com')
+    expect(to).toBe('pell_pennington@example.com')
     expect(url).toContain('/accept-invite?token=')
     expect(url).not.toContain('old-token')
     expect(meta.needsSetup).toBe(true)

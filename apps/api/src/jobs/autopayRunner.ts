@@ -82,9 +82,9 @@
 import { query, queryOne, getClient } from '../db'
 import { getStripe } from '../lib/stripe'
 import { chargeLeaseBalance, quoteLeaseCharge, CreditChangedError, payAllRunCreditWaiting, creditWaitingSentence } from '../services/rentCharge'
-import { createNotification, notifyAutopayFailed, type AutopayFailureKind } from '../services/notifications'
+import { createNotification, emailTemplate, notifyAutopayFailed, type AutopayFailureKind } from '../services/notifications'
 import { createAdminNotification } from '../services/adminNotifications'
-import { propertyIdForLease } from '../services/replyRouting'
+import { propertyIdForLease, replyToProperty } from '../services/replyRouting'
 import { logger } from '../lib/logger'
 import { registerEngine } from './timezoneCronManager'
 import { formatCurrency } from '@gam/shared'
@@ -92,6 +92,162 @@ import { releaseUnconfirmedCardCharges, heldForCardholder } from './paymentRecon
 
 /** Failures in a row before autopay switches itself off (Nic). */
 export const AUTOPAY_DISARM_AFTER_FAILURES = 2
+
+/**
+ * The bank refused the pull and NO retry is coming — switch autopay off.
+ *
+ * 10/30 (Nic): "we're automatically going to retry one time on an ACH pull. But
+ * if that retry fails, that payment method is disabled from auto pay."
+ *
+ * AUTOPAY_DISARM_AFTER_FAILURES above is a different clock: it counts whole
+ * MONTHLY CYCLES, so it takes two failed months to stop. That leaves a method
+ * the bank has already refused twice in one month armed for another go, and the
+ * resident believing rent is handled while it is not. This fires on the
+ * terminal failure of a single pull instead — whether that is the retry failing
+ * or a return code that was never going to be retried (a closed account does
+ * not get better by waiting).
+ *
+ * The schedule is switched off, not deleted: disarmed_at and disarmed_reason
+ * say why, and turning it back on clears the failure count, which is the
+ * existing behaviour for a resident who has fixed their bank.
+ */
+export async function disarmAutopayAfterTerminalBankFailure(
+  paymentIds: string[],
+  reason: string,
+): Promise<number> {
+  if (!paymentIds.length) return 0
+  const hit = await query<{ id: string; tenant_id: string | null; lease_id: string | null; payment_method_id: string | null }>(
+    `UPDATE tenant_autopay ta
+        SET enabled = FALSE, disarmed_at = NOW(),
+            disarmed_reason = $2, updated_at = NOW()
+      WHERE ta.enabled = TRUE
+        AND (ta.lease_id IN (SELECT lease_id FROM payments WHERE id = ANY($1::uuid[]) AND lease_id IS NOT NULL)
+          OR ta.home_sale_contract_id IN (
+               -- payments has no contract column; a home-sale charge names its
+               -- INSTALLMENT, and the installment names the contract.
+               SELECT hsi.contract_id
+                 FROM payments pz
+                 JOIN home_sale_installments hsi ON hsi.id = pz.home_sale_installment_id
+                WHERE pz.id = ANY($1::uuid[]) AND pz.home_sale_installment_id IS NOT NULL))
+      RETURNING ta.id, ta.tenant_id, ta.lease_id, ta.payment_method_id`,
+    [paymentIds, reason.slice(0, 300)])
+
+  // 11/4 (Nic): "the payment method is blocked. That's it. Delete it from the
+  // system. Make them relink it, verify their micro deposits again."
+  //
+  // Turning autopay off is not enough on its own: the refused method stayed on
+  // the account, so the resident could switch autopay straight back on with the
+  // same bank, and every other pull path could still charge it. Detaching it at
+  // Stripe removes it everywhere at once, and the re-enable route then refuses
+  // ("Add a bank account or card first") until they link a new one — which,
+  // being newly linked, is `verifying` until its micro-deposits clear. So the
+  // relink and the re-verification fall out of deleting the method; neither
+  // needs a flag of its own.
+  //
+  // Best-effort per row: Stripe refusing a detach (already detached, unknown
+  // id) must never undo the disarm, which is the part that stops the bleeding.
+  for (const row of hit) {
+    if (!row.payment_method_id) continue
+    try {
+      await getStripe().paymentMethods.detach(row.payment_method_id)
+    } catch (e: any) {
+      logger.warn({ err: e?.message ?? String(e), payment_method_id: row.payment_method_id },
+        '[autopay] the refused payment method could not be detached at Stripe')
+    }
+    await query(`UPDATE tenant_autopay SET payment_method_id = NULL, updated_at = NOW() WHERE id = $1`,
+      [row.id]).catch(() => { /* the detach is what matters; a stale id cannot be charged */ })
+  }
+
+  for (const row of hit) {
+    if (!row.tenant_id) continue
+    // The resident must be told the thing they set up has stopped, or they find
+    // out by being late.
+    //
+    // 10/30 (Nic): "If autopay turns off, it needs to inform them." This wrote
+    // the row straight into `notifications`, which put it in the bell and
+    // emailed NOBODY — and marking the type always-send in the catalog changes
+    // nothing on that path, because the email is only built by
+    // createNotification and only when the caller hands it an address. So it
+    // goes through the service now, with the resident's own address.
+    const who = await queryOne<{ user_id: string; email: string | null; unit_number: string | null; property_name: string | null }>(
+      `SELECT t.user_id, u.email, un.unit_number, p.name AS property_name
+         FROM tenants t
+         JOIN users u ON u.id = t.user_id
+         LEFT JOIN leases l ON l.id = $2
+         LEFT JOIN units un ON un.id = l.unit_id
+         LEFT JOIN properties p ON p.id = un.property_id
+        WHERE t.id = $1 AND t.user_id IS NOT NULL
+        LIMIT 1`,
+      [row.tenant_id, row.lease_id]).catch(() => null)
+    if (!who?.user_id) continue
+    const where = who.unit_number
+      ? `${who.property_name ? who.property_name + ' ' : ''}Unit ${who.unit_number}`
+      : 'your account'
+    const body = 'Your bank refused the scheduled payment and the retry did not go through, so autopay is off. '
+      + 'Add or choose a working payment method and switch it back on.'
+    // Replies reach the people who run the property, never GAM
+    // (services/replyRouting). A home-sale contract has no lease, so there is
+    // no property to route to and this falls back to GAM support.
+    const propertyId = row.lease_id ? await propertyIdForLease(row.lease_id).catch(() => null) : null
+    await createNotification({
+      userId: who.user_id,
+      type: 'autopay_disarmed',
+      title: 'Autopay has been turned off',
+      body,
+      // action_url so the notice is actionable on a phone (10/30) — it lands on
+      // the page where a payment method is added.
+      actionUrl: '/payments',
+      sendEmail: true,
+      emailTo: who.email ?? undefined,
+      emailSubject: 'Autopay has been turned off — action needed',
+      emailHtml: emailTemplate(
+        'Autopay Has Been Turned Off',
+        `<p>Your bank refused the scheduled payment for <b>${where}</b>, and the retry did not go through.</p>`
+        + '<p>Autopay is now <b>off</b>, so no further payments will be attempted. Your rent is still owed.</p>'
+        + '<p>Add or choose a working payment method and switch autopay back on.</p>',
+        { label: 'Fix my payment method', url: '/payments' },
+      ),
+      replyTo: replyToProperty(propertyId),
+    }).catch(() => { /* never let a notice failure undo the disarm */ })
+
+    // 11/4 (Nic): "We also need to know when auto pay went off." Until now this
+    // notice was tenant-audience only, so from the operator's side the autopay
+    // badge simply disappeared and the first they heard of it was the resident
+    // being late. They are the ones who have to chase the money, so they are
+    // told by name which space it was and that the method is gone.
+    const owner = row.lease_id
+      ? await queryOne<{ user_id: string; email: string | null }>(
+          `SELECT lu.id AS user_id, lu.email
+             FROM leases l
+             JOIN landlords la ON la.id = l.landlord_id
+             JOIN users lu ON lu.id = la.user_id
+            WHERE l.id = $1`, [row.lease_id]).catch(() => null)
+      : null
+    if (owner?.user_id) {
+      await createNotification({
+        userId: owner.user_id,
+        type: 'autopay_disarmed_info',
+        title: `Autopay turned off — ${where}`,
+        body: `The bank refused the scheduled payment for ${where} and the retry did not go through, so autopay is off `
+            + 'and the payment method has been removed. The resident has been told to link a new one. The money is still owed.',
+        actionUrl: '/payments',
+        sendEmail: true,
+        emailTo: owner.email ?? undefined,
+        emailSubject: `Autopay turned off — ${where}`,
+        emailHtml: emailTemplate(
+          'Autopay Turned Off',
+          `<p>The bank refused the scheduled payment for <b>${where}</b>, and the retry did not go through.</p>`
+          + '<p>Autopay is <b>off</b> and the refused payment method has been removed, so nothing further will be '
+          + 'attempted against that account. The resident has been asked to link a new one and verify it.</p>'
+          + '<p>The money is still owed.</p>',
+          { label: 'Open payments', url: '/payments' },
+        ),
+      }).catch(() => { /* never let a notice failure undo the disarm */ })
+    }
+  }
+  if (hit.length) logger.warn({ disarmed: hit.length, reason }, '[autopay] disarmed after a terminal bank failure')
+  return hit.length
+}
 
 export interface AutopayRunResult {
   considered: number

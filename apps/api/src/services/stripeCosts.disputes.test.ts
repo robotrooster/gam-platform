@@ -133,8 +133,15 @@ async function nextRentDue(h: H, soon: boolean) {
     // days, which on the 15th of a month asks for the 29th and the insert is
     // refused — the suite failed on the date, not on the code. Stepped round
     // the 28-day cycle instead, which is the furthest from today it can be.
+    //
+    // 10/29: the SOON branch had the same bug and was missed, because it only
+    // fires on the 29th, 30th and 31st — today was the first day it could.
+    // It wrote today's raw day number, so the whole suite was refused by the
+    // same constraint the comment above is about. Wrapped round the same
+    // 28-day cycle: on the 29th "soon" becomes day 1, three days out, which is
+    // still inside the netting window this is setting up.
     `UPDATE leases SET rent_due_day = CASE WHEN $2
-        THEN EXTRACT(DAY FROM (NOW() AT TIME ZONE 'America/Phoenix'))::int
+        THEN ((EXTRACT(DAY FROM (NOW() AT TIME ZONE 'America/Phoenix'))::int - 1) % 28) + 1
         ELSE ((EXTRACT(DAY FROM (NOW() AT TIME ZONE 'America/Phoenix'))::int - 1 + 14) % 28) + 1 END
       WHERE id = $1`, [h.leaseId, soon])
 }

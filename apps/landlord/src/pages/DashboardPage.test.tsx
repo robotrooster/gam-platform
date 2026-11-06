@@ -72,6 +72,11 @@ const DASH: Record<string, any> = {
   [MV]: {
     monthlyRentVolume: 8900, activeUnits: 25, payableRentUnits: 25, unitsOwing: 2, unitsPastGrace: 1,
     outstanding: 1685,
+    // 11/3: this month's money from one population. The parts subtract
+    // (9000 + 300 + 1070 = 10370) and stillOwed + earlierOwed === outstanding
+    // (1070 + 615 = 1685), which is what makes this month a slice of the
+    // Outstanding card rather than a figure that can exceed it.
+    monthMoney: { charged: 10370, collected: 9000, clearing: 300, stillOwed: 1070, workTrade: 3478, earlierOwed: 615 },
     rentHealth: { invoiced: 18502, paid: 17087, owed: 1415, workTradeHeld: 3478 },
     propertyHealth: {
       period: '2026-10', source: 'ledger', total: 19483.98,
@@ -202,10 +207,12 @@ describe('the health block\'s three figures tie to each other and to the percent
     expect(healthFigures()).toEqual([
       { label: 'Rent invoiced this month', amount: '$18,502.00' },
       { label: 'Rent paid', amount: '$17,087.00' },
-      { label: 'Still owed', amount: '$1,415.00' },
+      { label: 'Rent still owed', amount: '$1,415.00' },
     ])
     // The subtraction and the percentage, printed, so neither has to be trusted.
-    expect(healthText()).toContain('$18,502.00 invoiced − $17,087.00 paid = $1,415.00 still owed')
+    // 11/3 (Nic): the word carries what it is owed ON — this block is rent,
+    // the money card above is every kind of money, and both said just "owed".
+    expect(healthText()).toContain("$18,502.00 invoiced − $17,087.00 paid = $1,415.00 of this month's rent still owed")
     expect(healthText()).toContain("92% of this month's rent bills paid")
     // And the meter above reads the same percentage off the same two figures.
     expect(host.querySelector('.phm-readout-value')?.textContent).toBe('92%')
@@ -214,7 +221,7 @@ describe('the health block\'s three figures tie to each other and to the percent
   it('says it counts this month\'s rent only, and names work trade without a figure', async () => {
     await renderMountainView()
     expect(healthText()).toContain("This counts this month's rent bills only")
-    expect(healthText()).toContain('The Outstanding card above counts every open charge of every month')
+    expect(healthText()).toContain('The Outstanding card above counts every unpaid charge of every month')
     expect(healthText()).toContain('Rent covered by work trade is not counted here')
     // S650: no work-trade balance on this card, only the fact that it is out.
     expect(healthText()).not.toContain('3,478')
@@ -262,7 +269,40 @@ describe('the health block\'s three figures tie to each other and to the percent
     expect(thisMonth).toContain('charged')
     // 10/18: it said "unpaid invoice balances" and that is what was wrong with
     // it — invoice totals never carry a late fee. It counts open charges now.
-    expect(card('Outstanding').textContent).toContain('every open charge, every month')
+    expect(card('Outstanding').textContent).toContain('every unpaid charge, every month')
+  })
+
+  /**
+   * 11/3 (Nic) — THREE "STILL OWED" FIGURES THAT FOUGHT EACH OTHER.
+   *
+   *   "It needs to be a grand fucking total of every outstanding money owed to
+   *    us. So how can 14,000 dollars in this month be higher than the total
+   *    outstanding from the other months? It is confusing to me even after your
+   *    explanation that you just said, and it's going to be confusing to
+   *    fucking everybody. It doesn't flow good. It doesn't fit."
+   *
+   * On his screen the card headed "This month" read $14,391 against an
+   * Outstanding of $9,042, because its Owed was the cumulative receivables
+   * BALANCE — this month's owed plus earlier months plus money already clearing
+   * at the bank plus work trade. Each figure was right; nothing made them nest.
+   */
+  it('this month is a SLICE of Outstanding, and the parts subtract', async () => {
+    await renderMountainView()
+    const thisMonth = card('This month — every kind of money').textContent ?? ''
+    const outstanding = card('Outstanding').textContent ?? ''
+
+    // Owed is THIS MONTH's, not a balance carrying earlier months.
+    expect(thisMonth).toContain('$1,070')
+    // The sentence is a subtraction that subtracts: 9000 + 300 + 1070 = 10370.
+    expect(thisMonth).toContain('Of $10,370.00 charged: $9,000.00 collected · $300.00 clearing at the bank · $1,070.00 still owed')
+    // Work trade is named, and said to be in NEITHER figure.
+    expect(thisMonth).toContain('$3,478.00 is covered by work trade')
+    expect(thisMonth).toContain('not charged and not owed')
+
+    // The Outstanding card shows this month as its own slice, so the two cards
+    // can be read together without one looking like a contradiction.
+    expect(outstanding).toContain('$1,070.00 this month')
+    expect(outstanding).toContain('$615.00 earlier months')
   })
 
   it('the property filter changes every figure in the block', async () => {

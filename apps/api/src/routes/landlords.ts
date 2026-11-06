@@ -12,7 +12,7 @@ import { payoutReadiness } from '../lib/payoutReadiness'
 // S640: the dashboard shows the date the payout ENGINE will fire, never its own guess.
 import { nextPayoutDateUtc } from '../jobs/autoPayouts'
 // S642: one definition of rent collected this month, shared with Reports and admin.
-import { rentCollectedFrom, incomeCardFrom, rentHealthMtd, outstandingBalanceOf } from '../lib/rentCollected'
+import { rentCollectedFrom, incomeCardFrom, rentHealthMtd, outstandingBalanceOf, monthMoneyBuckets } from '../lib/rentCollected'
 import { parseIncomeBasis, basisMeta, incomeEvents, byMonth, breakdownFrom } from '../services/incomeBasis'
 import { todayIn as todayInZone } from '../lib/timezone'
 import { emailTenantOnboarded, emailTenantInvite, emailBalanceDue, emailSigningRequest } from '../services/email'
@@ -581,6 +581,41 @@ landlordsRouter.delete('/members/:id', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// ── 10/27 (Nic): THE ONE SEARCH BAR ─────────────────────────────────────────
+//
+//   "if I'm just on the dashboard, I should have a search bar where I can
+//    quickly type in this person's name or unit 5, and it will link to every
+//    matching text across any page in the landlord portal... because people
+//    that are not familiar... are not going to know that they need to go into
+//    this thing or this thing to find what they need until they get used to
+//    it."
+//
+// A read, and the SAME two scopes every other landlord-side read uses: the
+// account's companies, and a staff member's own properties and nothing else.
+// A search bar that reached past a manager's own park would be the widest leak
+// in the portal, which is why the scope goes into the SQL on every branch
+// (services/portalSearch) rather than filtering what came back.
+//
+// No permission beyond being in the portal: it finds only things the caller
+// can already open, and narrowing it further would make it useless to exactly
+// the people it is for.
+landlordsRouter.get('/search', async (req, res, next) => {
+  try {
+    const landlordIds = landlordScopeIds(req.user!)
+    if (!landlordIds.length) return void res.json({ success: true, data: { query: '', hits: [], truncated: false } })
+    const { portalSearch } = await import('../services/portalSearch')
+    res.json({ success: true, data: await portalSearch({
+      landlordIds,
+      scopedPropertyIds: await getScopedPropertyIds(req.user),
+      q: String(req.query.q ?? ''),
+    }) })
+  } catch (e) { next(e) }
+})
+
+// ORDER MATTERS: this sits ABOVE `/:id` deliberately. Express matches in
+// order, so with it below, a GET of /search was matched by /:id with an id
+// of "search" and refused 403 — which looks exactly like a permission bug
+// and is not one. Any new literal path on this router belongs above here too.
 landlordsRouter.get('/:id', async (req, res, next) => {
   try {
     // S633: 'me' used to mean "the entity my session sits on". It names a
@@ -956,8 +991,17 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     // S633 in one line: reads span the account, writes name the company. This
     // is a read, so it takes the same scope the property list takes.
     const feeMap = await platformFeesByPropertyForEntities(scopeIds, feeMonth)
+    // 10/29 (Nic): "the platform fee still shows combined portfolio... the KPI
+    // cards don't filter with the property filter." This one did not — it
+    // listed EVERY property on the account and summed them, whatever the
+    // filter said, so an owner of two parks had no way to read one park's fee.
+    // Occupancy, occupied units, outstanding balance and property health all
+    // take the filter (S637); this query was simply missed. The breakdown modal
+    // reads the same list, so it narrows with the card.
     const feeProps = await query<any>(
-      `SELECT id, name FROM properties WHERE landlord_id = ANY($1) ORDER BY name`, [scopeIds])
+      `SELECT id, name FROM properties
+        WHERE landlord_id = ANY($1) AND ($2::uuid IS NULL OR id = $2)
+        ORDER BY name`, [scopeIds, propertyFilter])
     const platformFeeByProperty = feeProps.map((p: any) => ({
       propertyId: p.id, name: p.name, fee: Math.round((feeMap.get(p.id) ?? 0) * 100) / 100,
     }))
@@ -1084,6 +1128,22 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     // here, for the reason given with rentHealthMtd above.
     const outstandingRow = await outstandingBalanceOf(scopeIds, propertyFilter)
 
+    // ── 11/3 (Nic): THREE "STILL OWED" FIGURES ON ONE SCREEN ───────────────
+    //   "It needs to be a grand fucking total of every outstanding money owed
+    //    to us. So how can 14,000 dollars in this month be higher than the
+    //    total outstanding from the other months? ... it's going to be
+    //    confusing to fucking everybody."
+    //
+    // The money card's Owed was the cumulative `ar_tenants` BALANCE, so a card
+    // headed "This month" carried earlier months, money already clearing at the
+    // bank, and work trade. These buckets come from ONE population — the
+    // charges due this month — so the card's own subtraction ties, work trade
+    // and clearing stay out of anything called owed, and `stillOwed +
+    // earlierOwed` is exactly `outstandingRow.outstanding`, which makes this
+    // month a SLICE of the Outstanding card rather than a figure that can
+    // exceed it. No cutoffs, for the reason given with rentHealthMtd above.
+    const monthMoney = await monthMoneyBuckets(scopeIds, propertyFilter, `${thisMonth.ym}-01`)
+
     // ── S640 (Nic): "SIX DELINQUENT UNITS, LATE FEES ACCRUING" WAS FALSE ────
     //
     //   "That's a false flag on the tenants currently, because onboarding
@@ -1108,7 +1168,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     //
     // The units table says two, because the delinquency trigger counts unpaid
     // RENT only — which is right for the eviction clock and wrong for a card
-    // that a landlord reads as "who owes me". Jeremy Parker paid his rent and
+    // that a landlord reads as "who owes me". Margo Northcott paid his rent and
     // not his $96.81 of electricity, so his spot read clean.
     //
     // A charge on an INSTALLMENT PLAN is excluded because it is supposed to be
@@ -1121,13 +1181,32 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     // NOTE: it excludes the INSTALLMENT, not the person. A resident on a propane
     // plan who is also behind on rent still counts — it is the scheduled charge
     // that is not evidence of anything, not the tenancy.
+    // ── 11/4: THE CARD AND THE OUTSTANDING PAGE ANSWER WITH ONE RULE ────────
+    //
+    // This clause was its own spelling of "is money owed on this row", and it
+    // had drifted three ways from the rule every other money path uses
+    // (services/openBalances openBalanceSql → moneyPredicates payableRowSql):
+    //
+    //   · a charge HELD FOR THE NEXT BILL counted — the $4 a bounced pull costs
+    //     is deliberately asked for by nothing until a bill carries it (11/4,
+    //     Nic: "hide it so it doesn't show as outstanding"), and this card was
+    //     the one place it still showed, as a unit that "owes";
+    //   · a charge whose money is ALREADY IN FLIGHT counted — a pending row
+    //     carrying a Stripe intent read as owing while the bank was clearing it;
+    //   · GAM's FlexPay pull counted — and FlexPay must never appear anywhere a
+    //     landlord can see it (CLAUDE.md).
+    //
+    // S639 is the lesson being applied: the card and the Outstanding page
+    // disagreeing about the same dollar is the bug, so they now read the same
+    // rule. The two terms that are this card's own — a scheduled installment,
+    // and the property filter — stay.
+    const { openBalanceSql } = await import('../services/openBalances')
     const [owing] = await query<any>(`
       SELECT COUNT(DISTINCT p.unit_id)::int AS units_owing
         FROM payments p
         JOIN units u ON u.id = p.unit_id
        WHERE u.landlord_id = ANY($1)
-         AND p.status IN ('pending', 'failed')
-         AND p.work_trade_suspended_at IS NULL
+         AND ${openBalanceSql('p')}
          -- 10/12 (Nic): a $0 line is ignored — nothing is owed on it, so a unit
          -- whose only open line is $0 does not "owe" (past grace already
          -- ignored it; the headline said "owes" with nothing owed).
@@ -1223,8 +1302,10 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
           LEFT JOIN invoices i ON i.id = p.invoice_id
           LEFT JOIN leases l ON l.id = p.lease_id
          WHERE u.landlord_id = ANY($1)
-           AND p.status IN ('pending', 'failed')
-           AND p.work_trade_suspended_at IS NULL
+           -- 11/4: the same rule as the card above and the Outstanding page, so
+           -- a charge held for the next bill can never read as delinquent, and
+           -- neither can one whose money is already clearing.
+           AND ${openBalanceSql('p')}
            AND COALESCE(p.entry_description, '') <> 'LATEFEE'
            AND NOT EXISTS (SELECT 1 FROM v_installment_payments ip WHERE ip.payment_id = p.id)
            AND ($2::uuid IS NULL OR u.property_id = $2))
@@ -1268,7 +1349,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const occupancyRate = occupancyRateFrom(
       stats?.active_units || 0, nightsRow?.nights || 0, totalUnits)
 
-    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, platformFeeUnits, collected_mtd: collectedRow?.collected_mtd||0, collected_in_flight: basis === 'received' ? collected.inFlight : collected.billed.clearing, outstanding: outstandingRow.outstanding,
+    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, platformFeeUnits, collected_mtd: collectedRow?.collected_mtd||0, collected_in_flight: basis === 'received' ? collected.inFlight : collected.billed.clearing, outstanding: outstandingRow.outstanding, month_money: monthMoney,
       // S655: the rent card's other figures, both ways, and the income card.
       rent_card: { basis, received: { amount: collected.collected, clearing: collected.inFlight }, billed: collected.billed },
       // 10/17 (Nic): the health card's own figure — invoiced against paid, work
@@ -1824,6 +1905,31 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
     const scopeIds = landlordScopeIds(req.user!)
     const userId = req.user!.userId
 
+    // ── 10/29 (Nic): THE TO-DO LIST FILTERS WITH EVERYTHING ELSE ───────────
+    //
+    //   "the to-do list does not filter by property. So anybody that's only an
+    //    owner of one property only sees that correctly, but people that own
+    //    both don't have any way to make the entire dashboard accurate to one
+    //    property."
+    //
+    // Occupancy, occupied units, outstanding balance and property health took
+    // the filter from S637; the platform-fee card and this list were the two
+    // left behind. The page sends the same propertyId the dashboard gets.
+    //
+    // Validated against the caller's own scope before it is used, exactly as
+    // the dashboard does: a query-string id that is not checked would read
+    // another landlord's work through an endpoint that has already passed its
+    // auth check.
+    const rawTodoProperty = typeof req.query.propertyId === 'string' ? req.query.propertyId.trim() : ''
+    let todoProperty: string | null = null
+    if (rawTodoProperty) {
+      const owned = await queryOne<{ id: string }>(
+        `SELECT id FROM properties WHERE id = $1 AND landlord_id = ANY($2)`,
+        [rawTodoProperty, scopeIds])
+      if (!owned) throw new AppError(404, 'Property not found')
+      todoProperty = owned.id
+    }
+
     // Owner-financial concern — always shown to the calling owner regardless
     // of property delegation.
     // S605 (Nic): this asked "have you added a row to the legacy bank catalog?"
@@ -1893,6 +1999,7 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
         AND l.status = 'active'
         AND p.pm_company_id IS NULL
         AND p.managed_by_user_id = $2
+        AND ($3::uuid IS NULL OR p.id = $3)
         AND (
           l.needs_review = true
           OR (
@@ -1912,7 +2019,7 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       ORDER BY
         CASE WHEN l.needs_review = true THEN 0 ELSE 1 END,
         l.end_date NULLS LAST
-    `, [scopeIds, userId])
+    `, [scopeIds, userId, todoProperty])
 
     const leases = leaseRows.map((l: any) => {
       const tenantName = [l.tenant_first, l.tenant_last].filter(Boolean).join(' ') || 'Unassigned'
@@ -2010,8 +2117,9 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       JOIN properties p ON p.id = u.property_id
       WHERE mr.landlord_id = ANY($1)
         AND mr.status = 'awaiting_approval'
+        AND ($2::uuid IS NULL OR u.property_id = $2)
       ORDER BY mr.created_at DESC
-    `, [scopeIds])
+    `, [scopeIds, todoProperty])
 
     const maintenance = maintRows.map((m: any) => ({
       id: m.id,
@@ -2039,13 +2147,14 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       JOIN properties p ON p.id = un.property_id
       WHERE wta.landlord_id = ANY($1)
         AND wta.status = 'paused'
+        AND ($2::uuid IS NULL OR un.property_id = $2)
         AND NOT EXISTS (
           SELECT 1 FROM leases l
           JOIN lease_tenants lt ON lt.lease_id = l.id
           WHERE l.unit_id = wta.unit_id AND lt.tenant_id = wta.tenant_id
             AND l.status = 'active' AND lt.status = 'active')
       ORDER BY wta.updated_at DESC
-    `, [scopeIds])
+    `, [scopeIds, todoProperty])
 
     const workTrade = wtRows.map((w: any) => ({
       id: w.id,
@@ -2065,9 +2174,10 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       JOIN work_trade_agreements wta ON wta.id = d.work_trade_agreement_id
       JOIN units un ON un.id = d.unit_id
       WHERE d.landlord_id = ANY($1) AND d.status = 'pending'
+        AND ($2::uuid IS NULL OR un.property_id = $2)
         AND d.work_trade_agreement_id IS NOT NULL
       ORDER BY d.created_at DESC
-    `, [scopeIds])
+    `, [scopeIds, todoProperty])
     for (const a of wtAddendumRows as any[]) {
       workTrade.push({
         id: a.id,
@@ -2101,10 +2211,11 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
         LEFT JOIN units un ON un.id = pti.unit_id
         LEFT JOIN properties p ON p.id = un.property_id
        WHERE pti.landlord_id = ANY($1)
+         AND ($2::uuid IS NULL OR un.property_id = $2)
          AND pti.resolved_at IS NULL
          AND pti.cancelled_at IS NULL
        ORDER BY pti.created_at ASC
-    `, [scopeIds])
+    `, [scopeIds, todoProperty])
 
     // A whole_unit lease is ONE document for the whole roster, so
     // leaseOnboarding deliberately withholds the draft until every invited
@@ -2183,10 +2294,11 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
         LEFT JOIN units un ON un.id = d.unit_id
         LEFT JOIN properties p ON p.id = un.property_id
        WHERE d.landlord_id = ANY($1)
+         AND ($2::uuid IS NULL OR un.property_id = $2)
          AND d.status IN ('sent', 'in_progress')
          AND s.status <> 'signed'
        ORDER BY d.created_at ASC
-    `, [scopeIds])
+    `, [scopeIds, todoProperty])
     for (const d of awaitingSig as any[]) {
       const where = d.unit_number ? ' — Unit ' + d.unit_number + (d.property_name ? ' (' + d.property_name + ')' : '') : ''
       onboarding.push({
@@ -2216,11 +2328,12 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
         JOIN properties p ON p.id = un.property_id
         LEFT JOIN tenants t ON t.user_id = a.applicant_user_id
        WHERE a.landlord_id = ANY($1)
+         AND ($2::uuid IS NULL OR un.property_id = $2)
          AND a.unit_id IS NOT NULL
          AND a.applicant_user_id IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.source_application_id = a.id)
        ORDER BY a.created_at ASC
-    `, [scopeIds])
+    `, [scopeIds, todoProperty])
     for (const a of applicantRows as any[]) {
       const who = [a.first_name, a.last_name].filter(Boolean).join(' ') || 'Applicant'
       const where = a.unit_number ? ' — Unit ' + a.unit_number + (a.property_name ? ' (' + a.property_name + ')' : '') : ''
@@ -2256,6 +2369,7 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
         FROM properties p
         JOIN units u ON u.property_id = p.id
        WHERE p.landlord_id = ANY($1)
+         AND ($2::uuid IS NULL OR p.id = $2)
        GROUP BY p.id, p.name, p.state
       HAVING COUNT(*) FILTER (WHERE u.unit_type = 'mobile_home') >= (
                SELECT COALESCE(MIN(r.min_property_units), 25)
@@ -2267,7 +2381,7 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
                SELECT 1 FROM mobile_homes mh
                  JOIN units u2 ON u2.id = mh.unit_id
                 WHERE u2.property_id = p.id)
-    `, [scopeIds]).catch(() => [])
+    `, [scopeIds, todoProperty]).catch(() => [])
 
     // S655: a property somebody is transferring to THIS login waits on the
     // buyer's acceptance now. It expires in 7 days, so it goes first.
@@ -2302,14 +2416,14 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
     // waiting on a stay (staff without "Issue refunds" checked an overpaid guest
     // out, or the stay was checked out off the schedule) — the owner decides it.
     const { pendingMoneyTodos } = await import('../services/earlyCheckOut')
-    const stayMoney = await pendingMoneyTodos(scopeIds).catch((err) => {
+    const stayMoney = await pendingMoneyTodos(scopeIds, { propertyIds: todoProperty ? [todoProperty] : null }).catch((err) => {
       logger.error({ err }, '[todos] early check-out money questions failed')
       return [] as Awaited<ReturnType<typeof pendingMoneyTodos>>
     })
     // 10/4 (decisions #46.1): every ended lease still waiting on the landlord's
     // choice for the money paid ahead on it (and any refund of it not gone out).
     const { paidAheadChoiceTodos } = await import('../services/paidAheadChoice')
-    const paidAhead = await paidAheadChoiceTodos(scopeIds).catch((err) => {
+    const paidAhead = await paidAheadChoiceTodos(scopeIds, { propertyIds: todoProperty ? [todoProperty] : null }).catch((err) => {
       logger.error({ err }, '[todos] paid-ahead money choices failed')
       return [] as Awaited<ReturnType<typeof paidAheadChoiceTodos>>
     })
@@ -2319,7 +2433,7 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
     // take (give it back in cash at the office, or try again), and the
     // landlord's own part not yet marked handed back.
     const { depositRefundTodos } = await import('../services/depositRefundSend')
-    const depositRefunds = await depositRefundTodos(scopeIds).catch((err) => {
+    const depositRefunds = await depositRefundTodos(scopeIds, { propertyIds: todoProperty ? [todoProperty] : null }).catch((err) => {
       logger.error({ err }, '[todos] deposit refunds failed')
       return [] as Awaited<ReturnType<typeof depositRefundTodos>>
     })
@@ -2718,6 +2832,10 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
       rentDueDay: inviteRentDueDay(req.body),
       homeSale,
       packageTemplateIds: packetIds(req.body?.packageTemplateIds),
+      // 10/28: the Tenant Onboarding roster reaches the takeover too, so all
+      // four doors onto a lease behave the same way. Which tenancy is replaced
+      // is resolved from the space, never named by the browser.
+      takeover: req.body?.takeover === true,
       source: 'invite',
     })
     const first = out.people[0]
@@ -3134,10 +3252,10 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create', 'front_
          --   "me sending it and them accepting it is two different states. I
          --    need you to mark it how it really was."
          --
-         -- Three invite states cannot say where somebody actually is. Dakota
-         -- Lane read 'accepted' — correct, he activated on 09-02 — while what
+         -- Three invite states cannot say where somebody actually is. Tobin
+         -- Thornbury read 'accepted' — correct, he activated on 09-02 — while what
          -- Nic needed to know was that his lease had been drafted, Nic had
-         -- signed it, and it had been sitting unsigned by Dakota for a week.
+         -- signed it, and it had been sitting unsigned by Tobin for a week.
          -- One word was carrying a whole pipeline.
          --
          -- So the lease stage rides alongside the invite state instead of being
@@ -3177,7 +3295,7 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create', 'front_
          -- The first fix reached for proxies (a login, an entry in the email
          -- send log) and still missed the obvious: THIS ROW already records it.
          -- pending_tenant_intents.accepted_at is stamped the moment the person
-         -- activates, and Glenda Greek and Dakota Lane both had it set while the
+         -- activates, and Birdie Calloway and Tobin Thornbury both had it set while the
          -- pool called them uninvited, because the answer was being read off the
          -- user instead of off the invite in front of it.
          --
@@ -3243,7 +3361,7 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create', 'front_
               OR (ld.id IS NOT NULL AND ld.status NOT IN ('completed','voided')))
          AND pti.cancelled_at IS NULL
          -- S636 (Nic): "It's double sending things. The pending pool has two
-         -- Blanca Avalos, two Little Joe Martinez. It's doubling people that
+         -- Gail Glenmore, two Little Joe Martinez. It's doubling people that
          -- don't have two spaces. Some people do have two spaces, so it's
          -- important to make that distinction."
          --
@@ -3257,9 +3375,9 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create', 'front_
          -- a genuine property-level invite (no unit yet) still shows, and anyone
          -- actually renting two spaces still shows twice.
          --
-         -- S639 (Nic: "you're still showing... Iliana Gonzalez"): the unit-bound
+         -- S639 (Nic: "you're still showing... Iliana Holloway"): the unit-bound
          -- invite used to have to be OPEN for the waiver row to be hidden, and
-         -- Illyana Gonzalez showed how that fails. Her address was corrected on
+         -- Greta Holloway showed how that fails. Her address was corrected on
          -- 2026-09-02: the MH 09 invite was cancelled and a fresh account made a
          -- minute later, which accepted, signed and now holds the lease. The
          -- cancel closed the unit row and left the waiver row behind it open, so
@@ -3272,7 +3390,7 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create', 'front_
          --
          -- The condition used to require the person to ALSO have a unit-bound
          -- invite, which held for 55 of the 56 live waiver rows and failed on the
-         -- 56th. Kevin Black was onboarded twice on 2026-08-29, at kjblack1@
+         -- 56th. Wilda Yeardley was onboarded twice on 2026-08-29, at kjblack1@
          -- hotmail and kjblack1@gmail. The hotmail account accepted and holds
          -- MH 04 and MH 05 at Oak Park. The gmail shell holds no lease, no
          -- document and no payment — only a waiver record pointing at MH 05, the
@@ -3367,7 +3485,7 @@ landlordsRouter.delete('/me/pending-tenants/:intentId', requirePerm('tenant_onbo
     // S639: cancel the paired screening-waiver row with it. A waive writes a
     // SECOND, unit-less intent purely to hold the audit (who waived, when,
     // attested). Canceling the real invite left that one open, and once its
-    // partner was gone it had nothing to hide behind — Illyana Gonzalez's
+    // partner was gone it had nothing to hide behind — Greta Holloway's
     // corrected-address cancellation on 2026-09-02 left a ghost of a dead
     // account sitting in Nic's pending pool for a week.
     //
@@ -4676,10 +4794,22 @@ type PaymentCsvRow = {
   propertyName:  string
   unitNumber:    string
   reference:     string
+  // 11/1 (Nic): a phone for a payer who has no lease, so GAM can identify the
+  // person by its own three-point rule instead of refusing the row.
+  payerPhone:    string
   resolvedTenantId?: string
   resolvedLeaseId?:  string
   resolvedUnitId?:   string
   resolvedVia?:      'email' | 'name'
+  /**
+   * 11/1 (Nic): "it needs to be this unit brought this much money, attributed
+   * to this person's contact information." TRUE when no lease could be found
+   * and the line was matched to a SPACE instead — it commits to
+   * pre_gam_income_history (income already received, never a charge) rather
+   * than to the tenant rent rail. Set on validate so the landlord sees which
+   * lines are going which way BEFORE committing.
+   */
+  historyOnly?:  boolean
   // S294: source-platform columns that aren't canonical-mapped and
   // aren't on the platform's noise list. Stored on the payment's
   // import_extra_data JSONB at commit time.
@@ -4709,7 +4839,7 @@ function tenantNameVariants(raw: string): string[] {
       const [last, first] = p.split(',').map(s => s.trim())
       if (first && last) variants.add(normalizeTenantNameForMatch(`${first} ${last}`))
     }
-    // Strip middle names / initials: "Josh R. Roby" → "Josh Roby".
+    // Strip middle names / initials: "Soren R. Tremaine" → "Soren Tremaine".
     const words = p.split(/\s+/).filter(Boolean)
     if (words.length > 2) {
       variants.add(normalizeTenantNameForMatch(`${words[0]} ${words[words.length - 1]}`))
@@ -4765,6 +4895,254 @@ const ENTRY_DESC_BY_TYPE: Record<'rent' | 'fee' | 'deposit' | 'utility' | 'late_
   utility:  'UTILITY',
   late_fee: 'LATEFEE',
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TYPING OLD MONEY IN BY HAND (11/1, Nic).
+//
+//   "Build the way to type manual stuff in. People switching to gam may not use
+//    software so lots of stuff may go in manual."
+//
+// The CSV import assumes the operator is coming off other software and can
+// export a file. Plenty are coming off a paper ledger and a shoebox, and they
+// have no file to upload — so the import alone leaves exactly the people who
+// most need help with nothing. This is the same two destinations as the import,
+// one entry at a time:
+//
+//   a RESIDENT who paid before the park joined → a settled payment on their
+//     lease, with NO invoice attached, so it is money received and never a bill;
+//   a SPACE with no lease behind it (an RV guest, a weekly stay) → the space's
+//     own past income, attributed to a GAM customer where the operator knows
+//     who paid (services/preGamIncome).
+//
+// Nothing here can ask anybody for money: no invoice is written, no charge is
+// left owed, no reservation and no occupancy night is created, and none of it
+// reaches GAM's own fee.
+//
+// GET  …/payment-history/spaces   — the spaces and who is on them, for the form
+// POST …/payment-history/manual   — record one payment
+// ─────────────────────────────────────────────────────────────────────────────
+
+// What the form needs to offer: every space in the company, and the resident on
+// it if there is one. One call, so typing twelve lots does not mean twelve
+// lookups.
+landlordsRouter.get('/me/payment-history/spaces', requirePerm('payments.import_history'), async (req: any, res, next) => {
+  try {
+    const landlordId = await landlordForRequest(req, 'import')
+    const rows = await query<any>(
+      `SELECT u.id AS unit_id, u.unit_number, p.id AS property_id, p.name AS property_name,
+              l.id AS lease_id,
+              us.first_name, us.last_name, us.email
+         FROM units u
+         JOIN properties p ON p.id = u.property_id
+         LEFT JOIN leases l ON l.unit_id = u.id AND l.status = 'active'
+         LEFT JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.status = 'active' AND lt.role = 'primary'
+         LEFT JOIN tenants t ON t.id = lt.tenant_id
+         LEFT JOIN users us ON us.id = t.user_id
+        WHERE p.landlord_id = $1
+        ORDER BY p.name, lpad(regexp_replace(u.unit_number, '\\D', '', 'g'), 8, '0'), u.unit_number`,
+      [landlordId])
+    res.json({
+      success: true,
+      data: rows.map((r: any) => ({
+        unitId: r.unit_id, unitNumber: r.unit_number,
+        propertyId: r.property_id, propertyName: r.property_name,
+        leaseId: r.lease_id ?? null,
+        // Found in the browser: Copper Canyon House 01 carries an active lease
+        // with NO primary tenant on it, and the list read "(nobody on it)" while
+        // still offering to put money on that lease. Three states, not two, and
+        // the screen has to be able to tell them apart.
+        residentName: [r.first_name, r.last_name].filter(Boolean).join(' ') || null,
+        residentEmail: r.email ?? null,
+        hasLeaseWithoutResident: !!r.lease_id && !r.first_name && !r.last_name,
+      })),
+    })
+  } catch (e) { next(e) }
+})
+
+const money2 = (n: number) => `$${n.toFixed(2)}`
+
+landlordsRouter.post('/me/payment-history/manual', requirePerm('payments.import_history'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const landlordId = await landlordForRequest(req, 'import')
+    const body = z.object({
+      unitId:        z.string().uuid(),
+      // Given = it goes on that resident's lease. Left out = the space's own
+      // past income. The form shows which, so this is never a surprise.
+      leaseId:       z.string().uuid().nullish(),
+      payerName:     z.string().max(200).nullish(),
+      payerPhone:    z.string().max(40).nullish(),
+      payerEmail:    z.string().max(200).nullish(),
+      paymentDate:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      amount:        z.number().positive().max(1_000_000),
+      paymentType:   z.string().max(40),
+      paymentMethod: z.string().max(40).nullish(),
+      reference:     z.string().max(200).nullish(),
+    }).parse(req.body ?? {})
+
+    const type = normalizePaymentType(body.paymentType)
+    if (!type && body.paymentType.trim().toLowerCase() !== 'stay' && body.paymentType.trim().toLowerCase() !== 'other') {
+      throw new AppError(400, `"${body.paymentType}" is not a kind of payment GAM records`)
+    }
+
+    // The space has to be this company's. Without this, one operator could post
+    // another's space as their own income.
+    const unit = await queryOne<{ id: string; unit_number: string; property_name: string }>(
+      `SELECT u.id, u.unit_number, p.name AS property_name
+         FROM units u JOIN properties p ON p.id = u.property_id
+        WHERE u.id = $1 AND p.landlord_id = $2`, [body.unitId, landlordId])
+    if (!unit) throw new AppError(404, 'That space is not in this company.')
+
+    await client.query('BEGIN')
+
+    // ── ON A RESIDENT'S LEASE ────────────────────────────────────────────────
+    if (body.leaseId) {
+      const lease = await queryOne<{ id: string; tenant_id: string | null }>(
+        `SELECT l.id, lt.tenant_id
+           FROM leases l
+           LEFT JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.status = 'active' AND lt.role = 'primary'
+          WHERE l.id = $1 AND l.landlord_id = $2 AND l.unit_id = $3`,
+        [body.leaseId, landlordId, body.unitId])
+      if (!lease) throw new AppError(404, 'That lease is not on this space in this company.')
+      if (!type) throw new AppError(400, 'A payment on a lease has to be rent, a fee, a deposit, a utility or a late fee.')
+
+      const notes = ['Typed in by hand — collected before GAM.',
+                     body.paymentMethod ? `method: ${body.paymentMethod}` : null,
+                     body.reference ? `ref: ${body.reference}` : null]
+        .filter(Boolean).join(' ')
+      // settled, dated the day it arrived, and NO invoice_id — money received,
+      // never a bill. Exactly what the CSV commit writes.
+      // ONE RENT PAYMENT PER LEASE PER DUE DATE — the database says so
+      // (ux_payments_rent_idempotent), and it is right: typing the same lot
+      // twice is how an operator working down a paper sheet double-counts a
+      // month's rent. Caught and said in plain words rather than surfacing a
+      // constraint name as a 500.
+      let made
+      try {
+        made = await client.query<{ id: string }>(
+          `INSERT INTO payments (
+             landlord_id, tenant_id, lease_id, unit_id,
+             type, entry_description, amount, status,
+             due_date, settled_at, processed_at, notes, import_source, imported_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,'settled',$8::date,$8::date,$8::date,$9,'manual',NOW())
+           RETURNING id`,
+          [landlordId, lease.tenant_id, lease.id, body.unitId,
+           type, ENTRY_DESC_BY_TYPE[type], body.amount.toFixed(2), body.paymentDate, notes])
+      } catch (err: any) {
+        if (err?.code === '23505' && String(err?.constraint ?? '').includes('rent_idempotent')) {
+          throw new AppError(409,
+            `There is already a rent payment on ${unit.property_name} ${unit.unit_number} for `
+            + `${body.paymentDate}. If this is a second payment toward the same month, record it `
+            + `with the day it actually arrived.`)
+        }
+        throw err
+      }
+
+      await client.query('COMMIT')
+      res.json({ success: true, data: {
+        where: 'lease',
+        paymentId: made.rows[0].id,
+        said: `$${body.amount.toFixed(2)} recorded as already paid on ${unit.property_name} ${unit.unit_number}. Nobody was billed.`,
+      } })
+      return
+    }
+
+    // ── AGAINST THE SPACE, NO LEASE ──────────────────────────────────────────
+    //
+    // DOUBLE-KEYING IS THE MISTAKE THIS FEATURE INVITES. The import is protected
+    // within a file (one row per space, day, amount and kind per batch), but
+    // every manual save is its OWN batch, so that index cannot see the line
+    // somebody typed a minute ago. Found in the browser: the same $589 on the
+    // same space and day landed twice.
+    //
+    // Somebody working down a paper ledger and losing their place is the normal
+    // case, not the edge one, so an identical line is refused in plain words —
+    // the same protection the rent rail already has. A genuine second payment
+    // of the same amount on the same day is rare and has a way through: the
+    // reference field, which makes the two lines distinguishable on purpose.
+    const already = await queryOne<{ id: string; reference: string | null }>(
+      `SELECT id, reference FROM pre_gam_income_history
+        WHERE landlord_id = $1 AND unit_id = $2 AND occurred_on = $3::date
+          AND amount = $4 AND voided_at IS NULL
+          AND COALESCE(reference, '') = COALESCE($5, '')
+        LIMIT 1`,
+      [landlordId, body.unitId, body.paymentDate, body.amount.toFixed(2),
+       (body.reference ?? '').trim() || null])
+    if (already) {
+      await client.query('ROLLBACK')
+      throw new AppError(409,
+        `${money2(body.amount)} on ${unit.property_name} ${unit.unit_number} for ${body.paymentDate} `
+        + `is already recorded. If this is a second payment of the same amount that day, put the `
+        + `check or receipt number in Reference so the two can be told apart.`)
+    }
+
+    const { recordPreGamIncome } = await import('../services/preGamIncome')
+    const out = await recordPreGamIncome(client, {
+      landlordId, byUserId: req.user!.userId, importSource: 'manual',
+      rows: [{
+        unitId: body.unitId,
+        occurredOn: body.paymentDate,
+        amount: body.amount,
+        incomeType: (type ?? (body.paymentType.trim().toLowerCase() as any)),
+        payerName: body.payerName ?? null,
+        payerPhone: body.payerPhone ?? null,
+        payerEmail: body.payerEmail ?? null,
+        method: body.paymentMethod ?? null,
+        reference: body.reference ?? null,
+        notes: 'Typed in by hand — collected before GAM, no lease on this space.',
+      }],
+    })
+    if (out.recorded === 0) {
+      await client.query('ROLLBACK')
+      throw new AppError(400, out.refused[0]?.why ?? 'That could not be recorded.')
+    }
+    await client.query('COMMIT')
+    res.json({ success: true, data: {
+      where: 'space',
+      batchId: out.batchId,
+      person: out.withPerson > 0,
+      said: `$${body.amount.toFixed(2)} recorded as past income for ${unit.property_name} ${unit.unit_number}`
+        + (out.withPerson > 0 ? `, from ${body.payerName}.` : '.')
+        + ' Nobody was billed.',
+    } })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally {
+    client.release()
+  }
+})
+
+// Take one typed line back off. The mistake this invites is keying the wrong
+// lot and noticing two rows later, so Undo has to be there while the sheet is
+// still in front of them.
+//
+// Only a SPACE line: it owns its own batch and comes off cleanly. A line on a
+// resident's record is an ordinary settled payment and is removed from the
+// Payments page with everything else — the screen says so rather than offering
+// a button here that could not do it.
+//
+// Keep-everything: the row is voided with its reason, never deleted.
+landlordsRouter.post('/me/payment-history/undo', requirePerm('payments.import_history'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const landlordId = await landlordForRequest(req, 'import')
+    const { batchId } = z.object({ batchId: z.string().uuid() }).parse(req.body ?? {})
+    await client.query('BEGIN')
+    const { voidPreGamIncomeBatch } = await import('../services/preGamIncome')
+    const out = await voidPreGamIncomeBatch(client, {
+      landlordId, batchId, why: 'taken back off by hand while it was being typed in',
+    })
+    await client.query('COMMIT')
+    if (out.voided === 0) throw new AppError(404, 'There is nothing left on that entry to take off.')
+    res.json({ success: true, data: out })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally {
+    client.release()
+  }
+})
 
 // GET /api/landlords/me/onboard-payment-history-csv/template?source=generic
 landlordsRouter.get('/me/onboard-payment-history-csv/template', requirePerm('tenants.create'), async (req, res, next) => {
@@ -4915,6 +5293,7 @@ landlordsRouter.post('/me/onboard-payment-history-csv/validate', requirePerm('te
         propertyName:  String(r.property_name  || '').trim(),
         unitNumber:    String(r.unit_number    || '').trim(),
         reference:     String(r.reference      || '').trim(),
+        payerPhone:    String(r.payer_phone    || '').trim(),
         extra: r._extra,
         issues,
       }
@@ -5022,11 +5401,61 @@ landlordsRouter.post('/me/onboard-payment-history-csv/validate', requirePerm('te
         }
       }
 
-      if (!resolved && (row.tenantEmail || row.tenantName) && issues.every(it => it.field !== 'tenant_email' && it.field !== 'tenant_name')) {
-        // Neither path resolved and no disambiguation blocker was added.
-        // The tenant simply isn't in the portfolio.
-        const identifier = row.tenantEmail || row.tenantName
-        issues.push({ severity: 'block', field: row.tenantEmail ? 'tenant_email' : 'tenant_name', message: `No active lease found for "${identifier}" in your portfolio. Onboard the tenant first.` })
+      // ── 11/1 (Nic): NO LEASE IS NOT A BLOCKER ANY MORE ────────────────────
+      //
+      //   "We also need to have it not gated on leases, because income that
+      //    happened for a property may not attach to a lease. If it's an RV
+      //    park or a short-term stay situation, it needs to be this unit
+      //    brought this much money, attributed to this person's contact
+      //    information."
+      //
+      // This used to refuse the line outright ("Onboard the tenant first"),
+      // which is right for a resident typo and wrong for the whole RV and
+      // short-stay side of a park: those people never had a lease and never
+      // will, and the money is still real income the space earned.
+      //
+      // So the fallback is the SPACE. Matched on property + space number within
+      // this company, the line commits to pre_gam_income_history instead of the
+      // rent rail: income already received, never a charge, never in a balance,
+      // never collectible, never on GAM's fee. The warning says so, per line, so
+      // the landlord sees which way each one is going before committing.
+      if (!resolved && issues.every(it => it.field !== 'tenant_email' && it.field !== 'tenant_name')) {
+        if (!row.unitNumber) {
+          issues.push({
+            severity: 'block',
+            field: 'unit_number',
+            message: row.tenantEmail || row.tenantName
+              ? `No active lease for "${row.tenantEmail || row.tenantName}". Add the space number (and property_name if you have more than one) and it will be recorded as that space's past income instead.`
+              : 'Needs either a tenant with an active lease, or a space number so it can be recorded as that space\'s past income.',
+          })
+        } else {
+          const space = await queryOne<{ id: string; unit_number: string; property_name: string }>(
+            `SELECT u.id, u.unit_number, p.name AS property_name
+               FROM units u JOIN properties p ON p.id = u.property_id
+              WHERE p.landlord_id = $1
+                AND lower(trim(u.unit_number)) = lower($2)
+                AND ($3 = '' OR lower(trim(p.name)) = lower($3))
+              LIMIT 2`,
+            [landlordId, row.unitNumber, row.propertyName])
+          if (!space) {
+            issues.push({
+              severity: 'block', field: 'unit_number',
+              message: row.propertyName
+                ? `No space "${row.unitNumber}" at "${row.propertyName}" in this company.`
+                : `No space "${row.unitNumber}" in this company. Add property_name if the same number exists at more than one property.`,
+            })
+          } else {
+            row.resolvedUnitId = space.id
+            row.historyOnly = true
+            const who = row.tenantName || row.tenantEmail
+            issues.push({
+              severity: 'warn', field: 'unit_number',
+              message: `No lease for this line, so it will be recorded as past income for ${space.property_name} ${space.unit_number}`
+                + (who ? ` from ${who}` : ' with no payer named')
+                + '. Nobody is billed and it never appears on anyone\'s balance.',
+            })
+          }
+        }
       }
 
       rows.push(row)
@@ -5096,19 +5525,30 @@ landlordsRouter.post('/me/onboard-payment-history-csv/commit', requirePerm('paym
       if (blockers.length > 0) {
         throw new AppError(400, `Row ${row.rowIndex + 1} still has blockers: ${blockers.map(b => b.message).join(', ')}`)
       }
-      if (!row.resolvedTenantId || !row.resolvedLeaseId || !row.resolvedUnitId) {
+      // 11/1: a line with no lease is legitimate now — it is a space's past
+      // income. It still needs its SPACE, which is its unit of attribution, so
+      // the demand is narrowed rather than dropped.
+      if (row.historyOnly) {
+        if (!row.resolvedUnitId) {
+          throw new AppError(400, `Row ${row.rowIndex + 1} has no space to attribute the income to`)
+        }
+      } else if (!row.resolvedTenantId || !row.resolvedLeaseId || !row.resolvedUnitId) {
         throw new AppError(400, `Row ${row.rowIndex + 1} is missing resolved lease info`)
       }
     }
 
-    // Re-verify all referenced leases belong to this landlord.
-    const leaseIds = Array.from(new Set((rows as PaymentCsvRow[]).map(r => r.resolvedLeaseId!) ))
-    const ownedLeases = await query<any>(
+    // Re-verify all referenced leases belong to this landlord. 11/1: a
+    // history-only line references no lease — its SPACE is checked against the
+    // company inside services/preGamIncome, which refuses another operator's
+    // unit by name, so it is skipped here rather than failing on an absent id.
+    const leaseRows = (rows as PaymentCsvRow[]).filter(r => !r.historyOnly)
+    const leaseIds = Array.from(new Set(leaseRows.map(r => r.resolvedLeaseId!) ))
+    const ownedLeases = leaseIds.length > 0 ? await query<any>(
       `SELECT id FROM leases WHERE id = ANY($1::uuid[]) AND landlord_id = $2`,
       [leaseIds, landlordId]
-    )
+    ) : []
     const ownedSet = new Set(ownedLeases.map(l => l.id))
-    for (const row of rows as PaymentCsvRow[]) {
+    for (const row of leaseRows) {
       if (!ownedSet.has(row.resolvedLeaseId!)) {
         throw new AppError(403, `Row ${row.rowIndex + 1} references a lease not owned by this landlord`)
       }
@@ -5117,7 +5557,32 @@ landlordsRouter.post('/me/onboard-payment-history-csv/commit', requirePerm('paym
     await client.query('BEGIN')
 
     let committed = 0
-    for (const row of rows as PaymentCsvRow[]) {
+    // ── 11/1 (Nic): the lines with no lease go to the SPACE, not the rent rail.
+    // They are income already received — never a charge, never in a balance,
+    // never collectible, never on GAM's fee. One batch id for the whole file so
+    // a file typed wrong is one undo.
+    const historyRows = (rows as PaymentCsvRow[]).filter(r => r.historyOnly && r.resolvedUnitId)
+    let history: Awaited<ReturnType<typeof import('../services/preGamIncome').recordPreGamIncome>> | null = null
+    if (historyRows.length > 0) {
+      const { recordPreGamIncome } = await import('../services/preGamIncome')
+      history = await recordPreGamIncome(client, {
+        landlordId, byUserId: req.user!.userId, importSource: sourceNorm,
+        rows: historyRows.map(r => ({
+          unitId:     r.resolvedUnitId!,
+          occurredOn: r.paymentDate.slice(0, 10),
+          amount:     parseFloat(r.amount.replace(/[$,\s]/g, '')),
+          incomeType: (normalizePaymentType(r.paymentType) || 'other') as any,
+          payerName:  r.tenantName || null,
+          payerPhone: r.payerPhone || null,
+          payerEmail: r.tenantEmail || null,
+          method:     r.paymentMethod || null,
+          reference:  r.reference || null,
+          notes:      `Imported from ${sourceNorm} as past income — no lease on this line.`,
+        })),
+      })
+    }
+
+    for (const row of (rows as PaymentCsvRow[]).filter(r => !r.historyOnly)) {
       const amt = parseFloat(row.amount.replace(/[$,\s]/g, ''))
       const paymentType = (normalizePaymentType(row.paymentType) || 'rent') as 'rent' | 'fee' | 'deposit' | 'utility' | 'late_fee'
       const entryDesc = ENTRY_DESC_BY_TYPE[paymentType]
@@ -5182,6 +5647,17 @@ landlordsRouter.post('/me/onboard-payment-history-csv/commit', requirePerm('paym
       success: true,
       data: {
         committed,
+        // 11/1: the lines that had no lease, recorded as the space's past
+        // income instead. Reported separately so the screen can say plainly
+        // what went where — and the batch id is what undoes the whole file.
+        pastIncome: history ? {
+          recorded:        history.recorded,
+          withPerson:      history.withPerson,
+          withoutPerson:   history.withoutPerson,
+          profilesCreated: history.profilesCreated,
+          refused:         history.refused,
+          batchId:         history.batchId,
+        } : null,
         escalateToSuperAdmin: paymentStatus.escalateToSuperAdmin,
         mappingStatus:        paymentStatus.mappingStatus,
       },
@@ -6050,7 +6526,7 @@ landlordsRouter.patch('/me/pending-intents/:id/work-trade', requirePerm('tenants
 // S632 (Nic): "Let's make a way for a landlord to resend the invite. Otherwise
 // I'm gonna be asking you every time."
 //
-// Jonathan Covey changed his email between being invited and accepting, so his
+// Rilla Satterlee changed his email between being invited and accepting, so his
 // invitation was sitting in a mailbox he no longer reads — and there was no way
 // in the product to fix it. Correcting a tenant's invite address took a direct
 // database write. Over 29 invites at one park and 75 at another, a wrong or
@@ -6102,7 +6578,7 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
           WHERE pti.id = $1 AND pti.cancelled_at IS NULL`, [req.params.id])
       if (!intent) throw new AppError(404, 'That invite no longer exists.')
       if (!canManageLandlordResource(req.user, intent.landlord_id)) throw new AppError(403, 'Forbidden')
-      // S652 (Nic, Shannon Gregory): resolved_at is stamped for EVERY resident on
+      // S652 (Nic, Yorick Drakeford): resolved_at is stamped for EVERY resident on
       // the household the moment the lease issues on the landlord's signature —
       // it never said whether THIS person signed. A co-tenant whose mother had
       // signed was told "they have already signed" and her dead email could not
@@ -6230,7 +6706,7 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
       // ── S648 (Nic): the correction reaches their lease, and the email
       // follows the one-email flow. ────────────────────────────────────────
       //
-      // Two defects Nic hit fixing Clay Simpson: the name went onto the
+      // Two defects Nic hit fixing Pell Pennington: the name went onto the
       // account but not onto the lease already drafted for him, and saving
       // sent the OLD portal invite — a second, earlier email in a flow that
       // has exactly one, sent when the landlord signs.
@@ -6444,7 +6920,7 @@ landlordsRouter.patch('/me/pending-intents/:id/contact', requirePerm('tenants.cr
 
 // ── S639: REMIND A RESIDENT WHAT THEY OWE ────────────────────────────────────
 //
-// Nic: "send Jeremy Parker's email a reminder that there's a new charge for
+// Nic: "send Margo Northcott's email a reminder that there's a new charge for
 // electricity, or just send the reminder that there's an outstanding balance
 // due."
 //
@@ -6656,13 +7132,13 @@ landlordsRouter.get('/me/gam-charges', requirePerm('payments.view_all'), async (
 
 // ── S651: mail that never arrived ─────────────────────────────────────────
 //
-// Nic invited Arnoldo Arvizu to RV 39 at Mountain View three times. All three
+// Nic invited Dell Dunmore to RV 39 at Mountain View three times. All three
 // bounced. A lease signing request to RV 08 bounced. Nobody told him, because
 // bounce events only ever raised a GAM-side admin notification — the landlord,
 // who is the one person who can fix the address, saw nothing and could only
 // conclude the tenant was ignoring them.
 //
-// This is the same shape as the S650 Ellen Gregory failure: a person who cannot
+// This is the same shape as the S650 Zeph Ashcombe failure: a person who cannot
 // get in, and an operator with no way to see why.
 //
 // PICKING THE LATEST **RESOLVED** EMAIL, NOT THE LATEST EMAIL. A message sent

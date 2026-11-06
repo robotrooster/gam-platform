@@ -516,10 +516,10 @@ describe('S654: the invite route and existing accounts', () => {
 
   it('a resident stored in mixed case is found, not duplicated, and the link goes to their own address', async () => {
     const { token, unitId } = await seed()
-    const stored = 'Kim.Harland@Example.test'
+    const stored = 'yvette.bexley@Example.test'
     const r = await account(stored, '$2b$10$placeholder_invite_pending')
 
-    const res = await post(buildApp(), token, { email: 'kim.harland@example.test', firstName: 'Kim', unitId })
+    const res = await post(buildApp(), token, { email: 'yvette.bexley@example.test', firstName: 'Kim', unitId })
     expect(res.status).toBe(200)
     expect(res.body.data.userId).toBe(r.userId)
     expect(res.body.data).not.toHaveProperty('acceptUrl')

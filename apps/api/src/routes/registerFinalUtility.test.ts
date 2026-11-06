@@ -41,6 +41,7 @@ import { posPayLinksRouter } from './posPayLinks'
 import { utilityRouter } from './utility'
 import { errorHandler } from '../middleware/errorHandler'
 import { expectNoFigures } from '../test/noLeaks'
+import { todayIn } from '../lib/timezone'
 
 function buildApp() {
   const app = express()
@@ -58,8 +59,12 @@ beforeEach(async () => {
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_register_final_utility'
 })
 
+// 11/01: anchored to GAM's calendar day at noon UTC. This used to step off the
+// bare wall clock, which is already tomorrow in UTC after 5pm Phoenix, so every
+// day() was a day out for seven hours of every day.
 const day = (n: number) => {
-  const d = new Date(); d.setUTCDate(d.getUTCDate() + n)
+  const d = new Date(`${todayIn(null)}T12:00:00Z`)
+  d.setUTCDate(d.getUTCDate() + n)
   return d.toISOString().slice(0, 10)
 }
 const cycle = () => `${new Date().toISOString().slice(0, 8)}01`
@@ -128,7 +133,7 @@ async function stay(p: Park, o: {
     const b = await c.query<{ id: string }>(
       `INSERT INTO unit_bookings (unit_id, landlord_id, check_in, check_out, booked_check_out,
                                   status, lease_type, stay_terms, guest_name, guest_email, guest_phone, total_amount)
-       VALUES ($1,$2,$3::date,$4::date,$5::date,$9,$6,'stay','Andres Razo',$7,$8,$10)
+       VALUES ($1,$2,$3::date,$4::date,$5::date,$9,$6,'stay','Cora Castellan',$7,$8,$10)
        RETURNING id`,
       [o.unitId ?? p.unitId, p.landlordId, checkIn, checkOut, o.bookedCheckOut ?? checkOut,
        leaseType, o.email, o.phone ?? null, o.status ?? 'checked_out', o.total ?? null])
@@ -159,7 +164,7 @@ async function resident(p: Park, o: { email: string; phone?: string | null }) {
     await seedLeaseTenant(c, { leaseId, tenantId })
     const cust = await c.query<{ id: string }>(
       `INSERT INTO pos_customers (landlord_id, tenant_id, first_name, last_name, email, phone)
-       VALUES ($1,$2,'Andres','Razo',$3,$4) RETURNING id`,
+       VALUES ($1,$2,'Cora','Castellan',$3,$4) RETURNING id`,
       [p.landlordId, tenantId, o.email, o.phone ?? null])
     return { tenantId, leaseId, posCustomerId: cust.rows[0].id }
   } finally { c.release() }
@@ -171,7 +176,7 @@ async function guestRecord(p: Park, o: { email: string; phone?: string | null })
   try {
     const cust = await c.query<{ id: string }>(
       `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, phone)
-       VALUES ($1,'Andres','Razo',$2,$3) RETURNING id`, [p.landlordId, o.email, o.phone ?? null])
+       VALUES ($1,'Cora','Castellan',$2,$3) RETURNING id`, [p.landlordId, o.email, o.phone ?? null])
     return { posCustomerId: cust.rows[0].id }
   } finally { c.release() }
 }
@@ -226,7 +231,7 @@ const recovery = async (p: Park) => ((await request(buildApp())
 describe('D3 — GAM finds the site from their own reservation or lease', () => {
   it('matches on their exact email and shows their own stay, never a list of spaces', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
     const g = await guestRecord(p, { email })
 
@@ -253,7 +258,7 @@ describe('D3 — GAM finds the site from their own reservation or lease', () => 
 
   it('two rigs: the desk confirms WHICH one, and both are that person\'s own', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const a = await stay(p, { email, nights: 40, checkIn: day(-80), checkOut: day(-40), withAgreement: true })
     const b = await stay(p, { email, nights: 35, withAgreement: false })
     const g = await guestRecord(p, { email })
@@ -278,7 +283,7 @@ describe('D3 — GAM finds the site from their own reservation or lease', () => 
 describe('D5 — typing the number writes nothing; confirming writes the reading and the bill', () => {
   it('shows the usage and the dollar amount, and writes NOTHING before Confirm is pressed', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
 
     const q = await checkRead(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 48387 }] })
@@ -300,7 +305,7 @@ describe('D5 — typing the number writes nothing; confirming writes the reading
 
   it('a monthly stay with no lease is billed off the typed read, on no invoice and with nothing emailed', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
 
     const r = await putOnTicket(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 48387 }] })
@@ -346,7 +351,7 @@ describe('D5 — typing the number writes nothing; confirming writes the reading
 
   it('an upward slipped digit is caught: nothing is billed, and the desk is told without a figure', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
 
     // 120000 for 12000 on a six-digit face: 72,000 kWh, a $15,120 charge.
@@ -376,7 +381,7 @@ describe('D5 — typing the number writes nothing; confirming writes the reading
 
   it('a figure below the last read gets the SAME sentence as one that came in too high', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
     // 4800 typed against a prior 48000 — a dropped digit at a pull-out.
     const low = await checkRead(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 4800 }] })
@@ -490,7 +495,17 @@ describe('D5 — typing the number writes nothing; confirming writes the reading
         const m = await query<any>(
           `SELECT looks_broken_at, looks_broken_reason FROM utility_meters WHERE id = $1`, [p.meterId])
         expect(m[0].looks_broken_at).not.toBeNull()
-        expect(m[0].looks_broken_reason).toMatch(/barely moved|backwards/i)
+        // 11/1 (Nic): the words changed, and that is the point of asserting
+        // them. It used to say "the dial barely moved, OR WENT BACKWARDS... the
+        // meter may be stuck OR SWAPPED", and he objected: "when it rolls back
+        // by 1 or 2 or forward by 1 or 2, don't flag it. It's essentially the
+        // same meter read... And it's 1 number off." Within the reading margin
+        // there is one honest reading — the dial did not turn. A swap shows a
+        // wholly different figure, and a real reversal is a steady descent
+        // ([[gam-electric-meter-reversal-causes]]), so neither word belonged.
+        expect(m[0].looks_broken_reason).toMatch(/within a unit or two/i)
+        expect(m[0].looks_broken_reason).toMatch(/has not turned/i)
+        expect(m[0].looks_broken_reason).not.toMatch(/swapped/i)
         // NOT out of service: a flag must never stop a meter being billed.
         const svc = await query<any>(`SELECT out_of_service FROM utility_meters WHERE id = $1`, [p.meterId])
         expect(svc[0].out_of_service).toBe(false)
@@ -523,7 +538,7 @@ describe('D5 — typing the number writes nothing; confirming writes the reading
 
   it('refuses more digits than the face has, and records nothing at all for it', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
     const r = await putOnTicket(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 1234567 }] })
     expect(r.status, JSON.stringify(r.body)).toBe(400)
@@ -583,7 +598,7 @@ describe('D6 — a short stay\'s power is in its rate, and that is finally writt
 describe('THE WASH — called, not re-decided', () => {
   it('a guest who left early at a park that kept their money is billed nothing, and it is absorbed', async () => {
     const p = await park({ priorDaysAgo: 6 })
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     // Booked through a week from now, drove off two days ago, and the park kept
     // the unused money.
     const s = await stay(p, { email, nights: 40, checkIn: day(-38), checkOut: day(-2),
@@ -615,7 +630,7 @@ describe('THE WASH — called, not re-decided', () => {
 describe('D1 / D2 — the ticket IS the bill, and an unpaid one is owed the ordinary way', () => {
   it('paying the ticket closes the bill out, and the kilowatts are counted ONCE', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
     const raised = await putOnTicket(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 48387 }] })
     const line = raised.body.data.lines[0]
@@ -656,7 +671,7 @@ describe('D1 / D2 — the ticket IS the bill, and an unpaid one is owed the ordi
 
   it('an unpaid ticket leaves the bill OWED, and the reading stands', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
     const line = (await putOnTicket(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 48387 }] }))
       .body.data.lines[0]
@@ -686,7 +701,7 @@ describe('D1 / D2 — the ticket IS the bill, and an unpaid one is owed the ordi
 
   it('an ask left open by a dead ticket goes cold and the bill comes back to the ordinary route', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
     const line = (await putOnTicket(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 48387 }] }))
       .body.data.lines[0]
@@ -710,7 +725,7 @@ describe('D1 / D2 — the ticket IS the bill, and an unpaid one is owed the ordi
 
   it('a released bill cannot then be charged at the till — the ticket no longer holds it', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
     const line = (await putOnTicket(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 48387 }] }))
       .body.data.lines[0]
@@ -754,7 +769,7 @@ describe('D1 / D2 — the ticket IS the bill, and an unpaid one is owed the ordi
 
   it('the line is the bill at the till: it cannot be retyped, dropped or discounted', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
     const line = (await putOnTicket(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: p.meterId, value: 48387 }] }))
       .body.data.lines[0]
@@ -776,7 +791,7 @@ describe('D1 / D2 — the ticket IS the bill, and an unpaid one is owed the ordi
   it('another company\'s bill id on a cart line buys nothing', async () => {
     const mine = await park()
     const theirs = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(theirs, { email, nights: 35, withAgreement: true })
     const line = (await putOnTicket(theirs, { closing: { kind: 'stay', id: s.bookingId }, reads: [{ meterId: theirs.meterId, value: 48387 }] }))
       .body.data.lines[0]
@@ -856,7 +871,7 @@ describe('both meters on one site, on one ticket (D4)', () => {
         [waterMeterId, day(-8), p.userId])
     } finally { c.release() }
 
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
 
     // Every submeter the site has gets a box.
@@ -933,7 +948,7 @@ describe('the closing\'s own space is what a read may be taken on', () => {
   it('refuses another space\'s meter at both doors, and names neither it nor its space', async () => {
     const p = await park()
     const next = await spaceNextDoor(p)
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
 
     // The browser is handed the RIGHT list: the closing's own space's meters,
@@ -979,7 +994,7 @@ describe('the closing\'s own space is what a read may be taken on', () => {
   it('slipped in beside the right meter, it writes NEITHER read', async () => {
     const p = await park()
     const next = await spaceNextDoor(p)
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
 
     // One screen, one confirm (D4): the site's own meter is checked and good,
@@ -1018,7 +1033,7 @@ describe('the closing\'s own space is what a read may be taken on', () => {
 describe('a pole is read once', () => {
   it('refuses the same meter sent twice, at both doors, and writes nothing', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, withAgreement: true })
 
     const r = await putOnTicket(p, { closing: { kind: 'stay', id: s.bookingId }, reads: [
@@ -1067,14 +1082,14 @@ describe('10/21 (Nic): who is due out, and what checking them out knows to bill 
 
   it('lists the guest whose last day has come or gone and who is still here, with every meter on their site and what their stay still owes', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     // Still here, their week up yesterday, $300 stay with nothing paid on it.
     const here = await stay(p, { email, nights: 8, checkIn: day(-8), checkOut: day(-1), status: 'checked_in', total: 300 })
 
     const r = await dueOut(p)
     expect(r.status, JSON.stringify(r.body)).toBe(200)
     expect(r.body.data.closings.map((c: any) => [c.kind, c.id, c.spaceLabel, c.who, c.owed, c.meters.length]))
-      .toEqual([['stay', here.bookingId, 'RV 27', 'Andres Razo', 300, 1]])
+      .toEqual([['stay', here.bookingId, 'RV 27', 'Cora Castellan', 300, 1]])
     // The site's own meter, named as the landlord named it — the unit answers,
     // the counter never picks a space.
     expect(r.body.data.closings[0].meters[0]).toMatchObject({ meterId: p.meterId, utilityType: 'electric' })
@@ -1082,7 +1097,7 @@ describe('10/21 (Nic): who is due out, and what checking them out knows to bill 
 
   it('is the schedule, not a list of everyone: not a guest still running, not one already checked out, not a lease-backed stay, not another park\'s', async () => {
     const p = await park()
-    const mine = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const mine = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const here = await stay(p, { email: mine, nights: 8, checkIn: day(-8), checkOut: day(-1), status: 'checked_in', total: 300 })
     // Still running: their last day is tomorrow.
     await stay(p, { email: `later-${mine}`, nights: 3, checkIn: day(-2), checkOut: day(1), status: 'checked_in' })
@@ -1114,7 +1129,7 @@ describe('10/21 (Nic): who is due out, and what checking them out knows to bill 
 
   it('a closing reached from the list reads and bills exactly as one reached by name', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 35, checkIn: day(-35), checkOut: day(-1), status: 'checked_in', withAgreement: true })
     const g = await guestRecord(p, { email })
 
@@ -1135,7 +1150,7 @@ describe('10/21 (Nic): who is due out, and what checking them out knows to bill 
 
   it('a lease says nothing is owed on it here — rent is its household\'s invoice, never a register line', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const who = await resident(p, { email })
     const r = await lookUp(p, { tenantId: who.tenantId })
     expect(r.status, JSON.stringify(r.body)).toBe(200)
@@ -1145,7 +1160,7 @@ describe('10/21 (Nic): who is due out, and what checking them out knows to bill 
 
   it('a cancelled stay asks for nothing — a closed reservation never becomes a figure at the counter', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await stay(p, { email, nights: 4, checkIn: day(-4), checkOut: day(-1), total: 300 })
     await db.query(`UPDATE unit_bookings SET status = 'cancelled', cancelled_at = NOW() WHERE id = $1`, [s.bookingId])
     const g = await guestRecord(p, { email })

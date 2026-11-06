@@ -37,6 +37,7 @@ import {
   seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
 import { reportsRouter } from './reports'
+import { todayIn } from '../lib/timezone'
 import { errorHandler } from '../middleware/errorHandler'
 import { expectNoFigures } from '../test/noLeaks'
 
@@ -1542,7 +1543,15 @@ describe('10/12: Charged, Received and Owed side by side on every report', () =>
 
   it('the summary row equals the P&L it opens', async () => {
     const f = await seed()
-    const today = new Date().toISOString().slice(0, 10)
+    // 10/31: a DUE DATE is a calendar day on GAM's home clock — the clock every
+    // report cuts its month on (lib/timezone todayIn, the same day the
+    // database's CURRENT_DATE gives, which the laundry row below uses).
+    // `new Date().toISOString()` is UTC, and UTC turns over at 5 pm here, so
+    // after 5 pm on the last day of a month this bill was dated into NEXT
+    // month while its payment still arrived in THIS one: the rent card then
+    // read $700 received and $0 billed — correctly — and the Money billed leg
+    // of this assertion had nothing to tie to. settled_at stays an instant.
+    const today = todayIn(null)
     const base = { unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid }
     await seedSettledRow({ ...base, type: 'rent', amount: 700, revenueOwner: 'landlord', entry: 'RENT',
       dueDate: today, settledAt: new Date().toISOString() })

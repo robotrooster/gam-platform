@@ -92,14 +92,38 @@ export const securityDepositProjector: LedgerProjector = {
       `SELECT l.landlord_id, sd.lease_id, sd.tenant_id, sd.unit_id, u.property_id,
               sd.flex_deposit_enabled IS TRUE AS installments, (sd.voided_at IS NOT NULL OR sd.status = 'voided') AS voided,
               ${cSql('sd.total_amount')} AS c,
-              ${localDaySql('(SELECT min(f.created_at) FROM flex_deposit_installments f WHERE f.security_deposit_id = sd.id)',
+              -- 10/28 (Nic): THE LANDLORD'S BOOKS TAKE THE DEPOSIT WHEN IT IS PAID.
+              --
+              --   "The deposit on the landlord's books is going to show paid in
+              --    full when the tenant pays their first installment of flex
+              --    deposit. On our books, they still owe... But they only get
+              --    that when the first payment happens."
+              --   "The landlord's books should only take the deposit when the
+              --    fucking deposit is paid."
+              --
+              -- This was min(created_at) — the ENROLLMENT day — so the balance
+              -- sheet posted the whole deposit as held in GAM custody before a
+              -- cent existed, and nothing corrected it until move-out. With
+              -- enrollment about to be allowed on a bank that is still
+              -- verifying, that would have booked custody of money for people
+              -- who never funded anything at all.
+              --
+              -- So the posting is dated the first installment that actually
+              -- SETTLED. No settled installment, no day, and the guard below
+              -- returns no posting — the deposit simply reads unpaid on the
+              -- landlord's books, like any other unpaid deposit, until money
+              -- lands.
+              ${localDaySql("(SELECT min(f.settled_at) FROM flex_deposit_installments f WHERE f.security_deposit_id = sd.id AND f.settled_at IS NOT NULL)",
                             propertyTzSql('u.property_id', 'l.landlord_id'))} AS day
          FROM security_deposits sd JOIN leases l ON l.id = sd.lease_id LEFT JOIN units u ON u.id = sd.unit_id
         WHERE sd.id = $1`, [sourceId])).rows[0]
     if (!s || !s.installments || s.voided || !s.day) return []
     const d = { propertyId: s.property_id, unitId: s.unit_id, leaseId: s.lease_id, tenantId: s.tenant_id }
     const L = new Lines()
-    L.dr('deposits_gam_holds', centsOf(s.c), { ...d, memo: 'Deposit GAM holds for you (the full deposit at move-in)' })
+    // The FULL deposit, on the day the first installment landed: that is the
+    // moment the landlord is made whole on their books, even though GAM is
+    // still collecting the rest (and still shows it owed on ours).
+    L.dr('deposits_gam_holds', centsOf(s.c), { ...d, memo: 'Deposit GAM holds for you (in full, from the first installment)' })
     L.cr('security_deposits_payable', centsOf(s.c), { ...d, reportCategory: 'deposits' })
     if (L.empty) return []
     return [{ owner: { landlordId: s.landlord_id }, intendedDate: s.day, memo: 'Deposit held for you', lines: L.lines }]

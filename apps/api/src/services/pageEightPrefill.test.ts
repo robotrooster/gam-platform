@@ -193,7 +193,7 @@ describe('S648 page 8 rent lines, deposit copy and total', () => {
     })
   })
 
-  // Clay Simpson and Martin Alvarado: page 2 said one rent, page 8 another,
+  // Pell Pennington and Faye Inglewood: page 2 said one rent, page 8 another,
   // and billing followed page 2. For an existing resident the two now cannot
   // differ — whatever page 2 says, page 8 follows when the landlord signs.
   it('restamping follows a changed page 2 rent for an onboarding resident', async () => {

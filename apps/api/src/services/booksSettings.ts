@@ -421,7 +421,15 @@ export async function updateBooksSettings(args: {
       // The opening posting reads the home-sale method (a note owed, or
       // nothing on the balance sheet), and a record that waited on a method
       // posts once it is chosen. Writers only ever insert into the outbox.
-      await c.query(`INSERT INTO ledger_outbox (source_type, source_id, owner_id) VALUES ('opening', $1::text, $1::uuid)`,
+      // 11/3: one row per opening — the company's own and one for each
+      // property that has started. `$1::uuid` stays the owner; the source id
+      // is the composite, which is why it is built in SQL rather than cast.
+      await c.query(
+        `INSERT INTO ledger_outbox (source_type, source_id, owner_id)
+         SELECT 'opening', $1::text, $1::uuid
+          UNION ALL
+         SELECT 'opening', $1::text || '|' || p.id::text, $1::uuid
+           FROM properties p WHERE p.landlord_id = $1::uuid AND p.books_start_date IS NOT NULL`,
         [viewer.landlordId])
       ledgerTouched = true
     }

@@ -5,7 +5,7 @@
  * when you said there's five critical things and 22 other ones that weren't even
  * on the list... I want you to fix the root."
  *
- * Blu Haws sat with Nic on 10/19 and unchecked every box the settings page
+ * Hollis Harkness sat with Nic on 10/19 and unchecked every box the settings page
  * showed him. Fifteen rows saved. He kept getting email, because twenty-two
  * types GAM actually sends him had no box anywhere and a missing row means
  * email-on.
@@ -24,7 +24,7 @@
  * reminders and the monthly property report all go out through the OTHER road
  * (their own senders in services/email.ts, straight to send()), outside the
  * mock's reach and outside the assertion. The suite was green, 15 of 15, while
- * every one of those still mailed Blu Haws.
+ * every one of those still mailed Hollis Harkness.
  *
  * The last describe in this file closes that. It drives the REAL senders with
  * the REAL send(), and reads the answer off the email_send_log row each one
@@ -58,10 +58,11 @@ import {
 } from '@gam/shared'
 import {
   sendLatePaymentDigest, emailInvoiceReady, emailPaymentReceipt, emailBalanceDue,
+  emailFlexDepositOffer,
   emailMonthlyPropertyReport, emailSigningRequest, emailSigningReminder,
   emailSigningCompleted, emailDocumentAutoVoided, emailNewLeaseTenantUnsigned,
   emailNewBackgroundCheck, emailPoolMatchInterest, emailPoolTenantInterested,
-  emailBirthdayGreeting, sendPasswordResetEmail,
+  emailBirthdayGreeting, sendPasswordResetEmail, emailOwnerStatement,
 } from './email'
 
 function buildApp() {
@@ -128,7 +129,7 @@ const LANDLORD_OPTIONAL = notificationCatalogFor('landlord', { isAccountHolder: 
 function allOffBody() {
   return {
     updates: LANDLORD_OPTIONAL.map(e => ({
-      // 10/20 (Nic, on Blu): email off, in-app on — "he told Nic he would rather
+      // 10/20 (Nic, on Hollis): email off, in-app on — "he told Nic he would rather
       // log in and see what needs attention."
       type: e.type, emailEnabled: false, inAppEnabled: true,
     })),
@@ -311,7 +312,7 @@ describe('the route will not store a preference GAM cannot act on', () => {
 /**
  * ── THE OTHER ROAD, DRIVEN FOR REAL ─────────────────────────────────────────
  *
- * Every sender below is one Blu Haws kept hearing from after he answered all 90
+ * Every sender below is one Hollis Harkness kept hearing from after he answered all 90
  * of his rows. None of them touches createNotification; each calls send()
  * itself with its own category. The gate in services/email.ts reads the
  * declaration in @gam/shared emailCategories, looks up the recipient by
@@ -360,51 +361,72 @@ describe('a landlord who switches everything off also stops getting the mail tha
     const resident = residentEmail
     return [
       { category: 'late_payment_notice', who: 'landlord', fire: () => sendLatePaymentDigest({
-          landlordEmail: email, landlordName: 'Blu', ctx: { landlordId },
-          items: [{ tenantName: 'A Resident', unitNumber: '1', propertyName: 'TruBlu', daysLate: 4, amount: 500 }],
+          landlordEmail: email, landlordName: 'Hollis', ctx: { landlordId },
+          items: [{ tenantName: 'A Resident', unitNumber: '1', propertyName: 'TruHollis', daysLate: 4, amount: 500 }],
         }) },
       { category: 'invoice_ready', who: 'resident', fire: () => emailInvoiceReady(resident, {
-          tenantName: 'Blu', unitLabel: 'TruBlu — 1', invoiceNumber: 'INV-1',
+          tenantName: 'Hollis', unitLabel: 'TruHollis — 1', invoiceNumber: 'INV-1',
           dueDateLabel: 'Nov 1, 2026', total: 500,
           lines: [{ label: 'Rent', amount: 500 }],
         }, { landlordId }) },
       { category: 'payment_receipt', who: 'resident', fire: () => emailPaymentReceipt(resident, {
-          tenantName: 'Blu', unitLabel: 'TruBlu — 1', amount: 500, method: 'check',
+          tenantName: 'Hollis', unitLabel: 'TruHollis — 1', amount: 500, method: 'check',
           paidAt: new Date('2026-10-20T12:00:00Z'), lines: [{ label: 'Rent', amount: 500 }],
         }, { landlordId }) },
       { category: 'balance_due_reminder', who: 'resident', fire: () => emailBalanceDue(resident, {
-          tenantName: 'Blu', unitLabel: 'TruBlu — 1', total: 500,
+          tenantName: 'Hollis', unitLabel: 'TruHollis — 1', total: 500,
           lines: [{ label: 'Rent', amount: 500 }],
         }, { landlordId }) },
+      // 10/29: the one-time "your deposit can be split" offer. Gated, not
+      // critical — it is an offer rather than a fact about their account, so a
+      // resident who switches it off still gets every bill and receipt, and
+      // the standing prompt in their portal is unaffected either way.
+      { category: 'flexdeposit_offer', who: 'resident', fire: () => emailFlexDepositOffer(
+          resident, 'Hollis',
+          { depositAmount: 500, lowestFirstPull: 298, splits: [2, 4], dueDate: 'November 1' },
+          undefined, { landlordId }) },
+      // 11/01: the owner's monthly statement from their management company.
+      // Fired at the LANDLORD address because the owner entity is a landlord
+      // here — it is their own money, on their own page.
+      { category: 'owner_statement', who: 'landlord', fire: () => emailOwnerStatement({
+          to: email, recipientName: 'Hollis', entityName: 'Hollis Holdings LLC',
+          pmCompanyName: 'TruHollis Management', monthLabel: 'October 2026',
+          totals: { collected: 500, ownerShare: 450, managementFee: 50, expenses: 0, net: 450 },
+          rows: [{ name: 'TruHollis', collected: 500, ownerShare: 450,
+                   managementFee: 50, expenses: 0, net: 450 }],
+          pdf: Buffer.from('%PDF-1.4 test'), filename: 'owner-statement.pdf',
+          statementUrl: null, landlordId,
+          sendId: '00000000-0000-0000-0000-00000000cafe',
+        }) },
       { category: 'monthly_property_report', who: 'landlord', fire: () => emailMonthlyPropertyReport({
-          to: email, recipientName: 'Blu', companyName: 'TruBlu', monthLabel: 'October 2026',
-          rows: [{ name: 'TruBlu', charged: 500, received: 500, owed: 0, lateHouseholds: 0 }],
+          to: email, recipientName: 'Hollis', companyName: 'TruHollis', monthLabel: 'October 2026',
+          rows: [{ name: 'TruHollis', charged: 500, received: 500, owed: 0, lateHouseholds: 0 }],
           pdf: Buffer.from('%PDF-1.4 test'), filename: 'report.pdf', reportUrl: null, landlordId,
           sendId: '00000000-0000-0000-0000-00000000beef',
         }) },
       { category: 'esign_signing_request', who: 'landlord', fire: () => emailSigningRequest(
-          email, 'Blu', 'Lease', 'TruBlu — 1', 'TruBlu', 'https://example.test/sign/x',
+          email, 'Hollis', 'Lease', 'TruHollis — 1', 'TruHollis', 'https://example.test/sign/x',
           { landlordId }) },
       { category: 'esign_signing_reminder', who: 'landlord', fire: () => emailSigningReminder(
-          email, 'Blu', 'Lease', 'TruBlu — 1', 'TruBlu', 'https://example.test/sign/x',
+          email, 'Hollis', 'Lease', 'TruHollis — 1', 'TruHollis', 'https://example.test/sign/x',
           { landlordId }) },
       { category: 'esign_signing_completed', who: 'landlord', fire: () => emailSigningCompleted(
-          email, 'Blu', 'Lease', 'TruBlu — 1', undefined, undefined, { landlordId }) },
+          email, 'Hollis', 'Lease', 'TruHollis — 1', undefined, undefined, { landlordId }) },
       { category: 'esign_document_auto_voided', who: 'landlord', fire: () => emailDocumentAutoVoided(
-          email, 'Blu', 'Lease', 'TruBlu — 1', { landlordId }) },
+          email, 'Hollis', 'Lease', 'TruHollis — 1', { landlordId }) },
       { category: 'esign_new_lease_unsigned', who: 'landlord', fire: () => emailNewLeaseTenantUnsigned(
-          email, 'Blu', [{ unitLabel: 'TruBlu — 1', startDate: '2026-11-01', rent: 500, tenantNames: 'A Resident' }],
+          email, 'Hollis', [{ unitLabel: 'TruHollis — 1', startDate: '2026-11-01', rent: 500, tenantNames: 'A Resident' }],
           { stage: 'started', landlordId }) },
       { category: 'background_new', who: 'landlord', fire: () => emailNewBackgroundCheck(
-          email, 'Blu', 'A Resident', 'TruBlu', '1', 'low', 'https://example.test/background',
+          email, 'Hollis', 'A Resident', 'TruHollis', '1', 'low', 'https://example.test/background',
           { landlordId }) },
       { category: 'pool_match_interest', who: 'resident', fire: () => emailPoolMatchInterest(
-          resident, 'Blu', 'TruBlu', 'TruBlu', '1', null, 500, 'https://example.test/notifications',
+          resident, 'Hollis', 'TruHollis', 'TruHollis', '1', null, 500, 'https://example.test/notifications',
           { landlordId }) },
       { category: 'pool_tenant_interested', who: 'landlord', fire: () => emailPoolTenantInterested(
-          email, 'Blu', 'https://example.test/pool', { landlordId }) },
+          email, 'Hollis', 'https://example.test/pool', { landlordId }) },
       { category: 'birthday', who: 'landlord', fire: () => emailBirthdayGreeting({
-          to: email, firstName: 'Blu', ctx: { audience: 'landlord' } }) },
+          to: email, firstName: 'Hollis', ctx: { audience: 'landlord' } }) },
     ]
   }
 
@@ -442,7 +464,7 @@ describe('a landlord who switches everything off also stops getting the mail tha
 
   it('and the transactional mail they cannot decline is NOT stopped', async () => {
     const { ll } = await bothAnsweredEverythingOff()
-    await sendPasswordResetEmail(ll.email, 'Blu', 'https://example.test/reset/x')
+    await sendPasswordResetEmail(ll.email, 'Hollis', 'https://example.test/reset/x')
     const row = await logRowFor(ll.email, 'password_reset')
     expect(row, 'a password reset must still be attempted').toBeTruthy()
     // Not declined. In a test environment nothing leaves the machine, so the

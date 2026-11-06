@@ -164,7 +164,7 @@ describe('record_cash_payment and account credit', () => {
     expect(r).toMatchObject({ ok: true, recorded: true, creditUsed: 0, towardOldBalance: 40, keptAsCredit: 0, changeGiven: 0 })
     expect(await rentStatus(f.rentId)).toBe('settled')
     const parts = await db.query<any>(
-      `SELECT amount::text AS amount, status FROM payments WHERE type = 'carried_balance' ORDER BY is_remainder, amount`)
+      `SELECT amount::text AS amount, status FROM payments WHERE type = 'carried_balance' ORDER BY is_remainder, payments.amount`)
     expect(parts.rows).toEqual([{ amount: '40.00', status: 'settled' }, { amount: '960.00', status: 'pending' }])
     expect(old).toBeTruthy()
     expect((await db.query(`SELECT 1 FROM lease_prepaid_credits`)).rowCount).toBe(0)

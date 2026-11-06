@@ -79,7 +79,7 @@ describe('draftHouseholdLease', () => {
     // templates actually bind their fields to. This test asserted 'tenant',
     // which is exactly the value that matched no field and silently stripped
     // every tenant name, initial and signature date off thirteen Country Acres
-    // leases before Blu Haws noticed they were blank.
+    // leases before Hollis Harkness noticed they were blank.
     expect(rows[1].role).toBe('primary')
     expect(Number(rows[1].order_index)).toBe(2)
   })

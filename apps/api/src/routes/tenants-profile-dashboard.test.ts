@@ -404,7 +404,11 @@ describe('GET /api/tenants/me/deposit-interest', () => {
     expect(getAccrualHistoryMock).not.toHaveBeenCalled()
   })
 
-  it('statutory state (MA 2026) → rate.source=statutory; accruals from service', async () => {
+  // 10/30 (Nic): a STATUTORY rate never reaches a resident. It is the state
+  // telling the landlord what they owe, and putting it on the resident's screen
+  // starts a fight out of our data. The accrual still runs and the landlord
+  // still sees it; the tenant payload simply carries no rate.
+  it('statutory state (MA 2026) → the tenant is told nothing about it', async () => {
     const f = await seedTFixture({ propertyState: 'MA' })
     const client = await db.connect()
     try {
@@ -431,9 +435,10 @@ describe('GET /api/tenants/me/deposit-interest', () => {
       .set('Authorization', `Bearer ${f.tenantToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.deposit.state).toBe('MA')
-    expect(res.body.data.rate.source).toBe('statutory')
-    expect(res.body.data.rate.state_code).toBe('MA')
-    expect(Number(res.body.data.rate.annual_rate_pct)).toBe(5)
+    expect(res.body.data.rate).toBeNull()
+    // and no statute number anywhere in what the tenant receives
+    expect(JSON.stringify(res.body)).not.toMatch(/Mass\. Gen\. Laws|§/)
+    // the accrual itself is untouched — it is the TELLING that stopped
     expect(res.body.data.accruals.length).toBe(2)
   })
 
@@ -461,7 +466,9 @@ describe('GET /api/tenants/me/deposit-interest', () => {
     expect(res.body.data.rate.source).toBe('landlord_override')
     expect(res.body.data.rate.state_code).toBe('AK')
     expect(Number(res.body.data.rate.annual_rate_pct)).toBe(0.5)
-    expect(res.body.data.rate.statute_citation).toBeNull()
+    // A rate the LANDLORD chose is their own lease term and still shows — but
+    // the citation field is gone from the tenant payload entirely.
+    expect(res.body.data.rate.statute_citation).toBeUndefined()
   })
 })
 

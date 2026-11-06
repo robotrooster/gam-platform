@@ -111,10 +111,15 @@ describe('S636 — window A: waiting on the landlord', () => {
     expect(pti).toEqual([{ c: false, resolved_at: null, draft_document_id: null }])
   })
 
-  // 10/14 (Nic, #4): only a document no money touched is deleted. One the
-  // erase's test keeps (here a rent change from it already reached the bill)
-  // is VOIDED exactly as before, and everyone hears the old words.
-  it('voids, as before, a document the erase keeps — and the notice keeps the void wording', async () => {
+  // 10/14 (Nic, #4): only a document no money touched is deleted.
+  // 11/4 (Nic): "I don't want to void things." One the erase's test KEEPS (here
+  // a rent change from it already reached the bill) is now LEFT EXACTLY AS IT
+  // IS — not voided, nobody emailed. This used to assert the opposite.
+  //
+  // Country Acres MH 24 is why it changed: her installment contract was 36 of
+  // 72 billed when this job voided the unsigned purchase agreement behind it,
+  // which cancelled the contract and silently stopped her trailer payments.
+  it('leaves alone — never voids — a document the erase keeps, and tells nobody', async () => {
     const id = await seedDoc({ status: 'sent', sentHoursAgo: 49, tenantAcceptedHoursAgo: 49 })
     const d = (await db.query<any>(`SELECT landlord_id, unit_id FROM lease_documents WHERE id=$1`, [id])).rows[0]
     const leaseId = (await db.query<{ id: string }>(
@@ -124,10 +129,8 @@ describe('S636 — window A: waiting on the landlord', () => {
       `INSERT INTO scheduled_lease_changes (lease_id, change_type, effective_date, new_rent_amount, status, source_document_id)
        VALUES ($1,'rent', CURRENT_DATE, 600, 'applied', $2)`, [leaseId, id])
     await processEsignTimeouts()
-    expect(await statusOf(id)).toBe('voided')
-    const calls = (emailDocumentAutoVoided as any).mock.calls
-    expect(calls.length).toBeGreaterThan(0)
-    for (const c of calls) expect(c[4]).toMatchObject({ deleted: false })
+    expect(await statusOf(id)).toBe('sent')
+    expect((emailDocumentAutoVoided as any).mock.calls).toHaveLength(0)
   })
 
   // S647 (Nic, DIRECTIVE): onboarding drafts leases for the landlord to sign
@@ -322,8 +325,8 @@ describe('S652 — one reminder per signer per packet', () => {
 //
 // The resend-instead-of-void path (S637) looped over EVERY outstanding signer
 // and mailed them all in one pass, stamping invite_sent_at on each. Brandon
-// Valdez and Yesenia Sanchez were both mailed at 15:15:02 on the 7th; Ruben
-// Chavarin and Obed Parra both at 13:45:02 on the 8th. The one behind opened
+// Valdez and Isadora Nithsdale were both mailed at 15:15:02 on the 7th; Ruben
+// Chavarin and Nyla Quilliam both at 13:45:02 on the 8th. The one behind opened
 // it, filled it in, could not submit, and reported themselves as done.
 describe('S638 a timeout resend targets only the current signer', () => {
   it('mails the primary and leaves the co-tenant untouched', async () => {

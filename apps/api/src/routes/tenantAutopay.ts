@@ -88,7 +88,15 @@ tenantAutopayRouter.get('/', async (req: any, res, next) => {
               a.last_error,
               a.consecutive_failures,
               a.disarmed_at,
-              a.disarmed_reason
+              a.disarmed_reason,
+              -- 10/30: has this resident ever made a CHOICE about autopay? The
+              -- join is LEFT, so a lease with no row at all still appears here
+              -- with enabled NULL — which looks identical to someone who
+              -- deliberately switched it off. The portal turns autopay on by
+              -- itself with the first payment method, and it must only ever do
+              -- that for somebody who has never decided. Turning a resident's
+              -- own "off" back on behind their back is the obnoxious version.
+              (a.id IS NOT NULL) AS ever_set
          FROM v_lease_active_tenants vt
          JOIN leases l ON l.id = vt.lease_id
          JOIN units u ON u.id = l.unit_id
@@ -174,6 +182,24 @@ tenantAutopayRouter.put('/', async (req: any, res, next) => {
           throw new AppError(409, 'That bank is still being verified. It can be chosen for autopay once its two small deposits are confirmed.')
         }
       }
+    }
+
+    // 10/30 (Nic): the UI hides the card with nothing linked, but the rule
+    // belongs HERE too — the check above only runs when a specific method is
+    // named, and the default ("whichever is my default at the time") names
+    // none, which is exactly the path that let autopay switch on with an empty
+    // account. A schedule with nothing behind it never charges; the resident
+    // just finds out they are late.
+    if (body.enabled === true && !body.paymentMethodId) {
+      const t = await queryOne<{ stripe_customer_id: string | null; ach_suspended: boolean }>(
+        `SELECT stripe_customer_id, (ach_suspended_at IS NOT NULL) AS ach_suspended FROM tenants WHERE id = $1`,
+        [tenantId])
+      const NOTHING_LINKED = 'Add a bank account or card first, then turn autopay on.'
+      if (!t?.stripe_customer_id) throw new AppError(409, NOTHING_LINKED)
+      const facts = await readStripeMethodFacts(t.stripe_customer_id).catch(() => null)
+      const hasCard = facts ? facts.cards.length > 0 : false
+      const hasBank = facts ? facts.banks.some(b => !b.verifying) && !t.ach_suspended : false
+      if (!hasCard && !hasBank) throw new AppError(409, NOTHING_LINKED)
     }
 
     // Turning it back on clears a system disarm — the tenant has seen why it

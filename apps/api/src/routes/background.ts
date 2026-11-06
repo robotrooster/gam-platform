@@ -254,8 +254,52 @@ if (!fs.existsSync(idDir)) fs.mkdirSync(idDir, { recursive: true })
 const idStorage = multer.diskStorage({
   destination: idDir,
   filename: (_req, file, cb) =>
-    cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
+    cb(null, screeningStoredName(file)),
 })
+/**
+ * ── 10/29: THE STORED EXTENSION IS OURS, NOT THE APPLICANT'S ────────────────
+ *
+ * Found while reading the GCP branch's storage driver, and it is LIVE on main:
+ * both screening upload routes below named the stored file with
+ * `path.extname(file.originalname)` and filtered on `file.mimetype` — both
+ * client-supplied — and both serve routes then removed the CSP and CORP headers
+ * and called res.sendFile with no pinned Content-Type and no nosniff.
+ *
+ * So an applicant could upload a file declared image/png, named "x.html",
+ * holding a script. It landed as <ts>-<hex>.html, passed the per-row auth
+ * (which is correct and unchanged), and when the LANDLORD screening them opened
+ * the ID document express derived text/html from that extension and served it
+ * as a document with no CSP — running the applicant's script on the landlord
+ * portal's own origin. Anyone who submits an application could aim it at the
+ * company screening them.
+ *
+ * The repo had already closed this exact shape four times (S380 avatars, S394
+ * esign, S399 unit photos, S409 avatar serve) and these two were missed. The
+ * extension now comes from the accepted type, and the type is pinned on the way
+ * back out. Per-row authorization is untouched — it was never the weak part.
+ */
+const SCREENING_MIME_TO_EXT: Record<string, string> = {
+  'image/jpeg': '.jpg', 'image/png': '.png', 'application/pdf': '.pdf',
+}
+const SCREENING_EXT_TO_MIME: Record<string, string> = {
+  '.jpg': 'image/jpeg', '.png': 'image/png', '.pdf': 'application/pdf',
+}
+/** The stored name, with an extension WE chose from the accepted type. */
+export const screeningStoredName = (file: { mimetype: string }): string =>
+  Date.now() + '-' + crypto.randomBytes(8).toString('hex')
+  + (SCREENING_MIME_TO_EXT[file.mimetype] ?? '.bin')
+
+/** Serve a screening document as its own type, never as one sniffed or guessed. */
+export function sendScreeningFile(res: any, fp: string): void {
+  res.setHeader('Content-Type', SCREENING_EXT_TO_MIME[path.extname(fp).toLowerCase()] ?? 'application/octet-stream')
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  // Removed so the portal can display the document inline; safe only because
+  // the type above is pinned from our own whitelist.
+  res.removeHeader('Content-Security-Policy')
+  res.removeHeader('Cross-Origin-Resource-Policy')
+  res.sendFile(fp)
+}
+
 const idUpload = multer({
   storage: idStorage,
   limits: { fileSize: 10 * 1024 * 1024 },
@@ -292,7 +336,7 @@ const incomeUpload = multer({
   storage: multer.diskStorage({
     destination: incomeDir,
     filename: (_req, file, cb) =>
-      cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
+      cb(null, screeningStoredName(file)),
   }),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
@@ -1326,7 +1370,7 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
       -- profileId is NULL — an account is not an entity, and the companies it
       -- owns come from landlordIds. So the comparison matched nothing and the
       -- page rendered empty for every landlord, however many screenings they
-      -- had. Anastacio Erreguin's check has been sitting under Mountain View
+      -- had. Bryce Belmont's check has been sitting under Mountain View
       -- since 09-04, paid for and running, and Nic could not see it anywhere.
       --
       -- Same fix the dashboard, units and payments lists already carry: ask the
@@ -1435,7 +1479,7 @@ backgroundRouter.get('/:id', requireAuth, requirePerm('tenants.run_background_ch
 //
 // There is no button to click, and there should not be: a check that found its
 // stay is already filed as done. The match was just too narrow to find one.
-// Victor Cardoza (RV 10) and Nemesio Rivera (RV 11) came to Mountain View on
+// Horatio Mapperley (RV 10) and Kestrel Norrington (RV 11) came to Mountain View on
 // 10-04, stayed 14 nights and checked out 10-18, and their approved checks sat
 // on his attention list asking which space the two of them were taking.
 //
@@ -1467,7 +1511,7 @@ backgroundRouter.get('/:id', requireAuth, requirePerm('tenants.run_background_ch
 //   · the stay had started, or was about to. Nothing else bounds the FUTURE,
 //     and a screening taken to get a LEASE must not be swallowed by whatever
 //     stay that person takes next (every stay over three weeks needs screening,
-//     so there is always a candidate). Anastacio Erreguin screened on 09-04 and
+//     so there is always a candidate). Bryce Belmont screened on 09-04 and
 //     is still waiting on a space; park him on a site for a month and his
 //     screening would file itself as done and the lease button would 409.
 //
@@ -1541,7 +1585,10 @@ const ymd = (v: any): string | null => {
   return String(v).slice(0, 10)
 }
 
-async function draftLeaseForApprovedCheck(check: any, scope: string[], bodyUnitId: string | null, actorUserId: string) {
+async function draftLeaseForApprovedCheck(
+  check: any, scope: string[], bodyUnitId: string | null, actorUserId: string,
+  takeover = false,
+) {
   // The unit may come from the check (a QR scan or a landlord-sent link that
   // named a space) or from the landlord picking one now for a walk-up. Either
   // way it has to belong to a company this account can read — a body-supplied
@@ -1565,7 +1612,7 @@ async function draftLeaseForApprovedCheck(check: any, scope: string[], bodyUnitI
     // want to stay" on the screening form — a guess, typed by somebody who has
     // not seen the place yet. It used to be handed to the drafter as the LEASE
     // TERM, which computed a hard end date (computeLeaseEnd snaps to month-end)
-    // and silently set lease_type = 'fixed_term'. James Fenton said "3 months"
+    // and silently set lease_type = 'fixed_term'. Juno Kendrew said "3 months"
     // on 10/5 and got a binding lease ending 2027-01-31 on RV 15 — in the
     // park's busiest month — which nothing on the lease screen disclosed, and
     // which the nightly job would then have expired and freed the space for.
@@ -1577,6 +1624,10 @@ async function draftLeaseForApprovedCheck(check: any, scope: string[], bodyUnitI
     termMonths: null,
     monthToMonth: true,
     actorUserId,
+    // 10/28: an approved applicant can be put on an OCCUPIED space as a
+    // takeover from this door too, not only from GoldSign. Which tenancy is
+    // replaced is resolved from the space, never sent by the browser.
+    takeover,
   })
   // A walk-up's pick is remembered on the check so a second click needs no pick.
   if (!check.unit_id) {
@@ -1605,7 +1656,8 @@ backgroundRouter.post('/:id/draft-lease', requireAuth, requirePerm('tenants.run_
         ? 'This guest chose a lease for their stay, and it is already drafted. Open it on the Leases page.'
         : 'This guest was screened for their stay. To give them a lease, open the stay on the schedule and choose Offer a lease.')
     }
-    res.json({ success: true, data: await draftLeaseForApprovedCheck(check, scope, req.body?.unitId || null, req.user!.userId) })
+    res.json({ success: true, data: await draftLeaseForApprovedCheck(
+      check, scope, req.body?.unitId || null, req.user!.userId, req.body?.takeover === true) })
   } catch (e) { next(e) }
 })
 
@@ -1613,7 +1665,7 @@ backgroundRouter.post('/:id/draft-lease', requireAuth, requirePerm('tenants.run_
 //
 //   "for background checks that were approved that opted not to sign a lease
 //    ... keep them approved but mark them as dormant for now... so this last
-//    one for Anastacio does not just forever say that it needs attention."
+//    one for Bryce does not just forever say that it needs attention."
 //
 // Park = the approval stands (expires_at untouched), the row leaves the
 // needs-attention list. Un-park brings it back. Drafting a lease from a parked
@@ -1943,9 +1995,7 @@ backgroundRouter.get('/id-files/:filename', requireAuth, async (req, res, next) 
     // S639: same — an account can own several companies.
     const isLandlord = !!owner.landlord_id && landlordScopeIds(req.user!).includes(owner.landlord_id)
     if (!isApplicant && !isLandlord) throw new AppError(403, 'Not authorized')
-    res.removeHeader('Content-Security-Policy')
-    res.removeHeader('Cross-Origin-Resource-Policy')
-    res.sendFile(fp)
+    sendScreeningFile(res, fp)
   } catch (e) { next(e) }
 })
 
@@ -1979,9 +2029,7 @@ backgroundRouter.get('/income-files/:filename', requireAuth, async (req, res, ne
     const isApplicant = owner.user_id === req.user!.userId
     const isLandlord = !!owner.landlord_id && landlordScopeIds(req.user!).includes(owner.landlord_id)
     if (!isApplicant && !isLandlord) throw new AppError(403, 'Not authorized')
-    res.removeHeader('Content-Security-Policy')
-    res.removeHeader('Cross-Origin-Resource-Policy')
-    res.sendFile(fp)
+    sendScreeningFile(res, fp)
   } catch (e) { next(e) }
 })
 
@@ -2074,7 +2122,7 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
     // ends the delivery. Answering 500, which is what throwing used to do, told
     // Checkr to try again: 75 of 79 webhooks in a 25-hour window were the same
     // event failing over and over, and the `report.completed` that would have
-    // finished Anastacio Erreguin's screening never got through.
+    // finished Bryce Belmont's screening never got through.
     if (!update) {
       logger.info({ provider: provider.name, type: eventType },
         '[BGC WEBHOOK] acknowledged, nothing to apply')
@@ -2140,7 +2188,7 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
 
     // S640: the body of this handler now lives in services/backgroundApplyUpdate
     // so the status POLLER applies a verdict exactly the way a webhook does.
-    // Checkr completed Anastacio Erreguin's report and no webhook ever arrived;
+    // Checkr completed Bryce Belmont's report and no webhook ever arrived;
     // the poller is what makes the answer land at all, and two near-identical
     // code paths advancing the same row is how they stop matching.
     await applyProviderUpdate({

@@ -832,9 +832,9 @@ async function runGeneration(
       // S654 put the installment on this bill so that the bill email, the
       // who-owes page and the Pay screen could all see it. They can — but it
       // also made the trailer payment unpayable on its own, because rent is
-      // pay-in-full. A work-trade resident (Lisa Scheeler) gets no rent bill at
+      // pay-in-full. A work-trade resident (Calla Fitzhugh) gets no rent bill at
       // all and so had nowhere to be billed, and a buyer whose trailer money
-      // belongs to a different book from their space rent (Dominic Gonzalez,
+      // belongs to a different book from their space rent (Vesper Vanterpool,
       // whose installment is the trust's) cannot have the two on one document.
       //
       // Every installment is now billed on its contract's OWN bill, by
@@ -1282,7 +1282,7 @@ async function runGeneration(
         //
         //   "Payment health = ONE definition … $0 lines are ignored."
         //
-        // Gerald Logue's October bill carried a $0.00 electric line: his August
+        // Arlo Braddock's October bill carried a $0.00 electric line: his August
         // reading (49083 → 49083, 0 kWh), held from before his lease and
         // released when he signed. The release path skips a $0 share
         // (utilityBilling.attachBillToOpenInvoice); this run did not, so it
@@ -1426,6 +1426,198 @@ async function runGeneration(
           utilitiesInserted++
         }
 
+        // ── 10/27 (Nic): A BALANCE THEY BROUGHT WITH THEM ────────────────────
+        //
+        //   "The tenant will be charged in installments in addition to whatever
+        //    rent that new landlord has."
+        //
+        // A resident taken on while still owing another operator on the
+        // platform carries an arrangement (left_owing_collections), and one
+        // month of it rides this invoice. It is an ordinary carried balance, so
+        // it inherits this bill's reminders and the landlord's own late-fee
+        // rules; FlexPay never fronts it, because GAM should not advance one
+        // landlord's money to settle another's old debt.
+        //
+        // Best-effort on purpose: a resident's rent bill must not fail to
+        // generate because an old debt could not be added to it. The next run
+        // catches it up — the line is idempotent per (arrangement, due date).
+        // No resident on the bill, no arrangement to ride it. An unoccupied
+        // space's invoice has nobody to owe anything.
+        // Savepoint-guarded, like the whole-bill credit step below: a failure
+        // inside a transaction aborts it, so without one a thrown error here
+        // would be caught, the next statement would fail with "current
+        // transaction is aborted", and the resident would get NO BILL — the
+        // opposite of what the paragraph above promises.
+        if (effectiveTenantId) try {
+          await client.query('SAVEPOINT left_owing_line')
+          const { billInstallment } = await import('../services/leftOwingCollection')
+          const arrangements = await client.query<{ id: string }>(
+            `SELECT id FROM left_owing_collections
+              WHERE tenant_id = $1 AND collecting_landlord_id = $2 AND status = 'active'
+              ORDER BY created_at`,
+            [effectiveTenantId, lease.landlord_id])
+          for (const a of arrangements.rows) {
+            await billInstallment({
+              collectionId: a.id, invoiceId, unitId: lease.unit_id, leaseId: lease.id,
+              tenantId: effectiveTenantId, landlordId: lease.landlord_id,
+              dueDate, client,
+            })
+          }
+          await client.query('RELEASE SAVEPOINT left_owing_line')
+        } catch (e) {
+          await client.query('ROLLBACK TO SAVEPOINT left_owing_line').catch(() => {})
+          logger.error({ err: e, lease_id: lease.id },
+            '[invoice] a left-owing installment could not be added to this bill')
+        }
+
+        // ── 10/30 (Nic): A DEPOSIT INSTALLMENT RIDES THE NEXT INVOICE ────────
+        //
+        //   "It needs to ride the next invoice... if a landlord allows
+        //    mid-month move-ins and their bill is due the 15th each month, it
+        //    needs to ride that bill."
+        //
+        // FlexDeposit installments 2..N used to run on their own ACH pull,
+        // dated five days before a due date computed from the ENROLLMENT month
+        // (services/flexDeposit computeInstallmentPullDates, now retired). So a
+        // resident who signed up on the 20th got a bank pull on the 26th
+        // forever, unrelated to their lease or their landlord's billing day,
+        // and a second debit landed in a month they had already been invoiced
+        // for. Heather Miller's plan (10/29) is the one that found it.
+        //
+        // There is no date arithmetic here on purpose. The next unfunded
+        // installment rides the next invoice this lease generates, in order,
+        // one per bill. That is correct for every billing day, every custom
+        // cycle, and a prorated first month, because the invoice decides and
+        // the calendar does not.
+        //
+        // Installment 1 is not here — it rides the MOVE-IN invoice, linked by
+        // jobs/moveInBundle (or, when enrollment comes after that invoice was
+        // written, by services/flexDeposit enrollFlexDeposit rewriting the
+        // deposit line it finds).
+        //
+        // Deliberately NOT run through the work-trade credit distribution, the
+        // same as propane: a fixed contractual amount funding the resident's own
+        // custody balance is not rent and is not discounted by hours worked.
+        // 10/30 (Nic): a work-trade resident with no rent bill has nowhere for
+        // an installment to ride, and it waits rather than silently pulling
+        // their bank -- "anybody that's going to be on work trade shouldn't
+        // have a deposit installment anyway."
+        //
+        // Best-effort, like the left-owing line above: a resident's rent bill
+        // must not fail to generate because a deposit installment could not be
+        // added. The next run catches it up.
+        if (effectiveTenantId) try {
+          await client.query('SAVEPOINT flex_deposit_line')
+          const already = await client.query<{ one: number }>(
+            `SELECT 1 AS one FROM payments
+              WHERE invoice_id = $1 AND flex_deposit_security_deposit_id IS NOT NULL
+                AND status <> 'voided' LIMIT 1`,
+            [invoiceId])
+          if (!already.rows.length) {
+            const nextInst = await client.query<{
+              id: string; installment_number: number; installment_count: number
+              amount: string; security_deposit_id: string; tenant_id: string
+            }>(
+              `SELECT i.id, i.installment_number, i.installment_count,
+                      i.amount::text, i.security_deposit_id, i.tenant_id
+                 FROM flex_deposit_installments i
+                 JOIN security_deposits sd ON sd.id = i.security_deposit_id
+                WHERE sd.lease_id = $1
+                  AND sd.flex_deposit_enabled = TRUE
+                  AND sd.flex_deposit_plan_status = 'active'
+                  AND sd.status <> 'voided'
+                  AND i.installment_number > 1
+                  AND i.status IN ('pending', 'missed')
+                  -- Nothing left to fund, however it got there: GAM-first
+                  -- routing may already have satisfied this installment out of
+                  -- another payment the resident made.
+                  AND COALESCE(sd.collected_amount, 0) < sd.total_amount
+                  -- Not already sitting on a live bill. An installment whose
+                  -- payment failed, returned or was voided comes back here and
+                  -- rides the next invoice; one still waiting to be paid is not
+                  -- billed a second time.
+                  AND NOT EXISTS (
+                        SELECT 1 FROM payments pz
+                         WHERE pz.id = i.payment_id
+                           AND pz.status IN ('pending', 'processing'))
+                ORDER BY i.installment_number
+                LIMIT 1`,
+              [lease.id])
+            const fi = nextInst.rows[0]
+            if (fi) {
+              const depPay = await client.query<{ id: string }>(
+                `INSERT INTO payments (
+                   invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+                   type, amount, status, due_date, entry_description, notes,
+                   flex_deposit_security_deposit_id
+                 ) VALUES ($1, $2, $3, $4, $5, 'deposit', $6, 'pending', $7, 'DEPOSIT', $8, $9)
+                 RETURNING id`,
+                [
+                  invoiceId, lease.unit_id, lease.id, fi.tenant_id, lease.landlord_id,
+                  Number(fi.amount).toFixed(2), dueDate,
+                  'FlexDeposit installment ' + fi.installment_number + ' of ' + fi.installment_count,
+                  fi.security_deposit_id,
+                ])
+              // The displayed schedule follows the bill it landed on, so the
+              // resident's plan page stops showing a date that was a guess.
+              await client.query(
+                `UPDATE flex_deposit_installments
+                    SET payment_id = $1, due_date = $2::date, updated_at = NOW()
+                  WHERE id = $3`,
+                [depPay.rows[0].id, dueDate, fi.id])
+            }
+          }
+          await client.query('RELEASE SAVEPOINT flex_deposit_line')
+        } catch (e) {
+          await client.query('ROLLBACK TO SAVEPOINT flex_deposit_line').catch(() => {})
+          logger.error({ err: e, lease_id: lease.id },
+            '[invoice] a FlexDeposit installment could not be added to this bill')
+        }
+
+        // ── 11/4 (Nic): A CHARGE THAT WAS WAITING FOR A BILL RIDES THIS ONE ──
+        //
+        //   "That $4 retry fee just needs to go on. It needs to ride the next
+        //    bill."
+        //
+        // A fee GAM incurs between bills — today only the $4 a bank charges for
+        // returning a debit (routes/webhooks) — is written the moment it is
+        // incurred, with no invoice and held_for_next_bill_at set, so nothing
+        // asks anybody for it (payableRowSql). This is the bill it was waiting
+        // for: it joins this invoice at this invoice's due date, the hold is
+        // cleared, and from here on it is an ordinary line with this bill's
+        // reminders and this bill's Pay now.
+        //
+        // Before the whole-bill credit check below on purpose: a bill carrying a
+        // GAM fee never settles itself from credit, and that rule has to see the
+        // fee to apply.
+        //
+        // Its notes are left exactly as written — they are the key that keeps a
+        // re-delivered Stripe event from billing the fee twice.
+        //
+        // Savepoint-guarded: a fee that cannot be moved waits for the next bill
+        // instead of costing this resident their rent bill.
+        try {
+          await client.query('SAVEPOINT held_charges')
+          const adopted = await client.query<{ id: string }>(
+            `UPDATE payments
+                SET invoice_id = $1, due_date = $2::date, held_for_next_bill_at = NULL
+              WHERE lease_id = $3
+                AND held_for_next_bill_at IS NOT NULL
+                AND status = 'pending'
+                AND voided_at IS NULL
+                AND invoice_id IS NULL
+              RETURNING id`,
+            [invoiceId, dueDate, lease.id])
+          await client.query('RELEASE SAVEPOINT held_charges')
+          if (adopted.rows.length > 0) {
+            logger.info({ leaseId: lease.id, invoiceId, charges: adopted.rows.length },
+              '[InvoiceGen] charges that were waiting for a bill joined this one')
+          }
+        } catch (e) {
+          await client.query('ROLLBACK TO SAVEPOINT held_charges').catch(() => {})
+          logger.error({ err: e, lease_id: lease.id, invoice_id: invoiceId },
+            '[invoice] a charge waiting for a bill could not join this one — it waits for the next')
+        }
 
         // ── S655 (Nic, 10/2): THE WHOLE-BILL RULE, ONCE PER HOUSEHOLD ────────
         //

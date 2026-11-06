@@ -183,8 +183,18 @@ describe('fixed assets', () => {
     expect(r.body.data).toMatchObject({ name: 'Clubhouse', opens_at_books_start: true, depreciates: true, monthly: 1000,
       life_ends: '2042-07-31', problem: null })
     // Every month that ended by today is depreciation so far.
+    //
+    // 10/31: this was a flat (year-2015)*12 + month - 2, which counts months
+    // through LAST month. assetFigures counts every month whose end day is on
+    // or before today (depreciationThrough), so on the last day of a month the
+    // current month has ended too and the server counts one more than this did.
+    // The suite went red at 00:07 on Oct 31 for that reason alone and took a
+    // deploy with it — it would have done the same on the last day of every
+    // month. The final term is what makes the arithmetic true on every date.
     const today: string = r.body.data.today
-    const ended = (Number(today.slice(0, 4)) - 2015) * 12 + Number(today.slice(5, 7)) - 2
+    const [ty, tm, td] = today.split('-').map(Number)
+    const lastDayOfThatMonth = new Date(ty, tm, 0).getDate()
+    const ended = (ty - 2015) * 12 + tm - 2 + (td === lastDayOfThatMonth ? 1 : 0)
     expect(r.body.data.depreciated_to_date).toBe(ended * 1000)
     expect(r.body.data.book_value).toBe(330000 - ended * 1000)
   })

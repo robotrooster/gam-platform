@@ -1,7 +1,7 @@
 /**
  * S640 — a landlord can invite a team member at all.
  *
- * Setting Lisa Scheeler up on the front desk failed on a raw Postgres string:
+ * Setting Calla Fitzhugh up on the front desk failed on a raw Postgres string:
  * "null value in column landlord_id of relation invitations". The Team page
  * resolved the company as `req.user.profileId`, and since S633 a landlord's
  * profileId is NULL — an account is not an entity. So EVERY invite, permission

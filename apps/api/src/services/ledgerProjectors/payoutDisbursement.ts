@@ -65,8 +65,8 @@ export const payoutDisbursementProjector: LedgerProjector = {
 
     // The transfers it carried, and each one's money by property.
     const intents = (await client.query<{ id: string; landlord_id: string | null; amount: string }>(
-      `SELECT id::text, landlord_id, amount::text FROM platform_transfer_intents
-        WHERE disbursement_id::text = $1 AND status = 'transferred' ORDER BY id`, [d.id])).rows
+      `SELECT i.id::text, i.landlord_id, i.amount::text FROM platform_transfer_intents i
+        WHERE i.disbursement_id::text = $1 AND i.status = 'transferred' ORDER BY i.id`, [d.id])).rows
     const byCompany = new Map<string, Map<string, number>>()
     for (const it of intents) {
       if (!it.landlord_id) continue

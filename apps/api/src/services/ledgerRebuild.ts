@@ -123,7 +123,17 @@ export async function rebuildOwner(owner: LedgerOwner, opts: Omit<RebuildOptions
     sources = await sourcesForOwner(client, owner, { sourceType: opts.sourceType, since: opts.since })
     if (!ctx.exists) refusal = 'No such company.'
     else if (!ctx.booksStartDate && sources.length > 0) {
-      refusal = 'This company has money and no books start date. Pick the books start date first.'
+      // 11/3: the books start date lives on each PROPERTY and the company's is
+      // the earliest of them, so this refusal means NO property has picked one.
+      // It names them, because "this company has no books start date" sent
+      // whoever read it looking at a company setting that no longer exists.
+      const none = (await client.query<{ names: string | null }>(
+        `SELECT string_agg(p.name, ', ' ORDER BY p.name) AS names
+           FROM properties p WHERE p.landlord_id = $1 AND p.books_start_date IS NULL`,
+        [owner.landlordId])).rows[0]?.names
+      refusal = none
+        ? `This company has money and no property has a books start date yet (${none}). Pick each property's books start date first.`
+        : 'This company has money and no books start date. Pick the books start date first.'
     } else if (opts.mode === 'from_scratch' && ctx.closedThrough) {
       refusal = `The books are closed through ${ctx.closedThrough}; a rebuild from scratch would rewrite closed months. Use apply.`
     }
@@ -140,7 +150,16 @@ export async function rebuildOwner(owner: LedgerOwner, opts: Omit<RebuildOptions
   // before it): a source before the start need not mark it for the drain
   // until the walk has passed it.
   const ownerId = ownerIdOf(owner)
-  const opening = sources!.some(s => s.type === 'opening' && s.id === ownerId)
+  // 11/3: an opening's source id is the company id, or `companyId|propertyId`
+  // for a property's own opening — so it is recognized by the owner half. A
+  // plain equality here went blind to every per-property opening, which turned
+  // the ordering guard below off and let a property's pre-start sources be
+  // walked before the opening that takes them over.
+  const isOpeningOf = (s: { type: string; id: string }): boolean =>
+    s.type === 'opening' && (s.id === ownerId || s.id.startsWith(`${ownerId}|`))
+  const openingIds = new Set(sources!.filter(isOpeningOf).map(s => s.id))
+  const opening = openingIds.size > 0
+  const walkedOpenings = new Set<string>()
   let openingWalked = false
   try {
     for (const s of sources!) {
@@ -169,7 +188,13 @@ export async function rebuildOwner(owner: LedgerOwner, opts: Omit<RebuildOptions
         rebuildRunId: runId, actorUserId: opts.actorUserId ?? null, ownerHint: ownerIdOf(owner),
         openingFollows: opening && !openingWalked,
       })
-      if (s.type === 'opening' && s.id === ownerId) openingWalked = true
+      // Only once EVERY opening of this company has been walked: with one per
+      // property, stopping at the first would let the rest be rebuilt out of
+      // order behind it.
+      if (isOpeningOf(s)) {
+        walkedOpenings.add(s.id)
+        if (walkedOpenings.size >= openingIds.size) openingWalked = true
+      }
       if (res.error) {
         counts.failed++
         drift.push({ sourceType: s.type, sourceId: s.id, status: 'failed', message: `${res.error.reasonCode}: ${res.error.message}` })

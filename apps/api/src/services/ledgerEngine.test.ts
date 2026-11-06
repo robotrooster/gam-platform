@@ -251,12 +251,104 @@ describe('the books start date', () => {
     expect(await outboxCount()).toBe(0)
     expect(await postingsOf(OI, id)).toHaveLength(0)
     // The start moves earlier: the row is now inside the books.
-    await db.query(`UPDATE landlords SET books_start_date = '2026-08-01' WHERE id = $1`, [co.landlordId])
+    await db.query(`UPDATE properties SET books_start_date = '2026-08-01' WHERE landlord_id = $1`, [co.landlordId])
     expect(await outboxCount('opening', co.landlordId)).toBe(1)
     expect(await postSource(OI, id)).toMatchObject({ posted: 1 })
     // …and later again: the posting is taken back.
-    await db.query(`UPDATE landlords SET books_start_date = '2026-09-01' WHERE id = $1`, [co.landlordId])
+    await db.query(`UPDATE properties SET books_start_date = '2026-09-01' WHERE landlord_id = $1`, [co.landlordId])
     expect(await postSource(OI, id)).toMatchObject({ reversed: 1, posted: 0, suppressed: 1 })
+  })
+
+  // ── 11/3 — EACH PROPERTY HAS ITS OWN BOOKS START DATE ──────────────────
+  // Nic, 11/2: "If I have one property now and I buy another property later,
+  // my books for that property are going to start from when I bought that
+  // property. Fucking whether or not it's the same LLC is irrelevant. It's a
+  // completely separate business revenue stream."
+  //
+  // The gate that used to drop a whole posting dated before ONE company date
+  // now drops the LINES whose own property has not started. These tests are
+  // the ones that would have caught the two ways that can go wrong quietly:
+  // money at a started property parking behind a sibling's unanswered
+  // question, and a property's share of a cross-property posting vanishing
+  // instead of landing in that property's opening.
+
+  it('money at a started property posts while the same day at a later-starting property does not', async () => {
+    const co = await ledgerCompany({ booksStart: '2026-08-01', booksStart2: '2026-10-01' })
+    const early = await addOtherIncome(co, { amount: 50, day: '2026-09-20', propertyId: co.propertyId })
+    const late = await addOtherIncome(co, { amount: 70, day: '2026-09-20', propertyId: co.propertyId2 })
+    expect(await postSource(OI, early)).toMatchObject({ posted: 1 })
+    // Same company, same day, same money — and it does not post, because the
+    // property it belongs to had not been bought yet.
+    expect(await postSource(OI, late)).toMatchObject({ posted: 0, suppressed: 1 })
+    expect(await postingsOf(OI, late)).toHaveLength(0)
+    expect(await activeOf(early)).toHaveLength(1)
+  })
+
+  it("the company's date is the earliest of its properties', and follows them", async () => {
+    const co = await ledgerCompany({ booksStart: '2026-08-01', booksStart2: '2026-10-01' })
+    const companyDate = async () => (await db.query<{ d: string | null }>(
+      `SELECT books_start_date::text AS d FROM landlords WHERE id = $1`, [co.landlordId])).rows[0].d
+    expect(await companyDate()).toBe('2026-08-01')
+    // The earliest one moves: the company's moves with it.
+    await db.query(`UPDATE properties SET books_start_date = '2026-07-01' WHERE id = $1`, [co.propertyId])
+    expect(await companyDate()).toBe('2026-07-01')
+    // The LATER one moves, but not past the earliest: the company's does not move.
+    await db.query(`UPDATE properties SET books_start_date = '2026-09-01' WHERE id = $1`, [co.propertyId2])
+    expect(await companyDate()).toBe('2026-07-01')
+    // The earliest one moves past the other: the other becomes the earliest.
+    await db.query(`UPDATE properties SET books_start_date = '2026-11-01' WHERE id = $1`, [co.propertyId])
+    expect(await companyDate()).toBe('2026-09-01')
+  })
+
+  it("a property with no date of its own parks only its own money, never its sibling's", async () => {
+    const co = await ledgerCompany({ booksStart: '2026-08-01', booksStart2: null })
+    const started = await addOtherIncome(co, { amount: 50, day: '2026-09-20', propertyId: co.propertyId })
+    const waiting = await addOtherIncome(co, { amount: 70, day: '2026-09-20', propertyId: co.propertyId2 })
+    // The started property's money is NOT held up by the other's unanswered
+    // question — which is what reading the company's date would have done,
+    // because the company's is non-null as soon as any one property picks.
+    expect(await postSource(OI, started)).toMatchObject({ posted: 1 })
+    const refused = await postSource(OI, waiting)
+    expect(refused.posted).toBe(0)
+    expect(refused.error?.reasonCode).toBe('no_books_start')
+    const e = (await db.query<{ reason_code: string; property_id: string | null }>(
+      `SELECT reason_code, property_id::text AS property_id FROM ledger_source_errors WHERE source_id = $1`, [waiting])).rows[0]
+    expect(e.reason_code).toBe('no_books_start')
+    // The error NAMES the property, which is what stops the drain's immediate
+    // retry from spinning on it while the question is still unanswered.
+    expect(e.property_id).toBe(co.propertyId2)
+    // Answering it lets that money through at once, and leaves the other alone.
+    await db.query(`UPDATE properties SET books_start_date = '2026-09-01' WHERE id = $1`, [co.propertyId2])
+    expect((await drainLedgerOutbox()).posted).toBeGreaterThanOrEqual(1)
+    expect(await activeOf(waiting)).toHaveLength(1)
+    expect(await activeOf(started)).toHaveLength(1)
+  })
+
+  it('a posting that crosses a started and a not-yet-started property keeps the started side whole', async () => {
+    const co = await ledgerCompany({ booksStart: '2026-08-01', booksStart2: '2026-10-01' })
+    const m = memProjector('deposit_slip')
+    registerLedgerProjector(m.projector)
+    const sid = randomUUID()
+    m.wants.set(sid, [{ owner: co.owner, intendedDate: '2026-09-05', lines: [
+      { role: 'suspense', debitCents: 10_000, propertyId: co.propertyId },
+      { role: 'other_income', creditCents: 10_000, propertyId: co.propertyId2 },
+    ] }])
+    expect(await postSource('deposit_slip', sid)).toMatchObject({ posted: 1 })
+    const [p] = await postingsOf('deposit_slip', sid)
+    const lines = await linesOf(p.id)
+    // The started property keeps BOTH of its lines — its own and the clearing
+    // line that makes its slice balance — so it is a valid posting on its own.
+    // The other property's two lines are gone from here; they belong to that
+    // property's opening, which is marked for the drain.
+    expect(lines.map(l => [l.account_role, l.property_id, l.debit, l.credit]).sort()).toEqual([
+      ['interproperty_clearing', co.propertyId, '0.00', '100.00'],
+      ['suspense', co.propertyId, '100.00', '0.00'],
+    ].sort())
+    expect(lines.every(l => l.property_id === co.propertyId)).toBe(true)
+    // And it balances for the property it is on, which is what the balance
+    // trigger checks — so dropping the other half cannot have unbalanced it.
+    const net = lines.reduce((t, l) => t + Number(l.debit) - Number(l.credit), 0)
+    expect(net).toBe(0)
   })
 
   it('a company with no books start date posts nothing and says why, until it picks one', async () => {
@@ -268,9 +360,10 @@ describe('the books start date', () => {
     expect(e.reason_code).toBe('no_books_start')
     const r = await rebuildOwner(co.owner, { mode: 'apply' })
     expect(r.status).toBe('refused')
-    expect(r.reason).toMatch(/no books start date/)
+    // 11/3: the refusal now names the properties that have not picked one.
+    expect(r.reason).toMatch(/no property has a books start date/)
     // Picking a start date lets the waiting source through at once (no backoff wait).
-    await db.query(`UPDATE landlords SET books_start_date = '2026-09-01' WHERE id = $1`, [co.landlordId])
+    await db.query(`UPDATE properties SET books_start_date = '2026-09-01' WHERE landlord_id = $1`, [co.landlordId])
     expect((await drainLedgerOutbox()).posted).toBe(1)
     expect(await activeOf(id)).toHaveLength(1)
   })
@@ -508,7 +601,7 @@ describe('a moved books start date (10/12 (Nic) review)', () => {
     expect(await activeOf(march)).toHaveLength(1)
 
     // Later: March now opens in the opening posting, so its own posting is taken back.
-    await db.query(`UPDATE landlords SET books_start_date = '2026-06-01' WHERE id = $1`, [co.landlordId])
+    await db.query(`UPDATE properties SET books_start_date = '2026-06-01' WHERE landlord_id = $1`, [co.landlordId])
     expect(await outboxCount('books_start', `${co.landlordId}|2026-01-01|2026-06-01`)).toBe(1)
     await drainLedgerOutbox()
     expect(await activeOf(march)).toHaveLength(0)
@@ -517,7 +610,7 @@ describe('a moved books start date (10/12 (Nic) review)', () => {
     expect((await rebuildOwner(co.owner, { mode: 'dry_run' })).counts.drift).toBe(0)
 
     // Earlier again: March is inside the books and posts again.
-    await db.query(`UPDATE landlords SET books_start_date = '2026-02-01' WHERE id = $1`, [co.landlordId])
+    await db.query(`UPDATE properties SET books_start_date = '2026-02-01' WHERE landlord_id = $1`, [co.landlordId])
     await drainLedgerOutbox()
     expect(await activeOf(march)).toHaveLength(1)
     expect((await rebuildOwner(co.owner, { mode: 'dry_run' })).counts.drift).toBe(0)
@@ -526,7 +619,7 @@ describe('a moved books start date (10/12 (Nic) review)', () => {
 
   it('picking a start date for the first time leaves no mark (nothing crossed it)', async () => {
     const co = await ledgerCompany({ booksStart: null })
-    await db.query(`UPDATE landlords SET books_start_date = '2026-03-01' WHERE id = $1`, [co.landlordId])
+    await db.query(`UPDATE properties SET books_start_date = '2026-03-01' WHERE landlord_id = $1`, [co.landlordId])
     expect(await outboxCount('books_start')).toBe(0)
     expect(await outboxCount('opening', co.landlordId)).toBe(1)
   })

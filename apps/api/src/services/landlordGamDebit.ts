@@ -54,7 +54,7 @@ import { logger } from '../lib/logger'
 import { isDefiniteStripeRefusal } from '../lib/stripeRefusal'
 import {
   chargeLandlord, outstandingForLandlord, debitThresholdForLandlord,
-  GAM_CHARGE_OWED_SQL, gamAccountLockKey, voidGamCharge, recordGamChargeCollections,
+  GAM_CHARGE_OWED_SQL, NETTING_ROUTE_SQL, gamAccountLockKey, voidGamCharge, recordGamChargeCollections,
 } from './landlordGamAccount'
 import type { LandlordGamChargeVoidReason } from '@gam/shared'
 import { recordPlatformRevenue } from './platformRevenue'
@@ -97,7 +97,13 @@ export interface DebitOutcome {
     | 'under_threshold'
     | 'nothing_owed'
     | 'debit_in_flight'
-    /** no usable bank link — the debt stays owed and this alerts */
+    /**
+     * 11/2 (Nic): there is no bank to pull from AND none is needed — money is
+     * already on its way to this landlord and the next payout batch nets it.
+     * Not a failure, so it does not alert and nobody is mailed about it.
+     */
+    | 'awaiting_netting'
+    /** no usable bank link and nothing to net from — the debt stays owed and this alerts */
     | 'no_bank_link'
     | 'stripe_failed'
   /** S652: WHY the link is unusable, in words a person can act on. */
@@ -506,9 +512,11 @@ export async function debitLandlordForCharges(landlordId: string): Promise<Debit
   // rather than at link time, so a landlord who never owes anything never has a
   // payment method sitting on their account.
   //
-  // No usable link is a COLLECTION FAILURE, not an exemption. It alerts loudly
-  // and the debt stays exactly where it is — the alternative is a park running
-  // for free because nobody noticed a bank was never connected.
+  // Netting first, bank second, alert third (11/2, Nic). No usable link is a
+  // collection failure ONLY when there is also no disbursement to net from —
+  // money already on its way to the landlord collects this for free on the next
+  // batch. It alerts loudly for the genuine case, because the alternative is a
+  // park running for free because nobody noticed a bank was never connected.
   let paymentMethodId = l.gam_debit_payment_method_id
   if (!paymentMethodId) {
     const { createDebitPaymentMethod } = await import('./bankFeed')
@@ -521,6 +529,16 @@ export async function debitLandlordForCharges(landlordId: string): Promise<Debit
       if (!why) {
         const { debitLinkProblem } = await import('./bankFeed')
         why = await debitLinkProblem(landlordId)
+      }
+      // Before calling this a failure: is there money on its way to them? If
+      // so the next payout batch nets it (landlordGamAccount
+      // netAgainstDisbursement), which costs nobody a transfer fee. Routine.
+      const netting = await queryOne<{ ok: boolean }>(
+        `SELECT ${NETTING_ROUTE_SQL('l')} AS ok FROM landlords l WHERE l.id = $1`, [landlordId])
+      if (netting?.ok === true) {
+        logger.info({ landlordId, owed, threshold },
+          '[gam-debit] no bank link, and none needed — netting from the next payout')
+        return { status: 'skipped', reason: 'awaiting_netting', detail: why ?? undefined }
       }
       logger.error({ landlordId, owed, threshold, why },
         '[gam-debit] OWES GAM AND CANNOT BE COLLECTED FROM — no usable bank link')
@@ -880,7 +898,8 @@ export async function uncollectableLandlords(): Promise<UncollectableLandlord[]>
             COALESCE(SUM(c.amount - c.collected_amount), 0)::float AS owed,
             MIN(c.created_at) AS oldest_charge_at,
             EXISTS (SELECT 1 FROM bank_connections bc
-                     WHERE bc.landlord_id = l.id AND bc.status = 'active') AS has_bank_link
+                     WHERE bc.landlord_id = l.id AND bc.status = 'active') AS has_bank_link,
+            ${NETTING_ROUTE_SQL('l')} AS has_netting_route
        FROM landlords l
        JOIN landlord_gam_charges c ON c.landlord_id = l.id AND ${GAM_CHARGE_OWED_SQL('c')}
       WHERE l.is_demo = FALSE
@@ -896,6 +915,10 @@ export async function uncollectableLandlords(): Promise<UncollectableLandlord[]>
     // A bank GAM can actually pull from means this is a timing question, not a
     // collection failure. The sweep will take it.
     if (r.gam_debit_payment_method_id) continue
+    // 11/2 (Nic): "we pull from their next disbursement." Money already moving
+    // to this landlord IS the collection route, and the cheapest one — so they
+    // are not uncollectable, nothing is surfaced, and no one is mailed.
+    if (r.has_netting_route === true) continue
     out.push({
       landlordId: r.id,
       businessName: r.business_name,

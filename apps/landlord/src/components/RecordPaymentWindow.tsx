@@ -174,7 +174,7 @@ function BillLines({ title, rows, labels, sub }: {
  *
  * They went in on 10/14 to make the desk say which bill money paid. What that
  * actually bought was a step between a resident holding cash and the desk
- * taking it — and on 10/27 it stopped Lisa Scheeler's trailer payment dead,
+ * taking it — and on 10/27 it stopped Calla Fitzhugh's trailer payment dead,
  * because every way of paying by hand was greyed out until a box nobody could
  * see got ticked. The desk takes the whole balance now, oldest bill first,
  * which is the platform's standing rule for where money lands anyway

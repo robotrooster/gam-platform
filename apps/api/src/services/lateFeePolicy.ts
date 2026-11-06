@@ -49,7 +49,7 @@ export interface ResolvedLateFeePolicy {
   late_fee_initial_type: 'flat' | 'percent_of_rent'
   late_fee_accrual_amount: string | null
   late_fee_accrual_type: 'flat' | 'percent_of_rent' | null
-  late_fee_accrual_period: 'daily' | 'weekly' | 'monthly' | null
+  late_fee_accrual_period: 'daily' | 'weekly' | null
   late_fee_accrual_from: 'grace_end' | 'due_date' | 'due_date_inclusive'
   late_fee_cap_amount: string | null
   late_fee_cap_type: 'flat' | 'percent_of_rent' | null
@@ -186,7 +186,7 @@ export interface LateFeeAgreementStamp {
   initialType: 'flat' | 'percent_of_rent'
   accrualAmount: string | null
   accrualType: 'flat' | 'percent_of_rent' | null
-  accrualPeriod: 'daily' | 'weekly' | 'monthly' | null
+  accrualPeriod: 'daily' | 'weekly' | null
   /** Where a daily accrual counts from. The agreement column defaults to
    *  'grace_end', so the policy's own answer is stamped explicitly — Nic's
    *  parks accrue from the due date itself, and taking the column default

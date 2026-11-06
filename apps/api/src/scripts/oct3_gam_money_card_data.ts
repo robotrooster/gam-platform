@@ -97,11 +97,11 @@ const TAXED_FEE_LINES: Array<[string, number, number]> = [
 /** [stripe_processing_costs.stripe_txn_id, the PaymentIntent it came from] — Stripe, 10/3. */
 const BANK_FEE_PAYMENTS: Array<[string, string]> = [
   ['txn_3U6GFiDNEru9AEpK1geZNfAh:fee', 'pi_3U6GFiDNEru9AEpK1f6pGlDP'],   // Aug test payment ($8.00)
-  ['txn_3UByDfDNEru9AEpK21W8kQUi:fee', 'pi_3UByDfDNEru9AEpK2tB2YAtE'],   // Randall Cox, September
-  ['txn_3UDvG5DNEru9AEpK2VBGF5C7:fee', 'pi_3UDvG5DNEru9AEpK2d7eGBwW'],   // Mireya Fierro, September
+  ['txn_3UByDfDNEru9AEpK21W8kQUi:fee', 'pi_3UByDfDNEru9AEpK2tB2YAtE'],   // Osric Rookwood, September
+  ['txn_3UDvG5DNEru9AEpK2VBGF5C7:fee', 'pi_3UDvG5DNEru9AEpK2d7eGBwW'],   // Jarrah Mortmain, September
   ['txn_3UK4lZDNEru9AEpK1fW36kur:fee', 'pi_3UK4lZDNEru9AEpK17s3i4lH'],   // Oak Park GAM-fee debit
-  ['txn_3ULlcUDNEru9AEpK2BlZdygc:fee', 'pi_3ULlcUDNEru9AEpK2CGlGLM2'],   // Randall Cox, October (clearing)
-  ['txn_3ULlPkDNEru9AEpK2KfrDwvM:fee', 'pi_3ULlPkDNEru9AEpK2J3WxEN0'],   // Mireya Fierro, October (clearing)
+  ['txn_3ULlcUDNEru9AEpK2BlZdygc:fee', 'pi_3ULlcUDNEru9AEpK2CGlGLM2'],   // Osric Rookwood, October (clearing)
+  ['txn_3ULlPkDNEru9AEpK2KfrDwvM:fee', 'pi_3ULlPkDNEru9AEpK2J3WxEN0'],   // Jarrah Mortmain, October (clearing)
 ]
 
 const money = (n: number) => `$${n.toFixed(2)}`

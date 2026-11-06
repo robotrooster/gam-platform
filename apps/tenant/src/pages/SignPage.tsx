@@ -109,7 +109,7 @@ function SignatureChooser({ name, type, onSelect, onClose }: { name:string; type
           ends with nothing scrollable, so the confirm button existed and could
           not be reached. 100dvh rather than 100vh because mobile browser chrome
           makes vh taller than what is actually visible. */}
-      <div style={{ background:'white', borderRadius:20, width:'100%', maxWidth:460, maxHeight:'calc(100dvh - 40px)', overflowY:'auto', margin:'auto', boxShadow:'0 24px 80px rgba(0,0,0,.4)' }}>
+      <div style={{ background:'white', borderRadius:20, width:'100%', maxWidth:460, maxHeight:'calc(var(--vh) - 40px)', overflowY:'auto', margin:'auto', boxShadow:'0 24px 80px rgba(0,0,0,.4)' }}>
         <div style={{ padding:'20px 24px 0' }}>
           <div style={{ fontWeight:800, fontSize:'1.05rem', color:'#1a1a1a', marginBottom:4 }}>{type==='signature'?'Create Your Signature':'Create Your Initials'}</div>
           <p style={{ fontSize:'.8rem', color:'#999', margin:'0 0 14px' }}>{type==='initials'?'Initials are locked to your name on file.':'Applied to all signature fields.'}</p>
@@ -355,7 +355,11 @@ export function SignPage() {
   const scaleRef     = useRef(1)
 
   const { data, isLoading, error } = useQuery(['sign', documentId],
-    () => authFetch('/esign/sign/'+documentId).then(r=>r.json()).then(r=>{ if(!r.success)throw new Error(r.error); return r.data }),
+    () => authFetch('/esign/sign/'+documentId).then(r=>r.json()).then(r=>{
+      // 10/30: see the landlord copy — a fully-signed document's link is
+      // finished, and the heading has to read that way.
+      if(!r.success){ const e:any = new Error(r.error); e.code = r.code; throw e }
+      return r.data }),
     { retry:false }
   )
 
@@ -430,7 +434,7 @@ export function SignPage() {
   )
   // ── S636: A SIGNING PAGE HEALS ITSELF, IT DOES NOT ASK ──────────────
   //
-  // Mireya Fierro, MH 07 at Mountain View: she opened this page at 12:13 and
+  // Jarrah Mortmain, MH 07 at Mountain View: she opened this page at 12:13 and
   // the date-input fix deployed at 16:29. Her tab sat open in between, still
   // running the old bundle, so every reminder we sent led back to code that
   // could not work. Nic: "I don't know if they're still stuck on an
@@ -529,8 +533,15 @@ export function SignPage() {
   if (isLoading) return <div style={{ display:'flex', alignItems:'center', justifyContent:'center', minHeight:'60vh', color:'var(--text-3)' }}>Loading document...</div>
   if (error||!data) return (
     <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:'60vh', gap:16, textAlign:'center', padding:32 }}>
-      <AlertCircle size={40} style={{ color:'var(--red)' }}/>
-      <h2 style={{ color:'var(--text-0)' }}>Invalid Signing Link</h2>
+      {/* 10/30: a link that closed because everybody signed is not a failure,
+          and a red alert icon over the words "Already Signed" reads like one.
+          Green check for that case, red alert for a link that really is bad. */}
+      {(error as any)?.code === 'document_completed'
+        ? <Check size={40} style={{ color:'var(--green)' }}/>
+        : <AlertCircle size={40} style={{ color:'var(--red)' }}/>}
+      <h2 style={{ color:'var(--text-0)' }}>
+        {(error as any)?.code === 'document_completed' ? 'Already Signed' : 'Invalid Signing Link'}
+      </h2>
       <p style={{ color:'var(--text-3)', maxWidth:380 }}>{(error as any)?.message || 'This link may be invalid or not associated with your account.'}</p>
       <button className="btn btn-ghost" onClick={()=>navigate('/')}>Back to Portal</button>
     </div>
@@ -805,7 +816,27 @@ export function SignPage() {
       )}
 
       <div ref={containerRef} style={{ position:'relative', background:'#525659', borderRadius:12, overflow:'auto', maxHeight:'78vh', marginBottom:16 }}>
-        <div style={{ position:'relative', display:'inline-block', width:'100%' }}>
+        {/* 10/28 — ONE PIXEL FRAME FOR THE PAGE AND ITS BOXES.
+            Blue, mid-signing: the Exhibit A boxes were "all down and to the
+            right", and full screen "helped a little, but not really".
+
+            The boxes are placed in absolute pixels (left: f.x * scale), where
+            `scale` was measured ONCE from this container's clientWidth — while
+            the page image under them is laid out by CSS as width:100% of the
+            same container. Two widths for one frame. Anything that changes the
+            container's painted width after that measurement (the scroll bar
+            appearing as the canvas grows, a resize, browser zoom) leaves the
+            image re-fitted and the boxes still placed for the old width, so
+            every box drifts down and to the right by a factor that grows with
+            its distance from the top-left corner. Full screen changes the
+            width, which is why it only "helped a little".
+
+            Pinning the wrapper to the exact width the scale was computed for
+            makes the image and the boxes share one frame. Nothing stored moves:
+            the coordinates were always right, and the stamped PDFs were always
+            right — only the browser overlay was wrong. */}
+        <div style={{ position:'relative', display:'inline-block',
+                      width: pdfDims ? pdfDims.width : '100%' }}>
           <canvas ref={canvasRef}/>
           {pdfDims && pageFields.map((f:any) => {
             const s = scaleRef.current
@@ -1012,15 +1043,10 @@ export function SignPage() {
                   Deposit interest in {data.depositInterestContext.stateCode}
                 </div>
                 <div style={{ color:'#444' }}>
-                  {data.depositInterestContext.source === 'statutory' ? (
-                    <>
-                      State law ({data.depositInterestContext.statuteCitation || data.depositInterestContext.stateCode}) requires {Number(data.depositInterestContext.annualRatePct).toFixed(2)}% annual interest on held security deposits. If your lease specifies a deposit, it accrues monthly and is paid out with your refund at move-out.
-                    </>
-                  ) : (
-                    <>
-                      Your landlord has set a {Number(data.depositInterestContext.annualRatePct).toFixed(2)}% annual interest rate for held security deposits in {data.depositInterestContext.stateCode} ({data.depositInterestContext.effectiveYear}). Interest accrues monthly and is paid out with your refund at move-out.
-                    </>
-                  )}
+                  {/* 10/30 (Nic): the statutory wording is gone — the API no
+                      longer sends it, and it is not written here either. Only a
+                      rate the landlord chose for themselves appears. */}
+                  Your landlord has set a {Number(data.depositInterestContext.annualRatePct).toFixed(2)}% annual interest rate for held security deposits in {data.depositInterestContext.stateCode} ({data.depositInterestContext.effectiveYear}). Interest accrues monthly and is paid out with your refund at move-out.
                 </div>
               </div>
             )}

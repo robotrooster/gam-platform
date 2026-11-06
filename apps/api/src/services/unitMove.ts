@@ -137,7 +137,7 @@ export async function moveLeaseToUnit(params: {
     }
   }
 
-  // S652 (Nic): "make sure that Dakota Lane was billed properly." She was not:
+  // S652 (Nic): "make sure that Tobin Thornbury was billed properly." She was not:
   // the closing read on the space she left was recorded but never BILLED, so
   // the month-end read found nothing between it and itself and billed her old
   // space 0 kWh — the 481 kWh she used there before the move went nowhere. The
@@ -186,7 +186,7 @@ export async function moveLeaseToUnit(params: {
     `UPDATE units SET status = 'active' WHERE id = $1 AND status IN ('vacant','available')`,
     [params.toUnitId])
 
-  // S652 (Nic): "after I moved Dakota, I got an email saying that the meter
+  // S652 (Nic): "after I moved Tobin, I got an email saying that the meter
   // reads were needed for a space move. That email shouldn't happen because
   // the whole workflow happens in the system. I can't do the move without the
   // meter reads in the first place." The chase (S641) belonged to a move that

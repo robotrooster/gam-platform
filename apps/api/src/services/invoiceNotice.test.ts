@@ -27,7 +27,7 @@ vi.mock('./reversalRecovery', async (orig) => ({
 
 import { db, query, queryOne } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLease, seedTenant, seedLeaseTenant, seedUtilityMeter, seedUtilityBill } from '../test/dbHelpers'
-import { sendPendingInvoiceNotices, payNowLink, chargeLabel, chargeDetail, chargeLabelColumnsSql } from './invoiceNotice'
+import { sendPendingInvoiceNotices, payNowLink, chargeLabel, chargeDetail, chargeLabelColumnsSql, monthDay } from './invoiceNotice'
 import { handlePaymentReversal } from './paymentReversal'
 import { sendPaymentReceipt } from './paymentReceipt'
 import { portalLink } from '../lib/portalUrls'
@@ -178,7 +178,7 @@ describe('invoice notices', () => {
     expect(mail.html).not.toContain('Water')
   })
 
-  // S652 (Nic): Donald Hamp paid by check the day his bill was made; the next
+  // S652 (Nic): Wren Westbrook paid by check the day his bill was made; the next
   // morning's pass mailed him "$137.43 due".
   it('a bill paid before it was announced is never announced as due', async () => {
     const { invoiceId } = await seedInvoice()
@@ -384,7 +384,7 @@ describe('the full bill, with the credit Pay Now will offer beside it', () => {
   })
 
   it('10/6 (Nic): credit on PART of a line — the line at its amount, the credit paid against it, and what is still owed', async () => {
-    // Marc Renspurger: $282.36 paid ahead on $300 rent leaves $17.64 owed.
+    // Darrow Galbraith: $282.36 paid ahead on $300 rent leaves $17.64 owed.
     const f = await seedInvoice({ rent: 300 })
     const inv = (await db.query(`SELECT lease_id, unit_id, landlord_id FROM invoices WHERE id=$1`, [f.invoiceId])).rows[0]
     const rent = (await db.query<{ id: string }>(`SELECT id FROM payments WHERE invoice_id = $1 AND type = 'rent'`, [f.invoiceId])).rows[0].id
@@ -426,8 +426,8 @@ describe('the full bill, with the credit Pay Now will offer beside it', () => {
 })
 
 // decisions #17 (Nic, 10/3): "Bill and email lines name the utility: 'Water',
-// 'Electric', 'Trash', 'Sewer' — never a generic 'Utilities' line." Kim
-// Harland's October email read "Utilities $10.45" (water) and "Utilities $25" (trash).
+// 'Electric', 'Trash', 'Sewer' — never a generic 'Utilities' line." Yvette
+// Bexley's October email read "Utilities $10.45" (water) and "Utilities $25" (trash).
 describe('each line names what it is', () => {
   async function utilityLine(f: { invoiceId: string; tenantId: string | null }, type: 'water' | 'trash' | 'electric', amount: number, note: string | null) {
     const c = await db.connect()
@@ -443,7 +443,7 @@ describe('each line names what it is', () => {
     } finally { c.release() }
   }
 
-  it('Kim Harland, October: Water and Trash, never "Utilities"', async () => {
+  it('Yvette Bexley, October: Water and Trash, never "Utilities"', async () => {
     const f = await seedInvoice({ rent: 450 })
     await utilityLine(f, 'water', 10.45, null)
     await utilityLine(f, 'trash', 25, null)
@@ -580,6 +580,101 @@ describe('chargeLabel / chargeDetail', () => {
     expect(chargeDetail({ type: 'rent', notes: 'S652: corrected to the agreed $440 rent' })).toBeNull()
     expect(chargeDetail({ type: 'utility', notes: 'Work trade — suspended while the hours are worked; settled at month close' })).toBeNull()
     expect(chargeDetail({ type: 'rent', notes: null })).toBeNull()
+  })
+
+  // ── 11/5 (Nic): TWO BOUNCE FEES ON ONE BILL READ AS TWO DIFFERENT LINES ───
+  //
+  //   "For now, just separate the line items by putting the bounce date on
+  //    there."
+  //
+  // Heather Miller's November bill carries two $4 refusals and both lines read
+  // "Returned-payment fee  $4.00". That is how a real second bounce came to be
+  // reported to Nic as a duplicate — he had to open Stripe himself to prove
+  // there were two. A resident reading it has less to go on than I did.
+  it('names the day each pass-through fee happened, so two of them are told apart', () => {
+    const nov1 = { type: 'fee', entry_description: 'RETURNFEE', returned_on: '2026-11-01',
+      notes: 'Returned bank payment — pi_3SabcDEF1234 (evt_1NxyzGHI5678)' }
+    const nov3 = { type: 'fee', entry_description: 'RETURNFEE', returned_on: '2026-11-03',
+      notes: 'Returned bank payment — pi_3SjklMNO9012 (evt_1NpqrSTU3456)' }
+    expect(chargeLabel(nov1)).toBe('Returned-payment fee — Nov 1')
+    expect(chargeLabel(nov3)).toBe('Returned-payment fee — Nov 3')
+    expect(chargeLabel(nov1)).not.toBe(chargeLabel(nov3))
+    // The ids stay out of it: the day is the information, not the paperwork.
+    expect(chargeDetail(nov1)).toBeNull()
+
+    // A card refused twice has the same problem and the same answer.
+    expect(chargeLabel({ type: 'fee', entry_description: 'DECLINEFEE',
+      returned_on: '2026-11-02', notes: 'Declined card attempt — pi_3S (evt_1N)' }))
+      .toBe('Declined-payment fee — Nov 2')
+
+    // A fee written before the day was recorded reads exactly as it did.
+    expect(chargeLabel({ type: 'fee', entry_description: 'RETURNFEE', returned_on: null,
+      notes: 'Returned bank payment — pi_3S (evt_1N)' })).toBe('Returned-payment fee')
+
+    // And only these two: a date on anything else would be noise, because
+    // nothing else appears twice on one bill.
+    expect(chargeLabel({ type: 'fee', entry_description: 'LATEFEE', returned_on: '2026-11-01' }))
+      .toBe('Late fee')
+    expect(chargeLabel({ type: 'fee', entry_description: 'FLEXDEP', returned_on: '2026-11-01' }))
+      .toBe('FlexDeposit fee')
+  })
+
+  // THE DAY MUST NOT DRIFT. `new Date('2026-11-01')` is midnight UTC and reads
+  // as Oct 31 for everybody west of Greenwich, so a bill would name the day
+  // before the bank refused anything. monthDay never builds a Date.
+  it('reads the day off the calendar string, so it cannot slip a day west of UTC', () => {
+    expect(monthDay('2026-11-01')).toBe('Nov 1')
+    expect(monthDay('2026-01-01')).toBe('Jan 1')
+    expect(monthDay('2026-12-31')).toBe('Dec 31')
+    expect(monthDay('2026-03-09')).toBe('Mar 9')
+    // Nothing recognisable comes back untouched rather than as "NaN".
+    expect(monthDay('')).toBe('')
+    expect(monthDay('whenever')).toBe('whenever')
+  })
+
+  // ── 11/4: A LINE'S NAME IS THE CHARGE, NEVER THE PAYMENT'S PAPERWORK ──────
+  //
+  // Four note segments were printing on bills, receipts and the Rent Roll as
+  // what the charge IS. Three are facts about a payment and one is a pair of
+  // Stripe ids.
+  it('drops the machine ids and the pull\'s own paperwork from a line\'s name', () => {
+    // GAM's $4 return fee: its note is the key that stops a re-delivered Stripe
+    // event billing it twice. The label is the information; the ids are not.
+    const returnFee = { type: 'fee', entry_description: 'RETURNFEE',
+      notes: 'Returned bank payment — pi_3SabcDEF1234 (evt_1NxyzGHI5678)' }
+    expect(chargeLabel(returnFee)).toBe('Returned-payment fee')
+    expect(chargeDetail(returnFee)).toBeNull()
+
+    const declineFee = { type: 'fee', entry_description: 'DECLINEFEE',
+      notes: 'Declined card attempt — pi_3SabcDEF1234' }
+    expect(chargeLabel(declineFee)).toBe('Declined-payment fee')
+    expect(chargeDetail(declineFee)).toBeNull()
+
+    // MH 29's October rent, which read "Rent · What is left of this bill after
+    // a part payment — Automatic bank retry stopped 11/4 (Nic): this pull was
+    // refused for insufficient funds…" on the Rent Roll.
+    const rest = { type: 'rent', notes: 'What is left of this bill after a part payment — '
+      + 'Automatic bank retry stopped 11/4 (Nic): this pull was refused for insufficient funds; '
+      + 'the resident pays in person. Nothing further is pulled automatically.' }
+    expect(chargeLabel(rest)).toBe('Rent')
+    expect(chargeDetail(rest)).toBe('What is left of this bill after a part payment')
+
+    // 11/4: a dispute's fee note is built around a DISPUTE id, and an
+    // admin-recorded return around a prefixed key — neither is a bare pi_.
+    expect(chargeDetail({ type: 'fee', entry_description: 'RETURNFEE',
+      notes: 'Returned bank payment — dp_1NabcDEF2345' })).toBeNull()
+    expect(chargeDetail({ type: 'fee', entry_description: 'RETURNFEE',
+      notes: 'Returned bank payment — du_1NabcDEF2345' })).toBeNull()
+    expect(chargeDetail({ type: 'fee', entry_description: 'RETURNFEE',
+      notes: 'Returned bank payment — manual_return:pi_3SabcDEF1234' })).toBeNull()
+    // A real charge name that merely STARTS with one of those letters is kept.
+    expect(chargeDetail({ type: 'utility', notes: 'Water — duplex meter 100 → 200' }))
+      .toBe('duplex meter 100 → 200')
+
+    // Where the money went is a fact about the payment too.
+    expect(chargeDetail({ type: 'carried_balance', notes: 'September 2026 at Country Acres — '
+      + 'Re-applied to September 2026, which was older and unpaid; money rides the oldest balance first.' }))
+      .toBe('September 2026 at Country Acres')
   })
 
   it('a reopened charge is named and detailed by the charge it was reopened from, never by its reopen note', () => {

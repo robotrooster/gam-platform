@@ -60,7 +60,7 @@ async function main() {
 
   const residents = await query<any>(
     `SELECT u.id AS user_id, u.first_name||' '||u.last_name AS name, u.email, u.phone
-       FROM users u WHERE u.role='tenant' AND u.last_name ILIKE 'Sheptock' ORDER BY 2`)
+       FROM users u WHERE u.role='tenant' AND u.last_name ILIKE 'Prescott' ORDER BY 2`)
   const tenant = await queryOne<any>(
     `SELECT t.id FROM tenants t JOIN users u ON u.id=t.user_id WHERE u.id=$1`, [residents[0].user_id])
   const owner = await queryOne<any>(
@@ -69,13 +69,13 @@ async function main() {
 
   // S652 — THE ADULTS WHO ARE NOT SIGNING ARE STILL ON THE LEASE.
   //
-  // Nic, catching this a second time: "you didn't add john as authorized
-  // occupant. why?" Because I built the packet from SIGNERS, and John Sheptock
+  // Nic, catching this a second time: "you didn't add opal as authorized
+  // occupant. why?" Because I built the packet from SIGNERS, and Opal Prescott
   // has no email, so he is not one. That is the identical mistake as S651 —
   // an account needs a real address and GAM never invents one, which is true,
-  // and says nothing at all about who lives there. Lot 1's sheet says "John
-  // Sheptock / Nancy Sheptock"; Nancy holds the mailbox, so Nancy signs, and
-  // John is a named resident with no account and no liability.
+  // and says nothing at all about who lives there. Lot 1's sheet says "Opal
+  // Prescott / Nancy Prescott"; Nancy holds the mailbox, so Nancy signs, and
+  // Opal is a named resident with no account and no liability.
   //
   // Read off the sheet at packet time rather than patched in afterwards: a
   // document that is right when it is created cannot be sent before the patch

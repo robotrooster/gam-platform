@@ -120,4 +120,74 @@ describe('reaching out before anything is locked', () => {
     const r = await noticeUncollectableLandlords()
     expect(r.notified).toBe(0)
   })
+
+  /**
+   * 11/2 — THE ONE THAT ESCAPED, AND WHY IT MATTERS MORE THAN THE REST.
+   *
+   * collectionsBook() knew since S652 that netting is a route (the 'does not
+   * count a debt that netting will take care of' case above). The notice did
+   * not: uncollectableLandlords() skipped only on a linked debit method, so a
+   * landlord whose every previous charge had been netted out of their payouts
+   * was mailed "we cannot collect your balance" anyway. Mountain View got that
+   * mail 2026-11-01 08:00, six and a half hours after the charge was raised, on
+   * a Sunday, with $3,410.76 of its own owner-share sitting on GAM's platform
+   * balance against $185.50 owed — 18x the debt, waiting for the next batch.
+   *
+   * Nic, 11/2: "I don't want those emails going out... When somebody doesn't
+   * have an account set up to debit from, we pull from their next disbursement.
+   * That's already in the code."
+   *
+   * Two readers disagreeing about one question is what let that out, so these
+   * test the question (landlordGamAccount NETTING_ROUTE_SQL) through the path
+   * that mails people.
+   */
+  it('says nothing to a landlord whose rent is moving through GAM', async () => {
+    const landlordId = await landlordOwing(480, 0)
+    await query(
+      `INSERT INTO payments (landlord_id, amount, status, type, due_date, entry_description)
+       VALUES ($1, 1200, 'settled', 'rent', CURRENT_DATE, 'RENT')`, [landlordId])
+    const r = await noticeUncollectableLandlords()
+    expect(r.notified).toBe(0)
+    expect(notes).toHaveLength(0)
+    // And nothing is stamped, so the one message that WOULD matter later is
+    // not burned on a landlord who never had a problem.
+    const [l] = await query<any>(`SELECT uncollectable_notice_at FROM landlords WHERE id = $1`, [landlordId])
+    expect(l.uncollectable_notice_at).toBeNull()
+  })
+
+  it('says nothing while owner-share is still sitting on the platform balance', async () => {
+    // The 35-day proxy alone is not enough: an all-cash month after a run of
+    // card months leaves no recent settled payment, while the money from the
+    // earlier ones is still held and about to be batched. That money collects
+    // this debt by itself, so this landlord is not uncollectable either.
+    const landlordId = await landlordOwing(480, 0)
+    const [{ user_id: userId }] = await query<any>(
+      `SELECT user_id FROM landlords WHERE id = $1`, [landlordId])
+    const [p] = await query<any>(
+      `INSERT INTO payments (landlord_id, amount, status, type, due_date, entry_description,
+                             platform_held, created_at)
+       VALUES ($1, 1200, 'settled', 'rent', CURRENT_DATE - 60, 'RENT', TRUE, NOW() - INTERVAL '60 days')
+       RETURNING id`, [landlordId])
+    await query(
+      `INSERT INTO user_balance_ledger (user_id, type, amount, balance_after, reference_id, reference_type)
+       VALUES ($1, 'allocation_owner_share', 1200, 1200, $2, 'payment')`, [userId, p.id])
+    const r = await noticeUncollectableLandlords()
+    expect(r.notified).toBe(0)
+    expect(notes).toHaveLength(0)
+  })
+
+  it('never tells a landlord their access will be suspended', async () => {
+    // Nic, 11/2: "I don't want that semi-threatening email that says, hey,
+    // we're gonna be blocking access to the landlord account."
+    await landlordOwing(480, 0)
+    const r = await noticeUncollectableLandlords()
+    expect(r.notified).toBe(1)
+    const sent = `${notes[0].body} ${notes[0].emailHtml}`
+    expect(sent).not.toMatch(/suspend/i)
+    expect(sent).not.toMatch(/block/i)
+    expect(sent).not.toMatch(/lock/i)
+    expect(sent).not.toMatch(/restrict/i)
+    // It still has to say the useful thing.
+    expect(sent).toMatch(/rent payouts/i)
+  })
 })

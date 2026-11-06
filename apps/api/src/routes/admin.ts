@@ -28,6 +28,8 @@ import { todayIn, addDaysTo, monthStartOf } from '../lib/timezone'
 import { graceDaysSql } from '../services/lateness'
 import { REVENUE_SLICE_TYPE_SQL } from '../services/revenueSlices'
 import { openMatchReviews, decideMatchReview } from '../services/leftOwing'
+import { frontReviewQueue, frontAccuracyByState, decideFrontReview, frontReviewCount }
+  from '../services/licenceFrontReview'
 
 export const adminRouter = Router()
 adminRouter.use(requireAuth)
@@ -242,6 +244,10 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
       vacant_units: spaces.vacant,
       total_spaces: spaces.spaces,
       spaces_month: spaces.month,
+      // 10/29: licence fronts the OCR could not settle, waiting for a person
+      // here. The predicate lives with the queue rather than being spelled a
+      // second time in this SQL.
+      id_front_reviews_waiting: await frontReviewCount(),
     } })
   } catch (e) { next(e) }
 })
@@ -423,6 +429,27 @@ adminRouter.get('/rent-volume-trend', requireSuperAdmin, async (req, res, next) 
       fees: Number(r.fees),
       inFlight: Number(r.in_flight),
     })) })
+  } catch (e) { next(e) }
+})
+
+// ── 10/27 (Nic): THE FLEXDEPOSIT CASH BOARD ─────────────────────────────────
+//
+// His flowchart, verbatim: "This month coming up, do we have tenants moving
+// out? Okay, do they have deposits that GAM holds? If yes ... what is the total
+// we're holding, and what is the total amount funded, or that the landlord is
+// owed? And is there a difference? If there's a difference, what is that
+// difference? That's how much cash we potentially need that month. If there's
+// no tenants scheduled to move out that month, that's it. It just, the flow
+// chart stops right there."
+//
+// Only residents whose deposit GAM holds can cost anything, which is the whole
+// population: "The data on other people moving out doesn't matter if we don't
+// have the deposit." So with no FlexDeposit plans this answers a true $0.
+adminRouter.get('/flexdeposit/exposure', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const months = Number(req.query.months ?? 12)
+    const { flexDepositExposure } = await import('../services/flexDepositExposure')
+    res.json({ success: true, data: await flexDepositExposure(Number.isFinite(months) ? months : 12) })
   } catch (e) { next(e) }
 })
 
@@ -953,6 +980,67 @@ adminRouter.get('/nacha/monitoring', requireSuperAdmin, async (_req, res, next) 
 // A GAM admin sees the whole debt — amount, dates, who was owed — because that
 // is what research takes. The rule that holds all of it back is a rule about
 // other LANDLORDS.
+// ── READING A LICENCE BY HAND (Nic, 10/29) ─────────────────────────────────
+//
+//   "Maybe we can have it where gam to-do list for gam admin people is
+//    verifying the front photo and typing it in by hand, or like letting the
+//    parser try to read the license and matching it up, and then we can flag a
+//    percentage of accuracy of, hey, we're getting 99% accuracy in this state,
+//    and this state is only 30%."
+//
+// Only what the OCR could not settle reaches here: the front and the barcode
+// disagreeing, or a state GAM has not read enough cards from to trust a front
+// on its own. Everything else files itself.
+//
+// This is a GAM queue and not a landlord one on purpose. An identification
+// decides which human being a left-owing debt belongs to, so the landlord who
+// stands to collect never gets to decide whose debt it is.
+adminRouter.get('/id-front-reviews', requireAdmin, async (req, res, next) => {
+  try {
+    const limit = Math.min(Math.max(1, Number(req.query.limit) || 200), 500)
+    res.json({ success: true, data: {
+      waiting: await frontReviewQueue(limit),
+      byState: await frontAccuracyByState(),
+    } })
+  } catch (e) { next(e) }
+})
+
+// The person's answer, which is also the ANSWER KEY. A card with no barcode had
+// nothing to grade against — that is why it came here — so the number typed by
+// hand grades the read it arrived with, and the per-state figure climbs off
+// real work instead of waiting on two-sided cards.
+adminRouter.post('/id-front-reviews/:id/decide', requireAdmin, async (req, res, next) => {
+  try {
+    const body = z.object({
+      // All omitted means "what is on file is right."
+      idNumber: z.string().trim().min(2).max(40).nullish(),
+      dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullish(),
+      issuingState: z.string().trim().length(2).nullish(),
+      note: z.string().max(1000).nullish(),
+    }).parse(req.body)
+    const said = await decideFrontReview({
+      identificationId: req.params.id,
+      byUserId: req.user!.userId,
+      idNumber: body.idNumber ?? undefined,
+      dateOfBirth: body.dateOfBirth === undefined ? undefined : body.dateOfBirth,
+      issuingState: body.issuingState === undefined ? undefined : body.issuingState,
+      note: body.note ?? null,
+    })
+    if (!said.decided) throw new AppError(409, said.why)
+    await logAdminAction({
+      adminUserId: req.user!.userId,
+      actionType: 'id_front_confirmed',
+      targetType: 'tenant_identification',
+      targetId: req.params.id,
+      // The number itself is not written into the audit metadata — the row
+      // holds it, and an admin log is read by more people than the card is.
+      metadata: { retyped: !!body.idNumber, gradedTheRead: said.gradedTheRead },
+      ipAddress: req.ip ?? null,
+    })
+    res.json({ success: true, data: said })
+  } catch (e) { next(e) }
+})
+
 adminRouter.get('/left-owing-reviews', requireAdmin, async (req, res, next) => {
   try {
     const limit = Math.min(Math.max(1, Number(req.query.limit) || 200), 500)
@@ -4367,7 +4455,7 @@ adminInviteRouter.post('/:token/accept', async (req, res, next) => {
       // that address and is 64 random characters, so opening it proves the inbox
       // exactly as a verification link would (the S650 password-reset reasoning).
       // Without it the new admin's first sign-in was refused with "Please verify
-      // your email" — Ben Layton accepted on Sept 5 and was still locked out,
+      // your email" — Faye Pemberton accepted on Sept 5 and was still locked out,
       // unverified, a month later.
       const user = (await client.query(
         `INSERT INTO users (email, password_hash, role, first_name, last_name,
@@ -4395,44 +4483,29 @@ adminInviteRouter.post('/:token/accept', async (req, res, next) => {
 /**
  * S652 — GAM's own collections desk.
  *
- * GET  /api/admin/uncollectable        — who owes GAM with no way to collect
- * POST /api/admin/landlords/:id/unlock — restore access by hand
+ * GET /api/admin/uncollectable — who owes GAM with no way to collect.
  *
- * THERE IS NO MANUAL LOCK, AND THAT IS THE POINT. I built one, on the reasoning
- * that a sweep which suspends accounts by itself is one bug from taking a paying
- * customer offline. Nic threw it out: "I don't want it flipped by a person. Like,
- * that means somebody manually had to go in there and do that and make a choice.
- * And choice creates the opportunity for discrimination. We need to have a
- * standing company rule and a sweep that happens when that threshold is reached."
+ * 11/2 (Nic): THERE IS NO LOCK ANY MORE, by hand or by rule, so the unlock
+ * route that sat here is gone with it. The S652 reasoning is kept because it is
+ * the argument he may want back one day: he refused a manual lock on the ground
+ * that "choice creates the opportunity for discrimination" and asked for a
+ * standing rule and a sweep instead, so that the 3-lot duplex and the 41-space
+ * park are treated identically.
  *
- * He is right and the reasoning is not really about bugs. A lock a human chooses
- * to apply is a lock a human can choose NOT to apply, and every instance of
- * either is a decision somebody could be asked to justify. A rule that runs
- * itself is the same for the 3-lot duplex and the 41-space park.
+ * What happened in practice is that the sweep never locked anyone and the notice
+ * in front of it mailed his own two parks "we cannot collect your balance" while
+ * their money sat on GAM's platform balance waiting to be batched. Asked whether
+ * to keep the lock without the threats, he removed it: "Nobody is ever locked out
+ * for owing GAM; collection stays netting, bank pull, then your judgment." The
+ * trade is explicit and is his — who gets chased is a human decision again.
  *
- * The rule lives in services/portalLockSweep. Unlocking stays available by hand
- * because restoring access is not the decision anybody would abuse, and it also
- * happens automatically the moment the balance is settled.
+ * This list is now the whole mechanism: it surfaces, a person reads it, nothing
+ * acts. See middleware/auth's header for what collects instead.
  */
 adminRouter.get('/uncollectable', requireSuperAdmin, async (_req, res, next) => {
   try {
     const { uncollectableLandlords } = await import('../services/landlordGamDebit')
     res.json({ success: true, data: await uncollectableLandlords() })
-  } catch (e) { next(e) }
-})
-
-adminRouter.post('/landlords/:id/unlock', requireSuperAdmin, async (req: any, res, next) => {
-  try {
-    const l = await queryOne<any>(
-      `SELECT id, platform_locked_at FROM landlords WHERE id = $1`, [req.params.id])
-    if (!l) throw new AppError(404, 'No such company')
-    if (!l.platform_locked_at) return res.json({ success: true, data: { locked: false } })
-    // The reason is kept, not blanked: the history of a lock is the answer to
-    // "has this happened before", and GAM does not erase records.
-    await query(
-      `UPDATE landlords SET platform_locked_at = NULL, updated_at = NOW() WHERE id = $1`, [l.id])
-    logger.warn({ landlordId: l.id, by: req.user.userId }, '[admin] a landlord portal was unlocked')
-    res.json({ success: true, data: { locked: false } })
   } catch (e) { next(e) }
 })
 

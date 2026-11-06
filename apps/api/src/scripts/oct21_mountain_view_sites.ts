@@ -2,9 +2,9 @@
  * 10/21 (Nic) — TWO THINGS ABOUT MOUNTAIN VIEW'S RV SITES, FROM READING THE OLD
  * SYSTEM'S EXPORT BESIDE GAM.
  *
- *   RV 34. "Martin Alvarado is in 33. 34 is vacant, and it actually is a 50 amp
+ *   RV 34. "Faye Inglewood is in 33. 34 is vacant, and it actually is a 50 amp
  *          space. I didn't know it was 50 amp. So we can change that setting as
- *          well for that site." (Campground Master had Alvarado on 34; GAM has
+ *          well for that site." (Campground Master had Inglewood on 34; GAM has
  *          him on 33 and GAM is right.)
  *
  *   RV 15A. "15A is a real site. It doesn't have an electric meter on it though,

@@ -232,9 +232,9 @@ describe('attaching a bill stranded by the monthly run', () => {
 // Releasing HELD charges only rescues a unit that had a hold. A unit with
 // nobody invited at billing time gets no hold — the run passes straight over
 // it — so a resident invited afterwards was invisible to that cycle forever.
-// Blanca Avalos was invited to Mountain View RV 36 three hours after the Sept 2
-// run and had no electric on her bill at all; the same for Jeremy Parker at
-// RV 49 and Julie Kenyon at RV 04.
+// Gail Glenmore was invited to Mountain View RV 36 three hours after the Sept 2
+// run and had no electric on her bill at all; the same for Margo Northcott at
+// RV 49 and Ulric Vandermere at RV 04.
 describe('S638 a lease bills the cycle it arrives into', () => {
   it('creates the charge for a cycle the run skipped', async () => {
     const f = await seedStack()

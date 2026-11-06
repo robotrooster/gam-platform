@@ -94,7 +94,7 @@ async function stay(p: Park, o: {
         total_amount, platform_fee, status, source, booked_check_out, stay_tax_rate)
      VALUES ($1,$2,$3,'month_to_month',$4::date,$5::date,($5::date - $4::date),$6,0,'checked_in','direct',$5::date,$7)
      RETURNING id`,
-    [p.landlordId, p.unitId, o.guest ?? 'Victor Cardoza', ARRIVED, through, o.total ?? 589,
+    [p.landlordId, p.unitId, o.guest ?? 'Horatio Mapperley', ARRIVED, through, o.total ?? 589,
      o.stayTaxRate ?? null]))[0].id
 }
 
@@ -194,18 +194,18 @@ describe('"No refund" records the money that stayed here', () => {
 
     // The two halves, side by side, which is the whole point.
     expect(await washPairing(p.landlordId)).toMatchObject([
-      { unitNumber: 'RV 10', who: 'Victor Cardoza', moneyKept: 51, utilityAbsorbed: 81.27, evenedOutBy: -30.27 },
+      { unitNumber: 'RV 10', who: 'Horatio Mapperley', moneyKept: 51, utilityAbsorbed: 81.27, evenedOutBy: -30.27 },
     ])
   })
 
   it('two guests off one site in one month are two departures, not one', async () => {
     const p = await park()
-    const first = await stay(p, { guest: 'Victor Cardoza' })
+    const first = await stay(p, { guest: 'Horatio Mapperley' })
     await paidCash(p, first, 589)
     await decide(p, first, 'no_refund')
     await settleFinalStubForDeparture(stub(p, first))
 
-    const second = await stay(p, { guest: 'Nemesio Rivera' })
+    const second = await stay(p, { guest: 'Kestrel Norrington' })
     await paidCash(p, second, 589)
     await decide(p, second, 'no_refund')
     await settleFinalStubForDeparture(stub(p, second))
@@ -287,7 +287,7 @@ describe('a taxed park: what the till is up is stamped before tax', () => {
     // of pocket, $15.49 really ahead — and no closing read in yet, so the power
     // side is still zero rather than the shortfall being understated by $30.98.
     expect(await washPairing(p.landlordId)).toMatchObject([{
-      unitNumber: 'RV 10', who: 'Victor Cardoza',
+      unitNumber: 'RV 10', who: 'Horatio Mapperley',
       moneyKeptBeforeTax: 51, lodgingTaxOwed: 35.51, moneyKept: 15.49,
       utilityAbsorbed: 0, closingReadsIn: false, evenedOutBy: 15.49,
     }])
@@ -317,12 +317,12 @@ describe('a taxed park: what the till is up is stamped before tax', () => {
 
   it('two of them: $102.00 in the till, $71.02 of tax, $30.98 really ahead', async () => {
     const p = await taxed()
-    const victor = await soldAt635(p, { guest: 'Victor Cardoza' })
-    await paidCash(p, victor, 589)
-    await decide(p, victor, 'no_refund')
-    const nemesio = await soldAt635(p, { guest: 'Nemesio Rivera' })
-    await paidCash(p, nemesio, 589)
-    await decide(p, nemesio, 'no_refund')
+    const horatio = await soldAt635(p, { guest: 'Horatio Mapperley' })
+    await paidCash(p, horatio, 589)
+    await decide(p, horatio, 'no_refund')
+    const kestrel = await soldAt635(p, { guest: 'Kestrel Norrington' })
+    await paidCash(p, kestrel, 589)
+    await decide(p, kestrel, 'no_refund')
 
     const rows = await washPairing(p.landlordId)
     expect(rows.map((r) => r.moneyKeptBeforeTax)).toEqual([51, 51])
@@ -456,7 +456,7 @@ describe('putting the booked day back takes the wash with it', () => {
     const c = await getClient()
     try {
       await c.query('BEGIN')
-      await onCheckOutUndone(c, b, { change: 'undo', guest: 'Victor Cardoza' })
+      await onCheckOutUndone(c, b, { change: 'undo', guest: 'Horatio Mapperley' })
       await c.query('COMMIT')
     } finally { c.release() }
 
@@ -478,7 +478,7 @@ describe('putting the booked day back takes the wash with it', () => {
     const c = await getClient()
     try {
       await c.query('BEGIN')
-      await onCheckOutUndone(c, b, { change: 'undo', guest: 'Victor Cardoza' })
+      await onCheckOutUndone(c, b, { change: 'undo', guest: 'Horatio Mapperley' })
       await c.query('COMMIT')
     } finally { c.release() }
 
@@ -496,7 +496,7 @@ describe('putting the booked day back takes the wash with it', () => {
     const c = await getClient()
     try {
       await c.query('BEGIN')
-      await onCheckOutUndone(c, b, { change: 'undo', guest: 'Victor Cardoza' })
+      await onCheckOutUndone(c, b, { change: 'undo', guest: 'Horatio Mapperley' })
       await c.query('COMMIT')
     } finally { c.release() }
 
@@ -517,7 +517,7 @@ describe('the desk is told the whole trade in one breath', () => {
 
     const q = await quoteEarlyCheckOut(poolQ, b, { leftOn: LEFT, canRefund: true })
     expect(q.noRefunds).toBe(
-      'Victor Cardoza paid $51.00 more than the nights they stayed are worth, but this property does not give '
+      'Horatio Mapperley paid $51.00 more than the nights they stayed are worth, but this property does not give '
       + 'money back when a guest leaves early — so nothing goes back and the price as booked, $589.00, stands. '
       + 'Check them out and the stay closes. Because that money stayed here, their final electric bill is a '
       + 'wash: the closing read is still taken to close the space out, but nothing is billed to them for it. '

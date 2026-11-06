@@ -3,6 +3,7 @@
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { db } from '../db'
+import { todayIn } from '../lib/timezone'
 import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import { installmentSplit, SUPPORTED_CARD_READER } from '@gam/shared'
 
@@ -233,6 +234,25 @@ describe('the order finds its reader — nobody types a serial', () => {
     `SELECT status, serial, stripe_reader_id, shipped_at, registered_at, installments_raised FROM pos_reader_orders WHERE id = $1`, [id])).rows[0]
   const day = (n: number) => new Date(Date.now() + n * 86400000)
 
+  /**
+   * The 2nd of the month `n` months on, on GAM'S OWN CALENDAR.
+   *
+   * 11/01: this used to be `new Date(); setUTCMonth(+1, 2)`. The installment
+   * raiser now counts billing months on GAM's calendar rather than in UTC
+   * (which turned over at 5pm Phoenix and raised a piece early), so a test that
+   * builds "next month" in UTC asks about a different month than the service
+   * answers for: run on the evening of 31 October, UTC was already 1 November
+   * and "+1 UTC month" landed two billing months out, raising two pieces.
+   *
+   * Noon Phoenix (19:00 UTC) is deliberately mid-day, so the instant is inside
+   * that date on either calendar.
+   */
+  const monthsOn = (n: number) => {
+    const [y, m] = todayIn(null).split('-').map(Number)
+    const total = (y * 12 + (m - 1)) + n
+    return new Date(`${Math.floor(total / 12)}-${String((total % 12) + 1).padStart(2, '0')}-02T19:00:00Z`)
+  }
+
   it('a reader that turns up at the property after the order ships the order, with Stripe\u2019s serial', async () => {
     const w = await world(); const o = await placed(w)
     stripeReaders.mockImplementation(async () => ({ data: [{ id: 'tmr_mv', serial_number: 'STR71Z1H614000756', label: null, status: null, last_seen_at: null }] }))
@@ -242,8 +262,7 @@ describe('the order finds its reader — nobody types a serial', () => {
     expect(r.shipped_at).not.toBeNull()
     // shipped → nothing in the ship month; the plan's first piece next month
     expect(await raiseDueInstallments(new Date())).toBe(0)
-    const next = new Date(); next.setUTCMonth(next.getUTCMonth() + 1, 2)
-    expect(await raiseDueInstallments(next)).toBe(1)
+    expect(await raiseDueInstallments(monthsOn(1))).toBe(1)
   })
 
   it('an order matched after its ship month charges the piece already due at once — not two on the next 1st', async () => {

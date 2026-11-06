@@ -8,7 +8,7 @@
  *    bank deposit: "why is it talking about credit when they didn't even make
  *    a full payment to begin with?"
  *
- *   1. Marc Renspurger's exact case: $297.06 paid ahead against $300 rent +
+ *   1. Darrow Galbraith's exact case: $297.06 paid ahead against $300 rent +
  *      $14.70 electric — $17.64 owed, and no line marked as covered by credit
  *      "collected by the landlord".
  *   2. Credit larger than the balance: everything paid, the rest stays credit.
@@ -18,7 +18,7 @@
  *      still refuses a tenant's own short cash where part payments are off.
  *   5. The portal's figures: the bill, the credit applied, what is still owed.
  *   6. The Bowmans' $500 part payment: no credit anywhere.
- *   7. The data fix: a dry run changes nothing; --apply fixes Marc to $17.64
+ *   7. The data fix: a dry run changes nothing; --apply fixes Darrow to $17.64
  *      and zeroes his six late fees; a second run finds nothing.
  *   8. 10/15 (Nic): the same for every other kind of credit — "money gets
  *      applied to the most outstanding balance first. Somebody can't go put
@@ -105,7 +105,7 @@ async function stack(opts: { partial?: boolean; bankDeposits?: boolean; rent?: n
     const tenantId = await seedTenant(c)
     await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
     const tenantUserId = (await c.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id = $1`, [tenantId])).rows[0].user_id
-    await c.query(`UPDATE users SET first_name = 'Marc', last_name = 'Renspurger' WHERE id = $1`, [tenantUserId])
+    await c.query(`UPDATE users SET first_name = 'Darrow', last_name = 'Galbraith' WHERE id = $1`, [tenantUserId])
     return {
       landlordId: ll.landlordId, ownerUserId: ll.userId, propertyId, unitId, leaseId, tenantId, tenantUserId,
       token: sign(ll.userId, 'landlord', { profileId: ll.landlordId }),
@@ -154,7 +154,7 @@ const owedNow = async (s: Stack) => {
 const creditLeft = async (id: string) =>
   Number((await db.query<{ r: string }>(`SELECT amount_remaining::text AS r FROM lease_prepaid_credits WHERE id = $1`, [id])).rows[0].r)
 
-/** Marc's account as production had it on Oct 6: the old per-line draw paid the electric only. */
+/** Darrow's account as production had it on Oct 6: the old per-line draw paid the electric only. */
 async function marcAsHeOct6(s: Stack) {
   const credit = await paidAhead(s, 297.06)
   const oct = await bill(s, '2026-10-01', [
@@ -181,7 +181,7 @@ async function marcAsHeOct6(s: Stack) {
   return { credit, invoiceId: oct.invoiceId, rent, electric, fees }
 }
 
-describe('1. Marc Renspurger: credit against the whole balance', () => {
+describe('1. Darrow Galbraith: credit against the whole balance', () => {
   it('$297.06 paid ahead against $300 rent + $14.70 electric: $17.64 owed, the rent never cut in two', async () => {
     const s = await stack()
     const credit = await paidAhead(s, 297.06)
@@ -361,7 +361,7 @@ describe('7. the data fix (scripts/oct6_apply_credit_to_whole_balance)', () => {
     for (const f of m.fees) expect(await row(f)).toMatchObject({ status: 'pending', amount: 5 })
   })
 
-  it('--apply fixes Marc to $17.64, zeroes his six late fees (never deletes them), and a second run finds nothing', async () => {
+  it('--apply fixes Darrow to $17.64, zeroes his six late fees (never deletes them), and a second run finds nothing', async () => {
     const s = await stack()
     const m = await marcAsHeOct6(s)
     const r = await tx(c => applyCreditToWholeBalance(c, { tenantIds: [s.tenantId], zeroExemptFor: [s.tenantId] }))
@@ -571,7 +571,7 @@ describe('8. credit the landlord gave goes on the balance too', () => {
     } finally { c.release() }
     expect(dry).toHaveLength(1)
     expect(dry[0]).toMatchObject({
-      name: 'Marc Renspurger', company: 'Mountain View RV Park Ranch LLC', spaces: 'RV 52',
+      name: 'Darrow Galbraith', company: 'Mountain View RV Park Ranch LLC', spaces: 'RV 52',
       creditHeld: 400, owedBefore: 1000, creditHeldAfter: 0, owedAfter: 600, leftSitting: null,
     })
     // Rolled back: the books are as they were.

@@ -1,5 +1,5 @@
 /**
- * S642 (Nic, via Calvin Curtis on RV 40) — "it's not showing any electricity.
+ * S642 (Nic, via Kesh Kilbride on RV 40) — "it's not showing any electricity.
  * We're supposed to be matching broken reads that are active spots."
  *
  * A stuck meter on an OCCUPIED space bills the lowest comparable rather than

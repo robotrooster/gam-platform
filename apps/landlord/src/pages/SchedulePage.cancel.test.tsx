@@ -196,7 +196,11 @@ describe('Cancel reservation opens the never-moved-in confirm (decisions #53)', 
     const src = readFileSync(file, 'utf8')
     // 10/12 (Nic): the Money received / Money billed switch is gone, so the key is the property alone.
     expect(src).toMatch(/useQuery<DashStats>\(\s*\['dashboard', propertyId\]/)
-    expect(src).toMatch(/useQuery<any>\(\s*'landlord-todos'/)
+    // 10/29: the to-do list takes the property filter too, so its key carries
+    // the property the same way the dashboard's does. The plain
+    // 'landlord-todos' invalidations above still reach it — react-query matches
+    // an array key by its prefix — which is why only this assertion moved.
+    expect(src).toMatch(/useQuery<any>\(\s*(\/\/[^\n]*\n\s*)*\['landlord-todos', propertyId\]/)
     const { LEASE_CLOSE_REFRESH_KEYS } = await import('./LeasesPage')
     expect(LEASE_CLOSE_REFRESH_KEYS).toEqual(expect.arrayContaining(['dashboard', 'landlord-todos', 'leases', 'schedule']))
   })

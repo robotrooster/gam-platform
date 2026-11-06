@@ -3109,11 +3109,32 @@ export async function setBooksStartDate(
   landlordId: string,
   date: string | null,
   outer?: PoolClient,
+  /**
+   * 11/3 — WHICH property's books start. Left out, it sets EVERY property the
+   * company holds, which is exactly what this function has always meant for a
+   * company with one property, and is what the Books Settings page sends when
+   * an owner answers the question once for a single-property company.
+   */
+  propertyId?: string | null,
 ): Promise<{ ignored: number; restored: number }> {
   const client = outer ?? await getClient()
   try {
     if (!outer) await client.query('BEGIN')
-    await client.query('UPDATE landlords SET books_start_date = $2 WHERE id = $1', [landlordId, date])
+    // 11/3 — THE PROPERTY IS WHERE THE DATE LIVES (Nic, 11/2: a property bought
+    // later has its own books start, same LLC or not). landlords.books_start_date
+    // is now a MIRROR of MIN(properties.books_start_date), kept by
+    // properties_derive_company_books_start(); writing it directly would be
+    // silently replaced the next time any property of the company changed.
+    // The bank half below still keys off the COMPANY, because a bank account
+    // cannot be split between properties — so it reads the derived date back
+    // rather than the one just passed in, which for a second property may not
+    // be the earliest.
+    await client.query(
+      `UPDATE properties SET books_start_date = $2
+        WHERE landlord_id = $1 AND ($3::uuid IS NULL OR id = $3::uuid)`,
+      [landlordId, date, propertyId ?? null])
+    const companyStart = (await client.query<{ d: string | null }>(
+      `SELECT books_start_date::text AS d FROM landlords WHERE id = $1`, [landlordId])).rows[0]?.d ?? null
     // Lock what may move in id order — the order a bank sync locks in — so a
     // save that lands mid-sync waits for it instead of deadlocking with it.
     await client.query(
@@ -3121,20 +3142,22 @@ export async function setBooksStartDate(
         WHERE landlord_id = $1 AND (status = 'needs_review' OR (status = 'ignored' AND ignored_reason = 'before_books'))
         ORDER BY id FOR UPDATE`, [landlordId])
 
-    const ignored = date
+    const ignored = companyStart
       ? (await client.query(
           `UPDATE bank_transactions SET status = 'ignored', ignored_reason = 'before_books', updated_at = now()
             WHERE landlord_id = $1 AND posted_date < $2::date AND status = 'needs_review'
-            RETURNING id`, [landlordId, date])).rowCount ?? 0
+            RETURNING id`, [landlordId, companyStart])).rowCount ?? 0
       : 0
 
     // Cleared: everything the date hid comes back. Moved: what is now on or
-    // after it comes back.
+    // after it comes back. 11/3: measured against the company's EARLIEST
+    // property date — adding a property bought earlier deliberately brings
+    // bank history back into review (PER_PROPERTY_BOOKS_PLAN.md, told to Nic).
     const restored = (await client.query(
       `UPDATE bank_transactions SET status = 'needs_review', ignored_reason = NULL, updated_at = now()
         WHERE landlord_id = $1 AND status = 'ignored' AND ignored_reason = 'before_books'
           AND ($2::date IS NULL OR posted_date >= $2::date)
-        RETURNING id`, [landlordId, date])).rowCount ?? 0
+        RETURNING id`, [landlordId, companyStart])).rowCount ?? 0
 
     if (!outer) await client.query('COMMIT')
     return { ignored, restored }

@@ -15,7 +15,7 @@
  *   services/registerFinalUtility asked "is there a row for this booking",
  *     which answers a question about the past, not about who owes this power.
  *
- * So Andres books 35 nights on RV 27 and pays his own power; the landlord drags
+ * So Cora books 35 nights on RV 27 and pays his own power; the landlord drags
  * his reservation in on the schedule to 10 nights. He is a weekly guest now.
  * The stale row said "he pays his own", the counter priced 387 kWh at $87.77,
  * and the desk would have read that figure out to him with him standing there —
@@ -125,7 +125,7 @@ async function longStayOn(p: Park, o: { email: string; from: number; to: number 
     `INSERT INTO unit_bookings (unit_id, landlord_id, tenant_id, check_in, check_out, booked_check_out,
                                 status, lease_type, stay_terms, guest_name, guest_email)
      VALUES ($1,$2,$3,CURRENT_DATE + $4::int, CURRENT_DATE + $5::int, CURRENT_DATE + $5::int,
-             'checked_in','month_to_month','stay','Andres Razo',$6)
+             'checked_in','month_to_month','stay','Cora Castellan',$6)
      RETURNING id`,
     [p.unitId, p.landlordId, tenantId, o.from, o.to, o.email])
   const made = await syncStayUtilityAgreement(b.rows[0].id, { byUserId: p.userId })
@@ -169,7 +169,7 @@ async function confirmRead(p: Park, closing: any, reads: Array<{ meterId: string
 describe('a stay re-dated under thirty nights is back in the rate', () => {
   it('the re-date ends the agreement, and the counter collects nothing from him', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     // 35 nights: his site's power is his to pay, through the stay's agreement.
     const s = await longStayOn(p, { email, from: -10, to: 25 })
     expect(await agreement(s.agreementId)).toMatchObject({ status: 'active', e: await day(25) })
@@ -229,7 +229,7 @@ describe('a stay re-dated under thirty nights is back in the rate', () => {
 
   it('and checking him out does not hand the agreement a real span back', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await longStayOn(p, { email, from: -10, to: 25 })
     expect((await reDate(p, s.bookingId, { checkOut: await day(0) })).status).toBe(200)
 
@@ -257,7 +257,7 @@ describe('a stay re-dated under thirty nights is back in the rate', () => {
 
   it('dragged back out over thirty nights, he pays his own power again', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await longStayOn(p, { email, from: -10, to: 25 })
 
     // In to 10 nights, then back out to 35 — a landlord correcting a slip.
@@ -290,7 +290,7 @@ describe('a stay re-dated under thirty nights is back in the rate', () => {
 
   it('an agreement that covers no day is nobody\'s payer, whatever the row says', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await longStayOn(p, { email, from: -10, to: 25 })
     // The shape a re-date leaves behind, and the shape a no-show has always
     // left behind: the row is still there, ended the day it began. The old
@@ -318,7 +318,7 @@ describe('a stay re-dated under thirty nights is back in the rate', () => {
   // to the ticket would be different numbers.
   it('refuses the same pole twice at both doors, with nothing written and no figure said', async () => {
     const p = await park()
-    const email = `razo-${Math.random().toString(36).slice(2)}@example.com`
+    const email = `castellan-${Math.random().toString(36).slice(2)}@example.com`
     const s = await longStayOn(p, { email, from: -10, to: 25 })
     const closing = await counterClosingById(db as any, {
       landlordId: p.landlordId, propertyId: p.propertyId, kind: 'stay', id: s.bookingId })
